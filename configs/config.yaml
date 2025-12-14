@@ -1,0 +1,28 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  rp_id: "localhost"
+  rp_origin: "http://localhost:8080"
+  rp_name: "Wallet Backend"
+  base_url: "http://localhost:8080"
+
+storage:
+  type: "memory"  # Options: memory, sqlite, mongodb
+  
+  sqlite:
+    path: "wallet.db"
+  
+  mongodb:
+    uri: "mongodb://localhost:27017"
+    database: "wallet"
+    timeout: 10
+
+logging:
+  level: "info"  # Options: debug, info, warn, error
+  format: "json" # Options: json, text
+
+jwt:
+  secret: "change-this-secret-in-production"
+  expiry_hours: 24
+  refresh_days: 7
+  issuer: "wallet-backend"

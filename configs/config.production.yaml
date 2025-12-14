@@ -1,0 +1,29 @@
+# Example configuration for production deployment
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  rp_id: "wallet.example.com"
+  rp_origin: "https://wallet.example.com"
+  rp_name: "Example Wallet"
+  base_url: "https://wallet.example.com"
+
+storage:
+  type: "mongodb"
+  
+  mongodb:
+    uri: "mongodb://username:password@mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0"
+    database: "wallet_production"
+    timeout: 10
+
+logging:
+  level: "info"
+  format: "json"
+
+jwt:
+  # IMPORTANT: Use a strong secret (min 32 characters)
+  # Generate with: openssl rand -base64 32
+  secret: "${WALLET_JWT_SECRET}"
+  expiry_hours: 24
+  refresh_days: 7
+  issuer: "wallet.example.com"
