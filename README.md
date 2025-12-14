@@ -1,6 +1,8 @@
 # Go Wallet Backend
 
-A scalable, cloud-native wallet backend server implementation in Go, designed for horizontal scaling and production deployment.
+**This is work in progress**
+
+This is a proof of concept re-implementation of wwWallet/wallet-backend-server in golang. The intention is to build a version of the wwWallet backend that is ready for large scale production deployment.
 
 ## Features
 
