@@ -251,7 +251,101 @@ location ~ ^/[a-z0-9-]+/ {
 **Estimated Files Changed**: 10-15 files
 **Estimated Complexity**: Medium-High (more files, but more standard pattern)
 
+### OAuth State Parameter Standards Compliance
+
+A key consideration is whether using the `state` parameter to preserve tenant context impacts compatibility with external OAuth providers or requires non-standard client configuration.
+
+#### Standards Analysis
+
+The OAuth 2.0 specification ([RFC 6749 Section 4.1.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1.1)) defines `state` as:
+
+> **state** (RECOMMENDED): An opaque value used by the client to maintain state between the request and callback. The authorization server includes this value when redirecting the user-agent back to the client.
+
+The spec explicitly allows clients to encode **any** application state in this parameter. Common uses include:
+- CSRF protection (nonce)
+- Return URL after authentication
+- Session context
+- **Tenant/organization context** ← Our use case
+
+**Conclusion: Encoding tenant in `state` is 100% standards-compliant.**
+
+#### Library Compatibility
+
+All major OAuth libraries support custom state values:
+
+| Library | Language | State Handling | Custom Data Support |
+|---------|----------|----------------|---------------------|
+| passport-oauth2 | Node.js | ✅ `state` option accepts any string | Yes |
+| golang.org/x/oauth2 | Go | ✅ `AuthCodeURL(state)` accepts any string | Yes |
+| authlib | Python | ✅ State parameter passthrough | Yes |
+| Spring Security OAuth | Java | ✅ Customizable state | Yes |
+| MSAL | JavaScript/.NET | ✅ State parameter support | Yes |
+
+**No non-standard configuration required.** Standard usage:
+
+```javascript
+// Standard OAuth library usage - works unchanged
+const state = base64url(JSON.stringify({
+  csrf: crypto.randomUUID(),
+  tenant: 'acme-corp',        // ← Just add tenant here
+  returnTo: '/dashboard'
+}));
+
+oauth.authorizeURL({ state: state, /* ... */ });
+```
+
+The authorization server does not parse the state - it echoes it back unchanged. This is by design.
+
+#### OpenID4VCI/VP Compatibility
+
+OpenID4VCI and OpenID4VP also support `state`:
+- **OpenID4VCI**: Uses standard OAuth authorization code flow with `state`
+- **OpenID4VP**: The `state` parameter is echoed in the authorization response
+
+The current `UriHandlerProvider.tsx` already uses `state` for CSRF. Adding tenant is additive.
+
+#### Redirect URI Registration Comparison
+
+When using external OAuth providers with pre-registered redirect URIs:
+
+| Routing Approach | Registered Redirect URI | External Provider Compatibility |
+|-----------------|------------------------|--------------------------------|
+| **Fragment** | `https://example.com/cb` (single) | ✅ One URI for all tenants |
+| **Path** | `https://example.com/{tenant}/cb` | ⚠️ Requires wildcard support or per-tenant registration |
+
+**Fragment routing advantage**: Register ONE redirect URI for all tenants. Tenant context round-trips via `state`, which all providers support.
+
+**Path routing consideration**: Would require either:
+- Wildcard redirect URI support (not all providers support this)
+- Register each tenant's callback URL separately
+- Use a single `/cb` endpoint that reads tenant from `state` anyway (negating the path benefit)
+
+#### Summary
+
+| Aspect | Fragment + State | Path Routing |
+|--------|-----------------|--------------|
+| Standards Compliance | ✅ Fully compliant | ✅ Fully compliant |
+| Library Compatibility | ✅ All libraries | ✅ All libraries |
+| External OAuth Providers | ✅ Single redirect URI | ⚠️ May need wildcard/multiple URIs |
+| Client Code Changes | None (standard state usage) | None |
+| Provider Configuration | Single redirect URI | Per-tenant or wildcard URIs |
+
+**Bottom line**: Fragment routing with state-encoded tenant is **more compatible** with external OAuth providers because it requires only a single registered redirect URI.
+
 ### Recommendation Matrix
+
+| If you prioritize... | Choose |
+|---------------------|--------|
+| CDN simplicity & caching efficiency | Fragment (`/#tenant`) |
+| Clean URLs & minimal frontend changes | Path (`/tenant`) |
+| Zero server/CDN configuration | Fragment (`/#tenant`) |
+| OAuth redirect simplicity | Path (`/tenant`) |
+| SEO (if applicable) | Path (`/tenant`) |
+| Static hosting (GitHub Pages, S3) | Fragment (`/#tenant`) |
+| Enterprise/traditional infrastructure | Path (`/tenant`) |
+| **External OAuth provider compatibility** | **Fragment (`/#tenant`)** |
+
+### Analysis Summary
 
 | If you prioritize... | Choose |
 |---------------------|--------|
