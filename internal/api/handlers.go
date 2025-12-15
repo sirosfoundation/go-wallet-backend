@@ -434,12 +434,11 @@ func (h *Handlers) DeletePresentation(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	holderDID, ok := h.getHolderDID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
-	holderDID := userID.(string)
 
 	if err := h.services.Presentation.Delete(c.Request.Context(), holderDID, presentationID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
