@@ -86,6 +86,8 @@ The application is designed to scale horizontally:
 
 ### Installation
 
+#### Using binaries
+
 ```bash
 # Clone the repository
 git clone https://github.com/sirosfoundation/go-wallet-backend
@@ -99,6 +101,12 @@ make build
 
 # Run
 ./bin/server
+```
+
+#### Using docker compose
+
+```bash
+docker compose up
 ```
 
 ### Configuration
