@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	gotrust "github.com/SUNET/go-trust/pkg/authzen"
+	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 

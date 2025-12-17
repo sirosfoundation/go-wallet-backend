@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	gotrust "github.com/SUNET/go-trust/pkg/authzen"
-	"github.com/SUNET/go-trust/pkg/authzenclient"
+	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
+	"github.com/sirosfoundation/go-trust/pkg/authzenclient"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
