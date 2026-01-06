@@ -108,10 +108,11 @@ func (e *Evaluator) Healthy() bool {
 
 // Evaluate validates a certificate chain against the root pool.
 func (e *Evaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
-	if req.Resource.Type != trust.ResourceTypeX5C {
+	keyType := req.GetKeyType()
+	if keyType != trust.ResourceTypeX5C {
 		return &trust.EvaluationResponse{
 			Decision: false,
-			Reason:   fmt.Sprintf("unsupported resource type: %s", req.Resource.Type),
+			Reason:   fmt.Sprintf("unsupported resource type: %s", keyType),
 		}, nil
 	}
 
@@ -138,9 +139,10 @@ func (e *Evaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) 
 	}
 
 	// If action specifies a DNS name or other constraint, add it
-	if req.Action != nil && req.Action.Name != "" {
+	action := req.GetAction()
+	if action != "" {
 		// For TLS server validation, the action name might be a hostname
-		opts.DNSName = req.Action.Name
+		opts.DNSName = action
 	}
 
 	leaf := certs[0]
@@ -167,18 +169,19 @@ func (e *Evaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) 
 
 // parseCertificates extracts certificates from the request.
 func (e *Evaluator) parseCertificates(req *trust.EvaluationRequest) ([]*x509.Certificate, error) {
-	// Use pre-parsed certificates if available
+	// Use pre-parsed certificates from legacy Resource field if available
 	if len(req.Resource.Certificates) > 0 {
 		return req.Resource.Certificates, nil
 	}
 
-	// Parse from Key field
-	switch key := req.Resource.Key.(type) {
+	// Parse from Key field (new or legacy)
+	key := req.GetKey()
+	switch k := key.(type) {
 	case []string:
-		return e.parseCertStrings(key)
+		return e.parseCertStrings(k)
 	case []interface{}:
-		strs := make([]string, len(key))
-		for i, v := range key {
+		strs := make([]string, len(k))
+		for i, v := range k {
 			s, ok := v.(string)
 			if !ok {
 				return nil, fmt.Errorf("certificate %d is not a string", i)

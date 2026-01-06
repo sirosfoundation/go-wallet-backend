@@ -175,16 +175,17 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 	authzenReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
 			Type: "key",
-			ID:   req.Subject.ID,
+			ID:   req.GetSubjectID(),
 		},
 		Resource: gotrust.Resource{
-			Type: string(req.Resource.Type),
+			Type: string(req.GetKeyType()),
 			ID:   req.Resource.ID,
 		},
 	}
 
 	// Set resource key based on type
-	switch req.Resource.Type {
+	keyType := req.GetKeyType()
+	switch keyType {
 	case trust.ResourceTypeX5C:
 		keys, err := e.extractX5CKeys(req)
 		if err != nil {
@@ -192,12 +193,13 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 		}
 		authzenReq.Resource.Key = keys
 	case trust.ResourceTypeJWK:
-		authzenReq.Resource.Key = []interface{}{req.Resource.Key}
+		authzenReq.Resource.Key = []interface{}{req.GetKey()}
 	}
 
 	// Set action if specified
-	if req.Action != nil && req.Action.Name != "" {
-		authzenReq.Action = &gotrust.Action{Name: req.Action.Name}
+	action := req.GetAction()
+	if action != "" {
+		authzenReq.Action = &gotrust.Action{Name: action}
 	}
 
 	// Copy context
@@ -210,15 +212,16 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 
 // extractX5CKeys extracts certificate strings for AuthZEN.
 func (e *Evaluator) extractX5CKeys(req *trust.EvaluationRequest) ([]interface{}, error) {
-	switch key := req.Resource.Key.(type) {
+	key := req.GetKey()
+	switch k := key.(type) {
 	case []string:
-		result := make([]interface{}, len(key))
-		for i, s := range key {
+		result := make([]interface{}, len(k))
+		for i, s := range k {
 			result[i] = s
 		}
 		return result, nil
 	case []interface{}:
-		return key, nil
+		return k, nil
 	case nil:
 		return nil, fmt.Errorf("no key material provided")
 	default:

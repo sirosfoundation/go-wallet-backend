@@ -4,48 +4,95 @@
 // 1. X509 evaluator - validates certificates against a root CA pool
 // 2. AuthZEN evaluator - delegates to a go-trust PDP service
 //
-// The TrustEvaluator interface allows for custom trust evaluation implementations.
+// This package uses types from github.com/sirosfoundation/go-trust/pkg/trustapi
+// for compatibility with other ecosystem components (vc, etc.).
 package trust
 
 import (
 	"context"
 	"crypto/x509"
+
+	"github.com/sirosfoundation/go-trust/pkg/trustapi"
 )
 
-// SubjectType represents the type of subject being evaluated.
-type SubjectType string
+// Type aliases from trustapi for compatibility.
+type (
+	// KeyType indicates the format of the public key being validated.
+	KeyType = trustapi.KeyType
 
+	// Role represents the expected role of the key holder.
+	Role = trustapi.Role
+
+	// TrustOptions contains additional options for trust evaluation.
+	TrustOptions = trustapi.TrustOptions
+
+	// X5CCertChain is a helper type for x5c certificate chains.
+	X5CCertChain = trustapi.X5CCertChain
+)
+
+// Constants re-exported from trustapi.
+const (
+	KeyTypeJWK = trustapi.KeyTypeJWK
+	KeyTypeX5C = trustapi.KeyTypeX5C
+
+	RoleIssuer             = trustapi.RoleIssuer
+	RoleVerifier           = trustapi.RoleVerifier
+	RoleWalletProvider     = trustapi.RoleWalletProvider
+	RolePIDProvider        = trustapi.RolePIDProvider
+	RoleCredentialIssuer   = trustapi.RoleCredentialIssuer
+	RoleCredentialVerifier = trustapi.RoleCredentialVerifier
+	RoleAny                = trustapi.RoleAny
+)
+
+// Legacy type aliases for backward compatibility.
+// These map the old Resource/Subject model to the new flat model.
+type (
+	// SubjectType represents the type of subject being evaluated.
+	// Deprecated: Use KeyType instead.
+	SubjectType = string
+
+	// ResourceType represents the type of resource/credential being validated.
+	// Deprecated: Use KeyType instead.
+	ResourceType = KeyType
+)
+
+// Legacy constants for backward compatibility.
 const (
 	// SubjectTypeKey represents a public key subject (used in AuthZEN).
 	SubjectTypeKey SubjectType = "key"
 	// SubjectTypeCertificate represents an X.509 certificate subject.
 	SubjectTypeCertificate SubjectType = "certificate"
-)
 
-// ResourceType represents the type of resource/credential being validated.
-type ResourceType string
-
-const (
 	// ResourceTypeX5C represents an X.509 certificate chain.
-	ResourceTypeX5C ResourceType = "x5c"
+	ResourceTypeX5C ResourceType = KeyTypeX5C
 	// ResourceTypeJWK represents a JSON Web Key.
-	ResourceTypeJWK ResourceType = "jwk"
+	ResourceTypeJWK ResourceType = KeyTypeJWK
 )
 
 // EvaluationRequest represents a trust evaluation request.
-// It is designed to be compatible with AuthZEN but also supports simpler X.509 evaluation.
+// This wraps trustapi.EvaluationRequest and adds wallet-specific fields.
 type EvaluationRequest struct {
-	// Subject identifies what is being validated.
+	trustapi.EvaluationRequest
+
+	// Subject identifies what is being validated (legacy field).
+	// Prefer using SubjectID directly.
 	Subject Subject
-	// Resource contains the cryptographic material (certificate chain, JWK, etc.).
+
+	// Resource contains the cryptographic material (legacy field).
+	// Prefer using Key and KeyType directly.
 	Resource Resource
-	// Action optionally specifies the role or action being validated.
-	Action *Action
-	// Context provides additional information for evaluation.
+
+	// LegacyAction specifies the action (legacy field).
+	// Deprecated: Use EvaluationRequest.Action or Role directly.
+	LegacyAction *Action
+
+	// Context provides additional information for evaluation (legacy field).
+	// Prefer using Options.
 	Context map[string]interface{}
 }
 
 // Subject represents the entity whose trust is being evaluated.
+// Deprecated: Use EvaluationRequest.SubjectID directly.
 type Subject struct {
 	// Type is the subject type (e.g., "key", "certificate").
 	Type SubjectType
@@ -54,22 +101,22 @@ type Subject struct {
 }
 
 // Resource contains the cryptographic material to validate.
+// Deprecated: Use EvaluationRequest.Key and KeyType directly.
 type Resource struct {
 	// Type is the resource type (e.g., "x5c", "jwk").
 	Type ResourceType
 	// ID is the identifier for the resource, typically matching Subject.ID.
 	ID string
 	// Key contains the actual key material.
-	// For x5c: slice of base64-encoded certificate strings
-	// For jwk: the JWK as map[string]interface{}
 	Key interface{}
 	// Certificates is a convenience field for pre-parsed X.509 certificates.
 	Certificates []*x509.Certificate
 }
 
 // Action specifies the role or operation being validated.
+// Deprecated: Use EvaluationRequest.Role or Action field directly.
 type Action struct {
-	// Name is the action/role name (e.g., "http://ec.europa.eu/NS/wallet-provider").
+	// Name is the action/role name.
 	Name string
 }
 
@@ -85,8 +132,67 @@ type EvaluationResponse struct {
 	Chain []*x509.Certificate
 }
 
+// ToTrustDecision converts EvaluationResponse to trustapi.TrustDecision.
+func (r *EvaluationResponse) ToTrustDecision() *trustapi.TrustDecision {
+	return &trustapi.TrustDecision{
+		Trusted:  r.Decision,
+		Reason:   r.Reason,
+		Metadata: r.TrustMetadata,
+	}
+}
+
+// FromTrustDecision creates an EvaluationResponse from trustapi.TrustDecision.
+func FromTrustDecision(d *trustapi.TrustDecision) *EvaluationResponse {
+	return &EvaluationResponse{
+		Decision:      d.Trusted,
+		Reason:        d.Reason,
+		TrustMetadata: d.Metadata,
+	}
+}
+
+// GetSubjectID returns the subject ID, preferring the new field over legacy.
+func (r *EvaluationRequest) GetSubjectID() string {
+	if r.SubjectID != "" {
+		return r.SubjectID
+	}
+	return r.Subject.ID
+}
+
+// GetKeyType returns the key type, preferring the new field over legacy.
+func (r *EvaluationRequest) GetKeyType() KeyType {
+	if r.KeyType != "" {
+		return r.KeyType
+	}
+	return r.Resource.Type
+}
+
+// GetKey returns the key material, preferring the new field over legacy.
+func (r *EvaluationRequest) GetKey() interface{} {
+	if r.Key != nil {
+		return r.Key
+	}
+	if len(r.Resource.Certificates) > 0 {
+		return r.Resource.Certificates
+	}
+	return r.Resource.Key
+}
+
+// GetAction returns the action name, preferring the new field over legacy.
+func (r *EvaluationRequest) GetAction() string {
+	if r.Action != "" {
+		return r.Action
+	}
+	if r.LegacyAction != nil {
+		return r.LegacyAction.Name
+	}
+	return ""
+}
+
 // TrustEvaluator is the interface for trust evaluation plugins.
 // Implementations must be safe for concurrent use.
+//
+// This interface is compatible with trustapi.TrustEvaluator but uses
+// wallet-specific request/response types for backward compatibility.
 type TrustEvaluator interface {
 	// Evaluate performs trust evaluation for the given request.
 	// Returns EvaluationResponse with Decision=true if trusted, false otherwise.
@@ -101,6 +207,60 @@ type TrustEvaluator interface {
 
 	// Healthy returns true if the evaluator is operational.
 	Healthy() bool
+}
+
+// TrustapiEvaluator wraps a trustapi.TrustEvaluator for use with wallet-backend types.
+type TrustapiEvaluator struct {
+	inner trustapi.TrustEvaluator
+}
+
+// NewTrustapiEvaluator wraps a trustapi.TrustEvaluator.
+func NewTrustapiEvaluator(e trustapi.TrustEvaluator) *TrustapiEvaluator {
+	return &TrustapiEvaluator{inner: e}
+}
+
+// Evaluate implements TrustEvaluator.
+func (e *TrustapiEvaluator) Evaluate(ctx context.Context, req *EvaluationRequest) (*EvaluationResponse, error) {
+	// Convert to trustapi request
+	apiReq := &trustapi.EvaluationRequest{
+		SubjectID:      req.GetSubjectID(),
+		KeyType:        req.GetKeyType(),
+		Key:            req.GetKey(),
+		Role:           req.Role,
+		Action:         req.Action,
+		CredentialType: req.CredentialType,
+		DocType:        req.DocType,
+		Options:        req.Options,
+	}
+
+	decision, err := e.inner.Evaluate(ctx, apiReq)
+	if err != nil {
+		return nil, err
+	}
+
+	return FromTrustDecision(decision), nil
+}
+
+// Name implements TrustEvaluator.
+func (e *TrustapiEvaluator) Name() string {
+	return e.inner.Name()
+}
+
+// SupportedResourceTypes implements TrustEvaluator.
+func (e *TrustapiEvaluator) SupportedResourceTypes() []ResourceType {
+	var result []ResourceType
+	if e.inner.SupportsKeyType(KeyTypeX5C) {
+		result = append(result, ResourceTypeX5C)
+	}
+	if e.inner.SupportsKeyType(KeyTypeJWK) {
+		result = append(result, ResourceTypeJWK)
+	}
+	return result
+}
+
+// Healthy implements TrustEvaluator.
+func (e *TrustapiEvaluator) Healthy() bool {
+	return e.inner.Healthy()
 }
 
 // EvaluatorManager coordinates multiple trust evaluators.
@@ -144,9 +304,10 @@ func (m *EvaluatorManager) SupportedResourceTypes() []ResourceType {
 // Evaluate routes the request to an appropriate evaluator.
 // It tries evaluators in order until one returns a decision.
 func (m *EvaluatorManager) Evaluate(ctx context.Context, req *EvaluationRequest) (*EvaluationResponse, error) {
+	keyType := req.GetKeyType()
 	for _, e := range m.evaluators {
 		for _, rt := range e.SupportedResourceTypes() {
-			if rt == req.Resource.Type {
+			if rt == keyType {
 				return e.Evaluate(ctx, req)
 			}
 		}
@@ -154,7 +315,7 @@ func (m *EvaluatorManager) Evaluate(ctx context.Context, req *EvaluationRequest)
 
 	return &EvaluationResponse{
 		Decision: false,
-		Reason:   "no evaluator available for resource type: " + string(req.Resource.Type),
+		Reason:   "no evaluator available for resource type: " + string(keyType),
 	}, nil
 }
 
