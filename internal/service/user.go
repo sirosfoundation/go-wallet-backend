@@ -197,7 +197,10 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	return user.PrivateDataETag, nil
 }
 
-// DeleteUser deletes a user and all associated data across ALL tenants
+// DeleteUser deletes a user and all associated data across ALL tenants.
+// Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
+// which may leave orphaned data in other tenants. This is a best-effort cleanup
+// that prioritizes completing the user deletion over strict data consistency.
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
 	// Get all tenants the user belongs to
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)

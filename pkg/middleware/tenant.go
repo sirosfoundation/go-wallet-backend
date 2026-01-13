@@ -65,8 +65,20 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 
-		userID := domain.UserIDFromString(userIDStr.(string))
-		tenantID := tenantIDVal.(domain.TenantID)
+		userIDString, ok := userIDStr.(string)
+		if !ok {
+			c.JSON(500, gin.H{"error": "invalid user_id type in context"})
+			c.Abort()
+			return
+		}
+		userID := domain.UserIDFromString(userIDString)
+
+		tenantID, ok := tenantIDVal.(domain.TenantID)
+		if !ok {
+			c.JSON(500, gin.H{"error": "invalid tenant_id type in context"})
+			c.Abort()
+			return
+		}
 
 		// Check membership
 		isMember, err := store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
@@ -92,7 +104,11 @@ func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
 	if !exists {
 		return "", false
 	}
-	return tenantID.(domain.TenantID), true
+	tid, ok := tenantID.(domain.TenantID)
+	if !ok {
+		return "", false
+	}
+	return tid, true
 }
 
 // GetTenant extracts tenant from gin context
@@ -101,5 +117,9 @@ func GetTenant(c *gin.Context) (*domain.Tenant, bool) {
 	if !exists {
 		return nil, false
 	}
-	return tenant.(*domain.Tenant), true
+	t, ok := tenant.(*domain.Tenant)
+	if !ok {
+		return nil, false
+	}
+	return t, true
 }

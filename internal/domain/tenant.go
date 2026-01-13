@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -11,6 +12,25 @@ type TenantID string
 
 // DefaultTenantID is the default tenant for backward compatibility
 const DefaultTenantID TenantID = "default"
+
+// tenantIDRegex validates that tenant IDs contain only URL-safe characters
+// Allowed: lowercase letters, numbers, hyphens, underscores (no colons to avoid conflicts with user handle encoding)
+var tenantIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// ValidateTenantID checks if a tenant ID is valid (URL-safe slug without colons)
+func ValidateTenantID(id TenantID) error {
+	s := string(id)
+	if len(s) == 0 {
+		return fmt.Errorf("tenant ID cannot be empty")
+	}
+	if len(s) > 63 {
+		return fmt.Errorf("tenant ID cannot exceed 63 characters")
+	}
+	if !tenantIDRegex.MatchString(s) {
+		return fmt.Errorf("tenant ID must contain only lowercase letters, numbers, hyphens, and underscores, and must start with a letter or number")
+	}
+	return nil
+}
 
 // String returns the string representation
 func (t TenantID) String() string {

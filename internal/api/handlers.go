@@ -204,7 +204,13 @@ func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 		// Default to "default" tenant for backward compatibility
 		return domain.DefaultTenantID, true
 	}
-	return tenantID.(domain.TenantID), true
+	tid, ok := tenantID.(domain.TenantID)
+	if !ok {
+		h.logger.Warn("tenant_id in context has unexpected type; falling back to default tenant",
+			zap.Any("tenant_id", tenantID))
+		return domain.DefaultTenantID, true
+	}
+	return tid, true
 }
 
 // GetAllCredentials returns all credentials for the authenticated user
@@ -402,7 +408,6 @@ func (h *Handlers) StorePresentation(c *gin.Context) {
 
 	tenantID, _ := h.getTenantID(c)
 	presentation.HolderDID = holderDID
-	presentation.TenantID = tenantID
 
 	if err := h.services.Presentation.Store(c.Request.Context(), tenantID, &presentation); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {

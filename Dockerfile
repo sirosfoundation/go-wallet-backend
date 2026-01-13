@@ -23,8 +23,8 @@ RUN if [ -n "$GIT_REF" ]; then \
     fi
 
 # Copy local source (these will be overwritten if GIT_REF was used)
-COPY go.mod go.sum* ./
-RUN go mod download || true
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
 

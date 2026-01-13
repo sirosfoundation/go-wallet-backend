@@ -133,6 +133,25 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create verifier indexes: %w", err)
 	}
 
+	// Tenants collection indexes
+	_, err = s.tenants.collection.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "name", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create tenant indexes: %w", err)
+	}
+
+	// User-tenant membership indexes
+	_, err = s.userTenants.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "tenant_id", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "user_id", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create user-tenant indexes: %w", err)
+	}
+
 	return nil
 }
 

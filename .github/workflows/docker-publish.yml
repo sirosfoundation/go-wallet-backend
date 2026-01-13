@@ -61,8 +61,20 @@ jobs:
             if [ -n "$CUSTOM_TAG" ]; then
               echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${CUSTOM_TAG}" >> $GITHUB_OUTPUT
             else
-              # Sanitize ref name for use as docker tag
-              SAFE_REF=$(echo "$REF" | sed 's/[^a-zA-Z0-9._-]/-/g')
+              # Sanitize ref name for use as docker tag:
+              # - Strip common Git ref prefixes
+              # - Convert to lowercase
+              # - Replace invalid characters with '-'
+              # - Normalize separators and trim edges
+              # - Enforce Docker's 128-character tag limit
+              SAFE_REF=$(echo "$REF" \
+                | sed 's#^refs/heads/##; s#^refs/tags/##' \
+                | tr '[:upper:]' '[:lower:]' \
+                | sed 's/[^a-z0-9._-]/-/g' \
+                | sed 's/[-._]\{2,\}/-/g' \
+                | sed 's/^[-._]\+//; s/[-._]\+$//' \
+                | cut -c1-128 \
+              )
               echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SAFE_REF}" >> $GITHUB_OUTPUT
             fi
           fi
