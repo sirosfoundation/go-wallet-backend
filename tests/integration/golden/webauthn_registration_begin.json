@@ -1,0 +1,46 @@
+{
+  "challengeId": "\u003cCHALLENGE_ID\u003e",
+  "createOptions": {
+    "publicKey": {
+      "attestation": "direct",
+      "authenticatorSelection": {
+        "requireResidentKey": true,
+        "residentKey": "required",
+        "userVerification": "required"
+      },
+      "challenge": {
+        "$b64u": "\u003cCHALLENGE_B64U\u003e"
+      },
+      "excludeCredentials": [],
+      "extensions": {
+        "credProps": true,
+        "prf": {}
+      },
+      "pubKeyCredParams": [
+        {
+          "alg": -7,
+          "type": "public-key"
+        },
+        {
+          "alg": -8,
+          "type": "public-key"
+        },
+        {
+          "alg": -257,
+          "type": "public-key"
+        }
+      ],
+      "rp": {
+        "id": "localhost",
+        "name": "Test Wallet"
+      },
+      "user": {
+        "displayName": "",
+        "id": {
+          "$b64u": "\u003cCHALLENGE_B64U\u003e"
+        },
+        "name": "\u003cUSER_UUID\u003e"
+      }
+    }
+  }
+}

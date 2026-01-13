@@ -1,0 +1,13 @@
+{
+  "challengeId": "\u003cCHALLENGE_ID\u003e",
+  "getOptions": {
+    "publicKey": {
+      "allowCredentials": [],
+      "challenge": {
+        "$b64u": "\u003cCHALLENGE_B64U\u003e"
+      },
+      "rpId": "localhost",
+      "userVerification": "required"
+    }
+  }
+}
