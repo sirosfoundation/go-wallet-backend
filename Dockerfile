@@ -1,7 +1,10 @@
 # Build stage
-FROM golang:1.25.1-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
+
+# Install git for fetching dependencies
+RUN apk add --no-cache git ca-certificates
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -10,22 +13,27 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server cmd/server/main.go
+# Build with version information
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT}" \
+    -o server cmd/server/main.go
 
 # Runtime stage
-FROM alpine:latest
+FROM gcr.io/distroless/static-debian12
 
-RUN apk --no-cache add ca-certificates
-
-WORKDIR /root/
+WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/server .
-COPY --from=builder /app/configs ./configs
+COPY --from=builder /app/server /app/server
+COPY --from=builder /app/configs /app/configs
+
+USER nonroot:nonroot
 
 # Expose port
 EXPOSE 8080
 
 # Run
-CMD ["./server"]
+ENTRYPOINT ["/app/server"]

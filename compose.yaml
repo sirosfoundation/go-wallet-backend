@@ -8,10 +8,6 @@ services:
       - "8002:8080"
     volumes:
       - "./configs/config.yaml:/app/configs/config.yaml"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-      start_interval: 5s
+    # Note: healthcheck is not configured because the distroless runtime image
+    # doesn't have curl, wget, or a shell. A proper healthcheck would require
+    # building a custom health binary into the image.
