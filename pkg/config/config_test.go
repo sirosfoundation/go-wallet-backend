@@ -284,7 +284,6 @@ server:
 }
 
 func TestLoad_BaseURLGeneration(t *testing.T) {
-	// The envconfig defaults override YAML values, so we use default host/port
 	// Create a temporary config file without base_url
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -311,5 +310,54 @@ jwt:
 	expected := "http://0.0.0.0:8080"
 	if cfg.Server.BaseURL != expected {
 		t.Errorf("Expected BaseURL %q, got %q", expected, cfg.Server.BaseURL)
+	}
+}
+
+func TestLoad_YAMLValuesNotOverwrittenByDefaults(t *testing.T) {
+	// This test ensures that YAML values are preserved and not overwritten
+	// by default values. This was a bug where envconfig's `default:` tags
+	// would overwrite values that were already set from YAML.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Use non-default port 8081 to verify it's preserved
+	content := `
+server:
+  host: 127.0.0.1
+  port: 8081
+  rp_id: example.com
+  rp_origin: http://example.com:8081
+storage:
+  type: sqlite
+  sqlite:
+    path: /custom/path.db
+jwt:
+  secret: test-secret
+  expiry_hours: 48
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Verify YAML values are preserved, not overwritten by defaults
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Errorf("Expected host '127.0.0.1', got %q", cfg.Server.Host)
+	}
+	if cfg.Server.Port != 8081 {
+		t.Errorf("Expected port 8081, got %d (default 8080 was applied)", cfg.Server.Port)
+	}
+	if cfg.Storage.Type != "sqlite" {
+		t.Errorf("Expected storage type 'sqlite', got %q", cfg.Storage.Type)
+	}
+	if cfg.Storage.SQLite.Path != "/custom/path.db" {
+		t.Errorf("Expected SQLite path '/custom/path.db', got %q", cfg.Storage.SQLite.Path)
+	}
+	if cfg.JWT.ExpiryHours != 48 {
+		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
 	}
 }

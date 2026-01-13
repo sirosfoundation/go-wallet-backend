@@ -20,45 +20,45 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host     string `yaml:"host" envconfig:"HOST" default:"0.0.0.0"`
-	Port     int    `yaml:"port" envconfig:"PORT" default:"8080"`
-	RPID     string `yaml:"rp_id" envconfig:"RP_ID" default:"localhost"`
-	RPOrigin string `yaml:"rp_origin" envconfig:"RP_ORIGIN" default:"http://localhost:8080"`
-	RPName   string `yaml:"rp_name" envconfig:"RP_NAME" default:"Wallet Backend"`
+	Host     string `yaml:"host" envconfig:"HOST"`
+	Port     int    `yaml:"port" envconfig:"PORT"`
+	RPID     string `yaml:"rp_id" envconfig:"RP_ID"`
+	RPOrigin string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPName   string `yaml:"rp_name" envconfig:"RP_NAME"`
 	BaseURL  string `yaml:"base_url" envconfig:"BASE_URL"`
 }
 
 // StorageConfig contains storage configuration
 type StorageConfig struct {
-	Type    string        `yaml:"type" envconfig:"TYPE" default:"memory"` // memory, sqlite, mongodb
+	Type    string        `yaml:"type" envconfig:"TYPE"` // memory, sqlite, mongodb
 	SQLite  SQLiteConfig  `yaml:"sqlite" envconfig:"SQLITE"`
 	MongoDB MongoDBConfig `yaml:"mongodb" envconfig:"MONGODB"`
 }
 
 // SQLiteConfig contains SQLite-specific configuration
 type SQLiteConfig struct {
-	Path string `yaml:"path" envconfig:"PATH" default:"wallet.db"`
+	Path string `yaml:"path" envconfig:"DB_PATH"`
 }
 
 // MongoDBConfig contains MongoDB-specific configuration
 type MongoDBConfig struct {
-	URI      string `yaml:"uri" envconfig:"URI" default:"mongodb://localhost:27017"`
-	Database string `yaml:"database" envconfig:"DATABASE" default:"wallet"`
-	Timeout  int    `yaml:"timeout" envconfig:"TIMEOUT" default:"10"` // seconds
+	URI      string `yaml:"uri" envconfig:"URI"`
+	Database string `yaml:"database" envconfig:"DATABASE"`
+	Timeout  int    `yaml:"timeout" envconfig:"TIMEOUT"` // seconds
 }
 
 // LoggingConfig contains logging configuration
 type LoggingConfig struct {
-	Level  string `yaml:"level" envconfig:"LEVEL" default:"info"`   // debug, info, warn, error
-	Format string `yaml:"format" envconfig:"FORMAT" default:"json"` // json, text
+	Level  string `yaml:"level" envconfig:"LEVEL"`   // debug, info, warn, error
+	Format string `yaml:"format" envconfig:"FORMAT"` // json, text
 }
 
 // JWTConfig contains JWT configuration
 type JWTConfig struct {
 	Secret      string `yaml:"secret" envconfig:"SECRET"`
-	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS" default:"24"`
-	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS" default:"7"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER" default:"wallet-backend"`
+	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
+	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
+	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
 // WalletProviderConfig contains wallet provider key attestation configuration
@@ -71,7 +71,7 @@ type WalletProviderConfig struct {
 // TrustConfig contains trust evaluation configuration (ADR 010)
 type TrustConfig struct {
 	// Type is the trust evaluator type: "none", "x509", "authzen", or "composite"
-	Type string `yaml:"type" envconfig:"TYPE" default:"none"`
+	Type string `yaml:"type" envconfig:"TYPE"`
 	// X509 configuration for the X.509 certificate evaluator
 	X509 X509TrustConfig `yaml:"x509" envconfig:"X509"`
 	// AuthZEN configuration for the AuthZEN PDP evaluator
@@ -91,16 +91,17 @@ type AuthZENConfig struct {
 	// BaseURL is the base URL of the AuthZEN PDP service (e.g., "https://pdp.example.com")
 	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
 	// Timeout is the HTTP request timeout in seconds (default 30)
-	Timeout int `yaml:"timeout" envconfig:"TIMEOUT" default:"30"`
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 	// UseDiscovery enables .well-known/authzen-configuration discovery
-	UseDiscovery bool `yaml:"use_discovery" envconfig:"USE_DISCOVERY" default:"false"`
+	UseDiscovery bool `yaml:"use_discovery" envconfig:"USE_DISCOVERY"`
 }
 
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
-	cfg := &Config{}
+	// Start with defaults
+	cfg := defaultConfig()
 
-	// Load from YAML file if provided
+	// Load from YAML file if provided (overrides defaults)
 	if configFile != "" {
 		data, err := os.ReadFile(configFile)
 		if err != nil {
@@ -115,7 +116,8 @@ func Load(configFile string) (*Config, error) {
 		}
 	}
 
-	// Override with environment variables
+	// Override with environment variables (highest priority)
+	// Since we removed `default:` tags, this only applies actual env vars
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
@@ -131,6 +133,45 @@ func Load(configFile string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// defaultConfig returns a Config with sensible default values
+func defaultConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Host:     "0.0.0.0",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			RPName:   "Wallet Backend",
+		},
+		Storage: StorageConfig{
+			Type: "memory",
+			SQLite: SQLiteConfig{
+				Path: "wallet.db",
+			},
+			MongoDB: MongoDBConfig{
+				URI:      "mongodb://localhost:27017",
+				Database: "wallet",
+				Timeout:  10,
+			},
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "json",
+		},
+		JWT: JWTConfig{
+			ExpiryHours: 24,
+			RefreshDays: 7,
+			Issuer:      "wallet-backend",
+		},
+		Trust: TrustConfig{
+			Type: "none",
+			AuthZEN: AuthZENConfig{
+				Timeout: 30,
+			},
+		},
+	}
 }
 
 // Validate validates the configuration
