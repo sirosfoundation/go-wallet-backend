@@ -6,17 +6,29 @@ WORKDIR /app
 # Install git for fetching dependencies
 RUN apk add --no-cache git ca-certificates
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+# Build arguments for versioning and source control
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG GIT_REF=
 
-# Copy source code
+# If GIT_REF is provided, clone from that ref instead of using local context
+# Otherwise, use the local COPY approach for standard builds
+RUN if [ -n "$GIT_REF" ]; then \
+        echo "Building from git ref: $GIT_REF" && \
+        git clone https://github.com/sirosfoundation/go-wallet-backend.git /tmp/repo && \
+        cd /tmp/repo && \
+        git checkout "$GIT_REF" && \
+        cp -r /tmp/repo/* /app/ && \
+        rm -rf /tmp/repo; \
+    fi
+
+# Copy local source (these will be overwritten if GIT_REF was used)
+COPY go.mod go.sum* ./
+RUN go mod download || true
+
 COPY . .
 
 # Build with version information
-ARG VERSION=dev
-ARG COMMIT=unknown
-
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT}" \
     -o server cmd/server/main.go

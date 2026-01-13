@@ -9,6 +9,17 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'Git ref to build (branch, tag, or commit SHA)'
+        required: true
+        default: 'main'
+        type: string
+      image_tag:
+        description: 'Custom image tag (optional, defaults to ref name)'
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -24,6 +35,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git_ref || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -39,8 +52,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine image tags
+        id: tags
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            REF="${{ github.event.inputs.git_ref }}"
+            CUSTOM_TAG="${{ github.event.inputs.image_tag }}"
+            if [ -n "$CUSTOM_TAG" ]; then
+              echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${CUSTOM_TAG}" >> $GITHUB_OUTPUT
+            else
+              # Sanitize ref name for use as docker tag
+              SAFE_REF=$(echo "$REF" | sed 's/[^a-zA-Z0-9._-]/-/g')
+              echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SAFE_REF}" >> $GITHUB_OUTPUT
+            fi
+          fi
+
       - name: Extract metadata (tags, labels) for Docker
         id: meta
+        if: github.event_name != 'workflow_dispatch'
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -60,7 +89,10 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tags || steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.event.inputs.git_ref || github.ref_name }}
+            COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
