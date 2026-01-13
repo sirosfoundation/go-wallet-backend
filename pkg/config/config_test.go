@@ -238,9 +238,9 @@ func TestLoad_ValidYAMLFile(t *testing.T) {
 	content := `
 server:
   host: localhost
-  port: 8080
+  port: 8081
   rp_id: localhost
-  rp_origin: http://localhost:8080
+  rp_origin: http://localhost:8081
 storage:
   type: memory
 jwt:
@@ -255,8 +255,8 @@ jwt:
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.Server.Port != 8080 {
-		t.Errorf("Expected port 8080, got %d", cfg.Server.Port)
+	if cfg.Server.Port != 8081 {
+		t.Errorf("Expected port 8081, got %d", cfg.Server.Port)
 	}
 	if cfg.JWT.Secret != "test-secret" {
 		t.Errorf("Expected JWT secret 'test-secret', got %q", cfg.JWT.Secret)
