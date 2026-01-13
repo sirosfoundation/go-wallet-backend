@@ -18,7 +18,7 @@ func TestNew_MemoryBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	defer backend.Close()
+	defer func() { _ = backend.Close() }()
 
 	// Verify all stores are accessible
 	if backend.Users() == nil {
@@ -52,7 +52,7 @@ func TestNew_DefaultToMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error for empty type, got %v", err)
 	}
-	defer backend.Close()
+	defer func() { _ = backend.Close() }()
 
 	// Should be able to use the backend
 	if backend.Users() == nil {

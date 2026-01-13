@@ -74,7 +74,7 @@ func (s *HelperService) GetCertificateChain(ctx context.Context, targetURL strin
 			return nil, fmt.Errorf("failed to connect: %w", err)
 		}
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Get the peer certificates
 	state := conn.ConnectionState()

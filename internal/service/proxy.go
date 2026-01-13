@@ -118,7 +118,7 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 			},
 		}, nil, nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read the response body
 	body, err := io.ReadAll(resp.Body)

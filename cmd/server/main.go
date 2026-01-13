@@ -41,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	logger.Info("Starting Wallet Backend Server",
 		zap.String("version", version),
@@ -55,7 +55,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("Failed to initialize storage backend", zap.Error(err))
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	logger.Info("Storage backend initialized", zap.String("type", cfg.Storage.Type))
 

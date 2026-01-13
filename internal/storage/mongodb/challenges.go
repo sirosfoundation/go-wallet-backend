@@ -136,7 +136,7 @@ func (s *IssuerStore) GetAll(ctx context.Context) ([]*domain.CredentialIssuer, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issuers: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var issuers []*domain.CredentialIssuer
 	if err := cursor.All(ctx, &issuers); err != nil {
@@ -233,7 +233,7 @@ func (s *VerifierStore) GetAll(ctx context.Context) ([]*domain.Verifier, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get verifiers: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var verifiers []*domain.Verifier
 	if err := cursor.All(ctx, &verifiers); err != nil {

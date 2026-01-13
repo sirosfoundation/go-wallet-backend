@@ -97,7 +97,7 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, holderDID string) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get credentials: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var credentials []*domain.VerifiableCredential
 	if err := cursor.All(ctx, &credentials); err != nil {
