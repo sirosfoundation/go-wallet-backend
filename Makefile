@@ -33,7 +33,7 @@ lint: ## Run linter
 clean: ## Clean build artifacts
 	@echo "Cleaning..."
 	@rm -rf bin/
-	@rm -f coverage.out coverage.html
+	@rm -f coverage.out coverage.html cover.out coverage_*.out
 	@rm -f wallet.db
 	@rm -f *.log
 
