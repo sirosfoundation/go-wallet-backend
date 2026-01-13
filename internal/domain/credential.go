@@ -87,8 +87,8 @@ type CredentialIssuer struct {
 	ID                         int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
 	TenantID                   TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	CredentialIssuerIdentifier string   `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
-	ClientID                   string `json:"clientId,omitempty" bson:"client_id"`
-	Visible                    bool   `json:"visible" bson:"visible"`
+	ClientID                   string   `json:"clientId,omitempty" bson:"client_id"`
+	Visible                    bool     `json:"visible" bson:"visible"`
 }
 
 // TableName specifies the table name for GORM
@@ -101,7 +101,7 @@ type Verifier struct {
 	ID       int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
 	TenantID TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	Name     string   `json:"name" bson:"name" gorm:"not null"`
-	URL  string `json:"url" bson:"url" gorm:"not null"`
+	URL      string   `json:"url" bson:"url" gorm:"not null"`
 }
 
 // TableName specifies the table name for GORM

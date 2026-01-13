@@ -36,7 +36,7 @@ func TestCredentialStorage(t *testing.T) {
 		}
 
 		resp := h.AuthPOST(user, "/storage/vc", storeReq)
-		
+
 		// May succeed or return 400 depending on validation
 		if resp.Response.StatusCode == http.StatusOK || resp.Response.StatusCode == http.StatusCreated {
 			var result map[string]interface{}
@@ -124,7 +124,7 @@ func TestPresentationStorage(t *testing.T) {
 		}
 
 		resp := h.AuthPOST(user, "/storage/vp", storeReq)
-		
+
 		if resp.Response.StatusCode == http.StatusOK || resp.Response.StatusCode == http.StatusCreated {
 			var result map[string]interface{}
 			resp.JSON(&result)

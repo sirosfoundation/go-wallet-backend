@@ -47,16 +47,16 @@ func NewStore() *Store {
 	return s
 }
 
-func (s *Store) Users() storage.UserStore               { return s.users }
-func (s *Store) Tenants() storage.TenantStore           { return s.tenants }
-func (s *Store) UserTenants() storage.UserTenantStore   { return s.userTenants }
-func (s *Store) Credentials() storage.CredentialStore   { return s.credentials }
+func (s *Store) Users() storage.UserStore                 { return s.users }
+func (s *Store) Tenants() storage.TenantStore             { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore     { return s.userTenants }
+func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
 func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
-func (s *Store) Challenges() storage.ChallengeStore     { return s.challenges }
-func (s *Store) Issuers() storage.IssuerStore           { return s.issuers }
-func (s *Store) Verifiers() storage.VerifierStore       { return s.verifiers }
-func (s *Store) Close() error                           { return nil }
-func (s *Store) Ping(ctx context.Context) error         { return nil }
+func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
+func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
+func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
+func (s *Store) Close() error                             { return nil }
+func (s *Store) Ping(ctx context.Context) error           { return nil }
 
 // TenantStore implements in-memory tenant storage
 type TenantStore struct {
