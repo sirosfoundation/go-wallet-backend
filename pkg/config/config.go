@@ -15,6 +15,7 @@ type Config struct {
 	Logging        LoggingConfig        `yaml:"logging" envconfig:"LOGGING"`
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
+	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -65,6 +66,34 @@ type WalletProviderConfig struct {
 	PrivateKeyPath  string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
 	CertificatePath string `yaml:"certificate_path" envconfig:"CERTIFICATE_PATH"`
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
+}
+
+// TrustConfig contains trust evaluation configuration (ADR 010)
+type TrustConfig struct {
+	// Type is the trust evaluator type: "none", "x509", "authzen", or "composite"
+	Type string `yaml:"type" envconfig:"TYPE" default:"none"`
+	// X509 configuration for the X.509 certificate evaluator
+	X509 X509TrustConfig `yaml:"x509" envconfig:"X509"`
+	// AuthZEN configuration for the AuthZEN PDP evaluator
+	AuthZEN AuthZENConfig `yaml:"authzen" envconfig:"AUTHZEN"`
+}
+
+// X509TrustConfig contains X.509 certificate trust configuration
+type X509TrustConfig struct {
+	// RootCertPaths are paths to root CA certificate files (PEM format)
+	RootCertPaths []string `yaml:"root_cert_paths" envconfig:"ROOT_CERT_PATHS"`
+	// IntermediateCertPaths are paths to intermediate CA certificate files
+	IntermediateCertPaths []string `yaml:"intermediate_cert_paths" envconfig:"INTERMEDIATE_CERT_PATHS"`
+}
+
+// AuthZENConfig contains AuthZEN PDP configuration
+type AuthZENConfig struct {
+	// BaseURL is the base URL of the AuthZEN PDP service (e.g., "https://pdp.example.com")
+	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
+	// Timeout is the HTTP request timeout in seconds (default 30)
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT" default:"30"`
+	// UseDiscovery enables .well-known/authzen-configuration discovery
+	UseDiscovery bool `yaml:"use_discovery" envconfig:"USE_DISCOVERY" default:"false"`
 }
 
 // Load loads configuration from file and environment variables

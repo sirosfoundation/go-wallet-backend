@@ -93,20 +93,16 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 			t.Error("Expected challenge ID")
 		}
 
-		if resp.CreateOptions.PublicKey == nil {
-			t.Error("Expected credential creation options")
-		}
-
-		// Verify options structure
-		if resp.CreateOptions.PublicKey.Response.Challenge == nil {
+		// Verify options structure - now uses custom types matching TS format
+		if len(resp.CreateOptions.PublicKey.Challenge) == 0 {
 			t.Error("Expected challenge in options")
 		}
 
-		if resp.CreateOptions.PublicKey.Response.RelyingParty.ID != "localhost" {
-			t.Errorf("Expected RPID 'localhost', got '%s'", resp.CreateOptions.PublicKey.Response.RelyingParty.ID)
+		if resp.CreateOptions.PublicKey.RP.ID != "localhost" {
+			t.Errorf("Expected RPID 'localhost', got '%s'", resp.CreateOptions.PublicKey.RP.ID)
 		}
 
-		if resp.CreateOptions.PublicKey.Response.User.Name == "" {
+		if resp.CreateOptions.PublicKey.User.Name == "" {
 			t.Error("Expected user name in options")
 		}
 	})
@@ -122,7 +118,7 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 		}
 
 		// Should generate a user ID even without display name
-		if resp.CreateOptions.PublicKey.Response.User.ID == nil {
+		if len(resp.CreateOptions.PublicKey.User.ID) == 0 {
 			t.Error("Expected user ID")
 		}
 	})
@@ -146,22 +142,18 @@ func TestWebAuthnService_BeginLogin(t *testing.T) {
 			t.Error("Expected challenge ID")
 		}
 
-		if resp.GetOptions.PublicKey == nil {
-			t.Error("Expected assertion options")
-		}
-
-		// Verify options structure
-		if resp.GetOptions.PublicKey.Response.Challenge == nil {
+		// Verify options structure - now uses custom types matching TS format
+		if len(resp.GetOptions.PublicKey.Challenge) == 0 {
 			t.Error("Expected challenge in options")
 		}
 
 		// Discoverable credential login should have empty AllowedCredentials
-		if len(resp.GetOptions.PublicKey.Response.AllowedCredentials) != 0 {
+		if len(resp.GetOptions.PublicKey.AllowCredentials) != 0 {
 			t.Error("Expected empty AllowedCredentials for discoverable login")
 		}
 
-		if resp.GetOptions.PublicKey.Response.RelyingPartyID != "localhost" {
-			t.Errorf("Expected RPID 'localhost', got '%s'", resp.GetOptions.PublicKey.Response.RelyingPartyID)
+		if resp.GetOptions.PublicKey.RPId != "localhost" {
+			t.Errorf("Expected RPID 'localhost', got '%s'", resp.GetOptions.PublicKey.RPId)
 		}
 	})
 }
