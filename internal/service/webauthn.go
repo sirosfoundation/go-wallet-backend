@@ -358,9 +358,9 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	// Create the user with the credential
-	nickname := req.Nickname
-	if nickname == "" {
-		nickname = "Primary Passkey"
+	credNickname := req.Nickname
+	if credNickname == "" {
+		credNickname = "Primary Passkey"
 	}
 
 	transports := make([]string, 0)
@@ -388,6 +388,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 					SignCount:    credential.Authenticator.SignCount,
 					CloneWarning: credential.Authenticator.CloneWarning,
 				},
+				Nickname:  &credNickname,
 				CreatedAt: now,
 			},
 		},

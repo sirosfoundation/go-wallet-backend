@@ -106,7 +106,7 @@ func TestEvaluator_Evaluate(t *testing.T) {
 			}
 
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
+			_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
 				Decision: true,
 				Context: &gotrust.EvaluationResponseContext{
 					Reason: map[string]interface{}{
@@ -146,9 +146,9 @@ func TestEvaluator_Evaluate(t *testing.T) {
 	})
 
 	t.Run("successful evaluation - decision false", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
+			_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
 				Decision: false,
 				Context: &gotrust.EvaluationResponseContext{
 					Reason: map[string]interface{}{
@@ -204,7 +204,7 @@ func TestEvaluator_Evaluate(t *testing.T) {
 func TestEvaluator_Resolve(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req gotrust.EvaluationRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		// Verify it's a resolution-only request (no key)
 		if req.Subject.ID != "did:web:example.com" {
@@ -212,7 +212,7 @@ func TestEvaluator_Resolve(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
+		_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
 			Decision: true,
 			Context: &gotrust.EvaluationResponseContext{
 				TrustMetadata: map[string]interface{}{
@@ -241,7 +241,7 @@ func TestEvaluator_Resolve(t *testing.T) {
 func TestEvaluator_EvaluateX5C(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req gotrust.EvaluationRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		if req.Resource.Type != "x5c" {
 			t.Errorf("expected resource type 'x5c', got '%s'", req.Resource.Type)
@@ -251,7 +251,7 @@ func TestEvaluator_EvaluateX5C(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+		_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
 	}))
 	defer server.Close()
 

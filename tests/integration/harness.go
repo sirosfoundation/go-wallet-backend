@@ -304,7 +304,7 @@ func (r *Response) Body() []byte {
 		if err != nil {
 			r.T.Fatalf("Failed to read response body: %v", err)
 		}
-		r.Response.Body.Close()
+		_ = r.Response.Body.Close()
 		r.bodyRead = true
 	}
 	return r.body

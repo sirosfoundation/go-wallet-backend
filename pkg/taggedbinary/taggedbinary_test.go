@@ -122,8 +122,8 @@ func TestEncodeJSON(t *testing.T) {
 
 			// Normalize JSON for comparison
 			var gotObj, wantObj interface{}
-			json.Unmarshal(got, &gotObj)
-			json.Unmarshal([]byte(tt.want), &wantObj)
+			_ = json.Unmarshal(got, &gotObj)
+			_ = json.Unmarshal([]byte(tt.want), &wantObj)
 
 			gotNorm, _ := json.Marshal(gotObj)
 			wantNorm, _ := json.Marshal(wantObj)
@@ -161,7 +161,7 @@ func TestMustDecodeJSON(t *testing.T) {
 	got := MustDecodeJSON([]byte(input))
 
 	var obj map[string]interface{}
-	json.Unmarshal(got, &obj)
+	_ = json.Unmarshal(got, &obj)
 
 	if rawId, ok := obj["rawId"].(string); !ok || rawId != "SGVsbG8" {
 		t.Errorf("MustDecodeJSON() did not decode properly")
