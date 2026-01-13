@@ -17,6 +17,7 @@ const (
 // VerifiableCredential represents a stored verifiable credential
 type VerifiableCredential struct {
 	ID                         int64            `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID                   TenantID         `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	HolderDID                  string           `json:"holderDID" bson:"holder_did" gorm:"index;not null"`
 	CredentialIdentifier       string           `json:"credentialIdentifier" bson:"credential_identifier" gorm:"index;not null"`
 	Credential                 string           `json:"credential" bson:"credential" gorm:"type:text;not null"`
@@ -55,6 +56,7 @@ type UpdateCredentialRequest struct {
 // VerifiablePresentation represents a stored verifiable presentation
 type VerifiablePresentation struct {
 	ID                                      int64     `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID                                TenantID  `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	HolderDID                               string    `json:"holderDID" bson:"holder_did" gorm:"index;not null"`
 	PresentationIdentifier                  string    `json:"presentationIdentifier" bson:"presentation_identifier" gorm:"index;not null"`
 	Presentation                            string    `json:"presentation" bson:"presentation" gorm:"type:text;not null"`
@@ -82,8 +84,9 @@ type StorePresentationRequest struct {
 
 // CredentialIssuer represents a trusted credential issuer
 type CredentialIssuer struct {
-	ID                         int64  `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
-	CredentialIssuerIdentifier string `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"uniqueIndex;not null"`
+	ID                         int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID                   TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
+	CredentialIssuerIdentifier string   `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
 	ClientID                   string `json:"clientId,omitempty" bson:"client_id"`
 	Visible                    bool   `json:"visible" bson:"visible"`
 }
@@ -95,8 +98,9 @@ func (CredentialIssuer) TableName() string {
 
 // Verifier represents a trusted verifier
 type Verifier struct {
-	ID   int64  `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
-	Name string `json:"name" bson:"name" gorm:"not null"`
+	ID       int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
+	Name     string   `json:"name" bson:"name" gorm:"not null"`
 	URL  string `json:"url" bson:"url" gorm:"not null"`
 }
 

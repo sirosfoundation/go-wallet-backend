@@ -69,6 +69,7 @@ type User struct {
 // WebauthnCredential represents a WebAuthn credential
 type WebauthnCredential struct {
 	ID              string        `json:"id" bson:"id"`
+	TenantID        TenantID      `json:"tenantId" bson:"tenant_id"`
 	CredentialID    []byte        `json:"credentialId" bson:"credential_id"`
 	PublicKey       []byte        `json:"public_key" bson:"public_key"`
 	AttestationType string        `json:"attestation_type" bson:"attestation_type"`

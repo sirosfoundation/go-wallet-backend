@@ -197,6 +197,16 @@ func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 	return userID.(string), true
 }
 
+// getTenantID retrieves the tenant ID from context (set by TenantPathMiddleware)
+func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
+	tenantID, exists := c.Get("tenant_id")
+	if !exists {
+		// Default to "default" tenant for backward compatibility
+		return domain.DefaultTenantID, true
+	}
+	return tenantID.(domain.TenantID), true
+}
+
 // GetAllCredentials returns all credentials for the authenticated user
 func (h *Handlers) GetAllCredentials(c *gin.Context) {
 	holderDID, ok := h.getHolderDID(c)
@@ -205,7 +215,8 @@ func (h *Handlers) GetAllCredentials(c *gin.Context) {
 		return
 	}
 
-	credentials, err := h.services.Credential.GetAll(c.Request.Context(), holderDID)
+	tenantID, _ := h.getTenantID(c)
+	credentials, err := h.services.Credential.GetAll(c.Request.Context(), tenantID, holderDID)
 	if err != nil {
 		h.logger.Error("Failed to get credentials", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to retrieve credentials"})
@@ -237,10 +248,11 @@ func (h *Handlers) StoreCredential(c *gin.Context) {
 		return
 	}
 
+	tenantID, _ := h.getTenantID(c)
 	// Batch storage
 	for _, credReq := range batchReq.Credentials {
 		credReq.HolderDID = holderDID
-		if _, err := h.services.Credential.Store(c.Request.Context(), &credReq); err != nil {
+		if _, err := h.services.Credential.Store(c.Request.Context(), tenantID, &credReq); err != nil {
 			h.logger.Error("Failed to store credential", zap.Error(err))
 			// Continue storing other credentials
 		}
@@ -271,7 +283,8 @@ func (h *Handlers) UpdateCredential(c *gin.Context) {
 		return
 	}
 
-	credential, err := h.services.Credential.Update(c.Request.Context(), holderDID, &req)
+	tenantID, _ := h.getTenantID(c)
+	credential, err := h.services.Credential.Update(c.Request.Context(), tenantID, holderDID, &req)
 	if err != nil {
 		h.logger.Error("Failed to update credential", zap.Error(err))
 		if errors.Is(err, storage.ErrNotFound) {
@@ -300,7 +313,8 @@ func (h *Handlers) GetCredentialByIdentifier(c *gin.Context) {
 		return
 	}
 
-	credential, err := h.services.Credential.GetByIdentifier(c.Request.Context(), holderDID, credentialID)
+	tenantID, _ := h.getTenantID(c)
+	credential, err := h.services.Credential.GetByIdentifier(c.Request.Context(), tenantID, holderDID, credentialID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
@@ -328,15 +342,17 @@ func (h *Handlers) DeleteCredential(c *gin.Context) {
 		return
 	}
 
+	tenantID, _ := h.getTenantID(c)
+
 	// Delete associated presentations first (like the reference implementation)
-	if err := h.services.Presentation.DeleteByCredentialID(c.Request.Context(), holderDID, credentialID); err != nil {
+	if err := h.services.Presentation.DeleteByCredentialID(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
 		// Log but continue - presentations may not exist
 		h.logger.Warn("Error deleting presentations for credential",
 			zap.String("credential_id", credentialID),
 			zap.Error(err))
 	}
 
-	if err := h.services.Credential.Delete(c.Request.Context(), holderDID, credentialID); err != nil {
+	if err := h.services.Credential.Delete(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -359,7 +375,8 @@ func (h *Handlers) GetAllPresentations(c *gin.Context) {
 		return
 	}
 
-	presentations, err := h.services.Presentation.GetAll(c.Request.Context(), holderDID)
+	tenantID, _ := h.getTenantID(c)
+	presentations, err := h.services.Presentation.GetAll(c.Request.Context(), tenantID, holderDID)
 	if err != nil {
 		h.logger.Error("Failed to get presentations", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to get presentations"})
@@ -383,9 +400,11 @@ func (h *Handlers) StorePresentation(c *gin.Context) {
 		return
 	}
 
+	tenantID, _ := h.getTenantID(c)
 	presentation.HolderDID = holderDID
+	presentation.TenantID = tenantID
 
-	if err := h.services.Presentation.Store(c.Request.Context(), &presentation); err != nil {
+	if err := h.services.Presentation.Store(c.Request.Context(), tenantID, &presentation); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
 			c.JSON(409, gin.H{"error": "Presentation already exists"})
 			return
@@ -412,7 +431,8 @@ func (h *Handlers) GetPresentationByIdentifier(c *gin.Context) {
 		return
 	}
 
-	presentation, err := h.services.Presentation.Get(c.Request.Context(), holderDID, presentationID)
+	tenantID, _ := h.getTenantID(c)
+	presentation, err := h.services.Presentation.Get(c.Request.Context(), tenantID, holderDID, presentationID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Presentation not found"})
@@ -440,7 +460,8 @@ func (h *Handlers) DeletePresentation(c *gin.Context) {
 		return
 	}
 
-	if err := h.services.Presentation.Delete(c.Request.Context(), holderDID, presentationID); err != nil {
+	tenantID, _ := h.getTenantID(c)
+	if err := h.services.Presentation.Delete(c.Request.Context(), tenantID, holderDID, presentationID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Presentation not found"})
 			return
@@ -457,7 +478,8 @@ func (h *Handlers) DeletePresentation(c *gin.Context) {
 
 // GetAllIssuers returns all credential issuers
 func (h *Handlers) GetAllIssuers(c *gin.Context) {
-	issuers, err := h.services.Issuer.GetAll(c.Request.Context())
+	tenantID, _ := h.getTenantID(c)
+	issuers, err := h.services.Issuer.GetAll(c.Request.Context(), tenantID)
 	if err != nil {
 		h.logger.Error("Failed to get issuers", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to get issuers"})
@@ -482,7 +504,8 @@ func (h *Handlers) GetIssuerByID(c *gin.Context) {
 		return
 	}
 
-	issuer, err := h.services.Issuer.GetByID(c.Request.Context(), id)
+	tenantID, _ := h.getTenantID(c)
+	issuer, err := h.services.Issuer.GetByID(c.Request.Context(), tenantID, id)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Issuer not found"})
@@ -500,7 +523,8 @@ func (h *Handlers) GetIssuerByID(c *gin.Context) {
 
 // GetAllVerifiers returns all verifiers
 func (h *Handlers) GetAllVerifiers(c *gin.Context) {
-	verifiers, err := h.services.Verifier.GetAll(c.Request.Context())
+	tenantID, _ := h.getTenantID(c)
+	verifiers, err := h.services.Verifier.GetAll(c.Request.Context(), tenantID)
 	if err != nil {
 		h.logger.Error("Failed to get verifiers", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to get verifiers"})

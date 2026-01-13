@@ -10,6 +10,8 @@ import (
 // Services aggregates all application services
 type Services struct {
 	User           *UserService
+	Tenant         *TenantService
+	UserTenant     *UserTenantService
 	WebAuthn       *WebAuthnService
 	Credential     *CredentialService
 	Presentation   *PresentationService
@@ -31,6 +33,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 
 	return &Services{
 		User:           NewUserService(store, cfg, logger),
+		Tenant:         NewTenantService(store, logger),
+		UserTenant:     NewUserTenantService(store, logger),
 		WebAuthn:       webauthnSvc,
 		Credential:     NewCredentialService(store, cfg, logger),
 		Presentation:   NewPresentationService(store, logger),

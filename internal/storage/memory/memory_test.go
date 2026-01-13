@@ -384,8 +384,10 @@ func TestCredentialStore_GetByIdentifier(t *testing.T) {
 
 	holderDID := "did:key:holder"
 	credIdentifier := "urn:credential:findme"
+	tenantID := domain.DefaultTenantID
 
 	cred := &domain.VerifiableCredential{
+		TenantID:             tenantID,
 		HolderDID:            holderDID,
 		CredentialIdentifier: credIdentifier,
 		Credential:           "eyJhbGciOi...",
@@ -397,7 +399,7 @@ func TestCredentialStore_GetByIdentifier(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	retrieved, err := credentials.GetByIdentifier(ctx, holderDID, credIdentifier)
+	retrieved, err := credentials.GetByIdentifier(ctx, tenantID, holderDID, credIdentifier)
 	if err != nil {
 		t.Fatalf("GetByIdentifier() error = %v", err)
 	}
@@ -412,7 +414,7 @@ func TestCredentialStore_GetByIdentifier_NotFound(t *testing.T) {
 	store := NewStore()
 	credentials := store.Credentials()
 
-	_, err := credentials.GetByIdentifier(ctx, "did:key:holder", "nonexistent")
+	_, err := credentials.GetByIdentifier(ctx, domain.DefaultTenantID, "did:key:holder", "nonexistent")
 	if err != storage.ErrNotFound {
 		t.Errorf("GetByIdentifier() for nonexistent credential should return ErrNotFound, got %v", err)
 	}
@@ -424,10 +426,12 @@ func TestCredentialStore_GetAllByHolder(t *testing.T) {
 	credentials := store.Credentials()
 
 	holderDID := "did:key:holder"
+	tenantID := domain.DefaultTenantID
 
 	// Create multiple credentials
 	for i := 0; i < 3; i++ {
 		cred := &domain.VerifiableCredential{
+			TenantID:             tenantID,
 			HolderDID:            holderDID,
 			CredentialIdentifier: "urn:credential:" + string(rune('a'+i)),
 			Credential:           "eyJhbGciOi...",
@@ -441,6 +445,7 @@ func TestCredentialStore_GetAllByHolder(t *testing.T) {
 
 	// Create credential for different holder
 	otherCred := &domain.VerifiableCredential{
+		TenantID:             tenantID,
 		HolderDID:            "did:key:other",
 		CredentialIdentifier: "urn:credential:other",
 		Credential:           "eyJhbGciOi...",
@@ -451,7 +456,7 @@ func TestCredentialStore_GetAllByHolder(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	creds, err := credentials.GetAllByHolder(ctx, holderDID)
+	creds, err := credentials.GetAllByHolder(ctx, tenantID, holderDID)
 	if err != nil {
 		t.Fatalf("GetAllByHolder() error = %v", err)
 	}
@@ -471,8 +476,10 @@ func TestCredentialStore_Update(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	credentials := store.Credentials()
+	tenantID := domain.DefaultTenantID
 
 	cred := &domain.VerifiableCredential{
+		TenantID:             tenantID,
 		HolderDID:            "did:key:holder",
 		CredentialIdentifier: "urn:credential:update",
 		Credential:           "original",
@@ -493,7 +500,7 @@ func TestCredentialStore_Update(t *testing.T) {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	retrieved, err := credentials.GetByID(ctx, cred.ID)
+	retrieved, err := credentials.GetByID(ctx, tenantID, cred.ID)
 	if err != nil {
 		t.Fatalf("GetByID() error = %v", err)
 	}
@@ -507,11 +514,13 @@ func TestCredentialStore_Delete(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	credentials := store.Credentials()
+	tenantID := domain.DefaultTenantID
 
 	holderDID := "did:key:holder"
 	credIdentifier := "urn:credential:delete"
 
 	cred := &domain.VerifiableCredential{
+		TenantID:             tenantID,
 		HolderDID:            holderDID,
 		CredentialIdentifier: credIdentifier,
 		Credential:           "eyJhbGciOi...",
@@ -523,12 +532,12 @@ func TestCredentialStore_Delete(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	err = credentials.Delete(ctx, holderDID, credIdentifier)
+	err = credentials.Delete(ctx, tenantID, holderDID, credIdentifier)
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
-	_, err = credentials.GetByIdentifier(ctx, holderDID, credIdentifier)
+	_, err = credentials.GetByIdentifier(ctx, tenantID, holderDID, credIdentifier)
 	if err != storage.ErrNotFound {
 		t.Error("Credential should be deleted")
 	}
@@ -562,11 +571,13 @@ func TestPresentationStore_GetByIdentifier(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	presentations := store.Presentations()
+	tenantID := domain.DefaultTenantID
 
 	holderDID := "did:key:holder"
 	presIdentifier := "urn:presentation:find"
 
 	pres := &domain.VerifiablePresentation{
+		TenantID:                                tenantID,
 		HolderDID:                               holderDID,
 		PresentationIdentifier:                  presIdentifier,
 		Presentation:                            "eyJhbGciOi...",
@@ -578,7 +589,7 @@ func TestPresentationStore_GetByIdentifier(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	retrieved, err := presentations.GetByIdentifier(ctx, holderDID, presIdentifier)
+	retrieved, err := presentations.GetByIdentifier(ctx, tenantID, holderDID, presIdentifier)
 	if err != nil {
 		t.Fatalf("GetByIdentifier() error = %v", err)
 	}
@@ -592,11 +603,13 @@ func TestPresentationStore_GetAllByHolder(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	presentations := store.Presentations()
+	tenantID := domain.DefaultTenantID
 
 	holderDID := "did:key:holder"
 
 	for i := 0; i < 2; i++ {
 		pres := &domain.VerifiablePresentation{
+			TenantID:               tenantID,
 			HolderDID:              holderDID,
 			PresentationIdentifier: "urn:presentation:" + string(rune('a'+i)),
 			Presentation:           "eyJhbGciOi...",
@@ -607,7 +620,7 @@ func TestPresentationStore_GetAllByHolder(t *testing.T) {
 		}
 	}
 
-	presList, err := presentations.GetAllByHolder(ctx, holderDID)
+	presList, err := presentations.GetAllByHolder(ctx, tenantID, holderDID)
 	if err != nil {
 		t.Fatalf("GetAllByHolder() error = %v", err)
 	}
@@ -621,11 +634,13 @@ func TestPresentationStore_Delete(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	presentations := store.Presentations()
+	tenantID := domain.DefaultTenantID
 
 	holderDID := "did:key:holder"
 	presIdentifier := "urn:presentation:delete"
 
 	pres := &domain.VerifiablePresentation{
+		TenantID:               tenantID,
 		HolderDID:              holderDID,
 		PresentationIdentifier: presIdentifier,
 		Presentation:           "eyJhbGciOi...",
@@ -636,12 +651,12 @@ func TestPresentationStore_Delete(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	err = presentations.Delete(ctx, holderDID, presIdentifier)
+	err = presentations.Delete(ctx, tenantID, holderDID, presIdentifier)
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
-	_, err = presentations.GetByIdentifier(ctx, holderDID, presIdentifier)
+	_, err = presentations.GetByIdentifier(ctx, tenantID, holderDID, presIdentifier)
 	if err != storage.ErrNotFound {
 		t.Error("Presentation should be deleted")
 	}
@@ -651,11 +666,13 @@ func TestPresentationStore_DeleteByCredentialID(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	presentations := store.Presentations()
+	tenantID := domain.DefaultTenantID
 
 	holderDID := "did:key:holder"
 	credID := "urn:credential:linked"
 
 	pres := &domain.VerifiablePresentation{
+		TenantID:                                tenantID,
 		HolderDID:                               holderDID,
 		PresentationIdentifier:                  "urn:presentation:linked",
 		Presentation:                            "eyJhbGciOi...",
@@ -667,7 +684,7 @@ func TestPresentationStore_DeleteByCredentialID(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	err = presentations.DeleteByCredentialID(ctx, holderDID, credID)
+	err = presentations.DeleteByCredentialID(ctx, tenantID, holderDID, credID)
 	if err != nil {
 		t.Fatalf("DeleteByCredentialID() error = %v", err)
 	}
@@ -821,8 +838,10 @@ func TestIssuerStore_GetByIdentifier(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	issuers := store.Issuers()
+	tenantID := domain.DefaultTenantID
 
 	issuer := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
 		CredentialIssuerIdentifier: "https://issuer.example.com",
 		ClientID:                   "client123",
 		Visible:                    true,
@@ -833,7 +852,7 @@ func TestIssuerStore_GetByIdentifier(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	retrieved, err := issuers.GetByIdentifier(ctx, "https://issuer.example.com")
+	retrieved, err := issuers.GetByIdentifier(ctx, tenantID, "https://issuer.example.com")
 	if err != nil {
 		t.Fatalf("GetByIdentifier() error = %v", err)
 	}
@@ -847,9 +866,11 @@ func TestIssuerStore_GetAll(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	issuers := store.Issuers()
+	tenantID := domain.DefaultTenantID
 
 	for i := 0; i < 3; i++ {
 		issuer := &domain.CredentialIssuer{
+			TenantID:                   tenantID,
 			CredentialIssuerIdentifier: "https://issuer" + string(rune('0'+i)) + ".example.com",
 			ClientID:                   "client" + string(rune('0'+i)),
 			Visible:                    true,
@@ -860,7 +881,7 @@ func TestIssuerStore_GetAll(t *testing.T) {
 		}
 	}
 
-	issuerList, err := issuers.GetAll(ctx)
+	issuerList, err := issuers.GetAll(ctx, tenantID)
 	if err != nil {
 		t.Fatalf("GetAll() error = %v", err)
 	}
@@ -874,8 +895,10 @@ func TestIssuerStore_Update(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	issuers := store.Issuers()
+	tenantID := domain.DefaultTenantID
 
 	issuer := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
 		CredentialIssuerIdentifier: "https://issuer.example.com",
 		ClientID:                   "original",
 		Visible:                    false,
@@ -893,7 +916,7 @@ func TestIssuerStore_Update(t *testing.T) {
 		t.Fatalf("Update() error = %v", err)
 	}
 
-	retrieved, err := issuers.GetByID(ctx, issuer.ID)
+	retrieved, err := issuers.GetByID(ctx, tenantID, issuer.ID)
 	if err != nil {
 		t.Fatalf("GetByID() error = %v", err)
 	}
@@ -907,8 +930,10 @@ func TestIssuerStore_Delete(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	issuers := store.Issuers()
+	tenantID := domain.DefaultTenantID
 
 	issuer := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
 		CredentialIssuerIdentifier: "https://issuer.example.com",
 		ClientID:                   "client123",
 		Visible:                    true,
@@ -919,12 +944,12 @@ func TestIssuerStore_Delete(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	err = issuers.Delete(ctx, issuer.ID)
+	err = issuers.Delete(ctx, tenantID, issuer.ID)
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
-	_, err = issuers.GetByID(ctx, issuer.ID)
+	_, err = issuers.GetByID(ctx, tenantID, issuer.ID)
 	if err != storage.ErrNotFound {
 		t.Error("Issuer should be deleted")
 	}
@@ -956,10 +981,12 @@ func TestVerifierStore_GetByID(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
 
 	verifier := &domain.Verifier{
-		Name: "Test Verifier",
-		URL:  "https://verifier.example.com",
+		TenantID: tenantID,
+		Name:     "Test Verifier",
+		URL:      "https://verifier.example.com",
 	}
 
 	err := verifiers.Create(ctx, verifier)
@@ -967,7 +994,7 @@ func TestVerifierStore_GetByID(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	retrieved, err := verifiers.GetByID(ctx, verifier.ID)
+	retrieved, err := verifiers.GetByID(ctx, tenantID, verifier.ID)
 	if err != nil {
 		t.Fatalf("GetByID() error = %v", err)
 	}
@@ -981,11 +1008,13 @@ func TestVerifierStore_GetAll(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
 
 	for i := 0; i < 2; i++ {
 		verifier := &domain.Verifier{
-			Name: "Verifier " + string(rune('A'+i)),
-			URL:  "https://verifier" + string(rune('0'+i)) + ".example.com",
+			TenantID: tenantID,
+			Name:     "Verifier " + string(rune('A'+i)),
+			URL:      "https://verifier" + string(rune('0'+i)) + ".example.com",
 		}
 		err := verifiers.Create(ctx, verifier)
 		if err != nil {
@@ -993,7 +1022,7 @@ func TestVerifierStore_GetAll(t *testing.T) {
 		}
 	}
 
-	verifierList, err := verifiers.GetAll(ctx)
+	verifierList, err := verifiers.GetAll(ctx, tenantID)
 	if err != nil {
 		t.Fatalf("GetAll() error = %v", err)
 	}

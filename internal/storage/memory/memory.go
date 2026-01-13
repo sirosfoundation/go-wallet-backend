@@ -12,6 +12,8 @@ import (
 // Store implements an in-memory storage
 type Store struct {
 	users         *UserStore
+	tenants       *TenantStore
+	userTenants   *UserTenantStore
 	credentials   *CredentialStore
 	presentations *PresentationStore
 	challenges    *ChallengeStore
@@ -21,24 +23,207 @@ type Store struct {
 
 // NewStore creates a new in-memory store
 func NewStore() *Store {
-	return &Store{
+	s := &Store{
 		users:         &UserStore{data: make(map[string]*domain.User)},
+		tenants:       &TenantStore{data: make(map[domain.TenantID]*domain.Tenant)},
+		userTenants:   &UserTenantStore{data: make(map[string]*domain.UserTenantMembership)},
 		credentials:   &CredentialStore{data: make(map[int64]*domain.VerifiableCredential)},
 		presentations: &PresentationStore{data: make(map[int64]*domain.VerifiablePresentation)},
 		challenges:    &ChallengeStore{data: make(map[string]*domain.WebauthnChallenge)},
 		issuers:       &IssuerStore{data: make(map[int64]*domain.CredentialIssuer)},
 		verifiers:     &VerifierStore{data: make(map[int64]*domain.Verifier)},
 	}
+
+	// Create default tenant
+	s.tenants.data[domain.DefaultTenantID] = &domain.Tenant{
+		ID:          domain.DefaultTenantID,
+		Name:        "Default",
+		DisplayName: "Default Tenant",
+		Enabled:     true,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	return s
 }
 
-func (s *Store) Users() storage.UserStore                 { return s.users }
-func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
+func (s *Store) Users() storage.UserStore               { return s.users }
+func (s *Store) Tenants() storage.TenantStore           { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore   { return s.userTenants }
+func (s *Store) Credentials() storage.CredentialStore   { return s.credentials }
 func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
-func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
-func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
-func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
-func (s *Store) Close() error                             { return nil }
-func (s *Store) Ping(ctx context.Context) error           { return nil }
+func (s *Store) Challenges() storage.ChallengeStore     { return s.challenges }
+func (s *Store) Issuers() storage.IssuerStore           { return s.issuers }
+func (s *Store) Verifiers() storage.VerifierStore       { return s.verifiers }
+func (s *Store) Close() error                           { return nil }
+func (s *Store) Ping(ctx context.Context) error         { return nil }
+
+// TenantStore implements in-memory tenant storage
+type TenantStore struct {
+	mu   sync.RWMutex
+	data map[domain.TenantID]*domain.Tenant
+}
+
+func (s *TenantStore) Create(ctx context.Context, tenant *domain.Tenant) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.data[tenant.ID]; exists {
+		return storage.ErrAlreadyExists
+	}
+
+	tenant.CreatedAt = time.Now()
+	tenant.UpdatedAt = time.Now()
+	s.data[tenant.ID] = tenant
+	return nil
+}
+
+func (s *TenantStore) GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	tenant, exists := s.data[id]
+	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	return tenant, nil
+}
+
+func (s *TenantStore) GetAll(ctx context.Context) ([]*domain.Tenant, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	tenants := make([]*domain.Tenant, 0, len(s.data))
+	for _, tenant := range s.data {
+		tenants = append(tenants, tenant)
+	}
+	return tenants, nil
+}
+
+func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var tenants []*domain.Tenant
+	for _, tenant := range s.data {
+		if tenant.Enabled {
+			tenants = append(tenants, tenant)
+		}
+	}
+	return tenants, nil
+}
+
+func (s *TenantStore) Update(ctx context.Context, tenant *domain.Tenant) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.data[tenant.ID]; !exists {
+		return storage.ErrNotFound
+	}
+
+	tenant.UpdatedAt = time.Now()
+	s.data[tenant.ID] = tenant
+	return nil
+}
+
+func (s *TenantStore) Delete(ctx context.Context, id domain.TenantID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.data[id]; !exists {
+		return storage.ErrNotFound
+	}
+
+	delete(s.data, id)
+	return nil
+}
+
+// UserTenantStore implements in-memory user-tenant membership storage
+type UserTenantStore struct {
+	mu     sync.RWMutex
+	data   map[string]*domain.UserTenantMembership // key: "userID:tenantID"
+	nextID int64
+}
+
+func membershipKey(userID domain.UserID, tenantID domain.TenantID) string {
+	return userID.String() + ":" + string(tenantID)
+}
+
+func (s *UserTenantStore) AddMembership(ctx context.Context, membership *domain.UserTenantMembership) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := membershipKey(membership.UserID, membership.TenantID)
+	if _, exists := s.data[key]; exists {
+		return storage.ErrAlreadyExists
+	}
+
+	s.nextID++
+	membership.ID = s.nextID
+	membership.CreatedAt = time.Now()
+	s.data[key] = membership
+	return nil
+}
+
+func (s *UserTenantStore) RemoveMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := membershipKey(userID, tenantID)
+	if _, exists := s.data[key]; !exists {
+		return storage.ErrNotFound
+	}
+
+	delete(s.data, key)
+	return nil
+}
+
+func (s *UserTenantStore) GetUserTenants(ctx context.Context, userID domain.UserID) ([]domain.TenantID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var tenants []domain.TenantID
+	for _, membership := range s.data {
+		if membership.UserID == userID {
+			tenants = append(tenants, membership.TenantID)
+		}
+	}
+	return tenants, nil
+}
+
+func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.TenantID) ([]domain.UserID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var users []domain.UserID
+	for _, membership := range s.data {
+		if membership.TenantID == tenantID {
+			users = append(users, membership.UserID)
+		}
+	}
+	return users, nil
+}
+
+func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	key := membershipKey(userID, tenantID)
+	_, exists := s.data[key]
+	return exists, nil
+}
+
+func (s *UserTenantStore) GetMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (*domain.UserTenantMembership, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	key := membershipKey(userID, tenantID)
+	membership, exists := s.data[key]
+	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	return membership, nil
+}
 
 // UserStore implements in-memory user storage
 type UserStore struct {
@@ -157,7 +342,7 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	return nil
 }
 
-func (s *CredentialStore) GetByID(ctx context.Context, id int64) (*domain.VerifiableCredential, error) {
+func (s *CredentialStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.VerifiableCredential, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -165,28 +350,32 @@ func (s *CredentialStore) GetByID(ctx context.Context, id int64) (*domain.Verifi
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	// Tenant isolation check
+	if credential.TenantID != tenantID {
+		return nil, storage.ErrNotFound
+	}
 	return credential, nil
 }
 
-func (s *CredentialStore) GetByIdentifier(ctx context.Context, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
+func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, cred := range s.data {
-		if cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
+		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
 			return cred, nil
 		}
 	}
 	return nil, storage.ErrNotFound
 }
 
-func (s *CredentialStore) GetAllByHolder(ctx context.Context, holderDID string) ([]*domain.VerifiableCredential, error) {
+func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiableCredential, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var credentials []*domain.VerifiableCredential
 	for _, cred := range s.data {
-		if cred.HolderDID == holderDID {
+		if cred.TenantID == tenantID && cred.HolderDID == holderDID {
 			credentials = append(credentials, cred)
 		}
 	}
@@ -206,12 +395,12 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 	return nil
 }
 
-func (s *CredentialStore) Delete(ctx context.Context, holderDID, credentialIdentifier string) error {
+func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, cred := range s.data {
-		if cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
+		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
 			delete(s.data, id)
 			return nil
 		}
@@ -239,7 +428,7 @@ func (s *PresentationStore) Create(ctx context.Context, presentation *domain.Ver
 	return nil
 }
 
-func (s *PresentationStore) GetByID(ctx context.Context, id int64) (*domain.VerifiablePresentation, error) {
+func (s *PresentationStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.VerifiablePresentation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -247,40 +436,44 @@ func (s *PresentationStore) GetByID(ctx context.Context, id int64) (*domain.Veri
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	// Tenant isolation check
+	if presentation.TenantID != tenantID {
+		return nil, storage.ErrNotFound
+	}
 	return presentation, nil
 }
 
-func (s *PresentationStore) GetByIdentifier(ctx context.Context, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
+func (s *PresentationStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, pres := range s.data {
-		if pres.HolderDID == holderDID && pres.PresentationIdentifier == presentationIdentifier {
+		if pres.TenantID == tenantID && pres.HolderDID == holderDID && pres.PresentationIdentifier == presentationIdentifier {
 			return pres, nil
 		}
 	}
 	return nil, storage.ErrNotFound
 }
 
-func (s *PresentationStore) GetAllByHolder(ctx context.Context, holderDID string) ([]*domain.VerifiablePresentation, error) {
+func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiablePresentation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var presentations []*domain.VerifiablePresentation
 	for _, pres := range s.data {
-		if pres.HolderDID == holderDID {
+		if pres.TenantID == tenantID && pres.HolderDID == holderDID {
 			presentations = append(presentations, pres)
 		}
 	}
 	return presentations, nil
 }
 
-func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, holderDID, credentialID string) error {
+func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, pres := range s.data {
-		if pres.HolderDID == holderDID {
+		if pres.TenantID == tenantID && pres.HolderDID == holderDID {
 			for _, credID := range pres.IncludedVerifiableCredentialIdentifiers {
 				if credID == credentialID {
 					delete(s.data, id)
@@ -292,12 +485,12 @@ func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, holderDID,
 	return nil
 }
 
-func (s *PresentationStore) Delete(ctx context.Context, holderDID, presentationIdentifier string) error {
+func (s *PresentationStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, pres := range s.data {
-		if pres.HolderDID == holderDID && pres.PresentationIdentifier == presentationIdentifier {
+		if pres.TenantID == tenantID && pres.HolderDID == holderDID && pres.PresentationIdentifier == presentationIdentifier {
 			delete(s.data, id)
 			return nil
 		}
@@ -368,7 +561,7 @@ func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssue
 	return nil
 }
 
-func (s *IssuerStore) GetByID(ctx context.Context, id int64) (*domain.CredentialIssuer, error) {
+func (s *IssuerStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.CredentialIssuer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -376,28 +569,34 @@ func (s *IssuerStore) GetByID(ctx context.Context, id int64) (*domain.Credential
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	// Tenant isolation check
+	if issuer.TenantID != tenantID {
+		return nil, storage.ErrNotFound
+	}
 	return issuer, nil
 }
 
-func (s *IssuerStore) GetByIdentifier(ctx context.Context, identifier string) (*domain.CredentialIssuer, error) {
+func (s *IssuerStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, issuer := range s.data {
-		if issuer.CredentialIssuerIdentifier == identifier {
+		if issuer.TenantID == tenantID && issuer.CredentialIssuerIdentifier == identifier {
 			return issuer, nil
 		}
 	}
 	return nil, storage.ErrNotFound
 }
 
-func (s *IssuerStore) GetAll(ctx context.Context) ([]*domain.CredentialIssuer, error) {
+func (s *IssuerStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.CredentialIssuer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	issuers := make([]*domain.CredentialIssuer, 0, len(s.data))
+	var issuers []*domain.CredentialIssuer
 	for _, issuer := range s.data {
-		issuers = append(issuers, issuer)
+		if issuer.TenantID == tenantID {
+			issuers = append(issuers, issuer)
+		}
 	}
 	return issuers, nil
 }
@@ -414,11 +613,12 @@ func (s *IssuerStore) Update(ctx context.Context, issuer *domain.CredentialIssue
 	return nil
 }
 
-func (s *IssuerStore) Delete(ctx context.Context, id int64) error {
+func (s *IssuerStore) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[id]; !exists {
+	issuer, exists := s.data[id]
+	if !exists || issuer.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
 
@@ -443,7 +643,7 @@ func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) e
 	return nil
 }
 
-func (s *VerifierStore) GetByID(ctx context.Context, id int64) (*domain.Verifier, error) {
+func (s *VerifierStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.Verifier, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -451,16 +651,22 @@ func (s *VerifierStore) GetByID(ctx context.Context, id int64) (*domain.Verifier
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	// Tenant isolation check
+	if verifier.TenantID != tenantID {
+		return nil, storage.ErrNotFound
+	}
 	return verifier, nil
 }
 
-func (s *VerifierStore) GetAll(ctx context.Context) ([]*domain.Verifier, error) {
+func (s *VerifierStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	verifiers := make([]*domain.Verifier, 0, len(s.data))
+	var verifiers []*domain.Verifier
 	for _, verifier := range s.data {
-		verifiers = append(verifiers, verifier)
+		if verifier.TenantID == tenantID {
+			verifiers = append(verifiers, verifier)
+		}
 	}
 	return verifiers, nil
 }
@@ -477,11 +683,12 @@ func (s *VerifierStore) Update(ctx context.Context, verifier *domain.Verifier) e
 	return nil
 }
 
-func (s *VerifierStore) Delete(ctx context.Context, id int64) error {
+func (s *VerifierStore) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[id]; !exists {
+	verifier, exists := s.data[id]
+	if !exists || verifier.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
 

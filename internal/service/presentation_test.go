@@ -37,12 +37,12 @@ func TestPresentationService_Store_Success(t *testing.T) {
 		Presentation:           `{"type": "VerifiablePresentation"}`,
 	}
 
-	err := svc.Store(ctx, pres)
+	err := svc.Store(ctx, domain.DefaultTenantID, pres)
 	if err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
 
-	retrieved, err := svc.Get(ctx, pres.HolderDID, pres.PresentationIdentifier)
+	retrieved, err := svc.Get(ctx, domain.DefaultTenantID, pres.HolderDID, pres.PresentationIdentifier)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -62,7 +62,7 @@ func TestPresentationService_Store_MissingHolderDID(t *testing.T) {
 		Presentation:           `{"type": "VerifiablePresentation"}`,
 	}
 
-	err := svc.Store(ctx, pres)
+	err := svc.Store(ctx, domain.DefaultTenantID, pres)
 	if err == nil {
 		t.Error("Expected error for missing holder DID")
 	}
@@ -78,7 +78,7 @@ func TestPresentationService_Store_MissingPresentationIdentifier(t *testing.T) {
 		Presentation:           `{"type": "VerifiablePresentation"}`,
 	}
 
-	err := svc.Store(ctx, pres)
+	err := svc.Store(ctx, domain.DefaultTenantID, pres)
 	if err == nil {
 		t.Error("Expected error for missing presentation identifier")
 	}
@@ -94,12 +94,12 @@ func TestPresentationService_Store_Duplicate(t *testing.T) {
 		Presentation:           `{"type": "VerifiablePresentation"}`,
 	}
 
-	err := svc.Store(ctx, pres)
+	err := svc.Store(ctx, domain.DefaultTenantID, pres)
 	if err != nil {
 		t.Fatalf("First Store() error = %v", err)
 	}
 
-	err = svc.Store(ctx, pres)
+	err = svc.Store(ctx, domain.DefaultTenantID, pres)
 	if err == nil {
 		t.Error("Expected error for duplicate presentation")
 	}
@@ -109,7 +109,7 @@ func TestPresentationService_Get_NotFound(t *testing.T) {
 	svc, _ := setupPresentationService(t)
 	ctx := context.Background()
 
-	_, err := svc.Get(ctx, "did:example:holder", "non-existent")
+	_, err := svc.Get(ctx, domain.DefaultTenantID, "did:example:holder", "non-existent")
 	if err == nil {
 		t.Error("Expected error for non-existent presentation")
 	}
@@ -119,7 +119,7 @@ func TestPresentationService_GetAll_Empty(t *testing.T) {
 	svc, _ := setupPresentationService(t)
 	ctx := context.Background()
 
-	presentations, err := svc.GetAll(ctx, "did:example:holder")
+	presentations, err := svc.GetAll(ctx, domain.DefaultTenantID, "did:example:holder")
 	if err != nil {
 		t.Fatalf("GetAll() error = %v", err)
 	}
@@ -140,12 +140,12 @@ func TestPresentationService_GetAll_MultiplePresentations(t *testing.T) {
 			PresentationIdentifier: "pres-" + string(rune(48+i)),
 			Presentation:           `{"type": "VerifiablePresentation"}`,
 		}
-		if err := svc.Store(ctx, pres); err != nil {
+		if err := svc.Store(ctx, domain.DefaultTenantID, pres); err != nil {
 			t.Fatalf("Store() error = %v", err)
 		}
 	}
 
-	presentations, err := svc.GetAll(ctx, holderDID)
+	presentations, err := svc.GetAll(ctx, domain.DefaultTenantID, holderDID)
 	if err != nil {
 		t.Fatalf("GetAll() error = %v", err)
 	}
@@ -165,16 +165,16 @@ func TestPresentationService_Delete_Success(t *testing.T) {
 		Presentation:           `{"type": "VerifiablePresentation"}`,
 	}
 
-	if err := svc.Store(ctx, pres); err != nil {
+	if err := svc.Store(ctx, domain.DefaultTenantID, pres); err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
 
-	err := svc.Delete(ctx, pres.HolderDID, pres.PresentationIdentifier)
+	err := svc.Delete(ctx, domain.DefaultTenantID, pres.HolderDID, pres.PresentationIdentifier)
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
-	_, err = svc.Get(ctx, pres.HolderDID, pres.PresentationIdentifier)
+	_, err = svc.Get(ctx, domain.DefaultTenantID, pres.HolderDID, pres.PresentationIdentifier)
 	if err == nil {
 		t.Error("Expected error for deleted presentation")
 	}
@@ -184,7 +184,7 @@ func TestPresentationService_Delete_NotFound(t *testing.T) {
 	svc, _ := setupPresentationService(t)
 	ctx := context.Background()
 
-	err := svc.Delete(ctx, "did:example:holder", "non-existent")
+	err := svc.Delete(ctx, domain.DefaultTenantID, "did:example:holder", "non-existent")
 	if err == nil {
 		t.Error("Expected error for deleting non-existent presentation")
 	}
@@ -209,24 +209,24 @@ func TestPresentationService_DeleteByCredentialID(t *testing.T) {
 		IncludedVerifiableCredentialIdentifiers: []string{"other-cred"},
 	}
 
-	if err := svc.Store(ctx, pres1); err != nil {
+	if err := svc.Store(ctx, domain.DefaultTenantID, pres1); err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
-	if err := svc.Store(ctx, pres2); err != nil {
+	if err := svc.Store(ctx, domain.DefaultTenantID, pres2); err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
 
-	err := svc.DeleteByCredentialID(ctx, holderDID, credentialID)
+	err := svc.DeleteByCredentialID(ctx, domain.DefaultTenantID, holderDID, credentialID)
 	if err != nil {
 		t.Fatalf("DeleteByCredentialID() error = %v", err)
 	}
 
-	_, err = svc.Get(ctx, holderDID, "pres-001")
+	_, err = svc.Get(ctx, domain.DefaultTenantID, holderDID, "pres-001")
 	if err == nil {
 		t.Error("Expected pres-001 to be deleted")
 	}
 
-	_, err = svc.Get(ctx, holderDID, "pres-002")
+	_, err = svc.Get(ctx, domain.DefaultTenantID, holderDID, "pres-002")
 	if err != nil {
 		t.Error("Expected pres-002 to still exist")
 	}

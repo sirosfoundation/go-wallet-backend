@@ -24,6 +24,10 @@ const (
 type Backend interface {
 	// Users returns the user store
 	Users() storage.UserStore
+	// Tenants returns the tenant store
+	Tenants() storage.TenantStore
+	// UserTenants returns the user-tenant membership store
+	UserTenants() storage.UserTenantStore
 	// Credentials returns the credential store
 	Credentials() storage.CredentialStore
 	// Presentations returns the presentation store
@@ -46,6 +50,8 @@ type memoryBackend struct {
 }
 
 func (b *memoryBackend) Users() storage.UserStore                 { return b.store.Users() }
+func (b *memoryBackend) Tenants() storage.TenantStore             { return b.store.Tenants() }
+func (b *memoryBackend) UserTenants() storage.UserTenantStore     { return b.store.UserTenants() }
 func (b *memoryBackend) Credentials() storage.CredentialStore     { return b.store.Credentials() }
 func (b *memoryBackend) Presentations() storage.PresentationStore { return b.store.Presentations() }
 func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.store.Challenges() }
@@ -60,6 +66,8 @@ type mongoBackend struct {
 }
 
 func (b *mongoBackend) Users() storage.UserStore                 { return b.store.Users() }
+func (b *mongoBackend) Tenants() storage.TenantStore             { return b.store.Tenants() }
+func (b *mongoBackend) UserTenants() storage.UserTenantStore     { return b.store.UserTenants() }
 func (b *mongoBackend) Credentials() storage.CredentialStore     { return b.store.Credentials() }
 func (b *mongoBackend) Presentations() storage.PresentationStore { return b.store.Presentations() }
 func (b *mongoBackend) Challenges() storage.ChallengeStore       { return b.store.Challenges() }
