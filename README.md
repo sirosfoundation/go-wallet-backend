@@ -1,9 +1,19 @@
 # Go Wallet Backend
 
+<div align="center">
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wallet-backend.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wallet-backend)
 [![CI](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sirosfoundation/go-wallet-backend)](https://goreportcard.com/report/github.com/sirosfoundation/go-wallet-backend)
-[![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wallet-backend.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wallet-backend)
+[![codecov](https://codecov.io/gh/sirosfoundation/go-wallet-backend/branch/main/graph/badge.svg)](https://codecov.io/gh/sirosfoundation/go-wallet-backend)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+[![Docker](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/docker-publish.yml)
+[![Latest Release](https://img.shields.io/github/v/release/sirosfoundation/go-wallet-backend?include_prereleases)](https://github.com/sirosfoundation/go-wallet-backend/releases)
+[![Issues](https://img.shields.io/github/issues/sirosfoundation/go-wallet-backend)](https://github.com/sirosfoundation/go-wallet-backend/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/sirosfoundation/go-wallet-backend)](https://github.com/sirosfoundation/go-wallet-backend/commits/main)
+
+</div>
 
 **This is work in progress**
 
