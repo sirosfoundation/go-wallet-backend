@@ -77,7 +77,7 @@ func TestManager_WebSocketHandshake(t *testing.T) {
 	ws, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
 	require.Equal(t, 101, resp.StatusCode)
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	// Create valid JWT token
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -126,7 +126,7 @@ func TestManager_WebSocketInvalidToken(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	// Send handshake with invalid token
 	handshake := ClientMessage{

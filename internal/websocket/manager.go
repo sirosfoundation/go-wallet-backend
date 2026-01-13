@@ -120,7 +120,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleClient(conn *websocket.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	var client *clientConnection
 
@@ -139,12 +139,11 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			continue
 		}
 
-		// Handle handshake
 		if msg.AppToken != "" {
 			userID, err := m.validateToken(msg.AppToken)
 			if err != nil {
 				m.logger.Error("Handshake failed - invalid token", zap.Error(err))
-				conn.WriteJSON(ServerMessage{Type: "ERROR", MessageID: "auth_failed"})
+				_ = conn.WriteJSON(ServerMessage{Type: "ERROR", MessageID: "auth_failed"})
 				continue
 			}
 
@@ -157,13 +156,13 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			m.clientsMu.Lock()
 			// Close any existing connection for this user
 			if existing, ok := m.clients[userID]; ok {
-				existing.conn.Close()
+				_ = existing.conn.Close()
 			}
 			m.clients[userID] = client
 			m.clientsMu.Unlock()
 
 			m.logger.Info("WebSocket handshake established", zap.String("user_id", userID))
-			conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})
+			_ = conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})
 			continue
 		}
 
@@ -325,7 +324,7 @@ func (m *Manager) Close() {
 	defer m.clientsMu.Unlock()
 
 	for _, client := range m.clients {
-		client.conn.Close()
+		_ = client.conn.Close()
 	}
 	m.clients = make(map[string]*clientConnection)
 }

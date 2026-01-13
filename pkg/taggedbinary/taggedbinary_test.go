@@ -72,8 +72,8 @@ func TestDecodeJSON(t *testing.T) {
 
 			// Normalize JSON for comparison (re-marshal both)
 			var gotObj, wantObj interface{}
-			json.Unmarshal(got, &gotObj)
-			json.Unmarshal([]byte(tt.want), &wantObj)
+			_ = json.Unmarshal(got, &gotObj)
+			_ = json.Unmarshal([]byte(tt.want), &wantObj)
 
 			gotNorm, _ := json.Marshal(gotObj)
 			wantNorm, _ := json.Marshal(wantObj)

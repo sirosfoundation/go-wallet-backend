@@ -216,7 +216,7 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, holderDID string
 	if err != nil {
 		return nil, fmt.Errorf("failed to get presentations: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var presentations []*domain.VerifiablePresentation
 	if err := cursor.All(ctx, &presentations); err != nil {
