@@ -1,0 +1,13 @@
+services:
+  wallet-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "8002:8080"
+    volumes:
+      - "./configs/config.yaml:/app/configs/config.yaml"
+    # Note: healthcheck is not configured because the distroless runtime image
+    # doesn't have curl, wget, or a shell. A proper healthcheck would require
+    # building a custom health binary into the image.
