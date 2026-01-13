@@ -189,7 +189,7 @@ func TestUserService_Login(t *testing.T) {
 	}
 
 	if user == nil {
-		t.Error("Login() returned nil user")
+		t.Fatal("Login() returned nil user")
 	}
 
 	if token == "" {

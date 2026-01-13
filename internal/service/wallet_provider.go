@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"os"
@@ -140,9 +139,4 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	}
 
 	return tokenString, nil
-}
-
-// Helper to encode certificate to base64
-func encodeCertToBase64(cert *x509.Certificate) string {
-	return base64.StdEncoding.EncodeToString(cert.Raw)
 }

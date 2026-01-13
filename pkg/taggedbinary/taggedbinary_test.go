@@ -187,7 +187,7 @@ func TestTransformReader(t *testing.T) {
 	got := string(buf[:n])
 
 	var obj map[string]interface{}
-	json.Unmarshal([]byte(got), &obj)
+	_ = json.Unmarshal([]byte(got), &obj)
 
 	if rawId, ok := obj["rawId"].(string); !ok || rawId != "SGVsbG8" {
 		t.Errorf("TransformReader.Read() did not decode properly, got %s", got)

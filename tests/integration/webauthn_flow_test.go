@@ -84,12 +84,12 @@ func TestWebAuthnRequestResponseFormats(t *testing.T) {
 		// - 500 (internal server error) - indicates format parsing failed
 		// - 404/405 - indicates route not found
 		// 400 is expected for invalid credential data
-		status := finishResp.Response.StatusCode
-		if status == http.StatusInternalServerError {
+		switch status := finishResp.Response.StatusCode; status {
+		case http.StatusInternalServerError:
 			t.Errorf("Got 500 Internal Server Error - request format may be wrong: %s", finishResp.Pretty())
-		} else if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		case http.StatusNotFound, http.StatusMethodNotAllowed:
 			t.Errorf("Got %d - route issue: %s", status, finishResp.Pretty())
-		} else {
+		default:
 			t.Logf("Finish request accepted with status %d (expected 400 for invalid credential)", status)
 		}
 	})
@@ -154,12 +154,12 @@ func TestWebAuthnLoginRequestFormat(t *testing.T) {
 
 		finishResp := h.POST("/user/login-webauthn-finish", finishReq)
 
-		status := finishResp.Response.StatusCode
-		if status == http.StatusInternalServerError {
+		switch status := finishResp.Response.StatusCode; status {
+		case http.StatusInternalServerError:
 			t.Errorf("Got 500 Internal Server Error - request format may be wrong: %s", finishResp.Pretty())
-		} else if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		case http.StatusNotFound, http.StatusMethodNotAllowed:
 			t.Errorf("Got %d - route issue: %s", status, finishResp.Pretty())
-		} else {
+		default:
 			t.Logf("Finish login request accepted with status %d (expected 400/401 for invalid credential)", status)
 		}
 	})
@@ -178,11 +178,11 @@ func TestSessionEndpointFormats(t *testing.T) {
 
 		resp := h.POST("/user/session/public-info", req)
 
-		status := resp.Response.StatusCode
 		// 404 is expected (user not found), not 400/500
-		if status == http.StatusInternalServerError {
+		switch status := resp.Response.StatusCode; status {
+		case http.StatusInternalServerError:
 			t.Errorf("Got 500 - format may be wrong: %s", resp.Pretty())
-		} else if status == http.StatusBadRequest {
+		case http.StatusBadRequest:
 			t.Errorf("Got 400 - request format rejected: %s", resp.Pretty())
 		}
 	})
