@@ -2,32 +2,37 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // TestHarness provides a complete test environment with an HTTP server,
 // configured services, and helper methods for making API requests.
 type TestHarness struct {
-	T       *testing.T
-	Server  *httptest.Server
-	Config  *config.Config
-	Router  *gin.Engine
-	Storage storage.Store
-	Logger  *zap.Logger
+	T        *testing.T
+	Server   *httptest.Server
+	Config   *config.Config
+	Router   *gin.Engine
+	Storage  storage.Store
+	Services *service.Services
+	Logger   *zap.Logger
 
 	// Client is a pre-configured HTTP client for making requests
 	Client *http.Client
@@ -91,15 +96,15 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	h.Storage = memory.NewStore()
 
 	// Create services
-	services := service.NewServices(h.Storage, h.Config, logger)
+	h.Services = service.NewServices(h.Storage, h.Config, logger)
 
 	// Create handlers
-	handlers := api.NewHandlers(services, h.Config, logger)
+	handlers := api.NewHandlers(h.Services, h.Config, logger)
 
 	// Setup router
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
-	setupRoutes(h.Router, handlers)
+	setupRoutes(h.Router, handlers, h.Config, logger)
 
 	// Create test server
 	h.Server = httptest.NewServer(h.Router)
@@ -114,58 +119,70 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 }
 
 // setupRoutes configures all API routes (mirrors the main server setup)
-func setupRoutes(r *gin.Engine, h *api.Handlers) {
-	// Health/status
+func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, logger *zap.Logger) {
+	// Create auth middleware
+	auth := middleware.AuthMiddleware(cfg, logger)
+
+	// Health/status (public)
 	r.GET("/status", h.Status)
 
-	// User routes (deprecated password-based)
+	// User routes (deprecated password-based - public)
 	r.POST("/user/register", h.RegisterUser)
 	r.POST("/user/login", h.LoginUser)
 
-	// WebAuthn routes
+	// WebAuthn routes (public - for registration/login)
 	r.POST("/user/register-webauthn-begin", h.StartWebAuthnRegistration)
 	r.POST("/user/register-webauthn-finish", h.FinishWebAuthnRegistration)
 	r.POST("/user/login-webauthn-begin", h.StartWebAuthnLogin)
 	r.POST("/user/login-webauthn-finish", h.FinishWebAuthnLogin)
 
-	// Session routes
-	r.GET("/user/session/account-info", h.GetAccountInfo)
-	r.GET("/user/session/private-data", h.GetPrivateData)
-	r.POST("/user/session/private-data", h.UpdatePrivateData)
-	r.DELETE("/user/session", h.DeleteUser)
-	r.POST("/user/session/settings", h.UpdateSettings)
+	// Session routes (authenticated)
+	session := r.Group("/user/session")
+	session.Use(auth)
+	{
+		session.GET("/account-info", h.GetAccountInfo)
+		session.GET("/private-data", h.GetPrivateData)
+		session.POST("/private-data", h.UpdatePrivateData)
+		session.DELETE("", h.DeleteUser)
+		session.POST("/settings", h.UpdateSettings)
 
-	// WebAuthn credential management
-	r.POST("/user/session/webauthn-credential/add-begin", h.StartAddWebAuthnCredential)
-	r.POST("/user/session/webauthn-credential/add-finish", h.FinishAddWebAuthnCredential)
-	r.DELETE("/user/session/webauthn-credential/:id", h.DeleteWebAuthnCredential)
-	r.POST("/user/session/webauthn-credential/:id/rename", h.RenameWebAuthnCredential)
+		// WebAuthn credential management
+		session.POST("/webauthn-credential/add-begin", h.StartAddWebAuthnCredential)
+		session.POST("/webauthn-credential/add-finish", h.FinishAddWebAuthnCredential)
+		session.DELETE("/webauthn-credential/:id", h.DeleteWebAuthnCredential)
+		session.POST("/webauthn-credential/:id/rename", h.RenameWebAuthnCredential)
+	}
 
-	// Storage routes - Credentials
-	r.GET("/storage/vc", h.GetAllCredentials)
-	r.POST("/storage/vc", h.StoreCredential)
-	r.GET("/storage/vc/:id", h.GetCredentialByIdentifier)
-	r.PUT("/storage/vc/:id", h.UpdateCredential)
-	r.DELETE("/storage/vc/:id", h.DeleteCredential)
+	// Storage routes (authenticated)
+	storage := r.Group("/storage")
+	storage.Use(auth)
+	{
+		// Credentials
+		storage.GET("/vc", h.GetAllCredentials)
+		storage.POST("/vc", h.StoreCredential)
+		storage.GET("/vc/:id", h.GetCredentialByIdentifier)
+		storage.PUT("/vc/:id", h.UpdateCredential)
+		storage.DELETE("/vc/:id", h.DeleteCredential)
 
-	// Storage routes - Presentations
-	r.GET("/storage/vp", h.GetAllPresentations)
-	r.POST("/storage/vp", h.StorePresentation)
-	r.GET("/storage/vp/:id", h.GetPresentationByIdentifier)
-	r.DELETE("/storage/vp/:id", h.DeletePresentation)
+		// Presentations
+		storage.GET("/vp", h.GetAllPresentations)
+		storage.POST("/vp", h.StorePresentation)
+		storage.GET("/vp/:id", h.GetPresentationByIdentifier)
+		storage.DELETE("/vp/:id", h.DeletePresentation)
+	}
 
-	// Issuer routes
+	// Issuer routes (public)
 	r.GET("/issuer/all", h.GetAllIssuers)
 	r.GET("/issuer/:id", h.GetIssuerByID)
 
-	// Verifier routes
+	// Verifier routes (public)
 	r.GET("/verifier/all", h.GetAllVerifiers)
 
-	// Key attestation routes
+	// Key attestation routes (public)
 	r.GET("/wallet-provider/certificate", h.GetCertificate)
 	r.POST("/wallet-provider/key-attestation", h.GenerateKeyAttestation)
 
-	// Auth check
+	// Auth check (public - returns 200 always for token validation done by client)
 	r.GET("/auth/check", h.AuthCheck)
 }
 
@@ -358,4 +375,166 @@ func (r *Response) Debug() *Response {
 	fmt.Printf("=== Response ===\nStatus: %d\nHeaders: %v\nBody:\n%s\n================\n",
 		r.Response.StatusCode, r.Response.Header, r.Pretty())
 	return r
+}
+
+// TestUser represents a test user with authentication token
+type TestUser struct {
+	UUID        domain.UserID
+	DisplayName string
+	DID         string
+	Token       string
+	PrivateData []byte
+}
+
+// CreateTestUser creates a user directly in storage and generates a valid JWT token.
+// This bypasses WebAuthn authentication for testing authenticated endpoints.
+func (h *TestHarness) CreateTestUser(displayName string) *TestUser {
+	h.T.Helper()
+
+	ctx := context.Background()
+
+	// Create user
+	userID := domain.NewUserID()
+	now := time.Now()
+	did := fmt.Sprintf("did:key:%s", userID.String())
+	privateData := []byte(`{"testKey":"testValue"}`)
+
+	user := &domain.User{
+		UUID:            userID,
+		DisplayName:     &displayName,
+		DID:             did,
+		PrivateData:     privateData,
+		PrivateDataETag: domain.ComputePrivateDataETag(privateData),
+		WalletType:      domain.WalletTypeClient,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	// Store user
+	if err := h.Storage.Users().Create(ctx, user); err != nil {
+		h.T.Fatalf("Failed to create test user: %v", err)
+	}
+
+	// Generate token using UserService
+	token, err := h.Services.User.GenerateTokenForUser(user)
+	if err != nil {
+		h.T.Fatalf("Failed to generate token for test user: %v", err)
+	}
+
+	return &TestUser{
+		UUID:        userID,
+		DisplayName: displayName,
+		DID:         did,
+		Token:       token,
+		PrivateData: privateData,
+	}
+}
+
+// CreateTestUserWithCredentials creates a user with a mock WebAuthn credential.
+// Useful for testing credential management endpoints.
+func (h *TestHarness) CreateTestUserWithCredentials(displayName string) *TestUser {
+	h.T.Helper()
+
+	ctx := context.Background()
+
+	// Create user
+	userID := domain.NewUserID()
+	now := time.Now()
+	did := fmt.Sprintf("did:key:%s", userID.String())
+	privateData := []byte(`{"testKey":"testValue"}`)
+
+	// Create a mock credential
+	credential := domain.WebauthnCredential{
+		ID:              "test-credential-1",
+		CredentialID:    []byte("mock-credential-id-1"),
+		PublicKey:       []byte("mock-public-key"),
+		AttestationType: "none",
+		Transport:       []string{"internal"},
+		Flags:           0x45, // UP | UV | AT
+		Authenticator: domain.Authenticator{
+			AAGUID:    []byte("mock-aaguid-12345"),
+			SignCount: 0,
+		},
+		PRFCapable: false,
+		CreatedAt:  now,
+	}
+
+	user := &domain.User{
+		UUID:                userID,
+		DisplayName:         &displayName,
+		DID:                 did,
+		PrivateData:         privateData,
+		PrivateDataETag:     domain.ComputePrivateDataETag(privateData),
+		WalletType:          domain.WalletTypeClient,
+		WebauthnCredentials: []domain.WebauthnCredential{credential},
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+
+	// Store user
+	if err := h.Storage.Users().Create(ctx, user); err != nil {
+		h.T.Fatalf("Failed to create test user with credentials: %v", err)
+	}
+
+	// Generate token using UserService
+	token, err := h.Services.User.GenerateTokenForUser(user)
+	if err != nil {
+		h.T.Fatalf("Failed to generate token for test user: %v", err)
+	}
+
+	return &TestUser{
+		UUID:        userID,
+		DisplayName: displayName,
+		DID:         did,
+		Token:       token,
+		PrivateData: privateData,
+	}
+}
+
+// AuthGET makes an authenticated GET request
+func (h *TestHarness) AuthGET(user *TestUser, path string) *Response {
+	return h.AuthRequest(user, "GET", path, nil)
+}
+
+// AuthPOST makes an authenticated POST request
+func (h *TestHarness) AuthPOST(user *TestUser, path string, body interface{}) *Response {
+	return h.AuthRequest(user, "POST", path, body)
+}
+
+// AuthPUT makes an authenticated PUT request
+func (h *TestHarness) AuthPUT(user *TestUser, path string, body interface{}) *Response {
+	return h.AuthRequest(user, "PUT", path, body)
+}
+
+// AuthDELETE makes an authenticated DELETE request
+func (h *TestHarness) AuthDELETE(user *TestUser, path string) *Response {
+	return h.AuthRequest(user, "DELETE", path, nil)
+}
+
+// AuthRequest makes an authenticated HTTP request
+func (h *TestHarness) AuthRequest(user *TestUser, method, path string, body interface{}) *Response {
+	h.T.Helper()
+
+	var bodyReader io.Reader
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			h.T.Fatalf("Failed to marshal request body: %v", err)
+		}
+		bodyReader = bytes.NewReader(jsonBody)
+	}
+
+	req, err := http.NewRequest(method, h.BaseURL+path, bodyReader)
+	if err != nil {
+		h.T.Fatalf("Failed to create request: %v", err)
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Add authentication header
+	req.Header.Set("Authorization", "Bearer "+user.Token)
+
+	return h.Do(req)
 }
