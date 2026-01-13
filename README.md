@@ -1,5 +1,10 @@
 # Go Wallet Backend
 
+[![CI](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/sirosfoundation/go-wallet-backend)](https://goreportcard.com/report/github.com/sirosfoundation/go-wallet-backend)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wallet-backend.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wallet-backend)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **This is work in progress**
 
 This is a proof of concept re-implementation of wwWallet/wallet-backend-server in golang. The intention is to build a version of the wwWallet backend that is ready for large scale production deployment.
