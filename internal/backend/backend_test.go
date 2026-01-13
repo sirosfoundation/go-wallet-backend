@@ -108,3 +108,46 @@ func TestMemoryBackend_Close(t *testing.T) {
 		t.Errorf("expected no error on Close(), got %v", err)
 	}
 }
+
+func TestMemoryBackend_TenantStores(t *testing.T) {
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+	}
+
+	backend, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+
+	// Test Tenants store
+	if backend.Tenants() == nil {
+		t.Error("expected Tenants() to return non-nil store")
+	}
+
+	// Test UserTenants store
+	if backend.UserTenants() == nil {
+		t.Error("expected UserTenants() to return non-nil store")
+	}
+}
+
+func TestMemoryBackend_Ping(t *testing.T) {
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+	}
+
+	backend, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+
+	// Ping should succeed for memory backend
+	if err := backend.Ping(context.Background()); err != nil {
+		t.Errorf("expected no error on Ping(), got %v", err)
+	}
+}

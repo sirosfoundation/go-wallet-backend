@@ -276,3 +276,32 @@ func TestEvaluator_AddRootCert(t *testing.T) {
 		t.Error("expected error for invalid PEM")
 	}
 }
+
+func TestEvaluator_AddIntermediateCert(t *testing.T) {
+	caPEM, _ := generateTestCerts(t)
+
+	eval, err := NewEvaluator(&Config{RootCertificates: [][]byte{caPEM}})
+	if err != nil {
+		t.Fatalf("unexpected error creating evaluator: %v", err)
+	}
+
+	// Add an intermediate cert (using CA cert as example)
+	err = eval.AddIntermediateCert(caPEM)
+	if err != nil {
+		t.Errorf("unexpected error adding intermediate cert: %v", err)
+	}
+
+	// Invalid cert should fail
+	err = eval.AddIntermediateCert([]byte("not a cert"))
+	if err == nil {
+		t.Error("expected error for invalid PEM")
+	}
+}
+
+func TestNewEvaluatorFromPaths(t *testing.T) {
+	// Test with non-existent path
+	_, err := NewEvaluatorFromPaths([]string{"/nonexistent/path.pem"}, nil)
+	if err == nil {
+		t.Error("expected error for non-existent path")
+	}
+}

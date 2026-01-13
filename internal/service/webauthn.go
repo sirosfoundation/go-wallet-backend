@@ -144,15 +144,15 @@ type PublicKeyCredentialParameters struct {
 
 // PublicKeyCredentialDescriptor matches the TS format
 type PublicKeyCredentialDescriptor struct {
-	Type       string                          `json:"type"`
-	ID         taggedbinary.TaggedBytes        `json:"id"`
+	Type       string                            `json:"type"`
+	ID         taggedbinary.TaggedBytes          `json:"id"`
 	Transports []protocol.AuthenticatorTransport `json:"transports,omitempty"`
 }
 
 // AuthenticatorSelectionCriteria matches the TS format
 type AuthenticatorSelectionCriteria struct {
-	RequireResidentKey bool                              `json:"requireResidentKey"`
-	ResidentKey        protocol.ResidentKeyRequirement   `json:"residentKey"`
+	RequireResidentKey bool                                 `json:"requireResidentKey"`
+	ResidentKey        protocol.ResidentKeyRequirement      `json:"residentKey"`
 	UserVerification   protocol.UserVerificationRequirement `json:"userVerification"`
 }
 
@@ -174,14 +174,14 @@ type AuthenticationExtensions struct {
 
 // PublicKeyCredentialCreationOptions matches the TS format exactly
 type PublicKeyCredentialCreationOptions struct {
-	RP                     PublicKeyCredentialRpEntity      `json:"rp"`
-	User                   PublicKeyCredentialUserEntity    `json:"user"`
-	Challenge              taggedbinary.TaggedBytes         `json:"challenge"`
-	PubKeyCredParams       []PublicKeyCredentialParameters  `json:"pubKeyCredParams"`
-	ExcludeCredentials     []PublicKeyCredentialDescriptor  `json:"excludeCredentials"`
-	AuthenticatorSelection AuthenticatorSelectionCriteria   `json:"authenticatorSelection"`
-	Attestation            protocol.ConveyancePreference    `json:"attestation"`
-	Extensions             AuthenticationExtensions         `json:"extensions"`
+	RP                     PublicKeyCredentialRpEntity     `json:"rp"`
+	User                   PublicKeyCredentialUserEntity   `json:"user"`
+	Challenge              taggedbinary.TaggedBytes        `json:"challenge"`
+	PubKeyCredParams       []PublicKeyCredentialParameters `json:"pubKeyCredParams"`
+	ExcludeCredentials     []PublicKeyCredentialDescriptor `json:"excludeCredentials"`
+	AuthenticatorSelection AuthenticatorSelectionCriteria  `json:"authenticatorSelection"`
+	Attestation            protocol.ConveyancePreference   `json:"attestation"`
+	Extensions             AuthenticationExtensions        `json:"extensions"`
 }
 
 // CreateOptionsResponse wraps the creation options in publicKey (single level)
@@ -431,9 +431,9 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 // GetOptionsWrapper wraps WebAuthn assertion options in a publicKey property (matches reference impl)
 // PublicKeyCredentialRequestOptions matches the TS format exactly
 type PublicKeyCredentialRequestOptions struct {
-	RPId             string                          `json:"rpId"`
-	Challenge        taggedbinary.TaggedBytes        `json:"challenge"`
-	AllowCredentials []PublicKeyCredentialDescriptor `json:"allowCredentials"`
+	RPId             string                               `json:"rpId"`
+	Challenge        taggedbinary.TaggedBytes             `json:"challenge"`
+	AllowCredentials []PublicKeyCredentialDescriptor      `json:"allowCredentials"`
 	UserVerification protocol.UserVerificationRequirement `json:"userVerification"`
 }
 

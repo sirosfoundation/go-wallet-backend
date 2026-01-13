@@ -364,3 +364,242 @@ func TestUserService_ValidateToken_WrongSecret(t *testing.T) {
 		t.Error("ValidateToken() with wrong secret should return error")
 	}
 }
+
+func TestUserService_GetPrivateData(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user with private data
+	username := "privatedata"
+	password := "password123"
+	privateData := []byte(`{"key": "value"}`)
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Private Data User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+		PrivateData: privateData,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Get private data
+	data, etag, err := service.GetPrivateData(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetPrivateData() error = %v", err)
+	}
+
+	if string(data) != string(privateData) {
+		t.Errorf("GetPrivateData() data = %s, want %s", data, privateData)
+	}
+
+	if etag == "" {
+		t.Error("GetPrivateData() etag should not be empty")
+	}
+}
+
+func TestUserService_UpdatePrivateData(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "updateprivate"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Update Private User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+		PrivateData: []byte("initial"),
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Get initial ETag
+	_, initialEtag, err := service.GetPrivateData(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetPrivateData() error = %v", err)
+	}
+
+	// Update private data
+	newData := []byte("updated")
+	newEtag, err := service.UpdatePrivateData(ctx, user.UUID, newData, initialEtag)
+	if err != nil {
+		t.Fatalf("UpdatePrivateData() error = %v", err)
+	}
+
+	if newEtag == initialEtag {
+		t.Error("UpdatePrivateData() should return new ETag")
+	}
+
+	// Verify update
+	data, _, err := service.GetPrivateData(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetPrivateData() error = %v", err)
+	}
+
+	if string(data) != "updated" {
+		t.Errorf("GetPrivateData() after update = %s, want updated", data)
+	}
+}
+
+func TestUserService_UpdatePrivateData_ETagConflict(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "etagconflict"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "ETag Conflict User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+		PrivateData: []byte("initial"),
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Try to update with wrong ETag
+	_, err = service.UpdatePrivateData(ctx, user.UUID, []byte("new"), "wrong-etag")
+	if err != ErrPrivateDataConflict {
+		t.Errorf("UpdatePrivateData() with wrong ETag should return ErrPrivateDataConflict, got %v", err)
+	}
+}
+
+func TestUserService_DeleteUser(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "deleteuser"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Delete User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Delete user
+	err = service.DeleteUser(ctx, user.UUID, user.DID)
+	if err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify user is deleted
+	_, err = service.GetUserByID(ctx, user.UUID)
+	if err == nil {
+		t.Error("GetUserByID() after deletion should return error")
+	}
+}
+
+func TestUserService_GenerateTokenForUser(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "generatetoken"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Generate Token User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Generate token directly
+	token, err := service.GenerateTokenForUser(user)
+	if err != nil {
+		t.Fatalf("GenerateTokenForUser() error = %v", err)
+	}
+
+	if token == "" {
+		t.Error("GenerateTokenForUser() returned empty token")
+	}
+
+	// Validate the token
+	userID, err := service.ValidateToken(token)
+	if err != nil {
+		t.Fatalf("ValidateToken() error = %v", err)
+	}
+
+	if userID.String() != user.UUID.String() {
+		t.Errorf("ValidateToken() returned wrong user ID")
+	}
+}
+
+func TestUserService_UpdateUser(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "updateuser"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Original Name",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Update user
+	newName := "Updated Name"
+	user.DisplayName = &newName
+	err = service.UpdateUser(ctx, user)
+	if err != nil {
+		t.Fatalf("UpdateUser() error = %v", err)
+	}
+
+	// Verify update
+	updated, err := service.GetUserByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetUserByID() error = %v", err)
+	}
+
+	if updated.DisplayName == nil || *updated.DisplayName != newName {
+		t.Errorf("UpdateUser() DisplayName = %v, want %s", updated.DisplayName, newName)
+	}
+}

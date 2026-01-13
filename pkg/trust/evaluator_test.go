@@ -3,6 +3,8 @@ package trust
 import (
 	"context"
 	"testing"
+
+	"github.com/sirosfoundation/go-trust/pkg/trustapi"
 )
 
 func TestEvaluatorManager_NoEvaluators(t *testing.T) {
@@ -139,4 +141,187 @@ func (m *mockEvaluator) SupportedResourceTypes() []ResourceType {
 
 func (m *mockEvaluator) Healthy() bool {
 	return m.healthy
+}
+
+func TestEvaluationRequest_GetSubjectID(t *testing.T) {
+	tests := []struct {
+		name string
+		req  EvaluationRequest
+		want string
+	}{
+		{
+			name: "prefers new SubjectID",
+			req:  EvaluationRequest{EvaluationRequest: trustapi.EvaluationRequest{SubjectID: "new-id"}, Subject: Subject{ID: "legacy-id"}},
+			want: "new-id",
+		},
+		{
+			name: "falls back to legacy Subject.ID",
+			req:  EvaluationRequest{Subject: Subject{ID: "legacy-id"}},
+			want: "legacy-id",
+		},
+		{
+			name: "empty if both empty",
+			req:  EvaluationRequest{},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.req.GetSubjectID(); got != tt.want {
+				t.Errorf("GetSubjectID() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluationRequest_GetKeyType(t *testing.T) {
+	tests := []struct {
+		name string
+		req  EvaluationRequest
+		want KeyType
+	}{
+		{
+			name: "prefers new KeyType",
+			req:  EvaluationRequest{EvaluationRequest: trustapi.EvaluationRequest{KeyType: KeyTypeJWK}, Resource: Resource{Type: KeyTypeX5C}},
+			want: KeyTypeJWK,
+		},
+		{
+			name: "falls back to legacy Resource.Type",
+			req:  EvaluationRequest{Resource: Resource{Type: KeyTypeX5C}},
+			want: KeyTypeX5C,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.req.GetKeyType(); got != tt.want {
+				t.Errorf("GetKeyType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluationRequest_GetKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		req      EvaluationRequest
+		wantType string
+	}{
+		{
+			name:     "prefers new Key",
+			req:      EvaluationRequest{EvaluationRequest: trustapi.EvaluationRequest{Key: "new-key"}, Resource: Resource{Key: "legacy-key"}},
+			wantType: "string",
+		},
+		{
+			name:     "falls back to legacy Resource.Key",
+			req:      EvaluationRequest{Resource: Resource{Key: "legacy-key"}},
+			wantType: "string",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.req.GetKey()
+			if got == nil && tt.wantType != "" {
+				t.Errorf("GetKey() = nil, want non-nil")
+			}
+		})
+	}
+}
+
+func TestEvaluationRequest_GetAction(t *testing.T) {
+	tests := []struct {
+		name string
+		req  EvaluationRequest
+		want string
+	}{
+		{
+			name: "prefers new Action",
+			req:  EvaluationRequest{EvaluationRequest: trustapi.EvaluationRequest{Action: "new-action"}, LegacyAction: &Action{Name: "legacy-action"}},
+			want: "new-action",
+		},
+		{
+			name: "falls back to legacy LegacyAction",
+			req:  EvaluationRequest{LegacyAction: &Action{Name: "legacy-action"}},
+			want: "legacy-action",
+		},
+		{
+			name: "empty if both nil/empty",
+			req:  EvaluationRequest{},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.req.GetAction(); got != tt.want {
+				t.Errorf("GetAction() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEvaluationResponse_ToTrustDecision(t *testing.T) {
+	resp := &EvaluationResponse{
+		Decision:      true,
+		Reason:        "test reason",
+		TrustMetadata: map[string]string{"key": "value"},
+	}
+
+	decision := resp.ToTrustDecision()
+	if decision == nil {
+		t.Fatal("ToTrustDecision() returned nil")
+	}
+	if !decision.Trusted {
+		t.Error("ToTrustDecision().Trusted = false, want true")
+	}
+	if decision.Reason != "test reason" {
+		t.Errorf("ToTrustDecision().Reason = %v, want test reason", decision.Reason)
+	}
+}
+
+func TestFromTrustDecision(t *testing.T) {
+	decision := &trustapi.TrustDecision{
+		Trusted:  true,
+		Reason:   "trusted reason",
+		Metadata: map[string]string{"foo": "bar"},
+	}
+
+	resp := FromTrustDecision(decision)
+	if resp == nil {
+		t.Fatal("FromTrustDecision() returned nil")
+	}
+	if !resp.Decision {
+		t.Error("FromTrustDecision().Decision = false, want true")
+	}
+	if resp.Reason != "trusted reason" {
+		t.Errorf("FromTrustDecision().Reason = %v, want trusted reason", resp.Reason)
+	}
+}
+
+func TestEvaluatorManager_Name(t *testing.T) {
+	manager := NewEvaluatorManager()
+	if name := manager.Name(); name != "composite" {
+		t.Errorf("Name() = %v, want composite", name)
+	}
+}
+
+func TestEvaluatorManager_SupportedResourceTypes(t *testing.T) {
+	manager := NewEvaluatorManager()
+
+	// Empty manager supports nothing
+	types := manager.SupportedResourceTypes()
+	if len(types) != 0 {
+		t.Errorf("Empty manager SupportedResourceTypes() = %v, want []", types)
+	}
+
+	// Add evaluators with different types
+	manager.AddEvaluator(&mockEvaluator{types: []ResourceType{ResourceTypeX5C}})
+	manager.AddEvaluator(&mockEvaluator{types: []ResourceType{ResourceTypeJWK}})
+
+	types = manager.SupportedResourceTypes()
+	if len(types) != 2 {
+		t.Errorf("SupportedResourceTypes() has %d types, want 2", len(types))
+	}
 }
