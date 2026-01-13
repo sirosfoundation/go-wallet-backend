@@ -4,68 +4,69 @@
 
 This document describes the design for supporting multiple tenants in the go-wallet-backend. A tenant represents an isolated organization or deployment that shares the same backend infrastructure but maintains complete data isolation.
 
+## Document Status
+
+| Aspect | Status |
+|--------|--------|
+| **Overall Status** | 🟢 **DECIDED** |
+| **Last Updated** | 2026-01-13 |
+| **Decision** | URL Path-Based Routing with Tenant-Scoped WebAuthn |
+
 ## Requirements
 
 1. **User-Tenant Association**: A user can belong to multiple tenants
 2. **Data Isolation**: Credentials, presentations, and related data must be completely isolated between tenants
-3. **URL Routing**: All tenants accessible under the same domain
+3. **URL Routing**: All tenants accessible under the same domain via URL path prefix
 4. **Shared Infrastructure**: Single deployment serves all tenants
 5. **Per-Tenant Configuration**: Issuers, verifiers, and trust configuration can be tenant-specific
 6. **CDN-Friendly**: Frontend assets must be fully cacheable; no tenant-specific builds
+7. **Tenant-Scoped Authentication**: WebAuthn passkeys are bound to specific tenants
+8. **Cross-Tenant Passkey Prohibition**: No "master" passkeys that work across multiple tenants
 
-## Tenant Identification Strategy Analysis
+## Tenant Identification Strategy
 
-### Option A: URL Path Prefix (Server-Side Routing)
+### Decision: URL Path Prefix (Server-Side Routing) ✅ CHOSEN
 
 ```
 https://example.com/acme-corp/storage/vc
 https://example.com/acme-corp/user/session/account-info
 ```
 
-**Pros:**
-- Clean REST semantics
-- Server can route directly
-- Standard pattern for multi-tenant SaaS
+**Rationale for choosing URL path over fragment-based routing:**
 
-**Cons:**
-- Requires CDN path-based routing rules or no CDN for frontend
-- Either build tenant-specific frontends OR use complex CDN rewrites
-- Creates deployment silos - defeats scalability goal
+| Factor | URL Path | Fragment |
+|--------|----------|----------|
+| RESTful semantics | ✅ Clean | ❌ Non-standard |
+| OAuth redirect simplicity | ✅ Path preserved | ⚠️ Requires state encoding |
+| Deep linking | ✅ Natural | ✅ Works |
+| Server visibility | ✅ Full | ❌ Fragment not sent |
+| Debuggability | ✅ Visible in logs | ❌ Hidden |
+| Consistency with go-as4 | ✅ Same pattern | ❌ Different |
+| CDN configuration | ⚠️ SPA rewrite rule | ✅ None needed |
 
-### Option B: URL Fragment (Client-Side Tenant Selection) ✅ RECOMMENDED
+**The CDN concern is mitigated**: Modern CDNs (CloudFront, Cloudflare, Vercel) handle SPA routing trivially with a single rewrite rule (`/*` → `index.html`).
 
+### Rejected Alternatives
+
+#### Option B: URL Fragment (Client-Side)
 ```
-https://example.com/#acme-corp
 https://example.com/#acme-corp/settings
 ```
+Rejected because: Non-RESTful, fragment not visible server-side, inconsistent with go-as4.
 
-**Pros:**
-- **CDN-Perfect**: Single frontend build serves all tenants
-- **No Server Routing**: Fragment never hits the server for static assets
-- **Dynamic Tenant Switching**: User can switch tenants without reload
-- **Deep Linking**: `/#tenant/path` still works for internal navigation
-- **Same-Origin**: All API calls from same origin, simple CORS
-
-**Cons:**
-- Requires frontend to parse fragment and inject into API calls
-- Fragment lost on some OAuth redirects (mitigated - see below)
-- Non-standard REST pattern (tenant in header, not path)
-
-### Option C: Subdomain per Tenant
-
+#### Option C: Subdomain per Tenant
 ```
 https://acme-corp.example.com/storage/vc
 ```
+Rejected because: WebAuthn RP ID complexity, wildcard DNS/SSL requirements, cookie isolation issues.
 
-**Pros:**
-- Clean separation
-- Natural for DNS-based routing
+---
 
-**Cons:**
-- Requires wildcard DNS and SSL certificates
-- WebAuthn RP ID complexity (needs rpId configuration per subdomain)
-- More complex CDN configuration
-- Cookie isolation complexities
+## Appendix: Historical Analysis
+
+> **Note**: The following sections contain the analysis performed during the design phase. 
+> The decision was made to use **URL path-based routing** (Option B in Path Routing section).
+> This analysis is preserved for reference.
 
 ## Frontend SPA Route Analysis
 
@@ -379,7 +380,7 @@ This analysis is provided for team discussion. The recommended approach depends 
 3. Team preference for URL aesthetics vs. operational simplicity
 4. OAuth flow complexity tolerance
 
-## Recommended Design: URL Fragment + HTTP Header
+## Chosen Design: URL Path Routing
 
 ### Architecture Overview
 
@@ -389,22 +390,23 @@ This analysis is provided for team discussion. The recommended approach depends 
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │  Static Assets: example.com/*                               │ │
 │  │  - Same cached bundle for ALL tenants                       │ │
-│  │  - SPA routes handled client-side                           │ │
+│  │  - SPA rewrite: /* → /index.html (standard pattern)         │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────┘
                                │
-                               │ API calls include X-Tenant-ID header
+                               │ API calls include tenant in URL path
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                      API Gateway / Load Balancer                  │
-│  api.example.com/* or example.com/api/*                          │
+│  example.com/api/{tenantID}/* or example.com/{tenantID}/api/*    │
 └──────────────────────────────────────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                    go-wallet-backend                              │
-│  - Extracts tenant from X-Tenant-ID header                       │
-│  - Validates tenant membership                                    │
+│  - Extracts tenant from URL path parameter                       │
+│  - Validates tenant exists and is active                         │
+│  - Validates user is member of tenant                            │
 │  - Routes to tenant-scoped data                                   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -413,37 +415,239 @@ This analysis is provided for team discussion. The recommended approach depends 
 
 **Frontend URLs (handled by SPA router):**
 ```
-https://example.com/                    → Tenant selection page (or default)
-https://example.com/#acme-corp          → Home page for acme-corp tenant
-https://example.com/#acme-corp/settings → Settings page for acme-corp tenant
-https://example.com/#acme-corp/credential/123 → Deep link to credential
+https://example.com/                       → Global login / tenant selection
+https://example.com/login                  → Global WebAuthn login (tenant-discovering)
+https://example.com/acme-corp/             → Home page for acme-corp tenant
+https://example.com/acme-corp/settings     → Settings page for acme-corp tenant
+https://example.com/acme-corp/credential/123 → Deep link to credential
+https://example.com/acme-corp/cb?code=xyz  → OAuth callback (tenant in path)
 ```
 
-**API URLs (backend - tenant in header):**
+**Backend API URLs (tenant in path):**
 ```
-POST https://example.com/api/storage/vc
-Header: X-Tenant-ID: acme-corp
-Header: Authorization: Bearer <jwt>
+# Global endpoints (no tenant)
+GET  /health
+GET  /status
+GET  /tenants                              # List public tenants
+GET  /tenants/{tenantID}                   # Get tenant info/branding
+POST /login/webauthn/start                 # Global login - tenant-discovering
+POST /login/webauthn/finish                # Returns tenant from userHandle
+
+# Tenant-scoped endpoints
+POST /{tenantID}/webauthn/register/start   # Register passkey for this tenant
+POST /{tenantID}/webauthn/register/finish
+GET  /{tenantID}/user/session/account-info
+GET  /{tenantID}/user/session/private-data
+PUT  /{tenantID}/user/session/private-data
+GET  /{tenantID}/storage/vc
+POST /{tenantID}/storage/vc
+DELETE /{tenantID}/storage/vc/{credentialId}
+GET  /{tenantID}/storage/vp
+POST /{tenantID}/storage/vp
+GET  /{tenantID}/issuer/all
+GET  /{tenantID}/verifier/all
+
+# User's tenant list (auth required, global)
+GET  /user/tenants
 ```
 
-### Fragment Format Options
+### Consistency with go-as4
 
-**Option 1: Simple Fragment (Recommended)**
-```
-example.com/#tenant-id
-example.com/#tenant-id/route/path
-```
-- Fragment starts with tenant ID
-- Route follows after `/`
-- Easy to parse: `hash.split('/')[0]` for tenant
+This URL structure mirrors the go-as4 multi-tenant pattern:
 
-**Option 2: Query-like Fragment**
-```
-example.com/#tenant=acme-corp&route=/settings
-```
-- More explicit but harder to use with React Router
+```go
+// go-as4 pattern:
+// POST /tenant/{tenantID}/as4
+// GET  /tenant/{tenantID}/api/messages
 
-**Recommendation:** Option 1 - Simple hierarchical fragment
+// go-wallet-backend pattern:
+// POST /{tenantID}/webauthn/register/start
+// GET  /{tenantID}/storage/vc
+```
+
+## Tenant-Scoped WebAuthn Authentication
+
+### Design Decision
+
+WebAuthn passkeys are **bound to specific tenants** via the user handle. This provides:
+
+1. **Single login page** - User doesn't need to know/select tenant before authenticating
+2. **Tenant discovery** - Tenant is extracted from the passkey's user handle
+3. **Security isolation** - Each tenant has separate passkeys; no cross-tenant keys
+
+### User Handle Encoding
+
+The WebAuthn `user.id` field (user handle) encodes the tenant:
+
+```
+Format: {tenantId}:{userId}
+Example: acme-corp:550e8400-e29b-41d4-a716-446655440000
+```
+
+This user handle is:
+- Set during registration (tenant-scoped endpoint)
+- Stored with the credential by the authenticator
+- Returned during authentication assertion
+- Used to discover the tenant during global login
+
+### Implementation
+
+```go
+// pkg/webauthn/userhandle.go
+
+// EncodeUserHandle creates a tenant-scoped user handle
+func EncodeUserHandle(tenantID, userID string) []byte {
+    combined := fmt.Sprintf("%s:%s", tenantID, userID)
+    return []byte(combined)
+}
+
+// DecodeUserHandle extracts tenant and user from a user handle
+func DecodeUserHandle(handle []byte) (tenantID, userID string, err error) {
+    parts := strings.SplitN(string(handle), ":", 2)
+    if len(parts) != 2 {
+        return "", "", fmt.Errorf("invalid user handle format")
+    }
+    return parts[0], parts[1], nil
+}
+```
+
+### Registration Flow (Tenant-Scoped)
+
+```
+User navigates to: /acme-corp/settings → "Add Passkey"
+                          │
+                          ▼
+POST /{tenantID}/webauthn/register/start
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  PublicKeyCredentialCreationOptions                     │
+│  user: {                                                │
+│    id: "acme-corp:550e8400-...",  ← tenant-encoded     │
+│    name: "alice@acme-corp",                             │
+│    displayName: "Alice Smith (Acme Corp)"               │
+│  }                                                      │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+        Authenticator creates passkey with this user handle
+                          │
+                          ▼
+POST /{tenantID}/webauthn/register/finish
+                          │
+                          ▼
+   Store credential with tenant_id in database (guardrail)
+```
+
+### Login Flow (Global, Tenant-Discovering)
+
+```
+User navigates to: /login (no tenant selected)
+                          │
+                          ▼
+POST /login/webauthn/start
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  PublicKeyCredentialRequestOptions                      │
+│  allowCredentials: [] (empty = discoverable)            │
+│  userVerification: "required"                           │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+        Browser shows all passkeys for this RP
+        User sees: "Alice Smith (Acme Corp)"
+                   "Alice Smith (University)"
+        User selects one
+                          │
+                          ▼
+POST /login/webauthn/finish
+Body: { assertion with userHandle: "acme-corp:550e8400-..." }
+                          │
+                          ▼
+   Backend parses userHandle → tenant: acme-corp, user: 550e8400-...
+   Validates tenant is active
+   Validates user is member of tenant
+   Issues JWT with tenant claim
+                          │
+                          ▼
+Response: {
+  token: "eyJ...",
+  tenant_id: "acme-corp",
+  redirect: "/acme-corp/"
+}
+                          │
+                          ▼
+        Frontend redirects to /acme-corp/
+```
+
+### Credential Storage Guardrail
+
+In addition to encoding tenant in the user handle, we **also store the tenant association** in the WebAuthn credentials table:
+
+```go
+// domain/webauthn.go
+
+type WebAuthnCredential struct {
+    ID              int64    `json:"id" gorm:"primaryKey;autoIncrement"`
+    TenantID        TenantID `json:"tenant_id" gorm:"index;not null"` // ← Guardrail
+    UserID          UserID   `json:"user_id" gorm:"index;not null"`
+    CredentialID    []byte   `json:"credential_id" gorm:"uniqueIndex;not null"`
+    PublicKey       []byte   `json:"public_key" gorm:"not null"`
+    AttestationType string   `json:"attestation_type"`
+    AAGUID          []byte   `json:"aaguid"`
+    SignCount       uint32   `json:"sign_count"`
+    CreatedAt       time.Time `json:"created_at" gorm:"autoCreateTime"`
+}
+```
+
+This provides defense-in-depth:
+- **Primary check**: Tenant from user handle
+- **Secondary check**: Credential's stored tenant matches claimed tenant
+
+### Passkey Display Names
+
+During registration, we set descriptive names so users can distinguish passkeys:
+
+```go
+user := webauthn.User{
+    ID:          EncodeUserHandle(tenantID, userID),
+    Name:        fmt.Sprintf("%s@%s", username, tenantID),
+    DisplayName: fmt.Sprintf("%s (%s)", displayName, tenantDisplayName),
+}
+
+// Results in passkey display like:
+// "Alice Smith (Acme Corp)"
+// "Alice Smith (University)"
+```
+
+### Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| User removed from tenant | Passkey exists but `IsTenantMember()` check fails at login |
+| Tenant disabled | Tenant validation rejects login |
+| User has multiple passkeys for same tenant | Allowed (laptop + phone) |
+| No passkey found | Show "No passkeys found" + link to specific tenant registration |
+| Attempt to use passkey for wrong tenant | User handle tenant doesn't match; rejected |
+
+### Security Properties
+
+| Property | Guarantee |
+|----------|-----------|
+| **No cross-tenant passkeys** | User handle encodes single tenant; registration is tenant-scoped |
+| **Tenant isolation** | Compromise of one tenant's passkey doesn't affect others |
+| **Audit trail** | Credential table records which tenant each passkey belongs to |
+| **Migration-safe** | Old passkeys without tenant encoding will fail validation |
+
+### Migration Impact
+
+Existing users must **re-register passkeys** after multi-tenancy is enabled:
+
+1. Old passkeys have user handles without tenant encoding
+2. These will fail `DecodeUserHandle()` validation
+3. Users must register new passkeys via tenant-scoped endpoint
+4. Old credentials can be cleaned up after migration period
 
 ## Data Model Changes
 
@@ -593,38 +797,41 @@ type Store interface {
 
 ## API Changes
 
-### URL Structure (Header-Based)
+### URL Structure (Path-Based)
 
-Backend API URLs remain unchanged - tenant is passed via HTTP header:
-
-```
-# All API calls use the same path structure
-POST https://example.com/api/storage/vc
-Header: X-Tenant-ID: acme-corp
-Header: Authorization: Bearer <jwt>
-
-GET https://example.com/api/user/session/account-info
-Header: X-Tenant-ID: acme-corp
-Header: Authorization: Bearer <jwt>
-```
-
-### New Endpoints
+Backend API uses URL path parameters for tenant identification (consistent with go-as4):
 
 ```
-# Global endpoints (no tenant header required)
-GET  /api/status                  → Health check
-GET  /api/tenants                 → List public tenants
-GET  /api/tenants/:id             → Get tenant metadata (public info)
+# Global endpoints (no tenant in path)
+GET  /health
+GET  /status
+GET  /tenants                              # List public tenants  
+GET  /tenants/{tenantID}                   # Get tenant metadata
+POST /login/webauthn/start                 # Global login (tenant-discovering)
+POST /login/webauthn/finish                # Returns tenant from userHandle
+GET  /user/tenants                         # List user's tenants (auth required)
 
-# User endpoints (tenant-aware after login)
-GET  /api/user/tenants            → List tenants for current user
-POST /api/user/tenant/:id/join    → Request to join a tenant (if allowed)
+# Tenant-scoped endpoints (tenant in path)
+POST /{tenantID}/webauthn/register/start   # Register passkey for this tenant
+POST /{tenantID}/webauthn/register/finish
+GET  /{tenantID}/user/session/account-info
+GET  /{tenantID}/user/session/private-data
+PUT  /{tenantID}/user/session/private-data
+GET  /{tenantID}/storage/vc
+POST /{tenantID}/storage/vc
+PUT  /{tenantID}/storage/vc/update
+DELETE /{tenantID}/storage/vc/{credentialId}
+GET  /{tenantID}/storage/vp
+POST /{tenantID}/storage/vp
+DELETE /{tenantID}/storage/vp/{presentationId}
+GET  /{tenantID}/issuer/all
+GET  /{tenantID}/verifier/all
 ```
 
-### Router Changes
+### Router Implementation
 
 ```go
-// cmd/server/main.go - setupRouter changes
+// cmd/server/main.go - setupRouter (path-based routing like go-as4)
 
 func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Logger) *gin.Engine {
     router := gin.New()
@@ -632,37 +839,38 @@ func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Log
 
     handlers := api.NewHandlers(services, cfg, logger)
 
-    // API routes under /api prefix
-    api := router.Group("/api")
+    // Global routes (no tenant)
+    router.GET("/health", handlers.Health)
+    router.GET("/status", handlers.Status)
+    router.GET("/tenants", handlers.ListPublicTenants)
+    router.GET("/tenants/:tenantID", handlers.GetTenantInfo)
     
-    // Global routes (no tenant header required)
+    // Global WebAuthn login (tenant-discovering)
+    router.POST("/login/webauthn/start", handlers.StartGlobalWebAuthnLogin)
+    router.POST("/login/webauthn/finish", handlers.FinishGlobalWebAuthnLogin)
+    
+    // User's tenant list (auth required, global)
+    router.GET("/user/tenants", middleware.AuthMiddleware(cfg), handlers.GetUserTenants)
+    
+    // Tenant-scoped routes
+    tenant := router.Group("/:tenantID")
+    tenant.Use(middleware.TenantPathMiddleware(services))
     {
-        api.GET("/status", handlers.Status)
-        api.GET("/tenants", handlers.ListPublicTenants)
-        api.GET("/tenants/:id", handlers.GetTenantInfo)
-    }
-
-    // Tenant-scoped routes (require X-Tenant-ID header)
-    tenantScoped := api.Group("/")
-    tenantScoped.Use(middleware.TenantHeaderMiddleware(services)) // Extract from header
-    {
-        // WebAuthn registration/login - tenant context needed for membership
-        user := tenantScoped.Group("/user")
-        {
-            user.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
-            user.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-            user.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-            user.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
-        }
+        // WebAuthn registration (tenant-scoped)
+        tenant.POST("/webauthn/register/start", 
+            middleware.AuthMiddleware(cfg),
+            middleware.TenantMembershipMiddleware(services),
+            handlers.StartWebAuthnRegistration)
+        tenant.POST("/webauthn/register/finish",
+            middleware.AuthMiddleware(cfg),
+            middleware.TenantMembershipMiddleware(services),
+            handlers.FinishWebAuthnRegistration)
 
         // Protected routes (authenticated + tenant member)
-        protected := tenantScoped.Group("/")
-        protected.Use(middleware.AuthMiddleware(cfg, logger))
+        protected := tenant.Group("/")
+        protected.Use(middleware.AuthMiddleware(cfg))
         protected.Use(middleware.TenantMembershipMiddleware(services))
         {
-            // User's tenant list
-            protected.GET("/user/tenants", handlers.GetUserTenants)
-            
             // Session routes
             session := protected.Group("/user/session")
             {
@@ -671,21 +879,20 @@ func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Log
                 session.PUT("/private-data", handlers.PutPrivateData)
             }
 
-            // Storage routes - tenant-scoped
-            storageGroup := protected.Group("/storage")
+            // Storage routes
+            storage := protected.Group("/storage")
             {
-                storageGroup.GET("/vc", handlers.GetAllCredentials)
-                storageGroup.POST("/vc", handlers.StoreCredential)
-                storageGroup.DELETE("/vc/:credentialId", handlers.DeleteCredential)
-                storageGroup.GET("/vp", handlers.GetAllPresentations)
-                storageGroup.POST("/vp", handlers.StorePresentation)
-                storageGroup.DELETE("/vp/:presentationId", handlers.DeletePresentation)
+                storage.GET("/vc", handlers.GetAllCredentials)
+                storage.POST("/vc", handlers.StoreCredential)
+                storage.PUT("/vc/update", handlers.UpdateCredential)
+                storage.DELETE("/vc/:credentialId", handlers.DeleteCredential)
+                storage.GET("/vp", handlers.GetAllPresentations)
+                storage.POST("/vp", handlers.StorePresentation)
+                storage.DELETE("/vp/:presentationId", handlers.DeletePresentation)
             }
 
-            // Issuer routes - tenant-scoped
+            // Issuer/Verifier routes
             protected.GET("/issuer/all", handlers.GetAllIssuers)
-            
-            // Verifier routes - tenant-scoped  
             protected.GET("/verifier/all", handlers.GetAllVerifiers)
         }
     }
@@ -694,17 +901,17 @@ func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Log
 }
 ```
 
-### Middleware (Header-Based)
+### Middleware (Path-Based)
 
 ```go
 // pkg/middleware/tenant.go
 
-// TenantHeaderMiddleware extracts the tenant from X-Tenant-ID header
-func TenantHeaderMiddleware(services *service.Services) gin.HandlerFunc {
+// TenantPathMiddleware extracts the tenant from URL path parameter
+func TenantPathMiddleware(services *service.Services) gin.HandlerFunc {
     return func(c *gin.Context) {
-        tenantIDStr := c.GetHeader("X-Tenant-ID")
+        tenantIDStr := c.Param("tenantID")
         if tenantIDStr == "" {
-            c.AbortWithStatusJSON(400, gin.H{"error": "X-Tenant-ID header required"})
+            c.AbortWithStatusJSON(400, gin.H{"error": "tenant ID required in path"})
             return
         }
         
@@ -712,12 +919,12 @@ func TenantHeaderMiddleware(services *service.Services) gin.HandlerFunc {
         
         tenant, err := services.Tenant.GetByID(c.Request.Context(), tenantID)
         if err != nil {
-            c.AbortWithStatusJSON(404, gin.H{"error": "Tenant not found"})
+            c.AbortWithStatusJSON(404, gin.H{"error": "tenant not found"})
             return
         }
         
         if !tenant.Enabled {
-            c.AbortWithStatusJSON(403, gin.H{"error": "Tenant is disabled"})
+            c.AbortWithStatusJSON(403, gin.H{"error": "tenant is disabled"})
             return
         }
         
@@ -739,7 +946,7 @@ func TenantMembershipMiddleware(services *service.Services) gin.HandlerFunc {
             tenantID.(domain.TenantID),
         )
         if err != nil || !isMember {
-            c.AbortWithStatusJSON(403, gin.H{"error": "Not a member of this tenant"})
+            c.AbortWithStatusJSON(403, gin.H{"error": "not a member of this tenant"})
             return
         }
         
@@ -748,14 +955,103 @@ func TenantMembershipMiddleware(services *service.Services) gin.HandlerFunc {
 }
 ```
 
-### Handler Changes
+### Global WebAuthn Login Handler
 
-Handlers need to extract `tenant_id` from context:
+```go
+// api/handlers_webauthn.go
+
+// StartGlobalWebAuthnLogin initiates a discoverable credential login
+// No tenant is specified - tenant will be discovered from the passkey
+func (h *Handlers) StartGlobalWebAuthnLogin(c *gin.Context) {
+    // Create assertion options for discoverable credentials
+    options, sessionData, err := h.webauthn.BeginDiscoverableLogin()
+    if err != nil {
+        c.JSON(500, gin.H{"error": "failed to begin login"})
+        return
+    }
+    
+    // Store session data
+    h.challengeStore.Store(sessionData.Challenge, sessionData)
+    
+    c.JSON(200, options)
+}
+
+// FinishGlobalWebAuthnLogin completes login and discovers tenant from userHandle
+func (h *Handlers) FinishGlobalWebAuthnLogin(c *gin.Context) {
+    var assertion protocol.CredentialAssertionResponse
+    if err := c.BindJSON(&assertion); err != nil {
+        c.JSON(400, gin.H{"error": "invalid assertion"})
+        return
+    }
+    
+    // Extract tenant and user from userHandle
+    tenantID, userID, err := webauthn.DecodeUserHandle(assertion.Response.UserHandle)
+    if err != nil {
+        c.JSON(400, gin.H{"error": "invalid user handle format"})
+        return
+    }
+    
+    // Validate tenant exists and is active
+    tenant, err := h.services.Tenant.GetByID(c.Request.Context(), domain.TenantID(tenantID))
+    if err != nil || !tenant.Enabled {
+        c.JSON(403, gin.H{"error": "tenant not found or disabled"})
+        return
+    }
+    
+    // Validate user is member of tenant
+    isMember, err := h.services.UserTenant.IsMember(c.Request.Context(), 
+        domain.UserID(userID), domain.TenantID(tenantID))
+    if err != nil || !isMember {
+        c.JSON(403, gin.H{"error": "user is not a member of this tenant"})
+        return
+    }
+    
+    // Get user and credential
+    user, err := h.services.User.GetByID(c.Request.Context(), domain.UserID(userID))
+    if err != nil {
+        c.JSON(404, gin.H{"error": "user not found"})
+        return
+    }
+    
+    // Verify the credential belongs to this tenant (guardrail check)
+    credential, err := h.services.WebAuthn.GetCredentialByID(
+        c.Request.Context(), 
+        domain.TenantID(tenantID),
+        assertion.ID,
+    )
+    if err != nil || credential.TenantID != domain.TenantID(tenantID) {
+        c.JSON(403, gin.H{"error": "credential not valid for this tenant"})
+        return
+    }
+    
+    // Verify assertion
+    if err := h.webauthn.ValidateDiscoverableLogin(assertion, sessionData, credential); err != nil {
+        c.JSON(401, gin.H{"error": "authentication failed"})
+        return
+    }
+    
+    // Issue JWT with tenant claim
+    token, err := h.issueJWT(user, domain.TenantID(tenantID))
+    if err != nil {
+        c.JSON(500, gin.H{"error": "failed to issue token"})
+        return
+    }
+    
+    c.JSON(200, gin.H{
+        "token":     token,
+        "tenant_id": tenantID,
+        "user_id":   userID,
+        "redirect":  fmt.Sprintf("/%s/", tenantID),
+    })
+}
+```
+
+### Handler Helper Changes
 
 ```go
 // api/handlers.go
 
-// Helper to get tenant ID from context
+// Helper to get tenant ID from context (set by TenantPathMiddleware)
 func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
     tenantID, exists := c.Get("tenant_id")
     if !exists {
@@ -768,13 +1064,13 @@ func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 func (h *Handlers) GetAllCredentials(c *gin.Context) {
     tenantID, ok := h.getTenantID(c)
     if !ok {
-        c.JSON(500, gin.H{"error": "Tenant context missing"})
+        c.JSON(500, gin.H{"error": "tenant context missing"})
         return
     }
     
     holderDID, ok := h.getHolderDID(c)
     if !ok {
-        c.JSON(401, gin.H{"error": "Unauthorized"})
+        c.JSON(401, gin.H{"error": "unauthorized"})
         return
     }
 
@@ -793,7 +1089,7 @@ server:
   port: 8080
   # ...
 
-# NEW: Multi-tenancy configuration
+# Multi-tenancy configuration
 tenants:
   # Default tenant for backward compatibility
   default_tenant: "default"
@@ -865,80 +1161,36 @@ ADD COLUMN tenant_id VARCHAR(64) NOT NULL DEFAULT 'default' REFERENCES tenants(i
 
 ALTER TABLE verifiers 
 ADD COLUMN tenant_id VARCHAR(64) NOT NULL DEFAULT 'default' REFERENCES tenants(id);
+
+-- 8. Add tenant_id to WebAuthn credentials (guardrail)
+ALTER TABLE webauthn_credentials 
+ADD COLUMN tenant_id VARCHAR(64) NOT NULL DEFAULT 'default' REFERENCES tenants(id);
+CREATE INDEX idx_webauthn_credentials_tenant ON webauthn_credentials(tenant_id);
 ```
 
-## Frontend Changes (Fragment-Based Tenant Selection)
+## Frontend Changes (Path-Based Tenant Selection)
 
-### URL Fragment Parsing
+### URL Path Routing
 
-The frontend reads the tenant ID from the URL fragment and passes it via HTTP header.
+The frontend uses React Router path parameters to identify the tenant. This is cleaner than fragment-based routing and consistent with the backend API structure.
 
 ```typescript
 // src/lib/tenant.ts - NEW FILE
 
 /**
- * Tenant management utilities for URL fragment-based tenant selection.
+ * Tenant management utilities for URL path-based tenant selection.
  * 
- * URL Format: https://example.com/#tenant-id/route/path
+ * URL Format: https://example.com/{tenantId}/route/path
  * 
  * Examples:
- *   https://example.com/#acme-corp           → tenant: acme-corp, route: /
- *   https://example.com/#acme-corp/settings  → tenant: acme-corp, route: /settings
- *   https://example.com/#/settings           → tenant: default, route: /settings
- *   https://example.com/                     → tenant: default, route: /
+ *   https://example.com/acme-corp/           → tenant: acme-corp, route: /
+ *   https://example.com/acme-corp/settings   → tenant: acme-corp, route: /settings
+ *   https://example.com/login                → global login page
+ *   https://example.com/                     → tenant selector / redirect
  */
 
 const DEFAULT_TENANT = 'default';
 const TENANT_STORAGE_KEY = 'currentTenant';
-
-export interface TenantRouteInfo {
-  tenantId: string;
-  route: string;
-}
-
-/**
- * Parse the URL fragment to extract tenant ID and route.
- */
-export function parseTenantFromFragment(hash: string = window.location.hash): TenantRouteInfo {
-  // Remove leading #
-  const fragment = hash.startsWith('#') ? hash.substring(1) : hash;
-  
-  if (!fragment) {
-    return { tenantId: getStoredTenant() || DEFAULT_TENANT, route: '/' };
-  }
-  
-  // Split on first /
-  const slashIndex = fragment.indexOf('/');
-  
-  if (slashIndex === -1) {
-    // No route, just tenant: #acme-corp
-    return { tenantId: fragment || DEFAULT_TENANT, route: '/' };
-  }
-  
-  if (slashIndex === 0) {
-    // Route only, no tenant: #/settings
-    return { tenantId: getStoredTenant() || DEFAULT_TENANT, route: fragment };
-  }
-  
-  // Both tenant and route: #acme-corp/settings
-  const tenantId = fragment.substring(0, slashIndex);
-  const route = fragment.substring(slashIndex); // includes leading /
-  
-  return { tenantId, route };
-}
-
-/**
- * Build a URL fragment from tenant and route.
- */
-export function buildTenantFragment(tenantId: string, route: string = '/'): string {
-  if (tenantId === DEFAULT_TENANT && route === '/') {
-    return '';
-  }
-  if (tenantId === DEFAULT_TENANT) {
-    return `#${route}`;
-  }
-  return `#${tenantId}${route}`;
-}
 
 /**
  * Get stored tenant from sessionStorage (persists across page reloads in same tab).
@@ -955,63 +1207,87 @@ export function setStoredTenant(tenantId: string): void {
 }
 
 /**
- * Switch to a different tenant.
- * Updates URL fragment and reloads the app with new tenant context.
+ * Build a URL path for a tenant route.
  */
-export function switchTenant(tenantId: string): void {
+export function buildTenantPath(tenantId: string, route: string = '/'): string {
+  const cleanRoute = route.startsWith('/') ? route : `/${route}`;
+  return `/${tenantId}${cleanRoute}`;
+}
+
+/**
+ * Switch to a different tenant.
+ * Navigates to new tenant's home page.
+ */
+export function switchTenant(tenantId: string, navigate: (path: string) => void): void {
   setStoredTenant(tenantId);
-  window.location.hash = buildTenantFragment(tenantId, '/');
-  // Force reload to reinitialize with new tenant context
-  window.location.reload();
+  navigate(buildTenantPath(tenantId, '/'));
 }
 ```
 
-### Tenant Context Provider
+### App Router Structure
 
 ```tsx
-// src/context/TenantContext.tsx - NEW FILE
+// src/App.tsx - Path-based tenant routing
 
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { parseTenantFromFragment, setStoredTenant, switchTenant, TenantRouteInfo } from '../lib/tenant';
+import { Routes, Route, Navigate } from 'react-router-dom';
+import { TenantProvider } from './context/TenantContext';
 
-interface TenantContextValue {
-  tenantId: string;
-  route: string;
-  switchTenant: (tenantId: string) => void;
+function App() {
+  return (
+    <Routes>
+      {/* Global routes (no tenant) */}
+      <Route path="/login" element={<GlobalLogin />} />
+      <Route path="/" element={<TenantSelector />} />
+      
+      {/* Tenant-scoped routes */}
+      <Route path="/:tenantId/*" element={<TenantRoutes />} />
+    </Routes>
+  );
 }
 
-const TenantContext = createContext<TenantContextValue | null>(null);
-
-export function TenantProvider({ children }: { children: ReactNode }) {
-  const [tenantInfo, setTenantInfo] = useState<TenantRouteInfo>(() => 
-    parseTenantFromFragment()
+function TenantRoutes() {
+  return (
+    <TenantProvider>
+      <Routes>
+        <Route path="/" element={<ProtectedRoute><Home /></ProtectedRoute>} />
+        <Route path="/settings" element={<ProtectedRoute><Settings /></ProtectedRoute>} />
+        <Route path="/credential/:batchId" element={<ProtectedRoute><CredentialDetail /></ProtectedRoute>} />
+        <Route path="/credential/:batchId/history" element={<ProtectedRoute><CredentialHistory /></ProtectedRoute>} />
+        <Route path="/credential/:batchId/details" element={<ProtectedRoute><CredentialDetails /></ProtectedRoute>} />
+        <Route path="/history" element={<ProtectedRoute><History /></ProtectedRoute>} />
+        <Route path="/history/:transactionId" element={<ProtectedRoute><TransactionDetail /></ProtectedRoute>} />
+        <Route path="/pending" element={<ProtectedRoute><Pending /></ProtectedRoute>} />
+        <Route path="/add" element={<ProtectedRoute><AddCredential /></ProtectedRoute>} />
+        <Route path="/send" element={<ProtectedRoute><SendCredential /></ProtectedRoute>} />
+        <Route path="/verification/result" element={<ProtectedRoute><VerificationResult /></ProtectedRoute>} />
+        <Route path="/cb/*" element={<ProtectedRoute><OAuthCallback /></ProtectedRoute>} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+    </TenantProvider>
   );
+}
+```
+
+### Tenant Context Provider (continued)
+
+```tsx
+// src/context/TenantContext.tsx - continued
 
   useEffect(() => {
-    // Store tenant when it changes
-    setStoredTenant(tenantInfo.tenantId);
-  }, [tenantInfo.tenantId]);
+    // Store tenant when route changes
+    if (tenantId) {
+      setStoredTenant(tenantId);
+    }
+  }, [tenantId]);
 
-  useEffect(() => {
-    // Listen for hash changes (browser back/forward, manual URL edit)
-    const handleHashChange = () => {
-      const newInfo = parseTenantFromFragment();
-      if (newInfo.tenantId !== tenantInfo.tenantId) {
-        // Tenant changed - reload to reinitialize
-        window.location.reload();
-      } else {
-        setTenantInfo(newInfo);
-      }
-    };
-
-    window.addEventListener('hashchange', handleHashChange);
-    return () => window.removeEventListener('hashchange', handleHashChange);
-  }, [tenantInfo.tenantId]);
+  const handleSwitchTenant = (newTenantId: string) => {
+    setStoredTenant(newTenantId);
+    navigate(buildTenantPath(newTenantId, '/'));
+  };
 
   const value: TenantContextValue = {
-    tenantId: tenantInfo.tenantId,
-    route: tenantInfo.route,
-    switchTenant,
+    tenantId: tenantId || 'default',
+    switchTenant: handleSwitchTenant,
   };
 
   return (
@@ -1030,20 +1306,122 @@ export function useTenant(): TenantContextValue {
 }
 ```
 
+### Global Login Page
+
+```tsx
+// src/pages/GlobalLogin.tsx - NEW FILE
+
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import * as config from '../config';
+
+/**
+ * Global login page that doesn't require tenant selection.
+ * User selects a passkey, and tenant is discovered from userHandle.
+ */
+export function GlobalLogin() {
+  const navigate = useNavigate();
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleWebAuthnLogin = async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      // Step 1: Get assertion options from server
+      const startResponse = await fetch(`${config.BACKEND_URL}/login/webauthn/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      
+      if (!startResponse.ok) {
+        throw new Error('Failed to start login');
+      }
+      
+      const options = await startResponse.json();
+      
+      // Step 2: Get credential from authenticator
+      const credential = await navigator.credentials.get({
+        publicKey: options.publicKey,
+      });
+      
+      if (!credential) {
+        throw new Error('No credential selected');
+      }
+      
+      // Step 3: Send assertion to server, which discovers tenant
+      const finishResponse = await fetch(`${config.BACKEND_URL}/login/webauthn/finish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credential),
+      });
+      
+      if (!finishResponse.ok) {
+        throw new Error('Authentication failed');
+      }
+      
+      const result = await finishResponse.json();
+      
+      // Step 4: Store token and redirect to tenant
+      localStorage.setItem('token', result.token);
+      sessionStorage.setItem('currentTenant', result.tenant_id);
+      
+      // Navigate to the tenant's home page
+      navigate(result.redirect || `/${result.tenant_id}/`);
+      
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Login failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="login-page">
+      <h1>Sign In</h1>
+      <p>Use your passkey to sign in</p>
+      
+      <button 
+        onClick={handleWebAuthnLogin} 
+        disabled={loading}
+        className="webauthn-button"
+      >
+        {loading ? 'Signing in...' : 'Sign in with Passkey'}
+      </button>
+      
+      {error && <p className="error">{error}</p>}
+      
+      <p className="help-text">
+        Don't have a passkey? <a href="/default/settings">Register for a tenant first</a>
+      </p>
+    </div>
+  );
+}
+```
+
 ### API Client Changes
 
 ```typescript
 // src/api/index.ts - UPDATE
 
 import * as config from '../config';
-import { getStoredTenant } from '../lib/tenant';
 
 const walletBackendUrl = config.BACKEND_URL;
 
-// Update buildGetHeaders to include tenant header
-const buildGetHeaders = useCallback((
-  headers: { [header: string]: string },
-  options: { appToken?: string },
+/**
+ * Build API URL with tenant prefix.
+ * @param tenantId - The tenant ID
+ * @param path - The API path (e.g., '/storage/vc')
+ */
+export function buildTenantApiUrl(tenantId: string, path: string): string {
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  return `${walletBackendUrl}/${tenantId}${cleanPath}`;
+}
+
+// Update hooks to use tenant-prefixed URLs
+// Example in a hook:
+// const url = buildTenantApiUrl(tenantId, '/storage/vc');
 ): { [header: string]: string } => {
   const authz = options?.appToken || appToken;
   const tenantId = getStoredTenant() || 'default';
@@ -1968,41 +2346,60 @@ For future dynamic tenant management (with database backend):
 
 ---
 
-## Document Status
+## Document Status (End Summary)
 
 | Aspect | Status |
 |--------|--------|
-| **Overall Status** | 🟡 **Draft - Pending Team Review** |
-| **Date** | 2024-12-15 |
-| **Author** | (Auto-generated design document) |
+| **Overall Status** | 🟢 **DECIDED - Ready for Implementation** |
+| **Last Updated** | 2026-01-13 |
+| **Author** | (Design document) |
 
-### Decisions Made
+### All Decisions
 
 | Decision | Status | Notes |
 |----------|--------|-------|
-| Tenant in HTTP header for API calls | ✅ Decided | `X-Tenant-ID` header |
-| Per-tenant credential isolation | ✅ Decided | Credentials, presentations scoped to tenant |
-| Per-tenant keystore | ✅ Decided | Browser's localStorage with tenant prefix |
-| YAML-based tenant configuration | ✅ Decided | `config/tenants.yaml` with hot-reload |
-| Per-tenant branding | ✅ Decided | Logo, colors, favicon configurable |
-| Per-tenant rate limiting | ✅ Decided | Token bucket per tenant |
-| Per-tenant audit logging | ✅ Decided | Webhook, syslog, S3 recipients |
-| Tenant auto-join policy | ✅ Decided | Per-tenant config: `auto_join`, `join_code` |
-| Tenant selector UI | ✅ Decided | Dropdown in header when user has multiple tenants |
+| **Tenant identification** | ✅ Decided | URL path parameter (`/{tenantID}/...`) |
+| **Tenant-scoped WebAuthn** | ✅ Decided | User handle encodes `{tenantId}:{userId}` |
+| **Global login endpoint** | ✅ Decided | `/login/webauthn/*` discovers tenant from passkey |
+| **Credential storage guardrail** | ✅ Decided | Store `tenant_id` in WebAuthn credentials table |
+| **No cross-tenant passkeys** | ✅ Decided | Each passkey bound to single tenant |
+| **Per-tenant credential isolation** | ✅ Decided | Credentials, presentations scoped to tenant |
+| **Per-tenant keystore** | ✅ Decided | Private data scoped by tenant |
+| **YAML-based tenant configuration** | ✅ Decided | `config/tenants.yaml` with hot-reload |
+| **Per-tenant branding** | ✅ Decided | Logo, colors, favicon configurable |
+| **Per-tenant rate limiting** | ✅ Decided | Token bucket per tenant |
+| **Per-tenant audit logging** | ✅ Decided | Webhook, syslog, S3 recipients |
+| **Tenant enrollment policy** | ✅ Decided | Per-tenant: `invite-only`, `open`, `approval-required` |
+| **Consistency with go-as4** | ✅ Decided | Same URL path pattern |
 
-### Decisions Pending Team Input
+### Migration Requirements
 
-| Decision | Options | Considerations |
-|----------|---------|----------------|
-| **Frontend routing approach** | Fragment (`/#tenant/path`) vs Path (`/tenant/path`) | See "Frontend SPA Route Analysis" section |
+| Item | Impact |
+|------|--------|
+| **Existing passkeys** | Must be re-registered with tenant-scoped user handles |
+| **Existing credentials** | Migrated to `default` tenant |
+| **Database schema** | Add `tenant_id` columns, create tenant tables |
 
-### Action Items
+### Implementation Phases
 
-1. [ ] Team review of routing options (Fragment vs Path)
-2. [ ] Decision on routing approach
-3. [ ] Update this ADR with final decision
-4. [ ] Begin implementation
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | Backend URL restructure (path-based routing) | 🔲 Not started |
+| 2 | Domain & Storage (tenant types, stores) | 🔲 Not started |
+| 3 | Database migration | 🔲 Not started |
+| 4 | WebAuthn tenant-scoping (user handle encoding) | 🔲 Not started |
+| 5 | Global login endpoint (tenant-discovering) | 🔲 Not started |
+| 6 | Frontend router update (path-based) | 🔲 Not started |
+| 7 | Frontend API client update | 🔲 Not started |
+| 8 | Per-tenant keystore | 🔲 Not started |
+| 9 | IndexedDB tenant scoping | 🔲 Not started |
+| 10 | Tenant selector UI | 🔲 Not started |
+| 11 | Branding backend | 🔲 Not started |
+| 12 | Branding frontend | 🔲 Not started |
+| 13 | Testing | 🔲 Not started |
+| 14 | Audit infrastructure | 🔲 Not started |
+| 15 | Rate limiting | 🔲 Not started |
 
 ---
 
-*This ADR is ready for team discussion. Please review the "Frontend SPA Route Analysis" section and provide input on the routing approach preference.*
+*This ADR has been reviewed and all major decisions are finalized. Implementation can begin.*

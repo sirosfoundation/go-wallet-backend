@@ -112,15 +112,87 @@ func parseTransports(transports []string) []protocol.AuthenticatorTransport {
 	return result
 }
 
-// CreateOptionsWrapper wraps WebAuthn options in a publicKey property (matches reference impl)
-type CreateOptionsWrapper struct {
-	PublicKey *protocol.CredentialCreation `json:"publicKey"`
+// parseTransportsToProtocol converts string transports to protocol type
+func parseTransportsToProtocol(transports []string) []protocol.AuthenticatorTransport {
+	return parseTransports(transports)
+}
+
+// WebAuthn response types that match the TypeScript wallet-backend-server format
+// The key differences from go-webauthn's default types:
+// 1. Binary fields (challenge, user.id) use {$b64u: "..."} tagged format
+// 2. Single publicKey wrapper (not double-wrapped)
+// 3. Includes userVerification, attestation, and extensions
+
+// PublicKeyCredentialRpEntity matches the TS format
+type PublicKeyCredentialRpEntity struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// PublicKeyCredentialUserEntity matches the TS format with tagged binary ID
+type PublicKeyCredentialUserEntity struct {
+	ID          taggedbinary.TaggedBytes `json:"id"`
+	Name        string                   `json:"name"`
+	DisplayName string                   `json:"displayName"`
+}
+
+// PublicKeyCredentialParameters matches the TS format
+type PublicKeyCredentialParameters struct {
+	Type string `json:"type"`
+	Alg  int64  `json:"alg"`
+}
+
+// PublicKeyCredentialDescriptor matches the TS format
+type PublicKeyCredentialDescriptor struct {
+	Type       string                          `json:"type"`
+	ID         taggedbinary.TaggedBytes        `json:"id"`
+	Transports []protocol.AuthenticatorTransport `json:"transports,omitempty"`
+}
+
+// AuthenticatorSelectionCriteria matches the TS format
+type AuthenticatorSelectionCriteria struct {
+	RequireResidentKey bool                              `json:"requireResidentKey"`
+	ResidentKey        protocol.ResidentKeyRequirement   `json:"residentKey"`
+	UserVerification   protocol.UserVerificationRequirement `json:"userVerification"`
+}
+
+// PRFExtension for WebAuthn PRF extension
+type PRFExtension struct {
+	Eval *PRFEvalExtension `json:"eval,omitempty"`
+}
+
+// PRFEvalExtension for PRF eval
+type PRFEvalExtension struct {
+	First taggedbinary.TaggedBytes `json:"first,omitempty"`
+}
+
+// AuthenticationExtensions matches the TS format
+type AuthenticationExtensions struct {
+	CredProps bool          `json:"credProps"`
+	PRF       *PRFExtension `json:"prf,omitempty"`
+}
+
+// PublicKeyCredentialCreationOptions matches the TS format exactly
+type PublicKeyCredentialCreationOptions struct {
+	RP                     PublicKeyCredentialRpEntity      `json:"rp"`
+	User                   PublicKeyCredentialUserEntity    `json:"user"`
+	Challenge              taggedbinary.TaggedBytes         `json:"challenge"`
+	PubKeyCredParams       []PublicKeyCredentialParameters  `json:"pubKeyCredParams"`
+	ExcludeCredentials     []PublicKeyCredentialDescriptor  `json:"excludeCredentials"`
+	AuthenticatorSelection AuthenticatorSelectionCriteria   `json:"authenticatorSelection"`
+	Attestation            protocol.ConveyancePreference    `json:"attestation"`
+	Extensions             AuthenticationExtensions         `json:"extensions"`
+}
+
+// CreateOptionsResponse wraps the creation options in publicKey (single level)
+type CreateOptionsResponse struct {
+	PublicKey PublicKeyCredentialCreationOptions `json:"publicKey"`
 }
 
 // BeginRegistrationResponse contains the registration options
 type BeginRegistrationResponse struct {
-	ChallengeID   string               `json:"challengeId"`
-	CreateOptions CreateOptionsWrapper `json:"createOptions"`
+	ChallengeID   string                `json:"challengeId"`
+	CreateOptions CreateOptionsResponse `json:"createOptions"`
 }
 
 // BeginRegistration starts WebAuthn registration for a new user
@@ -137,7 +209,7 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, displayName str
 	waUser := &WebAuthnUser{user: tempUser}
 
 	// Generate creation options
-	options, session, err := s.webauthn.BeginRegistration(waUser,
+	_, session, err := s.webauthn.BeginRegistration(waUser,
 		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
 	)
 	if err != nil {
@@ -162,9 +234,47 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, displayName str
 
 	s.logger.Info("Started registration", zap.String("user_id", userID.String()))
 
+	// Build response matching TypeScript wallet-backend-server format
+	// Decode challenge from base64url to raw bytes for TaggedBytes
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+	}
+
+	createOptions := CreateOptionsResponse{
+		PublicKey: PublicKeyCredentialCreationOptions{
+			RP: PublicKeyCredentialRpEntity{
+				ID:   s.cfg.Server.RPID,
+				Name: s.cfg.Server.RPName,
+			},
+			User: PublicKeyCredentialUserEntity{
+				ID:          userID.AsUserHandle(),
+				Name:        waUser.WebAuthnName(),
+				DisplayName: waUser.WebAuthnDisplayName(),
+			},
+			Challenge: challengeBytes,
+			PubKeyCredParams: []PublicKeyCredentialParameters{
+				{Type: "public-key", Alg: -7},   // ES256
+				{Type: "public-key", Alg: -8},   // EdDSA
+				{Type: "public-key", Alg: -257}, // RS256
+			},
+			ExcludeCredentials: []PublicKeyCredentialDescriptor{},
+			AuthenticatorSelection: AuthenticatorSelectionCriteria{
+				RequireResidentKey: true,
+				ResidentKey:        protocol.ResidentKeyRequirementRequired,
+				UserVerification:   protocol.VerificationRequired,
+			},
+			Attestation: protocol.PreferDirectAttestation,
+			Extensions: AuthenticationExtensions{
+				CredProps: true,
+				PRF:       &PRFExtension{},
+			},
+		},
+	}
+
 	return &BeginRegistrationResponse{
 		ChallengeID:   challengeID,
-		CreateOptions: CreateOptionsWrapper{PublicKey: options},
+		CreateOptions: createOptions,
 	}, nil
 }
 
@@ -319,20 +429,29 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 }
 
 // GetOptionsWrapper wraps WebAuthn assertion options in a publicKey property (matches reference impl)
-type GetOptionsWrapper struct {
-	PublicKey *protocol.CredentialAssertion `json:"publicKey"`
+// PublicKeyCredentialRequestOptions matches the TS format exactly
+type PublicKeyCredentialRequestOptions struct {
+	RPId             string                          `json:"rpId"`
+	Challenge        taggedbinary.TaggedBytes        `json:"challenge"`
+	AllowCredentials []PublicKeyCredentialDescriptor `json:"allowCredentials"`
+	UserVerification protocol.UserVerificationRequirement `json:"userVerification"`
+}
+
+// GetOptionsResponse wraps the assertion options in publicKey (single level)
+type GetOptionsResponse struct {
+	PublicKey PublicKeyCredentialRequestOptions `json:"publicKey"`
 }
 
 // BeginLoginResponse contains the login options
 type BeginLoginResponse struct {
-	ChallengeID string            `json:"challengeId"`
-	GetOptions  GetOptionsWrapper `json:"getOptions"`
+	ChallengeID string             `json:"challengeId"`
+	GetOptions  GetOptionsResponse `json:"getOptions"`
 }
 
 // BeginLogin starts WebAuthn authentication (discoverable credentials flow)
 func (s *WebAuthnService) BeginLogin(ctx context.Context) (*BeginLoginResponse, error) {
 	// For discoverable credentials, we don't need a specific user
-	options, session, err := s.webauthn.BeginDiscoverableLogin(
+	_, session, err := s.webauthn.BeginDiscoverableLogin(
 		webauthn.WithUserVerification(protocol.VerificationRequired),
 	)
 	if err != nil {
@@ -357,9 +476,24 @@ func (s *WebAuthnService) BeginLogin(ctx context.Context) (*BeginLoginResponse, 
 
 	s.logger.Info("Started login")
 
+	// Decode challenge from base64url to raw bytes for TaggedBytes
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+	}
+
+	getOptions := GetOptionsResponse{
+		PublicKey: PublicKeyCredentialRequestOptions{
+			RPId:             s.cfg.Server.RPID,
+			Challenge:        challengeBytes,
+			AllowCredentials: []PublicKeyCredentialDescriptor{},
+			UserVerification: protocol.VerificationRequired,
+		},
+	}
+
 	return &BeginLoginResponse{
 		ChallengeID: challengeID,
-		GetOptions:  GetOptionsWrapper{PublicKey: options},
+		GetOptions:  getOptions,
 	}, nil
 }
 
@@ -539,9 +673,9 @@ func encodeFlags(flags webauthn.CredentialFlags) uint8 {
 
 // BeginAddCredentialResponse contains the response for adding a credential
 type BeginAddCredentialResponse struct {
-	Username      string               `json:"username,omitempty"`
-	ChallengeID   string               `json:"challengeId"`
-	CreateOptions CreateOptionsWrapper `json:"createOptions"`
+	Username      string                `json:"username,omitempty"`
+	ChallengeID   string                `json:"challengeId"`
+	CreateOptions CreateOptionsResponse `json:"createOptions"`
 }
 
 // BeginAddCredential starts the process of adding a new credential to an existing user
@@ -555,7 +689,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	waUser := &WebAuthnUser{user: user}
 
 	// Generate creation options
-	options, session, err := s.webauthn.BeginRegistration(waUser,
+	_, session, err := s.webauthn.BeginRegistration(waUser,
 		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			ResidentKey:      protocol.ResidentKeyRequirementRequired,
@@ -586,10 +720,57 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		username = *user.Username
 	}
 
+	// Decode challenge from base64url to raw bytes for TaggedBytes
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+	}
+
+	// Build excludeCredentials from existing credentials
+	excludeCredentials := make([]PublicKeyCredentialDescriptor, 0, len(user.WebauthnCredentials))
+	for _, cred := range user.WebauthnCredentials {
+		excludeCredentials = append(excludeCredentials, PublicKeyCredentialDescriptor{
+			Type:       "public-key",
+			ID:         cred.CredentialID,
+			Transports: parseTransportsToProtocol(cred.Transport),
+		})
+	}
+
+	createOptions := CreateOptionsResponse{
+		PublicKey: PublicKeyCredentialCreationOptions{
+			RP: PublicKeyCredentialRpEntity{
+				ID:   s.cfg.Server.RPID,
+				Name: s.cfg.Server.RPName,
+			},
+			User: PublicKeyCredentialUserEntity{
+				ID:          userID.AsUserHandle(),
+				Name:        waUser.WebAuthnName(),
+				DisplayName: waUser.WebAuthnDisplayName(),
+			},
+			Challenge: challengeBytes,
+			PubKeyCredParams: []PublicKeyCredentialParameters{
+				{Type: "public-key", Alg: -7},   // ES256
+				{Type: "public-key", Alg: -8},   // EdDSA
+				{Type: "public-key", Alg: -257}, // RS256
+			},
+			ExcludeCredentials: excludeCredentials,
+			AuthenticatorSelection: AuthenticatorSelectionCriteria{
+				RequireResidentKey: true,
+				ResidentKey:        protocol.ResidentKeyRequirementRequired,
+				UserVerification:   protocol.VerificationRequired,
+			},
+			Attestation: protocol.PreferDirectAttestation,
+			Extensions: AuthenticationExtensions{
+				CredProps: true,
+				PRF:       &PRFExtension{},
+			},
+		},
+	}
+
 	return &BeginAddCredentialResponse{
 		Username:      username,
 		ChallengeID:   challengeID,
-		CreateOptions: CreateOptionsWrapper{PublicKey: options},
+		CreateOptions: createOptions,
 	}, nil
 }
 
