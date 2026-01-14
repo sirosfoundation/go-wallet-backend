@@ -21,11 +21,11 @@ import (
 )
 
 const (
-	testRPID          = "localhost"
-	testRPName        = "Test App"
-	testRPOrigin      = "http://localhost:8080"
-	testJWTSecret     = "test-jwt-secret-that-is-long-enough-32"
-	testJWTIssuer     = "test-issuer"
+	testRPID           = "localhost"
+	testRPName         = "Test App"
+	testRPOrigin       = "http://localhost:8080"
+	testJWTSecret      = "test-jwt-secret-that-is-long-enough-32"
+	testJWTIssuer      = "test-issuer"
 	testJWTExpiryHours = 24
 )
 
@@ -637,10 +637,6 @@ func TestCredentialReader(t *testing.T) {
 // ============================================================================
 
 func TestFullRegistrationFlow(t *testing.T) {
-	// Skip: virtualwebauthn has difficulty parsing our custom tagged binary format
-	// The full registration flow is tested via integration tests instead
-	t.Skip("Full registration flow requires custom tagged binary format not supported by virtualwebauthn")
-	
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// Step 1: Begin registration
@@ -648,13 +644,11 @@ func TestFullRegistrationFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	// Step 2: Parse attestation options with virtualwebauthn
-	// Need to convert tagged binary format to plain base64url
+	// The patched virtualwebauthn now supports tagged binary format {"$b64u": "..."}
 	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
 	require.NoError(t, err)
-	
-	plainOptionsJSON := convertOptionsToPlainBase64(optionsJSON)
 
-	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(plainOptionsJSON))
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
 	require.NoError(t, err)
 	require.NotNil(t, attestationOptions)
 
@@ -693,9 +687,6 @@ func TestFullRegistrationFlow(t *testing.T) {
 }
 
 func TestFullRegistrationFlowWithRSAKey(t *testing.T) {
-	// Skip: virtualwebauthn has difficulty parsing our custom tagged binary format
-	t.Skip("Full registration flow requires custom tagged binary format not supported by virtualwebauthn")
-	
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// Use RSA key instead of EC2
@@ -705,13 +696,11 @@ func TestFullRegistrationFlowWithRSAKey(t *testing.T) {
 	beginResp, err := setup.service.BeginRegistration(setup.ctx, "RSA User")
 	require.NoError(t, err)
 
-	// Parse attestation options
+	// Parse attestation options (virtualwebauthn supports tagged binary format)
 	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
 	require.NoError(t, err)
-	
-	plainOptionsJSON := convertOptionsToPlainBase64(optionsJSON)
 
-	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(plainOptionsJSON))
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
 	require.NoError(t, err)
 
 	// Create attestation response with RSA key
@@ -740,9 +729,6 @@ func TestFullRegistrationFlowWithRSAKey(t *testing.T) {
 // ============================================================================
 
 func TestFullLoginFlow(t *testing.T) {
-	// Skip: virtualwebauthn has difficulty parsing our custom tagged binary format
-	t.Skip("Full login flow requires custom tagged binary format not supported by virtualwebauthn")
-	
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// First, register a user
@@ -751,10 +737,8 @@ func TestFullLoginFlow(t *testing.T) {
 
 	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
 	require.NoError(t, err)
-	
-	plainRegOptions := convertOptionsToPlainBase64(regOptionsJSON)
 
-	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(plainRegOptions))
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
 	require.NoError(t, err)
 
 	regResponse := virtualwebauthn.CreateAttestationResponse(
@@ -782,13 +766,11 @@ func TestFullLoginFlow(t *testing.T) {
 		beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
 		require.NoError(t, err)
 
-		// Parse assertion options
+		// Parse assertion options (virtualwebauthn supports tagged binary format)
 		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
 		require.NoError(t, err)
-		
-		plainLoginOptions := convertOptionsToPlainBase64(loginOptionsJSON)
 
-		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(plainLoginOptions))
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
 		require.NoError(t, err)
 		require.NotNil(t, assertionOptions)
 
@@ -968,7 +950,7 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 func TestFullAddCredentialFlow(t *testing.T) {
 	// Skip: virtualwebauthn has difficulty parsing our custom tagged binary format
 	t.Skip("Full add credential flow requires custom tagged binary format not supported by virtualwebauthn")
-	
+
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// First, register a user with initial credential
@@ -977,7 +959,7 @@ func TestFullAddCredentialFlow(t *testing.T) {
 
 	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
 	require.NoError(t, err)
-	
+
 	plainRegOptions := convertOptionsToPlainBase64(regOptionsJSON)
 
 	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(plainRegOptions))
@@ -1009,7 +991,7 @@ func TestFullAddCredentialFlow(t *testing.T) {
 	// Parse options
 	addOptionsJSON, err := json.Marshal(beginAddResp.CreateOptions)
 	require.NoError(t, err)
-	
+
 	plainAddOptions := convertOptionsToPlainBase64(addOptionsJSON)
 
 	addOptions, err := virtualwebauthn.ParseAttestationOptions(string(plainAddOptions))

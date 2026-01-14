@@ -52,7 +52,7 @@ func TestKeystoreService_Close(t *testing.T) {
 	logger := zap.NewNop()
 
 	svc := NewKeystoreService(store, cfg, logger)
-	
+
 	// Close should not panic
 	svc.Close()
 }

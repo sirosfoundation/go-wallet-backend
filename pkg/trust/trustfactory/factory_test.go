@@ -111,7 +111,7 @@ func TestNewFromConfig(t *testing.T) {
 		// Create a temporary cert file
 		tmpDir := t.TempDir()
 		certPath := filepath.Join(tmpDir, "test-ca.pem")
-		
+
 		// Write a valid PEM certificate (self-signed for testing)
 		certPEM := `-----BEGIN CERTIFICATE-----
 MIIBkTCB+wIJAKHBfpxvQzx1MA0GCSqGSIb3DQEBCwUAMBExDzANBgNVBAMMBlRl
