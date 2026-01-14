@@ -70,3 +70,5 @@ require (
 )
 
 replace github.com/dc4eu/vc => ../vc
+
+replace github.com/descope/virtualwebauthn => github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61

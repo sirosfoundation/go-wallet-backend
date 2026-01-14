@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
@@ -337,8 +339,15 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// Create session data for verification
 	sessionData := webauthn.SessionData{
 		Challenge:        challenge.Challenge, // Already base64url encoded
+		RelyingPartyID:   s.cfg.Server.RPID,
 		UserID:           userID.AsUserHandle(),
 		UserVerification: protocol.VerificationRequired,
+		// CredParams must match what was sent to the client in BeginRegistration
+		CredParams: []protocol.CredentialParameter{
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
 	}
 
 	// Parse the credential creation response
@@ -574,10 +583,12 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	}
 
 	// Create session data for verification
+	// Note: For discoverable login, UserID MUST be empty
 	sessionData := webauthn.SessionData{
 		Challenge:        challenge.Challenge,
-		UserID:           userID.AsUserHandle(),
+		RelyingPartyID:   s.cfg.Server.RPID,
 		UserVerification: protocol.VerificationRequired,
+		// UserID intentionally left empty for discoverable login
 	}
 
 	// Verify the authentication using ValidateDiscoverableLogin
@@ -826,8 +837,15 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	// Create session data for verification
 	sessionData := webauthn.SessionData{
 		Challenge:        challenge.Challenge,
+		RelyingPartyID:   s.cfg.Server.RPID,
 		UserID:           userID.AsUserHandle(),
 		UserVerification: protocol.VerificationRequired,
+		// CredParams must match what was sent to the client in BeginAddCredential
+		CredParams: []protocol.CredentialParameter{
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
 	}
 
 	// Parse the credential creation response
@@ -919,7 +937,7 @@ func newCredentialReader(data []byte) *credentialReader {
 
 func (r *credentialReader) Read(p []byte) (n int, err error) {
 	if r.offset >= len(r.data) {
-		return 0, errors.New("EOF")
+		return 0, io.EOF
 	}
 	n = copy(p, r.data[r.offset:])
 	r.offset += n
