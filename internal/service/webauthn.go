@@ -351,11 +351,22 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	// Parse the credential creation response
+	// Debug: log the credential data being parsed
+	credData := taggedbinary.MustDecodeJSON(req.Credential)
+	s.logger.Debug("Parsing credential response",
+		zap.Int("original_len", len(req.Credential)),
+		zap.Int("decoded_len", len(credData)),
+		zap.ByteString("decoded_preview", credData[:min(500, len(credData))]),
+	)
+
 	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(
 		newCredentialReader(req.Credential),
 	)
 	if err != nil {
-		s.logger.Error("Failed to parse credential response", zap.Error(err))
+		s.logger.Error("Failed to parse credential response",
+			zap.Error(err),
+			zap.String("error_type", fmt.Sprintf("%T", err)),
+		)
 		return nil, ErrVerificationFailed
 	}
 
