@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -206,4 +207,171 @@ func TestSigningResponse_JSON(t *testing.T) {
 
 	assert.Equal(t, resp.Action, parsed.Action)
 	assert.Equal(t, resp.VPJWT, parsed.VPJWT)
+}
+
+func TestManager_SendSigningRequest_UserNotConnected(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+	ctx := context.Background()
+
+	_, err := m.SendSigningRequest(ctx, "nonexistent-user", &SigningRequest{
+		Action: ActionSignJwtPresentation,
+		Nonce:  "test-nonce",
+	})
+	assert.ErrorIs(t, err, ErrUserNotConnected)
+}
+
+func TestManager_GenerateOpenid4vciProof_UserNotConnected(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+	ctx := context.Background()
+
+	_, err := m.GenerateOpenid4vciProof(ctx, "nonexistent-user", "aud", "nonce")
+	assert.ErrorIs(t, err, ErrUserNotConnected)
+}
+
+func TestManager_SignJwtPresentation_UserNotConnected(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+	ctx := context.Background()
+
+	_, err := m.SignJwtPresentation(ctx, "nonexistent-user", "nonce", "aud", nil)
+	assert.ErrorIs(t, err, ErrUserNotConnected)
+}
+
+func TestClientMessage_JSON(t *testing.T) {
+	msg := ClientMessage{
+		MessageID: "msg-123",
+		AppToken:  "token-456",
+		Response: &SigningResponse{
+			Action:   ActionGenerateOpenid4vciProof,
+			ProofJWT: "eyJ...",
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	var parsed ClientMessage
+	err = json.Unmarshal(data, &parsed)
+	require.NoError(t, err)
+
+	assert.Equal(t, msg.MessageID, parsed.MessageID)
+	assert.Equal(t, msg.AppToken, parsed.AppToken)
+	assert.NotNil(t, parsed.Response)
+	assert.Equal(t, msg.Response.Action, parsed.Response.Action)
+	assert.Equal(t, msg.Response.ProofJWT, parsed.Response.ProofJWT)
+}
+
+func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+
+	// Create token with RS256 (not HMAC)
+	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+		"user_id": "test-user",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
+
+	_, err := m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+func TestManager_validateToken_ExpiredToken(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+
+	// Create expired token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user",
+		"exp":     time.Now().Add(-time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+func TestManager_validateToken_MissingUserID(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+
+	// Create token without user_id
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+func TestManager_validateToken_ValidToken(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+
+	m := NewManager(cfg, logger)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	userID, err := m.validateToken(tokenString)
+	require.NoError(t, err)
+	assert.Equal(t, "test-user-123", userID)
+}
+
+func TestErrorVariables(t *testing.T) {
+	assert.Equal(t, "user not connected", ErrUserNotConnected.Error())
+	assert.Equal(t, "wrong message id", ErrWrongMessageID.Error())
+	assert.Equal(t, "wrong action", ErrWrongAction.Error())
+	assert.Equal(t, "failed to receive message", ErrFailedToReceive.Error())
+	assert.Equal(t, "remote signing failed", ErrRemoteSigningFailed.Error())
+	assert.Equal(t, "operation timed out", ErrTimeout.Error())
 }

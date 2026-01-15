@@ -24,9 +24,9 @@ func NewVerifierService(store storage.Store, logger *zap.Logger) *VerifierServic
 	}
 }
 
-// GetAll retrieves all verifiers
-func (s *VerifierService) GetAll(ctx context.Context) ([]*domain.Verifier, error) {
-	verifiers, err := s.store.Verifiers().GetAll(ctx)
+// GetAll retrieves all verifiers for a tenant
+func (s *VerifierService) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error) {
+	verifiers, err := s.store.Verifiers().GetAll(ctx, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get verifiers: %w", err)
 	}

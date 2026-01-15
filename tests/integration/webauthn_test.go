@@ -185,8 +185,8 @@ func TestWebAuthnResponseFormat(t *testing.T) {
 
 // BeginLoginResponse for login flow
 type BeginLoginResponse struct {
-	ChallengeID string                `json:"challengeId"`
-	GetOptions  GetOptionsResponse    `json:"getOptions"`
+	ChallengeID string             `json:"challengeId"`
+	GetOptions  GetOptionsResponse `json:"getOptions"`
 }
 
 type GetOptionsResponse struct {

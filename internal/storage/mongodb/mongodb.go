@@ -21,6 +21,8 @@ type Store struct {
 	cfg      *config.MongoDBConfig
 
 	users         *UserStore
+	tenants       *TenantStore
+	userTenants   *UserTenantStore
 	credentials   *CredentialStore
 	presentations *PresentationStore
 	challenges    *ChallengeStore
@@ -55,11 +57,18 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 
 	// Initialize sub-stores
 	s.users = &UserStore{collection: database.Collection("users")}
+	s.tenants = &TenantStore{collection: database.Collection("tenants")}
+	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
 	s.presentations = &PresentationStore{collection: database.Collection("presentations"), counter: counters}
 	s.challenges = &ChallengeStore{collection: database.Collection("challenges")}
 	s.issuers = &IssuerStore{collection: database.Collection("issuers"), counter: counters}
 	s.verifiers = &VerifierStore{collection: database.Collection("verifiers"), counter: counters}
+
+	// Initialize default tenant
+	if err := s.initializeDefaultTenant(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize default tenant: %w", err)
+	}
 
 	// Create indexes
 	if err := s.createIndexes(ctx); err != nil {
@@ -124,10 +133,57 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create verifier indexes: %w", err)
 	}
 
+	// Tenants collection indexes
+	_, err = s.tenants.collection.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "name", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create tenant indexes: %w", err)
+	}
+
+	// User-tenant membership indexes
+	_, err = s.userTenants.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "tenant_id", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "user_id", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create user-tenant indexes: %w", err)
+	}
+
+	return nil
+}
+
+// initializeDefaultTenant creates the default tenant if it doesn't exist
+func (s *Store) initializeDefaultTenant(ctx context.Context) error {
+	defaultTenant := &domain.Tenant{
+		ID:          domain.DefaultTenantID,
+		Name:        "default",
+		DisplayName: "Default Tenant",
+		Enabled:     true,
+	}
+
+	// Try to find existing default tenant
+	_, err := s.tenants.GetByID(ctx, domain.DefaultTenantID)
+	if err == nil {
+		return nil // Already exists
+	}
+	if err != storage.ErrNotFound {
+		return fmt.Errorf("failed to check default tenant: %w", err)
+	}
+
+	// Create default tenant
+	if err := s.tenants.Create(ctx, defaultTenant); err != nil {
+		return fmt.Errorf("failed to create default tenant: %w", err)
+	}
+
 	return nil
 }
 
 func (s *Store) Users() storage.UserStore                 { return s.users }
+func (s *Store) Tenants() storage.TenantStore             { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore     { return s.userTenants }
 func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
 func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
 func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }

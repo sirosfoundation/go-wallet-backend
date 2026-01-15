@@ -28,7 +28,7 @@ func NewCredentialService(store storage.Store, cfg *config.Config, logger *zap.L
 }
 
 // Store stores a new credential
-func (s *CredentialService) Store(ctx context.Context, req *domain.StoreCredentialRequest) (*domain.VerifiableCredential, error) {
+func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID, req *domain.StoreCredentialRequest) (*domain.VerifiableCredential, error) {
 	if req.HolderDID == "" {
 		return nil, errors.New("holder_did is required")
 	}
@@ -43,6 +43,7 @@ func (s *CredentialService) Store(ctx context.Context, req *domain.StoreCredenti
 	}
 
 	credential := &domain.VerifiableCredential{
+		TenantID:                   tenantID,
 		HolderDID:                  req.HolderDID,
 		CredentialIdentifier:       req.CredentialIdentifier,
 		Credential:                 req.Credential,
@@ -59,21 +60,24 @@ func (s *CredentialService) Store(ctx context.Context, req *domain.StoreCredenti
 	}
 
 	s.logger.Info("Stored credential",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", req.HolderDID),
 		zap.String("credential_id", req.CredentialIdentifier))
 
 	return credential, nil
 }
 
-// GetAll retrieves all credentials for a holder
-func (s *CredentialService) GetAll(ctx context.Context, holderDID string) ([]*domain.VerifiableCredential, error) {
+// GetAll retrieves all credentials for a holder in a tenant
+func (s *CredentialService) GetAll(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiableCredential, error) {
 	if holderDID == "" {
 		return nil, errors.New("holder_did is required")
 	}
 
-	credentials, err := s.store.Credentials().GetAllByHolder(ctx, holderDID)
+	credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 	if err != nil {
-		s.logger.Error("Failed to get credentials", zap.Error(err), zap.String("holder_did", holderDID))
+		s.logger.Error("Failed to get credentials", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("holder_did", holderDID))
 		return nil, err
 	}
 
@@ -81,7 +85,7 @@ func (s *CredentialService) GetAll(ctx context.Context, holderDID string) ([]*do
 }
 
 // GetByIdentifier retrieves a credential by identifier
-func (s *CredentialService) GetByIdentifier(ctx context.Context, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
+func (s *CredentialService) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
 	if holderDID == "" {
 		return nil, errors.New("holder_did is required")
 	}
@@ -89,12 +93,13 @@ func (s *CredentialService) GetByIdentifier(ctx context.Context, holderDID, cred
 		return nil, errors.New("credential_identifier is required")
 	}
 
-	credential, err := s.store.Credentials().GetByIdentifier(ctx, holderDID, credentialIdentifier)
+	credential, err := s.store.Credentials().GetByIdentifier(ctx, tenantID, holderDID, credentialIdentifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, err
 		}
 		s.logger.Error("Failed to get credential", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)),
 			zap.String("holder_did", holderDID),
 			zap.String("credential_id", credentialIdentifier))
 		return nil, err
@@ -104,7 +109,7 @@ func (s *CredentialService) GetByIdentifier(ctx context.Context, holderDID, cred
 }
 
 // Update updates a credential
-func (s *CredentialService) Update(ctx context.Context, holderDID string, req *domain.UpdateCredentialRequest) (*domain.VerifiableCredential, error) {
+func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID, holderDID string, req *domain.UpdateCredentialRequest) (*domain.VerifiableCredential, error) {
 	if holderDID == "" {
 		return nil, errors.New("holder_did is required")
 	}
@@ -113,7 +118,7 @@ func (s *CredentialService) Update(ctx context.Context, holderDID string, req *d
 	}
 
 	// Get existing credential
-	credential, err := s.store.Credentials().GetByIdentifier(ctx, holderDID, req.CredentialIdentifier)
+	credential, err := s.store.Credentials().GetByIdentifier(ctx, tenantID, holderDID, req.CredentialIdentifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, err
@@ -132,6 +137,7 @@ func (s *CredentialService) Update(ctx context.Context, holderDID string, req *d
 	}
 
 	s.logger.Info("Updated credential",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", holderDID),
 		zap.String("credential_id", req.CredentialIdentifier))
 
@@ -139,7 +145,7 @@ func (s *CredentialService) Update(ctx context.Context, holderDID string, req *d
 }
 
 // Delete deletes a credential
-func (s *CredentialService) Delete(ctx context.Context, holderDID, credentialIdentifier string) error {
+func (s *CredentialService) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error {
 	if holderDID == "" {
 		return errors.New("holder_did is required")
 	}
@@ -147,7 +153,7 @@ func (s *CredentialService) Delete(ctx context.Context, holderDID, credentialIde
 		return errors.New("credential_identifier is required")
 	}
 
-	if err := s.store.Credentials().Delete(ctx, holderDID, credentialIdentifier); err != nil {
+	if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, credentialIdentifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return err
 		}
@@ -156,6 +162,7 @@ func (s *CredentialService) Delete(ctx context.Context, holderDID, credentialIde
 	}
 
 	s.logger.Info("Deleted credential",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", holderDID),
 		zap.String("credential_id", credentialIdentifier))
 

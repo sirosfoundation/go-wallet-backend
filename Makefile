@@ -33,13 +33,17 @@ lint: ## Run linter
 clean: ## Clean build artifacts
 	@echo "Cleaning..."
 	@rm -rf bin/
-	@rm -f coverage.out coverage.html
+	@rm -f coverage.out coverage.html cover.out coverage_*.out
 	@rm -f wallet.db
 	@rm -f *.log
 
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	@docker build -t go-wallet-backend:latest .
+
+docker-build-branch: ## Build Docker image from a git branch/tag (usage: make docker-build-branch GIT_REF=feature/multi-tenancy TAG=test)
+	@echo "Building Docker image from branch $(GIT_REF)..."
+	@docker build --build-arg GIT_REF=$(GIT_REF) -t go-wallet-backend:$(or $(TAG),$(GIT_REF)) .
 
 docker-run: docker-build ## Build and run Docker container
 	@echo "Running Docker container..."

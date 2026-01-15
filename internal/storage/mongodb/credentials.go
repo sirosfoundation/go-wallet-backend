@@ -65,9 +65,9 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	return nil
 }
 
-func (s *CredentialStore) GetByID(ctx context.Context, id int64) (*domain.VerifiableCredential, error) {
+func (s *CredentialStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.VerifiableCredential, error) {
 	var credential domain.VerifiableCredential
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&credential)
+	err := s.collection.FindOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)}).Decode(&credential)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -77,9 +77,10 @@ func (s *CredentialStore) GetByID(ctx context.Context, id int64) (*domain.Verifi
 	return &credential, nil
 }
 
-func (s *CredentialStore) GetByIdentifier(ctx context.Context, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
+func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
 	var credential domain.VerifiableCredential
 	err := s.collection.FindOne(ctx, bson.M{
+		"tenant_id":             string(tenantID),
 		"holder_did":            holderDID,
 		"credential_identifier": credentialIdentifier,
 	}).Decode(&credential)
@@ -92,8 +93,8 @@ func (s *CredentialStore) GetByIdentifier(ctx context.Context, holderDID, creden
 	return &credential, nil
 }
 
-func (s *CredentialStore) GetAllByHolder(ctx context.Context, holderDID string) ([]*domain.VerifiableCredential, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{"holder_did": holderDID})
+func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiableCredential, error) {
+	cursor, err := s.collection.Find(ctx, bson.M{"tenant_id": string(tenantID), "holder_did": holderDID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get credentials: %w", err)
 	}
@@ -118,8 +119,9 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 	return nil
 }
 
-func (s *CredentialStore) Delete(ctx context.Context, holderDID, credentialIdentifier string) error {
+func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error {
 	result, err := s.collection.DeleteOne(ctx, bson.M{
+		"tenant_id":             string(tenantID),
 		"holder_did":            holderDID,
 		"credential_identifier": credentialIdentifier,
 	})
@@ -184,9 +186,9 @@ func (s *PresentationStore) Create(ctx context.Context, presentation *domain.Ver
 	return nil
 }
 
-func (s *PresentationStore) GetByID(ctx context.Context, id int64) (*domain.VerifiablePresentation, error) {
+func (s *PresentationStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.VerifiablePresentation, error) {
 	var presentation domain.VerifiablePresentation
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&presentation)
+	err := s.collection.FindOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)}).Decode(&presentation)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -196,9 +198,10 @@ func (s *PresentationStore) GetByID(ctx context.Context, id int64) (*domain.Veri
 	return &presentation, nil
 }
 
-func (s *PresentationStore) GetByIdentifier(ctx context.Context, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
+func (s *PresentationStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
 	var presentation domain.VerifiablePresentation
 	err := s.collection.FindOne(ctx, bson.M{
+		"tenant_id":               string(tenantID),
 		"holder_did":              holderDID,
 		"presentation_identifier": presentationIdentifier,
 	}).Decode(&presentation)
@@ -211,8 +214,8 @@ func (s *PresentationStore) GetByIdentifier(ctx context.Context, holderDID, pres
 	return &presentation, nil
 }
 
-func (s *PresentationStore) GetAllByHolder(ctx context.Context, holderDID string) ([]*domain.VerifiablePresentation, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{"holder_did": holderDID})
+func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiablePresentation, error) {
+	cursor, err := s.collection.Find(ctx, bson.M{"tenant_id": string(tenantID), "holder_did": holderDID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get presentations: %w", err)
 	}
@@ -225,8 +228,9 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, holderDID string
 	return presentations, nil
 }
 
-func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, holderDID, credentialID string) error {
+func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
 	_, err := s.collection.DeleteMany(ctx, bson.M{
+		"tenant_id":              string(tenantID),
 		"holder_did":             holderDID,
 		"credential_identifiers": credentialID,
 	})
@@ -236,8 +240,9 @@ func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, holderDID,
 	return nil
 }
 
-func (s *PresentationStore) Delete(ctx context.Context, holderDID, presentationIdentifier string) error {
+func (s *PresentationStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error {
 	result, err := s.collection.DeleteOne(ctx, bson.M{
+		"tenant_id":               string(tenantID),
 		"holder_did":              holderDID,
 		"presentation_identifier": presentationIdentifier,
 	})

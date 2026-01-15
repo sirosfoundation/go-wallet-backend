@@ -26,7 +26,7 @@ func NewPresentationService(store storage.Store, logger *zap.Logger) *Presentati
 }
 
 // Store creates a new presentation
-func (s *PresentationService) Store(ctx context.Context, presentation *domain.VerifiablePresentation) error {
+func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantID, presentation *domain.VerifiablePresentation) error {
 	// Validate required fields
 	if presentation.HolderDID == "" {
 		return fmt.Errorf("holder DID is required")
@@ -35,8 +35,11 @@ func (s *PresentationService) Store(ctx context.Context, presentation *domain.Ve
 		return fmt.Errorf("presentation identifier is required")
 	}
 
+	// Set tenant ID
+	presentation.TenantID = tenantID
+
 	// Check if presentation already exists
-	existing, err := s.store.Presentations().GetByIdentifier(ctx, presentation.HolderDID, presentation.PresentationIdentifier)
+	existing, err := s.store.Presentations().GetByIdentifier(ctx, tenantID, presentation.HolderDID, presentation.PresentationIdentifier)
 	if err == nil && existing != nil {
 		return storage.ErrAlreadyExists
 	}
@@ -49,6 +52,7 @@ func (s *PresentationService) Store(ctx context.Context, presentation *domain.Ve
 	}
 
 	s.logger.Info("Presentation stored",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", presentation.HolderDID),
 		zap.String("presentation_id", presentation.PresentationIdentifier))
 
@@ -56,8 +60,8 @@ func (s *PresentationService) Store(ctx context.Context, presentation *domain.Ve
 }
 
 // Get retrieves a presentation by identifier
-func (s *PresentationService) Get(ctx context.Context, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
-	presentation, err := s.store.Presentations().GetByIdentifier(ctx, holderDID, presentationIdentifier)
+func (s *PresentationService) Get(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) (*domain.VerifiablePresentation, error) {
+	presentation, err := s.store.Presentations().GetByIdentifier(ctx, tenantID, holderDID, presentationIdentifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, storage.ErrNotFound
@@ -67,9 +71,9 @@ func (s *PresentationService) Get(ctx context.Context, holderDID, presentationId
 	return presentation, nil
 }
 
-// GetAll retrieves all presentations for a holder
-func (s *PresentationService) GetAll(ctx context.Context, holderDID string) ([]*domain.VerifiablePresentation, error) {
-	presentations, err := s.store.Presentations().GetAllByHolder(ctx, holderDID)
+// GetAll retrieves all presentations for a holder in a tenant
+func (s *PresentationService) GetAll(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiablePresentation, error) {
+	presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get presentations: %w", err)
 	}
@@ -77,8 +81,8 @@ func (s *PresentationService) GetAll(ctx context.Context, holderDID string) ([]*
 }
 
 // Delete removes a presentation
-func (s *PresentationService) Delete(ctx context.Context, holderDID, presentationIdentifier string) error {
-	if err := s.store.Presentations().Delete(ctx, holderDID, presentationIdentifier); err != nil {
+func (s *PresentationService) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error {
+	if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, presentationIdentifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
 		}
@@ -86,6 +90,7 @@ func (s *PresentationService) Delete(ctx context.Context, holderDID, presentatio
 	}
 
 	s.logger.Info("Presentation deleted",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", holderDID),
 		zap.String("presentation_id", presentationIdentifier))
 
@@ -93,12 +98,13 @@ func (s *PresentationService) Delete(ctx context.Context, holderDID, presentatio
 }
 
 // DeleteByCredentialID removes all presentations containing a specific credential
-func (s *PresentationService) DeleteByCredentialID(ctx context.Context, holderDID, credentialID string) error {
-	if err := s.store.Presentations().DeleteByCredentialID(ctx, holderDID, credentialID); err != nil {
+func (s *PresentationService) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
+	if err := s.store.Presentations().DeleteByCredentialID(ctx, tenantID, holderDID, credentialID); err != nil {
 		return fmt.Errorf("failed to delete presentations by credential: %w", err)
 	}
 
 	s.logger.Info("Presentations deleted by credential",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("holder_did", holderDID),
 		zap.String("credential_id", credentialID))
 

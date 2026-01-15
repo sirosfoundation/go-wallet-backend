@@ -26,14 +26,17 @@ func NewIssuerService(store storage.Store, logger *zap.Logger) *IssuerService {
 }
 
 // Create creates a new credential issuer
-func (s *IssuerService) Create(ctx context.Context, issuer *domain.CredentialIssuer) error {
+func (s *IssuerService) Create(ctx context.Context, tenantID domain.TenantID, issuer *domain.CredentialIssuer) error {
 	// Validate required fields
 	if issuer.CredentialIssuerIdentifier == "" {
 		return fmt.Errorf("credential issuer identifier is required")
 	}
 
-	// Check if issuer already exists
-	existing, err := s.store.Issuers().GetByIdentifier(ctx, issuer.CredentialIssuerIdentifier)
+	// Set tenant ID
+	issuer.TenantID = tenantID
+
+	// Check if issuer already exists in this tenant
+	existing, err := s.store.Issuers().GetByIdentifier(ctx, tenantID, issuer.CredentialIssuerIdentifier)
 	if err == nil && existing != nil {
 		return storage.ErrAlreadyExists
 	}
@@ -46,14 +49,15 @@ func (s *IssuerService) Create(ctx context.Context, issuer *domain.CredentialIss
 	}
 
 	s.logger.Info("Issuer created",
+		zap.String("tenant_id", string(tenantID)),
 		zap.String("identifier", issuer.CredentialIssuerIdentifier))
 
 	return nil
 }
 
-// Get retrieves an issuer by identifier
-func (s *IssuerService) Get(ctx context.Context, identifier string) (*domain.CredentialIssuer, error) {
-	issuer, err := s.store.Issuers().GetByIdentifier(ctx, identifier)
+// Get retrieves an issuer by identifier within a tenant
+func (s *IssuerService) Get(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error) {
+	issuer, err := s.store.Issuers().GetByIdentifier(ctx, tenantID, identifier)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, storage.ErrNotFound
@@ -63,9 +67,9 @@ func (s *IssuerService) Get(ctx context.Context, identifier string) (*domain.Cre
 	return issuer, nil
 }
 
-// GetByID retrieves an issuer by ID
-func (s *IssuerService) GetByID(ctx context.Context, id int64) (*domain.CredentialIssuer, error) {
-	issuer, err := s.store.Issuers().GetByID(ctx, id)
+// GetByID retrieves an issuer by ID within a tenant
+func (s *IssuerService) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.CredentialIssuer, error) {
+	issuer, err := s.store.Issuers().GetByID(ctx, tenantID, id)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, storage.ErrNotFound
@@ -75,9 +79,9 @@ func (s *IssuerService) GetByID(ctx context.Context, id int64) (*domain.Credenti
 	return issuer, nil
 }
 
-// GetAll retrieves all issuers
-func (s *IssuerService) GetAll(ctx context.Context) ([]*domain.CredentialIssuer, error) {
-	issuers, err := s.store.Issuers().GetAll(ctx)
+// GetAll retrieves all issuers for a tenant
+func (s *IssuerService) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.CredentialIssuer, error) {
+	issuers, err := s.store.Issuers().GetAll(ctx, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issuers: %w", err)
 	}
@@ -101,15 +105,17 @@ func (s *IssuerService) Update(ctx context.Context, issuer *domain.CredentialIss
 }
 
 // Delete removes an issuer
-func (s *IssuerService) Delete(ctx context.Context, id int64) error {
-	if err := s.store.Issuers().Delete(ctx, id); err != nil {
+func (s *IssuerService) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	if err := s.store.Issuers().Delete(ctx, tenantID, id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
 		}
 		return fmt.Errorf("failed to delete issuer: %w", err)
 	}
 
-	s.logger.Info("Issuer deleted", zap.Int64("id", id))
+	s.logger.Info("Issuer deleted",
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int64("id", id))
 
 	return nil
 }

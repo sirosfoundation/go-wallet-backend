@@ -107,9 +107,9 @@ func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssue
 	return nil
 }
 
-func (s *IssuerStore) GetByID(ctx context.Context, id int64) (*domain.CredentialIssuer, error) {
+func (s *IssuerStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.CredentialIssuer, error) {
 	var issuer domain.CredentialIssuer
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&issuer)
+	err := s.collection.FindOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)}).Decode(&issuer)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -119,9 +119,9 @@ func (s *IssuerStore) GetByID(ctx context.Context, id int64) (*domain.Credential
 	return &issuer, nil
 }
 
-func (s *IssuerStore) GetByIdentifier(ctx context.Context, identifier string) (*domain.CredentialIssuer, error) {
+func (s *IssuerStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error) {
 	var issuer domain.CredentialIssuer
-	err := s.collection.FindOne(ctx, bson.M{"credential_issuer_identifier": identifier}).Decode(&issuer)
+	err := s.collection.FindOne(ctx, bson.M{"tenant_id": string(tenantID), "credential_issuer_identifier": identifier}).Decode(&issuer)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -131,8 +131,8 @@ func (s *IssuerStore) GetByIdentifier(ctx context.Context, identifier string) (*
 	return &issuer, nil
 }
 
-func (s *IssuerStore) GetAll(ctx context.Context) ([]*domain.CredentialIssuer, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{})
+func (s *IssuerStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.CredentialIssuer, error) {
+	cursor, err := s.collection.Find(ctx, bson.M{"tenant_id": string(tenantID)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issuers: %w", err)
 	}
@@ -156,8 +156,8 @@ func (s *IssuerStore) Update(ctx context.Context, issuer *domain.CredentialIssue
 	return nil
 }
 
-func (s *IssuerStore) Delete(ctx context.Context, id int64) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+func (s *IssuerStore) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)})
 	if err != nil {
 		return fmt.Errorf("failed to delete issuer: %w", err)
 	}
@@ -216,9 +216,9 @@ func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) e
 	return nil
 }
 
-func (s *VerifierStore) GetByID(ctx context.Context, id int64) (*domain.Verifier, error) {
+func (s *VerifierStore) GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.Verifier, error) {
 	var verifier domain.Verifier
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&verifier)
+	err := s.collection.FindOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)}).Decode(&verifier)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -228,8 +228,8 @@ func (s *VerifierStore) GetByID(ctx context.Context, id int64) (*domain.Verifier
 	return &verifier, nil
 }
 
-func (s *VerifierStore) GetAll(ctx context.Context) ([]*domain.Verifier, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{})
+func (s *VerifierStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error) {
+	cursor, err := s.collection.Find(ctx, bson.M{"tenant_id": string(tenantID)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get verifiers: %w", err)
 	}
@@ -253,8 +253,8 @@ func (s *VerifierStore) Update(ctx context.Context, verifier *domain.Verifier) e
 	return nil
 }
 
-func (s *VerifierStore) Delete(ctx context.Context, id int64) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+func (s *VerifierStore) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)})
 	if err != nil {
 		return fmt.Errorf("failed to delete verifier: %w", err)
 	}

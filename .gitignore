@@ -1,6 +1,7 @@
 cover.out
 coverage.html
 coverage.out
+coverage_*.out
 bin/
 pki/*
 !pki/create_pki.sh

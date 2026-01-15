@@ -197,27 +197,46 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	return user.PrivateDataETag, nil
 }
 
-// DeleteUser deletes a user and all associated data
+// DeleteUser deletes a user and all associated data across ALL tenants.
+// Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
+// which may leave orphaned data in other tenants. This is a best-effort cleanup
+// that prioritizes completing the user deletion over strict data consistency.
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
-	// Delete all credentials
-	credentials, err := s.store.Credentials().GetAllByHolder(ctx, holderDID)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return fmt.Errorf("failed to get credentials: %w", err)
-	}
-	for _, cred := range credentials {
-		if err := s.store.Credentials().Delete(ctx, holderDID, cred.CredentialIdentifier); err != nil {
-			s.logger.Warn("Failed to delete credential", zap.Error(err))
-		}
+	// Get all tenants the user belongs to
+	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		s.logger.Warn("Failed to get user tenants for cleanup", zap.Error(err))
+		// Continue with user deletion even if we can't get tenants
+		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
 
-	// Delete all presentations
-	presentations, err := s.store.Presentations().GetAllByHolder(ctx, holderDID)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return fmt.Errorf("failed to get presentations: %w", err)
-	}
-	for _, pres := range presentations {
-		if err := s.store.Presentations().Delete(ctx, holderDID, pres.PresentationIdentifier); err != nil {
-			s.logger.Warn("Failed to delete presentation", zap.Error(err))
+	// Delete credentials and presentations from each tenant
+	for _, tenantID := range tenantIDs {
+		// Delete all credentials in this tenant
+		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, cred := range credentials {
+			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
+				s.logger.Warn("Failed to delete credential", zap.Error(err))
+			}
+		}
+
+		// Delete all presentations in this tenant
+		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, pres := range presentations {
+			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
+				s.logger.Warn("Failed to delete presentation", zap.Error(err))
+			}
+		}
+
+		// Remove tenant membership
+		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
+			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
 		}
 	}
 

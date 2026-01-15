@@ -26,6 +26,7 @@ func setupCredentialService(t *testing.T) *CredentialService {
 func TestCredentialService_Store_Success(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
+	tenantID := domain.DefaultTenantID
 
 	req := &domain.StoreCredentialRequest{
 		HolderDID:            "did:example:holder",
@@ -34,7 +35,7 @@ func TestCredentialService_Store_Success(t *testing.T) {
 		Format:               domain.FormatJWTVC,
 	}
 
-	cred, err := svc.Store(ctx, req)
+	cred, err := svc.Store(ctx, tenantID, req)
 	if err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
@@ -50,6 +51,7 @@ func TestCredentialService_Store_Success(t *testing.T) {
 func TestCredentialService_Store_MissingHolderDID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
+	tenantID := domain.DefaultTenantID
 
 	req := &domain.StoreCredentialRequest{
 		HolderDID:            "",
@@ -58,7 +60,7 @@ func TestCredentialService_Store_MissingHolderDID(t *testing.T) {
 		Format:               domain.FormatJWTVC,
 	}
 
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, tenantID, req)
 	if err == nil {
 		t.Error("Expected error for missing holder_did")
 	}
@@ -75,7 +77,7 @@ func TestCredentialService_Store_MissingCredentialIdentifier(t *testing.T) {
 		Format:               domain.FormatJWTVC,
 	}
 
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err == nil {
 		t.Error("Expected error for missing credential_identifier")
 	}
@@ -92,7 +94,7 @@ func TestCredentialService_Store_MissingCredential(t *testing.T) {
 		Format:               domain.FormatJWTVC,
 	}
 
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err == nil {
 		t.Error("Expected error for missing credential")
 	}
@@ -109,7 +111,7 @@ func TestCredentialService_Store_MissingFormat(t *testing.T) {
 		Format:               "",
 	}
 
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err == nil {
 		t.Error("Expected error for missing format")
 	}
@@ -128,13 +130,13 @@ func TestCredentialService_GetAll_Success(t *testing.T) {
 			Credential:           `{"type": "VerifiableCredential"}`,
 			Format:               domain.FormatJWTVC,
 		}
-		_, err := svc.Store(ctx, req)
+		_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 		if err != nil {
 			t.Fatalf("Store() error = %v", err)
 		}
 	}
 
-	creds, err := svc.GetAll(ctx, holderDID)
+	creds, err := svc.GetAll(ctx, domain.DefaultTenantID, holderDID)
 	if err != nil {
 		t.Fatalf("GetAll() error = %v", err)
 	}
@@ -148,7 +150,7 @@ func TestCredentialService_GetAll_MissingHolderDID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	_, err := svc.GetAll(ctx, "")
+	_, err := svc.GetAll(ctx, domain.DefaultTenantID, "")
 	if err == nil {
 		t.Error("Expected error for missing holder_did")
 	}
@@ -167,12 +169,12 @@ func TestCredentialService_GetByIdentifier_Success(t *testing.T) {
 		Credential:           `{"type": "VerifiableCredential"}`,
 		Format:               domain.FormatJWTVC,
 	}
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
 
-	cred, err := svc.GetByIdentifier(ctx, holderDID, credID)
+	cred, err := svc.GetByIdentifier(ctx, domain.DefaultTenantID, holderDID, credID)
 	if err != nil {
 		t.Fatalf("GetByIdentifier() error = %v", err)
 	}
@@ -186,7 +188,7 @@ func TestCredentialService_GetByIdentifier_NotFound(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	_, err := svc.GetByIdentifier(ctx, "did:example:holder", "nonexistent")
+	_, err := svc.GetByIdentifier(ctx, domain.DefaultTenantID, "did:example:holder", "nonexistent")
 	if err == nil {
 		t.Error("Expected error for non-existent credential")
 	}
@@ -196,7 +198,7 @@ func TestCredentialService_GetByIdentifier_MissingHolderDID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	_, err := svc.GetByIdentifier(ctx, "", "cred-001")
+	_, err := svc.GetByIdentifier(ctx, domain.DefaultTenantID, "", "cred-001")
 	if err == nil {
 		t.Error("Expected error for missing holder_did")
 	}
@@ -206,7 +208,7 @@ func TestCredentialService_GetByIdentifier_MissingCredentialID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	_, err := svc.GetByIdentifier(ctx, "did:example:holder", "")
+	_, err := svc.GetByIdentifier(ctx, domain.DefaultTenantID, "did:example:holder", "")
 	if err == nil {
 		t.Error("Expected error for missing credential_identifier")
 	}
@@ -225,7 +227,7 @@ func TestCredentialService_Update_Success(t *testing.T) {
 		Credential:           `{"type": "VerifiableCredential"}`,
 		Format:               domain.FormatJWTVC,
 	}
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
@@ -236,7 +238,7 @@ func TestCredentialService_Update_Success(t *testing.T) {
 		InstanceID:           42,
 		SigCount:             5,
 	}
-	cred, err := svc.Update(ctx, holderDID, updateReq)
+	cred, err := svc.Update(ctx, domain.DefaultTenantID, holderDID, updateReq)
 	if err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
@@ -257,7 +259,7 @@ func TestCredentialService_Update_NotFound(t *testing.T) {
 		CredentialIdentifier: "nonexistent",
 		InstanceID:           42,
 	}
-	_, err := svc.Update(ctx, "did:example:holder", updateReq)
+	_, err := svc.Update(ctx, domain.DefaultTenantID, "did:example:holder", updateReq)
 	if err == nil {
 		t.Error("Expected error for non-existent credential")
 	}
@@ -270,7 +272,7 @@ func TestCredentialService_Update_MissingHolderDID(t *testing.T) {
 	updateReq := &domain.UpdateCredentialRequest{
 		CredentialIdentifier: "cred-001",
 	}
-	_, err := svc.Update(ctx, "", updateReq)
+	_, err := svc.Update(ctx, domain.DefaultTenantID, "", updateReq)
 	if err == nil {
 		t.Error("Expected error for missing holder_did")
 	}
@@ -283,7 +285,7 @@ func TestCredentialService_Update_MissingCredentialID(t *testing.T) {
 	updateReq := &domain.UpdateCredentialRequest{
 		CredentialIdentifier: "",
 	}
-	_, err := svc.Update(ctx, "did:example:holder", updateReq)
+	_, err := svc.Update(ctx, domain.DefaultTenantID, "did:example:holder", updateReq)
 	if err == nil {
 		t.Error("Expected error for missing credential_identifier")
 	}
@@ -302,19 +304,19 @@ func TestCredentialService_Delete_Success(t *testing.T) {
 		Credential:           `{"type": "VerifiableCredential"}`,
 		Format:               domain.FormatJWTVC,
 	}
-	_, err := svc.Store(ctx, req)
+	_, err := svc.Store(ctx, domain.DefaultTenantID, req)
 	if err != nil {
 		t.Fatalf("Store() error = %v", err)
 	}
 
 	// Delete the credential
-	err = svc.Delete(ctx, holderDID, credID)
+	err = svc.Delete(ctx, domain.DefaultTenantID, holderDID, credID)
 	if err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
 
 	// Verify it's gone
-	_, err = svc.GetByIdentifier(ctx, holderDID, credID)
+	_, err = svc.GetByIdentifier(ctx, domain.DefaultTenantID, holderDID, credID)
 	if err == nil {
 		t.Error("Expected error for deleted credential")
 	}
@@ -324,7 +326,7 @@ func TestCredentialService_Delete_NotFound(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	err := svc.Delete(ctx, "did:example:holder", "nonexistent")
+	err := svc.Delete(ctx, domain.DefaultTenantID, "did:example:holder", "nonexistent")
 	if err == nil {
 		t.Error("Expected error for non-existent credential")
 	}
@@ -334,7 +336,7 @@ func TestCredentialService_Delete_MissingHolderDID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	err := svc.Delete(ctx, "", "cred-001")
+	err := svc.Delete(ctx, domain.DefaultTenantID, "", "cred-001")
 	if err == nil {
 		t.Error("Expected error for missing holder_did")
 	}
@@ -344,7 +346,7 @@ func TestCredentialService_Delete_MissingCredentialID(t *testing.T) {
 	svc := setupCredentialService(t)
 	ctx := context.Background()
 
-	err := svc.Delete(ctx, "did:example:holder", "")
+	err := svc.Delete(ctx, domain.DefaultTenantID, "did:example:holder", "")
 	if err == nil {
 		t.Error("Expected error for missing credential_identifier")
 	}

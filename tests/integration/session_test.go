@@ -41,7 +41,7 @@ func TestPrivateData(t *testing.T) {
 	t.Run("GET returns private data with ETag", func(t *testing.T) {
 		resp := h.AuthGET(user, "/user/session/private-data")
 		resp.Status(http.StatusOK)
-		
+
 		// ETag is returned in X-Private-Data-ETag header
 		etag := resp.Header("X-Private-Data-ETag")
 		if etag == "" {
