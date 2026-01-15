@@ -131,7 +131,10 @@ Q0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCk8W8m1gAn7WM8RH5y
 		// This will fail because the cert is invalid, but we're testing the path reading
 		_, err := NewFromConfig(ctx, cfg)
 		// We expect either success or a cert parsing error (not a file read error)
-		if err != nil && !contains(err.Error(), "failed to read") {
+		if err != nil {
+			if contains(err.Error(), "failed to read") {
+				t.Errorf("unexpected file read error: %v", err)
+			}
 			// This is expected - cert parsing may fail with our dummy cert
 		}
 	})

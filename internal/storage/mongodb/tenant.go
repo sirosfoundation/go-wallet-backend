@@ -48,7 +48,7 @@ func (s *TenantStore) GetAll(ctx context.Context) ([]*domain.Tenant, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenants: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var tenants []*domain.Tenant
 	if err := cursor.All(ctx, &tenants); err != nil {
@@ -62,7 +62,7 @@ func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, erro
 	if err != nil {
 		return nil, fmt.Errorf("failed to get enabled tenants: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var tenants []*domain.Tenant
 	if err := cursor.All(ctx, &tenants); err != nil {
@@ -131,7 +131,7 @@ func (s *UserTenantStore) GetUserTenants(ctx context.Context, userID domain.User
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user tenants: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var memberships []domain.UserTenantMembership
 	if err := cursor.All(ctx, &memberships); err != nil {
@@ -150,7 +150,7 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 	if err != nil {
 		return nil, fmt.Errorf("failed to get tenant users: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var memberships []domain.UserTenantMembership
 	if err := cursor.All(ctx, &memberships); err != nil {

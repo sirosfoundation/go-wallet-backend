@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"sync"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -85,8 +86,11 @@ func NewEvaluatorFromPaths(rootPaths, intermediatePaths []string) (*Evaluator, e
 
 // loadCertFile reads a PEM certificate file.
 func loadCertFile(path string) ([]byte, error) {
-	// This is a placeholder - in production, use os.ReadFile
-	return nil, fmt.Errorf("file loading not implemented: %s", path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading cert file: %w", err)
+	}
+	return data, nil
 }
 
 // Name returns the evaluator name.
