@@ -1,10 +1,23 @@
 # API Reference
 
+This document describes the public wallet API. For the internal administration API, see [Admin API (OpenAPI)](./openapi-admin.yaml).
+
 ## Base URL
 
 ```
 http://localhost:8080
 ```
+
+## Admin API
+
+The admin API runs on a separate port (default: 8081) and provides multi-tenant management capabilities:
+
+- Tenant management (CRUD)
+- User membership management
+- Issuer configuration per tenant
+- Verifier configuration per tenant
+
+See [openapi-admin.yaml](./openapi-admin.yaml) for the complete OpenAPI 3.0 specification.
 
 ## Authentication
 

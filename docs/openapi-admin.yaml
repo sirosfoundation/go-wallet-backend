@@ -1,0 +1,815 @@
+openapi: 3.0.3
+info:
+  title: Wallet Backend Admin API
+  description: |
+    Internal administration API for managing the wallet backend multi-tenant infrastructure.
+    
+    This API is intended to be exposed on a separate port (default: 8081) and should only be
+    accessible from internal networks or trusted management systems.
+    
+    ## Multi-Tenancy Model
+    
+    The wallet backend supports multiple tenants, each with their own isolated:
+    - Users and credentials
+    - Credential issuers (where users can request credentials)
+    - Verifiers (where users can present credentials)
+    
+    Users are associated with tenants through memberships. Each user can belong to multiple
+    tenants with different roles (user, admin).
+    
+    ## Security
+    
+    This API does not require authentication by default, as it is designed to run on an
+    internal network. In production, you should:
+    - Only expose this API on internal networks
+    - Use network-level access control (firewalls, VPNs)
+    - Consider adding authentication middleware if needed
+  version: 1.0.0
+  contact:
+    name: SIROS Foundation
+    url: https://siros.org
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8081
+    description: Local development admin server
+  - url: http://admin.wallet.internal:8081
+    description: Internal admin server (example)
+
+tags:
+  - name: Status
+    description: Health check and status endpoints
+  - name: Tenants
+    description: Tenant management operations
+  - name: Users
+    description: Tenant user membership management
+  - name: Issuers
+    description: Credential issuer management per tenant
+  - name: Verifiers
+    description: Verifier management per tenant
+
+paths:
+  /admin/status:
+    get:
+      tags:
+        - Status
+      summary: Get admin server status
+      description: Health check endpoint for the admin server
+      operationId: getAdminStatus
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /admin/tenants:
+    get:
+      tags:
+        - Tenants
+      summary: List all tenants
+      description: Returns a list of all tenants in the system
+      operationId: listTenants
+      responses:
+        '200':
+          description: List of tenants
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TenantResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    post:
+      tags:
+        - Tenants
+      summary: Create a new tenant
+      description: |
+        Creates a new tenant with the specified configuration.
+        
+        Tenant IDs must:
+        - Be lowercase alphanumeric with hyphens
+        - Start with a letter
+        - Be between 2-50 characters
+      operationId: createTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantRequest'
+            example:
+              id: acme-corp
+              name: ACME Corporation
+              display_name: ACME Corp Wallet
+              enabled: true
+      responses:
+        '201':
+          description: Tenant created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Tenant already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+    
+    get:
+      tags:
+        - Tenants
+      summary: Get a specific tenant
+      description: Returns details of a specific tenant
+      operationId: getTenant
+      responses:
+        '200':
+          description: Tenant details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    put:
+      tags:
+        - Tenants
+      summary: Update a tenant
+      description: Updates an existing tenant's configuration
+      operationId: updateTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantRequest'
+      responses:
+        '200':
+          description: Tenant updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    delete:
+      tags:
+        - Tenants
+      summary: Delete a tenant
+      description: |
+        Deletes a tenant and all associated data.
+        
+        **Warning:** This is a destructive operation. All users, credentials,
+        issuers, and verifiers associated with this tenant will be deleted.
+        
+        The default tenant cannot be deleted.
+      operationId: deleteTenant
+      responses:
+        '200':
+          description: Tenant deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '403':
+          description: Cannot delete the default tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+    
+    get:
+      tags:
+        - Users
+      summary: List users in a tenant
+      description: Returns a list of all user IDs that are members of the tenant
+      operationId: getTenantUsers
+      responses:
+        '200':
+          description: List of user IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                    example:
+                      - "550e8400-e29b-41d4-a716-446655440000"
+                      - "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    post:
+      tags:
+        - Users
+      summary: Add a user to a tenant
+      description: |
+        Adds an existing user to a tenant with the specified role.
+        
+        Valid roles are:
+        - `user` - Standard user access (default)
+        - `admin` - Administrative access within the tenant
+      operationId: addUserToTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - user_id
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                  description: The UUID of the user to add
+                role:
+                  type: string
+                  enum: [user, admin]
+                  default: user
+                  description: The role to assign to the user
+            example:
+              user_id: "550e8400-e29b-41d4-a716-446655440000"
+              role: user
+      responses:
+        '200':
+          description: User added to tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/userId'
+    
+    delete:
+      tags:
+        - Users
+      summary: Remove a user from a tenant
+      description: Removes a user's membership from the tenant
+      operationId: removeUserFromTenant
+      responses:
+        '200':
+          description: User removed from tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/issuers:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+    
+    get:
+      tags:
+        - Issuers
+      summary: List credential issuers for a tenant
+      description: |
+        Returns all credential issuers configured for the tenant.
+        
+        Issuers define where users can request verifiable credentials from.
+        The wallet frontend uses this information to display available
+        credential sources to users.
+      operationId: listIssuers
+      responses:
+        '200':
+          description: List of issuers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  issuers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/IssuerResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    post:
+      tags:
+        - Issuers
+      summary: Create a credential issuer
+      description: |
+        Adds a new credential issuer to the tenant.
+        
+        The `credential_issuer_identifier` is the URL of an OpenID4VCI-compliant
+        credential issuer. The wallet will fetch the issuer's metadata from
+        `{credential_issuer_identifier}/.well-known/openid-credential-issuer`
+        to display available credentials.
+      operationId: createIssuer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuerRequest'
+            example:
+              credential_issuer_identifier: "https://issuer.example.com"
+              client_id: "wallet-client"
+              visible: true
+      responses:
+        '201':
+          description: Issuer created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Issuer with this identifier already exists in tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/issuers/{issuerId}:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/issuerId'
+    
+    get:
+      tags:
+        - Issuers
+      summary: Get a specific issuer
+      description: Returns details of a specific credential issuer
+      operationId: getIssuer
+      responses:
+        '200':
+          description: Issuer details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    put:
+      tags:
+        - Issuers
+      summary: Update an issuer
+      description: Updates an existing credential issuer's configuration
+      operationId: updateIssuer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuerRequest'
+      responses:
+        '200':
+          description: Issuer updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuerResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    delete:
+      tags:
+        - Issuers
+      summary: Delete an issuer
+      description: Removes a credential issuer from the tenant
+      operationId: deleteIssuer
+      responses:
+        '200':
+          description: Issuer deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/verifiers:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+    
+    get:
+      tags:
+        - Verifiers
+      summary: List verifiers for a tenant
+      description: |
+        Returns all verifiers configured for the tenant.
+        
+        Verifiers define where users can present their credentials.
+        The wallet frontend uses this information to display available
+        presentation destinations to users.
+      operationId: listVerifiers
+      responses:
+        '200':
+          description: List of verifiers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verifiers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VerifierResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    post:
+      tags:
+        - Verifiers
+      summary: Create a verifier
+      description: |
+        Adds a new verifier to the tenant.
+        
+        Verifiers are services that can request credential presentations from
+        users. The name and URL are displayed to users when they choose where
+        to present their credentials.
+      operationId: createVerifier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifierRequest'
+            example:
+              name: "University Portal"
+              url: "https://verifier.university.edu"
+      responses:
+        '201':
+          description: Verifier created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifierResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/verifiers/{verifierId}:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/verifierId'
+    
+    get:
+      tags:
+        - Verifiers
+      summary: Get a specific verifier
+      description: Returns details of a specific verifier
+      operationId: getVerifier
+      responses:
+        '200':
+          description: Verifier details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifierResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    put:
+      tags:
+        - Verifiers
+      summary: Update a verifier
+      description: Updates an existing verifier's configuration
+      operationId: updateVerifier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifierRequest'
+      responses:
+        '200':
+          description: Verifier updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifierResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    
+    delete:
+      tags:
+        - Verifiers
+      summary: Delete a verifier
+      description: Removes a verifier from the tenant
+      operationId: deleteVerifier
+      responses:
+        '200':
+          description: Verifier deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    tenantId:
+      name: tenantId
+      in: path
+      required: true
+      description: The unique identifier of the tenant
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9-]{1,49}$'
+      example: acme-corp
+    
+    userId:
+      name: userId
+      in: path
+      required: true
+      description: The UUID of the user
+      schema:
+        type: string
+        format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+    
+    issuerId:
+      name: issuerId
+      in: path
+      required: true
+      description: The numeric ID of the issuer
+      schema:
+        type: integer
+        format: int64
+      example: 1
+    
+    verifierId:
+      name: verifierId
+      in: path
+      required: true
+      description: The numeric ID of the verifier
+      schema:
+        type: integer
+        format: int64
+      example: 1
+
+  schemas:
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: wallet-backend-admin
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+      example:
+        error: "Resource not found"
+
+    MessageResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Success message
+      example:
+        message: "Operation completed successfully"
+
+    TenantRequest:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,49}$'
+          description: |
+            Unique tenant identifier. Must be lowercase alphanumeric with hyphens,
+            start with a letter, and be 2-50 characters.
+          example: acme-corp
+        name:
+          type: string
+          description: Human-readable tenant name
+          example: ACME Corporation
+        display_name:
+          type: string
+          description: Display name shown to users
+          example: ACME Corp Digital Wallet
+        enabled:
+          type: boolean
+          default: true
+          description: Whether the tenant is enabled
+
+    TenantResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          example: acme-corp
+        name:
+          type: string
+          example: ACME Corporation
+        display_name:
+          type: string
+          example: ACME Corp Digital Wallet
+        enabled:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-01-15T10:30:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-01-16T14:20:00Z"
+
+    IssuerRequest:
+      type: object
+      required:
+        - credential_issuer_identifier
+      properties:
+        credential_issuer_identifier:
+          type: string
+          format: uri
+          description: |
+            The URL of the OpenID4VCI credential issuer. The wallet will fetch
+            metadata from `{url}/.well-known/openid-credential-issuer`.
+          example: "https://issuer.example.com"
+        client_id:
+          type: string
+          description: |
+            OAuth2 client ID to use when authenticating with this issuer.
+            If not specified, the wallet may use dynamic client registration.
+          example: "wallet-client-id"
+        visible:
+          type: boolean
+          default: true
+          description: Whether this issuer should be visible to users in the wallet UI
+
+    IssuerResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        tenant_id:
+          type: string
+          example: acme-corp
+        credential_issuer_identifier:
+          type: string
+          format: uri
+          example: "https://issuer.example.com"
+        client_id:
+          type: string
+          example: "wallet-client-id"
+        visible:
+          type: boolean
+          example: true
+
+    VerifierRequest:
+      type: object
+      required:
+        - name
+        - url
+      properties:
+        name:
+          type: string
+          description: Human-readable name of the verifier
+          example: "University Portal"
+        url:
+          type: string
+          format: uri
+          description: URL of the verifier service
+          example: "https://verifier.university.edu"
+
+    VerifierResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        tenant_id:
+          type: string
+          example: acme-corp
+        name:
+          type: string
+          example: "University Portal"
+        url:
+          type: string
+          format: uri
+          example: "https://verifier.university.edu"
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Invalid request body"
+    
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Tenant not found"
+    
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Failed to process request"

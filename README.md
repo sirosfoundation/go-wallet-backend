@@ -210,6 +210,45 @@ make dev
 #### Status
 - `GET /status` - Health check
 
+### Multi-Tenancy
+
+The wallet backend supports multiple tenants with isolated data. Users access tenant-scoped APIs through:
+
+```
+/t/{tenant_id}/...
+```
+
+Example: `/t/acme-corp/storage/vc` accesses credentials for the `acme-corp` tenant.
+
+### Admin API (Port 8081)
+
+The admin API runs on a separate port for internal management:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET/POST /admin/tenants` | List/Create tenants |
+| `GET/PUT/DELETE /admin/tenants/:id` | Manage a tenant |
+| `GET/POST /admin/tenants/:id/users` | Manage tenant users |
+| `GET/POST /admin/tenants/:id/issuers` | Manage credential issuers |
+| `GET/POST /admin/tenants/:id/verifiers` | Manage verifiers |
+
+**OpenAPI Specification**: [docs/openapi-admin.yaml](docs/openapi-admin.yaml)
+
+```bash
+# Start with admin API
+WALLET_SERVER_ADMIN_PORT=8081 ./bin/server
+
+# Create a tenant
+curl -X POST http://localhost:8081/admin/tenants \
+  -H "Content-Type: application/json" \
+  -d '{"id":"my-tenant","name":"My Tenant","enabled":true}'
+
+# Add an issuer
+curl -X POST http://localhost:8081/admin/tenants/my-tenant/issuers \
+  -H "Content-Type: application/json" \
+  -d '{"credential_issuer_identifier":"https://issuer.example.com","visible":true}'
+```
+
 ## Deployment
 
 ### Docker
