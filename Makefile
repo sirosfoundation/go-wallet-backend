@@ -9,6 +9,12 @@ build: ## Build the server binary
 	@echo "Building server..."
 	@go build -o bin/server cmd/server/main.go
 
+build-admin: ## Build the wallet-admin CLI tool
+	@echo "Building wallet-admin CLI..."
+	@go build -o bin/wallet-admin ./cmd/wallet-admin
+
+build-all: build build-admin ## Build all binaries
+
 run: build ## Build and run the server
 	@echo "Running server..."
 	@./bin/server

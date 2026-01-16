@@ -234,20 +234,68 @@ The admin API runs on a separate port for internal management:
 
 **OpenAPI Specification**: [docs/openapi-admin.yaml](docs/openapi-admin.yaml)
 
+#### Admin CLI (wallet-admin)
+
+A command-line tool for managing the admin API:
+
 ```bash
-# Start with admin API
-WALLET_SERVER_ADMIN_PORT=8081 ./bin/server
+# Build the CLI
+make build-admin
+
+# Or build manually
+go build -o wallet-admin ./cmd/wallet-admin
+
+# Configure the admin URL
+export WALLET_ADMIN_URL=http://localhost:8081
+
+# List tenants
+./wallet-admin tenant list
 
 # Create a tenant
-curl -X POST http://localhost:8081/admin/tenants \
-  -H "Content-Type: application/json" \
-  -d '{"id":"my-tenant","name":"My Tenant","enabled":true}'
+./wallet-admin tenant create --id my-tenant --name "My Tenant"
 
-# Add an issuer
-curl -X POST http://localhost:8081/admin/tenants/my-tenant/issuers \
-  -H "Content-Type: application/json" \
-  -d '{"credential_issuer_identifier":"https://issuer.example.com","visible":true}'
+# Add an issuer to a tenant
+./wallet-admin issuer create --tenant my-tenant --id my-issuer --name "My Issuer" \
+  --issuer-url https://issuer.example.com \
+  --client-id my-client
+
+# Add a verifier
+./wallet-admin verifier create --tenant my-tenant --id my-verifier --name "My Verifier" \
+  --endpoint https://verifier.example.com
+
+# Output as JSON
+./wallet-admin tenant list --output json
 ```
+
+**Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `tenant list` | List all tenants |
+| `tenant create` | Create a new tenant |
+| `tenant get <id>` | Get tenant details |
+| `tenant update <id>` | Update a tenant |
+| `tenant delete <id>` | Delete a tenant |
+| `user list --tenant <id>` | List users in a tenant |
+| `user add --tenant <id> --id <user-id>` | Add user to tenant |
+| `user remove --tenant <id> --id <user-id>` | Remove user from tenant |
+| `issuer list --tenant <id>` | List issuers in a tenant |
+| `issuer create --tenant <id>` | Create an issuer |
+| `issuer get <id> --tenant <id>` | Get issuer details |
+| `issuer update <id> --tenant <id>` | Update an issuer |
+| `issuer delete <id> --tenant <id>` | Delete an issuer |
+| `verifier list --tenant <id>` | List verifiers in a tenant |
+| `verifier create --tenant <id>` | Create a verifier |
+| `verifier get <id> --tenant <id>` | Get verifier details |
+| `verifier update <id> --tenant <id>` | Update a verifier |
+| `verifier delete <id> --tenant <id>` | Delete a verifier |
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--url, -u` | Admin API base URL (default: http://localhost:8081) |
+| `--output, -o` | Output format: table, json (default: table) |
 
 ## Deployment
 
