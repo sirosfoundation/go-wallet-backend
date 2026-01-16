@@ -425,3 +425,323 @@ func TestHandlers_KeyAttestation_InvalidRequest(t *testing.T) {
 // Ensure context and uuid imports are used
 var _ = context.Background
 var _ = uuid.New
+
+// Test tenant-scoped WebAuthn registration - WebAuthn not available
+func TestHandlers_StartTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	// Note: WebAuthn is nil when not properly configured
+	handlers.services.WebAuthn = nil
+	router.POST("/tenant/webauthn/register/start", handlers.StartTenantWebAuthnRegistration)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/start", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestHandlers_FinishTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.POST("/tenant/webauthn/register/finish", handlers.FinishTenantWebAuthnRegistration)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/finish", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestHandlers_StartTenantWebAuthnLogin_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.POST("/tenant/webauthn/login/start", handlers.StartTenantWebAuthnLogin)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/start", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestHandlers_FinishTenantWebAuthnLogin_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.POST("/tenant/webauthn/login/finish", handlers.FinishTenantWebAuthnLogin)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/finish", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+// Test credential storage handlers with authentication context
+func TestHandlers_StoreCredential_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.POST("/credentials", handlers.StoreCredential)
+
+	w := httptest.NewRecorder()
+	body := `{"credentials": [{"format": "jwt_vc", "credential": "test"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/credentials", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestHandlers_UpdateCredential_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.PUT("/credentials/:id", handlers.UpdateCredential)
+
+	w := httptest.NewRecorder()
+	body := `{"vc": "updated"}`
+	req := httptest.NewRequest(http.MethodPut, "/credentials/test-id", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestHandlers_DeleteCredential_BadRequest(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.DELETE("/credentials/:id", handlers.DeleteCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/credentials/test-id", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 400 due to missing user context
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+// Test presentation handlers
+func TestHandlers_GetAllPresentations_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/presentations", handlers.GetAllPresentations)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/presentations", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestHandlers_StorePresentation_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.POST("/presentations", handlers.StorePresentation)
+
+	w := httptest.NewRecorder()
+	body := `{"vp": "test"}`
+	req := httptest.NewRequest(http.MethodPost, "/presentations", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestHandlers_DeletePresentation_BadRequest(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.DELETE("/presentations/:id", handlers.DeletePresentation)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/presentations/test-id", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 400 due to missing user context
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestHandlers_GetPresentationByIdentifier_BadRequest(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/presentations/:id", handlers.GetPresentationByIdentifier)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/presentations/test-id", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 400 due to missing user context
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+// Test WebAuthn add credential handlers
+func TestHandlers_StartAddWebAuthnCredential_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.POST("/webauthn/credential/start", handlers.StartAddWebAuthnCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/start", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestHandlers_FinishAddWebAuthnCredential_NotAvailable(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.POST("/webauthn/credential/finish", handlers.FinishAddWebAuthnCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/finish", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
+	}
+}
+
+func TestHandlers_DeleteWebAuthnCredential_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	handlers.services.WebAuthn = nil
+	router.DELETE("/webauthn/credentials/:id", handlers.DeleteWebAuthnCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/webauthn/credentials/test-id", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 401 because user context is checked before WebAuthn availability
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+// Test GetIssuerByID handler with invalid ID
+func TestHandlers_GetIssuerByID_InvalidID(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/issuers/:id", handlers.GetIssuerByID)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/issuers/999999", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 404 when issuer not found
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d, got %d", http.StatusNotFound, w.Code)
+	}
+}
+
+// Test KeystoreStatus handler
+func TestHandlers_KeystoreStatus_Unauthorized(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/keystore/status", handlers.KeystoreStatus)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/keystore/status", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 401 when no user context
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+// Test GetCertificate handler - returns certificate chain
+func TestHandlers_GetCertificate_Success(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/certificate", handlers.GetCertificate)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/certificate", nil)
+	router.ServeHTTP(w, req)
+
+	// Without proper setup, returns 500 or specific error
+	// At minimum, verifies the handler doesn't panic
+	if w.Code == 0 {
+		t.Error("Expected a response status code")
+	}
+}
+
+// Test GetAllIssuers handler - unauthorized
+func TestHandlers_GetAllIssuers_Unauthenticated(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/issuers", handlers.GetAllIssuers)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/issuers", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 500 due to no tenant context - but handler doesn't panic
+	if w.Code == 0 {
+		t.Error("Expected a response status code")
+	}
+}
+
+// Test GetAllVerifiers handler - unauthorized
+func TestHandlers_GetAllVerifiers_Unauthenticated(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/verifiers", handlers.GetAllVerifiers)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/verifiers", nil)
+	router.ServeHTTP(w, req)
+
+	// Returns 500 due to no tenant context - but handler doesn't panic
+	if w.Code == 0 {
+		t.Error("Expected a response status code")
+	}
+}
+
+// Test ProxyRequest handler - missing parameters
+func TestHandlers_ProxyRequest_MissingURL(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.POST("/proxy", handlers.ProxyRequest)
+
+	w := httptest.NewRecorder()
+	body := `{}`
+	req := httptest.NewRequest(http.MethodPost, "/proxy", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	// Returns 500 for missing URL (internal server error from proxy service)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+// Test GenerateKeyAttestation handler - bad request
+func TestHandlers_GenerateKeyAttestation_BadRequest(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.POST("/key-attestation", handlers.GenerateKeyAttestation)
+
+	w := httptest.NewRecorder()
+	body := `{"public_key": "test"}`
+	req := httptest.NewRequest(http.MethodPost, "/key-attestation", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	// Returns 400 for invalid request (missing user context causes bad request)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}

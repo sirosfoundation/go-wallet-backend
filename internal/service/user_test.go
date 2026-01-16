@@ -603,3 +603,136 @@ func TestUserService_UpdateUser(t *testing.T) {
 		t.Errorf("UpdateUser() DisplayName = %v, want %s", updated.DisplayName, newName)
 	}
 }
+
+func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "webauthnuser"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "WebAuthn User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Add multiple WebAuthn credentials to the user
+	user.WebauthnCredentials = []domain.WebauthnCredential{
+		{ID: "cred1", PublicKey: []byte("key1")},
+		{ID: "cred2", PublicKey: []byte("key2")},
+	}
+	if err := service.UpdateUser(ctx, user); err != nil {
+		t.Fatalf("UpdateUser() error = %v", err)
+	}
+
+	t.Run("deletes credential successfully", func(t *testing.T) {
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred1", []byte("{}"), "")
+		if err != nil {
+			t.Errorf("DeleteWebAuthnCredential() error = %v", err)
+		}
+
+		// Verify credential was deleted
+		updated, _ := service.GetUserByID(ctx, user.UUID)
+		if len(updated.WebauthnCredentials) != 1 {
+			t.Errorf("Expected 1 credential, got %d", len(updated.WebauthnCredentials))
+		}
+	})
+
+	t.Run("fails on last credential", func(t *testing.T) {
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "")
+		if err != ErrLastWebAuthnCredential {
+			t.Errorf("Expected ErrLastWebAuthnCredential, got %v", err)
+		}
+	})
+
+	t.Run("fails on non-existent credential", func(t *testing.T) {
+		// Add another credential first
+		u, _ := service.GetUserByID(ctx, user.UUID)
+		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
+			ID: "cred3", PublicKey: []byte("key3"),
+		})
+		service.UpdateUser(ctx, u)
+
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", []byte("{}"), "")
+		if err == nil {
+			t.Error("Expected error for non-existent credential")
+		}
+	})
+
+	t.Run("fails on ETag mismatch", func(t *testing.T) {
+		u, _ := service.GetUserByID(ctx, user.UUID)
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "wrong-etag")
+		if err != ErrPrivateDataConflict {
+			t.Errorf("Expected ErrPrivateDataConflict, got %v", err)
+		}
+		_ = u
+	})
+}
+
+func TestUserService_RenameWebAuthnCredential(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "renameuser"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Rename User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Add a WebAuthn credential
+	user.WebauthnCredentials = []domain.WebauthnCredential{
+		{ID: "cred1", PublicKey: []byte("key1")},
+	}
+	if err := service.UpdateUser(ctx, user); err != nil {
+		t.Fatalf("UpdateUser() error = %v", err)
+	}
+
+	t.Run("renames credential successfully", func(t *testing.T) {
+		err := service.RenameWebAuthnCredential(ctx, user.UUID, "cred1", "My Key")
+		if err != nil {
+			t.Errorf("RenameWebAuthnCredential() error = %v", err)
+		}
+
+		// Verify rename
+		updated, _ := service.GetUserByID(ctx, user.UUID)
+		if updated.WebauthnCredentials[0].Nickname == nil || *updated.WebauthnCredentials[0].Nickname != "My Key" {
+			t.Error("Nickname was not updated")
+		}
+	})
+
+	t.Run("fails on non-existent credential", func(t *testing.T) {
+		err := service.RenameWebAuthnCredential(ctx, user.UUID, "nonexistent", "Name")
+		if err == nil {
+			t.Error("Expected error for non-existent credential")
+		}
+	})
+
+	t.Run("fails on non-existent user", func(t *testing.T) {
+		err := service.RenameWebAuthnCredential(ctx, domain.NewUserID(), "cred1", "Name")
+		if err == nil {
+			t.Error("Expected error for non-existent user")
+		}
+	})
+}

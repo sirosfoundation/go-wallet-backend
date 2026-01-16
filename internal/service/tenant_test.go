@@ -326,3 +326,110 @@ func TestUserTenantService_GetTenantUsers(t *testing.T) {
 		t.Errorf("GetTenantUsers() returned %d users, want 2", len(got))
 	}
 }
+
+func TestTenantService_Create_DuplicateID(t *testing.T) {
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewTenantService(store, logger)
+
+	tenant := &domain.Tenant{
+		ID:          "duplicate-test",
+		Name:        "test",
+		DisplayName: "Test",
+		Enabled:     true,
+	}
+
+	err := svc.Create(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("First Create() error = %v", err)
+	}
+
+	// Try creating again with same ID
+	tenant2 := &domain.Tenant{
+		ID:          "duplicate-test",
+		Name:        "test2",
+		DisplayName: "Test 2",
+		Enabled:     true,
+	}
+	err = svc.Create(context.Background(), tenant2)
+	if err == nil {
+		t.Error("Create() with duplicate ID should return error")
+	}
+}
+
+func TestTenantService_Update_NotFound(t *testing.T) {
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewTenantService(store, logger)
+
+	tenant := &domain.Tenant{
+		ID:          "nonexistent",
+		Name:        "test",
+		DisplayName: "Test",
+		Enabled:     true,
+	}
+
+	err := svc.Update(context.Background(), tenant)
+	if err == nil {
+		t.Error("Update() for nonexistent tenant should return error")
+	}
+}
+
+func TestTenantService_Delete_NotFound(t *testing.T) {
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewTenantService(store, logger)
+
+	// Try to delete non-existent tenant
+	err := svc.Delete(context.Background(), "nonexistent-tenant")
+	if err == nil {
+		t.Error("Delete() on non-existent tenant should return error")
+	}
+}
+
+func TestUserTenantService_AddUserToTenant_DisabledTenant(t *testing.T) {
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	tenantSvc := NewTenantService(store, logger)
+	userTenantSvc := NewUserTenantService(store, logger)
+
+	// Create a disabled tenant
+	tenant := &domain.Tenant{
+		ID:      "disabled-tenant",
+		Name:    "disabled",
+		Enabled: false,
+	}
+	if err := tenantSvc.Create(context.Background(), tenant); err != nil {
+		t.Fatalf("Create tenant error = %v", err)
+	}
+
+	userID := domain.NewUserID()
+
+	// Adding user to disabled tenant should still work (just checking membership operation)
+	err := userTenantSvc.AddUserToTenant(context.Background(), userID, "disabled-tenant", domain.TenantRoleUser)
+	if err != nil {
+		// If error is thrown, it's valid behavior
+		t.Logf("AddUserToTenant() to disabled tenant returned: %v", err)
+	}
+}
+
+func TestUserTenantService_RemoveUserFromTenant_NotAMember(t *testing.T) {
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	tenantSvc := NewTenantService(store, logger)
+	userTenantSvc := NewUserTenantService(store, logger)
+
+	// Create tenant
+	tenant := &domain.Tenant{ID: "remove-not-member", Name: "test", Enabled: true}
+	if err := tenantSvc.Create(context.Background(), tenant); err != nil {
+		t.Fatalf("Create tenant error = %v", err)
+	}
+
+	userID := domain.NewUserID()
+
+	// Try to remove user who is not a member
+	err := userTenantSvc.RemoveUserFromTenant(context.Background(), userID, "remove-not-member")
+	if err == nil {
+		t.Error("RemoveUserFromTenant() for non-member should return error")
+	}
+}

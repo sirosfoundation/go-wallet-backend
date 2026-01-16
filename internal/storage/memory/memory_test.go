@@ -1032,6 +1032,108 @@ func TestVerifierStore_GetAll(t *testing.T) {
 	}
 }
 
+func TestVerifierStore_Update(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
+
+	// Create a verifier first
+	verifier := &domain.Verifier{
+		TenantID: tenantID,
+		Name:     "Original Name",
+		URL:      "https://original.example.com",
+	}
+	err := verifiers.Create(ctx, verifier)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Update the verifier
+	verifier.Name = "Updated Name"
+	verifier.URL = "https://updated.example.com"
+	err = verifiers.Update(ctx, verifier)
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	// Verify update
+	updated, err := verifiers.GetByID(ctx, tenantID, verifier.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if updated.Name != "Updated Name" {
+		t.Errorf("Update() name = %q, want %q", updated.Name, "Updated Name")
+	}
+}
+
+func TestVerifierStore_Update_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
+
+	verifier := &domain.Verifier{
+		ID:       99999,
+		TenantID: tenantID,
+		Name:     "Non-existent",
+		URL:      "https://nonexistent.example.com",
+	}
+
+	err := verifiers.Update(ctx, verifier)
+	if err == nil {
+		t.Error("Update() for non-existent verifier should return error")
+	}
+	if err != storage.ErrNotFound {
+		t.Errorf("Update() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestVerifierStore_Delete(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
+
+	// Create a verifier first
+	verifier := &domain.Verifier{
+		TenantID: tenantID,
+		Name:     "To Delete",
+		URL:      "https://delete.example.com",
+	}
+	err := verifiers.Create(ctx, verifier)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Delete the verifier
+	err = verifiers.Delete(ctx, tenantID, verifier.ID)
+	if err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	// Verify deletion
+	_, err = verifiers.GetByID(ctx, tenantID, verifier.ID)
+	if err == nil {
+		t.Error("GetByID() after delete should return error")
+	}
+}
+
+func TestVerifierStore_Delete_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
+
+	err := verifiers.Delete(ctx, tenantID, 99999)
+	if err == nil {
+		t.Error("Delete() for non-existent verifier should return error")
+	}
+	if err != storage.ErrNotFound {
+		t.Errorf("Delete() error = %v, want ErrNotFound", err)
+	}
+}
+
 // Concurrency Tests
 
 func TestStore_ConcurrentUserCreation(t *testing.T) {

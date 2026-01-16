@@ -102,3 +102,170 @@ func TestVerifierService_GetAll(t *testing.T) {
 		}
 	})
 }
+
+func TestVerifierService_Create(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewVerifierService(store, logger)
+	tenantID := domain.DefaultTenantID
+
+	t.Run("creates verifier successfully", func(t *testing.T) {
+		verifier := &domain.Verifier{
+			Name: "Test Verifier",
+			URL:  "https://verifier.example.com",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if verifier.TenantID != tenantID {
+			t.Errorf("Expected tenant ID %s, got %s", tenantID, verifier.TenantID)
+		}
+	})
+
+	t.Run("fails without name", func(t *testing.T) {
+		verifier := &domain.Verifier{
+			URL: "https://verifier.example.com",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err == nil {
+			t.Error("Expected error for missing name")
+		}
+	})
+
+	t.Run("fails without URL", func(t *testing.T) {
+		verifier := &domain.Verifier{
+			Name: "Test Verifier",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err == nil {
+			t.Error("Expected error for missing URL")
+		}
+	})
+}
+
+func TestVerifierService_GetByID(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewVerifierService(store, logger)
+	tenantID := domain.DefaultTenantID
+
+	t.Run("retrieves existing verifier", func(t *testing.T) {
+		// Create a verifier first
+		verifier := &domain.Verifier{
+			Name: "Test Verifier",
+			URL:  "https://verifier.example.com",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		// Retrieve it
+		got, err := svc.GetByID(ctx, tenantID, verifier.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		if got.Name != verifier.Name {
+			t.Errorf("Expected name %s, got %s", verifier.Name, got.Name)
+		}
+	})
+
+	t.Run("returns error for non-existent verifier", func(t *testing.T) {
+		_, err := svc.GetByID(ctx, tenantID, 99999)
+		if err == nil {
+			t.Error("Expected error for non-existent verifier")
+		}
+	})
+}
+
+func TestVerifierService_Update(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewVerifierService(store, logger)
+	tenantID := domain.DefaultTenantID
+
+	t.Run("updates existing verifier", func(t *testing.T) {
+		// Create a verifier first
+		verifier := &domain.Verifier{
+			Name: "Original Name",
+			URL:  "https://original.example.com",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		// Update it
+		verifier.Name = "Updated Name"
+		verifier.URL = "https://updated.example.com"
+		err = svc.Update(ctx, verifier)
+		if err != nil {
+			t.Fatalf("Update() error = %v", err)
+		}
+
+		// Verify update
+		got, err := svc.GetByID(ctx, tenantID, verifier.ID)
+		if err != nil {
+			t.Fatalf("GetByID() error = %v", err)
+		}
+		if got.Name != "Updated Name" {
+			t.Errorf("Expected name 'Updated Name', got %s", got.Name)
+		}
+	})
+
+	t.Run("returns error for non-existent verifier", func(t *testing.T) {
+		verifier := &domain.Verifier{
+			ID:       99999,
+			TenantID: tenantID,
+			Name:     "Non-existent",
+			URL:      "https://none.example.com",
+		}
+		err := svc.Update(ctx, verifier)
+		if err == nil {
+			t.Error("Expected error for non-existent verifier")
+		}
+	})
+}
+
+func TestVerifierService_Delete(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc := NewVerifierService(store, logger)
+	tenantID := domain.DefaultTenantID
+
+	t.Run("deletes existing verifier", func(t *testing.T) {
+		// Create a verifier first
+		verifier := &domain.Verifier{
+			Name: "To Delete",
+			URL:  "https://delete.example.com",
+		}
+		err := svc.Create(ctx, tenantID, verifier)
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		// Delete it
+		err = svc.Delete(ctx, tenantID, verifier.ID)
+		if err != nil {
+			t.Fatalf("Delete() error = %v", err)
+		}
+
+		// Verify deletion
+		_, err = svc.GetByID(ctx, tenantID, verifier.ID)
+		if err == nil {
+			t.Error("Expected error for deleted verifier")
+		}
+	})
+
+	t.Run("returns error for non-existent verifier", func(t *testing.T) {
+		err := svc.Delete(ctx, tenantID, 99999)
+		if err == nil {
+			t.Error("Expected error for non-existent verifier")
+		}
+	})
+}
