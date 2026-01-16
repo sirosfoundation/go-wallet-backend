@@ -27,10 +27,24 @@ test: ## Run tests
 	@echo "Running tests..."
 	@go test -v -race -cover ./...
 
-test-coverage: ## Run tests with coverage
+# Packages excluded from coverage:
+# - cmd/* - main packages with init/setup code
+# - internal/storage/mongodb - requires real MongoDB instance
+COVERAGE_PKGS = ./internal/api/... ./internal/backend/... ./internal/domain/... \
+                ./internal/service/... ./internal/storage/memory/... \
+                ./internal/websocket/... ./pkg/... ./tests/...
+
+test-coverage: ## Run tests with coverage (excludes untestable packages)
 	@echo "Running tests with coverage..."
+	@go test -v -race -coverprofile=coverage.out -covermode=atomic $(COVERAGE_PKGS)
+	@go tool cover -html=coverage.out -o coverage.html
+	@go tool cover -func=coverage.out | tail -1
+
+test-coverage-all: ## Run tests with coverage for all packages
+	@echo "Running tests with coverage (all packages)..."
 	@go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 	@go tool cover -html=coverage.out -o coverage.html
+	@go tool cover -func=coverage.out | tail -1
 
 lint: ## Run linter
 	@echo "Running linter..."
