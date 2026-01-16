@@ -104,7 +104,7 @@ func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, erro
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var tenants []*domain.Tenant
+	tenants := make([]*domain.Tenant, 0)
 	for _, tenant := range s.data {
 		if tenant.Enabled {
 			tenants = append(tenants, tenant)
@@ -182,7 +182,7 @@ func (s *UserTenantStore) GetUserTenants(ctx context.Context, userID domain.User
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var tenants []domain.TenantID
+	tenants := make([]domain.TenantID, 0)
 	for _, membership := range s.data {
 		if membership.UserID == userID {
 			tenants = append(tenants, membership.TenantID)
@@ -195,7 +195,7 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var users []domain.UserID
+	users := make([]domain.UserID, 0)
 	for _, membership := range s.data {
 		if membership.TenantID == tenantID {
 			users = append(users, membership.UserID)
@@ -373,7 +373,7 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var credentials []*domain.VerifiableCredential
+	credentials := make([]*domain.VerifiableCredential, 0)
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID {
 			credentials = append(credentials, cred)
@@ -459,7 +459,7 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var presentations []*domain.VerifiablePresentation
+	presentations := make([]*domain.VerifiablePresentation, 0)
 	for _, pres := range s.data {
 		if pres.TenantID == tenantID && pres.HolderDID == holderDID {
 			presentations = append(presentations, pres)
@@ -592,7 +592,7 @@ func (s *IssuerStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var issuers []*domain.CredentialIssuer
+	issuers := make([]*domain.CredentialIssuer, 0)
 	for _, issuer := range s.data {
 		if issuer.TenantID == tenantID {
 			issuers = append(issuers, issuer)
@@ -662,7 +662,7 @@ func (s *VerifierStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var verifiers []*domain.Verifier
+	verifiers := make([]*domain.Verifier, 0)
 	for _, verifier := range s.data {
 		if verifier.TenantID == tenantID {
 			verifiers = append(verifiers, verifier)

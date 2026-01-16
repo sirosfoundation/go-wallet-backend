@@ -138,7 +138,7 @@ func (s *IssuerStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var issuers []*domain.CredentialIssuer
+	issuers := make([]*domain.CredentialIssuer, 0)
 	if err := cursor.All(ctx, &issuers); err != nil {
 		return nil, fmt.Errorf("failed to decode issuers: %w", err)
 	}
@@ -235,7 +235,7 @@ func (s *VerifierStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var verifiers []*domain.Verifier
+	verifiers := make([]*domain.Verifier, 0)
 	if err := cursor.All(ctx, &verifiers); err != nil {
 		return nil, fmt.Errorf("failed to decode verifiers: %w", err)
 	}

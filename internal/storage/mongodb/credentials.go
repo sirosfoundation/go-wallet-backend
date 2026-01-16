@@ -100,7 +100,7 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var credentials []*domain.VerifiableCredential
+	credentials := make([]*domain.VerifiableCredential, 0)
 	if err := cursor.All(ctx, &credentials); err != nil {
 		return nil, fmt.Errorf("failed to decode credentials: %w", err)
 	}
@@ -221,7 +221,7 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var presentations []*domain.VerifiablePresentation
+	presentations := make([]*domain.VerifiablePresentation, 0)
 	if err := cursor.All(ctx, &presentations); err != nil {
 		return nil, fmt.Errorf("failed to decode presentations: %w", err)
 	}

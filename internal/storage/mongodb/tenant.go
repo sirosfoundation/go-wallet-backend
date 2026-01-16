@@ -50,7 +50,7 @@ func (s *TenantStore) GetAll(ctx context.Context) ([]*domain.Tenant, error) {
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var tenants []*domain.Tenant
+	tenants := make([]*domain.Tenant, 0)
 	if err := cursor.All(ctx, &tenants); err != nil {
 		return nil, fmt.Errorf("failed to decode tenants: %w", err)
 	}
@@ -64,7 +64,7 @@ func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, erro
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var tenants []*domain.Tenant
+	tenants := make([]*domain.Tenant, 0)
 	if err := cursor.All(ctx, &tenants); err != nil {
 		return nil, fmt.Errorf("failed to decode tenants: %w", err)
 	}
@@ -133,7 +133,7 @@ func (s *UserTenantStore) GetUserTenants(ctx context.Context, userID domain.User
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var memberships []domain.UserTenantMembership
+	memberships := make([]domain.UserTenantMembership, 0)
 	if err := cursor.All(ctx, &memberships); err != nil {
 		return nil, fmt.Errorf("failed to decode memberships: %w", err)
 	}
@@ -152,7 +152,7 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	var memberships []domain.UserTenantMembership
+	memberships := make([]domain.UserTenantMembership, 0)
 	if err := cursor.All(ctx, &memberships); err != nil {
 		return nil, fmt.Errorf("failed to decode memberships: %w", err)
 	}
