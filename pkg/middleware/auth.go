@@ -1,6 +1,9 @@
 package middleware
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -9,6 +12,52 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+// GenerateAdminToken generates a secure random token for admin API authentication
+func GenerateAdminToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+// AdminAuthMiddleware validates bearer tokens for the admin API
+func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.JSON(401, gin.H{"error": "Authorization header required"})
+			c.Abort()
+			return
+		}
+
+		// Extract token from "Bearer <token>"
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
+			c.Abort()
+			return
+		}
+
+		providedToken := strings.TrimSpace(parts[1])
+		if providedToken == "" {
+			c.JSON(401, gin.H{"error": "Token required"})
+			c.Abort()
+			return
+		}
+
+		// Constant-time comparison to prevent timing attacks
+		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
+			logger.Warn("Invalid admin token attempt", zap.String("ip", c.ClientIP()))
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
 
 // AuthMiddleware validates JWT tokens and sets user context
 func AuthMiddleware(cfg *config.Config, logger *zap.Logger) gin.HandlerFunc {

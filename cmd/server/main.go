@@ -91,7 +91,19 @@ func main() {
 	// Start admin server on separate port (if configured)
 	var adminSrv *http.Server
 	if cfg.Server.AdminPort > 0 {
-		adminRouter := setupAdminRouter(store, logger)
+		// Generate admin token if not provided
+		adminToken := cfg.Server.AdminToken
+		if adminToken == "" {
+			var err error
+			adminToken, err = middleware.GenerateAdminToken()
+			if err != nil {
+				logger.Fatal("Failed to generate admin token", zap.Error(err))
+			}
+			logger.Info("Generated admin API token (set WALLET_SERVER_ADMIN_TOKEN to use a fixed token)",
+				zap.String("token", adminToken))
+		}
+
+		adminRouter := setupAdminRouter(store, adminToken, logger)
 		adminSrv = &http.Server{
 			Addr:         cfg.Server.AdminAddress(),
 			Handler:      adminRouter,
@@ -301,7 +313,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 }
 
 // setupAdminRouter creates the admin router for internal management APIs
-func setupAdminRouter(store backend.Backend, logger *zap.Logger) *gin.Engine {
+func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logger) *gin.Engine {
 	router := gin.New()
 
 	// Middleware
@@ -311,12 +323,13 @@ func setupAdminRouter(store backend.Backend, logger *zap.Logger) *gin.Engine {
 	// Initialize admin handlers
 	adminHandlers := api.NewAdminHandlers(store, logger)
 
-	// Admin routes - no auth for internal admin API
-	// Security: This server should only be exposed internally
-	admin := router.Group("/admin")
-	{
-		admin.GET("/status", adminHandlers.AdminStatus)
+	// Public status endpoint (no auth required for health checks)
+	router.GET("/admin/status", adminHandlers.AdminStatus)
 
+	// Admin routes - protected with bearer token authentication
+	admin := router.Group("/admin")
+	admin.Use(middleware.AdminAuthMiddleware(adminToken, logger))
+	{
 		// Tenant management
 		tenants := admin.Group("/tenants")
 		{

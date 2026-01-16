@@ -1,0 +1,287 @@
+.\" Man page for wallet-admin
+.\" Generated from source code documentation
+.TH WALLET-ADMIN 1 "2025" "Wallet Backend" "Wallet Administration"
+.SH NAME
+wallet-admin \- command-line tool for managing wallet backend tenants, users, issuers, and verifiers
+.SH SYNOPSIS
+.B wallet-admin
+[\fIglobal-options\fR]
+.I command
+[\fIcommand-options\fR]
+[\fIarguments\fR]
+.SH DESCRIPTION
+.B wallet-admin
+is a command-line interface for administering the wallet backend server.
+It provides commands for managing tenants, users, credential issuers, and
+credential verifiers in a multi-tenant wallet deployment.
+.PP
+The tool communicates with the wallet backend's admin API, which by default
+runs on a separate port (8081) from the main API.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-u ", " \-\-url " " \fIURL\fR
+Base URL of the wallet backend admin API (default: http://localhost:8081).
+Can also be set via the
+.B WALLET_ADMIN_URL
+environment variable.
+.TP
+.BR \-t ", " \-\-token " " \fITOKEN\fR
+Authentication bearer token for the admin API.
+Can also be set via the
+.B WALLET_ADMIN_TOKEN
+environment variable.
+.TP
+.BR \-o ", " \-\-output " " \fIFORMAT\fR
+Output format: \fBtable\fR (default) or \fBjson\fR.
+.TP
+.BR \-h ", " \-\-help
+Show help for the command.
+.SH COMMANDS
+.SS tenant
+Manage tenants in the wallet backend.
+.TP
+.B wallet-admin tenant list
+List all tenants.
+.TP
+.B wallet-admin tenant get \fItenant-id\fR
+Get details of a specific tenant.
+.TP
+.B wallet-admin tenant create \fB--id\fR \fIid\fR \fB--name\fR \fIname\fR [\fIoptions\fR]
+Create a new tenant.
+.RS
+.TP
+.BI \-\-id " id"
+Tenant ID (required). Must be lowercase alphanumeric with hyphens, start with a letter, and be 2-50 characters long.
+.TP
+.BI \-\-name " name"
+Tenant name (required).
+.TP
+.BI \-\-display-name " name"
+Human-readable display name.
+.TP
+.BI \-\-enabled
+Enable the tenant (default: true).
+.RE
+.TP
+.B wallet-admin tenant update \fItenant-id\fR [\fIoptions\fR]
+Update an existing tenant.
+.RS
+.TP
+.BI \-\-name " name"
+New tenant name.
+.TP
+.BI \-\-display-name " name"
+New display name.
+.TP
+.BI \-\-enabled
+Enable the tenant.
+.TP
+.BI \-\-disabled
+Disable the tenant.
+.RE
+.TP
+.B wallet-admin tenant delete \fItenant-id\fR
+Delete a tenant and all associated data.
+.B WARNING:
+This is a destructive operation. The default tenant cannot be deleted.
+.SS user
+Manage users within a tenant.
+.TP
+.B wallet-admin user list \fB--tenant\fR \fItenant-id\fR
+List all users in a tenant.
+.TP
+.B wallet-admin user add \fB--tenant\fR \fItenant-id\fR \fB--id\fR \fIuser-id\fR [\fIoptions\fR]
+Add a user to a tenant.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-id " user-id"
+User ID (required).
+.TP
+.BI \-\-role " role"
+User role.
+.RE
+.TP
+.B wallet-admin user remove \fB--tenant\fR \fItenant-id\fR \fB--id\fR \fIuser-id\fR
+Remove a user from a tenant.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-id " user-id"
+User ID (required).
+.RE
+.SS issuer
+Manage credential issuers within a tenant.
+.TP
+.B wallet-admin issuer list \fB--tenant\fR \fItenant-id\fR
+List all issuers in a tenant.
+.TP
+.B wallet-admin issuer get \fB--tenant\fR \fItenant-id\fR \fIissuer-id\fR
+Get details of a specific issuer.
+.TP
+.B wallet-admin issuer create \fB--tenant\fR \fItenant-id\fR \fB--identifier\fR \fIurl\fR [\fIoptions\fR]
+Create a new issuer in a tenant.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-identifier " url"
+Credential issuer identifier/URL (required). This is typically the URL of the issuer's OpenID4VCI credential issuer endpoint.
+.TP
+.BI \-\-client-id " client-id"
+OAuth client ID.
+.TP
+.BI \-\-visible
+Make the issuer visible to users (default: true).
+.RE
+.TP
+.B wallet-admin issuer update \fB--tenant\fR \fItenant-id\fR \fIissuer-id\fR [\fIoptions\fR]
+Update an existing issuer.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-identifier " url"
+New credential issuer identifier/URL.
+.TP
+.BI \-\-client-id " client-id"
+New OAuth client ID.
+.TP
+.BI \-\-visible
+Make the issuer visible.
+.TP
+.BI \-\-hidden
+Hide the issuer from users.
+.RE
+.TP
+.B wallet-admin issuer delete \fB--tenant\fR \fItenant-id\fR \fIissuer-id\fR
+Delete an issuer from a tenant.
+.B WARNING:
+This may affect users who have credentials from this issuer.
+.SS verifier
+Manage credential verifiers within a tenant.
+.TP
+.B wallet-admin verifier list \fB--tenant\fR \fItenant-id\fR
+List all verifiers in a tenant.
+.TP
+.B wallet-admin verifier get \fB--tenant\fR \fItenant-id\fR \fIverifier-id\fR
+Get details of a specific verifier.
+.TP
+.B wallet-admin verifier create \fB--tenant\fR \fItenant-id\fR \fB--name\fR \fIname\fR \fB--verifier-url\fR \fIurl\fR
+Create a new verifier in a tenant.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-name " name"
+Verifier name (required).
+.TP
+.BI \-\-verifier-url " url"
+Verifier URL (required).
+.RE
+.TP
+.B wallet-admin verifier update \fB--tenant\fR \fItenant-id\fR \fIverifier-id\fR [\fIoptions\fR]
+Update an existing verifier.
+.RS
+.TP
+.BI \-\-tenant " tenant-id"
+Tenant ID (required).
+.TP
+.BI \-\-name " name"
+New verifier name.
+.TP
+.BI \-\-verifier-url " url"
+New verifier URL.
+.RE
+.TP
+.B wallet-admin verifier delete \fB--tenant\fR \fItenant-id\fR \fIverifier-id\fR
+Delete a verifier from a tenant.
+.B WARNING:
+Any presentation definitions or configurations associated with this verifier will be removed.
+.SH ENVIRONMENT
+.TP
+.B WALLET_ADMIN_URL
+Base URL of the wallet backend admin API. Overridden by \fB--url\fR.
+.TP
+.B WALLET_ADMIN_TOKEN
+Authentication bearer token for the admin API. Overridden by \fB--token\fR.
+.SH AUTHENTICATION
+The admin API requires bearer token authentication. The token can be provided via:
+.IP 1. 4
+The \fB--token\fR command-line flag
+.IP 2. 4
+The \fBWALLET_ADMIN_TOKEN\fR environment variable
+.PP
+If the wallet backend server is started without setting \fBWALLET_SERVER_ADMIN_TOKEN\fR,
+it will generate a random token and log it to the console on startup.
+.SH EXAMPLES
+.SS List all tenants
+.RS
+.nf
+wallet-admin tenant list
+wallet-admin -o json tenant list
+.fi
+.RE
+.SS Create a new tenant
+.RS
+.nf
+wallet-admin tenant create --id my-tenant --name "My Tenant" \\
+    --display-name "My Organization"
+.fi
+.RE
+.SS List users in a tenant
+.RS
+.nf
+wallet-admin user list --tenant my-tenant
+.fi
+.RE
+.SS Add an issuer to a tenant
+.RS
+.nf
+wallet-admin issuer create --tenant my-tenant \\
+    --identifier "https://issuer.example.com" \\
+    --client-id "wallet-client"
+.fi
+.RE
+.SS Add a verifier to a tenant
+.RS
+.nf
+wallet-admin verifier create --tenant my-tenant \\
+    --name "Example Verifier" \\
+    --verifier-url "https://verifier.example.com"
+.fi
+.RE
+.SS Using environment variables
+.RS
+.nf
+export WALLET_ADMIN_URL=http://localhost:8081
+export WALLET_ADMIN_TOKEN=your-token-here
+wallet-admin tenant list
+.fi
+.RE
+.SS JSON output for scripting
+.RS
+.nf
+wallet-admin -o json tenant list | jq '.tenants[].id'
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Successful execution.
+.TP
+.B 1
+An error occurred (authentication failure, API error, invalid arguments, etc.).
+.SH SEE ALSO
+.BR wallet-backend (1)
+.PP
+Project documentation: https://github.com/siros-eu/go-wallet-backend
+.SH AUTHORS
+SIROS Project Team

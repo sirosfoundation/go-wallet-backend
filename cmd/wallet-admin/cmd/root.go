@@ -16,20 +16,23 @@ import (
 
 var (
 	// Global flags
-	adminURL string
-	output   string
+	adminURL   string
+	adminToken string
+	output     string
 )
 
 // Client wraps HTTP client for admin API calls
 type Client struct {
 	baseURL    string
+	token      string
 	httpClient *http.Client
 }
 
 // NewClient creates a new admin API client
-func NewClient(baseURL string) *Client {
+func NewClient(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
+		token:   token,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -55,6 +58,11 @@ func (c *Client) Request(method, path string, body interface{}) ([]byte, error) 
 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Add authorization header if token is set
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -155,7 +163,8 @@ Examples:
   wallet-admin issuer create --tenant my-tenant --url https://issuer.example.com
 
 Environment Variables:
-  WALLET_ADMIN_URL  Base URL of the admin API (default: http://localhost:8081)`,
+  WALLET_ADMIN_URL    Base URL of the admin API (default: http://localhost:8081)
+  WALLET_ADMIN_TOKEN  Bearer token for admin API authentication (required)`,
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -166,6 +175,7 @@ func Execute() error {
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVarP(&adminURL, "url", "u", getEnvOrDefault("WALLET_ADMIN_URL", "http://localhost:8081"), "Admin API base URL")
+	rootCmd.PersistentFlags().StringVarP(&adminToken, "token", "t", os.Getenv("WALLET_ADMIN_TOKEN"), "Admin API bearer token (or set WALLET_ADMIN_TOKEN)")
 	rootCmd.PersistentFlags().StringVarP(&output, "output", "o", "table", "Output format: table, json")
 }
 

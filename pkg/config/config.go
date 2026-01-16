@@ -20,13 +20,14 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host      string `yaml:"host" envconfig:"HOST"`
-	Port      int    `yaml:"port" envconfig:"PORT"`
-	AdminPort int    `yaml:"admin_port" envconfig:"ADMIN_PORT"` // Internal admin API port (0 to disable)
-	RPID      string `yaml:"rp_id" envconfig:"RP_ID"`
-	RPOrigin  string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
-	RPName    string `yaml:"rp_name" envconfig:"RP_NAME"`
-	BaseURL   string `yaml:"base_url" envconfig:"BASE_URL"`
+	Host       string `yaml:"host" envconfig:"HOST"`
+	Port       int    `yaml:"port" envconfig:"PORT"`
+	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
+	AdminToken string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"` // Bearer token for admin API (auto-generated if empty)
+	RPID       string `yaml:"rp_id" envconfig:"RP_ID"`
+	RPOrigin   string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPName     string `yaml:"rp_name" envconfig:"RP_NAME"`
+	BaseURL    string `yaml:"base_url" envconfig:"BASE_URL"`
 }
 
 // StorageConfig contains storage configuration

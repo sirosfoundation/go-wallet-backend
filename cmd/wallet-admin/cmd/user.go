@@ -30,7 +30,7 @@ var userListCmd = &cobra.Command{
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+userListTenantID+"/users", nil)
 		if err != nil {
 			return err
@@ -78,7 +78,7 @@ var userAddCmd = &cobra.Command{
 			return fmt.Errorf("--id is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		reqBody := map[string]interface{}{
 			"user_id": userAddID,
 		}
@@ -116,7 +116,7 @@ var userRemoveCmd = &cobra.Command{
 			return fmt.Errorf("--id is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		_, err := client.Request("DELETE", "/admin/tenants/"+userRemoveTenantID+"/users/"+userRemoveID, nil)
 		if err != nil {
 			return err

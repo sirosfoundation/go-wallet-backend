@@ -222,10 +222,24 @@ Example: `/t/acme-corp/storage/vc` accesses credentials for the `acme-corp` tena
 
 ### Admin API (Port 8081)
 
-The admin API runs on a separate port for internal management:
+The admin API runs on a separate port for internal management. It requires bearer token authentication.
+
+**Authentication:**
+
+The admin API requires a bearer token for all endpoints except `/admin/status`. The token can be:
+- Set via the `WALLET_SERVER_ADMIN_TOKEN` environment variable
+- Auto-generated on startup (logged to console if not set)
+
+```bash
+# Set a fixed token
+export WALLET_SERVER_ADMIN_TOKEN=my-secret-admin-token
+
+# Or let the server generate one (check logs for the token)
+```
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /admin/status` | Health check (no auth required) |
 | `GET/POST /admin/tenants` | List/Create tenants |
 | `GET/PUT/DELETE /admin/tenants/:id` | Manage a tenant |
 | `GET/POST /admin/tenants/:id/users` | Manage tenant users |
@@ -245,8 +259,12 @@ make build-admin
 # Or build manually
 go build -o wallet-admin ./cmd/wallet-admin
 
-# Configure the admin URL
+# Configure the admin URL and token
 export WALLET_ADMIN_URL=http://localhost:8081
+export WALLET_ADMIN_TOKEN=my-secret-admin-token
+
+# Or pass token via flag
+./wallet-admin --token my-secret-admin-token tenant list
 
 # List tenants
 ./wallet-admin tenant list
@@ -295,6 +313,7 @@ export WALLET_ADMIN_URL=http://localhost:8081
 | Flag | Description |
 |------|-------------|
 | `--url, -u` | Admin API base URL (default: http://localhost:8081) |
+| `--token, -t` | Admin API bearer token (or set WALLET_ADMIN_TOKEN) |
 | `--output, -o` | Output format: table, json (default: table) |
 
 ## Deployment

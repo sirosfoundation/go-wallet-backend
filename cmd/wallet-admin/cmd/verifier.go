@@ -38,7 +38,7 @@ var verifierListCmd = &cobra.Command{
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+verifierListTenantID+"/verifiers", nil)
 		if err != nil {
 			return err
@@ -84,7 +84,7 @@ var verifierGetCmd = &cobra.Command{
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+verifierGetTenantID+"/verifiers/"+args[0], nil)
 		if err != nil {
 			return err
@@ -118,7 +118,7 @@ credentials from wallet users.`,
 			return fmt.Errorf("--url is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		reqBody := map[string]interface{}{
 			"name": verifierCreateName,
 			"url":  verifierCreateURL,
@@ -155,7 +155,7 @@ var verifierUpdateCmd = &cobra.Command{
 		verifierID := args[0]
 
 		// First get the existing verifier
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+verifierUpdateTenantID+"/verifiers/"+verifierID, nil)
 		if err != nil {
 			return err
@@ -207,7 +207,7 @@ or configurations associated with this verifier will be removed.`,
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		_, err := client.Request("DELETE", "/admin/tenants/"+verifierDeleteTenantID+"/verifiers/"+args[0], nil)
 		if err != nil {
 			return err

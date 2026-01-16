@@ -33,7 +33,7 @@ var tenantListCmd = &cobra.Command{
 	Short: "List all tenants",
 	Long:  `List all tenants in the wallet backend.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants", nil)
 		if err != nil {
 			return err
@@ -73,7 +73,7 @@ var tenantGetCmd = &cobra.Command{
 	Long:  `Get details of a specific tenant.`,
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+args[0], nil)
 		if err != nil {
 			return err
@@ -107,7 +107,7 @@ Tenant IDs must:
 			return fmt.Errorf("--name is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		reqBody := map[string]interface{}{
 			"id":      tenantCreateID,
 			"name":    tenantCreateName,
@@ -145,7 +145,7 @@ var tenantUpdateCmd = &cobra.Command{
 		tenantID := args[0]
 
 		// First get the existing tenant
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+tenantID, nil)
 		if err != nil {
 			return err
@@ -198,7 +198,7 @@ issuers, and verifiers associated with this tenant will be deleted.
 The default tenant cannot be deleted.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		_, err := client.Request("DELETE", "/admin/tenants/"+args[0], nil)
 		if err != nil {
 			return err

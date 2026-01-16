@@ -1,6 +1,6 @@
 # Go Wallet Backend
 
-.PHONY: help build run test clean docker-build docker-run
+.PHONY: help build run test clean docker-build docker-run man install-man
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -9,11 +9,21 @@ build: ## Build the server binary
 	@echo "Building server..."
 	@go build -o bin/server cmd/server/main.go
 
-build-admin: ## Build the wallet-admin CLI tool
+build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
 	@go build -o bin/wallet-admin ./cmd/wallet-admin
 
 build-all: build build-admin ## Build all binaries
+
+man: ## Copy man pages to bin directory
+	@echo "Copying man pages..."
+	@mkdir -p bin/man/man1
+	@cp docs/wallet-admin.1 bin/man/man1/
+
+install-man: man ## Install man pages to system (requires sudo)
+	@echo "Installing man pages..."
+	@sudo install -m 644 docs/wallet-admin.1 /usr/local/share/man/man1/
+	@sudo mandb
 
 run: build ## Build and run the server
 	@echo "Running server..."

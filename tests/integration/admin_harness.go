@@ -30,6 +30,9 @@ type AdminTestHarness struct {
 
 	// BaseURL is the URL of the test server
 	BaseURL string
+
+	// AdminToken is the bearer token for admin API authentication
+	AdminToken string
 }
 
 // NewAdminTestHarness creates a new test harness for the admin API
@@ -40,11 +43,15 @@ func NewAdminTestHarness(t *testing.T) *AdminTestHarness {
 
 	logger, _ := zap.NewDevelopment()
 
+	// Generate a test token
+	testToken := "test-admin-token-for-integration-tests"
+
 	h := &AdminTestHarness{
-		T:       t,
-		Logger:  logger,
-		Client:  &http.Client{},
-		Storage: memory.NewStore(),
+		T:          t,
+		Logger:     logger,
+		Client:     &http.Client{},
+		Storage:    memory.NewStore(),
+		AdminToken: testToken,
 	}
 
 	// Create admin handlers
@@ -54,7 +61,7 @@ func NewAdminTestHarness(t *testing.T) *AdminTestHarness {
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
 	h.Router.Use(middleware.Logger(logger))
-	setupAdminRoutes(h.Router, adminHandlers)
+	setupAdminRoutes(h.Router, adminHandlers, testToken, logger)
 
 	// Create test server
 	h.Server = httptest.NewServer(h.Router)
@@ -69,11 +76,14 @@ func NewAdminTestHarness(t *testing.T) *AdminTestHarness {
 }
 
 // setupAdminRoutes configures all admin API routes (mirrors the main server setup)
-func setupAdminRoutes(r *gin.Engine, h *api.AdminHandlers) {
-	admin := r.Group("/admin")
-	{
-		admin.GET("/status", h.AdminStatus)
+func setupAdminRoutes(r *gin.Engine, h *api.AdminHandlers, adminToken string, logger *zap.Logger) {
+	// Public status endpoint (no auth required)
+	r.GET("/admin/status", h.AdminStatus)
 
+	// Protected admin routes
+	admin := r.Group("/admin")
+	admin.Use(middleware.AdminAuthMiddleware(adminToken, logger))
+	{
 		// Tenant management
 		tenants := admin.Group("/tenants")
 		{
@@ -125,6 +135,11 @@ func (h *AdminTestHarness) Request(method, path string, body interface{}) *Respo
 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// Add admin token authentication
+	if h.AdminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+h.AdminToken)
 	}
 
 	return h.Do(req)

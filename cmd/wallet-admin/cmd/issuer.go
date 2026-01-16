@@ -39,7 +39,7 @@ var issuerListCmd = &cobra.Command{
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+issuerListTenantID+"/issuers", nil)
 		if err != nil {
 			return err
@@ -89,7 +89,7 @@ var issuerGetCmd = &cobra.Command{
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+issuerGetTenantID+"/issuers/"+args[0], nil)
 		if err != nil {
 			return err
@@ -122,7 +122,7 @@ the URL of the issuer's OpenID4VCI credential issuer endpoint.`,
 			return fmt.Errorf("--identifier is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		reqBody := map[string]interface{}{
 			"credential_issuer_identifier": issuerCreateIdentifier,
 			"visible":                      issuerCreateVisible,
@@ -163,7 +163,7 @@ var issuerUpdateCmd = &cobra.Command{
 		issuerID := args[0]
 
 		// First get the existing issuer
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		data, err := client.Request("GET", "/admin/tenants/"+issuerUpdateTenantID+"/issuers/"+issuerID, nil)
 		if err != nil {
 			return err
@@ -226,7 +226,7 @@ credentials from this issuer.`,
 			return fmt.Errorf("--tenant is required")
 		}
 
-		client := NewClient(adminURL)
+		client := NewClient(adminURL, adminToken)
 		_, err := client.Request("DELETE", "/admin/tenants/"+issuerDeleteTenantID+"/issuers/"+args[0], nil)
 		if err != nil {
 			return err

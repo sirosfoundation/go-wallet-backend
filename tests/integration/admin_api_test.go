@@ -22,6 +22,58 @@ func TestAdminStatus(t *testing.T) {
 	}
 }
 
+func TestAdminAuthRequired(t *testing.T) {
+	h := NewAdminTestHarness(t)
+
+	t.Run("no token returns 401", func(t *testing.T) {
+		// Make request without token
+		req, _ := http.NewRequest(http.MethodGet, h.BaseURL+"/admin/tenants", nil)
+		resp, err := h.Client.Do(req)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("invalid token returns 401", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodGet, h.BaseURL+"/admin/tenants", nil)
+		req.Header.Set("Authorization", "Bearer invalid-token")
+		resp, err := h.Client.Do(req)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("Expected 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("status endpoint is public", func(t *testing.T) {
+		// Status should work without token
+		req, _ := http.NewRequest(http.MethodGet, h.BaseURL+"/admin/status", nil)
+		resp, err := h.Client.Do(req)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("Expected 200 for status, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("valid token works", func(t *testing.T) {
+		// With the harness-provided token
+		resp := h.GET("/admin/tenants")
+		resp.Status(http.StatusOK)
+	})
+}
+
 func TestTenantCRUD(t *testing.T) {
 	h := NewAdminTestHarness(t)
 

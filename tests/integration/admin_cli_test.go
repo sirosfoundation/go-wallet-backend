@@ -69,8 +69,8 @@ type CLIResult struct {
 func (c *WalletAdminCLI) Run(args ...string) *CLIResult {
 	c.T.Helper()
 
-	// Add the --url flag pointing to our test server
-	fullArgs := append([]string{"--url", c.Harness.BaseURL}, args...)
+	// Add the --url and --token flags pointing to our test server
+	fullArgs := append([]string{"--url", c.Harness.BaseURL, "--token", c.Harness.AdminToken}, args...)
 
 	cmd := exec.Command(c.binPath, fullArgs...)
 	var stdout, stderr bytes.Buffer
