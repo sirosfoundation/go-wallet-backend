@@ -181,6 +181,159 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	c.JSON(200, resp)
 }
 
+// Tenant-scoped WebAuthn handlers
+
+// StartTenantWebAuthnRegistration begins WebAuthn registration for a specific tenant
+func (h *Handlers) StartTenantWebAuthnRegistration(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	tenantID, ok := h.getTenantID(c)
+	if !ok {
+		c.JSON(500, gin.H{"error": "Tenant context not available"})
+		return
+	}
+
+	var req struct {
+		DisplayName string `json:"display_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req.DisplayName = ""
+	}
+
+	resp, err := h.services.WebAuthn.BeginTenantRegistration(c.Request.Context(), tenantID, req.DisplayName)
+	if err != nil {
+		h.logger.Error("Failed to start tenant WebAuthn registration",
+			zap.Error(err),
+			zap.String("tenant_id", string(tenantID)))
+		c.JSON(500, gin.H{"error": "Failed to start registration"})
+		return
+	}
+
+	c.JSON(200, resp)
+}
+
+// FinishTenantWebAuthnRegistration completes WebAuthn registration for a specific tenant
+func (h *Handlers) FinishTenantWebAuthnRegistration(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	tenantID, ok := h.getTenantID(c)
+	if !ok {
+		c.JSON(500, gin.H{"error": "Tenant context not available"})
+		return
+	}
+
+	var req service.FinishRegistrationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.FinishTenantRegistration(c.Request.Context(), tenantID, &req)
+	if err != nil {
+		h.logger.Error("Failed to finish tenant WebAuthn registration",
+			zap.Error(err),
+			zap.String("tenant_id", string(tenantID)))
+		switch {
+		case errors.Is(err, service.ErrChallengeNotFound):
+			c.JSON(404, gin.H{"error": "Challenge not found"})
+		case errors.Is(err, service.ErrChallengeExpired):
+			c.JSON(410, gin.H{"error": "Challenge expired"})
+		case errors.Is(err, service.ErrVerificationFailed):
+			c.JSON(400, gin.H{"error": "Verification failed"})
+		default:
+			c.JSON(500, gin.H{"error": "Failed to complete registration"})
+		}
+		return
+	}
+
+	if len(resp.PrivateData) > 0 {
+		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
+	}
+
+	c.JSON(200, resp)
+}
+
+// StartTenantWebAuthnLogin begins WebAuthn login for a specific tenant
+func (h *Handlers) StartTenantWebAuthnLogin(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	tenantID, ok := h.getTenantID(c)
+	if !ok {
+		c.JSON(500, gin.H{"error": "Tenant context not available"})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.BeginTenantLogin(c.Request.Context(), tenantID)
+	if err != nil {
+		h.logger.Error("Failed to start tenant WebAuthn login",
+			zap.Error(err),
+			zap.String("tenant_id", string(tenantID)))
+		c.JSON(500, gin.H{"error": "Failed to start login"})
+		return
+	}
+
+	c.JSON(200, resp)
+}
+
+// FinishTenantWebAuthnLogin completes WebAuthn login for a specific tenant
+func (h *Handlers) FinishTenantWebAuthnLogin(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	tenantID, ok := h.getTenantID(c)
+	if !ok {
+		c.JSON(500, gin.H{"error": "Tenant context not available"})
+		return
+	}
+
+	var req service.FinishLoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.FinishTenantLogin(c.Request.Context(), tenantID, &req)
+	if err != nil {
+		h.logger.Error("Failed to finish tenant WebAuthn login",
+			zap.Error(err),
+			zap.String("tenant_id", string(tenantID)))
+		switch {
+		case errors.Is(err, service.ErrChallengeNotFound):
+			c.JSON(404, gin.H{"error": "Challenge not found"})
+		case errors.Is(err, service.ErrChallengeExpired):
+			c.JSON(410, gin.H{"error": "Challenge expired"})
+		case errors.Is(err, service.ErrUserNotFound):
+			c.JSON(404, gin.H{"error": "User not found"})
+		case errors.Is(err, service.ErrCredentialNotFound):
+			c.JSON(404, gin.H{"error": "Credential not found"})
+		case errors.Is(err, service.ErrVerificationFailed):
+			c.JSON(401, gin.H{"error": "Authentication failed"})
+		case errors.Is(err, service.ErrTenantMismatch):
+			c.JSON(403, gin.H{"error": "Credential belongs to a different tenant"})
+		default:
+			c.JSON(500, gin.H{"error": "Failed to complete login"})
+		}
+		return
+	}
+
+	if len(resp.PrivateData) > 0 {
+		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
+	}
+
+	c.JSON(200, resp)
+}
+
 // Storage handlers - Credentials
 
 // getHolderDID retrieves the holder DID from context

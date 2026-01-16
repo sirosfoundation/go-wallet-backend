@@ -20,12 +20,13 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host     string `yaml:"host" envconfig:"HOST"`
-	Port     int    `yaml:"port" envconfig:"PORT"`
-	RPID     string `yaml:"rp_id" envconfig:"RP_ID"`
-	RPOrigin string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
-	RPName   string `yaml:"rp_name" envconfig:"RP_NAME"`
-	BaseURL  string `yaml:"base_url" envconfig:"BASE_URL"`
+	Host      string `yaml:"host" envconfig:"HOST"`
+	Port      int    `yaml:"port" envconfig:"PORT"`
+	AdminPort int    `yaml:"admin_port" envconfig:"ADMIN_PORT"` // Internal admin API port (0 to disable)
+	RPID      string `yaml:"rp_id" envconfig:"RP_ID"`
+	RPOrigin  string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPName    string `yaml:"rp_name" envconfig:"RP_NAME"`
+	BaseURL   string `yaml:"base_url" envconfig:"BASE_URL"`
 }
 
 // StorageConfig contains storage configuration
@@ -139,11 +140,12 @@ func Load(configFile string) (*Config, error) {
 func defaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Host:     "0.0.0.0",
-			Port:     8080,
-			RPID:     "localhost",
-			RPOrigin: "http://localhost:8080",
-			RPName:   "Wallet Backend",
+			Host:      "0.0.0.0",
+			Port:      8080,
+			AdminPort: 8081, // Internal admin API port
+			RPID:      "localhost",
+			RPOrigin:  "http://localhost:8080",
+			RPName:    "Wallet Backend",
 		},
 		Storage: StorageConfig{
 			Type: "memory",
@@ -206,4 +208,9 @@ func (c *Config) Validate() error {
 // Address returns the server address
 func (c *ServerConfig) Address() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// AdminAddress returns the admin server address
+func (c *ServerConfig) AdminAddress() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.AdminPort)
 }

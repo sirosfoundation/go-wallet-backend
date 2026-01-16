@@ -28,6 +28,7 @@ var (
 	ErrUserNotFound       = errors.New("user not found")
 	ErrCredentialNotFound = errors.New("credential not found")
 	ErrVerificationFailed = errors.New("verification failed")
+	ErrTenantMismatch     = errors.New("tenant mismatch")
 )
 
 // WebAuthnService handles WebAuthn authentication
@@ -954,4 +955,453 @@ func (r *credentialReader) Read(p []byte) (n int, err error) {
 	n = copy(p, r.data[r.offset:])
 	r.offset += n
 	return n, nil
+}
+
+// =============================================================================
+// Tenant-scoped WebAuthn methods
+// =============================================================================
+
+// BeginTenantRegistration starts WebAuthn registration for a user in a specific tenant
+// The user handle includes the tenant ID prefix: "tenant_id:user_id"
+func (s *WebAuthnService) BeginTenantRegistration(ctx context.Context, tenantID domain.TenantID, displayName string) (*BeginRegistrationResponse, error) {
+	// Generate a new user ID
+	userID := domain.NewUserID()
+
+	// Create a tenant-scoped user handle
+	userHandle := domain.EncodeUserHandle(tenantID, userID)
+
+	// Create a temporary user for the ceremony
+	tempUser := &domain.User{
+		UUID:        userID,
+		DisplayName: &displayName,
+	}
+
+	waUser := &TenantWebAuthnUser{user: tempUser, userHandle: userHandle}
+
+	// Generate creation options
+	_, session, err := s.webauthn.BeginRegistration(waUser,
+		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
+	)
+	if err != nil {
+		s.logger.Error("Failed to begin tenant registration", zap.Error(err))
+		return nil, fmt.Errorf("failed to begin registration: %w", err)
+	}
+
+	// Store the challenge with tenant ID
+	challengeID := generateChallengeID()
+	challenge := &domain.WebauthnChallenge{
+		ID:        challengeID,
+		UserID:    userID.String(),
+		TenantID:  string(tenantID),
+		Challenge: session.Challenge,
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	if err := s.store.Challenges().Create(ctx, challenge); err != nil {
+		s.logger.Error("Failed to store challenge", zap.Error(err))
+		return nil, fmt.Errorf("failed to store challenge: %w", err)
+	}
+
+	s.logger.Info("Started tenant registration",
+		zap.String("user_id", userID.String()),
+		zap.String("tenant_id", string(tenantID)))
+
+	// Build response
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+	}
+
+	createOptions := CreateOptionsResponse{
+		PublicKey: PublicKeyCredentialCreationOptions{
+			RP: PublicKeyCredentialRpEntity{
+				ID:   s.cfg.Server.RPID,
+				Name: s.cfg.Server.RPName,
+			},
+			User: PublicKeyCredentialUserEntity{
+				ID:          userHandle, // Tenant-scoped user handle
+				Name:        waUser.WebAuthnName(),
+				DisplayName: waUser.WebAuthnDisplayName(),
+			},
+			Challenge: challengeBytes,
+			PubKeyCredParams: []PublicKeyCredentialParameters{
+				{Type: "public-key", Alg: -7},   // ES256
+				{Type: "public-key", Alg: -8},   // EdDSA
+				{Type: "public-key", Alg: -257}, // RS256
+			},
+			ExcludeCredentials: []PublicKeyCredentialDescriptor{},
+			AuthenticatorSelection: AuthenticatorSelectionCriteria{
+				RequireResidentKey: true,
+				ResidentKey:        protocol.ResidentKeyRequirementRequired,
+				UserVerification:   protocol.VerificationRequired,
+			},
+			Attestation: protocol.PreferDirectAttestation,
+			Extensions: AuthenticationExtensions{
+				CredProps: true,
+				PRF:       &PRFExtension{},
+			},
+		},
+	}
+
+	return &BeginRegistrationResponse{
+		ChallengeID:   challengeID,
+		CreateOptions: createOptions,
+	}, nil
+}
+
+// FinishTenantRegistration completes WebAuthn registration for a user in a specific tenant
+func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID domain.TenantID, req *FinishRegistrationRequest) (*FinishRegistrationResponse, error) {
+	// Retrieve challenge
+	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, ErrChallengeNotFound
+		}
+		return nil, fmt.Errorf("failed to retrieve challenge: %w", err)
+	}
+
+	// Check expiration
+	if time.Now().After(challenge.ExpiresAt) {
+		return nil, ErrChallengeExpired
+	}
+
+	// Verify tenant matches
+	if challenge.TenantID != string(tenantID) {
+		s.logger.Warn("Tenant mismatch in registration",
+			zap.String("expected", string(tenantID)),
+			zap.String("actual", challenge.TenantID))
+		return nil, ErrTenantMismatch
+	}
+
+	// Parse credential response
+	reader := newCredentialReader(req.Credential)
+	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(reader)
+	if err != nil {
+		s.logger.Error("Failed to parse credential", zap.Error(err))
+		return nil, fmt.Errorf("failed to parse credential: %w", err)
+	}
+
+	// Create tenant-scoped user handle
+	userID := domain.UserIDFromString(challenge.UserID)
+	userHandle := domain.EncodeUserHandle(tenantID, userID)
+
+	// Create user for verification
+	displayName := req.DisplayName
+	if displayName == "" {
+		displayName = "Anonymous"
+	}
+	waUser := &TenantWebAuthnUser{
+		user:       &domain.User{UUID: userID, DisplayName: &displayName},
+		userHandle: userHandle,
+	}
+
+	// Recreate session data
+	sessionData := webauthn.SessionData{
+		Challenge:            challenge.Challenge,
+		UserID:               userHandle,
+		AllowedCredentialIDs: [][]byte{},
+		Expires:              challenge.ExpiresAt,
+		UserVerification:     protocol.VerificationRequired,
+	}
+
+	// Verify credential
+	credential, err := s.webauthn.CreateCredential(waUser, sessionData, parsedResponse)
+	if err != nil {
+		s.logger.Error("Failed to verify credential", zap.Error(err))
+		return nil, ErrVerificationFailed
+	}
+
+	// Map transports
+	transports := make([]string, len(parsedResponse.Response.Transports))
+	for i, t := range parsedResponse.Response.Transports {
+		transports[i] = string(t)
+	}
+
+	// Create user with tenant-scoped user handle
+	now := time.Now()
+	user := &domain.User{
+		UUID:        userID,
+		DisplayName: &displayName,
+		DID:         fmt.Sprintf("did:web:%s:user:%s", s.cfg.Server.RPID, userID.String()),
+		WalletType:  domain.WalletTypeClient, // Using client wallet type for PRF-based credentials
+		WebauthnCredentials: []domain.WebauthnCredential{{
+			ID:              string(credential.ID),
+			PublicKey:       credential.PublicKey,
+			AttestationType: credential.AttestationType,
+			Transport:       transports,
+			Flags:           encodeFlags(credential.Flags),
+			Authenticator: domain.Authenticator{
+				AAGUID:       credential.Authenticator.AAGUID,
+				SignCount:    credential.Authenticator.SignCount,
+				CloneWarning: credential.Authenticator.CloneWarning,
+			},
+			CreatedAt: now,
+		}},
+		PrivateData: req.PrivateData,
+		Keys:        req.Keys,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	if len(user.PrivateData) > 0 {
+		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
+	}
+
+	// Create user
+	if err := s.store.Users().Create(ctx, user); err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Add user to tenant
+	membership := &domain.UserTenantMembership{
+		UserID:    userID,
+		TenantID:  tenantID,
+		Role:      domain.TenantRoleUser,
+		CreatedAt: now,
+	}
+	if err := s.store.UserTenants().AddMembership(ctx, membership); err != nil {
+		s.logger.Warn("Failed to add user to tenant membership",
+			zap.Error(err),
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)))
+	}
+
+	// Generate JWT token
+	token, err := s.generateToken(user)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	// Clean up challenge
+	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
+
+	s.logger.Info("Completed tenant registration",
+		zap.String("user_id", userID.String()),
+		zap.String("tenant_id", string(tenantID)))
+
+	return &FinishRegistrationResponse{
+		UUID:         userID.String(),
+		Token:        token,
+		DisplayName:  displayName,
+		PrivateData:  user.PrivateData,
+		WebauthnRpId: s.cfg.Server.RPID,
+	}, nil
+}
+
+// BeginTenantLogin starts WebAuthn login for a specific tenant
+func (s *WebAuthnService) BeginTenantLogin(ctx context.Context, tenantID domain.TenantID) (*BeginLoginResponse, error) {
+	// Generate login options without credentials (discoverable credentials mode)
+	_, session, err := s.webauthn.BeginDiscoverableLogin()
+	if err != nil {
+		s.logger.Error("Failed to begin tenant login", zap.Error(err))
+		return nil, fmt.Errorf("failed to begin login: %w", err)
+	}
+
+	// Store challenge with tenant ID
+	challengeID := generateChallengeID()
+	challenge := &domain.WebauthnChallenge{
+		ID:        challengeID,
+		TenantID:  string(tenantID),
+		Challenge: session.Challenge,
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	if err := s.store.Challenges().Create(ctx, challenge); err != nil {
+		s.logger.Error("Failed to store challenge", zap.Error(err))
+		return nil, fmt.Errorf("failed to store challenge: %w", err)
+	}
+
+	// Build response
+	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+	}
+
+	getOptions := GetOptionsResponse{
+		PublicKey: PublicKeyCredentialRequestOptions{
+			Challenge:        challengeBytes,
+			RPId:             s.cfg.Server.RPID,
+			UserVerification: protocol.VerificationRequired,
+			AllowCredentials: []PublicKeyCredentialDescriptor{},
+		},
+	}
+
+	return &BeginLoginResponse{
+		ChallengeID: challengeID,
+		GetOptions:  getOptions,
+	}, nil
+}
+
+// FinishTenantLogin completes WebAuthn login for a specific tenant
+// It validates that the user handle contains the expected tenant ID prefix
+func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain.TenantID, req *FinishLoginRequest) (*FinishLoginResponse, error) {
+	// Retrieve challenge
+	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, ErrChallengeNotFound
+		}
+		return nil, fmt.Errorf("failed to retrieve challenge: %w", err)
+	}
+
+	// Check expiration
+	if time.Now().After(challenge.ExpiresAt) {
+		return nil, ErrChallengeExpired
+	}
+
+	// Verify tenant matches
+	if challenge.TenantID != string(tenantID) {
+		s.logger.Warn("Tenant mismatch in login challenge",
+			zap.String("expected", string(tenantID)),
+			zap.String("actual", challenge.TenantID))
+		return nil, ErrTenantMismatch
+	}
+
+	// Parse credential response
+	reader := newCredentialReader(req.Credential)
+	parsedResponse, err := protocol.ParseCredentialRequestResponseBody(reader)
+	if err != nil {
+		s.logger.Error("Failed to parse credential", zap.Error(err))
+		return nil, fmt.Errorf("failed to parse credential: %w", err)
+	}
+
+	// Decode and validate user handle
+	userHandle := parsedResponse.Response.UserHandle
+	handleTenantID, userID, err := domain.DecodeUserHandle(userHandle)
+	if err != nil {
+		// For backward compatibility, try treating the user handle as just a user ID
+		// This handles users registered before multi-tenancy
+		s.logger.Debug("User handle doesn't contain tenant prefix, treating as legacy user",
+			zap.String("user_handle", string(userHandle)))
+		userID = domain.UserIDFromUserHandle(userHandle)
+		handleTenantID = domain.DefaultTenantID
+	}
+
+	// Validate tenant from user handle matches the request tenant
+	if handleTenantID != tenantID {
+		s.logger.Warn("Tenant mismatch in user handle",
+			zap.String("expected_tenant", string(tenantID)),
+			zap.String("handle_tenant", string(handleTenantID)),
+			zap.String("user_id", userID.String()))
+		return nil, ErrTenantMismatch
+	}
+
+	// Look up user
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to retrieve user: %w", err)
+	}
+
+	// Find the credential
+	credentialID := string(parsedResponse.RawID)
+	var foundCred *domain.WebauthnCredential
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].ID == credentialID {
+			foundCred = &user.WebauthnCredentials[i]
+			break
+		}
+	}
+
+	if foundCred == nil {
+		return nil, ErrCredentialNotFound
+	}
+
+	// Verify with the correct tenant-scoped user handle
+	waUser := &TenantWebAuthnUser{user: user, userHandle: domain.EncodeUserHandle(tenantID, userID)}
+	sessionData := webauthn.SessionData{
+		Challenge:            challenge.Challenge,
+		UserID:               waUser.WebAuthnID(),
+		AllowedCredentialIDs: [][]byte{},
+		Expires:              challenge.ExpiresAt,
+		UserVerification:     protocol.VerificationRequired,
+	}
+
+	// Verify credential
+	_, err = s.webauthn.ValidateDiscoverableLogin(func(rawID, userHandle []byte) (webauthn.User, error) {
+		return waUser, nil
+	}, sessionData, parsedResponse)
+
+	if err != nil {
+		s.logger.Error("Failed to verify credential", zap.Error(err))
+		return nil, ErrVerificationFailed
+	}
+
+	// Generate token
+	token, err := s.generateToken(user)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	// Clean up challenge
+	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
+
+	s.logger.Info("Completed tenant login",
+		zap.String("user_id", userID.String()),
+		zap.String("tenant_id", string(tenantID)))
+
+	displayName := ""
+	if user.DisplayName != nil {
+		displayName = *user.DisplayName
+	}
+
+	return &FinishLoginResponse{
+		UUID:         userID.String(),
+		Token:        token,
+		DisplayName:  displayName,
+		PrivateData:  user.PrivateData,
+		WebauthnRpId: s.cfg.Server.RPID,
+	}, nil
+}
+
+// TenantWebAuthnUser wraps a user with a tenant-scoped user handle
+type TenantWebAuthnUser struct {
+	user       *domain.User
+	userHandle []byte
+}
+
+func (u *TenantWebAuthnUser) WebAuthnID() []byte {
+	return u.userHandle
+}
+
+func (u *TenantWebAuthnUser) WebAuthnName() string {
+	if u.user.Username != nil {
+		return *u.user.Username
+	}
+	return u.user.UUID.String()
+}
+
+func (u *TenantWebAuthnUser) WebAuthnDisplayName() string {
+	if u.user.DisplayName != nil {
+		return *u.user.DisplayName
+	}
+	return u.WebAuthnName()
+}
+
+func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
+	creds := make([]webauthn.Credential, len(u.user.WebauthnCredentials))
+	for i, c := range u.user.WebauthnCredentials {
+		creds[i] = webauthn.Credential{
+			ID:              []byte(c.ID),
+			PublicKey:       c.PublicKey,
+			AttestationType: c.AttestationType,
+			Transport:       parseTransports(c.Transport),
+			Flags: webauthn.CredentialFlags{
+				UserPresent:    c.Flags&0x01 != 0,
+				UserVerified:   c.Flags&0x04 != 0,
+				BackupEligible: c.Flags&0x08 != 0,
+				BackupState:    c.Flags&0x10 != 0,
+			},
+			Authenticator: webauthn.Authenticator{
+				AAGUID:       c.Authenticator.AAGUID,
+				SignCount:    c.Authenticator.SignCount,
+				CloneWarning: c.Authenticator.CloneWarning,
+			},
+		}
+	}
+	return creds
 }

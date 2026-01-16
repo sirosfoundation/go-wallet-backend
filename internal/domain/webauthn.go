@@ -7,7 +7,8 @@ import (
 // WebauthnChallenge represents a WebAuthn challenge
 type WebauthnChallenge struct {
 	ID        string    `json:"id" bson:"_id" gorm:"primaryKey"`
-	UserID    string    `json:"user_id" bson:"user_id" gorm:"index;not null"`
+	UserID    string    `json:"user_id" bson:"user_id" gorm:"index"`
+	TenantID  string    `json:"tenant_id" bson:"tenant_id" gorm:"index"` // Optional tenant ID for tenant-scoped operations
 	Challenge string    `json:"challenge" bson:"challenge" gorm:"not null"`
 	Action    string    `json:"action" bson:"action" gorm:"not null"` // "register" or "login"
 	ExpiresAt time.Time `json:"expires_at" bson:"expires_at" gorm:"index;not null"`

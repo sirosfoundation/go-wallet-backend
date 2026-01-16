@@ -69,8 +69,8 @@ func main() {
 	// Initialize services
 	services := service.NewServices(store, cfg, logger)
 
-	// Initialize HTTP server
-	router := setupRouter(cfg, services, logger)
+	// Initialize public HTTP server
+	router := setupRouter(cfg, services, store, logger)
 
 	srv := &http.Server{
 		Addr:         cfg.Server.Address(),
@@ -80,13 +80,32 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Start server
+	// Start public server
 	go func() {
-		logger.Info("Server listening", zap.String("address", cfg.Server.Address()))
+		logger.Info("Public server listening", zap.String("address", cfg.Server.Address()))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("Failed to start server", zap.Error(err))
+			logger.Fatal("Failed to start public server", zap.Error(err))
 		}
 	}()
+
+	// Start admin server on separate port (if configured)
+	var adminSrv *http.Server
+	if cfg.Server.AdminPort > 0 {
+		adminRouter := setupAdminRouter(store, logger)
+		adminSrv = &http.Server{
+			Addr:         cfg.Server.AdminAddress(),
+			Handler:      adminRouter,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		go func() {
+			logger.Info("Admin server listening", zap.String("address", cfg.Server.AdminAddress()))
+			if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatal("Failed to start admin server", zap.Error(err))
+			}
+		}()
+	}
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
@@ -100,7 +119,14 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("Server forced to shutdown", zap.Error(err))
+		logger.Error("Public server forced to shutdown", zap.Error(err))
+	}
+
+	// Shutdown admin server if running
+	if adminSrv != nil {
+		if err := adminSrv.Shutdown(ctx); err != nil {
+			logger.Error("Admin server forced to shutdown", zap.Error(err))
+		}
 	}
 
 	logger.Info("Server exited")
@@ -132,7 +158,7 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 	return zapCfg.Build()
 }
 
-func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Logger) *gin.Engine {
+func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger) *gin.Engine {
 	// Set Gin mode
 	if cfg.Logging.Level == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -157,7 +183,7 @@ func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Log
 	// Initialize API handlers
 	handlers := api.NewHandlers(services, cfg, logger)
 
-	// Public routes
+	// Public routes (default tenant for backward compatibility)
 	public := router.Group("/")
 	{
 		public.GET("/status", handlers.Status)
@@ -253,6 +279,57 @@ func setupRouter(cfg *config.Config, services *service.Services, logger *zap.Log
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
+		}
+	}
+
+	// Tenant-scoped routes (with tenant path parameter)
+	// These routes require a valid tenant ID in the path
+	tenantRoutes := router.Group("/t/:tenantID")
+	tenantRoutes.Use(middleware.TenantPathMiddleware(store))
+	{
+		// Tenant-scoped WebAuthn registration/login (public)
+		tenantUser := tenantRoutes.Group("/user")
+		{
+			tenantUser.POST("/register-webauthn-begin", handlers.StartTenantWebAuthnRegistration)
+			tenantUser.POST("/register-webauthn-finish", handlers.FinishTenantWebAuthnRegistration)
+			tenantUser.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
+			tenantUser.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
+		}
+	}
+
+	return router
+}
+
+// setupAdminRouter creates the admin router for internal management APIs
+func setupAdminRouter(store backend.Backend, logger *zap.Logger) *gin.Engine {
+	router := gin.New()
+
+	// Middleware
+	router.Use(gin.Recovery())
+	router.Use(middleware.Logger(logger))
+
+	// Initialize admin handlers
+	adminHandlers := api.NewAdminHandlers(store, logger)
+
+	// Admin routes - no auth for internal admin API
+	// Security: This server should only be exposed internally
+	admin := router.Group("/admin")
+	{
+		admin.GET("/status", adminHandlers.AdminStatus)
+
+		// Tenant management
+		tenants := admin.Group("/tenants")
+		{
+			tenants.GET("", adminHandlers.ListTenants)
+			tenants.POST("", adminHandlers.CreateTenant)
+			tenants.GET("/:id", adminHandlers.GetTenant)
+			tenants.PUT("/:id", adminHandlers.UpdateTenant)
+			tenants.DELETE("/:id", adminHandlers.DeleteTenant)
+
+			// Tenant user management
+			tenants.GET("/:id/users", adminHandlers.GetTenantUsers)
+			tenants.POST("/:id/users", adminHandlers.AddUserToTenant)
+			tenants.DELETE("/:id/users/:user_id", adminHandlers.RemoveUserFromTenant)
 		}
 	}
 
