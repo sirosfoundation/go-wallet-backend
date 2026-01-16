@@ -7,16 +7,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// User represents a user in a tenant
-type User struct {
-	ID     string `json:"id"`
-	Role   string `json:"role,omitempty"`
-	Status string `json:"status,omitempty"`
-}
-
 // UserListResponse represents the list users response
+// The API returns just user IDs as strings
 type UserListResponse struct {
-	Users []User `json:"users"`
+	Users []string `json:"users"`
 }
 
 var userCmd = &cobra.Command{
@@ -56,18 +50,10 @@ var userListCmd = &cobra.Command{
 			return nil
 		}
 
-		headers := []string{"ID", "ROLE", "STATUS"}
+		headers := []string{"USER ID"}
 		rows := make([][]string, len(resp.Users))
-		for i, u := range resp.Users {
-			role := u.Role
-			if role == "" {
-				role = "-"
-			}
-			status := u.Status
-			if status == "" {
-				status = "-"
-			}
-			rows[i] = []string{u.ID, role, status}
+		for i, userID := range resp.Users {
+			rows[i] = []string{userID}
 		}
 		printTable(headers, rows)
 		return nil

@@ -3,20 +3,17 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/spf13/cobra"
 )
 
-// Verifier represents a verifier in a tenant
+// Verifier represents a verifier in a tenant (matching API response)
 type Verifier struct {
-	ID                    string   `json:"id"`
-	Name                  string   `json:"name"`
-	TenantID              string   `json:"tenant_id"`
-	AcceptedCredentials   []string `json:"accepted_credentials,omitempty"`
-	Enabled               bool     `json:"enabled"`
-	VerificationEndpoint  string   `json:"verification_endpoint,omitempty"`
-	PresentationDefID     string   `json:"presentation_definition_id,omitempty"`
-	ClientID              string   `json:"client_id,omitempty"`
+	ID       int64  `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
 }
 
 // VerifierListResponse represents the list verifiers response
@@ -61,18 +58,14 @@ var verifierListCmd = &cobra.Command{
 			return nil
 		}
 
-		headers := []string{"ID", "NAME", "ENDPOINT", "ENABLED"}
+		headers := []string{"ID", "NAME", "URL"}
 		rows := make([][]string, len(resp.Verifiers))
 		for i, v := range resp.Verifiers {
-			enabled := "yes"
-			if !v.Enabled {
-				enabled = "no"
+			url := v.URL
+			if url == "" {
+				url = "-"
 			}
-			endpoint := v.VerificationEndpoint
-			if endpoint == "" {
-				endpoint = "-"
-			}
-			rows[i] = []string{v.ID, v.Name, endpoint, enabled}
+			rows[i] = []string{strconv.FormatInt(v.ID, 10), v.Name, url}
 		}
 		printTable(headers, rows)
 		return nil
@@ -102,15 +95,9 @@ var verifierGetCmd = &cobra.Command{
 }
 
 var (
-	verifierCreateTenantID          string
-	verifierCreateID                string
-	verifierCreateName              string
-	verifierCreateEndpoint          string
-	verifierCreatePresentationDefID string
-	verifierCreateClientID          string
-	verifierCreateClientSecret      string
-	verifierCreateAcceptedCreds     []string
-	verifierCreateEnabled           bool
+	verifierCreateTenantID string
+	verifierCreateName     string
+	verifierCreateURL      string
 )
 
 var verifierCreateCmd = &cobra.Command{
@@ -119,39 +106,22 @@ var verifierCreateCmd = &cobra.Command{
 	Long: `Create a new verifier in a tenant.
 
 A verifier represents a relying party that can request and verify 
-credentials from wallet users. Verifiers are configured with 
-presentation definitions and verification endpoints.`,
+credentials from wallet users.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if verifierCreateTenantID == "" {
 			return fmt.Errorf("--tenant is required")
 		}
-		if verifierCreateID == "" {
-			return fmt.Errorf("--id is required")
-		}
 		if verifierCreateName == "" {
 			return fmt.Errorf("--name is required")
+		}
+		if verifierCreateURL == "" {
+			return fmt.Errorf("--url is required")
 		}
 
 		client := NewClient(adminURL)
 		reqBody := map[string]interface{}{
-			"id":      verifierCreateID,
-			"name":    verifierCreateName,
-			"enabled": verifierCreateEnabled,
-		}
-		if verifierCreateEndpoint != "" {
-			reqBody["verification_endpoint"] = verifierCreateEndpoint
-		}
-		if verifierCreatePresentationDefID != "" {
-			reqBody["presentation_definition_id"] = verifierCreatePresentationDefID
-		}
-		if verifierCreateClientID != "" {
-			reqBody["client_id"] = verifierCreateClientID
-		}
-		if verifierCreateClientSecret != "" {
-			reqBody["client_secret"] = verifierCreateClientSecret
-		}
-		if len(verifierCreateAcceptedCreds) > 0 {
-			reqBody["accepted_credentials"] = verifierCreateAcceptedCreds
+			"name": verifierCreateName,
+			"url":  verifierCreateURL,
 		}
 
 		data, err := client.Request("POST", "/admin/tenants/"+verifierCreateTenantID+"/verifiers", reqBody)
@@ -159,7 +129,7 @@ presentation definitions and verification endpoints.`,
 			return err
 		}
 
-		fmt.Printf("Verifier '%s' created successfully in tenant '%s'.\n", verifierCreateID, verifierCreateTenantID)
+		fmt.Printf("Verifier '%s' created successfully in tenant '%s'.\n", verifierCreateName, verifierCreateTenantID)
 		if output == "json" {
 			return printJSON(data)
 		}
@@ -168,13 +138,9 @@ presentation definitions and verification endpoints.`,
 }
 
 var (
-	verifierUpdateTenantID          string
-	verifierUpdateName              string
-	verifierUpdateEndpoint          string
-	verifierUpdatePresentationDefID string
-	verifierUpdateClientID          string
-	verifierUpdateClientSecret      string
-	verifierUpdateAcceptedCreds     []string
+	verifierUpdateTenantID string
+	verifierUpdateName     string
+	verifierUpdateURL      string
 )
 
 var verifierUpdateCmd = &cobra.Command{
@@ -202,36 +168,15 @@ var verifierUpdateCmd = &cobra.Command{
 
 		// Build update request preserving existing values
 		reqBody := map[string]interface{}{
-			"id":      verifierID,
-			"name":    existing.Name,
-			"enabled": existing.Enabled,
+			"name": existing.Name,
+			"url":  existing.URL,
 		}
 
 		if verifierUpdateName != "" {
 			reqBody["name"] = verifierUpdateName
 		}
-		if verifierUpdateEndpoint != "" {
-			reqBody["verification_endpoint"] = verifierUpdateEndpoint
-		} else if existing.VerificationEndpoint != "" {
-			reqBody["verification_endpoint"] = existing.VerificationEndpoint
-		}
-		if verifierUpdatePresentationDefID != "" {
-			reqBody["presentation_definition_id"] = verifierUpdatePresentationDefID
-		} else if existing.PresentationDefID != "" {
-			reqBody["presentation_definition_id"] = existing.PresentationDefID
-		}
-		if verifierUpdateClientID != "" {
-			reqBody["client_id"] = verifierUpdateClientID
-		} else if existing.ClientID != "" {
-			reqBody["client_id"] = existing.ClientID
-		}
-		if verifierUpdateClientSecret != "" {
-			reqBody["client_secret"] = verifierUpdateClientSecret
-		}
-		if len(verifierUpdateAcceptedCreds) > 0 {
-			reqBody["accepted_credentials"] = verifierUpdateAcceptedCreds
-		} else if len(existing.AcceptedCredentials) > 0 {
-			reqBody["accepted_credentials"] = existing.AcceptedCredentials
+		if verifierUpdateURL != "" {
+			reqBody["url"] = verifierUpdateURL
 		}
 
 		data, err = client.Request("PUT", "/admin/tenants/"+verifierUpdateTenantID+"/verifiers/"+verifierID, reqBody)
@@ -291,26 +236,16 @@ func init() {
 
 	// Create flags
 	verifierCreateCmd.Flags().StringVar(&verifierCreateTenantID, "tenant", "", "Tenant ID (required)")
-	verifierCreateCmd.Flags().StringVar(&verifierCreateID, "id", "", "Verifier ID (required)")
 	verifierCreateCmd.Flags().StringVar(&verifierCreateName, "name", "", "Verifier name (required)")
-	verifierCreateCmd.Flags().StringVar(&verifierCreateEndpoint, "endpoint", "", "Verification endpoint URL")
-	verifierCreateCmd.Flags().StringVar(&verifierCreatePresentationDefID, "presentation-def-id", "", "Presentation definition ID")
-	verifierCreateCmd.Flags().StringVar(&verifierCreateClientID, "client-id", "", "OAuth client ID")
-	verifierCreateCmd.Flags().StringVar(&verifierCreateClientSecret, "client-secret", "", "OAuth client secret")
-	verifierCreateCmd.Flags().StringSliceVar(&verifierCreateAcceptedCreds, "accepted-credential", nil, "Accepted credential types (can be repeated)")
-	verifierCreateCmd.Flags().BoolVar(&verifierCreateEnabled, "enabled", true, "Whether verifier is enabled")
+	verifierCreateCmd.Flags().StringVar(&verifierCreateURL, "verifier-url", "", "Verifier URL (required)")
 	verifierCreateCmd.MarkFlagRequired("tenant")
-	verifierCreateCmd.MarkFlagRequired("id")
 	verifierCreateCmd.MarkFlagRequired("name")
+	verifierCreateCmd.MarkFlagRequired("verifier-url")
 
 	// Update flags
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateTenantID, "tenant", "", "Tenant ID (required)")
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateName, "name", "", "New verifier name")
-	verifierUpdateCmd.Flags().StringVar(&verifierUpdateEndpoint, "endpoint", "", "New verification endpoint URL")
-	verifierUpdateCmd.Flags().StringVar(&verifierUpdatePresentationDefID, "presentation-def-id", "", "New presentation definition ID")
-	verifierUpdateCmd.Flags().StringVar(&verifierUpdateClientID, "client-id", "", "New OAuth client ID")
-	verifierUpdateCmd.Flags().StringVar(&verifierUpdateClientSecret, "client-secret", "", "New OAuth client secret")
-	verifierUpdateCmd.Flags().StringSliceVar(&verifierUpdateAcceptedCreds, "accepted-credential", nil, "New accepted credential types (can be repeated)")
+	verifierUpdateCmd.Flags().StringVar(&verifierUpdateURL, "verifier-url", "", "New verifier URL")
 	verifierUpdateCmd.MarkFlagRequired("tenant")
 
 	// Delete flags

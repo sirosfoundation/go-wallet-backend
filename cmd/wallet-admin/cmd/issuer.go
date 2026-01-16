@@ -3,22 +3,18 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/spf13/cobra"
 )
 
-// Issuer represents an issuer in a tenant
+// Issuer represents an issuer in a tenant (matching API response)
 type Issuer struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	TenantID          string   `json:"tenant_id"`
-	CredentialTypes   []string `json:"credential_types,omitempty"`
-	Enabled           bool     `json:"enabled"`
-	IssuerURL         string   `json:"issuer_url,omitempty"`
-	AuthorizationURL  string   `json:"authorization_url,omitempty"`
-	TokenURL          string   `json:"token_url,omitempty"`
-	CredentialURL     string   `json:"credential_url,omitempty"`
-	ClientID          string   `json:"client_id,omitempty"`
+	ID                         int64  `json:"id"`
+	TenantID                   string `json:"tenant_id"`
+	CredentialIssuerIdentifier string `json:"credential_issuer_identifier"`
+	ClientID                   string `json:"client_id,omitempty"`
+	Visible                    bool   `json:"visible"`
 }
 
 // IssuerListResponse represents the list issuers response
@@ -63,32 +59,30 @@ var issuerListCmd = &cobra.Command{
 			return nil
 		}
 
-		headers := []string{"ID", "NAME", "ISSUER URL", "ENABLED"}
+		headers := []string{"ID", "CREDENTIAL ISSUER IDENTIFIER", "CLIENT ID", "VISIBLE"}
 		rows := make([][]string, len(resp.Issuers))
 		for i, iss := range resp.Issuers {
-			enabled := "yes"
-			if !iss.Enabled {
-				enabled = "no"
+			visible := "yes"
+			if !iss.Visible {
+				visible = "no"
 			}
-			issuerURL := iss.IssuerURL
-			if issuerURL == "" {
-				issuerURL = "-"
+			clientID := iss.ClientID
+			if clientID == "" {
+				clientID = "-"
 			}
-			rows[i] = []string{iss.ID, iss.Name, issuerURL, enabled}
+			rows[i] = []string{strconv.FormatInt(iss.ID, 10), iss.CredentialIssuerIdentifier, clientID, visible}
 		}
 		printTable(headers, rows)
 		return nil
 	},
 }
 
-var (
-	issuerGetTenantID string
-)
+var issuerGetTenantID string
 
 var issuerGetCmd = &cobra.Command{
 	Use:   "get [issuer-id]",
 	Short: "Get a specific issuer",
-	Long:  `Get details of a specific issuer.`,
+	Long:  `Get details of a specific issuer by its numeric ID.`,
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if issuerGetTenantID == "" {
@@ -106,17 +100,10 @@ var issuerGetCmd = &cobra.Command{
 }
 
 var (
-	issuerCreateTenantID       string
-	issuerCreateID             string
-	issuerCreateName           string
-	issuerCreateIssuerURL      string
-	issuerCreateAuthURL        string
-	issuerCreateTokenURL       string
-	issuerCreateCredentialURL  string
-	issuerCreateClientID       string
-	issuerCreateClientSecret   string
-	issuerCreateCredTypes      []string
-	issuerCreateEnabled        bool
+	issuerCreateTenantID   string
+	issuerCreateIdentifier string
+	issuerCreateClientID   string
+	issuerCreateVisible    bool
 )
 
 var issuerCreateCmd = &cobra.Command{
@@ -125,45 +112,23 @@ var issuerCreateCmd = &cobra.Command{
 	Long: `Create a new issuer in a tenant.
 
 An issuer represents a credential issuing authority that users can 
-request credentials from. Issuers are configured with OAuth/OpenID 
-endpoints for authentication and credential issuance.`,
+request credentials from. The credential_issuer_identifier is typically
+the URL of the issuer's OpenID4VCI credential issuer endpoint.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if issuerCreateTenantID == "" {
 			return fmt.Errorf("--tenant is required")
 		}
-		if issuerCreateID == "" {
-			return fmt.Errorf("--id is required")
-		}
-		if issuerCreateName == "" {
-			return fmt.Errorf("--name is required")
+		if issuerCreateIdentifier == "" {
+			return fmt.Errorf("--identifier is required")
 		}
 
 		client := NewClient(adminURL)
 		reqBody := map[string]interface{}{
-			"id":       issuerCreateID,
-			"name":     issuerCreateName,
-			"enabled":  issuerCreateEnabled,
-		}
-		if issuerCreateIssuerURL != "" {
-			reqBody["issuer_url"] = issuerCreateIssuerURL
-		}
-		if issuerCreateAuthURL != "" {
-			reqBody["authorization_url"] = issuerCreateAuthURL
-		}
-		if issuerCreateTokenURL != "" {
-			reqBody["token_url"] = issuerCreateTokenURL
-		}
-		if issuerCreateCredentialURL != "" {
-			reqBody["credential_url"] = issuerCreateCredentialURL
+			"credential_issuer_identifier": issuerCreateIdentifier,
+			"visible":                      issuerCreateVisible,
 		}
 		if issuerCreateClientID != "" {
 			reqBody["client_id"] = issuerCreateClientID
-		}
-		if issuerCreateClientSecret != "" {
-			reqBody["client_secret"] = issuerCreateClientSecret
-		}
-		if len(issuerCreateCredTypes) > 0 {
-			reqBody["credential_types"] = issuerCreateCredTypes
 		}
 
 		data, err := client.Request("POST", "/admin/tenants/"+issuerCreateTenantID+"/issuers", reqBody)
@@ -171,7 +136,7 @@ endpoints for authentication and credential issuance.`,
 			return err
 		}
 
-		fmt.Printf("Issuer '%s' created successfully in tenant '%s'.\n", issuerCreateID, issuerCreateTenantID)
+		fmt.Printf("Issuer created successfully in tenant '%s'.\n", issuerCreateTenantID)
 		if output == "json" {
 			return printJSON(data)
 		}
@@ -180,15 +145,10 @@ endpoints for authentication and credential issuance.`,
 }
 
 var (
-	issuerUpdateTenantID       string
-	issuerUpdateName           string
-	issuerUpdateIssuerURL      string
-	issuerUpdateAuthURL        string
-	issuerUpdateTokenURL       string
-	issuerUpdateCredentialURL  string
-	issuerUpdateClientID       string
-	issuerUpdateClientSecret   string
-	issuerUpdateCredTypes      []string
+	issuerUpdateTenantID   string
+	issuerUpdateIdentifier string
+	issuerUpdateClientID   string
+	issuerUpdateVisible    *bool
 )
 
 var issuerUpdateCmd = &cobra.Command{
@@ -216,46 +176,26 @@ var issuerUpdateCmd = &cobra.Command{
 
 		// Build update request preserving existing values
 		reqBody := map[string]interface{}{
-			"id":      issuerID,
-			"name":    existing.Name,
-			"enabled": existing.Enabled,
+			"credential_issuer_identifier": existing.CredentialIssuerIdentifier,
+			"visible":                      existing.Visible,
 		}
 
-		if issuerUpdateName != "" {
-			reqBody["name"] = issuerUpdateName
-		}
-		if issuerUpdateIssuerURL != "" {
-			reqBody["issuer_url"] = issuerUpdateIssuerURL
-		} else if existing.IssuerURL != "" {
-			reqBody["issuer_url"] = existing.IssuerURL
-		}
-		if issuerUpdateAuthURL != "" {
-			reqBody["authorization_url"] = issuerUpdateAuthURL
-		} else if existing.AuthorizationURL != "" {
-			reqBody["authorization_url"] = existing.AuthorizationURL
-		}
-		if issuerUpdateTokenURL != "" {
-			reqBody["token_url"] = issuerUpdateTokenURL
-		} else if existing.TokenURL != "" {
-			reqBody["token_url"] = existing.TokenURL
-		}
-		if issuerUpdateCredentialURL != "" {
-			reqBody["credential_url"] = issuerUpdateCredentialURL
-		} else if existing.CredentialURL != "" {
-			reqBody["credential_url"] = existing.CredentialURL
+		if issuerUpdateIdentifier != "" {
+			reqBody["credential_issuer_identifier"] = issuerUpdateIdentifier
 		}
 		if issuerUpdateClientID != "" {
 			reqBody["client_id"] = issuerUpdateClientID
 		} else if existing.ClientID != "" {
 			reqBody["client_id"] = existing.ClientID
 		}
-		if issuerUpdateClientSecret != "" {
-			reqBody["client_secret"] = issuerUpdateClientSecret
-		}
-		if len(issuerUpdateCredTypes) > 0 {
-			reqBody["credential_types"] = issuerUpdateCredTypes
-		} else if len(existing.CredentialTypes) > 0 {
-			reqBody["credential_types"] = existing.CredentialTypes
+
+		// Handle visible flag - check if either --visible or --hidden was passed
+		if cmd.Flags().Changed("visible") {
+			visible, _ := cmd.Flags().GetBool("visible")
+			reqBody["visible"] = visible
+		} else if cmd.Flags().Changed("hidden") {
+			hidden, _ := cmd.Flags().GetBool("hidden")
+			reqBody["visible"] = !hidden
 		}
 
 		data, err = client.Request("PUT", "/admin/tenants/"+issuerUpdateTenantID+"/issuers/"+issuerID, reqBody)
@@ -315,30 +255,18 @@ func init() {
 
 	// Create flags
 	issuerCreateCmd.Flags().StringVar(&issuerCreateTenantID, "tenant", "", "Tenant ID (required)")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateID, "id", "", "Issuer ID (required)")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateName, "name", "", "Issuer name (required)")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateIssuerURL, "issuer-url", "", "Issuer URL")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateAuthURL, "auth-url", "", "Authorization endpoint URL")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateTokenURL, "token-url", "", "Token endpoint URL")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateCredentialURL, "credential-url", "", "Credential endpoint URL")
+	issuerCreateCmd.Flags().StringVar(&issuerCreateIdentifier, "identifier", "", "Credential issuer identifier/URL (required)")
 	issuerCreateCmd.Flags().StringVar(&issuerCreateClientID, "client-id", "", "OAuth client ID")
-	issuerCreateCmd.Flags().StringVar(&issuerCreateClientSecret, "client-secret", "", "OAuth client secret")
-	issuerCreateCmd.Flags().StringSliceVar(&issuerCreateCredTypes, "credential-type", nil, "Credential types (can be repeated)")
-	issuerCreateCmd.Flags().BoolVar(&issuerCreateEnabled, "enabled", true, "Whether issuer is enabled")
+	issuerCreateCmd.Flags().BoolVar(&issuerCreateVisible, "visible", true, "Whether issuer is visible to users")
 	issuerCreateCmd.MarkFlagRequired("tenant")
-	issuerCreateCmd.MarkFlagRequired("id")
-	issuerCreateCmd.MarkFlagRequired("name")
+	issuerCreateCmd.MarkFlagRequired("identifier")
 
 	// Update flags
 	issuerUpdateCmd.Flags().StringVar(&issuerUpdateTenantID, "tenant", "", "Tenant ID (required)")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateName, "name", "", "New issuer name")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateIssuerURL, "issuer-url", "", "New issuer URL")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateAuthURL, "auth-url", "", "New authorization endpoint URL")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateTokenURL, "token-url", "", "New token endpoint URL")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateCredentialURL, "credential-url", "", "New credential endpoint URL")
+	issuerUpdateCmd.Flags().StringVar(&issuerUpdateIdentifier, "identifier", "", "New credential issuer identifier/URL")
 	issuerUpdateCmd.Flags().StringVar(&issuerUpdateClientID, "client-id", "", "New OAuth client ID")
-	issuerUpdateCmd.Flags().StringVar(&issuerUpdateClientSecret, "client-secret", "", "New OAuth client secret")
-	issuerUpdateCmd.Flags().StringSliceVar(&issuerUpdateCredTypes, "credential-type", nil, "New credential types (can be repeated)")
+	issuerUpdateCmd.Flags().Bool("visible", true, "Make issuer visible")
+	issuerUpdateCmd.Flags().Bool("hidden", false, "Hide the issuer")
 	issuerUpdateCmd.MarkFlagRequired("tenant")
 
 	// Delete flags
