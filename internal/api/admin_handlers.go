@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -323,4 +324,431 @@ func (h *AdminHandlers) AdminStatus(c *gin.Context) {
 		"status":  "ok",
 		"service": "wallet-backend-admin",
 	})
+}
+
+// IssuerRequest represents the request body for creating/updating an issuer
+type IssuerRequest struct {
+	CredentialIssuerIdentifier string `json:"credential_issuer_identifier" binding:"required"`
+	ClientID                   string `json:"client_id,omitempty"`
+	Visible                    *bool  `json:"visible,omitempty"`
+}
+
+// IssuerResponse represents an issuer in API responses
+type IssuerResponse struct {
+	ID                         int64  `json:"id"`
+	TenantID                   string `json:"tenant_id"`
+	CredentialIssuerIdentifier string `json:"credential_issuer_identifier"`
+	ClientID                   string `json:"client_id,omitempty"`
+	Visible                    bool   `json:"visible"`
+}
+
+func issuerToResponse(i *domain.CredentialIssuer) *IssuerResponse {
+	return &IssuerResponse{
+		ID:                         i.ID,
+		TenantID:                   string(i.TenantID),
+		CredentialIssuerIdentifier: i.CredentialIssuerIdentifier,
+		ClientID:                   i.ClientID,
+		Visible:                    i.Visible,
+	}
+}
+
+// ListIssuers returns all issuers for a tenant
+// GET /admin/tenants/:id/issuers
+func (h *AdminHandlers) ListIssuers(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Verify tenant exists
+	_, err := h.store.Tenants().GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	issuers, err := h.store.Issuers().GetAll(c.Request.Context(), tenantID)
+	if err != nil {
+		h.logger.Error("Failed to list issuers", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list issuers"})
+		return
+	}
+
+	response := make([]*IssuerResponse, len(issuers))
+	for i, issuer := range issuers {
+		response[i] = issuerToResponse(issuer)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"issuers": response})
+}
+
+// GetIssuer returns a specific issuer
+// GET /admin/tenants/:id/issuers/:issuer_id
+func (h *AdminHandlers) GetIssuer(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	issuerIDStr := c.Param("issuer_id")
+
+	var issuerID int64
+	if _, err := fmt.Sscanf(issuerIDStr, "%d", &issuerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer ID"})
+		return
+	}
+
+	issuer, err := h.store.Issuers().GetByID(c.Request.Context(), tenantID, issuerID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Issuer not found"})
+			return
+		}
+		h.logger.Error("Failed to get issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get issuer"})
+		return
+	}
+
+	c.JSON(http.StatusOK, issuerToResponse(issuer))
+}
+
+// CreateIssuer creates a new issuer for a tenant
+// POST /admin/tenants/:id/issuers
+func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Verify tenant exists
+	_, err := h.store.Tenants().GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	var req IssuerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check if issuer with same identifier already exists in tenant
+	existing, err := h.store.Issuers().GetByIdentifier(c.Request.Context(), tenantID, req.CredentialIssuerIdentifier)
+	if err == nil && existing != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Issuer with this identifier already exists in tenant"})
+		return
+	}
+
+	visible := true
+	if req.Visible != nil {
+		visible = *req.Visible
+	}
+
+	issuer := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
+		CredentialIssuerIdentifier: req.CredentialIssuerIdentifier,
+		ClientID:                   req.ClientID,
+		Visible:                    visible,
+	}
+
+	if err := h.store.Issuers().Create(c.Request.Context(), issuer); err != nil {
+		h.logger.Error("Failed to create issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create issuer"})
+		return
+	}
+
+	h.logger.Info("Issuer created",
+		zap.String("tenant_id", string(tenantID)),
+		zap.String("identifier", req.CredentialIssuerIdentifier))
+	c.JSON(http.StatusCreated, issuerToResponse(issuer))
+}
+
+// UpdateIssuer updates an existing issuer
+// PUT /admin/tenants/:id/issuers/:issuer_id
+func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	issuerIDStr := c.Param("issuer_id")
+
+	var issuerID int64
+	if _, err := fmt.Sscanf(issuerIDStr, "%d", &issuerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer ID"})
+		return
+	}
+
+	// Get existing issuer
+	issuer, err := h.store.Issuers().GetByID(c.Request.Context(), tenantID, issuerID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Issuer not found"})
+			return
+		}
+		h.logger.Error("Failed to get issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get issuer"})
+		return
+	}
+
+	var req IssuerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update fields
+	issuer.CredentialIssuerIdentifier = req.CredentialIssuerIdentifier
+	issuer.ClientID = req.ClientID
+	if req.Visible != nil {
+		issuer.Visible = *req.Visible
+	}
+
+	if err := h.store.Issuers().Update(c.Request.Context(), issuer); err != nil {
+		h.logger.Error("Failed to update issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update issuer"})
+		return
+	}
+
+	h.logger.Info("Issuer updated",
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int64("issuer_id", issuerID))
+	c.JSON(http.StatusOK, issuerToResponse(issuer))
+}
+
+// DeleteIssuer deletes an issuer
+// DELETE /admin/tenants/:id/issuers/:issuer_id
+func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	issuerIDStr := c.Param("issuer_id")
+
+	var issuerID int64
+	if _, err := fmt.Sscanf(issuerIDStr, "%d", &issuerID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer ID"})
+		return
+	}
+
+	// Check if issuer exists
+	_, err := h.store.Issuers().GetByID(c.Request.Context(), tenantID, issuerID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Issuer not found"})
+			return
+		}
+		h.logger.Error("Failed to get issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get issuer"})
+		return
+	}
+
+	if err := h.store.Issuers().Delete(c.Request.Context(), tenantID, issuerID); err != nil {
+		h.logger.Error("Failed to delete issuer", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete issuer"})
+		return
+	}
+
+	h.logger.Info("Issuer deleted",
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int64("issuer_id", issuerID))
+	c.JSON(http.StatusOK, gin.H{"message": "Issuer deleted"})
+}
+
+// VerifierRequest represents the request body for creating/updating a verifier
+type VerifierRequest struct {
+	Name string `json:"name" binding:"required"`
+	URL  string `json:"url" binding:"required"`
+}
+
+// VerifierResponse represents a verifier in API responses
+type VerifierResponse struct {
+	ID       int64  `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+}
+
+func verifierToResponse(v *domain.Verifier) *VerifierResponse {
+	return &VerifierResponse{
+		ID:       v.ID,
+		TenantID: string(v.TenantID),
+		Name:     v.Name,
+		URL:      v.URL,
+	}
+}
+
+// ListVerifiers returns all verifiers for a tenant
+// GET /admin/tenants/:id/verifiers
+func (h *AdminHandlers) ListVerifiers(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Verify tenant exists
+	_, err := h.store.Tenants().GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	verifiers, err := h.store.Verifiers().GetAll(c.Request.Context(), tenantID)
+	if err != nil {
+		h.logger.Error("Failed to list verifiers", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list verifiers"})
+		return
+	}
+
+	response := make([]*VerifierResponse, len(verifiers))
+	for i, verifier := range verifiers {
+		response[i] = verifierToResponse(verifier)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"verifiers": response})
+}
+
+// GetVerifier returns a specific verifier
+// GET /admin/tenants/:id/verifiers/:verifier_id
+func (h *AdminHandlers) GetVerifier(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	verifierIDStr := c.Param("verifier_id")
+
+	var verifierID int64
+	if _, err := fmt.Sscanf(verifierIDStr, "%d", &verifierID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verifier ID"})
+		return
+	}
+
+	verifier, err := h.store.Verifiers().GetByID(c.Request.Context(), tenantID, verifierID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Verifier not found"})
+			return
+		}
+		h.logger.Error("Failed to get verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get verifier"})
+		return
+	}
+
+	c.JSON(http.StatusOK, verifierToResponse(verifier))
+}
+
+// CreateVerifier creates a new verifier for a tenant
+// POST /admin/tenants/:id/verifiers
+func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Verify tenant exists
+	_, err := h.store.Tenants().GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	var req VerifierRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	verifier := &domain.Verifier{
+		TenantID: tenantID,
+		Name:     req.Name,
+		URL:      req.URL,
+	}
+
+	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
+		h.logger.Error("Failed to create verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create verifier"})
+		return
+	}
+
+	h.logger.Info("Verifier created",
+		zap.String("tenant_id", string(tenantID)),
+		zap.String("name", req.Name))
+	c.JSON(http.StatusCreated, verifierToResponse(verifier))
+}
+
+// UpdateVerifier updates an existing verifier
+// PUT /admin/tenants/:id/verifiers/:verifier_id
+func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	verifierIDStr := c.Param("verifier_id")
+
+	var verifierID int64
+	if _, err := fmt.Sscanf(verifierIDStr, "%d", &verifierID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verifier ID"})
+		return
+	}
+
+	// Get existing verifier
+	verifier, err := h.store.Verifiers().GetByID(c.Request.Context(), tenantID, verifierID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Verifier not found"})
+			return
+		}
+		h.logger.Error("Failed to get verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get verifier"})
+		return
+	}
+
+	var req VerifierRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update fields
+	verifier.Name = req.Name
+	verifier.URL = req.URL
+
+	if err := h.store.Verifiers().Update(c.Request.Context(), verifier); err != nil {
+		h.logger.Error("Failed to update verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update verifier"})
+		return
+	}
+
+	h.logger.Info("Verifier updated",
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int64("verifier_id", verifierID))
+	c.JSON(http.StatusOK, verifierToResponse(verifier))
+}
+
+// DeleteVerifier deletes a verifier
+// DELETE /admin/tenants/:id/verifiers/:verifier_id
+func (h *AdminHandlers) DeleteVerifier(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	verifierIDStr := c.Param("verifier_id")
+
+	var verifierID int64
+	if _, err := fmt.Sscanf(verifierIDStr, "%d", &verifierID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid verifier ID"})
+		return
+	}
+
+	// Check if verifier exists
+	_, err := h.store.Verifiers().GetByID(c.Request.Context(), tenantID, verifierID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Verifier not found"})
+			return
+		}
+		h.logger.Error("Failed to get verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get verifier"})
+		return
+	}
+
+	if err := h.store.Verifiers().Delete(c.Request.Context(), tenantID, verifierID); err != nil {
+		h.logger.Error("Failed to delete verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete verifier"})
+		return
+	}
+
+	h.logger.Info("Verifier deleted",
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int64("verifier_id", verifierID))
+	c.JSON(http.StatusOK, gin.H{"message": "Verifier deleted"})
 }
