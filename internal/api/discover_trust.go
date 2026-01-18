@@ -161,7 +161,7 @@ func (h *Handlers) fetchIssuerMetadata(ctx context.Context, issuerURL string) (*
 	if err != nil {
 		return nil, fmt.Errorf("fetching metadata: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(httpResp.Body)
@@ -189,7 +189,7 @@ func (h *Handlers) fetchIACACertificates(ctx context.Context, iacasURL string) (
 	if err != nil {
 		return nil, fmt.Errorf("fetching IACA certificates: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(httpResp.Body)
