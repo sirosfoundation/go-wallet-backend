@@ -292,6 +292,10 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		{
 			walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
 		}
+
+		// Combined discovery and trust evaluation endpoint
+		// Available when api_version >= 2
+		protected.POST("/discover-and-trust", handlers.DiscoverAndTrust)
 	}
 
 	// Tenant-scoped routes (with tenant path parameter)

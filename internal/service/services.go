@@ -21,6 +21,7 @@ type Services struct {
 	Proxy          *ProxyService
 	Helper         *HelperService
 	WalletProvider *WalletProviderService
+	Trust          *TrustService
 }
 
 // NewServices creates a new Services instance
@@ -44,5 +45,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Proxy:          NewProxyService(cfg, logger),
 		Helper:         NewHelperService(logger),
 		WalletProvider: NewWalletProviderService(cfg, logger),
+		Trust:          NewTrustService(cfg, logger),
 	}
 }
