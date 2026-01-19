@@ -228,27 +228,27 @@ func init() {
 
 	// List flags
 	verifierListCmd.Flags().StringVar(&verifierListTenantID, "tenant", "", "Tenant ID (required)")
-	verifierListCmd.MarkFlagRequired("tenant")
+	_ = verifierListCmd.MarkFlagRequired("tenant")
 
 	// Get flags
 	verifierGetCmd.Flags().StringVar(&verifierGetTenantID, "tenant", "", "Tenant ID (required)")
-	verifierGetCmd.MarkFlagRequired("tenant")
+	_ = verifierGetCmd.MarkFlagRequired("tenant")
 
 	// Create flags
 	verifierCreateCmd.Flags().StringVar(&verifierCreateTenantID, "tenant", "", "Tenant ID (required)")
 	verifierCreateCmd.Flags().StringVar(&verifierCreateName, "name", "", "Verifier name (required)")
 	verifierCreateCmd.Flags().StringVar(&verifierCreateURL, "verifier-url", "", "Verifier URL (required)")
-	verifierCreateCmd.MarkFlagRequired("tenant")
-	verifierCreateCmd.MarkFlagRequired("name")
-	verifierCreateCmd.MarkFlagRequired("verifier-url")
+	_ = verifierCreateCmd.MarkFlagRequired("tenant")
+	_ = verifierCreateCmd.MarkFlagRequired("name")
+	_ = verifierCreateCmd.MarkFlagRequired("verifier-url")
 
 	// Update flags
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateTenantID, "tenant", "", "Tenant ID (required)")
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateName, "name", "", "New verifier name")
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateURL, "verifier-url", "", "New verifier URL")
-	verifierUpdateCmd.MarkFlagRequired("tenant")
+	_ = verifierUpdateCmd.MarkFlagRequired("tenant")
 
 	// Delete flags
 	verifierDeleteCmd.Flags().StringVar(&verifierDeleteTenantID, "tenant", "", "Tenant ID (required)")
-	verifierDeleteCmd.MarkFlagRequired("tenant")
+	_ = verifierDeleteCmd.MarkFlagRequired("tenant")
 }

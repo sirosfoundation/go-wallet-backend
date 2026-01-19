@@ -173,7 +173,7 @@ func TestAdminHandlers_CreateTenant(t *testing.T) {
 		}
 
 		var tenant TenantResponse
-		json.Unmarshal(w.Body.Bytes(), &tenant)
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
 		if tenant.Enabled {
 			t.Error("Expected tenant to be disabled")
 		}
@@ -202,7 +202,7 @@ func TestAdminHandlers_GetTenant(t *testing.T) {
 		}
 
 		var tenant TenantResponse
-		json.Unmarshal(w.Body.Bytes(), &tenant)
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
 		if tenant.ID != "get-test" {
 			t.Errorf("Expected id 'get-test', got %q", tenant.ID)
 		}
@@ -243,7 +243,7 @@ func TestAdminHandlers_UpdateTenant(t *testing.T) {
 		}
 
 		var tenant TenantResponse
-		json.Unmarshal(w.Body.Bytes(), &tenant)
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
 		if tenant.Name != "Updated Name" {
 			t.Errorf("Expected name 'Updated Name', got %q", tenant.Name)
 		}
@@ -346,7 +346,7 @@ func TestAdminHandlers_TenantUsers(t *testing.T) {
 		var response struct {
 			Users []string `json:"users"`
 		}
-		json.Unmarshal(w.Body.Bytes(), &response)
+		_ = json.Unmarshal(w.Body.Bytes(), &response)
 		if len(response.Users) != 0 {
 			t.Errorf("Expected empty users, got %d", len(response.Users))
 		}
@@ -388,7 +388,7 @@ func TestAdminHandlers_TenantUsers(t *testing.T) {
 		var response struct {
 			Users []string `json:"users"`
 		}
-		json.Unmarshal(w.Body.Bytes(), &response)
+		_ = json.Unmarshal(w.Body.Bytes(), &response)
 		if len(response.Users) != 2 {
 			t.Errorf("Expected 2 users, got %d", len(response.Users))
 		}
@@ -478,7 +478,7 @@ func TestAdminHandlers_IssuerCRUD(t *testing.T) {
 		}
 
 		var issuer IssuerResponse
-		json.Unmarshal(w.Body.Bytes(), &issuer)
+		_ = json.Unmarshal(w.Body.Bytes(), &issuer)
 		createdIssuerID = issuer.ID
 		if issuer.CredentialIssuerIdentifier != "https://issuer.example.com" {
 			t.Errorf("Expected credential_issuer_identifier, got %q", issuer.CredentialIssuerIdentifier)

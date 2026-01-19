@@ -135,18 +135,18 @@ func init() {
 
 	// List flags
 	userListCmd.Flags().StringVar(&userListTenantID, "tenant", "", "Tenant ID (required)")
-	userListCmd.MarkFlagRequired("tenant")
+	_ = userListCmd.MarkFlagRequired("tenant")
 
 	// Add flags
 	userAddCmd.Flags().StringVar(&userAddTenantID, "tenant", "", "Tenant ID (required)")
 	userAddCmd.Flags().StringVar(&userAddID, "id", "", "User ID (required)")
 	userAddCmd.Flags().StringVar(&userAddRole, "role", "", "User role")
-	userAddCmd.MarkFlagRequired("tenant")
-	userAddCmd.MarkFlagRequired("id")
+	_ = userAddCmd.MarkFlagRequired("tenant")
+	_ = userAddCmd.MarkFlagRequired("id")
 
 	// Remove flags
 	userRemoveCmd.Flags().StringVar(&userRemoveTenantID, "tenant", "", "Tenant ID (required)")
 	userRemoveCmd.Flags().StringVar(&userRemoveID, "id", "", "User ID (required)")
-	userRemoveCmd.MarkFlagRequired("tenant")
-	userRemoveCmd.MarkFlagRequired("id")
+	_ = userRemoveCmd.MarkFlagRequired("tenant")
+	_ = userRemoveCmd.MarkFlagRequired("id")
 }

@@ -661,7 +661,7 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
 			ID: "cred3", PublicKey: []byte("key3"),
 		})
-		service.UpdateUser(ctx, u)
+		_ = service.UpdateUser(ctx, u)
 
 		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", []byte("{}"), "")
 		if err == nil {

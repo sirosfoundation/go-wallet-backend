@@ -31,7 +31,7 @@ func NewWalletAdminCLI(t *testing.T) *WalletAdminCLI {
 	}
 
 	t.Cleanup(func() {
-		os.Remove(binPath)
+		_ = os.Remove(binPath)
 	})
 
 	return &WalletAdminCLI{

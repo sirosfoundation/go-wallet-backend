@@ -148,7 +148,6 @@ var (
 	issuerUpdateTenantID   string
 	issuerUpdateIdentifier string
 	issuerUpdateClientID   string
-	issuerUpdateVisible    *bool
 )
 
 var issuerUpdateCmd = &cobra.Command{
@@ -247,19 +246,19 @@ func init() {
 
 	// List flags
 	issuerListCmd.Flags().StringVar(&issuerListTenantID, "tenant", "", "Tenant ID (required)")
-	issuerListCmd.MarkFlagRequired("tenant")
+	_ = issuerListCmd.MarkFlagRequired("tenant")
 
 	// Get flags
 	issuerGetCmd.Flags().StringVar(&issuerGetTenantID, "tenant", "", "Tenant ID (required)")
-	issuerGetCmd.MarkFlagRequired("tenant")
+	_ = issuerGetCmd.MarkFlagRequired("tenant")
 
 	// Create flags
 	issuerCreateCmd.Flags().StringVar(&issuerCreateTenantID, "tenant", "", "Tenant ID (required)")
 	issuerCreateCmd.Flags().StringVar(&issuerCreateIdentifier, "identifier", "", "Credential issuer identifier/URL (required)")
 	issuerCreateCmd.Flags().StringVar(&issuerCreateClientID, "client-id", "", "OAuth client ID")
 	issuerCreateCmd.Flags().BoolVar(&issuerCreateVisible, "visible", true, "Whether issuer is visible to users")
-	issuerCreateCmd.MarkFlagRequired("tenant")
-	issuerCreateCmd.MarkFlagRequired("identifier")
+	_ = issuerCreateCmd.MarkFlagRequired("tenant")
+	_ = issuerCreateCmd.MarkFlagRequired("identifier")
 
 	// Update flags
 	issuerUpdateCmd.Flags().StringVar(&issuerUpdateTenantID, "tenant", "", "Tenant ID (required)")
@@ -267,9 +266,9 @@ func init() {
 	issuerUpdateCmd.Flags().StringVar(&issuerUpdateClientID, "client-id", "", "New OAuth client ID")
 	issuerUpdateCmd.Flags().Bool("visible", true, "Make issuer visible")
 	issuerUpdateCmd.Flags().Bool("hidden", false, "Hide the issuer")
-	issuerUpdateCmd.MarkFlagRequired("tenant")
+	_ = issuerUpdateCmd.MarkFlagRequired("tenant")
 
 	// Delete flags
 	issuerDeleteCmd.Flags().StringVar(&issuerDeleteTenantID, "tenant", "", "Tenant ID (required)")
-	issuerDeleteCmd.MarkFlagRequired("tenant")
+	_ = issuerDeleteCmd.MarkFlagRequired("tenant")
 }
