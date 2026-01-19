@@ -32,10 +32,13 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 }
 
 // Status handles the /status endpoint
+// This endpoint returns the server status and API version for client capability detection.
 func (h *Handlers) Status(c *gin.Context) {
-	c.JSON(200, gin.H{
-		"status":  "ok",
-		"service": "wallet-backend",
+	c.JSON(200, StatusResponse{
+		Status:       "ok",
+		Service:      "wallet-backend",
+		APIVersion:   CurrentAPIVersion,
+		Capabilities: APICapabilities[CurrentAPIVersion],
 	})
 }
 
@@ -167,6 +170,8 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
+		case errors.Is(err, service.ErrTenantMismatch):
+			c.JSON(403, gin.H{"error": "Tenant mismatch: use tenant-scoped login endpoint"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete login"})
 		}

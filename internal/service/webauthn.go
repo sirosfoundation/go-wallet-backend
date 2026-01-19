@@ -63,9 +63,18 @@ func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Log
 // WebAuthnUser implements webauthn.User interface
 type WebAuthnUser struct {
 	user *domain.User
+	// userHandle stores the original userHandle bytes for tenant-scoped users.
+	// When set, WebAuthnID() returns this instead of the user's UUID.
+	// This is needed for discoverable login validation where the authenticator
+	// returns the tenant-scoped userHandle (format: "tenantId:userId").
+	userHandle []byte
 }
 
 func (u *WebAuthnUser) WebAuthnID() []byte {
+	// If a custom userHandle was provided (for tenant-scoped logins), use it
+	if len(u.userHandle) > 0 {
+		return u.userHandle
+	}
 	return u.user.UUID.AsUserHandle()
 }
 
@@ -592,6 +601,15 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.String("user_id", userID.String()))
 	}
 
+	// SECURITY: Global login endpoint only allows default tenant users.
+	// Users registered with a specific tenant must use the tenant-scoped login endpoint.
+	if tenantID != domain.DefaultTenantID {
+		s.logger.Warn("Global login rejected for non-default tenant user",
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("user_id", userID.String()))
+		return nil, ErrTenantMismatch
+	}
+
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -626,12 +644,30 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// Verify the authentication using ValidateDiscoverableLogin
 	credential, err := s.webauthn.ValidateDiscoverableLogin(
 		func(rawID, userHandle []byte) (webauthn.User, error) {
-			uid := domain.UserIDFromUserHandle(userHandle)
+			s.logger.Debug("ValidateDiscoverableLogin callback called",
+				zap.String("userHandle", string(userHandle)),
+				zap.Int("userHandleLen", len(userHandle)))
+			// Try to decode as tenant-scoped user handle first (format: "tenantId:userId")
+			// Fall back to legacy format (just userId) for backward compatibility
+			var uid domain.UserID
+			if _, parsedUID, err := domain.DecodeUserHandle(userHandle); err == nil {
+				uid = parsedUID
+				s.logger.Debug("Decoded as tenant-scoped handle", zap.String("uid", uid.String()))
+			} else {
+				uid = domain.UserIDFromUserHandle(userHandle)
+				s.logger.Debug("Using legacy handle", zap.String("uid", uid.String()))
+			}
 			u, err := s.store.Users().GetByID(ctx, uid)
 			if err != nil {
+				s.logger.Error("Failed to get user in callback",
+					zap.String("uid", uid.String()),
+					zap.Error(err))
 				return nil, err
 			}
-			return &WebAuthnUser{user: u}, nil
+			// Pass the original userHandle so WebAuthnID() returns it during validation.
+			// This ensures the go-webauthn library's userHandle comparison succeeds for
+			// tenant-scoped credentials that have a "tenantId:userId" format userHandle.
+			return &WebAuthnUser{user: u, userHandle: userHandle}, nil
 		},
 		sessionData,
 		parsedResponse,
@@ -1125,6 +1161,12 @@ func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID
 		AllowedCredentialIDs: [][]byte{},
 		Expires:              challenge.ExpiresAt,
 		UserVerification:     protocol.VerificationRequired,
+		// CredParams must match what was sent to the client in BeginTenantRegistration
+		CredParams: []protocol.CredentialParameter{
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
 	}
 
 	// Verify credential
@@ -1338,7 +1380,7 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	waUser := &TenantWebAuthnUser{user: user, userHandle: domain.EncodeUserHandle(tenantID, userID)}
 	sessionData := webauthn.SessionData{
 		Challenge:            challenge.Challenge,
-		UserID:               waUser.WebAuthnID(),
+		// UserID must be empty for discoverable login validation
 		AllowedCredentialIDs: [][]byte{},
 		Expires:              challenge.ExpiresAt,
 		UserVerification:     protocol.VerificationRequired,
