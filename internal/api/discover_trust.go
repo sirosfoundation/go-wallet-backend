@@ -32,7 +32,7 @@ type DiscoverAndTrustRequest struct {
 // DiscoverAndTrustResponse is the response from POST /api/discover-and-trust
 type DiscoverAndTrustResponse struct {
 	// Discovered metadata (if any)
-	IssuerMetadata  json.RawMessage `json:"issuer_metadata,omitempty"`
+	IssuerMetadata   json.RawMessage `json:"issuer_metadata,omitempty"`
 	VerifierMetadata json.RawMessage `json:"verifier_metadata,omitempty"`
 
 	// Trust evaluation result
@@ -53,15 +53,15 @@ type DiscoverAndTrustResponse struct {
 // OpenID4VCIIssuerMetadata represents the credential issuer metadata from
 // .well-known/openid-credential-issuer
 type OpenID4VCIIssuerMetadata struct {
-	CredentialIssuer              string          `json:"credential_issuer"`
-	AuthorizationServers          []string        `json:"authorization_servers,omitempty"`
-	CredentialEndpoint            string          `json:"credential_endpoint"`
-	DeferredCredentialEndpoint    string          `json:"deferred_credential_endpoint,omitempty"`
-	NotificationEndpoint          string          `json:"notification_endpoint,omitempty"`
-	CredentialResponseEncryption  json.RawMessage `json:"credential_response_encryption,omitempty"`
-	BatchCredentialIssuance       json.RawMessage `json:"batch_credential_issuance,omitempty"`
-	SignedMetadata                string          `json:"signed_metadata,omitempty"`
-	Display                       json.RawMessage `json:"display,omitempty"`
+	CredentialIssuer                  string          `json:"credential_issuer"`
+	AuthorizationServers              []string        `json:"authorization_servers,omitempty"`
+	CredentialEndpoint                string          `json:"credential_endpoint"`
+	DeferredCredentialEndpoint        string          `json:"deferred_credential_endpoint,omitempty"`
+	NotificationEndpoint              string          `json:"notification_endpoint,omitempty"`
+	CredentialResponseEncryption      json.RawMessage `json:"credential_response_encryption,omitempty"`
+	BatchCredentialIssuance           json.RawMessage `json:"batch_credential_issuance,omitempty"`
+	SignedMetadata                    string          `json:"signed_metadata,omitempty"`
+	Display                           json.RawMessage `json:"display,omitempty"`
 	CredentialConfigurationsSupported json.RawMessage `json:"credential_configurations_supported,omitempty"`
 	// IACA certificates URL for mDOC
 	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
