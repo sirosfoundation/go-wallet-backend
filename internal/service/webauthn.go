@@ -299,6 +299,7 @@ type FinishRegistrationResponse struct {
 	Username     string                   `json:"username,omitempty"`
 	PrivateData  taggedbinary.TaggedBytes `json:"privateData,omitempty"`
 	WebauthnRpId string                   `json:"webauthnRpId"`
+	TenantID     string                   `json:"tenantId,omitempty"`
 }
 
 // FinishRegistration completes WebAuthn registration
@@ -533,6 +534,7 @@ type FinishLoginResponse struct {
 	Username     string                   `json:"username,omitempty"`
 	PrivateData  taggedbinary.TaggedBytes `json:"privateData,omitempty"`
 	WebauthnRpId string                   `json:"webauthnRpId"`
+	TenantID     string                   `json:"tenantId,omitempty"`
 }
 
 // FinishLogin completes WebAuthn authentication
@@ -572,7 +574,24 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, errors.New("user handle required for discoverable credentials")
 	}
 
-	userID := domain.UserIDFromUserHandle(parsedResponse.Response.UserHandle)
+	// Try to decode tenant-scoped user handle (format: "tenantId:userId")
+	// For backward compatibility, fall back to treating handle as just userId
+	var userID domain.UserID
+	var tenantID domain.TenantID
+	if tid, uid, err := domain.DecodeUserHandle(parsedResponse.Response.UserHandle); err == nil {
+		tenantID = tid
+		userID = uid
+		s.logger.Debug("Decoded tenant-scoped user handle",
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("user_id", userID.String()))
+	} else {
+		// Legacy user without tenant prefix
+		userID = domain.UserIDFromUserHandle(parsedResponse.Response.UserHandle)
+		tenantID = domain.DefaultTenantID
+		s.logger.Debug("Legacy user handle without tenant",
+			zap.String("user_id", userID.String()))
+	}
+
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -647,7 +666,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		username = *user.Username
 	}
 
-	s.logger.Info("User logged in via WebAuthn", zap.String("user_id", userID.String()))
+	s.logger.Info("User logged in via WebAuthn",
+		zap.String("user_id", userID.String()),
+		zap.String("tenant_id", string(tenantID)))
 
 	return &FinishLoginResponse{
 		UUID:         userID.String(),
@@ -656,6 +677,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		Username:     username,
 		PrivateData:  user.PrivateData,
 		WebauthnRpId: s.cfg.Server.RPID,
+		TenantID:     string(tenantID),
 	}, nil
 }
 
@@ -1186,6 +1208,7 @@ func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID
 		DisplayName:  displayName,
 		PrivateData:  user.PrivateData,
 		WebauthnRpId: s.cfg.Server.RPID,
+		TenantID:     string(tenantID),
 	}, nil
 }
 
@@ -1355,6 +1378,7 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 		DisplayName:  displayName,
 		PrivateData:  user.PrivateData,
 		WebauthnRpId: s.cfg.Server.RPID,
+		TenantID:     string(tenantID),
 	}, nil
 }
 
