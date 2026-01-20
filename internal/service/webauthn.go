@@ -629,14 +629,21 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			// Try to decode tenant-scoped user handle (format: "tenantId:userId")
 			// Fall back to treating handle as just userId for legacy users
 			var uid domain.UserID
+			var isTenantUser bool
 			if _, parsedUID, err := domain.DecodeUserHandle(userHandle); err == nil {
 				uid = parsedUID
+				isTenantUser = true
 			} else {
 				uid = domain.UserIDFromUserHandle(userHandle)
+				isTenantUser = false
 			}
 			u, err := s.store.Users().GetByID(ctx, uid)
 			if err != nil {
 				return nil, err
+			}
+			// Return the appropriate user type so WebAuthnID() returns the correct handle
+			if isTenantUser {
+				return &TenantWebAuthnUser{user: u, userHandle: userHandle}, nil
 			}
 			return &WebAuthnUser{user: u}, nil
 		},
