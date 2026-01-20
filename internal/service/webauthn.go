@@ -1125,6 +1125,12 @@ func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID
 		AllowedCredentialIDs: [][]byte{},
 		Expires:              challenge.ExpiresAt,
 		UserVerification:     protocol.VerificationRequired,
+		// CredParams must match what was sent to the client in BeginTenantRegistration
+		CredParams: []protocol.CredentialParameter{
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
+			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
 	}
 
 	// Verify credential
