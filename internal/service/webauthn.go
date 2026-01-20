@@ -626,7 +626,14 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// Verify the authentication using ValidateDiscoverableLogin
 	credential, err := s.webauthn.ValidateDiscoverableLogin(
 		func(rawID, userHandle []byte) (webauthn.User, error) {
-			uid := domain.UserIDFromUserHandle(userHandle)
+			// Try to decode tenant-scoped user handle (format: "tenantId:userId")
+			// Fall back to treating handle as just userId for legacy users
+			var uid domain.UserID
+			if _, parsedUID, err := domain.DecodeUserHandle(userHandle); err == nil {
+				uid = parsedUID
+			} else {
+				uid = domain.UserIDFromUserHandle(userHandle)
+			}
 			u, err := s.store.Users().GetByID(ctx, uid)
 			if err != nil {
 				return nil, err
