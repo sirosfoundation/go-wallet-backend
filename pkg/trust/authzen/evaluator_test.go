@@ -146,7 +146,7 @@ func TestEvaluator_Evaluate(t *testing.T) {
 	})
 
 	t.Run("successful evaluation - decision false", func(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{
 				Decision: false,
