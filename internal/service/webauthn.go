@@ -23,12 +23,13 @@ import (
 )
 
 var (
-	ErrChallengeNotFound  = errors.New("challenge not found")
-	ErrChallengeExpired   = errors.New("challenge expired")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrCredentialNotFound = errors.New("credential not found")
-	ErrVerificationFailed = errors.New("verification failed")
-	ErrTenantMismatch     = errors.New("tenant mismatch")
+	ErrChallengeNotFound   = errors.New("challenge not found")
+	ErrChallengeExpired    = errors.New("challenge expired")
+	ErrUserNotFound        = errors.New("user not found")
+	ErrCredentialNotFound  = errors.New("credential not found")
+	ErrVerificationFailed  = errors.New("verification failed")
+	ErrTenantMismatch      = errors.New("tenant mismatch")
+	ErrTenantAccessDenied  = errors.New("tenant user must use tenant-scoped login endpoint")
 )
 
 // WebAuthnService handles WebAuthn authentication
@@ -590,6 +591,17 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		tenantID = domain.DefaultTenantID
 		s.logger.Debug("Legacy user handle without tenant",
 			zap.String("user_id", userID.String()))
+	}
+
+	// SECURITY: Global login endpoint only allows default tenant users.
+	// Users registered with non-default tenants must use the tenant-scoped
+	// login endpoint (/t/{tenantId}/user/login-webauthn-*).
+	// This enforces tenant isolation and prevents cross-tenant access.
+	if tenantID != domain.DefaultTenantID {
+		s.logger.Warn("Attempted global login with non-default tenant user",
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("user_id", userID.String()))
+		return nil, ErrTenantAccessDenied
 	}
 
 	user, err := s.store.Users().GetByID(ctx, userID)
