@@ -402,6 +402,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
 				ID:              string(credential.ID),
+				CredentialID:    credential.ID,
 				PublicKey:       credential.PublicKey,
 				AttestationType: credential.AttestationType,
 				Transport:       transports,
@@ -946,6 +947,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	now := time.Now()
 	newCred := domain.WebauthnCredential{
 		ID:              string(credential.ID),
+		CredentialID:    credential.ID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: credential.AttestationType,
 		Transport:       transports,
@@ -1181,6 +1183,7 @@ func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID
 		WalletType:  domain.WalletTypeClient, // Using client wallet type for PRF-based credentials
 		WebauthnCredentials: []domain.WebauthnCredential{{
 			ID:              string(credential.ID),
+			CredentialID:    credential.ID,
 			PublicKey:       credential.PublicKey,
 			AttestationType: credential.AttestationType,
 			Transport:       transports,
