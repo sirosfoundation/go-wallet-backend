@@ -48,10 +48,10 @@ type ProxyFilterConfig struct {
 func DefaultProxyFilterConfig() ProxyFilterConfig {
 	return ProxyFilterConfig{
 		Enabled:        true,
-		RequireHTTPS:   true,  // Primary SSRF defense
-		BlockLoopback:  true,  // Block localhost access
-		BlockRFC1918:   true,  // Defense-in-depth for private networks
-		BlockLinkLocal: true,  // Block cloud metadata (169.254.169.254)
+		RequireHTTPS:   true, // Primary SSRF defense
+		BlockLoopback:  true, // Block localhost access
+		BlockRFC1918:   true, // Defense-in-depth for private networks
+		BlockLinkLocal: true, // Block cloud metadata (169.254.169.254)
 		BlockedHosts: []string{
 			// Cloud metadata hostnames (defense-in-depth, link-local blocking is primary)
 			"metadata.google.internal",

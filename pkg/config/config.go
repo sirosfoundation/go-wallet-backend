@@ -286,10 +286,10 @@ func defaultConfig() *Config {
 		},
 		Proxy: ProxyConfig{
 			Enabled:        true,
-			RequireHTTPS:   true,  // Primary SSRF defense
-			BlockLoopback:  true,  // Block localhost access
-			BlockLinkLocal: true,  // Block cloud metadata (169.254.169.254)
-			BlockRFC1918:   true,  // Defense-in-depth
+			RequireHTTPS:   true, // Primary SSRF defense
+			BlockLoopback:  true, // Block localhost access
+			BlockLinkLocal: true, // Block cloud metadata (169.254.169.254)
+			BlockRFC1918:   true, // Defense-in-depth
 			BlockedHosts: []string{
 				"metadata.google.internal",
 			},
@@ -307,9 +307,9 @@ func defaultConfig() *Config {
 		OHTTP: OHTTPConfig{
 			Enabled:         false, // Opt-in feature
 			KeyID:           1,
-			IntegratedRelay: true,              // Default to integrated mode
-			MaxRequestSize:  1 << 20,           // 1 MB
-			CreateKey:       true,              // Auto-generate if missing
+			IntegratedRelay: true,    // Default to integrated mode
+			MaxRequestSize:  1 << 20, // 1 MB
+			CreateKey:       true,    // Auto-generate if missing
 		},
 	}
 }
