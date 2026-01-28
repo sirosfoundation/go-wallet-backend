@@ -32,6 +32,25 @@ var (
 	ErrTenantAccessDenied = errors.New("tenant user must use tenant-scoped login endpoint")
 )
 
+// TenantRedirectError indicates the user should be redirected to a different tenant
+type TenantRedirectError struct {
+	CorrectTenantID domain.TenantID
+	UserID          domain.UserID
+}
+
+func (e *TenantRedirectError) Error() string {
+	return fmt.Sprintf("user belongs to tenant %s, redirect required", e.CorrectTenantID)
+}
+
+// IsTenantRedirectError checks if an error is a TenantRedirectError
+func IsTenantRedirectError(err error) (*TenantRedirectError, bool) {
+	var redirectErr *TenantRedirectError
+	if errors.As(err, &redirectErr) {
+		return redirectErr, true
+	}
+	return nil, false
+}
+
 // WebAuthnService handles WebAuthn authentication
 type WebAuthnService struct {
 	store    storage.Store
@@ -576,41 +595,73 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, errors.New("user handle required for discoverable credentials")
 	}
 
-	// Try to decode tenant-scoped user handle (format: "tenantId:userId")
-	// For backward compatibility, fall back to treating handle as just userId
+	// Try to decode user ID from the user handle
+	// Note: With the new binary format (v1), we can't directly extract the tenant ID
+	// from its hash. We need to look up the user and check their tenant membership.
 	var userID domain.UserID
 	var tenantID domain.TenantID
-	if tid, uid, err := domain.DecodeUserHandle(parsedResponse.Response.UserHandle); err == nil {
-		tenantID = tid
+	userHandle := parsedResponse.Response.UserHandle
+
+	// Try v1 binary format first, then legacy string format
+	if uid, err := domain.UserIDFromHandle(userHandle); err == nil {
 		userID = uid
-		s.logger.Debug("Decoded tenant-scoped user handle",
-			zap.String("tenant_id", string(tenantID)),
+		s.logger.Debug("Decoded user ID from handle",
 			zap.String("user_id", userID.String()))
 	} else {
-		// Legacy user without tenant prefix
-		userID = domain.UserIDFromUserHandle(parsedResponse.Response.UserHandle)
-		tenantID = domain.DefaultTenantID
-		s.logger.Debug("Legacy user handle without tenant",
+		// Legacy user without proper format
+		userID = domain.UserIDFromUserHandle(userHandle)
+		s.logger.Debug("Legacy user handle without proper encoding",
 			zap.String("user_id", userID.String()))
 	}
 
-	// SECURITY: Global login endpoint only allows default tenant users.
-	// Users registered with non-default tenants must use the tenant-scoped
-	// login endpoint (/t/{tenantId}/user/login-webauthn-*).
-	// This enforces tenant isolation and prevents cross-tenant access.
-	if tenantID != domain.DefaultTenantID {
-		s.logger.Warn("Attempted global login with non-default tenant user",
-			zap.String("tenant_id", string(tenantID)),
-			zap.String("user_id", userID.String()))
-		return nil, ErrTenantAccessDenied
-	}
-
+	// Look up the user first to determine their tenant
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrUserNotFound
 		}
-		return nil, fmt.Errorf("failed to get user: %w", err)
+		return nil, fmt.Errorf("failed to retrieve user: %w", err)
+	}
+
+	// Check the user's tenant membership to determine their primary tenant
+	// This enables tenant discovery from the passkey credential
+	userTenants, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		s.logger.Warn("Failed to get user tenant memberships", zap.Error(err))
+		// Default to treating as default tenant user for backward compatibility
+		tenantID = domain.DefaultTenantID
+	} else if len(userTenants) == 0 {
+		// No memberships - treat as default tenant (legacy user)
+		tenantID = domain.DefaultTenantID
+	} else {
+		// Check if user belongs to default tenant
+		hasDefaultTenant := false
+		for _, tid := range userTenants {
+			if tid == domain.DefaultTenantID {
+				hasDefaultTenant = true
+				break
+			}
+		}
+		if hasDefaultTenant {
+			tenantID = domain.DefaultTenantID
+		} else {
+			// User only belongs to non-default tenants - they need to be redirected
+			// Return the correct tenant for redirect
+			tenantID = userTenants[0]
+		}
+	}
+
+	// If user belongs to a non-default tenant, return a redirect error
+	// so the frontend can redirect to the correct tenant login flow.
+	// This implements the "tenant discovery from passkey" requirement.
+	if tenantID != domain.DefaultTenantID {
+		s.logger.Info("User belongs to non-default tenant, redirect required",
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("user_id", userID.String()))
+		return nil, &TenantRedirectError{
+			CorrectTenantID: tenantID,
+			UserID:          userID,
+		}
 	}
 
 	// Find the credential
@@ -1325,25 +1376,17 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 		return nil, fmt.Errorf("failed to parse credential: %w", err)
 	}
 
-	// Decode and validate user handle
+	// Decode user ID from user handle
+	// The new binary format (v1) doesn't include recoverable tenant ID,
+	// so we validate tenant membership after looking up the user.
 	userHandle := parsedResponse.Response.UserHandle
-	handleTenantID, userID, err := domain.DecodeUserHandle(userHandle)
+	userID, err := domain.UserIDFromHandle(userHandle)
 	if err != nil {
 		// For backward compatibility, try treating the user handle as just a user ID
-		// This handles users registered before multi-tenancy
-		s.logger.Debug("User handle doesn't contain tenant prefix, treating as legacy user",
-			zap.String("user_handle", string(userHandle)))
+		s.logger.Debug("User handle decode failed, treating as legacy user",
+			zap.String("user_handle", string(userHandle)),
+			zap.Error(err))
 		userID = domain.UserIDFromUserHandle(userHandle)
-		handleTenantID = domain.DefaultTenantID
-	}
-
-	// Validate tenant from user handle matches the request tenant
-	if handleTenantID != tenantID {
-		s.logger.Warn("Tenant mismatch in user handle",
-			zap.String("expected_tenant", string(tenantID)),
-			zap.String("handle_tenant", string(handleTenantID)),
-			zap.String("user_id", userID.String()))
-		return nil, ErrTenantMismatch
 	}
 
 	// Look up user
@@ -1353,6 +1396,41 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 			return nil, ErrUserNotFound
 		}
 		return nil, fmt.Errorf("failed to retrieve user: %w", err)
+	}
+
+	// Get the user's actual tenant memberships for redirect support
+	userTenants, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		s.logger.Warn("Failed to get user tenant memberships", zap.Error(err))
+		userTenants = []domain.TenantID{}
+	}
+
+	// Verify the user is a member of the requested tenant
+	isMember := false
+	for _, tid := range userTenants {
+		if tid == tenantID {
+			isMember = true
+			break
+		}
+	}
+
+	if !isMember {
+		// User is not a member of the requested tenant.
+		// Return a redirect error with the correct tenant if available.
+		s.logger.Warn("User not a member of requested tenant",
+			zap.String("user_id", userID.String()),
+			zap.String("requested_tenant", string(tenantID)),
+			zap.Any("user_tenants", userTenants))
+
+		if len(userTenants) > 0 {
+			// Return redirect error with the user's actual tenant
+			return nil, &TenantRedirectError{
+				CorrectTenantID: userTenants[0],
+				UserID:          userID,
+			}
+		}
+		// User has no tenant memberships - this shouldn't happen normally
+		return nil, ErrTenantMismatch
 	}
 
 	// Find the credential

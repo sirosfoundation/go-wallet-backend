@@ -130,9 +130,24 @@ func TestEncodeUserHandle(t *testing.T) {
 
 	handle := EncodeUserHandle(tenantID, userID)
 
-	expected := "test-tenant:" + userID.String()
-	if string(handle) != expected {
-		t.Errorf("EncodeUserHandle() = %v, want %v", string(handle), expected)
+	// V1 binary format: 1 byte version + 8 bytes tenant hash + 16 bytes UUID = 25 bytes
+	if len(handle) != 25 {
+		t.Errorf("EncodeUserHandle() length = %d, want 25", len(handle))
+	}
+	if handle[0] != 0x01 {
+		t.Errorf("EncodeUserHandle() version byte = %d, want 1", handle[0])
+	}
+}
+
+func TestEncodeUserHandle_SizeConstraint(t *testing.T) {
+	// Test that even very long tenant IDs produce 25-byte handles (within WebAuthn's 64-byte limit)
+	longTenantID := TenantID("this-is-a-very-long-tenant-id-that-would-exceed-64-bytes-combined")
+	userID := NewUserID()
+
+	handle := EncodeUserHandle(longTenantID, userID)
+
+	if len(handle) != 25 {
+		t.Errorf("EncodeUserHandle() length = %d, want 25 (within 64-byte WebAuthn limit)", len(handle))
 	}
 }
 
@@ -145,21 +160,21 @@ func TestDecodeUserHandle(t *testing.T) {
 		wantErr      bool
 	}{
 		{
-			name:         "valid handle",
+			name:         "legacy string format with valid tenant",
 			handle:       []byte("test-tenant:550e8400-e29b-41d4-a716-446655440000"),
 			wantTenantID: "test-tenant",
 			wantUserID:   "550e8400-e29b-41d4-a716-446655440000",
 			wantErr:      false,
 		},
 		{
-			name:         "valid with default tenant",
+			name:         "legacy string format with default tenant",
 			handle:       []byte("default:550e8400-e29b-41d4-a716-446655440000"),
 			wantTenantID: "default",
 			wantUserID:   "550e8400-e29b-41d4-a716-446655440000",
 			wantErr:      false,
 		},
 		{
-			name:    "missing colon",
+			name:    "legacy string format missing colon",
 			handle:  []byte("no-colon-here"),
 			wantErr: true,
 		},
@@ -194,16 +209,62 @@ func TestEncodeDecodeUserHandle_RoundTrip(t *testing.T) {
 	userID := NewUserID()
 
 	handle := EncodeUserHandle(tenantID, userID)
-	gotTenantID, gotUserID, err := DecodeUserHandle(handle)
+	// V1 format returns empty tenant ID (can't reverse the hash)
+	// but the user ID should be preserved
+	_, gotUserID, err := DecodeUserHandle(handle)
 
 	if err != nil {
 		t.Fatalf("DecodeUserHandle() error = %v", err)
 	}
-	if gotTenantID != tenantID {
-		t.Errorf("Round trip tenantID = %v, want %v", gotTenantID, tenantID)
-	}
+	// Note: V1 binary format cannot recover tenant ID from its hash
+	// gotTenantID will be empty for v1 handles
 	if gotUserID.String() != userID.String() {
 		t.Errorf("Round trip userID = %v, want %v", gotUserID.String(), userID.String())
+	}
+}
+
+func TestComputeTenantHash(t *testing.T) {
+	// Same tenant should always produce the same hash
+	hash1 := ComputeTenantHash("test-tenant")
+	hash2 := ComputeTenantHash("test-tenant")
+	if len(hash1) != 8 || len(hash2) != 8 {
+		t.Errorf("ComputeTenantHash() length should be 8")
+	}
+	for i := range hash1 {
+		if hash1[i] != hash2[i] {
+			t.Errorf("ComputeTenantHash() should be deterministic")
+		}
+	}
+
+	// Different tenants should produce different hashes
+	hash3 := ComputeTenantHash("other-tenant")
+	same := true
+	for i := range hash1 {
+		if hash1[i] != hash3[i] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Errorf("ComputeTenantHash() should produce different hashes for different tenants")
+	}
+}
+
+func TestTenantHashFromHandle(t *testing.T) {
+	tenantID := TenantID("test-tenant")
+	userID := NewUserID()
+
+	handle := EncodeUserHandle(tenantID, userID)
+	hash, err := TenantHashFromHandle(handle)
+	if err != nil {
+		t.Fatalf("TenantHashFromHandle() error = %v", err)
+	}
+
+	expectedHash := ComputeTenantHash(tenantID)
+	for i := range hash {
+		if hash[i] != expectedHash[i] {
+			t.Errorf("TenantHashFromHandle() hash mismatch at byte %d", i)
+		}
 	}
 }
 

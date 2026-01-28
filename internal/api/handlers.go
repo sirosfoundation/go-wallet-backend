@@ -156,6 +156,21 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Error("Failed to finish WebAuthn login", zap.Error(err))
+
+		// Check for redirect error - user belongs to a different tenant
+		// This enables tenant discovery from the passkey credential
+		if redirectErr, ok := service.IsTenantRedirectError(err); ok {
+			h.logger.Info("Tenant redirect required from global login",
+				zap.String("correct_tenant", string(redirectErr.CorrectTenantID)),
+				zap.String("user_id", redirectErr.UserID.String()))
+			c.JSON(409, gin.H{
+				"error":           "Tenant redirect required",
+				"redirect_tenant": string(redirectErr.CorrectTenantID),
+				"user_id":         redirectErr.UserID.String(),
+			})
+			return
+		}
+
 		switch {
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{"error": "Challenge not found"})
@@ -310,6 +325,20 @@ func (h *Handlers) FinishTenantWebAuthnLogin(c *gin.Context) {
 		h.logger.Error("Failed to finish tenant WebAuthn login",
 			zap.Error(err),
 			zap.String("tenant_id", string(tenantID)))
+
+		// Check for redirect error - user belongs to a different tenant
+		if redirectErr, ok := service.IsTenantRedirectError(err); ok {
+			h.logger.Info("Tenant redirect required",
+				zap.String("correct_tenant", string(redirectErr.CorrectTenantID)),
+				zap.String("requested_tenant", string(tenantID)))
+			c.JSON(409, gin.H{
+				"error":           "Tenant mismatch - redirect required",
+				"redirect_tenant": string(redirectErr.CorrectTenantID),
+				"user_id":         redirectErr.UserID.String(),
+			})
+			return
+		}
+
 		switch {
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{"error": "Challenge not found"})
