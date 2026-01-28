@@ -23,13 +23,13 @@ import (
 )
 
 var (
-	ErrChallengeNotFound   = errors.New("challenge not found")
-	ErrChallengeExpired    = errors.New("challenge expired")
-	ErrUserNotFound        = errors.New("user not found")
-	ErrCredentialNotFound  = errors.New("credential not found")
-	ErrVerificationFailed  = errors.New("verification failed")
-	ErrTenantMismatch      = errors.New("tenant mismatch")
-	ErrTenantAccessDenied  = errors.New("tenant user must use tenant-scoped login endpoint")
+	ErrChallengeNotFound  = errors.New("challenge not found")
+	ErrChallengeExpired   = errors.New("challenge expired")
+	ErrUserNotFound       = errors.New("user not found")
+	ErrCredentialNotFound = errors.New("credential not found")
+	ErrVerificationFailed = errors.New("verification failed")
+	ErrTenantMismatch     = errors.New("tenant mismatch")
+	ErrTenantAccessDenied = errors.New("tenant user must use tenant-scoped login endpoint")
 )
 
 // WebAuthnService handles WebAuthn authentication
@@ -1373,10 +1373,11 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	waUser := &TenantWebAuthnUser{user: user, userHandle: domain.EncodeUserHandle(tenantID, userID)}
 	sessionData := webauthn.SessionData{
 		Challenge:            challenge.Challenge,
-		UserID:               waUser.WebAuthnID(),
+		RelyingPartyID:       s.cfg.Server.RPID,
 		AllowedCredentialIDs: [][]byte{},
 		Expires:              challenge.ExpiresAt,
 		UserVerification:     protocol.VerificationRequired,
+		// UserID intentionally left empty for discoverable login
 	}
 
 	// Verify credential
