@@ -119,10 +119,16 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 		enabled = *req.Enabled
 	}
 
+	// Default DisplayName to Name if not provided
+	displayName := req.DisplayName
+	if displayName == "" {
+		displayName = req.Name
+	}
+
 	tenant := &domain.Tenant{
 		ID:          tenantID,
 		Name:        req.Name,
-		DisplayName: req.DisplayName,
+		DisplayName: displayName,
 		Enabled:     enabled,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
