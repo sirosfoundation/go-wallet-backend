@@ -313,13 +313,14 @@ type FinishRegistrationRequest struct {
 
 // FinishRegistrationResponse contains the result of registration
 type FinishRegistrationResponse struct {
-	UUID         string                   `json:"uuid"`
-	Token        string                   `json:"appToken"`
-	DisplayName  string                   `json:"displayName"`
-	Username     string                   `json:"username,omitempty"`
-	PrivateData  taggedbinary.TaggedBytes `json:"privateData,omitempty"`
-	WebauthnRpId string                   `json:"webauthnRpId"`
-	TenantID     string                   `json:"tenantId,omitempty"`
+	UUID              string                   `json:"uuid"`
+	Token             string                   `json:"appToken"`
+	DisplayName       string                   `json:"displayName"`
+	Username          string                   `json:"username,omitempty"`
+	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
+	WebauthnRpId      string                   `json:"webauthnRpId"`
+	TenantID          string                   `json:"tenantId,omitempty"`
+	TenantDisplayName string                   `json:"tenantDisplayName,omitempty"`
 }
 
 // FinishRegistration completes WebAuthn registration
@@ -549,13 +550,14 @@ type FinishLoginRequest struct {
 
 // FinishLoginResponse contains the result of login
 type FinishLoginResponse struct {
-	UUID         string                   `json:"uuid"`
-	Token        string                   `json:"appToken"`
-	DisplayName  string                   `json:"displayName"`
-	Username     string                   `json:"username,omitempty"`
-	PrivateData  taggedbinary.TaggedBytes `json:"privateData,omitempty"`
-	WebauthnRpId string                   `json:"webauthnRpId"`
-	TenantID     string                   `json:"tenantId,omitempty"`
+	UUID              string                   `json:"uuid"`
+	Token             string                   `json:"appToken"`
+	DisplayName       string                   `json:"displayName"`
+	Username          string                   `json:"username,omitempty"`
+	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
+	WebauthnRpId      string                   `json:"webauthnRpId"`
+	TenantID          string                   `json:"tenantId,omitempty"`
+	TenantDisplayName string                   `json:"tenantDisplayName,omitempty"`
 }
 
 // FinishLogin completes WebAuthn authentication
@@ -1284,17 +1286,24 @@ func (s *WebAuthnService) FinishTenantRegistration(ctx context.Context, tenantID
 	// Clean up challenge
 	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
+	// Get tenant display name for the response
+	var tenantDisplayName string
+	if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
+		tenantDisplayName = tenant.DisplayName
+	}
+
 	s.logger.Info("Completed tenant registration",
 		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)))
 
 	return &FinishRegistrationResponse{
-		UUID:         userID.String(),
-		Token:        token,
-		DisplayName:  displayName,
-		PrivateData:  user.PrivateData,
-		WebauthnRpId: s.cfg.Server.RPID,
-		TenantID:     string(tenantID),
+		UUID:              userID.String(),
+		Token:             token,
+		DisplayName:       displayName,
+		PrivateData:       user.PrivateData,
+		WebauthnRpId:      s.cfg.Server.RPID,
+		TenantID:          string(tenantID),
+		TenantDisplayName: tenantDisplayName,
 	}, nil
 }
 
@@ -1477,6 +1486,12 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	// Clean up challenge
 	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
+	// Get tenant display name for the response
+	var tenantDisplayName string
+	if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
+		tenantDisplayName = tenant.DisplayName
+	}
+
 	s.logger.Info("Completed tenant login",
 		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)))
@@ -1487,12 +1502,13 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	}
 
 	return &FinishLoginResponse{
-		UUID:         userID.String(),
-		Token:        token,
-		DisplayName:  displayName,
-		PrivateData:  user.PrivateData,
-		WebauthnRpId: s.cfg.Server.RPID,
-		TenantID:     string(tenantID),
+		UUID:              userID.String(),
+		Token:             token,
+		DisplayName:       displayName,
+		PrivateData:       user.PrivateData,
+		WebauthnRpId:      s.cfg.Server.RPID,
+		TenantID:          string(tenantID),
+		TenantDisplayName: tenantDisplayName,
 	}, nil
 }
 
