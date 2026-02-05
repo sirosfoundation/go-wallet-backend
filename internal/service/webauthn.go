@@ -636,34 +636,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// No memberships - treat as default tenant (legacy user)
 		tenantID = domain.DefaultTenantID
 	} else {
-		// Check if user belongs to default tenant
-		hasDefaultTenant := false
-		for _, tid := range userTenants {
-			if tid == domain.DefaultTenantID {
-				hasDefaultTenant = true
-				break
-			}
-		}
-		if hasDefaultTenant {
-			tenantID = domain.DefaultTenantID
-		} else {
-			// User only belongs to non-default tenants - they need to be redirected
-			// Return the correct tenant for redirect
-			tenantID = userTenants[0]
-		}
-	}
-
-	// If user belongs to a non-default tenant, return a redirect error
-	// so the frontend can redirect to the correct tenant login flow.
-	// This implements the "tenant discovery from passkey" requirement.
-	if tenantID != domain.DefaultTenantID {
-		s.logger.Info("User belongs to non-default tenant, redirect required",
-			zap.String("tenant_id", string(tenantID)),
-			zap.String("user_id", userID.String()))
-		return nil, &TenantRedirectError{
-			CorrectTenantID: tenantID,
-			UserID:          userID,
-		}
+		// Use the first tenant membership as the user's primary tenant
+		// This enables tenant discovery from the passkey without requiring redirect
+		tenantID = userTenants[0]
 	}
 
 	// Find the credential
@@ -746,18 +721,27 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		username = *user.Username
 	}
 
+	// Get tenant display name for the response
+	var tenantDisplayName string
+	if tenantID != domain.DefaultTenantID {
+		if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
+			tenantDisplayName = tenant.DisplayName
+		}
+	}
+
 	s.logger.Info("User logged in via WebAuthn",
 		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)))
 
 	return &FinishLoginResponse{
-		UUID:         userID.String(),
-		Token:        token,
-		DisplayName:  displayName,
-		Username:     username,
-		PrivateData:  user.PrivateData,
-		WebauthnRpId: s.cfg.Server.RPID,
-		TenantID:     string(tenantID),
+		UUID:              userID.String(),
+		Token:             token,
+		DisplayName:       displayName,
+		Username:          username,
+		PrivateData:       user.PrivateData,
+		WebauthnRpId:      s.cfg.Server.RPID,
+		TenantID:          string(tenantID),
+		TenantDisplayName: tenantDisplayName,
 	}, nil
 }
 
