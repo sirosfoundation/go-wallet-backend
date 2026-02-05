@@ -296,14 +296,13 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 
 	// Tenant-scoped routes (with tenant path parameter)
 	// These routes require a valid tenant ID in the path
+	// Note: Registration uses the global endpoint with tenantId parameter instead
 	tenantRoutes := router.Group("/t/:tenantID")
 	tenantRoutes.Use(middleware.TenantPathMiddleware(store))
 	{
-		// Tenant-scoped WebAuthn registration/login (public)
+		// Tenant-scoped WebAuthn login (public) - kept for backwards compatibility
 		tenantUser := tenantRoutes.Group("/user")
 		{
-			tenantUser.POST("/register-webauthn-begin", handlers.StartTenantWebAuthnRegistration)
-			tenantUser.POST("/register-webauthn-finish", handlers.FinishTenantWebAuthnRegistration)
 			tenantUser.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
 			tenantUser.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
 		}
