@@ -67,7 +67,7 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 		return nil, nil, fmt.Errorf("URL is required")
 	}
 
-	method := req.Method
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	if method == "" {
 		method = "GET"
 	}
