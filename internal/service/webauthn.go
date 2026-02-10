@@ -108,7 +108,7 @@ func (u *WebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 	creds := make([]webauthn.Credential, 0, len(u.user.WebauthnCredentials))
 	for _, c := range u.user.WebauthnCredentials {
 		creds = append(creds, webauthn.Credential{
-			ID:              []byte(c.ID),
+			ID:              c.CredentialID, // Use raw bytes, not base64url string
 			PublicKey:       c.PublicKey,
 			AttestationType: c.AttestationType,
 			Transport:       parseTransports(c.Transport),
@@ -469,7 +469,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		PrivateData: req.PrivateData,
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
-				ID:              string(credential.ID),
+				ID:              base64.RawURLEncoding.EncodeToString(credential.ID),
 				CredentialID:    credential.ID,
 				PublicKey:       credential.PublicKey,
 				AttestationType: credential.AttestationType,
@@ -715,10 +715,11 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	}
 
 	// Find the credential
-	credentialID := parsedResponse.RawID
+	// Encode RawID to base64url to match the format used during credential storage
+	credentialID := base64.RawURLEncoding.EncodeToString(parsedResponse.RawID)
 	var matchedCred *domain.WebauthnCredential
 	for i, c := range user.WebauthnCredentials {
-		if c.ID == string(credentialID) {
+		if c.ID == credentialID {
 			matchedCred = &user.WebauthnCredentials[i]
 			break
 		}
@@ -1056,7 +1057,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	now := time.Now()
 	newCred := domain.WebauthnCredential{
-		ID:              string(credential.ID),
+		ID:              base64.RawURLEncoding.EncodeToString(credential.ID),
 		CredentialID:    credential.ID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: credential.AttestationType,
@@ -1088,7 +1089,8 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	s.logger.Info("Added WebAuthn credential to user", zap.String("user_id", userID.String()))
 
 	return &FinishAddCredentialResponse{
-		CredentialID:    string(credential.ID),
+		// Return base64url encoded ID to match the stored format
+		CredentialID:    base64.RawURLEncoding.EncodeToString(credential.ID),
 		PrivateDataETag: user.PrivateDataETag,
 	}, nil
 }
@@ -1257,7 +1259,8 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	}
 
 	// Find the credential
-	credentialID := string(parsedResponse.RawID)
+	// Encode RawID to base64url to match the format used during credential storage
+	credentialID := base64.RawURLEncoding.EncodeToString(parsedResponse.RawID)
 	var foundCred *domain.WebauthnCredential
 	for i := range user.WebauthnCredentials {
 		if user.WebauthnCredentials[i].ID == credentialID {
@@ -1354,7 +1357,7 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 	creds := make([]webauthn.Credential, len(u.user.WebauthnCredentials))
 	for i, c := range u.user.WebauthnCredentials {
 		creds[i] = webauthn.Credential{
-			ID:              []byte(c.ID),
+			ID:              c.CredentialID, // Use raw bytes, not base64url string
 			PublicKey:       c.PublicKey,
 			AttestationType: c.AttestationType,
 			Transport:       parseTransports(c.Transport),
