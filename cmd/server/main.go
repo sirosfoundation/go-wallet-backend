@@ -237,7 +237,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 			session.GET("/private-data", handlers.GetPrivateData)
 			session.POST("/private-data", handlers.UpdatePrivateData)
 
-			// Account deletion
+			// Account deletion - handle both /user/session and /user/session/
 			session.DELETE("/", handlers.DeleteUser)
 
 			// WebAuthn credential management for existing users
@@ -246,6 +246,9 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 			session.POST("/webauthn/credential/:id/rename", handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", handlers.DeleteWebAuthnCredential)
 		}
+		// Also register DELETE at /user/session (without trailing slash)
+		// This is needed because DELETE requests don't follow redirects
+		protected.DELETE("/user/session", handlers.DeleteUser)
 
 		// Storage routes
 		storageGroup := protected.Group("/storage")
@@ -305,6 +308,23 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		{
 			tenantUser.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
 			tenantUser.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
+		}
+
+		// Tenant-scoped protected routes (require authentication)
+		tenantProtected := tenantRoutes.Group("/")
+		tenantProtected.Use(middleware.AuthMiddleware(cfg, logger))
+		{
+			// Tenant-scoped issuer routes
+			tenantIssuer := tenantProtected.Group("/issuer")
+			{
+				tenantIssuer.GET("/all", handlers.GetAllIssuers)
+			}
+
+			// Tenant-scoped verifier routes
+			tenantVerifier := tenantProtected.Group("/verifier")
+			{
+				tenantVerifier.GET("/all", handlers.GetAllVerifiers)
+			}
 		}
 	}
 
