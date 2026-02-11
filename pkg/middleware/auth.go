@@ -118,9 +118,19 @@ func AuthMiddleware(cfg *config.Config, logger *zap.Logger) gin.HandlerFunc {
 		// Get did from claims
 		did, _ := claims["did"].(string)
 
+		// Get tenant_id from claims (required for security boundary)
+		// This is the authoritative source for tenant on authenticated requests
+		tenantID, _ := claims["tenant_id"].(string)
+		if tenantID == "" {
+			// For backward compatibility with older tokens, default to "default"
+			tenantID = "default"
+		}
+
 		c.Set("user_id", userID)
 		c.Set("did", did)
 		c.Set("token", tokenString)
+		c.Set("tenant_id", tenantID)      // Set tenant from JWT for security
+		c.Set("tenant_from_jwt", true)    // Flag to indicate this came from JWT (authoritative)
 
 		c.Next()
 	}

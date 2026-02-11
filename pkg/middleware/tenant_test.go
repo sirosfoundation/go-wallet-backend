@@ -205,7 +205,7 @@ func TestTenantMembershipMiddleware(t *testing.T) {
 }
 
 func TestGetTenantID(t *testing.T) {
-	t.Run("returns tenant ID when set", func(t *testing.T) {
+	t.Run("returns tenant ID when set as domain.TenantID", func(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
@@ -219,6 +219,23 @@ func TestGetTenantID(t *testing.T) {
 		}
 		if id != expectedID {
 			t.Errorf("Expected tenant ID %s, got %s", expectedID, id)
+		}
+	})
+
+	t.Run("returns tenant ID when set as string (from JWT)", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		
+		// JWT sets tenant_id as a string, not domain.TenantID
+		c.Set("tenant_id", "test-tenant-from-jwt")
+		
+		id, ok := GetTenantID(c)
+		if !ok {
+			t.Error("Expected GetTenantID to return true for string type")
+		}
+		if id != domain.TenantID("test-tenant-from-jwt") {
+			t.Errorf("Expected tenant ID test-tenant-from-jwt, got %s", id)
 		}
 	})
 

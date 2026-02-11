@@ -195,13 +195,23 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	// Initialize API handlers
 	handlers := api.NewHandlers(services, cfg, logger)
 
-	// Public routes (default tenant for backward compatibility)
-	public := router.Group("/")
+	// Root-level health/status endpoints (no tenant required)
+	router.GET("/status", handlers.Status)
+	router.GET("/health", handlers.Status)
+
+	// All tenant-scoped routes under /:tenantID
+	// Note: "default" is a valid tenant ID for the default tenant
+	// This allows load balancers/CDN to route based on the first path segment
+	tenantRoutes := router.Group("/:tenantID")
+	tenantRoutes.Use(middleware.TenantPathMiddleware(store))
 	{
-		public.GET("/status", handlers.Status)
+		// =========================================================================
+		// PUBLIC ROUTES (unauthenticated)
+		// For these routes, tenant comes from the path
+		// =========================================================================
 
 		// User authentication routes (no auth required)
-		user := public.Group("/user")
+		user := tenantRoutes.Group("/user")
 		{
 			user.POST("/register", handlers.RegisterUser)
 			user.POST("/login", handlers.LoginUser)
@@ -209,121 +219,96 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 			// WebAuthn routes (no auth required for initial registration/login)
 			user.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
 			user.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-			user.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-			user.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+			user.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
+			user.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
 		}
 
 		// Helper routes (some public)
-		public.GET("/helper/auth-check", handlers.AuthCheck)
-		public.POST("/helper/auth-check", handlers.AuthCheck)
+		tenantRoutes.GET("/helper/auth-check", handlers.AuthCheck)
+		tenantRoutes.POST("/helper/auth-check", handlers.AuthCheck)
 
 		// WebSocket for client-side keystore
 		// Auth is handled via appToken in the WebSocket handshake, not HTTP headers
-		public.GET("/ws/keystore", handlers.WebSocketKeystore)
-	}
+		tenantRoutes.GET("/ws/keystore", handlers.WebSocketKeystore)
 
-	// Protected routes (require authentication)
-	protected := router.Group("/")
-	protected.Use(middleware.AuthMiddleware(cfg, logger))
-	{
-		// User session routes (authenticated)
-		session := protected.Group("/user/session")
+		// =========================================================================
+		// PROTECTED ROUTES (authenticated)
+		// For these routes, tenant comes from the JWT token (security boundary).
+		// AuthMiddleware runs first and sets tenant_id from JWT.
+		// TenantPathMiddleware validates the path tenant but does NOT override the
+		// JWT tenant for security.
+		// =========================================================================
+		protected := tenantRoutes.Group("/")
+		protected.Use(middleware.AuthMiddleware(cfg, logger))
 		{
-			// Account info and settings
-			session.GET("/account-info", handlers.GetAccountInfo)
-			session.POST("/settings", handlers.UpdateSettings)
-
-			// Private data management
-			session.GET("/private-data", handlers.GetPrivateData)
-			session.POST("/private-data", handlers.UpdatePrivateData)
-
-			// Account deletion - handle both /user/session and /user/session/
-			session.DELETE("/", handlers.DeleteUser)
-
-			// WebAuthn credential management for existing users
-			session.POST("/webauthn/register-begin", handlers.StartAddWebAuthnCredential)
-			session.POST("/webauthn/register-finish", handlers.FinishAddWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/rename", handlers.RenameWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/delete", handlers.DeleteWebAuthnCredential)
-		}
-		// Also register DELETE at /user/session (without trailing slash)
-		// This is needed because DELETE requests don't follow redirects
-		protected.DELETE("/user/session", handlers.DeleteUser)
-
-		// Storage routes
-		storageGroup := protected.Group("/storage")
-		{
-			storageGroup.GET("/vc", handlers.GetAllCredentials)
-			storageGroup.POST("/vc", handlers.StoreCredential)
-			storageGroup.POST("/vc/update", handlers.UpdateCredential)
-			storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
-			storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
-
-			storageGroup.GET("/vp", handlers.GetAllPresentations)
-			storageGroup.POST("/vp", handlers.StorePresentation)
-			storageGroup.GET("/vp/:presentation_identifier", handlers.GetPresentationByIdentifier)
-		}
-
-		// Issuer routes
-		issuerGroup := protected.Group("/issuer")
-		{
-			issuerGroup.GET("/all", handlers.GetAllIssuers)
-			// TODO: Add OpenID4VCI endpoints
-		}
-
-		// Verifier routes
-		verifierGroup := protected.Group("/verifier")
-		{
-			verifierGroup.GET("/all", handlers.GetAllVerifiers)
-			// TODO: Add OpenID4VP endpoints
-		}
-
-		// Proxy routes
-		protected.POST("/proxy", handlers.ProxyRequest)
-
-		// Helper routes
-		protected.POST("/helper/get-cert", handlers.GetCertificate)
-
-		// Keystore routes
-		keystoreGroup := protected.Group("/keystore")
-		{
-			keystoreGroup.GET("/status", handlers.KeystoreStatus)
-		}
-
-		// Wallet provider routes
-		walletProvider := protected.Group("/wallet-provider")
-		{
-			walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
-		}
-	}
-
-	// Tenant-scoped routes (with tenant path parameter)
-	// These routes require a valid tenant ID in the path
-	// Note: Registration uses the global endpoint with tenantId parameter instead
-	tenantRoutes := router.Group("/t/:tenantID")
-	tenantRoutes.Use(middleware.TenantPathMiddleware(store))
-	{
-		// Tenant-scoped WebAuthn login (public) - kept for backwards compatibility
-		tenantUser := tenantRoutes.Group("/user")
-		{
-			tenantUser.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
-			tenantUser.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
-		}
-
-		// Tenant-scoped protected routes (require authentication)
-		tenantProtected := tenantRoutes.Group("/")
-		tenantProtected.Use(middleware.AuthMiddleware(cfg, logger))
-		{
-			// Tenant-scoped issuer routes
-			tenantIssuer := tenantProtected.Group("/issuer")
+			// User session routes (authenticated)
+			session := protected.Group("/user/session")
 			{
-				tenantIssuer.GET("/all", handlers.GetAllIssuers)
+				// Account info and settings
+				session.GET("/account-info", handlers.GetAccountInfo)
+				session.POST("/settings", handlers.UpdateSettings)
+
+				// Private data management
+				session.GET("/private-data", handlers.GetPrivateData)
+				session.POST("/private-data", handlers.UpdatePrivateData)
+
+				// Account deletion - handle both /user/session and /user/session/
+				session.DELETE("/", handlers.DeleteUser)
+
+				// WebAuthn credential management for existing users
+				session.POST("/webauthn/register-begin", handlers.StartAddWebAuthnCredential)
+				session.POST("/webauthn/register-finish", handlers.FinishAddWebAuthnCredential)
+				session.POST("/webauthn/credential/:id/rename", handlers.RenameWebAuthnCredential)
+				session.POST("/webauthn/credential/:id/delete", handlers.DeleteWebAuthnCredential)
+			}
+			// Also register DELETE at /user/session (without trailing slash)
+			// This is needed because DELETE requests don't follow redirects
+			protected.DELETE("/user/session", handlers.DeleteUser)
+
+			// Storage routes
+			storageGroup := protected.Group("/storage")
+			{
+				storageGroup.GET("/vc", handlers.GetAllCredentials)
+				storageGroup.POST("/vc", handlers.StoreCredential)
+				storageGroup.POST("/vc/update", handlers.UpdateCredential)
+				storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
+				storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
+
+				storageGroup.GET("/vp", handlers.GetAllPresentations)
+				storageGroup.POST("/vp", handlers.StorePresentation)
+				storageGroup.GET("/vp/:presentation_identifier", handlers.GetPresentationByIdentifier)
 			}
 
-			// Tenant-scoped verifier routes
-			tenantVerifier := tenantProtected.Group("/verifier")
+			// Issuer routes
+			issuerGroup := protected.Group("/issuer")
 			{
-				tenantVerifier.GET("/all", handlers.GetAllVerifiers)
+				issuerGroup.GET("/all", handlers.GetAllIssuers)
+				// TODO: Add OpenID4VCI endpoints
+			}
+
+			// Verifier routes
+			verifierGroup := protected.Group("/verifier")
+			{
+				verifierGroup.GET("/all", handlers.GetAllVerifiers)
+				// TODO: Add OpenID4VP endpoints
+			}
+
+			// Proxy routes
+			protected.POST("/proxy", handlers.ProxyRequest)
+
+			// Helper routes
+			protected.POST("/helper/get-cert", handlers.GetCertificate)
+
+			// Keystore routes
+			keystoreGroup := protected.Group("/keystore")
+			{
+				keystoreGroup.GET("/status", handlers.KeystoreStatus)
+			}
+
+			// Wallet provider routes
+			walletProvider := protected.Group("/wallet-provider")
+			{
+				walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
 			}
 		}
 	}

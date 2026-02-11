@@ -426,12 +426,12 @@ func TestHandlers_KeyAttestation_InvalidRequest(t *testing.T) {
 var _ = context.Background
 var _ = uuid.New
 
-// Test tenant-scoped WebAuthn registration - WebAuthn not available
-func TestHandlers_StartTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
+// Test tenant-scoped WebAuthn registration - uses StartWebAuthnRegistration (tenant from path)
+func TestHandlers_StartWebAuthnRegistration_NotAvailable(t *testing.T) {
 	handlers, router := setupTestHandlers(t)
 	// Note: WebAuthn is nil when not properly configured
 	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/start", handlers.StartTenantWebAuthnRegistration)
+	router.POST("/tenant/webauthn/register/start", handlers.StartWebAuthnRegistration)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/start", strings.NewReader(`{}`))
@@ -443,10 +443,10 @@ func TestHandlers_StartTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
 	}
 }
 
-func TestHandlers_FinishTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
+func TestHandlers_FinishWebAuthnRegistration_NotAvailable(t *testing.T) {
 	handlers, router := setupTestHandlers(t)
 	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/finish", handlers.FinishTenantWebAuthnRegistration)
+	router.POST("/tenant/webauthn/register/finish", handlers.FinishWebAuthnRegistration)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/finish", strings.NewReader(`{}`))

@@ -195,7 +195,7 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("successful registration start", func(t *testing.T) {
-		resp, err := svc.BeginRegistration(ctx, "Test User")
+		resp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Test User"})
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -223,7 +223,7 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 	})
 
 	t.Run("registration with empty display name", func(t *testing.T) {
-		resp, err := svc.BeginRegistration(ctx, "")
+		resp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{})
 		if err != nil {
 			t.Fatalf("Expected no error, got %v", err)
 		}
@@ -333,7 +333,7 @@ func TestWebAuthnService_ChallengeExpiration(t *testing.T) {
 
 	t.Run("challenge expires after timeout", func(t *testing.T) {
 		// Start registration
-		resp, err := svc.BeginRegistration(ctx, "Test User")
+		resp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Test User"})
 		if err != nil {
 			t.Fatalf("Failed to begin registration: %v", err)
 		}
@@ -640,7 +640,7 @@ func TestFullRegistrationFlow(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// Step 1: Begin registration
-	beginResp, err := setup.service.BeginRegistration(setup.ctx, "Test User")
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "Test User"})
 	require.NoError(t, err)
 
 	// Step 2: Parse attestation options with virtualwebauthn
@@ -693,7 +693,7 @@ func TestFullRegistrationFlowWithRSAKey(t *testing.T) {
 	rsaCredential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeRSA)
 
 	// Begin registration
-	beginResp, err := setup.service.BeginRegistration(setup.ctx, "RSA User")
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "RSA User"})
 	require.NoError(t, err)
 
 	// Parse attestation options (virtualwebauthn supports tagged binary format)
@@ -732,7 +732,7 @@ func TestFullLoginFlow(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// First, register a user
-	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, "Login Test User")
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "Login Test User"})
 	require.NoError(t, err)
 
 	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
@@ -954,7 +954,7 @@ func TestFullAddCredentialFlow(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 
 	// First, register a user with initial credential
-	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, "Add Cred Test User")
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "Add Cred Test User"})
 	require.NoError(t, err)
 
 	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
@@ -1040,7 +1040,7 @@ func TestGenerateToken(t *testing.T) {
 		DID:  did,
 	}
 
-	token, err := svc.generateToken(user)
+	token, err := svc.generateToken(user, domain.DefaultTenantID)
 	require.NoError(t, err)
 	assert.NotEmpty(t, token)
 
@@ -1056,7 +1056,7 @@ func TestGenerateToken(t *testing.T) {
 func TestPublicKeyCredentialCreationOptions_JSONStructure(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 
-	resp, err := setup.service.BeginRegistration(setup.ctx, "Test User")
+	resp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "Test User"})
 	require.NoError(t, err)
 
 	// Verify JSON structure matches expected format
