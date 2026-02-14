@@ -186,7 +186,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"}, // TODO: Make configurable
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match"},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match", "X-Tenant-ID"},
 		ExposeHeaders:    []string{"X-Private-Data-ETag"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
@@ -201,7 +201,10 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		public.GET("/status", handlers.Status)
 
 		// User authentication routes (no auth required)
+		// TenantHeaderMiddleware validates the X-Tenant-ID header
+		// and sets tenant context for registration endpoints
 		user := public.Group("/user")
+		user.Use(middleware.TenantHeaderMiddleware(store))
 		{
 			user.POST("/register", handlers.RegisterUser)
 			user.POST("/login", handlers.LoginUser)

@@ -7,7 +7,48 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// TenantPathMiddleware extracts the tenant from URL path parameter and validates it
+// TenantHeaderMiddleware extracts the tenant from X-Tenant-ID header and validates it.
+// This is used for unauthenticated requests where tenant context is needed (e.g., login begin).
+// For authenticated requests, the JWT tenant_id claim is authoritative.
+func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tenantIDStr := c.GetHeader("X-Tenant-ID")
+		if tenantIDStr == "" {
+			// Default to "default" tenant for backwards compatibility
+			tenantIDStr = "default"
+		}
+
+		tenantID := domain.TenantID(tenantIDStr)
+
+		// Validate tenant exists
+		tenant, err := store.Tenants().GetByID(c.Request.Context(), tenantID)
+		if err != nil {
+			if err == storage.ErrNotFound {
+				c.JSON(404, gin.H{"error": "tenant not found"})
+			} else {
+				c.JSON(500, gin.H{"error": "failed to lookup tenant"})
+			}
+			c.Abort()
+			return
+		}
+
+		// Validate tenant is enabled
+		if !tenant.Enabled {
+			c.JSON(403, gin.H{"error": "tenant is disabled"})
+			c.Abort()
+			return
+		}
+
+		// Set tenant context (can be overridden by auth middleware if JWT has tenant_id)
+		c.Set("tenant_id", tenantID)
+		c.Set("tenant", tenant)
+		c.Next()
+	}
+}
+
+// TenantPathMiddleware extracts the tenant from URL path parameter and validates it.
+// Deprecated: Use TenantHeaderMiddleware for new code. This is kept for backwards compatibility
+// with clients that still use path-based tenant routing (/t/{tenantID}/...).
 func TenantPathMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenantIDStr := c.Param("tenantID")
@@ -98,17 +139,22 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 	}
 }
 
-// GetTenantID extracts tenant ID from gin context
+// GetTenantID extracts tenant ID from gin context.
+// Handles both domain.TenantID (from header middleware) and string (from JWT auth).
 func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantID, exists := c.Get("tenant_id")
 	if !exists {
 		return "", false
 	}
-	tid, ok := tenantID.(domain.TenantID)
-	if !ok {
-		return "", false
+	// Handle domain.TenantID type (from header/path middleware)
+	if tid, ok := tenantID.(domain.TenantID); ok {
+		return tid, true
 	}
-	return tid, true
+	// Handle string type (from JWT auth)
+	if tidStr, ok := tenantID.(string); ok {
+		return domain.TenantID(tidStr), true
+	}
+	return "", false
 }
 
 // GetTenant extracts tenant from gin context
