@@ -227,7 +227,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 
 	// Protected routes (require authentication)
 	protected := router.Group("/")
-	protected.Use(middleware.AuthMiddleware(cfg, logger))
+	protected.Use(middleware.AuthMiddleware(cfg, store, logger))
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")

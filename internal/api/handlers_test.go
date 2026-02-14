@@ -426,67 +426,10 @@ func TestHandlers_KeyAttestation_InvalidRequest(t *testing.T) {
 var _ = context.Background
 var _ = uuid.New
 
-// Test tenant-scoped WebAuthn registration - WebAuthn not available
-func TestHandlers_StartTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	// Note: WebAuthn is nil when not properly configured
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/start", handlers.StartTenantWebAuthnRegistration)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/start", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
-func TestHandlers_FinishTenantWebAuthnRegistration_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/finish", handlers.FinishTenantWebAuthnRegistration)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/finish", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
-func TestHandlers_StartTenantWebAuthnLogin_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/login/start", handlers.StartTenantWebAuthnLogin)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/start", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
-func TestHandlers_FinishTenantWebAuthnLogin_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/login/finish", handlers.FinishTenantWebAuthnLogin)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/finish", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
+// Note: Tests for deprecated tenant-scoped WebAuthn handlers (StartTenantWebAuthnRegistration,
+// FinishTenantWebAuthnRegistration, etc.) have been removed. The handlers themselves are marked
+// as deprecated and no longer have routes. See docs/adr/011-multi-tenancy.md for the new
+// header-based tenant routing design.
 
 // Test credential storage handlers with authentication context
 func TestHandlers_StoreCredential_Unauthorized(t *testing.T) {

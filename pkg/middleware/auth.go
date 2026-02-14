@@ -10,6 +10,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -59,8 +61,10 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// AuthMiddleware validates JWT tokens and sets user context
-func AuthMiddleware(cfg *config.Config, logger *zap.Logger) gin.HandlerFunc {
+// AuthMiddleware validates JWT tokens and sets user context.
+// It validates the tenant from the JWT exists and is enabled.
+// The JWT tenant_id claim is authoritative; X-Tenant-ID header is logged if mismatched.
+func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -124,9 +128,46 @@ func AuthMiddleware(cfg *config.Config, logger *zap.Logger) gin.HandlerFunc {
 			tenantID = "default"
 		}
 
+		// Validate tenant exists and is enabled
+		tenant, err := store.Tenants().GetByID(c.Request.Context(), domain.TenantID(tenantID))
+		if err != nil {
+			if err == storage.ErrNotFound {
+				logger.Warn("JWT contains invalid tenant_id",
+					zap.String("tenant_id", tenantID),
+					zap.String("user_id", userID))
+				c.JSON(401, gin.H{"error": "Invalid tenant in token"})
+			} else {
+				logger.Error("Failed to lookup tenant from JWT", zap.Error(err))
+				c.JSON(500, gin.H{"error": "Failed to validate tenant"})
+			}
+			c.Abort()
+			return
+		}
+
+		if !tenant.Enabled {
+			logger.Warn("JWT tenant is disabled",
+				zap.String("tenant_id", tenantID),
+				zap.String("user_id", userID))
+			c.JSON(403, gin.H{"error": "Tenant is disabled"})
+			c.Abort()
+			return
+		}
+
+		// Check X-Tenant-ID header against JWT tenant_id (JWT is authoritative)
+		headerTenantID := c.GetHeader("X-Tenant-ID")
+		if headerTenantID != "" && headerTenantID != tenantID {
+			logger.Warn("X-Tenant-ID header does not match JWT tenant_id",
+				zap.String("header_tenant", headerTenantID),
+				zap.String("jwt_tenant", tenantID),
+				zap.String("user_id", userID),
+				zap.String("path", c.Request.URL.Path))
+			// JWT is authoritative - continue with JWT tenant but log the mismatch
+		}
+
 		c.Set("user_id", userID)
 		c.Set("did", did)
 		c.Set("tenant_id", tenantID)
+		c.Set("tenant", tenant)
 		c.Set("token", tokenString)
 
 		c.Next()

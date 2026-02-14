@@ -214,17 +214,27 @@ The `X-Tenant-ID` header can theoretically be spoofed, but this has minimal secu
 
 ### Frontend Changes
 
-1. **`src/api/index.ts`**: Add `X-Tenant-ID` header to all requests
-2. **`src/lib/tenant.ts`**: Remove `buildTenantApiPath()` path prefixing (or make it return path unchanged)
-3. **`src/config.ts`**: Use static `VITE_WALLET_BACKEND_URL` (load balancer handles tenant routing)
+1. **`src/api/index.ts`**: Add `X-Tenant-ID` header to all requests ✅
+2. **`src/lib/tenant.ts`**: Remove `buildTenantApiPath()` path prefixing (or make it return path unchanged) ✅
+3. **`src/config.ts`**: Use static `VITE_WALLET_BACKEND_URL` (load balancer handles tenant routing) ✅
+4. **`src/pages/Login/Login.tsx`**: Fixed tenant discovery redirect to use `/id/:tenantId/*` route pattern ✅
 
 ### Backend Changes
 
-1. **Middleware**: Read `X-Tenant-ID` header for unauthenticated requests
-2. **JWT**: Include `tenant_id` claim (already implemented)
-3. **Auth middleware**: Validate JWT tenant matches header (if both present)
-4. **CORS**: Allow `X-Tenant-ID` header
-5. **Routes**: Remove path-based tenant prefix (routes become flat)
+1. **TenantHeaderMiddleware**: Reads `X-Tenant-ID` header for unauthenticated requests, validates tenant exists and is enabled ✅
+2. **JWT**: Includes `tenant_id` claim in token generation ✅
+3. **AuthMiddleware**: Validates JWT tenant exists and is enabled; logs warning if X-Tenant-ID header mismatches JWT (JWT is authoritative) ✅
+4. **CORS**: Allows `X-Tenant-ID` header ✅
+5. **Routes**: Removed path-based tenant prefix `/t/:tenantID/...` routes ✅
+
+### Security Guarantees
+
+| Request Type | Tenant Source | Validation |
+|--------------|---------------|------------|
+| Unauthenticated | `X-Tenant-ID` header | Validated against store (exists + enabled) |
+| Authenticated | JWT `tenant_id` claim | Validated against store (exists + enabled) |
+
+If X-Tenant-ID header is present on authenticated requests and differs from JWT tenant_id, the mismatch is logged but JWT is authoritative.
 
 ### Environment Variables
 
@@ -234,10 +244,12 @@ The `X-Tenant-ID` header can theoretically be spoofed, but this has minimal secu
 
 ## Migration Path
 
-1. **Phase 1**: Add `X-Tenant-ID` header support to frontend and backend (alongside existing behavior)
-2. **Phase 2**: Backend accepts both header and path-based tenant (transition period)
-3. **Phase 3**: Remove path-based tenant routing from backend
-4. **Phase 4**: Remove `buildTenantApiPath()` path modification from frontend
+1. **Phase 1**: Add `X-Tenant-ID` header support to frontend and backend (alongside existing behavior) ✅
+2. **Phase 2**: Backend accepts both header and path-based tenant (transition period) ✅
+3. **Phase 3**: Remove path-based tenant routing from backend ✅
+4. **Phase 4**: Remove `buildTenantApiPath()` path modification from frontend ✅
+
+**Status**: Core multi-tenancy implementation complete. WebSocket tenant-awareness (Appendix C) deferred.
 
 ## Open Questions
 
