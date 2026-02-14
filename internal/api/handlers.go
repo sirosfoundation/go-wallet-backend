@@ -201,8 +201,12 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 }
 
 // Tenant-scoped WebAuthn handlers
+// Deprecated: These handlers were used for path-based tenant routing (/t/{tenantID}/...).
+// Use the global handlers with X-Tenant-ID header instead.
+// See docs/adr/011-multi-tenancy.md for the new design.
 
 // StartTenantWebAuthnLogin begins WebAuthn login for a specific tenant
+// Deprecated: Use StartWebAuthnLogin with X-Tenant-ID header instead.
 func (h *Handlers) StartTenantWebAuthnLogin(c *gin.Context) {
 	if h.services.WebAuthn == nil {
 		c.JSON(503, gin.H{"error": "WebAuthn not available"})
@@ -228,6 +232,7 @@ func (h *Handlers) StartTenantWebAuthnLogin(c *gin.Context) {
 }
 
 // FinishTenantWebAuthnLogin completes WebAuthn login for a specific tenant
+// Deprecated: Use FinishWebAuthnLogin with X-Tenant-ID header instead.
 func (h *Handlers) FinishTenantWebAuthnLogin(c *gin.Context) {
 	if h.services.WebAuthn == nil {
 		c.JSON(503, gin.H{"error": "WebAuthn not available"})

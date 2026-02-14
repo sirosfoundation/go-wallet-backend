@@ -300,36 +300,10 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		}
 	}
 
-	// Tenant-scoped routes (with tenant path parameter)
-	// These routes require a valid tenant ID in the path
-	// Note: Registration uses the global endpoint with tenantId parameter instead
-	tenantRoutes := router.Group("/t/:tenantID")
-	tenantRoutes.Use(middleware.TenantPathMiddleware(store))
-	{
-		// Tenant-scoped WebAuthn login (public) - kept for backwards compatibility
-		tenantUser := tenantRoutes.Group("/user")
-		{
-			tenantUser.POST("/login-webauthn-begin", handlers.StartTenantWebAuthnLogin)
-			tenantUser.POST("/login-webauthn-finish", handlers.FinishTenantWebAuthnLogin)
-		}
-
-		// Tenant-scoped protected routes (require authentication)
-		tenantProtected := tenantRoutes.Group("/")
-		tenantProtected.Use(middleware.AuthMiddleware(cfg, logger))
-		{
-			// Tenant-scoped issuer routes
-			tenantIssuer := tenantProtected.Group("/issuer")
-			{
-				tenantIssuer.GET("/all", handlers.GetAllIssuers)
-			}
-
-			// Tenant-scoped verifier routes
-			tenantVerifier := tenantProtected.Group("/verifier")
-			{
-				tenantVerifier.GET("/all", handlers.GetAllVerifiers)
-			}
-		}
-	}
+	// Note: Path-based tenant routes (/t/:tenantID/...) have been removed.
+	// Tenant routing now uses the X-Tenant-ID header for unauthenticated requests
+	// and the JWT tenant_id claim for authenticated requests.
+	// See docs/adr/011-multi-tenancy.md for the design rationale.
 
 	return router
 }
