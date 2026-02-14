@@ -415,8 +415,8 @@ func (h *TestHarness) CreateTestUser(displayName string) *TestUser {
 		h.T.Fatalf("Failed to create test user: %v", err)
 	}
 
-	// Generate token using UserService
-	token, err := h.Services.User.GenerateTokenForUser(user)
+	// Generate token using UserService (default tenant for test users)
+	token, err := h.Services.User.GenerateTokenForUser(user, domain.DefaultTenantID)
 	if err != nil {
 		h.T.Fatalf("Failed to generate token for test user: %v", err)
 	}
@@ -476,8 +476,8 @@ func (h *TestHarness) CreateTestUserWithCredentials(displayName string) *TestUse
 		h.T.Fatalf("Failed to create test user with credentials: %v", err)
 	}
 
-	// Generate token using UserService
-	token, err := h.Services.User.GenerateTokenForUser(user)
+	// Generate token using UserService (default tenant for test users)
+	token, err := h.Services.User.GenerateTokenForUser(user, domain.DefaultTenantID)
 	if err != nil {
 		h.T.Fatalf("Failed to generate token for test user: %v", err)
 	}

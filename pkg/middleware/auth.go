@@ -118,8 +118,15 @@ func AuthMiddleware(cfg *config.Config, logger *zap.Logger) gin.HandlerFunc {
 		// Get did from claims
 		did, _ := claims["did"].(string)
 
+		// Get tenant_id from claims (defaults to "default" for backward compatibility)
+		tenantID, _ := claims["tenant_id"].(string)
+		if tenantID == "" {
+			tenantID = "default"
+		}
+
 		c.Set("user_id", userID)
 		c.Set("did", did)
+		c.Set("tenant_id", tenantID)
 		c.Set("token", tokenString)
 
 		c.Next()

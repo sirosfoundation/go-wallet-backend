@@ -1040,7 +1040,7 @@ func TestGenerateToken(t *testing.T) {
 		DID:  did,
 	}
 
-	token, err := svc.generateToken(user)
+	token, err := svc.generateToken(user, domain.DefaultTenantID)
 	require.NoError(t, err)
 	assert.NotEmpty(t, token)
 

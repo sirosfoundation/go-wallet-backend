@@ -108,8 +108,8 @@ func (s *UserService) Login(ctx context.Context, username, password string) (*do
 		return nil, "", ErrInvalidCredentials
 	}
 
-	// Generate JWT token
-	token, err := s.generateToken(user)
+	// Generate JWT token (default tenant for deprecated password login)
+	token, err := s.generateToken(user, domain.DefaultTenantID)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate token: %w", err)
 	}
@@ -147,13 +147,19 @@ func (s *UserService) ValidateToken(tokenString string) (domain.UserID, error) {
 	return domain.UserID{}, errors.New("invalid token")
 }
 
-func (s *UserService) generateToken(user *domain.User) (string, error) {
+func (s *UserService) generateToken(user *domain.User, tenantID domain.TenantID) (string, error) {
+	// Default to "default" tenant for backward compatibility
+	tid := string(tenantID)
+	if tid == "" {
+		tid = string(domain.DefaultTenantID)
+	}
 	claims := jwt.MapClaims{
-		"user_id": user.UUID.String(),
-		"did":     user.DID,
-		"iss":     s.cfg.JWT.Issuer,
-		"exp":     time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
-		"iat":     time.Now().Unix(),
+		"user_id":   user.UUID.String(),
+		"did":       user.DID,
+		"tenant_id": tid,
+		"iss":       s.cfg.JWT.Issuer,
+		"exp":       time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
+		"iat":       time.Now().Unix(),
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -161,8 +167,9 @@ func (s *UserService) generateToken(user *domain.User) (string, error) {
 }
 
 // GenerateTokenForUser generates a JWT token for a user (used after WebAuthn auth)
-func (s *UserService) GenerateTokenForUser(user *domain.User) (string, error) {
-	return s.generateToken(user)
+// The tenantID is included in the JWT claims for tenant-scoped authorization
+func (s *UserService) GenerateTokenForUser(user *domain.User, tenantID domain.TenantID) (string, error) {
+	return s.generateToken(user, tenantID)
 }
 
 // GetPrivateData retrieves user's private data

@@ -519,8 +519,13 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		}
 	}
 
-	// Generate JWT token
-	token, err := s.generateToken(user)
+	// Generate JWT token with tenant_id claim
+	// Use 'default' tenant if no tenant specified for backward compatibility
+	tokenTenantID := tenantID
+	if tokenTenantID == "" {
+		tokenTenantID = domain.DefaultTenantID
+	}
+	token, err := s.generateToken(user, tokenTenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
@@ -779,8 +784,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// Don't fail login for this
 	}
 
-	// Generate JWT token
-	token, err := s.generateToken(user)
+	// Generate JWT token with tenant_id claim
+	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
@@ -819,13 +824,14 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	}, nil
 }
 
-func (s *WebAuthnService) generateToken(user *domain.User) (string, error) {
+func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.TenantID) (string, error) {
 	claims := jwt.MapClaims{
-		"user_id": user.UUID.String(),
-		"did":     user.DID,
-		"iat":     time.Now().Unix(),
-		"exp":     time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
-		"iss":     s.cfg.JWT.Issuer,
+		"user_id":   user.UUID.String(),
+		"did":       user.DID,
+		"tenant_id": string(tenantID),
+		"iat":       time.Now().Unix(),
+		"exp":       time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
+		"iss":       s.cfg.JWT.Issuer,
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -1294,8 +1300,8 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 		return nil, ErrVerificationFailed
 	}
 
-	// Generate token
-	token, err := s.generateToken(user)
+	// Generate token with tenant_id claim
+	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}

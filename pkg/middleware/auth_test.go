@@ -44,6 +44,16 @@ func createExpiredToken(secret string, userID string) string {
 	return tokenString
 }
 
+func createTokenWithTenantID(secret string, userID string, tenantID string) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   userID,
+		"tenant_id": tenantID,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, _ := token.SignedString([]byte(secret))
+	return tokenString
+}
+
 // Helper function to create a test router with auth middleware and a success handler
 func createTestRouter(cfg *config.Config, logger *zap.Logger) *gin.Engine {
 	router := gin.New()
@@ -161,6 +171,73 @@ func TestAuthMiddleware_WrongSecret(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestAuthMiddleware_ExtractsTenantID(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+
+	// Create a router that returns the tenant_id from context
+	router := gin.New()
+	router.Use(AuthMiddleware(cfg, logger))
+	router.GET("/test", func(c *gin.Context) {
+		tenantID, exists := c.Get("tenant_id")
+		if !exists {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant_id not found"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"tenant_id": tenantID})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+createTokenWithTenantID(secret, "user-123", "test-tenant"))
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+	}
+
+	// Verify the tenant_id was extracted correctly
+	expected := `{"tenant_id":"test-tenant"}`
+	if w.Body.String() != expected {
+		t.Errorf("Expected body %s, got %s", expected, w.Body.String())
+	}
+}
+
+func TestAuthMiddleware_DefaultsTenantIDWhenMissing(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+
+	// Create a router that returns the tenant_id from context
+	router := gin.New()
+	router.Use(AuthMiddleware(cfg, logger))
+	router.GET("/test", func(c *gin.Context) {
+		tenantID, exists := c.Get("tenant_id")
+		if !exists {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant_id not found"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"tenant_id": tenantID})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	// Use a token without tenant_id
+	req.Header.Set("Authorization", "Bearer "+createValidToken(secret, "user-123"))
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
+	}
+
+	// Verify the tenant_id defaults to "default"
+	expected := `{"tenant_id":"default"}`
+	if w.Body.String() != expected {
+		t.Errorf("Expected body %s, got %s", expected, w.Body.String())
 	}
 }
 

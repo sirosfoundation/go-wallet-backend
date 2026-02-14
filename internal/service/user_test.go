@@ -542,8 +542,8 @@ func TestUserService_GenerateTokenForUser(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	// Generate token directly
-	token, err := service.GenerateTokenForUser(user)
+	// Generate token directly (with default tenant)
+	token, err := service.GenerateTokenForUser(user, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("GenerateTokenForUser() error = %v", err)
 	}
