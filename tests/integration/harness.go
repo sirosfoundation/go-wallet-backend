@@ -104,7 +104,7 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	// Setup router
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
-	setupRoutes(h.Router, handlers, h.Config, logger)
+	setupRoutes(h.Router, handlers, h.Config, h.Storage, logger)
 
 	// Create test server
 	h.Server = httptest.NewServer(h.Router)
@@ -119,9 +119,9 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 }
 
 // setupRoutes configures all API routes (mirrors the main server setup)
-func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, logger *zap.Logger) {
+func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store storage.Store, logger *zap.Logger) {
 	// Create auth middleware
-	auth := middleware.AuthMiddleware(cfg, logger)
+	auth := middleware.AuthMiddleware(cfg, store, logger)
 
 	// Health/status (public)
 	r.GET("/status", h.Status)

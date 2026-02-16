@@ -62,7 +62,7 @@ func (h *Handlers) LoginUser(c *gin.Context) {
 // WebAuthn handlers
 
 // StartWebAuthnRegistration begins the WebAuthn registration process
-// Tenant is taken from the URL path (set by TenantPathMiddleware)
+// Tenant is taken from X-Tenant-ID header (set by TenantHeaderMiddleware)
 func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 	if h.services.WebAuthn == nil {
 		c.JSON(503, gin.H{"error": "WebAuthn not available"})
@@ -75,7 +75,7 @@ func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 		req = service.BeginRegistrationRequest{}
 	}
 
-	// Get tenant from path (set by TenantPathMiddleware for this unauthenticated endpoint)
+	// Get tenant from header (set by TenantHeaderMiddleware for this unauthenticated endpoint)
 	tenantID, _ := h.getTenantID(c)
 	req.TenantID = string(tenantID)
 
@@ -314,7 +314,7 @@ func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 
 // getTenantID retrieves the tenant ID from context.
 // For authenticated requests, this comes from the JWT token (security boundary).
-// For unauthenticated requests, this comes from the path.
+// For unauthenticated requests, this comes from X-Tenant-ID header.
 // Handles both string (from JWT via AuthMiddleware) and domain.TenantID types.
 func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantID, exists := c.Get("tenant_id")
@@ -328,7 +328,7 @@ func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 		return domain.TenantID(tidStr), true
 	}
 
-	// Handle domain.TenantID type (from path via TenantPathMiddleware)
+	// Handle domain.TenantID type (from header via TenantHeaderMiddleware)
 	if tid, ok := tenantID.(domain.TenantID); ok {
 		return tid, true
 	}

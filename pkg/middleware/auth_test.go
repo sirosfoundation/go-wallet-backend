@@ -10,6 +10,9 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -45,9 +48,9 @@ func createExpiredToken(secret string, userID string) string {
 }
 
 // Helper function to create a test router with auth middleware and a success handler
-func createTestRouter(cfg *config.Config, logger *zap.Logger) *gin.Engine {
+func createTestRouter(cfg *config.Config, store storage.Store, logger *zap.Logger) *gin.Engine {
 	router := gin.New()
-	router.Use(AuthMiddleware(cfg, logger))
+	router.Use(AuthMiddleware(cfg, store, logger))
 	router.GET("/test", func(c *gin.Context) {
 		userID, exists := c.Get("user_id")
 		if !exists {
@@ -59,10 +62,23 @@ func createTestRouter(cfg *config.Config, logger *zap.Logger) *gin.Engine {
 	return router
 }
 
+// createTestStore creates a memory store with a default tenant for testing
+func createTestStore() storage.Store {
+	store := memory.NewStore()
+	// Create default tenant that JWT tokens reference
+	store.Tenants().Create(nil, &domain.Tenant{
+		ID:      domain.DefaultTenantID,
+		Name:    "Default",
+		Enabled: true,
+	})
+	return store
+}
+
 func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -76,7 +92,8 @@ func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	tests := []struct {
 		name   string
@@ -104,7 +121,8 @@ func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 func TestAuthMiddleware_InvalidToken(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -120,7 +138,8 @@ func TestAuthMiddleware_ExpiredToken(t *testing.T) {
 	logger := zap.NewNop()
 	secret := "test-secret"
 	cfg := createTestConfig(secret)
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -136,7 +155,8 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 	logger := zap.NewNop()
 	secret := "test-secret"
 	cfg := createTestConfig(secret)
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -151,7 +171,8 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 func TestAuthMiddleware_WrongSecret(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("correct-secret")
-	router := createTestRouter(cfg, logger)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)

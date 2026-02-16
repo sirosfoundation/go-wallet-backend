@@ -35,9 +35,9 @@
         "name": "Test Wallet"
       },
       "user": {
-        "displayName": "",
+        "displayName": "User",
         "id": {
-          "$b64u": "\u003cCHALLENGE_B64U\u003e"
+          "$b64u": "\u003cUSER_ID_B64U\u003e"
         },
         "name": "\u003cUSER_UUID\u003e"
       }

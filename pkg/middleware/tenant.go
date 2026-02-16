@@ -7,25 +7,21 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// TenantPathMiddleware extracts the tenant from URL path parameter and validates it.
-// For authenticated requests (where AuthMiddleware has already run), the tenant_id from
-// the JWT is authoritative and will NOT be overwritten by the path tenant.
-// The path tenant is only used for:
-// 1. Unauthenticated endpoints (login, registration) where tenant comes from path
-// 2. Routing purposes (load balancer/CDN) - we still validate the tenant exists
-func TenantPathMiddleware(store storage.Store) gin.HandlerFunc {
+// TenantHeaderMiddleware extracts the tenant from X-Tenant-ID header and validates it.
+// This is used for unauthenticated requests where tenant context is needed (e.g., login begin).
+// For authenticated requests, the JWT tenant_id claim is authoritative (set by AuthMiddleware).
+func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tenantIDStr := c.Param("tenantID")
+		tenantIDStr := c.GetHeader("X-Tenant-ID")
 		if tenantIDStr == "" {
-			c.JSON(400, gin.H{"error": "tenant ID required in path"})
-			c.Abort()
-			return
+			// Default to "default" tenant for backwards compatibility with single-tenant deployments
+			tenantIDStr = "default"
 		}
 
-		pathTenantID := domain.TenantID(tenantIDStr)
+		tenantID := domain.TenantID(tenantIDStr)
 
-		// Always validate that the path tenant exists (for routing validation)
-		tenant, err := store.Tenants().GetByID(c.Request.Context(), pathTenantID)
+		// Validate tenant exists
+		tenant, err := store.Tenants().GetByID(c.Request.Context(), tenantID)
 		if err != nil {
 			if err == storage.ErrNotFound {
 				c.JSON(404, gin.H{"error": "tenant not found"})
@@ -43,25 +39,15 @@ func TenantPathMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 
-		// Check if tenant was already set by AuthMiddleware (from JWT)
-		// If so, the JWT tenant_id is authoritative for security boundary
-		if _, exists := c.Get("tenant_from_jwt"); exists {
-			// tenant_id already set from JWT - don't override (security boundary)
-			// Store the path tenant separately for reference if needed
-			c.Set("path_tenant_id", pathTenantID)
-			c.Set("path_tenant", tenant)
-		} else {
-			// No JWT auth yet (unauthenticated endpoint) - use path tenant
-			c.Set("tenant_id", pathTenantID)
-			c.Set("tenant", tenant)
-		}
-
+		// Set tenant context (can be overridden by AuthMiddleware if JWT has tenant_id)
+		c.Set("tenant_id", tenantID)
+		c.Set("tenant", tenant)
 		c.Next()
 	}
 }
 
 // TenantMembershipMiddleware verifies the user is a member of the current tenant
-// Must be used after AuthMiddleware and TenantPathMiddleware
+// Must be used after AuthMiddleware (which sets tenant from JWT)
 func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get user ID from auth context
@@ -107,7 +93,7 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 }
 
 // GetTenantID extracts tenant ID from gin context
-// Handles both string (from JWT) and domain.TenantID (from path) types
+// Handles both string (from JWT via AuthMiddleware) and domain.TenantID (from header via TenantHeaderMiddleware)
 func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
@@ -119,7 +105,7 @@ func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
 		return domain.TenantID(tidStr), true
 	}
 
-	// Handle domain.TenantID type (from path via TenantPathMiddleware)
+	// Handle domain.TenantID type (from header via TenantHeaderMiddleware)
 	if tid, ok := tenantIDVal.(domain.TenantID); ok {
 		return tid, true
 	}

@@ -15,7 +15,7 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-func TestTenantPathMiddleware(t *testing.T) {
+func TestTenantHeaderMiddleware(t *testing.T) {
 	store := memory.NewStore()
 
 	// Create a test tenant
@@ -42,37 +42,37 @@ func TestTenantPathMiddleware(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		tenantID       string
+		headerTenantID string // empty string means no header
 		expectedStatus int
 		checkContext   bool
 	}{
 		{
 			name:           "valid tenant returns 200",
-			tenantID:       "test-tenant",
+			headerTenantID: "test-tenant",
 			expectedStatus: http.StatusOK,
 			checkContext:   true,
 		},
 		{
 			name:           "default tenant returns 200",
-			tenantID:       string(domain.DefaultTenantID),
+			headerTenantID: string(domain.DefaultTenantID),
 			expectedStatus: http.StatusOK,
 			checkContext:   true,
 		},
 		{
-			name:           "missing tenant ID returns 400",
-			tenantID:       "",
-			expectedStatus: http.StatusBadRequest,
-			checkContext:   false,
+			name:           "missing X-Tenant-ID header defaults to 'default' tenant",
+			headerTenantID: "",
+			expectedStatus: http.StatusOK,
+			checkContext:   true,
 		},
 		{
 			name:           "nonexistent tenant returns 404",
-			tenantID:       "nonexistent",
+			headerTenantID: "nonexistent",
 			expectedStatus: http.StatusNotFound,
 			checkContext:   false,
 		},
 		{
 			name:           "disabled tenant returns 403",
-			tenantID:       "disabled-tenant",
+			headerTenantID: "disabled-tenant",
 			expectedStatus: http.StatusForbidden,
 			checkContext:   false,
 		},
@@ -81,18 +81,21 @@ func TestTenantPathMiddleware(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			router := gin.New()
-			router.Use(TenantPathMiddleware(store))
-			
+			router.Use(TenantHeaderMiddleware(store))
+
 			var contextTenantID domain.TenantID
 			var contextTenant *domain.Tenant
-			
-			router.GET("/:tenantID/test", func(c *gin.Context) {
+
+			router.GET("/test", func(c *gin.Context) {
 				contextTenantID, _ = GetTenantID(c)
 				contextTenant, _ = GetTenant(c)
 				c.JSON(http.StatusOK, gin.H{"status": "ok"})
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/"+tt.tenantID+"/test", nil)
+			req := httptest.NewRequest(http.MethodGet, "/test", nil)
+			if tt.headerTenantID != "" {
+				req.Header.Set("X-Tenant-ID", tt.headerTenantID)
+			}
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
 
@@ -180,15 +183,15 @@ func TestTenantMembershipMiddleware(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			router := gin.New()
-			
+
 			// Setup context middleware
 			router.Use(func(c *gin.Context) {
 				tt.setupContext(c)
 				c.Next()
 			})
-			
+
 			router.Use(TenantMembershipMiddleware(store))
-			
+
 			router.GET("/test", func(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"status": "ok"})
 			})
@@ -209,10 +212,10 @@ func TestGetTenantID(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
-		
+
 		expectedID := domain.TenantID("test-tenant")
 		c.Set("tenant_id", expectedID)
-		
+
 		id, ok := GetTenantID(c)
 		if !ok {
 			t.Error("Expected GetTenantID to return true")
@@ -226,10 +229,10 @@ func TestGetTenantID(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
-		
+
 		// JWT sets tenant_id as a string, not domain.TenantID
 		c.Set("tenant_id", "test-tenant-from-jwt")
-		
+
 		id, ok := GetTenantID(c)
 		if !ok {
 			t.Error("Expected GetTenantID to return true for string type")
@@ -243,7 +246,7 @@ func TestGetTenantID(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
-		
+
 		_, ok := GetTenantID(c)
 		if ok {
 			t.Error("Expected GetTenantID to return false")
@@ -256,13 +259,13 @@ func TestGetTenant(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
-		
+
 		expectedTenant := &domain.Tenant{
 			ID:   "test-tenant",
 			Name: "Test",
 		}
 		c.Set("tenant", expectedTenant)
-		
+
 		tenant, ok := GetTenant(c)
 		if !ok {
 			t.Error("Expected GetTenant to return true")
@@ -276,7 +279,7 @@ func TestGetTenant(t *testing.T) {
 		gin.SetMode(gin.TestMode)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
-		
+
 		_, ok := GetTenant(c)
 		if ok {
 			t.Error("Expected GetTenant to return false")
