@@ -61,9 +61,9 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// AuthMiddleware validates JWT tokens and sets user context.
-// It validates the tenant from the JWT exists and is enabled.
-// The JWT tenant_id claim is authoritative; X-Tenant-ID header is logged if mismatched.
+// AuthMiddleware validates JWT tokens, validates tenant, and sets user/tenant context.
+// The JWT tenant_id claim is authoritative for authenticated requests.
+// If X-Tenant-ID header is provided and differs from JWT, a warning is logged but JWT wins.
 func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
@@ -122,9 +122,11 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 		// Get did from claims
 		did, _ := claims["did"].(string)
 
-		// Get tenant_id from claims (defaults to "default" for backward compatibility)
+		// Get tenant_id from claims (required for security boundary)
+		// This is the authoritative source for tenant on authenticated requests
 		tenantID, _ := claims["tenant_id"].(string)
 		if tenantID == "" {
+			// For backward compatibility with older tokens, default to "default"
 			tenantID = "default"
 		}
 
@@ -134,11 +136,15 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 			if err == storage.ErrNotFound {
 				logger.Warn("JWT contains invalid tenant_id",
 					zap.String("tenant_id", tenantID),
-					zap.String("user_id", userID))
+					zap.String("user_id", userID),
+				)
 				c.JSON(401, gin.H{"error": "Invalid tenant in token"})
 			} else {
-				logger.Error("Failed to lookup tenant from JWT", zap.Error(err))
-				c.JSON(500, gin.H{"error": "Failed to validate tenant"})
+				logger.Error("Failed to lookup tenant from JWT",
+					zap.String("tenant_id", tenantID),
+					zap.Error(err),
+				)
+				c.JSON(500, gin.H{"error": "Internal server error"})
 			}
 			c.Abort()
 			return
@@ -147,28 +153,29 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 		if !tenant.Enabled {
 			logger.Warn("JWT tenant is disabled",
 				zap.String("tenant_id", tenantID),
-				zap.String("user_id", userID))
+				zap.String("user_id", userID),
+			)
 			c.JSON(403, gin.H{"error": "Tenant is disabled"})
 			c.Abort()
 			return
 		}
 
-		// Check X-Tenant-ID header against JWT tenant_id (JWT is authoritative)
+		// Check if X-Tenant-ID header was provided and log if it mismatches JWT
 		headerTenantID := c.GetHeader("X-Tenant-ID")
 		if headerTenantID != "" && headerTenantID != tenantID {
-			logger.Warn("X-Tenant-ID header does not match JWT tenant_id",
-				zap.String("header_tenant", headerTenantID),
-				zap.String("jwt_tenant", tenantID),
+			logger.Warn("X-Tenant-ID header mismatches JWT tenant_id - using JWT (authoritative)",
+				zap.String("header_tenant_id", headerTenantID),
+				zap.String("jwt_tenant_id", tenantID),
 				zap.String("user_id", userID),
-				zap.String("path", c.Request.URL.Path))
-			// JWT is authoritative - continue with JWT tenant but log the mismatch
+			)
 		}
 
 		c.Set("user_id", userID)
 		c.Set("did", did)
-		c.Set("tenant_id", tenantID)
-		c.Set("tenant", tenant)
 		c.Set("token", tokenString)
+		c.Set("tenant_id", tenantID)   // Set tenant from JWT for security
+		c.Set("tenant", tenant)        // Set full tenant object for handlers
+		c.Set("tenant_from_jwt", true) // Flag to indicate this came from JWT (authoritative)
 
 		c.Next()
 	}

@@ -62,6 +62,7 @@ func (h *Handlers) LoginUser(c *gin.Context) {
 // WebAuthn handlers
 
 // StartWebAuthnRegistration begins the WebAuthn registration process
+// Tenant is taken from X-Tenant-ID header (set by TenantHeaderMiddleware)
 func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 	if h.services.WebAuthn == nil {
 		c.JSON(503, gin.H{"error": "WebAuthn not available"})
@@ -73,6 +74,10 @@ func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 		// Allow empty body - all fields are optional
 		req = service.BeginRegistrationRequest{}
 	}
+
+	// Get tenant from header (set by TenantHeaderMiddleware for this unauthenticated endpoint)
+	tenantID, _ := h.getTenantID(c)
+	req.TenantID = string(tenantID)
 
 	resp, err := h.services.WebAuthn.BeginRegistration(c.Request.Context(), &req)
 	if err != nil {
@@ -312,20 +317,30 @@ func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 	return userID.(string), true
 }
 
-// getTenantID retrieves the tenant ID from context (set by TenantPathMiddleware)
+// getTenantID retrieves the tenant ID from context.
+// For authenticated requests, this comes from the JWT token (security boundary).
+// For unauthenticated requests, this comes from X-Tenant-ID header.
+// Handles both string (from JWT via AuthMiddleware) and domain.TenantID types.
 func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantID, exists := c.Get("tenant_id")
 	if !exists {
 		// Default to "default" tenant for backward compatibility
 		return domain.DefaultTenantID, true
 	}
-	tid, ok := tenantID.(domain.TenantID)
-	if !ok {
-		h.logger.Warn("tenant_id in context has unexpected type; falling back to default tenant",
-			zap.Any("tenant_id", tenantID))
-		return domain.DefaultTenantID, true
+
+	// Handle string type (from JWT via AuthMiddleware)
+	if tidStr, ok := tenantID.(string); ok {
+		return domain.TenantID(tidStr), true
 	}
-	return tid, true
+
+	// Handle domain.TenantID type (from header via TenantHeaderMiddleware)
+	if tid, ok := tenantID.(domain.TenantID); ok {
+		return tid, true
+	}
+
+	h.logger.Warn("tenant_id in context has unexpected type; falling back to default tenant",
+		zap.Any("tenant_id", tenantID))
+	return domain.DefaultTenantID, true
 }
 
 // GetAllCredentials returns all credentials for the authenticated user

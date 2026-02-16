@@ -519,13 +519,8 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		}
 	}
 
-	// Generate JWT token with tenant_id claim
-	// Use 'default' tenant if no tenant specified for backward compatibility
-	tokenTenantID := tenantID
-	if tokenTenantID == "" {
-		tokenTenantID = domain.DefaultTenantID
-	}
-	token, err := s.generateToken(user, tokenTenantID)
+	// Generate JWT token with tenant_id included for security boundary
+	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
@@ -784,7 +779,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// Don't fail login for this
 	}
 
-	// Generate JWT token with tenant_id claim
+	// Generate JWT token with tenant_id included for security boundary
 	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
@@ -825,6 +820,11 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 }
 
 func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.TenantID) (string, error) {
+	// For backward compatibility, default to "default" tenant if not specified
+	if tenantID == "" {
+		tenantID = domain.DefaultTenantID
+	}
+
 	claims := jwt.MapClaims{
 		"user_id":   user.UUID.String(),
 		"did":       user.DID,
@@ -1300,7 +1300,7 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 		return nil, ErrVerificationFailed
 	}
 
-	// Generate token with tenant_id claim
+	// Generate token with tenant_id included for security boundary
 	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)

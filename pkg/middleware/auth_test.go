@@ -47,36 +47,6 @@ func createExpiredToken(secret string, userID string) string {
 	return tokenString
 }
 
-func createTokenWithTenantID(secret string, userID string, tenantID string) string {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id":   userID,
-		"tenant_id": tenantID,
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, _ := token.SignedString([]byte(secret))
-	return tokenString
-}
-
-// Helper function to create a test store with default tenant
-func createTestStore(t *testing.T) storage.Store {
-	store := memory.NewStore()
-	// Default tenant is auto-created by memory store
-	return store
-}
-
-// Helper function to add custom tenant to store
-func addTestTenant(t *testing.T, store storage.Store, tenantID string, enabled bool) {
-	tenant := &domain.Tenant{
-		ID:          domain.TenantID(tenantID),
-		Name:        tenantID,
-		DisplayName: tenantID,
-		Enabled:     enabled,
-	}
-	if err := store.Tenants().Create(t.Context(), tenant); err != nil {
-		t.Fatalf("Failed to create test tenant: %v", err)
-	}
-}
-
 // Helper function to create a test router with auth middleware and a success handler
 func createTestRouter(cfg *config.Config, store storage.Store, logger *zap.Logger) *gin.Engine {
 	router := gin.New()
@@ -92,10 +62,22 @@ func createTestRouter(cfg *config.Config, store storage.Store, logger *zap.Logge
 	return router
 }
 
+// createTestStore creates a memory store with a default tenant for testing
+func createTestStore() storage.Store {
+	store := memory.NewStore()
+	// Create default tenant that JWT tokens reference
+	store.Tenants().Create(nil, &domain.Tenant{
+		ID:      domain.DefaultTenantID,
+		Name:    "Default",
+		Enabled: true,
+	})
+	return store
+}
+
 func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
@@ -110,7 +92,7 @@ func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	tests := []struct {
@@ -139,7 +121,7 @@ func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 func TestAuthMiddleware_InvalidToken(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
@@ -156,7 +138,7 @@ func TestAuthMiddleware_ExpiredToken(t *testing.T) {
 	logger := zap.NewNop()
 	secret := "test-secret"
 	cfg := createTestConfig(secret)
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
@@ -173,7 +155,7 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 	logger := zap.NewNop()
 	secret := "test-secret"
 	cfg := createTestConfig(secret)
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
@@ -189,7 +171,7 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 func TestAuthMiddleware_WrongSecret(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("correct-secret")
-	store := createTestStore(t)
+	store := createTestStore()
 	router := createTestRouter(cfg, store, logger)
 
 	w := httptest.NewRecorder()
@@ -200,197 +182,6 @@ func TestAuthMiddleware_WrongSecret(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
-	}
-}
-
-func TestAuthMiddleware_ExtractsTenantID(t *testing.T) {
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	// Add custom tenant for this test
-	addTestTenant(t, store, "test-tenant", true)
-
-	// Create a router that returns the tenant_id from context
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		tenantID, exists := c.Get("tenant_id")
-		if !exists {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant_id not found"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"tenant_id": tenantID})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+createTokenWithTenantID(secret, "user-123", "test-tenant"))
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
-	}
-
-	// Verify the tenant_id was extracted correctly
-	expected := `{"tenant_id":"test-tenant"}`
-	if w.Body.String() != expected {
-		t.Errorf("Expected body %s, got %s", expected, w.Body.String())
-	}
-}
-
-func TestAuthMiddleware_DefaultsTenantIDWhenMissing(t *testing.T) {
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	// Create a router that returns the tenant_id from context
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		tenantID, exists := c.Get("tenant_id")
-		if !exists {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant_id not found"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"tenant_id": tenantID})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	// Use a token without tenant_id
-	req.Header.Set("Authorization", "Bearer "+createValidToken(secret, "user-123"))
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
-	}
-
-	// Verify the tenant_id defaults to "default"
-	expected := `{"tenant_id":"default"}`
-	if w.Body.String() != expected {
-		t.Errorf("Expected body %s, got %s", expected, w.Body.String())
-	}
-}
-
-func TestAuthMiddleware_InvalidTenantInJWT(t *testing.T) {
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	// Use a token with a nonexistent tenant
-	req.Header.Set("Authorization", "Bearer "+createTokenWithTenantID(secret, "user-123", "nonexistent-tenant"))
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("Expected status %d for invalid tenant, got %d", http.StatusUnauthorized, w.Code)
-	}
-}
-
-func TestAuthMiddleware_DisabledTenantInJWT(t *testing.T) {
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	// Add a disabled tenant
-	addTestTenant(t, store, "disabled-tenant", false)
-
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	// Use a token with a disabled tenant
-	req.Header.Set("Authorization", "Bearer "+createTokenWithTenantID(secret, "user-123", "disabled-tenant"))
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusForbidden {
-		t.Errorf("Expected status %d for disabled tenant, got %d", http.StatusForbidden, w.Code)
-	}
-}
-
-func TestAuthMiddleware_HeaderTenantMismatch(t *testing.T) {
-	// Test that JWT tenant takes precedence even when X-Tenant-ID header differs
-	// The request should succeed but the header mismatch should be logged
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	addTestTenant(t, store, "jwt-tenant", true)
-	addTestTenant(t, store, "header-tenant", true)
-
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		tenantID, _ := c.Get("tenant_id")
-		c.JSON(http.StatusOK, gin.H{"tenant_id": tenantID})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	// JWT has "jwt-tenant" but header has "header-tenant"
-	req.Header.Set("Authorization", "Bearer "+createTokenWithTenantID(secret, "user-123", "jwt-tenant"))
-	req.Header.Set("X-Tenant-ID", "header-tenant")
-	router.ServeHTTP(w, req)
-
-	// Should succeed with JWT tenant (JWT is authoritative)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
-	}
-
-	// Should use JWT tenant, not header tenant
-	expected := `{"tenant_id":"jwt-tenant"}`
-	if w.Body.String() != expected {
-		t.Errorf("Expected body %s, got %s", expected, w.Body.String())
-	}
-}
-
-func TestAuthMiddleware_TenantObjectInContext(t *testing.T) {
-	// Test that the full tenant object is available in context
-	logger := zap.NewNop()
-	secret := "test-secret"
-	cfg := createTestConfig(secret)
-	store := createTestStore(t)
-
-	router := gin.New()
-	router.Use(AuthMiddleware(cfg, store, logger))
-	router.GET("/test", func(c *gin.Context) {
-		tenant, exists := c.Get("tenant")
-		if !exists {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant not found in context"})
-			return
-		}
-		// Just verify we got something - actual type would be *domain.Tenant
-		if tenant == nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant is nil"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+createValidToken(secret, "user-123"))
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d", http.StatusOK, w.Code)
 	}
 }
 

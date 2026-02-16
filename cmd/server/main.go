@@ -195,11 +195,16 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	// Initialize API handlers
 	handlers := api.NewHandlers(services, cfg, logger)
 
-	// Public routes (default tenant for backward compatibility)
+	// Root-level health/status endpoints (no tenant required)
+	router.GET("/status", handlers.Status)
+	router.GET("/health", handlers.Status)
+
+	// =========================================================================
+	// PUBLIC ROUTES (unauthenticated)
+	// Tenant comes from X-Tenant-ID header (TenantHeaderMiddleware)
+	// =========================================================================
 	public := router.Group("/")
 	{
-		public.GET("/status", handlers.Status)
-
 		// User authentication routes (no auth required)
 		// TenantHeaderMiddleware validates the X-Tenant-ID header
 		// and sets tenant context for registration endpoints
@@ -225,7 +230,11 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		public.GET("/ws/keystore", handlers.WebSocketKeystore)
 	}
 
-	// Protected routes (require authentication)
+	// =========================================================================
+	// PROTECTED ROUTES (authenticated)
+	// Tenant comes from JWT token (AuthMiddleware sets tenant_id from JWT claim)
+	// JWT tenant_id is authoritative for security boundary
+	// =========================================================================
 	protected := router.Group("/")
 	protected.Use(middleware.AuthMiddleware(cfg, store, logger))
 	{
@@ -301,8 +310,9 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	}
 
 	// Note: Path-based tenant routes (/t/:tenantID/...) have been removed.
-	// Tenant routing now uses the X-Tenant-ID header for unauthenticated requests
-	// and the JWT tenant_id claim for authenticated requests.
+	// Tenant routing now uses:
+	// - X-Tenant-ID header for unauthenticated requests
+	// - JWT tenant_id claim for authenticated requests (authoritative)
 	// See docs/adr/011-multi-tenancy.md for the design rationale.
 
 	return router

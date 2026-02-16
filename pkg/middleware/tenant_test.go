@@ -15,7 +15,7 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-func TestTenantPathMiddleware(t *testing.T) {
+func TestTenantHeaderMiddleware(t *testing.T) {
 	store := memory.NewStore()
 
 	// Create a test tenant
@@ -42,37 +42,37 @@ func TestTenantPathMiddleware(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		tenantID       string
+		headerTenantID string // empty string means no header
 		expectedStatus int
 		checkContext   bool
 	}{
 		{
 			name:           "valid tenant returns 200",
-			tenantID:       "test-tenant",
+			headerTenantID: "test-tenant",
 			expectedStatus: http.StatusOK,
 			checkContext:   true,
 		},
 		{
 			name:           "default tenant returns 200",
-			tenantID:       string(domain.DefaultTenantID),
+			headerTenantID: string(domain.DefaultTenantID),
 			expectedStatus: http.StatusOK,
 			checkContext:   true,
 		},
 		{
-			name:           "missing tenant ID returns 400",
-			tenantID:       "",
-			expectedStatus: http.StatusBadRequest,
-			checkContext:   false,
+			name:           "missing X-Tenant-ID header defaults to 'default' tenant",
+			headerTenantID: "",
+			expectedStatus: http.StatusOK,
+			checkContext:   true,
 		},
 		{
 			name:           "nonexistent tenant returns 404",
-			tenantID:       "nonexistent",
+			headerTenantID: "nonexistent",
 			expectedStatus: http.StatusNotFound,
 			checkContext:   false,
 		},
 		{
 			name:           "disabled tenant returns 403",
-			tenantID:       "disabled-tenant",
+			headerTenantID: "disabled-tenant",
 			expectedStatus: http.StatusForbidden,
 			checkContext:   false,
 		},
@@ -81,18 +81,21 @@ func TestTenantPathMiddleware(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			router := gin.New()
-			router.Use(TenantPathMiddleware(store))
+			router.Use(TenantHeaderMiddleware(store))
 
 			var contextTenantID domain.TenantID
 			var contextTenant *domain.Tenant
 
-			router.GET("/:tenantID/test", func(c *gin.Context) {
+			router.GET("/test", func(c *gin.Context) {
 				contextTenantID, _ = GetTenantID(c)
 				contextTenant, _ = GetTenant(c)
 				c.JSON(http.StatusOK, gin.H{"status": "ok"})
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/"+tt.tenantID+"/test", nil)
+			req := httptest.NewRequest(http.MethodGet, "/test", nil)
+			if tt.headerTenantID != "" {
+				req.Header.Set("X-Tenant-ID", tt.headerTenantID)
+			}
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
 
@@ -282,113 +285,4 @@ func TestGetTenant(t *testing.T) {
 			t.Error("Expected GetTenant to return false")
 		}
 	})
-}
-
-func TestTenantHeaderMiddleware(t *testing.T) {
-	store := memory.NewStore()
-
-	// Create a test tenant
-	testTenant := &domain.Tenant{
-		ID:          "test-tenant",
-		Name:        "test-tenant",
-		DisplayName: "Test Tenant",
-		Enabled:     true,
-	}
-	if err := store.Tenants().Create(t.Context(), testTenant); err != nil {
-		t.Fatalf("Failed to create test tenant: %v", err)
-	}
-
-	// Create a disabled tenant
-	disabledTenant := &domain.Tenant{
-		ID:          "disabled-tenant",
-		Name:        "disabled",
-		DisplayName: "Disabled Tenant",
-		Enabled:     false,
-	}
-	if err := store.Tenants().Create(t.Context(), disabledTenant); err != nil {
-		t.Fatalf("Failed to create disabled tenant: %v", err)
-	}
-
-	tests := []struct {
-		name           string
-		headerValue    string
-		expectedStatus int
-		checkContext   bool
-		expectedTenant string
-	}{
-		{
-			name:           "valid tenant in header returns 200",
-			headerValue:    "test-tenant",
-			expectedStatus: http.StatusOK,
-			checkContext:   true,
-			expectedTenant: "test-tenant",
-		},
-		{
-			name:           "default tenant in header returns 200",
-			headerValue:    string(domain.DefaultTenantID),
-			expectedStatus: http.StatusOK,
-			checkContext:   true,
-			expectedTenant: string(domain.DefaultTenantID),
-		},
-		{
-			name:           "missing header defaults to 'default' tenant",
-			headerValue:    "",
-			expectedStatus: http.StatusOK,
-			checkContext:   true,
-			expectedTenant: string(domain.DefaultTenantID),
-		},
-		{
-			name:           "nonexistent tenant returns 404",
-			headerValue:    "nonexistent",
-			expectedStatus: http.StatusNotFound,
-			checkContext:   false,
-			expectedTenant: "",
-		},
-		{
-			name:           "disabled tenant returns 403",
-			headerValue:    "disabled-tenant",
-			expectedStatus: http.StatusForbidden,
-			checkContext:   false,
-			expectedTenant: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			router := gin.New()
-			router.Use(TenantHeaderMiddleware(store))
-
-			var contextTenantID domain.TenantID
-			var contextTenant *domain.Tenant
-
-			router.GET("/test", func(c *gin.Context) {
-				contextTenantID, _ = GetTenantID(c)
-				contextTenant, _ = GetTenant(c)
-				c.JSON(http.StatusOK, gin.H{"status": "ok"})
-			})
-
-			req := httptest.NewRequest(http.MethodGet, "/test", nil)
-			if tt.headerValue != "" {
-				req.Header.Set("X-Tenant-ID", tt.headerValue)
-			}
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, req)
-
-			if w.Code != tt.expectedStatus {
-				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.Code)
-			}
-
-			if tt.checkContext {
-				if contextTenantID == "" {
-					t.Error("Expected tenant ID in context")
-				}
-				if string(contextTenantID) != tt.expectedTenant {
-					t.Errorf("Expected tenant ID %s, got %s", tt.expectedTenant, contextTenantID)
-				}
-				if contextTenant == nil {
-					t.Error("Expected tenant in context")
-				}
-			}
-		})
-	}
 }

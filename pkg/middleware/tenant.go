@@ -9,12 +9,12 @@ import (
 
 // TenantHeaderMiddleware extracts the tenant from X-Tenant-ID header and validates it.
 // This is used for unauthenticated requests where tenant context is needed (e.g., login begin).
-// For authenticated requests, the JWT tenant_id claim is authoritative.
+// For authenticated requests, the JWT tenant_id claim is authoritative (set by AuthMiddleware).
 func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenantIDStr := c.GetHeader("X-Tenant-ID")
 		if tenantIDStr == "" {
-			// Default to "default" tenant for backwards compatibility
+			// Default to "default" tenant for backwards compatibility with single-tenant deployments
 			tenantIDStr = "default"
 		}
 
@@ -39,47 +39,7 @@ func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 
-		// Set tenant context (can be overridden by auth middleware if JWT has tenant_id)
-		c.Set("tenant_id", tenantID)
-		c.Set("tenant", tenant)
-		c.Next()
-	}
-}
-
-// TenantPathMiddleware extracts the tenant from URL path parameter and validates it.
-// Deprecated: Use TenantHeaderMiddleware for new code. This is kept for backwards compatibility
-// with clients that still use path-based tenant routing (/t/{tenantID}/...).
-func TenantPathMiddleware(store storage.Store) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		tenantIDStr := c.Param("tenantID")
-		if tenantIDStr == "" {
-			c.JSON(400, gin.H{"error": "tenant ID required in path"})
-			c.Abort()
-			return
-		}
-
-		tenantID := domain.TenantID(tenantIDStr)
-
-		// Validate tenant exists
-		tenant, err := store.Tenants().GetByID(c.Request.Context(), tenantID)
-		if err != nil {
-			if err == storage.ErrNotFound {
-				c.JSON(404, gin.H{"error": "tenant not found"})
-			} else {
-				c.JSON(500, gin.H{"error": "failed to lookup tenant"})
-			}
-			c.Abort()
-			return
-		}
-
-		// Validate tenant is enabled
-		if !tenant.Enabled {
-			c.JSON(403, gin.H{"error": "tenant is disabled"})
-			c.Abort()
-			return
-		}
-
-		// Set tenant context
+		// Set tenant context (can be overridden by AuthMiddleware if JWT has tenant_id)
 		c.Set("tenant_id", tenantID)
 		c.Set("tenant", tenant)
 		c.Next()
@@ -87,7 +47,7 @@ func TenantPathMiddleware(store storage.Store) gin.HandlerFunc {
 }
 
 // TenantMembershipMiddleware verifies the user is a member of the current tenant
-// Must be used after AuthMiddleware and TenantPathMiddleware
+// Must be used after AuthMiddleware (which sets tenant from JWT)
 func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get user ID from auth context
@@ -98,9 +58,9 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 
-		// Get tenant ID from tenant context
-		tenantIDVal, exists := c.Get("tenant_id")
-		if !exists {
+		// Get tenant ID from context (could be string from JWT or domain.TenantID from path)
+		tenantID, ok := GetTenantID(c)
+		if !ok {
 			c.JSON(500, gin.H{"error": "tenant context missing"})
 			c.Abort()
 			return
@@ -113,13 +73,6 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 		userID := domain.UserIDFromString(userIDString)
-
-		tenantID, ok := tenantIDVal.(domain.TenantID)
-		if !ok {
-			c.JSON(500, gin.H{"error": "invalid tenant_id type in context"})
-			c.Abort()
-			return
-		}
 
 		// Check membership
 		isMember, err := store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
@@ -139,21 +92,24 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 	}
 }
 
-// GetTenantID extracts tenant ID from gin context.
-// Handles both domain.TenantID (from header middleware) and string (from JWT auth).
+// GetTenantID extracts tenant ID from gin context
+// Handles both string (from JWT via AuthMiddleware) and domain.TenantID (from header via TenantHeaderMiddleware)
 func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
-	tenantID, exists := c.Get("tenant_id")
+	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
 		return "", false
 	}
-	// Handle domain.TenantID type (from header/path middleware)
-	if tid, ok := tenantID.(domain.TenantID); ok {
-		return tid, true
-	}
-	// Handle string type (from JWT auth)
-	if tidStr, ok := tenantID.(string); ok {
+
+	// Handle string type (from JWT via AuthMiddleware)
+	if tidStr, ok := tenantIDVal.(string); ok {
 		return domain.TenantID(tidStr), true
 	}
+
+	// Handle domain.TenantID type (from header via TenantHeaderMiddleware)
+	if tid, ok := tenantIDVal.(domain.TenantID); ok {
+		return tid, true
+	}
+
 	return "", false
 }
 
