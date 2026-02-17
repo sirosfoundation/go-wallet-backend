@@ -263,6 +263,14 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 		waUser = &WebAuthnUser{user: tempUser}
 	}
 
+	// Debug: log the userHandle being sent to the browser
+	s.logger.Info("Registration: generated userHandle",
+		zap.String("user_id", userID.String()),
+		zap.String("tenant_id", string(tenantID)),
+		zap.Int("handle_length", len(userHandle)),
+		zap.Binary("handle_bytes", userHandle),
+		zap.String("handle_as_string", string(userHandle)))
+
 	// Generate creation options
 	_, session, err := s.webauthn.BeginRegistration(waUser,
 		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
@@ -677,21 +685,31 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	var tenantID domain.TenantID
 	userHandle := parsedResponse.Response.UserHandle
 
+	// Debug: log the raw userHandle bytes to diagnose login failures
+	s.logger.Info("Login: received userHandle",
+		zap.Int("length", len(userHandle)),
+		zap.Binary("bytes", userHandle),
+		zap.String("as_string", string(userHandle)))
+
 	// Try v1 binary format first, then legacy string format
 	if uid, err := domain.UserIDFromHandle(userHandle); err == nil {
 		userID = uid
-		s.logger.Debug("Decoded user ID from handle",
+		s.logger.Info("Login: decoded user ID from v1 binary handle",
 			zap.String("user_id", userID.String()))
 	} else {
 		// Legacy user without proper format
 		userID = domain.UserIDFromUserHandle(userHandle)
-		s.logger.Debug("Legacy user handle without proper encoding",
-			zap.String("user_id", userID.String()))
+		s.logger.Info("Login: using legacy string handle format",
+			zap.String("user_id", userID.String()),
+			zap.Error(err))
 	}
 
 	// Look up the user first to determine their tenant
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		s.logger.Error("Login: user lookup failed",
+			zap.String("user_id", userID.String()),
+			zap.Error(err))
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrUserNotFound
 		}
