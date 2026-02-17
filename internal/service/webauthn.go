@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -285,7 +286,7 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 	challenge := &domain.WebauthnChallenge{
 		ID:        challengeID,
 		UserID:    userID.String(),
-		TenantID:  string(tenantID), // Empty string for global registration
+		TenantID:  string(tenantID),  // Empty string for global registration
 		Challenge: session.Challenge, // Already base64url encoded
 		Action:    "register",
 		ExpiresAt: time.Now().Add(5 * time.Minute),
@@ -745,6 +746,40 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 
 	if matchedCred == nil {
 		return nil, ErrCredentialNotFound
+	}
+
+	// SECURITY: Validate tenant isolation
+	// The tenant hash in the userHandle must match the credential's tenant
+	// This prevents cross-tenant login attacks
+	handleTenantHash, isV1Handle := domain.TenantHashFromHandle(userHandle)
+	if isV1Handle == nil {
+		// V1 handle: verify tenant hash matches the credential's tenant
+		credTenantID := domain.TenantID(matchedCred.TenantID)
+		if credTenantID == "" {
+			credTenantID = domain.DefaultTenantID
+		}
+		expectedTenantHash := domain.ComputeTenantHash(credTenantID)
+		if !bytes.Equal(handleTenantHash, expectedTenantHash) {
+			s.logger.Warn("Tenant hash mismatch in userHandle",
+				zap.String("user_id", userID.String()),
+				zap.String("credential_tenant", string(credTenantID)),
+				zap.Binary("handle_tenant_hash", handleTenantHash),
+				zap.Binary("expected_tenant_hash", expectedTenantHash))
+			return nil, ErrTenantAccessDenied
+		}
+		// Use the credential's tenant as the authoritative tenant
+		tenantID = credTenantID
+		s.logger.Info("Login: validated tenant from v1 handle",
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)))
+	} else {
+		// Legacy handle: only allow default tenant access
+		if tenantID != domain.DefaultTenantID {
+			s.logger.Warn("Legacy handle cannot access non-default tenant",
+				zap.String("user_id", userID.String()),
+				zap.String("attempted_tenant", string(tenantID)))
+			return nil, ErrTenantAccessDenied
+		}
 	}
 
 	// Create session data for verification
