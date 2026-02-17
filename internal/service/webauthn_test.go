@@ -548,6 +548,7 @@ func TestWebAuthnUserCredentials(t *testing.T) {
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
 				ID:              "cred1",
+				CredentialID:    []byte("cred1"),
 				PublicKey:       []byte("pubkey1"),
 				AttestationType: "none",
 				Transport:       []string{"usb", "nfc"},
@@ -560,6 +561,7 @@ func TestWebAuthnUserCredentials(t *testing.T) {
 			},
 			{
 				ID:              "cred2",
+				CredentialID:    []byte("cred2"),
 				PublicKey:       []byte("pubkey2"),
 				AttestationType: "packed",
 				Transport:       []string{"internal"},
