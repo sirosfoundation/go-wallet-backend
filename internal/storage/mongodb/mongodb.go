@@ -221,7 +221,7 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
 	var user domain.User
-	err := s.collection.FindOne(ctx, bson.M{"id.id": id.String()}).Decode(&user)
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -257,7 +257,7 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id": user.UUID.String()}, user)
+	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
@@ -268,7 +268,7 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id.String()})
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id.id": id.String()})
 	if err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
