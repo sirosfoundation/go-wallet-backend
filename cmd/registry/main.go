@@ -89,7 +89,7 @@ func main() {
 	router.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handlers
-	handler := registry.NewHandler(store, &config.DynamicCache, logger)
+	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger)
 	handler.RegisterRoutes(router)
 
 	// Create HTTP server

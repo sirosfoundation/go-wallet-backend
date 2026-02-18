@@ -12,6 +12,7 @@ import (
 type Handler struct {
 	store          *Store
 	dynamicFetcher *DynamicFetcher
+	imageEmbedder  *ImageEmbedder
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
 
@@ -20,14 +21,19 @@ type Handler struct {
 }
 
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, logger *zap.Logger) *Handler {
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *ImageEmbedConfig, logger *zap.Logger) *Handler {
 	var dynamicFetcher *DynamicFetcher
 	if config != nil && config.Enabled {
 		dynamicFetcher = NewDynamicFetcher(config, logger)
 	}
+	var imageEmbedder *ImageEmbedder
+	if imageEmbedConfig == nil || imageEmbedConfig.Enabled {
+		imageEmbedder = NewImageEmbedder(imageEmbedConfig, logger)
+	}
 	h := &Handler{
 		store:          store,
 		dynamicFetcher: dynamicFetcher,
+		imageEmbedder:  imageEmbedder,
 		config:         config,
 		logger:         logger,
 		saveCh:         make(chan struct{}, 1),
@@ -178,7 +184,23 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 func (h *Handler) serveEntry(c *gin.Context, entry *VCTMEntry) {
 	// Return the full VCTM metadata document if available
 	if entry.Metadata != nil {
-		c.Data(http.StatusOK, "application/json", entry.Metadata)
+		data := entry.Metadata
+
+		// Embed images if enabled
+		if h.imageEmbedder != nil {
+			embedded, err := h.imageEmbedder.EmbedImages(c.Request.Context(), data)
+			if err != nil {
+				h.logger.Warn("failed to embed images",
+					zap.String("vct", entry.VCT),
+					zap.Error(err),
+				)
+				// Continue with original data
+			} else {
+				data = embedded
+			}
+		}
+
+		c.Data(http.StatusOK, "application/json", data)
 		return
 	}
 

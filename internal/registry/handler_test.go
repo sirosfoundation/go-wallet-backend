@@ -21,7 +21,7 @@ func testHandlerLogger() *zap.Logger {
 func setupTestRouter(store *Store) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	handler := NewHandler(store, nil, testHandlerLogger())
+	handler := NewHandler(store, nil, nil, testHandlerLogger())
 	handler.RegisterRoutes(router)
 	return router
 }
@@ -30,7 +30,7 @@ func TestNewHandler(t *testing.T) {
 	store := NewStore("")
 	logger := testHandlerLogger()
 
-	handler := NewHandler(store, nil, logger)
+	handler := NewHandler(store, nil, nil, logger)
 
 	require.NotNil(t, handler)
 	assert.Equal(t, store, handler.store)

@@ -22,6 +22,9 @@ type Config struct {
 	// DynamicCache configuration for on-demand URL fetching
 	DynamicCache DynamicCacheConfig `yaml:"dynamic_cache" envconfig:"DYNAMIC_CACHE"`
 
+	// ImageEmbed configuration for embedding images as data URIs
+	ImageEmbed ImageEmbedConfig `yaml:"image_embed" envconfig:"IMAGE_EMBED"`
+
 	// Filter configuration for include/exclude patterns
 	Filter FilterConfig `yaml:"filter" envconfig:"FILTER"`
 
