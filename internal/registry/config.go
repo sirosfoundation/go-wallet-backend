@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 )
 
 // Config holds the registry server configuration
@@ -23,7 +25,7 @@ type Config struct {
 	DynamicCache DynamicCacheConfig `yaml:"dynamic_cache" envconfig:"DYNAMIC_CACHE"`
 
 	// ImageEmbed configuration for embedding images as data URIs
-	ImageEmbed ImageEmbedConfig `yaml:"image_embed" envconfig:"IMAGE_EMBED"`
+	ImageEmbed embed.Config `yaml:"image_embed" envconfig:"IMAGE_EMBED"`
 
 	// Filter configuration for include/exclude patterns
 	Filter FilterConfig `yaml:"filter" envconfig:"FILTER"`

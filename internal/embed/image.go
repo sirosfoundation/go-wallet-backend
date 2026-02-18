@@ -1,4 +1,7 @@
-package registry
+// Package embed provides utilities for embedding external resources as data URIs.
+// It is designed to be used by multiple services (VCTM registry, issuer metadata, etc.)
+// to eliminate recursive fetching by clients.
+package embed
 
 import (
 	"context"
@@ -14,8 +17,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// ImageEmbedConfig contains configuration for image embedding
-type ImageEmbedConfig struct {
+// Config contains configuration for image embedding
+type Config struct {
 	// Enabled controls whether image embedding is active
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
@@ -30,9 +33,9 @@ type ImageEmbedConfig struct {
 	ConcurrentFetches int `yaml:"concurrent_fetches" envconfig:"CONCURRENT_FETCHES"`
 }
 
-// DefaultImageEmbedConfig returns default configuration for image embedding
-func DefaultImageEmbedConfig() ImageEmbedConfig {
-	return ImageEmbedConfig{
+// DefaultConfig returns default configuration for image embedding
+func DefaultConfig() Config {
+	return Config{
 		Enabled:           true,
 		MaxImageSize:      1024 * 1024, // 1MB default
 		Timeout:           10 * time.Second,
@@ -40,63 +43,110 @@ func DefaultImageEmbedConfig() ImageEmbedConfig {
 	}
 }
 
-// ImageEmbedder handles embedding of image URLs as data URIs in VCTM documents
+// URLExtractor is a function that extracts image URLs from a JSON document.
+// Different document types (VCTM, issuer metadata) may have different structures.
+type URLExtractor func(doc map[string]interface{}) []string
+
+// URLReplacer is a function that replaces URLs with data URIs in a JSON document.
+// It should modify the document in place.
+type URLReplacer func(doc map[string]interface{}, dataURLs map[string]string)
+
+// ImageEmbedder handles embedding of image URLs as data URIs in JSON documents
 type ImageEmbedder struct {
-	config *ImageEmbedConfig
-	client *http.Client
-	logger *zap.Logger
+	config    *Config
+	client    *http.Client
+	logger    *zap.Logger
+	extractor URLExtractor
+	replacer  URLReplacer
 }
 
-// NewImageEmbedder creates a new image embedder
-func NewImageEmbedder(config *ImageEmbedConfig, logger *zap.Logger) *ImageEmbedder {
+// Option configures an ImageEmbedder
+type Option func(*ImageEmbedder)
+
+// WithExtractor sets a custom URL extractor function
+func WithExtractor(extractor URLExtractor) Option {
+	return func(e *ImageEmbedder) {
+		e.extractor = extractor
+	}
+}
+
+// WithReplacer sets a custom URL replacer function
+func WithReplacer(replacer URLReplacer) Option {
+	return func(e *ImageEmbedder) {
+		e.replacer = replacer
+	}
+}
+
+// WithHTTPClient sets a custom HTTP client
+func WithHTTPClient(client *http.Client) Option {
+	return func(e *ImageEmbedder) {
+		e.client = client
+	}
+}
+
+// NewImageEmbedder creates a new image embedder with the given configuration.
+// By default, it uses extractors and replacers suitable for VCTM documents.
+// Use WithExtractor and WithReplacer options for other document types.
+func NewImageEmbedder(config *Config, logger *zap.Logger, opts ...Option) *ImageEmbedder {
 	if config == nil {
-		defaultConfig := DefaultImageEmbedConfig()
+		defaultConfig := DefaultConfig()
 		config = &defaultConfig
 	}
-	return &ImageEmbedder{
+
+	e := &ImageEmbedder{
 		config: config,
 		client: &http.Client{
 			Timeout: config.Timeout,
 		},
-		logger: logger,
+		logger:    logger,
+		extractor: DefaultURLExtractor,
+		replacer:  DefaultURLReplacer,
 	}
+
+	for _, opt := range opts {
+		opt(e)
+	}
+
+	return e
 }
 
-// EmbedImages processes a VCTM JSON document and embeds all image URLs as data URIs
-// Returns the modified JSON document
-func (e *ImageEmbedder) EmbedImages(ctx context.Context, vctmData []byte) ([]byte, error) {
+// EmbedImages processes a JSON document and embeds all image URLs as data URIs.
+// Returns the modified JSON document.
+func (e *ImageEmbedder) EmbedImages(ctx context.Context, data []byte) ([]byte, error) {
 	if !e.config.Enabled {
-		return vctmData, nil
+		return data, nil
 	}
 
-	var vctm map[string]interface{}
-	if err := json.Unmarshal(vctmData, &vctm); err != nil {
-		return vctmData, fmt.Errorf("failed to parse VCTM: %w", err)
+	var doc map[string]interface{}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return data, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
-	// Collect all image URLs
-	urls := e.collectImageURLs(vctm)
+	// Collect all image URLs using the configured extractor
+	urls := e.extractor(doc)
 	if len(urls) == 0 {
-		return vctmData, nil
+		return data, nil
 	}
 
 	// Fetch all images concurrently
 	dataURLs := e.fetchImages(ctx, urls)
 
-	// Replace URLs with data URIs in the document
-	e.replaceURLs(vctm, dataURLs)
+	// Replace URLs with data URIs using the configured replacer
+	e.replacer(doc, dataURLs)
 
 	// Serialize back to JSON
-	result, err := json.Marshal(vctm)
+	result, err := json.Marshal(doc)
 	if err != nil {
-		return vctmData, fmt.Errorf("failed to serialize VCTM: %w", err)
+		return data, fmt.Errorf("failed to serialize JSON: %w", err)
 	}
 
 	return result, nil
 }
 
-// collectImageURLs finds all image URLs in a VCTM document
-func (e *ImageEmbedder) collectImageURLs(vctm map[string]interface{}) []string {
+// DefaultURLExtractor extracts image URLs from documents following OpenID4VCI patterns.
+// It looks for "uri" fields in logo, background_image, and svg_templates structures.
+// This works for both VCTM documents and OpenID4VCI issuer/credential metadata.
+func DefaultURLExtractor(doc map[string]interface{}) []string {
 	var urls []string
 	seen := make(map[string]bool)
 
@@ -104,8 +154,8 @@ func (e *ImageEmbedder) collectImageURLs(vctm map[string]interface{}) []string {
 	collect = func(v interface{}) {
 		switch val := v.(type) {
 		case map[string]interface{}:
-			// Check for "uri" field in logo, background_image, or svg_templates
-			if uri, ok := val["uri"].(string); ok && isImageURL(uri) && !seen[uri] {
+			// Check for "uri" field in logo, background_image, svg_templates, etc.
+			if uri, ok := val["uri"].(string); ok && IsImageURL(uri) && !seen[uri] {
 				urls = append(urls, uri)
 				seen[uri] = true
 			}
@@ -120,8 +170,37 @@ func (e *ImageEmbedder) collectImageURLs(vctm map[string]interface{}) []string {
 		}
 	}
 
-	collect(vctm)
+	collect(doc)
 	return urls
+}
+
+// DefaultURLReplacer replaces image URLs with data URIs in documents.
+// It looks for "uri" fields and replaces them with the corresponding data URI.
+func DefaultURLReplacer(doc map[string]interface{}, dataURLs map[string]string) {
+	var replace func(v interface{})
+	replace = func(v interface{}) {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			// Check for "uri" field
+			if uri, ok := val["uri"].(string); ok {
+				if dataURL, found := dataURLs[uri]; found {
+					val["uri"] = dataURL
+					// Remove integrity hash since data URIs are self-contained
+					delete(val, "uri#integrity")
+				}
+			}
+			// Recurse into all fields
+			for _, child := range val {
+				replace(child)
+			}
+		case []interface{}:
+			for _, item := range val {
+				replace(item)
+			}
+		}
+	}
+
+	replace(doc)
 }
 
 // fetchImages fetches all images concurrently and returns a map of URL to data URI
@@ -201,7 +280,7 @@ func (e *ImageEmbedder) fetchAndEncode(ctx context.Context, url string) (string,
 	// Determine MIME type
 	mimeType := resp.Header.Get("Content-Type")
 	if mimeType == "" {
-		mimeType = detectMimeType(url, data)
+		mimeType = DetectMimeType(url, data)
 	}
 	// Clean up MIME type (remove charset etc.)
 	if idx := strings.Index(mimeType, ";"); idx > 0 {
@@ -213,36 +292,8 @@ func (e *ImageEmbedder) fetchAndEncode(ctx context.Context, url string) (string,
 	return fmt.Sprintf("data:%s;base64,%s", mimeType, encoded), nil
 }
 
-// replaceURLs replaces image URLs with data URIs in the VCTM document
-func (e *ImageEmbedder) replaceURLs(vctm map[string]interface{}, dataURLs map[string]string) {
-	var replace func(v interface{})
-	replace = func(v interface{}) {
-		switch val := v.(type) {
-		case map[string]interface{}:
-			// Check for "uri" field
-			if uri, ok := val["uri"].(string); ok {
-				if dataURL, found := dataURLs[uri]; found {
-					val["uri"] = dataURL
-					// Remove integrity hash since data URIs are self-contained
-					delete(val, "uri#integrity")
-				}
-			}
-			// Recurse into all fields
-			for _, child := range val {
-				replace(child)
-			}
-		case []interface{}:
-			for _, item := range val {
-				replace(item)
-			}
-		}
-	}
-
-	replace(vctm)
-}
-
-// isImageURL checks if a URL points to an image resource
-func isImageURL(url string) bool {
+// IsImageURL checks if a URL points to an image resource
+func IsImageURL(url string) bool {
 	// Skip if already a data URI
 	if strings.HasPrefix(url, "data:") {
 		return false
@@ -272,8 +323,8 @@ func isImageURL(url string) bool {
 	return true
 }
 
-// detectMimeType attempts to detect the MIME type of image data
-func detectMimeType(url string, data []byte) string {
+// DetectMimeType attempts to detect the MIME type of image data
+func DetectMimeType(url string, data []byte) string {
 	// First, check file extension
 	lower := strings.ToLower(url)
 	if idx := strings.Index(lower, "?"); idx > 0 {

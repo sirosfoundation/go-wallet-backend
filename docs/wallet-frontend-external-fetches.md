@@ -91,15 +91,21 @@ From VCTM documents:
 
 ### Reusability for Discovery/Trust API
 
-The `ImageEmbedder` implementation (`internal/registry/image_embed.go`) is designed to be
-reusable. When implementing issuer metadata image embedding in the discovery/trust work:
+The `ImageEmbedder` implementation (`internal/embed/image.go`) is designed as a
+standalone package that can be imported by multiple services:
 
-1. Move `ImageEmbedder` to a shared package (e.g., `internal/embed/`)
-2. Import from both registry and discovery/trust handlers
-3. Same pattern: parse JSON → find image URLs → fetch → embed as data: URIs
+1. **VCTM Registry** (`internal/registry/`) - imports `internal/embed`
+2. **Discovery/Trust API** (future) - will import `internal/embed`
 
-The key difference is that discovery/trust will additionally call go-trust for certificate
-chain validation on `signed_metadata` JWTs before embedding images.
+The package supports customization via functional options:
+- `WithExtractor(func)` - custom URL extraction logic
+- `WithReplacer(func)` - custom URL replacement logic
+- `WithHTTPClient(client)` - custom HTTP client
+
+Same pattern: parse JSON → find image URLs → fetch → embed as data: URIs
+
+The key difference for discovery/trust will be that it additionally calls go-trust
+for certificate chain validation on `signed_metadata` JWTs before embedding images.
 - `rendering.simple.logo.uri`
 - `rendering.simple.background_image.uri`
 

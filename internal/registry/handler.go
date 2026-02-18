@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"go.uber.org/zap"
 )
 
@@ -12,7 +13,7 @@ import (
 type Handler struct {
 	store          *Store
 	dynamicFetcher *DynamicFetcher
-	imageEmbedder  *ImageEmbedder
+	imageEmbedder  *embed.ImageEmbedder
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
 
@@ -21,14 +22,14 @@ type Handler struct {
 }
 
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *ImageEmbedConfig, logger *zap.Logger) *Handler {
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger) *Handler {
 	var dynamicFetcher *DynamicFetcher
 	if config != nil && config.Enabled {
 		dynamicFetcher = NewDynamicFetcher(config, logger)
 	}
-	var imageEmbedder *ImageEmbedder
+	var imageEmbedder *embed.ImageEmbedder
 	if imageEmbedConfig == nil || imageEmbedConfig.Enabled {
-		imageEmbedder = NewImageEmbedder(imageEmbedConfig, logger)
+		imageEmbedder = embed.NewImageEmbedder(imageEmbedConfig, logger)
 	}
 	h := &Handler{
 		store:          store,
