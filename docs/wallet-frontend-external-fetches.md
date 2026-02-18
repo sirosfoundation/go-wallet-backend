@@ -63,11 +63,11 @@ The goal is to move traffic from the generic proxy to purpose-specific backend A
 |-------------------|---------------------|--------|
 | VCT metadata via proxy | **VCT Registry** (`/type-metadata`) | ✅ PR #22 |
 | Images/SVG in VCTM | **Embedded in VCTM** (data: URIs) | ✅ PR #22 |
-| `.well-known/*` via proxy | **Discover & Trust** (`/api/discover-and-trust`) | 🔄 PR #995 |
+| Issuer metadata via proxy | **Discovery/Trust API** (with go-trust) | ⏳ api-versioning-discovery-trust |
+| Issuer logos/images | **Embedded in issuer metadata** | ⏳ api-versioning-discovery-trust |
 | OHTTP gateway keys | Already separate endpoint | ✅ Complete |
-| Credential offer URIs | Still needs proxy (arbitrary URLs) | ⏳ No change |
-| mDOC IACAs | Could embed in registry | ⏳ Future |
-| Direct issuer logos | Embed in issuer metadata cache | ⏳ Future |
+| Credential offer URIs | Still needs proxy (arbitrary URLs) | — No change |
+| mDOC IACAs | Could embed in discovery/trust | ⏳ Future |
 
 ## Benefits of Purpose-Specific APIs
 
@@ -88,6 +88,18 @@ From VCTM documents:
 - `display[].logo.uri`
 - `display[].background_image.uri`
 - `rendering.svg_templates[].uri` (SVG content)
+
+### Reusability for Discovery/Trust API
+
+The `ImageEmbedder` implementation (`internal/registry/image_embed.go`) is designed to be
+reusable. When implementing issuer metadata image embedding in the discovery/trust work:
+
+1. Move `ImageEmbedder` to a shared package (e.g., `internal/embed/`)
+2. Import from both registry and discovery/trust handlers
+3. Same pattern: parse JSON → find image URLs → fetch → embed as data: URIs
+
+The key difference is that discovery/trust will additionally call go-trust for certificate
+chain validation on `signed_metadata` JWTs before embedding images.
 - `rendering.simple.logo.uri`
 - `rendering.simple.background_image.uri`
 
@@ -123,11 +135,18 @@ before returning the VCTM to clients. This eliminates:
 **Current flow**: When displaying credentials from OpenID4VCI issuers, the frontend fetches
 logo and background images via the proxy from URLs in `credential_issuer` metadata.
 
-**Solution**: Extend the Discover & Trust service (PR #995) to embed images in cached
-issuer metadata, similar to how the VCTM registry embeds images.
+**Solution**: Add issuer metadata endpoint to the Discovery/Trust API (api-versioning-discovery-trust branch).
+This endpoint would:
+1. Fetch and cache issuer metadata from `/.well-known/openid-credential-issuer`
+2. Validate `signed_metadata` JWTs using go-trust for certificate chain verification
+3. Embed images using the same `ImageEmbedder` pattern from the VCTM registry
+4. Return pre-validated, image-embedded metadata to frontends
+
+**Architectural note**: This belongs in the discovery/trust work rather than the VCTM registry
+because it requires trust validation (go-trust integration) which VCTM does not need.
 
 **Files affected**:
-- `wallet-frontend/src/lib/services/OpenID4VCIHelper.ts` - `fetchIssuerImages()`
+- `wallet-frontend/src/lib/services/OpenID4VCIHelper.ts` - `getCredentialIssuerMetadata()`
 - `wallet-common/src/functions/openID4VCICredentialRendering.ts`
 
 **Estimated reduction**: ~60% of remaining proxy image traffic
@@ -175,10 +194,12 @@ These will continue to require the generic proxy:
 
 | Phase | Component | Traffic Reduction |
 |-------|-----------|-------------------|
-| ✅ Done | VCTM image embedding | ~25% |
-| 🔄 In Progress | Discover & Trust (PR #995) | ~20% |
-| ⏳ Next | Issuer metadata images | ~30% |
-| ⏳ Future | mDOC IACAs + JWT-VC | ~10% |
+| ✅ Done | VCTM image embedding (PR #22) | ~25% |
+| ⏳ Next | Discovery/Trust API with go-trust | ~50% |
+|        | - Issuer metadata + image embedding | |
+|        | - Authorization server metadata | |
+|        | - JWT-VC issuer metadata | |
+| ⏳ Future | mDOC IACAs | ~10% |
 | — | Irreducible (dynamic URLs) | ~15% |
 
 Total estimated proxy traffic reduction: **~85%**
