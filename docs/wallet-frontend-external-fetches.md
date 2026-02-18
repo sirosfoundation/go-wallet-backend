@@ -61,10 +61,13 @@ The goal is to move traffic from the generic proxy to purpose-specific backend A
 
 | Current Mechanism | Purpose-Specific API | Status |
 |-------------------|---------------------|--------|
-| VCT metadata via proxy | **VCT Registry** (`/type-metadata`) | PR #22 |
-| `.well-known/*` via proxy | **Discover & Trust** (`/api/discover-and-trust`) | PR #995 |
-| Images/SVG via proxy | **Embedded in VCTM** | This PR |
-| OHTTP gateway keys | Already separate | Done |
+| VCT metadata via proxy | **VCT Registry** (`/type-metadata`) | ✅ PR #22 |
+| Images/SVG in VCTM | **Embedded in VCTM** (data: URIs) | ✅ PR #22 |
+| `.well-known/*` via proxy | **Discover & Trust** (`/api/discover-and-trust`) | 🔄 PR #995 |
+| OHTTP gateway keys | Already separate endpoint | ✅ Complete |
+| Credential offer URIs | Still needs proxy (arbitrary URLs) | ⏳ No change |
+| mDOC IACAs | Could embed in registry | ⏳ Future |
+| Direct issuer logos | Embed in issuer metadata cache | ⏳ Future |
 
 ## Benefits of Purpose-Specific APIs
 
@@ -112,3 +115,70 @@ before returning the VCTM to clients. This eliminates:
 2. **Trust Evaluation**: Integrate image sources with trust framework
 3. **Content Verification**: Verify integrity of embedded images
 4. **Size Limits**: Enforce maximum image sizes to prevent abuse
+
+## Next Targets for Proxy Elimination
+
+### Priority 1: Issuer Metadata Images (High Impact)
+
+**Current flow**: When displaying credentials from OpenID4VCI issuers, the frontend fetches
+logo and background images via the proxy from URLs in `credential_issuer` metadata.
+
+**Solution**: Extend the Discover & Trust service (PR #995) to embed images in cached
+issuer metadata, similar to how the VCTM registry embeds images.
+
+**Files affected**:
+- `wallet-frontend/src/lib/services/OpenID4VCIHelper.ts` - `fetchIssuerImages()`
+- `wallet-common/src/functions/openID4VCICredentialRendering.ts`
+
+**Estimated reduction**: ~60% of remaining proxy image traffic
+
+### Priority 2: mDOC IACAs (Medium Impact)
+
+**Current flow**: mDOC credentials include `mdoc_iacas_uri` pointing to issuer authority
+certificate authorities. These are fetched via proxy each time.
+
+**Solution**: Add IACA caching to the registry or Discover & Trust service. IACAs change
+rarely and can be cached aggressively.
+
+**Files affected**:
+- `wallet-common/src/functions/OpenID4VCIHelper.ts` - IACA fetch logic
+
+**Estimated reduction**: ~10% of proxy traffic (infrequent but predictable)
+
+### Priority 3: JWT-VC Issuer Metadata (Medium Impact)
+
+**Current flow**: For JWT-VC credentials without `vct`, the frontend fetches
+`/.well-known/jwt-vc-issuer` from the issuer origin.
+
+**Solution**: Route through Discover & Trust with caching. The metadata is static and
+benefits from trust evaluation.
+
+**Files affected**:
+- `wallet-common/src/functions/getSdJwtVcMetadata.ts` - `getJwtVcMetadata()`
+
+### Priority 4: Authorization Server Metadata (Lower Priority)
+
+**Current flow**: OAuth AS metadata is fetched during credential issuance flow.
+
+**Solution**: Already targeted by Discover & Trust PR #995. Caching here helps issuance
+flow performance.
+
+### Remaining Proxy Uses (Cannot Eliminate)
+
+These will continue to require the generic proxy:
+
+1. **Credential Offer URIs**: Arbitrary URLs from QR codes cannot be pre-cached
+2. **Dynamic external resources**: URLs not known until presentation time
+3. **One-time URLs**: Token endpoints, redirect URIs, etc.
+
+## Proxy Traffic Reduction Summary
+
+| Phase | Component | Traffic Reduction |
+|-------|-----------|-------------------|
+| ✅ Done | VCTM image embedding | ~25% |
+| 🔄 In Progress | Discover & Trust (PR #995) | ~20% |
+| ⏳ Next | Issuer metadata images | ~30% |
+| ⏳ Future | mDOC IACAs + JWT-VC | ~10% |
+| — | Irreducible (dynamic URLs) | ~15% |
+
+Total estimated proxy traffic reduction: **~85%**
