@@ -1,0 +1,95 @@
+# Registry Server Configuration
+# This file provides example configuration for the VCTM registry server.
+
+# Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8097
+
+# Source configuration - where to fetch VCTMs from
+source:
+  # URL of the upstream VCTM registry index
+  url: "https://registry.siros.org/.well-known/vctm-registry.json"
+  
+  # How often to poll for updates (e.g., 5m, 1h)
+  poll_interval: 5m
+  
+  # HTTP timeout for fetching from upstream
+  timeout: 30s
+
+# Cache configuration
+cache:
+  # Path to the disk cache file
+  path: "data/vctm-cache.json"
+  
+  # Maximum age of cached data before forcing refresh
+  max_age: 24h
+
+# Dynamic cache configuration - on-demand fetching of VCTMs by URL
+dynamic_cache:
+  # Enable on-demand fetching for VCTs identified by URL
+  enabled: true
+  
+  # Default cache TTL when no HTTP cache headers are present
+  default_ttl: 1h
+  
+  # Maximum TTL to respect from HTTP headers (caps longer values)
+  max_ttl: 24h
+  
+  # Minimum TTL (bumps up shorter values from HTTP headers)
+  min_ttl: 5m
+  
+  # HTTP timeout for dynamic fetch requests
+  timeout: 30s
+  
+  # Optional: List of allowed host patterns (regex)
+  # If empty, all HTTPS hosts are allowed
+  allowed_hosts: []
+  #  - "^credentials\\.example\\.com$"
+  #  - "\\.gov$"
+
+# Filter configuration - control which VCTs to include
+filter:
+  # Regex patterns for VCT IDs to include (if empty, all are included)
+  include_patterns: []
+  #  - "^https://credentials\\.siros\\."
+  #  - "^https://example\\.com/"
+  
+  # Regex patterns for VCT IDs to exclude
+  exclude_patterns: []
+  #  - "^https://test\\."
+  #  - "-dev$"
+
+# Rate limiting configuration
+rate_limit:
+  enabled: true
+  
+  # Requests per minute for authenticated clients
+  authenticated_rpm: 1000
+  
+  # Requests per minute for unauthenticated clients  
+  unauthenticated_rpm: 100
+  
+  # Allow bursts of this multiple of the rate limit
+  burst_multiplier: 3
+
+# JWT configuration for authentication
+jwt:
+  # Shared secret for HMAC signature validation
+  # Use environment variable REGISTRY_JWT_SECRET in production
+  secret: ""
+  
+  # Expected issuer of JWT tokens
+  issuer: "wallet-backend"
+  
+  # If true, all requests require valid JWT authentication
+  # If false, unauthenticated requests are allowed (with lower rate limits)
+  require_auth: false
+
+# Logging configuration
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+  
+  # Log format: json, text
+  format: "json"
