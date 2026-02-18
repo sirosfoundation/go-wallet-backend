@@ -479,6 +479,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
 				ID:              base64.RawURLEncoding.EncodeToString(credential.ID),
+				TenantID:        tenantID, // Store credential's tenant for isolation
 				CredentialID:    credential.ID,
 				PublicKey:       credential.PublicKey,
 				AttestationType: credential.AttestationType,
@@ -1117,6 +1118,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	now := time.Now()
 	newCred := domain.WebauthnCredential{
 		ID:              base64.RawURLEncoding.EncodeToString(credential.ID),
+		TenantID:        domain.TenantID(challenge.TenantID), // Store credential's tenant for isolation
 		CredentialID:    credential.ID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: credential.AttestationType,
