@@ -16,7 +16,7 @@ source:
   timeout: 30s
 
 cache:
-  path: "/var/lib/registry/vctm-cache.json"
+  path: "/app/data/vctm-cache.json"
   max_age: 24h
 
 dynamic_cache:

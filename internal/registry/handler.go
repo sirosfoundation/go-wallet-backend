@@ -2,6 +2,7 @@ package registry
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -13,6 +14,9 @@ type Handler struct {
 	dynamicFetcher *DynamicFetcher
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
+
+	// Debounced save mechanism
+	saveCh chan struct{}
 }
 
 // NewHandler creates a new registry handler
@@ -21,11 +25,60 @@ func NewHandler(store *Store, config *DynamicCacheConfig, logger *zap.Logger) *H
 	if config != nil && config.Enabled {
 		dynamicFetcher = NewDynamicFetcher(config, logger)
 	}
-	return &Handler{
+	h := &Handler{
 		store:          store,
 		dynamicFetcher: dynamicFetcher,
 		config:         config,
 		logger:         logger,
+		saveCh:         make(chan struct{}, 1),
+	}
+	// Start the debounced save worker
+	go h.saveWorker()
+	return h
+}
+
+// saveWorker runs in the background and coalesces save requests
+func (h *Handler) saveWorker() {
+	debounceDelay := 5 * time.Second
+	timer := time.NewTimer(debounceDelay)
+	timer.Stop() // Start with a stopped timer
+	pendingSave := false
+
+	for {
+		select {
+		case _, ok := <-h.saveCh:
+			if !ok {
+				// Channel closed, perform final save if pending
+				timer.Stop()
+				if pendingSave {
+					if err := h.store.Save(); err != nil {
+						h.logger.Error("failed to save store", zap.Error(err))
+					}
+				}
+				return
+			}
+			// Request save, start/reset debounce timer
+			if !pendingSave {
+				pendingSave = true
+				timer.Reset(debounceDelay)
+			}
+		case <-timer.C:
+			if pendingSave {
+				if err := h.store.Save(); err != nil {
+					h.logger.Error("failed to save store after dynamic fetch", zap.Error(err))
+				}
+				pendingSave = false
+			}
+		}
+	}
+}
+
+// requestSave signals that the store should be saved (debounced)
+func (h *Handler) requestSave() {
+	select {
+	case h.saveCh <- struct{}{}:
+	default:
+		// Channel full, save already pending
 	}
 }
 
@@ -79,7 +132,7 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 				"error":   "not_found",
 				"message": "Credential type not found and could not be fetched",
 				"vct":     vctID,
-				"detail":  err.Error(),
+				"detail":  "dynamic fetch failed",
 			})
 			return
 		}
@@ -98,12 +151,8 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 		// Store the new entry
 		if result.Entry != nil {
 			h.store.Set(vctID, result.Entry)
-			// Save to disk asynchronously
-			go func() {
-				if err := h.store.Save(); err != nil {
-					h.logger.Error("failed to save store after dynamic fetch", zap.Error(err))
-				}
-			}()
+			// Request debounced save to disk
+			h.requestSave()
 			c.Header("X-Cache-Status", "fetched")
 			h.serveEntry(c, result.Entry)
 			return

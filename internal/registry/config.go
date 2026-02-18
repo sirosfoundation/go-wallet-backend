@@ -236,7 +236,7 @@ func DefaultConfig() *Config {
 			MaxAge: 24 * time.Hour,
 		},
 		DynamicCache: DynamicCacheConfig{
-			Enabled:      true,
+			Enabled:      false, // Disabled by default to prevent SSRF
 			DefaultTTL:   1 * time.Hour,
 			MaxTTL:       24 * time.Hour,
 			MinTTL:       5 * time.Minute,

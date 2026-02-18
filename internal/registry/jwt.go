@@ -50,6 +50,21 @@ func JWTMiddleware(config JWTConfig, logger *zap.Logger) gin.HandlerFunc {
 
 		tokenString := parts[1]
 
+		// Reject validation if secret is empty (prevents empty-key HMAC attacks)
+		if config.Secret == "" {
+			logger.Debug("JWT secret is empty, rejecting token")
+			if config.RequireAuth {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error":   "unauthorized",
+					"message": "Authentication not configured",
+				})
+				c.Abort()
+				return
+			}
+			c.Next()
+			return
+		}
+
 		// Parse and validate the token
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			// Validate signing method

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -59,7 +60,8 @@ type Fetcher struct {
 	logger *zap.Logger
 
 	// stopCh signals the polling goroutine to stop
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewFetcher creates a new registry fetcher
@@ -88,9 +90,11 @@ func (f *Fetcher) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the polling loop
+// Stop stops the polling loop (safe to call multiple times)
 func (f *Fetcher) Stop() {
-	close(f.stopCh)
+	f.stopOnce.Do(func() {
+		close(f.stopCh)
+	})
 }
 
 // pollLoop runs the periodic fetch

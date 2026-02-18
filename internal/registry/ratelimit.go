@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -48,33 +49,24 @@ func NewRateLimiter(config RateLimitConfig) *RateLimiter {
 
 // getLimiter returns the rate limiter for a client
 func (r *RateLimiter) getLimiter(clientIP string) *clientLimiter {
-	r.mu.RLock()
-	limiter, exists := r.clients[clientIP]
-	r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
+	limiter, exists := r.clients[clientIP]
 	if exists {
 		limiter.lastSeen = time.Now()
 		return limiter
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Double-check after acquiring write lock
-	if limiter, exists := r.clients[clientIP]; exists {
-		limiter.lastSeen = time.Now()
-		return limiter
-	}
-
-	// Create new limiter
+	// Create new limiter - use ceiling to avoid truncation for low RPM values
 	authRate := rate.Limit(float64(r.config.AuthenticatedRPM) / 60.0)
-	authBurst := r.config.AuthenticatedRPM / 60 * r.config.BurstMultiplier
+	authBurst := int(math.Ceil(float64(r.config.AuthenticatedRPM) / 60.0 * float64(r.config.BurstMultiplier)))
 	if authBurst < 1 {
 		authBurst = 1
 	}
 
 	anonRate := rate.Limit(float64(r.config.UnauthenticatedRPM) / 60.0)
-	anonBurst := r.config.UnauthenticatedRPM / 60 * r.config.BurstMultiplier
+	anonBurst := int(math.Ceil(float64(r.config.UnauthenticatedRPM) / 60.0 * float64(r.config.BurstMultiplier)))
 	if anonBurst < 1 {
 		anonBurst = 1
 	}

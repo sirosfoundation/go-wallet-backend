@@ -136,11 +136,16 @@ func (s *Store) Load() error {
 // Save persists the store to the disk cache
 func (s *Store) Save() error {
 	s.mu.RLock()
+	// Copy the entries map to avoid data race during marshaling
+	entriesCopy := make(map[string]*VCTMEntry, len(s.entries))
+	for k, v := range s.entries {
+		entriesCopy[k] = v
+	}
 	cache := CacheData{
 		Version:     "1",
 		LastUpdated: s.lastUpdated,
 		SourceURL:   s.sourceURL,
-		Entries:     s.entries,
+		Entries:     entriesCopy,
 	}
 	s.mu.RUnlock()
 

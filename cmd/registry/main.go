@@ -21,7 +21,7 @@ import (
 
 func main() {
 	// Parse command line flags
-	configFile := flag.String("config", "config/registry.yaml", "Path to configuration file")
+	configFile := flag.String("config", "configs/registry.yaml", "Path to configuration file")
 	flag.Parse()
 
 	// Load configuration

@@ -27,9 +27,9 @@ RUN go mod download
 
 COPY . .
 
-# Build the registry server with version information
+# Build the registry server
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT}" \
+    -ldflags="-s -w" \
     -o registry cmd/registry/main.go
 
 # Runtime stage

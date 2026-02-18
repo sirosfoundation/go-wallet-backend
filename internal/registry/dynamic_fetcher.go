@@ -59,9 +59,10 @@ func (f *DynamicFetcher) Fetch(ctx context.Context, vctURL string, existingEntry
 		return nil, fmt.Errorf("only HTTPS URLs are allowed")
 	}
 
-	// Check if host is allowed
-	if !f.config.IsHostAllowed(parsedURL.Host) {
-		return nil, fmt.Errorf("host %q is not in the allowed hosts list", parsedURL.Host)
+	// Check if host is allowed (without port)
+	host := parsedURL.Hostname()
+	if !f.config.IsHostAllowed(host) {
+		return nil, fmt.Errorf("host %q is not in the allowed hosts list", host)
 	}
 
 	// Create request
