@@ -139,7 +139,7 @@ func TestDynamicFetcher_Fetch_Success(t *testing.T) {
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Header().Set("ETag", `"abc123"`)
 		w.Header().Set("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
-		w.Write(vctmJSON)
+		_, _ = w.Write(vctmJSON)
 	}))
 	defer server.Close()
 
@@ -244,7 +244,7 @@ func TestDynamicFetcher_Fetch_HostNotAllowed(t *testing.T) {
 	// Create a TLS test server (for allowed host matching)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"vct":"test"}`))
+		_, _ = w.Write([]byte(`{"vct":"test"}`))
 	}))
 	defer server.Close()
 
@@ -294,7 +294,7 @@ func TestDynamicFetcher_Fetch_ServerError(t *testing.T) {
 func TestDynamicFetcher_Fetch_InvalidJSON(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("not valid json"))
+		_, _ = w.Write([]byte("not valid json"))
 	}))
 	defer server.Close()
 

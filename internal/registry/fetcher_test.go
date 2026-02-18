@@ -70,7 +70,7 @@ func TestFetcher_FetchIndex(t *testing.T) {
 		assert.Equal(t, "go-wallet-registry/1.0", r.Header.Get("User-Agent"))
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(index)
+		_ = json.NewEncoder(w).Encode(index)
 	}))
 	defer server.Close()
 
@@ -111,7 +111,7 @@ func TestFetcher_FetchIndex_ServerError(t *testing.T) {
 func TestFetcher_FetchIndex_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("not valid json"))
+		_, _ = w.Write([]byte("not valid json"))
 	}))
 	defer server.Close()
 
@@ -132,7 +132,7 @@ func TestFetcher_FetchVCTM(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(vctmContent))
+		_, _ = w.Write([]byte(vctmContent))
 	}))
 	defer server.Close()
 
@@ -205,7 +205,7 @@ func TestFetcher_FetchVCTM_FallbackToMetadataJSON(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(vctmContent))
+		_, _ = w.Write([]byte(vctmContent))
 	}))
 	defer server.Close()
 
@@ -255,7 +255,7 @@ func TestFetcher_FetchVCTM_ServerError(t *testing.T) {
 func TestFetcher_FetchVCTM_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("not valid json {"))
+		_, _ = w.Write([]byte("not valid json {"))
 	}))
 	defer server.Close()
 
@@ -295,7 +295,7 @@ func TestFetcher_Fetch_WithFilter(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(index)
+		_ = json.NewEncoder(w).Encode(index)
 	}))
 	defer server.Close()
 
@@ -330,7 +330,7 @@ func TestFetcher_Fetch_UpdatesStore(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(index)
+		_ = json.NewEncoder(w).Encode(index)
 	}))
 	defer server.Close()
 
@@ -359,7 +359,7 @@ func TestFetcher_StartAndStop(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(index)
+		_ = json.NewEncoder(w).Encode(index)
 	}))
 	defer server.Close()
 
@@ -393,7 +393,7 @@ func TestFetcher_ContextCancellation(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(index)
+		_ = json.NewEncoder(w).Encode(index)
 	}))
 	defer server.Close()
 

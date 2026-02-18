@@ -162,7 +162,7 @@ func (s *Store) Save() error {
 	}
 
 	if err := os.Rename(tmpPath, s.cachePath); err != nil {
-		os.Remove(tmpPath) // Clean up on failure
+		_ = os.Remove(tmpPath) // Clean up on failure
 		return fmt.Errorf("failed to rename cache file: %w", err)
 	}
 
