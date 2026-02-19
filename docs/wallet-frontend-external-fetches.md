@@ -55,32 +55,69 @@ The wallet-frontend fetches external resources via two mechanisms:
 | Backend Status | `{BACKEND_URL}/status` | StatusContextProvider.tsx |
 | Backend API | `{BACKEND_URL}/api/*` | Various |
 
-## Strategy: Purpose-Specific APIs
+## Strategy: Purpose-Specific APIs via Hybrid Binary
 
-The goal is to move traffic from the generic proxy to purpose-specific backend APIs:
+The wallet backend is built as a **hybrid binary** with multiple operating modes.
+Each mode serves specific purposes, replacing the generic proxy:
 
-| Current Mechanism | Purpose-Specific API | Status |
-|-------------------|---------------------|--------|
-| VCT metadata via proxy | **VCT Registry** (`/type-metadata`) | ✅ PR #22 |
-| Images/SVG in VCTM | **Embedded in VCTM** (data: URIs) | ✅ PR #22 |
-| Issuer metadata via proxy | **Discovery/Trust API** (with go-trust) | ⏳ api-versioning-discovery-trust |
-| Issuer logos/images | **Embedded in issuer metadata** | ⏳ api-versioning-discovery-trust |
-| OHTTP gateway keys | Already separate endpoint | ✅ Complete |
-| Credential offer URIs | Still needs proxy (arbitrary URLs) | — No change |
-| mDOC IACAs | Could embed in discovery/trust | ⏳ Future |
+### Operating Modes
+
+```bash
+go-wallet --mode=<mode>
+
+Modes:
+  all       Development: all services in one process
+  engine    WebSocket protocol flows (OID4VCI, OID4VP)
+  registry  VCTM and issuer metadata with image embedding
+  auth      User authentication (WebAuthn, OAuth)
+  storage   Encrypted credential storage
+  backend   Admin API, background workers
+```
+
+### Traffic Routing
+
+| Current Mechanism | Target Service | Mode | Status |
+|-------------------|---------------|------|--------|
+| VCT metadata via proxy | `GET /type-metadata` | registry | ✅ Complete |
+| Images/SVG in VCTM | Embedded by registry | registry | ✅ Complete |
+| Issuer metadata via proxy | `GET /issuer-metadata` | registry | ✅ Complete |
+| OID4VCI flows via proxy | WebSocket `/api/v2/wallet` | engine | 📋 Designed |
+| OID4VP flows via proxy | WebSocket `/api/v2/wallet` | engine | 📋 Designed |
+| OHTTP gateway keys | Direct fetch (unchanged) | — | ✅ N/A |
+| Login/Registration | `POST /auth/*` | auth | ✅ Current |
+| Credential storage | `PUT /storage/*` | storage | ✅ Current |
+
+### Privacy: Client-Side Credential Matching
+
+The engine does NOT have access to the user's credential store. During OID4VP:
+
+1. Engine sends `presentation_definition` to client via WebSocket
+2. Client matches credentials locally (never sends full inventory)
+3. Client returns only matched credential IDs
+4. Engine requests signature for selected credentials only
+
+See `websocket-protocol-spec.md` for the `match_credentials` protocol step.
+
+### Native App: Local Engine Privacy
+
+Native apps can embed the engine locally. In this mode:
+- All OID4VCI/OID4VP flows happen on-device
+- Cloud services only see login and encrypted storage
+- Issuers/verifiers never know user's cloud identity
 
 ## Benefits of Purpose-Specific APIs
 
-1. **Caching**: Backend can implement intelligent caching strategies
-2. **Validation**: Backend can validate and sanitize responses
-3. **Trust**: Backend can verify signatures and trust chains
-4. **Privacy**: Reduces frontend fingerprinting via request patterns
-5. **Performance**: Backend can batch and prefetch related resources
-6. **Security**: Reduces SSRF attack surface by limiting proxy scope
+1. **Caching**: Registry can cache VCTM and issuer metadata
+2. **Validation**: Engine validates all protocol messages
+3. **Trust**: Registry/Engine integrate with go-trust via AuthZEN
+4. **Privacy**: Client-side matching; local engine option
+5. **Performance**: WebSocket eliminates round-trips
+6. **Security**: No arbitrary URL fetching; SSRF mitigations built-in
 
 ## VCT Registry Image Embedding
 
-The VCT Registry server embeds image URLs as data: URIs to eliminate recursive fetching:
+The VCT Registry server (`--mode=registry`) embeds image URLs as data: URIs to
+eliminate recursive fetching:
 
 ### Images Embedded
 
@@ -89,13 +126,13 @@ From VCTM documents:
 - `display[].background_image.uri`
 - `rendering.svg_templates[].uri` (SVG content)
 
-### Reusability for Discovery/Trust API
+### Reusability Across Services
 
 The `ImageEmbedder` implementation (`internal/embed/image.go`) is designed as a
-standalone package that can be imported by multiple services:
+standalone package that can be imported by multiple modes:
 
-1. **VCTM Registry** (`internal/registry/`) - imports `internal/embed`
-2. **Discovery/Trust API** (future) - will import `internal/embed`
+1. **Registry mode** (`internal/modes/registry/`) - VCTM and issuer metadata
+2. **Engine mode** (`internal/modes/engine/`) - During OID4VCI flows
 
 The package supports customization via functional options:
 - `WithExtractor(func)` - custom URL extraction logic
@@ -129,83 +166,90 @@ before returning the VCTM to clients. This eliminates:
 
 ## Future Work
 
-1. **Asset Registry**: Dedicated endpoint for logos, backgrounds, and SVGs
-2. **Trust Evaluation**: Integrate image sources with trust framework
-3. **Content Verification**: Verify integrity of embedded images
-4. **Size Limits**: Enforce maximum image sizes to prevent abuse
+1. **Size Limits**: Enforce maximum image sizes to prevent abuse
+2. **Content Verification**: Verify integrity of embedded images
+3. **Offline Support**: Cache VCTM and issuer metadata for offline display
 
-## Next Targets for Proxy Elimination
+## WebSocket Engine: Complete Proxy Elimination
 
-### Priority 1: Issuer Metadata Images (High Impact)
+### How the Engine Eliminates Proxy Usage
 
-**Current flow**: When displaying credentials from OpenID4VCI issuers, the frontend fetches
-logo and background images via the proxy from URLs in `credential_issuer` metadata.
+All remaining proxy traffic is eliminated by the WebSocket engine (`--mode=engine`).
+The engine handles protocol flows internally, making external HTTP requests on behalf
+of the client while applying SSRF protections and trust validation.
 
-**Solution**: Add issuer metadata endpoint to the Discovery/Trust API (api-versioning-discovery-trust branch).
-This endpoint would:
-1. Fetch and cache issuer metadata from `/.well-known/openid-credential-issuer`
-2. Validate `signed_metadata` JWTs using go-trust for certificate chain verification
-3. Embed images using the same `ImageEmbedder` pattern from the VCTM registry
-4. Return pre-validated, image-embedded metadata to frontends
+| Current Proxy Usage | Engine Solution |
+|--------------------|-----------------| 
+| Issuer metadata fetch | Engine fetches during `oid4vci` flow |
+| Issuer logo images | Embedded in `metadata_fetched` step |
+| Token endpoint calls | Engine calls during flow |
+| Credential endpoint calls | Engine calls during flow |
+| Authorization server metadata | Engine fetches during flow |
+| credential_offer_uri fetch | Engine validates and fetches |
+| mDOC IACAs | Engine fetches and caches |
+| Verifier metadata | Engine fetches during `oid4vp` flow |
+| VP response submission | Engine submits during flow |
 
-**Architectural note**: This belongs in the discovery/trust work rather than the VCTM registry
-because it requires trust validation (go-trust integration) which VCTM does not need.
+### Protocol-Aware Request Handling
 
-**Files affected**:
-- `wallet-frontend/src/lib/services/OpenID4VCIHelper.ts` - `getCredentialIssuerMetadata()`
-- `wallet-common/src/functions/openID4VCICredentialRendering.ts`
+Unlike the generic proxy, the engine:
 
-**Estimated reduction**: ~60% of remaining proxy image traffic
+1. **Validates URLs** - Only fetches from protocol-defined paths:
+   - `/.well-known/openid-credential-issuer`
+   - `/.well-known/oauth-authorization-server`
+   - Endpoints declared in fetched metadata
 
-### Priority 2: mDOC IACAs (Medium Impact)
+2. **Blocks SSRF** - Rejects requests to:
+   - Private IP ranges (10.x, 172.16-31.x, 192.168.x)
+   - Localhost and link-local addresses
+   - Cloud metadata endpoints
 
-**Current flow**: mDOC credentials include `mdoc_iacas_uri` pointing to issuer authority
-certificate authorities. These are fetched via proxy each time.
+3. **Validates responses** - All fetched content validated against schemas
 
-**Solution**: Add IACA caching to the registry or Discover & Trust service. IACAs change
-rarely and can be cached aggressively.
+4. **Embeds images** - Logo and background images converted to data: URIs
 
-**Files affected**:
-- `wallet-common/src/functions/OpenID4VCIHelper.ts` - IACA fetch logic
+5. **Evaluates trust** - Calls go-trust (AuthZEN) for issuer/verifier validation
 
-**Estimated reduction**: ~10% of proxy traffic (infrequent but predictable)
+### Proxy Traffic Reduction Summary
 
-### Priority 3: JWT-VC Issuer Metadata (Medium Impact)
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PROXY ELIMINATION PROGRESS                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Current State (all via /proxy):                                            │
+│  ██████████████████████████████████████████████████████████████ 100%       │
+│                                                                             │
+│  After Registry Mode (--mode=registry):                                     │
+│  ░░░░░░░░░░░░░░░░██████████████████████████████████████████████ 75%        │
+│  ^^^^^^^^^^^^^^^^^                                                          │
+│  VCTM + issuer-metadata (25%)                                               │
+│                                                                             │
+│  After Engine Mode (--mode=engine):                                         │
+│  ░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 0%         │
+│  ^ Registry (25%)  ^ Engine handles all flows (75%)                         │
+│                                                                             │
+│  Legend: █ = Proxy  ░ = Registry  ▓ = Engine                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Current flow**: For JWT-VC credentials without `vct`, the frontend fetches
-`/.well-known/jwt-vc-issuer` from the issuer origin.
+### Remaining Proxy: Emergency Fallback Only
 
-**Solution**: Route through Discover & Trust with caching. The metadata is static and
-benefits from trust evaluation.
+After engine adoption, the `/proxy` endpoint can be:
+1. Rate-limited severely
+2. Logged for analysis
+3. Eventually disabled
 
-**Files affected**:
-- `wallet-common/src/functions/getSdJwtVcMetadata.ts` - `getJwtVcMetadata()`
+Keep for:
+- Legacy frontend versions during migration
+- Debug/development scenarios
+- Non-conformant implementations (rare)
 
-### Priority 4: Authorization Server Metadata (Lower Priority)
+## Related Documents
 
-**Current flow**: OAuth AS metadata is fetched during credential issuance flow.
-
-**Solution**: Already targeted by Discover & Trust PR #995. Caching here helps issuance
-flow performance.
-
-### Remaining Proxy Uses (Cannot Eliminate)
-
-These will continue to require the generic proxy:
-
-1. **Credential Offer URIs**: Arbitrary URLs from QR codes cannot be pre-cached
-2. **Dynamic external resources**: URLs not known until presentation time
-3. **One-time URLs**: Token endpoints, redirect URIs, etc.
-
-## Proxy Traffic Reduction Summary
-
-| Phase | Component | Traffic Reduction |
-|-------|-----------|-------------------|
-| ✅ Done | VCTM image embedding (PR #22) | ~25% |
-| ⏳ Next | Discovery/Trust API with go-trust | ~50% |
-|        | - Issuer metadata + image embedding | |
-|        | - Authorization server metadata | |
-|        | - JWT-VC issuer metadata | |
-| ⏳ Future | mDOC IACAs | ~10% |
-| — | Irreducible (dynamic URLs) | ~15% |
-
-Total estimated proxy traffic reduction: **~85%**
+| Document | Purpose |
+|----------|---------|
+| `proxy-elimination-plan.md` | Implementation plan, hybrid binary architecture |
+| `websocket-protocol-spec.md` | WebSocket protocol, message formats, flow definitions |
+| `frontend-websocket-integration.md` | Frontend transport abstraction |
