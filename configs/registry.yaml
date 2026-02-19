@@ -97,9 +97,12 @@ trust:
   default_endpoint: ""
   
   # Default trust cache TTL in seconds (default: 86400 = 24 hours)
+  # Per-tenant TTL can override this via Admin API
   default_ttl: 86400
   
-  # How often to check for stale trust evaluations in seconds (default: 3600 = 1 hour)
+  # Global refresh interval: how often to refresh all stale trust evaluations (seconds)
+  # This is a server-wide setting, not per-tenant
+  # Default: 3600 (1 hour)
   refresh_interval: 3600
   
   # Optional path to cache issuer trust status

@@ -49,10 +49,6 @@ type TrustConfig struct {
 	// TrustTTL is how long trust evaluations remain valid (in seconds).
 	// Default: 86400 (24 hours)
 	TrustTTL int `json:"trust_ttl,omitempty" bson:"trust_ttl" gorm:"column:trust_ttl;default:86400"`
-
-	// RefreshInterval is how often to check for stale trust evaluations (in seconds).
-	// Default: 3600 (1 hour)
-	RefreshInterval int `json:"refresh_interval,omitempty" bson:"refresh_interval" gorm:"column:refresh_interval;default:3600"`
 }
 
 // Tenant represents an organizational tenant

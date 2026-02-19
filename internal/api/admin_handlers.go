@@ -37,9 +37,8 @@ type TenantRequest struct {
 
 // TrustConfigRequest represents the trust configuration in API requests
 type TrustConfigRequest struct {
-	TrustEndpoint   string `json:"trust_endpoint,omitempty"`
-	TrustTTL        *int   `json:"trust_ttl,omitempty"`        // seconds
-	RefreshInterval *int   `json:"refresh_interval,omitempty"` // seconds
+	TrustEndpoint string `json:"trust_endpoint,omitempty"`
+	TrustTTL      *int   `json:"trust_ttl,omitempty"` // seconds
 }
 
 // TenantResponse represents a tenant in API responses
@@ -55,9 +54,8 @@ type TenantResponse struct {
 
 // TrustConfigResponse represents the trust configuration in API responses
 type TrustConfigResponse struct {
-	TrustEndpoint   string `json:"trust_endpoint,omitempty"`
-	TrustTTL        int    `json:"trust_ttl"`        // seconds
-	RefreshInterval int    `json:"refresh_interval"` // seconds
+	TrustEndpoint string `json:"trust_endpoint,omitempty"`
+	TrustTTL      int    `json:"trust_ttl"` // seconds
 }
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
@@ -70,11 +68,10 @@ func tenantToResponse(t *domain.Tenant) *TenantResponse {
 		UpdatedAt:   t.UpdatedAt,
 	}
 	// Include trust config if any non-default values are set
-	if t.TrustConfig.TrustEndpoint != "" || t.TrustConfig.TrustTTL != 0 || t.TrustConfig.RefreshInterval != 0 {
+	if t.TrustConfig.TrustEndpoint != "" || t.TrustConfig.TrustTTL != 0 {
 		resp.TrustConfig = &TrustConfigResponse{
-			TrustEndpoint:   t.TrustConfig.TrustEndpoint,
-			TrustTTL:        t.TrustConfig.TrustTTL,
-			RefreshInterval: t.TrustConfig.RefreshInterval,
+			TrustEndpoint: t.TrustConfig.TrustEndpoint,
+			TrustTTL:      t.TrustConfig.TrustTTL,
 		}
 	}
 	return resp
@@ -165,9 +162,6 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 		if req.TrustConfig.TrustTTL != nil {
 			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
 		}
-		if req.TrustConfig.RefreshInterval != nil {
-			tenant.TrustConfig.RefreshInterval = *req.TrustConfig.RefreshInterval
-		}
 	}
 
 	if err := h.store.Tenants().Create(c.Request.Context(), tenant); err != nil {
@@ -214,9 +208,6 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
 		if req.TrustConfig.TrustTTL != nil {
 			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
-		}
-		if req.TrustConfig.RefreshInterval != nil {
-			tenant.TrustConfig.RefreshInterval = *req.TrustConfig.RefreshInterval
 		}
 	}
 	tenant.UpdatedAt = time.Now()
