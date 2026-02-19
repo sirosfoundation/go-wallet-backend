@@ -243,12 +243,13 @@ Phase 4: Validation & Rollout (Week 8)
 
 ## Milestone Definitions
 
-### M1: Pre-computed Trust (End of Phase 1) - IN PROGRESS
+### M1: Trust Integration (End of Phase 1) - IN PROGRESS
 - ✅ VCTM Registry merged
-- ✅ IssuerStore with trust status per issuer
-- ✅ Trust evaluation at issuer registration time
-- ✅ JIT discover-and-trust endpoint for unknown issuers
-- ⬜ Wire up IssuerStore in main server
+- ✅ TrustService wrapping go-trust evaluators
+- ✅ JIT discover-and-trust endpoint
+- ✅ Trust fields in CredentialIssuer (TrustStatus, TrustFramework, TrustEvaluatedAt)
+- ⬜ Per-tenant TrustEvaluator configuration
+- ⬜ Admin API integration (evaluate on issuer create/update)
 - ⬜ Frontend can display trust indicators
 
 ### M2: API v2 Available (End of Phase 2)
@@ -302,83 +303,90 @@ Phase 4: Validation & Rollout (Week 8)
 
 ## Next Steps
 
-### ✅ Completed: Issuer Store and Trust Evaluation
+### ✅ Completed in `feature/trust-evaluation` branch
 
-The `trust-evaluation` branch now contains:
+1. **TrustService** (`internal/service/trust.go`): Wraps go-trust evaluators
+   for issuer/verifier trust evaluation with multi-framework support.
 
-1. **IssuerStore** (`internal/registry/issuer.go`): Separate storage for issuers
-   with trust status, indexed by issuer ID and credential types.
+2. **JIT Trust Endpoint** (`internal/api/discover_trust.go`):
+   - `POST /api/discover-and-trust` - Evaluate issuer trust on-demand
+   - Fetches issuer metadata and IACA certificates
+   - Returns trust status, framework, and certificate chain
 
-2. **TrustService** (`internal/service/trust.go`): Wraps go-trust evaluators
-   for issuer/verifier trust evaluation.
+3. **Trust Fields in CredentialIssuer** (`internal/domain/credential.go`):
+   - `TrustStatus` (trusted/untrusted/unknown)
+   - `TrustFramework` (oidf/ebsi/x509/etc.)
+   - `TrustEvaluatedAt` (for TTL-based refresh)
 
-3. **Issuer API Endpoints** (when IssuerStore is configured):
-   - `GET /api/v1/vctm/issuers` - List all issuers
-   - `GET /api/v1/vctm/issuers/:id` - Get specific issuer
-   - `POST /api/v1/vctm/issuers` - Register issuer (triggers trust evaluation)
-   - `DELETE /api/v1/vctm/issuers/:id` - Remove issuer
-   - `GET /api/v1/vctm/credentials/:vct/issuers` - Get issuers for credential type
+4. **API Version Capabilities** (`internal/api/version.go`):
+   - Version discovery endpoint
+   - Capability negotiation structure
 
-4. **JIT Trust Endpoint** (`/api/discover-and-trust`): For unknown issuers
-   not pre-registered via the issuer API.
+### 🔄 Gaps Identified
 
-### Current: Wire Up IssuerStore in Main Server
+| Gap | Description | Priority |
+|-----|-------------|----------|
+| **Per-tenant TrustEvaluator** | TrustService needs per-tenant go-trust config | High |
+| **Admin API integration** | Create/update issuer should trigger trust eval | High |
+| **Cache persistence** | discover-and-trust should cache to CredentialIssuer | Medium |
+| **TTL refresh** | Background job to refresh stale trust status | Medium |
+| **go-trust config per tenant** | How do tenants configure their trust anchors? | High |
 
-**Files to modify**: `cmd/server/main.go` or server setup code
+### Open Questions
 
-**Changes needed**:
-1. Create IssuerStore with cache path
-2. Load IssuerStore on startup
-3. Pass IssuerStore to registry Handler via `WithIssuerStore()` option
-4. Optionally pass TrustService via `WithTrustService()` option
+1. **Per-Tenant Trust Configuration**: How is go-trust configured per tenant?
+   - Option A: Tenant-specific config files (e.g., `/config/tenants/{id}/trust.yaml`)
+   - Option B: Database-stored trust anchors per tenant
+   - Option C: Tenant profile references shared trust configs
 
-**Example wiring**:
+2. **Trust TTL Policy**: How long should cached trust be valid?
+   - Suggested: 24 hours for federation-based, 1 hour for IACA/X.509
+
+3. **Trust Refresh Strategy**: Eager vs lazy refresh?
+   - Eager: Background job refreshes all issuers periodically
+   - Lazy: Refresh on access when TTL expired
+
+4. **Existing Issuers Migration**: How to populate trust for existing issuers?
+   - Migration script to evaluate all existing CredentialIssuer records
+
+### Recommended Next Steps
+
+**Immediate (Complete Trust Integration):**
+
+1. **Wire per-tenant TrustEvaluator config** - Determine how tenants configure
+   trust anchors and implement config loading per tenant.
+
+2. **Integrate with Admin Issuer API** - When `POST /admin/tenants/:id/issuers`
+   is called, invoke TrustService to evaluate and populate trust fields.
+
+3. **Persist from discover-and-trust** - Option to save JIT results to
+   CredentialIssuer for future lookups.
+
+**Near-term (WebSocket Protocol):**
+
+4. **Begin WebSocket endpoint** (`/api/v2/wallet`) - This is the bulk of
+   proxy elimination work.
+
+5. **OID4VCI flow handler** - First protocol to implement over WebSocket.
+
+**Example Admin API integration:**
 ```go
-// Create issuer store
-issuerCachePath := filepath.Join(cacheDir, "issuers.json")
-issuerStore := registry.NewIssuerStore(issuerCachePath)
-if err := issuerStore.Load(); err != nil {
-    logger.Warn("failed to load issuer cache", zap.Error(err))
+// In admin_handlers.go CreateIssuer:
+func (h *AdminHandler) CreateIssuer(c *gin.Context) {
+    // ... existing validation ...
+    
+    // Evaluate trust for the new issuer
+    if h.trustService != nil {
+        trustResult, err := h.trustService.EvaluateIssuer(c.Request.Context(), 
+            req.CredentialIssuerIdentifier, tenant.ID)
+        if err == nil {
+            issuer.TrustStatus = domain.TrustStatus(trustResult.Status)
+            issuer.TrustFramework = trustResult.Framework
+            now := time.Now()
+            issuer.TrustEvaluatedAt = &now
+        }
+    }
+    
+    // ... save issuer ...
 }
-
-// Create trust service (optional)
-trustService := service.NewTrustService(cfg, logger)
-
-// Create registry handler with issuer support
-registryHandler := registry.NewHandler(
-    vctmStore,
-    dynamicCacheConfig,
-    imageEmbedConfig,
-    logger,
-    registry.WithIssuerStore(issuerStore),
-    registry.WithTrustService(trustService),
-)
 ```
-
-### Next: Frontend Integration for Trust Display
-
-When displaying credentials, the frontend needs to:
-
-1. Look up VCTM by credential type (vct) → get display metadata
-2. Look up issuer by credential's issuer identifier → get trust status
-3. Display VCTM metadata + issuer trust marker
-
-**API flow**:
-```
-GET /api/v1/vctm/type-metadata?vct=eu.europa.ec.pid.1
-  → Returns: display info, logo, schema
-
-GET /api/v1/vctm/issuers/<url-encoded-issuer-id>
-  → Returns: trust_status, trust_framework, trust_reason
-  
-OR (combined):
-GET /api/v1/vctm/credentials/eu.europa.ec.pid.1/issuers
-  → Returns: list of issuers with trust status
-```
-
-### After Frontend Integration
-
-1. Begin WebSocket endpoint implementation (`/api/v2/wallet`)
-2. Implement OID4VCI flow handler (uses IssuerStore for trust lookup)
-3. Implement OID4VP flow handler
-4. Coordinate with wallet-frontend team on transport abstraction
