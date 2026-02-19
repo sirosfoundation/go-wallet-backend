@@ -99,6 +99,7 @@ func fetchVerifierMetadata(ctx context.Context, metadataURI string) (*VerifierMe
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)

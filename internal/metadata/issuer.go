@@ -84,6 +84,7 @@ func fetchIssuerMetadata(ctx context.Context, issuerURL string) (*IssuerMetadata
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
@@ -112,6 +113,7 @@ func fetchIACACertificates(ctx context.Context, iacasURL string) ([]string, erro
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)

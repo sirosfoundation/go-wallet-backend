@@ -25,7 +25,7 @@ func TestNewRateLimiter(t *testing.T) {
 	rl := NewRateLimiter(config)
 	require.NotNil(t, rl)
 	assert.Equal(t, config, rl.config)
-	assert.NotNil(t, rl.clients)
+	assert.NotNil(t, rl.tenants)
 }
 
 func TestRateLimiter_Allow_Unauthenticated(t *testing.T) {
@@ -39,8 +39,9 @@ func TestRateLimiter_Allow_Unauthenticated(t *testing.T) {
 	rl := NewRateLimiter(config)
 
 	// First few requests should be allowed (burst)
+	// Privacy: uses anonymousKey, not IP
 	for i := 0; i < 3; i++ {
-		assert.True(t, rl.Allow("192.168.1.1", false), "request %d should be allowed", i+1)
+		assert.True(t, rl.Allow(anonymousKey, false), "request %d should be allowed", i+1)
 	}
 
 	// After burst, should be rate limited
@@ -57,13 +58,13 @@ func TestRateLimiter_Allow_Authenticated(t *testing.T) {
 
 	rl := NewRateLimiter(config)
 
-	// Authenticated should have more requests allowed
+	// Privacy: rate limit by tenant_id, not IP
 	for i := 0; i < 3; i++ {
-		assert.True(t, rl.Allow("192.168.1.1", true), "authenticated request %d should be allowed", i+1)
+		assert.True(t, rl.Allow("tenant_1", true), "authenticated request %d should be allowed", i+1)
 	}
 }
 
-func TestRateLimiter_DifferentClients(t *testing.T) {
+func TestRateLimiter_DifferentTenants(t *testing.T) {
 	config := RateLimitConfig{
 		Enabled:            true,
 		AuthenticatedRPM:   60,
@@ -73,14 +74,14 @@ func TestRateLimiter_DifferentClients(t *testing.T) {
 
 	rl := NewRateLimiter(config)
 
-	// Client 1 makes request
-	assert.True(t, rl.Allow("192.168.1.1", false))
+	// Tenant 1 makes request
+	assert.True(t, rl.Allow("tenant_1", true))
 
-	// Client 2 should have its own limiter
-	assert.True(t, rl.Allow("192.168.1.2", false))
+	// Tenant 2 should have its own limiter
+	assert.True(t, rl.Allow("tenant_2", true))
 
 	// They should have separate limiters
-	assert.Len(t, rl.clients, 2)
+	assert.Len(t, rl.tenants, 2)
 }
 
 func TestRateLimiter_GetLimiter_Creates(t *testing.T) {
@@ -93,10 +94,9 @@ func TestRateLimiter_GetLimiter_Creates(t *testing.T) {
 
 	rl := NewRateLimiter(config)
 
-	limiter := rl.getLimiter("192.168.1.1")
+	limiter := rl.getLimiter("tenant_1", true)
 	require.NotNil(t, limiter)
-	assert.NotNil(t, limiter.authenticated)
-	assert.NotNil(t, limiter.anonymous)
+	assert.NotNil(t, limiter.limiter)
 }
 
 func TestRateLimiter_GetLimiter_Reuses(t *testing.T) {
@@ -109,8 +109,8 @@ func TestRateLimiter_GetLimiter_Reuses(t *testing.T) {
 
 	rl := NewRateLimiter(config)
 
-	limiter1 := rl.getLimiter("192.168.1.1")
-	limiter2 := rl.getLimiter("192.168.1.1")
+	limiter1 := rl.getLimiter("tenant_1", true)
+	limiter2 := rl.getLimiter("tenant_1", true)
 
 	assert.Same(t, limiter1, limiter2)
 }
@@ -186,10 +186,11 @@ func TestRateLimitMiddleware_RespectsAuthentication(t *testing.T) {
 	rl := NewRateLimiter(config)
 
 	router := gin.New()
-	// Simulate authentication middleware
+	// Simulate authentication middleware (privacy: uses tenant_id, not IP)
 	router.Use(func(c *gin.Context) {
 		if c.GetHeader("Authorization") != "" {
 			c.Set(string(AuthenticatedKey), true)
+			c.Set(string(TenantIDKey), "test-tenant")
 		}
 		c.Next()
 	})
@@ -303,12 +304,12 @@ func TestRateLimiter_Cleanup(t *testing.T) {
 
 	rl := NewRateLimiter(config)
 
-	// Add some clients
-	rl.getLimiter("192.168.1.1")
-	rl.getLimiter("192.168.1.2")
-	rl.getLimiter("192.168.1.3")
+	// Add some tenants (privacy: uses tenant_id, not IP)
+	rl.getLimiter("tenant_1", true)
+	rl.getLimiter("tenant_2", true)
+	rl.getLimiter("tenant_3", true)
 
-	assert.Len(t, rl.clients, 3)
+	assert.Len(t, rl.tenants, 3)
 
 	// Note: cleanup is internal and time-based, we just verify it doesn't panic
 }
@@ -323,9 +324,47 @@ func TestRateLimiter_MinimalBurst(t *testing.T) {
 	}
 
 	rl := NewRateLimiter(config)
-	limiter := rl.getLimiter("192.168.1.1")
+	limiter := rl.getLimiter("tenant_1", true)
 
 	// Should be able to make at least one request
-	assert.NotNil(t, limiter.authenticated)
-	assert.NotNil(t, limiter.anonymous)
+	assert.NotNil(t, limiter.limiter)
+}
+
+func TestGetTenantID(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*gin.Context)
+		wantResult string
+	}{
+		{
+			name:       "no value set",
+			setup:      func(c *gin.Context) {},
+			wantResult: "",
+		},
+		{
+			name: "value set",
+			setup: func(c *gin.Context) {
+				c.Set(string(TenantIDKey), "test-tenant")
+			},
+			wantResult: "test-tenant",
+		},
+		{
+			name: "wrong type",
+			setup: func(c *gin.Context) {
+				c.Set(string(TenantIDKey), 12345)
+			},
+			wantResult: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			tt.setup(c)
+
+			result := getTenantID(c)
+			assert.Equal(t, tt.wantResult, result)
+		})
+	}
 }
