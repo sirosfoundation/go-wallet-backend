@@ -33,56 +33,62 @@ the backend drives protocol flows.
 
 ## Trust Evaluation Architecture
 
-A critical architectural insight: **VCTMs enable pre-computed trust**.
+A critical architectural insight: **Trust is a question you ask, not data you store**.
+
+Trust evaluation is a runtime query, not a persistent entity. The wallet needs:
+1. **VCTM Registry**: "How do I display this credential type?" (keyed by `vct`)
+2. **TrustService**: "Is this issuer trusted?" (keyed by issuer identifier)
+3. **Existing Issuer Store**: Wallet configuration via Admin API (`domain.CredentialIssuer`)
+
+### Separation of Concerns
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                      TRUST EVALUATION TIMING                                │
+│                      TRUST EVALUATION ARCHITECTURE                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │ PRE-COMPUTED TRUST (VCTM Registration)                               │  │
-│  │                                                                       │  │
-│  │   1. Admin/User registers VCTM URL                                   │  │
-│  │   2. Backend fetches issuer metadata                                 │  │
-│  │   3. TrustEvaluator evaluates trust policies                         │  │
-│  │   4. Store metadata + trust decision in registry                     │  │
-│  │                                                                       │  │
-│  │   ✅ Performance: Trust decision cached at registration time         │  │
-│  │   ✅ Use case: Known issuers, federation members, pre-approved list  │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  VCTM Registry                    TrustService                              │
+│  ─────────────                    ────────────                              │
+│  Question: "How display?"         Question: "Is trusted?"                   │
+│  Key: vct identifier              Key: issuer identifier                    │
+│  Storage: Persistent              Storage: TTL cache only                   │
 │                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │ JUST-IN-TIME TRUST (Fallback for unknown issuers)                    │  │
-│  │                                                                       │  │
-│  │   1. Credential presented from unregistered issuer                   │  │
-│  │   2. Fetch issuer metadata on-demand                                 │  │
-│  │   3. TrustEvaluator evaluates trust policies                         │  │
-│  │   4. Cache result for future presentations                           │  │
-│  │                                                                       │  │
-│  │   ⚠️ Performance: Trust evaluation adds latency to presentation      │  │
-│  │   ✅ Use case: Ad-hoc issuers, first-time encounters                 │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│  Returns:                         Returns:                                  │
+│  - Display name                   - Trust status (trusted/unknown/untrusted)│
+│  - Logo, colors, background       - Trust framework used                    │
+│  - Schema for rendering           - Certificate chain (if applicable)       │
 │                                                                             │
-│  HYBRID MODEL: Try pre-computed first, fallback to JIT if needed           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Credential Display Flow                                             │   │
+│  │                                                                     │   │
+│  │   credential.vct ───▶ VCTM Registry ───▶ visual metadata            │   │
+│  │   credential.iss ───▶ TrustService  ───▶ trust marker (✓/✗/?)      │   │
+│  │                                                                     │   │
+│  │   Both are needed to display: [EU PID] ✓                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Existing Admin API (domain.CredentialIssuer):                              │
+│  - Wallet configuration of known issuers                                    │
+│  - Per-tenant issuer management                                             │
+│  - Updated separately from trust evaluation                                 │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why Pre-computed Trust Matters
+### Trust Evaluation Endpoints
 
-1. **Performance**: Trust policy evaluation can involve network calls (OIDF
-   discovery, ETSI TSL traversal, X.509 chain validation). Doing this at
-   registration time amortizes the cost across all credential presentations.
+**JIT Evaluation** (`/api/discover-and-trust`):
+- Takes issuer identifier, returns trust evaluation
+- Fetches metadata, runs TrustEvaluator
+- Results cached with TTL (not persisted)
+- Used for any issuer, known or unknown
 
-2. **User Experience**: Credential acceptance is instant for known issuers.
-   The wallet can show trust status without delays.
+### Why Service-Based Trust
 
-3. **Operational Control**: Deployment administrators can curate a list of
-   trusted issuers through VCTM registration, enabling policy enforcement.
-
-4. **Graceful Degradation**: Unknown issuers still work via JIT evaluation,
-   the user just sees a brief delay the first time.
+1. **Simplicity**: No new entity stores, no duplication with existing issuer management
+2. **Freshness**: Trust status can change; TTL cache ensures reasonable freshness
+3. **Flexibility**: Issuers issue multiple credential types in multiple formats
+4. **Separation**: VCTM describes types, TrustService evaluates entities
 
 ## Workstreams
 
@@ -93,9 +99,9 @@ A critical architectural insight: **VCTMs enable pre-computed trust**.
 │                                                                             │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
 │  │ 1. VCTM     │    │ 2. Trust    │    │ 3. WebSocket│    │ 4. Frontend │  │
-│  │ Registry    │───▶│ Integration │───▶│ Protocol    │───▶│ Integration │  │
+│  │ Registry    │───▶│ Service     │───▶│ Protocol    │───▶│ Integration │  │
 │  │             │    │             │    │ (API v2)    │    │             │  │
-│  │ ✅ MERGED   │    │ 🔄 NEXT     │    │ 📋 DESIGNED │    │ 📋 DESIGNED │  │
+│  │ ✅ COMPLETE │    │ ✅ COMPLETE │    │ 📋 DESIGNED │    │ 📋 DESIGNED │  │
 │  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
 │                                                                             │
 │  Legend: ✅ Complete  🔄 In Progress  📋 Design Complete  ⬜ Not Started   │
@@ -108,8 +114,7 @@ A critical architectural insight: **VCTMs enable pre-computed trust**.
 **Status**: ✅ Complete (Merged to main)
 
 **Purpose**: Server-side caching and resolution of Verifiable Credential Type
-Metadata (VCTM) with embedded images. This is also the primary storage for
-**pre-computed trust decisions**.
+Metadata (VCTM) with embedded images. Provides display metadata for credentials.
 
 **Location**: `go-wallet-backend/internal/registry/`
 
@@ -117,47 +122,31 @@ Metadata (VCTM) with embedded images. This is also the primary storage for
 - [x] VCTM fetcher with caching
 - [x] Image embedding (logos, backgrounds)
 - [x] REST API endpoints (`/api/v1/vctm/*`)
-- [ ] Trust evaluation at registration time (Phase 1.2)
-- [ ] Trust status included in stored/returned VCTMs
 
 **Proxy Traffic Reduction**: ~25%
 
 ---
 
-### 2. Trust Abstraction Layer (Mostly Complete)
+### 2. Trust Service (Complete)
 
-**Status**: 🔄 Integration Pending
+**Status**: ✅ Complete
 
-**Purpose**: Unified interface for evaluating trust across multiple frameworks
-(OIDF, EBSI, X.509, ETSI TSL). Called at **VCTM registration time** to
-pre-compute trust decisions.
+**Purpose**: Query-based trust evaluation using go-trust evaluators. Returns
+trust status for any issuer identifier with TTL caching.
 
-**Existing Implementation**:
-- `go-trust/pkg/trustapi/` - Core interfaces (TrustEvaluator, KeyResolver)
-- `go-trust/pkg/registry/` - Multi-registry support with strategies
-- `go-wallet-backend/pkg/trust/` - Wallet-specific wrapper and factory
-
-**Documents**:
-- Architecture: `go-trust/docs/ARCHITECTURE-MULTI-REGISTRY.md`
-- Multi-Registry Strategies: `go-trust/docs/MULTI-REGISTRY-STRATEGIES.md`
-- Trust Metadata: `go-trust/docs/TRUST_METADATA_IMPLEMENTATION.md`
-- OIDF Mapping: `go-trust/docs/OIDFED_PROTOCOL_MAPPING.md`
+**Location**: 
+- `go-wallet-backend/internal/service/trust.go` - TrustService wrapper
+- `go-wallet-backend/internal/api/discover_trust.go` - JIT evaluation endpoint
 
 **Key Deliverables**:
-- [x] `TrustEvaluator` interface (go-trust/pkg/trustapi)
-- [x] Multi-registry support (go-trust/pkg/registry)
-- [x] Trust status enumeration (`trusted`, `unknown`, `untrusted`)
-- [ ] **Call from VCTM registry at registration time** ← NEXT STEP
-- [ ] **JIT evaluation service for unknown issuers** (fallback)
-- [ ] Policy expression language (optional, future)
-
-**Dependencies**: None (foundational)
+- [x] `TrustService` wrapping go-trust evaluators
+- [x] `/api/discover-and-trust` JIT evaluation endpoint
+- [x] Trust status (trusted/unknown/untrusted) with framework info
 
 **Integration Points**:
-- VCTM Registry calls `TrustEvaluator` when registering new VCTMs
-- Trust decision stored alongside VCTM metadata
-- WebSocket protocol uses cached trust for known issuers
-- JIT evaluation for credentials from unregistered issuers
+- Existing issuer management via Admin API (`domain.CredentialIssuer`)
+- VCTM Registry for credential display metadata
+- WebSocket protocol for trust queries during protocol flows
 
 ---
 
@@ -249,11 +238,13 @@ Phase 4: Validation & Rollout (Week 8)
 
 ## Milestone Definitions
 
-### M1: Pre-computed Trust (End of Phase 1)
-- VCTM Registry evaluates trust at registration time
-- Trust decisions stored alongside VCTM metadata
-- Frontend can display trust indicators from cached data
-- JIT fallback service available for unregistered issuers
+### M1: Pre-computed Trust (End of Phase 1) - IN PROGRESS
+- ✅ VCTM Registry merged
+- ✅ IssuerStore with trust status per issuer
+- ✅ Trust evaluation at issuer registration time
+- ✅ JIT discover-and-trust endpoint for unknown issuers
+- ⬜ Wire up IssuerStore in main server
+- ⬜ Frontend can display trust indicators
 
 ### M2: API v2 Available (End of Phase 2)
 - WebSocket endpoint functional (`/api/v2/wallet`)
@@ -306,74 +297,83 @@ Phase 4: Validation & Rollout (Week 8)
 
 ## Next Steps
 
-### Immediate: Trust Evaluation at VCTM Registration
+### ✅ Completed: Issuer Store and Trust Evaluation
 
-The VCTM registry is merged. The next task is adding trust evaluation at
-**registration time** so trust decisions are pre-computed:
+The `trust-evaluation` branch now contains:
 
-**Files to modify**: `go-wallet-backend/internal/registry/handler.go`
+1. **IssuerStore** (`internal/registry/issuer.go`): Separate storage for issuers
+   with trust status, indexed by issuer ID and credential types.
 
-**Changes**:
-1. Add `TrustEvaluator` field to Handler struct (optional dependency)
-2. Update `NewHandler()` to accept evaluator
-3. When **registering** a VCTM, evaluate issuer trust
-4. Store trust decision alongside VCTM in storage
-5. Include trust status in responses (new field)
+2. **TrustService** (`internal/service/trust.go`): Wraps go-trust evaluators
+   for issuer/verifier trust evaluation.
 
-**Interface** (from `go-wallet-backend/pkg/trust`):
+3. **Issuer API Endpoints** (when IssuerStore is configured):
+   - `GET /api/v1/vctm/issuers` - List all issuers
+   - `GET /api/v1/vctm/issuers/:id` - Get specific issuer
+   - `POST /api/v1/vctm/issuers` - Register issuer (triggers trust evaluation)
+   - `DELETE /api/v1/vctm/issuers/:id` - Remove issuer
+   - `GET /api/v1/vctm/credentials/:vct/issuers` - Get issuers for credential type
+
+4. **JIT Trust Endpoint** (`/api/discover-and-trust`): For unknown issuers
+   not pre-registered via the issuer API.
+
+### Current: Wire Up IssuerStore in Main Server
+
+**Files to modify**: `cmd/server/main.go` or server setup code
+
+**Changes needed**:
+1. Create IssuerStore with cache path
+2. Load IssuerStore on startup
+3. Pass IssuerStore to registry Handler via `WithIssuerStore()` option
+4. Optionally pass TrustService via `WithTrustService()` option
+
+**Example wiring**:
 ```go
-type TrustEvaluator interface {
-    Evaluate(ctx context.Context, req *EvaluationRequest) (*TrustDecision, error)
-    SupportsKeyType(kt KeyType) bool
-    Name() string
-    Healthy() bool
+// Create issuer store
+issuerCachePath := filepath.Join(cacheDir, "issuers.json")
+issuerStore := registry.NewIssuerStore(issuerCachePath)
+if err := issuerStore.Load(); err != nil {
+    logger.Warn("failed to load issuer cache", zap.Error(err))
 }
+
+// Create trust service (optional)
+trustService := service.NewTrustService(cfg, logger)
+
+// Create registry handler with issuer support
+registryHandler := registry.NewHandler(
+    vctmStore,
+    dynamicCacheConfig,
+    imageEmbedConfig,
+    logger,
+    registry.WithIssuerStore(issuerStore),
+    registry.WithTrustService(trustService),
+)
 ```
 
-**Pre-computed trust workflow**:
-```
-POST /api/v1/vctm/register
-  ↓
-Fetch VCTM from URL
-  ↓
-Extract issuer identifier
-  ↓
-Call TrustEvaluator.Evaluate()  ← Trust evaluation happens HERE
-  ↓
-Store VCTM + TrustDecision in DB
-  ↓
-Return response with trust_status
-```
+### Next: Frontend Integration for Trust Display
 
-**Trust decision stored with VCTM**:
-```go
-type StoredVCTM struct {
-    VCT             string         `json:"vct"`              // Existing
-    Metadata        *VCTMDocument  `json:"metadata"`         // Existing
-    EmbeddedImages  map[string]... `json:"embedded_images"`  // Existing
-    TrustStatus     string         `json:"trust_status"`     // NEW: "trusted", "unknown", "untrusted"
-    TrustEvaluator  string         `json:"trust_evaluator"`  // NEW: Which evaluator made decision
-    TrustEvaluatedAt time.Time     `json:"trust_evaluated_at"` // NEW: When evaluated
-    TrustMetadata   map[string]any `json:"trust_metadata"`   // NEW: Framework-specific info
-}
+When displaying credentials, the frontend needs to:
+
+1. Look up VCTM by credential type (vct) → get display metadata
+2. Look up issuer by credential's issuer identifier → get trust status
+3. Display VCTM metadata + issuer trust marker
+
+**API flow**:
+```
+GET /api/v1/vctm/type-metadata?vct=eu.europa.ec.pid.1
+  → Returns: display info, logo, schema
+
+GET /api/v1/vctm/issuers/<url-encoded-issuer-id>
+  → Returns: trust_status, trust_framework, trust_reason
+  
+OR (combined):
+GET /api/v1/vctm/credentials/eu.europa.ec.pid.1/issuers
+  → Returns: list of issuers with trust status
 ```
 
-### After Trust Integration
+### After Frontend Integration
 
-1. Add JIT trust evaluation service for unregistered issuers
-2. Begin WebSocket endpoint implementation (`/api/v2/wallet`)
-3. Implement OID4VCI flow handler (uses VCTM registry for trust lookup)
-4. Implement OID4VP flow handler
-5. Coordinate with wallet-frontend team on v2 integration timeline
-
-### Branch Reconciliation Note
-
-The `feature/api-versioning-discover-trust` branch predates the VCTM registry
-merge and had a different API versioning concept. That branch's discover-and-trust
-endpoint concept is now subsumed by:
-
-1. **Pre-computed trust**: VCTM registration includes trust evaluation
-2. **API v2 = WebSocket**: Not new REST endpoints
-
-The useful code from that branch (TrustService implementation) can be cherry-picked
-or adapted for the JIT fallback service.
+1. Begin WebSocket endpoint implementation (`/api/v2/wallet`)
+2. Implement OID4VCI flow handler (uses IssuerStore for trust lookup)
+3. Implement OID4VP flow handler
+4. Coordinate with wallet-frontend team on transport abstraction
