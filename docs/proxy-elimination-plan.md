@@ -33,12 +33,17 @@ the backend drives protocol flows.
 
 ## Trust Evaluation Architecture
 
-A critical architectural insight: **Trust is a question you ask, not data you store**.
+A critical architectural insight: **Trust is per-tenant**.
 
-Trust evaluation is a runtime query, not a persistent entity. The wallet needs:
+Each tenant may have different trust anchors, federation endpoints, and policies
+configured in go-trust. Trust evaluation results can be cached in the existing
+per-tenant issuer store (`domain.CredentialIssuer`), but the trust decision for
+the same issuer may differ between tenants.
+
+The wallet needs:
 1. **VCTM Registry**: "How do I display this credential type?" (keyed by `vct`)
-2. **TrustService**: "Is this issuer trusted?" (keyed by issuer identifier)
-3. **Existing Issuer Store**: Wallet configuration via Admin API (`domain.CredentialIssuer`)
+2. **TrustService**: "Is this issuer trusted for this tenant?" (tenant + issuer)
+3. **Existing Issuer Store**: Per-tenant issuer config with cached trust status
 
 ### Separation of Concerns
 
@@ -49,9 +54,9 @@ Trust evaluation is a runtime query, not a persistent entity. The wallet needs:
 │                                                                             │
 │  VCTM Registry                    TrustService                              │
 │  ─────────────                    ────────────                              │
-│  Question: "How display?"         Question: "Is trusted?"                   │
-│  Key: vct identifier              Key: issuer identifier                    │
-│  Storage: Persistent              Storage: TTL cache only                   │
+│  Question: "How display?"         Question: "Is trusted (for tenant)?"      │
+│  Key: vct identifier              Key: tenant_id + issuer identifier        │
+│  Storage: Persistent              Storage: Cached in CredentialIssuer       │
 │                                                                             │
 │  Returns:                         Returns:                                  │
 │  - Display name                   - Trust status (trusted/unknown/untrusted)│
@@ -59,18 +64,18 @@ Trust evaluation is a runtime query, not a persistent entity. The wallet needs:
 │  - Schema for rendering           - Certificate chain (if applicable)       │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │ Credential Display Flow                                             │   │
+│  │ Per-Tenant Trust                                                    │   │
 │  │                                                                     │   │
-│  │   credential.vct ───▶ VCTM Registry ───▶ visual metadata            │   │
-│  │   credential.iss ───▶ TrustService  ───▶ trust marker (✓/✗/?)      │   │
+│  │   Tenant A: go-trust config → OIDF federation anchor A             │   │
+│  │   Tenant B: go-trust config → OIDF federation anchor B             │   │
 │  │                                                                     │   │
-│  │   Both are needed to display: [EU PID] ✓                            │   │
+│  │   Same issuer → different trust result per tenant                  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
-│  Existing Admin API (domain.CredentialIssuer):                              │
-│  - Wallet configuration of known issuers                                    │
-│  - Per-tenant issuer management                                             │
-│  - Updated separately from trust evaluation                                 │
+│  Existing domain.CredentialIssuer (per-tenant):                             │
+│  - CredentialIssuerIdentifier (issuer URL)                                  │
+│  - TrustStatus, TrustFramework (cached evaluation)                          │
+│  - TrustEvaluatedAt (for TTL/refresh)                                       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -78,17 +83,17 @@ Trust evaluation is a runtime query, not a persistent entity. The wallet needs:
 ### Trust Evaluation Endpoints
 
 **JIT Evaluation** (`/api/discover-and-trust`):
-- Takes issuer identifier, returns trust evaluation
-- Fetches metadata, runs TrustEvaluator
-- Results cached with TTL (not persisted)
+- Takes tenant context + issuer identifier
+- Fetches metadata, runs tenant-specific TrustEvaluator
+- Can cache result in tenant's CredentialIssuer record
 - Used for any issuer, known or unknown
 
-### Why Service-Based Trust
+### Why Per-Tenant Trust
 
-1. **Simplicity**: No new entity stores, no duplication with existing issuer management
-2. **Freshness**: Trust status can change; TTL cache ensures reasonable freshness
-3. **Flexibility**: Issuers issue multiple credential types in multiple formats
-4. **Separation**: VCTM describes types, TrustService evaluates entities
+1. **Different Trust Anchors**: Each tenant may trust different federation roots
+2. **Policy Isolation**: Tenant A's trust policy shouldn't affect Tenant B
+3. **Existing Model**: `domain.CredentialIssuer` already has TenantID
+4. **Caching**: Trust results cached per-tenant with TTL for freshness
 
 ## Workstreams
 
