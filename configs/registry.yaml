@@ -86,6 +86,25 @@ jwt:
   # If false, unauthenticated requests are allowed (with lower rate limits)
   require_auth: false
 
+# Trust evaluation configuration for /issuer-metadata endpoint
+trust:
+  # Enable the /issuer-metadata endpoint
+  enabled: false
+  
+  # Default go-trust service endpoint URL
+  # Used when no tenant-specific endpoint is configured
+  # Use environment variable REGISTRY_TRUST_DEFAULT_ENDPOINT in production
+  default_endpoint: ""
+  
+  # Default trust cache TTL in seconds (default: 86400 = 24 hours)
+  default_ttl: 86400
+  
+  # How often to check for stale trust evaluations in seconds (default: 3600 = 1 hour)
+  refresh_interval: 3600
+  
+  # Optional path to cache issuer trust status
+  # issuer_cache_path: "data/issuer-trust-cache.json"
+
 # Logging configuration
 logging:
   # Log level: debug, info, warn, error

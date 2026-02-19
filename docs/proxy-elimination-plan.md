@@ -80,13 +80,24 @@ The wallet needs:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Trust Evaluation Endpoints
+### Trust Evaluation Strategy
 
-**JIT Evaluation** (`/api/discover-and-trust`):
-- Takes tenant context + issuer identifier
-- Fetches metadata, runs tenant-specific TrustEvaluator
-- Can cache result in tenant's CredentialIssuer record
-- Used for any issuer, known or unknown
+**At-Registration Trust with Background Refresh**:
+- Trust evaluated when issuers are registered
+- Background worker refreshes stale trust (TTL-based)
+- JIT fallback for unregistered issuers
+
+**Issuer Metadata Endpoint** (`/issuer-metadata`):
+- Located on registry server (standalone mode)
+- Takes issuer identifier parameter
+- Fetches metadata, evaluates trust via go-trust
+- Returns combined metadata + trust status
+- Standalone mode: stateless, no database persistence
+
+**Per-Tenant Configuration** (via Admin API):
+- `trust_endpoint`: go-trust service URL (or default)
+- `trust_ttl`: How long trust results are valid
+- `refresh_interval`: Background refresh frequency
 
 ### Why Per-Tenant Trust
 
@@ -141,15 +152,20 @@ trust status for any issuer identifier with TTL caching.
 
 **Location**: 
 - `go-wallet-backend/internal/service/trust.go` - TrustService wrapper
-- `go-wallet-backend/internal/api/discover_trust.go` - JIT evaluation endpoint
+- `go-wallet-backend/internal/registry/issuer_metadata.go` - /issuer-metadata handler
+- `go-wallet-backend/internal/registry/trust_refresh.go` - Background refresh worker
 
 **Key Deliverables**:
 - [x] `TrustService` wrapping go-trust evaluators
-- [x] `/api/discover-and-trust` JIT evaluation endpoint
+- [x] `/issuer-metadata` endpoint on registry server
 - [x] Trust status (trusted/unknown/untrusted) with framework info
+- [x] Per-tenant trust configuration (trust_endpoint, trust_ttl, refresh_interval)
+- [x] Background refresh worker for stale trust evaluations
+- [x] Admin API support for trust configuration
 
 **Integration Points**:
-- Existing issuer management via Admin API (`domain.CredentialIssuer`)
+- Registry server: standalone /issuer-metadata endpoint (stateless)
+- Main server: per-tenant trust via CredentialIssuer persistence
 - VCTM Registry for credential display metadata
 - WebSocket protocol for trust queries during protocol flows
 

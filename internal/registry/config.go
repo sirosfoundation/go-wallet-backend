@@ -36,8 +36,30 @@ type Config struct {
 	// JWT configuration for authentication
 	JWT JWTConfig `yaml:"jwt" envconfig:"JWT"`
 
+	// Trust configuration for issuer metadata endpoint
+	Trust TrustConfig `yaml:"trust" envconfig:"TRUST"`
+
 	// Logging configuration
 	Logging LoggingConfig `yaml:"logging" envconfig:"LOGGING"`
+}
+
+// TrustConfig contains configuration for issuer trust evaluation
+type TrustConfig struct {
+	// Enabled controls whether the /issuer-metadata endpoint is available
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// DefaultEndpoint is the default go-trust service URL used when no tenant-specific endpoint is configured
+	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
+
+	// DefaultTTL is the default trust cache TTL in seconds (default: 86400 = 24 hours)
+	DefaultTTL int `yaml:"default_ttl" envconfig:"DEFAULT_TTL"`
+
+	// RefreshInterval is how often to check for stale trust evaluations in seconds (default: 3600 = 1 hour)
+	RefreshInterval int `yaml:"refresh_interval" envconfig:"REFRESH_INTERVAL"`
+
+	// IssuerCachePath is the path to cache issuer trust status (optional)
+	// If not set, issuer trust is not persisted between restarts
+	IssuerCachePath string `yaml:"issuer_cache_path" envconfig:"ISSUER_CACHE_PATH"`
 }
 
 // ServerConfig contains HTTP server configuration

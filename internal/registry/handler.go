@@ -6,6 +6,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"go.uber.org/zap"
 )
 
@@ -17,12 +19,33 @@ type Handler struct {
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
 
+	// Issuer metadata handler (optional)
+	issuerMetadataHandler *IssuerMetadataHandler
+
 	// Debounced save mechanism
 	saveCh chan struct{}
 }
 
+// HandlerOption configures the Handler
+type HandlerOption func(*Handler)
+
+// WithIssuerMetadata configures the issuer metadata handler with full storage support
+func WithIssuerMetadata(trustService *service.TrustService, issuerStore storage.IssuerStore, tenantStore storage.TenantStore, config *IssuerMetadataConfig) HandlerOption {
+	return func(h *Handler) {
+		h.issuerMetadataHandler = NewIssuerMetadataHandler(trustService, issuerStore, tenantStore, config, h.logger)
+	}
+}
+
+// WithStandaloneIssuerMetadata configures the issuer metadata handler for standalone registry mode
+// (no database storage, just metadata discovery and optional trust evaluation)
+func WithStandaloneIssuerMetadata(config *IssuerMetadataConfig) HandlerOption {
+	return func(h *Handler) {
+		h.issuerMetadataHandler = NewStandaloneIssuerMetadataHandler(config, h.logger)
+	}
+}
+
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger) *Handler {
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, opts ...HandlerOption) *Handler {
 	var dynamicFetcher *DynamicFetcher
 	if config != nil && config.Enabled {
 		dynamicFetcher = NewDynamicFetcher(config, logger)
@@ -39,6 +62,12 @@ func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embe
 		logger:         logger,
 		saveCh:         make(chan struct{}, 1),
 	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(h)
+	}
+
 	// Start the debounced save worker
 	go h.saveWorker()
 	return h
@@ -252,4 +281,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/type-metadata", h.GetTypeMetadata)
 	r.GET("/credentials", h.ListCredentials)
 	r.GET("/status", h.GetStatus)
+
+	// Issuer metadata endpoint (if configured)
+	if h.issuerMetadataHandler != nil {
+		r.POST("/issuer-metadata", h.issuerMetadataHandler.GetIssuerMetadata)
+	}
 }
