@@ -279,12 +279,12 @@ func TestIsImageURL(t *testing.T) {
 		expected bool
 	}{
 		{"https://example.com/logo.png", true},
-		{"http://example.com/image.jpg", false},        // HTTP not allowed (HTTPS only)
+		{"http://example.com/image.jpg", false}, // HTTP not allowed (HTTPS only)
 		{"https://example.com/icon.svg", true},
-		{"https://example.com/api/image", true},        // No extension but HTTPS
-		{"data:image/png;base64,iVBORw0KGgo=", false},  // Already data URI
-		{"file:///path/to/image.png", false},           // Not HTTPS
-		{"/relative/path.png", false},                  // Not HTTPS
+		{"https://example.com/api/image", true},       // No extension but HTTPS
+		{"data:image/png;base64,iVBORw0KGgo=", false}, // Already data URI
+		{"file:///path/to/image.png", false},          // Not HTTPS
+		{"/relative/path.png", false},                 // Not HTTPS
 	}
 
 	for _, tt := range tests {

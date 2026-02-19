@@ -74,7 +74,6 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 
 	s.logger.Debug("Proxying request",
 		zap.String("method", method),
-		zap.String("url", req.URL),
 	)
 
 	// Build the request body if data is provided
@@ -102,10 +101,29 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Copy headers
-	for key, value := range req.Headers {
-		httpReq.Header.Set(key, value)
+	// Copy headers but strip fingerprinting headers (privacy)
+	fingerprintHeaders := map[string]bool{
+		"user-agent":                true, // Browser/OS fingerprinting
+		"accept-language":           true, // Locale fingerprinting
+		"accept-encoding":           true, // Compression support fingerprinting
+		"sec-ch-ua":                 true, // User-Agent Client Hints
+		"sec-ch-ua-mobile":          true,
+		"sec-ch-ua-platform":        true,
+		"sec-ch-ua-arch":            true,
+		"sec-ch-ua-bitness":         true,
+		"sec-ch-ua-full-version":    true,
+		"sec-ch-ua-platform-version": true,
+		"x-forwarded-for":           true, // IP forwarding
+		"x-real-ip":                 true,
+		"forwarded":                 true,
 	}
+	for key, value := range req.Headers {
+		if !fingerprintHeaders[strings.ToLower(key)] {
+			httpReq.Header.Set(key, value)
+		}
+	}
+	// Set a generic user-agent to avoid fingerprinting
+	httpReq.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
 	// Execute the request
 	resp, err := s.client.Do(httpReq)

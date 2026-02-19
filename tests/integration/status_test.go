@@ -11,7 +11,7 @@ func TestStatus(t *testing.T) {
 	resp := h.GET("/status")
 	resp.Status(http.StatusOK)
 
-	var body map[string]string
+	var body map[string]interface{}
 	resp.JSON(&body)
 
 	if body["status"] != "ok" {

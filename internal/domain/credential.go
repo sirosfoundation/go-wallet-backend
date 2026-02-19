@@ -82,13 +82,25 @@ type StorePresentationRequest struct {
 	IssuanceDate                            time.Time `json:"issuanceDate"`
 }
 
-// CredentialIssuer represents a trusted credential issuer
+// TrustStatus represents the trust evaluation result for an issuer
+type TrustStatus string
+
+const (
+	TrustStatusTrusted   TrustStatus = "trusted"
+	TrustStatusUntrusted TrustStatus = "untrusted"
+	TrustStatusUnknown   TrustStatus = "unknown"
+)
+
+// CredentialIssuer represents a credential issuer with per-tenant trust status
 type CredentialIssuer struct {
-	ID                         int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
-	TenantID                   TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
-	CredentialIssuerIdentifier string   `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
-	ClientID                   string   `json:"clientId,omitempty" bson:"client_id"`
-	Visible                    bool     `json:"visible" bson:"visible"`
+	ID                         int64       `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID                   TenantID    `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
+	CredentialIssuerIdentifier string      `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
+	ClientID                   string      `json:"clientId,omitempty" bson:"client_id"`
+	Visible                    bool        `json:"visible" bson:"visible"`
+	TrustStatus                TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
+	TrustFramework             string      `json:"trustFramework,omitempty" bson:"trust_framework"`
+	TrustEvaluatedAt           *time.Time  `json:"trustEvaluatedAt,omitempty" bson:"trust_evaluated_at"`
 }
 
 // TableName specifies the table name for GORM

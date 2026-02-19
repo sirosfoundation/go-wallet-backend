@@ -1,4 +1,12 @@
 {
+  "api_version": 1,
+  "capabilities": [
+    "webauthn",
+    "storage",
+    "proxy",
+    "multi-tenancy",
+    "vctm-registry"
+  ],
   "service": "wallet-backend",
   "status": "ok"
 }

@@ -51,7 +51,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		// Constant-time comparison to prevent timing attacks
 		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
-			logger.Warn("Invalid admin token attempt", zap.String("ip", c.ClientIP()))
+			logger.Warn("Invalid admin token attempt")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -195,8 +195,6 @@ func Logger(logger *zap.Logger) gin.HandlerFunc {
 			zap.String("path", path),
 			zap.String("query", query),
 			zap.Int("status", c.Writer.Status()),
-			zap.String("ip", c.ClientIP()),
-			zap.String("user_agent", c.Request.UserAgent()),
 		)
 
 		_ = start // Use the variable

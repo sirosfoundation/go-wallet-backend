@@ -9,9 +9,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// JWTMiddleware validates JWT tokens and sets authentication status
-// It only validates that the token is valid and from the expected issuer
-// No user-specific claims are extracted or required
+// JWTMiddleware validates JWT tokens and sets authentication status.
+// When present and valid, it also extracts tenant_id from claims and sets it in context.
+// This enables per-tenant authorization for authenticated endpoints.
 func JWTMiddleware(config JWTConfig, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Default to unauthenticated
@@ -105,7 +105,19 @@ func JWTMiddleware(config JWTConfig, logger *zap.Logger) gin.HandlerFunc {
 
 		// Token is valid, mark as authenticated
 		c.Set(string(AuthenticatedKey), true)
-		logger.Debug("request authenticated")
+
+		// Extract tenant_id claim if present for per-tenant authorization
+		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			if tenantID, ok := claims["tenant_id"].(string); ok && tenantID != "" {
+				c.Set(string(TenantIDKey), tenantID)
+				logger.Debug("request authenticated with tenant",
+					zap.String("tenant_id", tenantID))
+			} else {
+				logger.Debug("request authenticated (no tenant_id in token)")
+			}
+		} else {
+			logger.Debug("request authenticated")
+		}
 
 		c.Next()
 	}
