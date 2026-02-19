@@ -9,11 +9,15 @@ build: ## Build the server binary
 	@echo "Building server..."
 	@go build -o bin/server cmd/server/main.go
 
+build-registry: ## Build the registry server binary
+	@echo "Building registry server..."
+	@go build -o bin/registry cmd/registry/main.go
+
 build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
 	@go build -o bin/wallet-admin ./cmd/wallet-admin
 
-build-all: build build-admin ## Build all binaries
+build-all: build build-registry build-admin ## Build all binaries
 
 man: ## Copy man pages to bin directory
 	@echo "Copying man pages..."
@@ -28,6 +32,10 @@ install-man: man ## Install man pages to system (requires sudo)
 run: build ## Build and run the server
 	@echo "Running server..."
 	@./bin/server
+
+run-registry: build-registry ## Build and run the registry server
+	@echo "Running registry server..."
+	@./bin/registry
 
 dev: ## Run with hot reload (requires air)
 	@echo "Running in development mode..."
@@ -71,13 +79,27 @@ docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	@docker build -t go-wallet-backend:latest .
 
+docker-build-registry: ## Build Docker image for registry server
+	@echo "Building registry Docker image..."
+	@docker build -f Dockerfile.registry -t go-wallet-registry:latest .
+
 docker-build-branch: ## Build Docker image from a git branch/tag (usage: make docker-build-branch GIT_REF=feature/multi-tenancy TAG=test)
 	@echo "Building Docker image from branch $(GIT_REF)..."
 	@docker build --build-arg GIT_REF=$(GIT_REF) -t go-wallet-backend:$(or $(TAG),$(GIT_REF)) .
 
+docker-build-registry-branch: ## Build registry Docker image from a git branch/tag
+	@echo "Building registry Docker image from branch $(GIT_REF)..."
+	@docker build -f Dockerfile.registry --build-arg GIT_REF=$(GIT_REF) -t go-wallet-registry:$(or $(TAG),$(GIT_REF)) .
+
 docker-run: docker-build ## Build and run Docker container
 	@echo "Running Docker container..."
 	@docker run -p 8080:8080 --rm go-wallet-backend:latest
+
+docker-run-registry: docker-build-registry ## Build and run registry Docker container
+	@echo "Running registry Docker container..."
+	@docker run -p 8097:8097 --rm go-wallet-registry:latest
+
+docker-build-all: docker-build docker-build-registry ## Build all Docker images
 
 deps: ## Download dependencies
 	@echo "Downloading dependencies..."

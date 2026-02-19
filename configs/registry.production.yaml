@@ -1,0 +1,49 @@
+# Registry Server Production Configuration
+# 
+# Environment variables override these settings with REGISTRY_ prefix:
+#   REGISTRY_SERVER_PORT=8097
+#   REGISTRY_SOURCE_URL=https://registry.siros.org/.well-known/vctm-registry.json
+#   REGISTRY_JWT_SECRET=your-secret-here
+#   REGISTRY_LOGGING_LEVEL=info
+
+server:
+  host: "0.0.0.0"
+  port: 8097
+
+source:
+  url: "https://registry.siros.org/.well-known/vctm-registry.json"
+  poll_interval: 5m
+  timeout: 30s
+
+cache:
+  path: "/app/data/vctm-cache.json"
+  max_age: 24h
+
+dynamic_cache:
+  enabled: true
+  default_ttl: 1h
+  max_ttl: 24h
+  min_ttl: 5m
+  timeout: 30s
+  # In production, consider restricting to known credential hosts
+  allowed_hosts: []
+
+filter:
+  include_patterns: []
+  exclude_patterns: []
+
+rate_limit:
+  enabled: true
+  authenticated_rpm: 1000
+  unauthenticated_rpm: 100
+  burst_multiplier: 3
+
+jwt:
+  # Set via REGISTRY_JWT_SECRET environment variable
+  secret: ""
+  issuer: "wallet-backend"
+  require_auth: false
+
+logging:
+  level: "info"
+  format: "json"

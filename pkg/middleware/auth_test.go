@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -66,7 +67,7 @@ func createTestRouter(cfg *config.Config, store storage.Store, logger *zap.Logge
 func createTestStore() storage.Store {
 	store := memory.NewStore()
 	// Create default tenant that JWT tokens reference
-	store.Tenants().Create(nil, &domain.Tenant{
+	_ = store.Tenants().Create(context.Background(), &domain.Tenant{
 		ID:      domain.DefaultTenantID,
 		Name:    "Default",
 		Enabled: true,

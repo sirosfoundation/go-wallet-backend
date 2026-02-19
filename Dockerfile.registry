@@ -1,0 +1,45 @@
+# Build stage
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+# Install git for fetching dependencies
+RUN apk add --no-cache git ca-certificates
+
+# Build arguments for versioning
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+# Copy local module files and download dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the local source
+COPY . .
+
+# Build the registry server
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w" \
+    -o registry cmd/registry/main.go
+
+# Runtime stage
+FROM gcr.io/distroless/static-debian12
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/registry /app/registry
+COPY --from=builder /app/configs/registry.yaml /app/configs/registry.yaml
+COPY --from=builder /app/configs/registry.production.yaml /app/configs/registry.production.yaml
+
+# Create data directory for cache (will be mounted as volume in production)
+VOLUME /app/data
+
+USER nonroot:nonroot
+
+# Expose port (default registry port)
+EXPOSE 8097
+
+# Run with production config by default
+ENTRYPOINT ["/app/registry"]
+CMD ["-config", "/app/configs/registry.production.yaml"]
