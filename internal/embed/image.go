@@ -287,6 +287,11 @@ func (e *ImageEmbedder) fetchAndEncode(ctx context.Context, url string) (string,
 		mimeType = strings.TrimSpace(mimeType[:idx])
 	}
 
+	// Validate content-type is an image to prevent embedding non-image content
+	if !strings.HasPrefix(mimeType, "image/") && mimeType != "application/octet-stream" {
+		return "", fmt.Errorf("invalid content-type: %s (expected image/*)", mimeType)
+	}
+
 	// Encode as data URI
 	encoded := base64.StdEncoding.EncodeToString(data)
 	return fmt.Sprintf("data:%s;base64,%s", mimeType, encoded), nil
@@ -299,8 +304,8 @@ func IsImageURL(url string) bool {
 		return false
 	}
 
-	// Must be HTTP(S) URL
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+	// Must be HTTPS URL (HTTP is not allowed for security reasons)
+	if !strings.HasPrefix(url, "https://") {
 		return false
 	}
 

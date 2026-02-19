@@ -15,8 +15,8 @@ import (
 func TestImageEmbedder_EmbedImages(t *testing.T) {
 	logger := zap.NewNop()
 
-	// Create a test server that serves images
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Create a TLS test server that serves images (embedder requires HTTPS)
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/logo.png":
 			// 1x1 transparent PNG
@@ -77,7 +77,8 @@ func TestImageEmbedder_EmbedImages(t *testing.T) {
 		Timeout:           5 * time.Second,
 		ConcurrentFetches: 2,
 	}
-	embedder := NewImageEmbedder(config, logger)
+	// Use TLS client from test server to allow HTTPS connections
+	embedder := NewImageEmbedder(config, logger, WithHTTPClient(ts.Client()))
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -125,8 +126,8 @@ func TestImageEmbedder_Disabled(t *testing.T) {
 func TestImageEmbedder_MaxSize(t *testing.T) {
 	logger := zap.NewNop()
 
-	// Server that returns a "large" image
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// TLS server that returns a "large" image
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		// Write 2KB of data
 		_, _ = w.Write(make([]byte, 2048))
@@ -139,7 +140,7 @@ func TestImageEmbedder_MaxSize(t *testing.T) {
 		Timeout:           5 * time.Second,
 		ConcurrentFetches: 1,
 	}
-	embedder := NewImageEmbedder(config, logger)
+	embedder := NewImageEmbedder(config, logger, WithHTTPClient(ts.Client()))
 
 	input := `{"vct": "test", "display": [{"logo": {"uri": "` + ts.URL + `/large.png"}}]}`
 	result, err := embedder.EmbedImages(context.Background(), []byte(input))
@@ -174,7 +175,7 @@ func TestImageEmbedder_CustomExtractor(t *testing.T) {
 		}
 	}
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, _ := base64.StdEncoding.DecodeString(
 			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 		w.Header().Set("Content-Type", "image/png")
@@ -191,6 +192,7 @@ func TestImageEmbedder_CustomExtractor(t *testing.T) {
 	embedder := NewImageEmbedder(config, logger,
 		WithExtractor(customExtractor),
 		WithReplacer(customReplacer),
+		WithHTTPClient(ts.Client()),
 	)
 
 	input := `{"icon": "` + ts.URL + `/test.png", "logo": {"uri": "` + ts.URL + `/other.png"}}`
@@ -277,12 +279,12 @@ func TestIsImageURL(t *testing.T) {
 		expected bool
 	}{
 		{"https://example.com/logo.png", true},
-		{"http://example.com/image.jpg", true},
+		{"http://example.com/image.jpg", false},        // HTTP not allowed (HTTPS only)
 		{"https://example.com/icon.svg", true},
-		{"https://example.com/api/image", true}, // No extension but HTTP
-		{"data:image/png;base64,iVBORw0KGgo=", false}, // Already data URI
-		{"file:///path/to/image.png", false},          // Not HTTP
-		{"/relative/path.png", false},                 // Not HTTP
+		{"https://example.com/api/image", true},        // No extension but HTTPS
+		{"data:image/png;base64,iVBORw0KGgo=", false},  // Already data URI
+		{"file:///path/to/image.png", false},           // Not HTTPS
+		{"/relative/path.png", false},                  // Not HTTPS
 	}
 
 	for _, tt := range tests {

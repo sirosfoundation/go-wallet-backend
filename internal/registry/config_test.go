@@ -345,3 +345,48 @@ func TestFilterConfig_Matches(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheConfig_IsExpired(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxAge      time.Duration
+		lastUpdated time.Time
+		expected    bool
+	}{
+		{
+			name:        "not expired - within max age",
+			maxAge:      1 * time.Hour,
+			lastUpdated: time.Now().Add(-30 * time.Minute),
+			expected:    false,
+		},
+		{
+			name:        "expired - past max age",
+			maxAge:      1 * time.Hour,
+			lastUpdated: time.Now().Add(-2 * time.Hour),
+			expected:    true,
+		},
+		{
+			name:        "zero max age - never expires",
+			maxAge:      0,
+			lastUpdated: time.Now().Add(-24 * time.Hour),
+			expected:    false,
+		},
+		{
+			name:        "negative max age - never expires",
+			maxAge:      -1 * time.Hour,
+			lastUpdated: time.Now().Add(-24 * time.Hour),
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := CacheConfig{
+				Path:   "/tmp/cache.json",
+				MaxAge: tt.maxAge,
+			}
+			result := config.IsExpired(tt.lastUpdated)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

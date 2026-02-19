@@ -72,6 +72,18 @@ type CacheConfig struct {
 	MaxAge time.Duration `yaml:"max_age" envconfig:"MAX_AGE"`
 }
 
+// IsExpired reports whether cached data last updated at the given time
+// should be considered expired according to MaxAge.
+//
+// If MaxAge is zero or negative, the cache is treated as non-expiring
+// and this method always returns false.
+func (c CacheConfig) IsExpired(lastUpdated time.Time) bool {
+	if c.MaxAge <= 0 {
+		return false
+	}
+	return time.Since(lastUpdated) > c.MaxAge
+}
+
 // DynamicCacheConfig contains configuration for on-demand URL fetching
 type DynamicCacheConfig struct {
 	// Enabled controls whether dynamic URL fetching is active

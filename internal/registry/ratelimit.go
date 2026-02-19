@@ -52,6 +52,12 @@ func (r *RateLimiter) getLimiter(clientIP string) *clientLimiter {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Cleanup old limiters periodically (before checking if client exists,
+	// so cleanup runs even when existing clients are making requests)
+	if time.Since(r.lastCleanup) > r.cleanupInterval {
+		r.cleanup()
+	}
+
 	limiter, exists := r.clients[clientIP]
 	if exists {
 		limiter.lastSeen = time.Now()
@@ -77,11 +83,6 @@ func (r *RateLimiter) getLimiter(clientIP string) *clientLimiter {
 		lastSeen:      time.Now(),
 	}
 	r.clients[clientIP] = limiter
-
-	// Cleanup old limiters periodically
-	if time.Since(r.lastCleanup) > r.cleanupInterval {
-		r.cleanup()
-	}
 
 	return limiter
 }
