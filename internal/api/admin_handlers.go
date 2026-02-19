@@ -326,9 +326,11 @@ func (h *AdminHandlers) GetTenantUsers(c *gin.Context) {
 // AdminStatus returns the admin server status
 // GET /admin/status
 func (h *AdminHandlers) AdminStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"service": "wallet-backend-admin",
+	c.JSON(http.StatusOK, StatusResponse{
+		Status:       "ok",
+		Service:      "wallet-backend-admin",
+		APIVersion:   CurrentAPIVersion,
+		Capabilities: APICapabilities[CurrentAPIVersion],
 	})
 }
 
