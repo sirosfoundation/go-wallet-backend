@@ -209,8 +209,12 @@ func (e *ImageEmbedder) fetchImages(ctx context.Context, urls []string) map[stri
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Semaphore for limiting concurrent fetches
-	sem := make(chan struct{}, e.config.ConcurrentFetches)
+	// Semaphore for limiting concurrent fetches; ensure capacity is at least 1
+	maxConcurrent := e.config.ConcurrentFetches
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
+	sem := make(chan struct{}, maxConcurrent)
 
 	for _, url := range urls {
 		wg.Add(1)

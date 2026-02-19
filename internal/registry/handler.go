@@ -146,12 +146,13 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 
 		// Handle 304 Not Modified
 		if result.NotModified && existingEntry != nil {
-			// Refresh the expiration time
-			existingEntry.ExpiresAt = h.dynamicFetcher.calculateExpiresAt(nil)
-			existingEntry.FetchedAt = existingEntry.ExpiresAt.Add(-h.config.DefaultTTL) // Approximate
-			h.store.Set(vctID, existingEntry)
+			// Refresh the expiration time without mutating the shared cached entry directly.
+			updatedEntry := *existingEntry
+			updatedEntry.ExpiresAt = h.dynamicFetcher.calculateExpiresAt(nil)
+			updatedEntry.FetchedAt = updatedEntry.ExpiresAt.Add(-h.config.DefaultTTL) // Approximate
+			h.store.Set(vctID, &updatedEntry)
 			c.Header("X-Cache-Status", "revalidated")
-			h.serveEntry(c, existingEntry)
+			h.serveEntry(c, &updatedEntry)
 			return
 		}
 
