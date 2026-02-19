@@ -93,23 +93,8 @@ func main() {
 	rateLimiter := registry.NewRateLimiter(config.RateLimit)
 	router.Use(registry.RateLimitMiddleware(rateLimiter))
 
-	// Build handler options
-	var handlerOpts []registry.HandlerOption
-
-	// Add issuer metadata support if trust is enabled
-	if config.Trust.Enabled {
-		issuerMetadataConfig := &registry.IssuerMetadataConfig{
-			DefaultTrustEndpoint: config.Trust.DefaultEndpoint,
-			DefaultTrustTTL:      time.Duration(config.Trust.DefaultTTL) * time.Second,
-		}
-		handlerOpts = append(handlerOpts, registry.WithStandaloneIssuerMetadata(issuerMetadataConfig))
-		logger.Info("issuer metadata endpoint enabled",
-			zap.String("default_trust_endpoint", config.Trust.DefaultEndpoint),
-			zap.Int("default_ttl_seconds", config.Trust.DefaultTTL))
-	}
-
 	// Register handlers
-	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger, handlerOpts...)
+	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger)
 	handler.RegisterRoutes(router)
 
 	// Create HTTP server

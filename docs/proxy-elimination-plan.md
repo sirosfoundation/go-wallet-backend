@@ -143,31 +143,44 @@ Metadata (VCTM) with embedded images. Provides display metadata for credentials.
 
 ---
 
-### 2. Trust Service (Complete)
+### 2. Trust & Metadata Discovery (Complete)
 
 **Status**: ✅ Complete
 
-**Purpose**: Query-based trust evaluation using go-trust evaluators. Returns
-trust status for any issuer identifier with TTL caching.
+**Purpose**: Internal services for entity metadata discovery and trust evaluation
+via go-trust (AuthZEN). Used by WebSocket flow handlers during credential issuance
+and presentation.
+
+**Architecture**: All trust configuration (X.509, TSL, OIDF federation, etc.) is
+managed by go-trust. The wallet backend calls go-trust endpoints via AuthZEN protocol.
+No REST endpoints exposed - discovery and trust evaluation happen internally during
+WebSocket flows.
 
 **Location**: 
-- `go-wallet-backend/internal/service/trust.go` - TrustService wrapper
-- `go-wallet-backend/internal/registry/issuer_metadata.go` - /issuer-metadata handler
+- `go-wallet-backend/internal/metadata/` - Entity metadata discovery services
+  - `issuer.go` - OpenID4VCI issuer metadata discovery + IACA certificates
+  - `verifier.go` - OpenID4VP verifier/client metadata discovery
+- `go-wallet-backend/pkg/trust/authzen/` - AuthZEN client for go-trust endpoints
 - `go-wallet-backend/internal/registry/trust_refresh.go` - Background refresh worker
 
 **Key Deliverables**:
-- [x] `TrustService` wrapping go-trust evaluators
-- [x] `/issuer-metadata` endpoint on registry server
-- [x] Trust status (trusted/unknown/untrusted) with framework info
-- [x] Per-tenant trust configuration (trust_endpoint, trust_ttl, refresh_interval)
-- [x] Background refresh worker for stale trust evaluations
-- [x] Admin API support for trust configuration
+- [x] Issuer metadata discovery (OpenID4VCI `.well-known/openid-credential-issuer`)
+- [x] Verifier metadata discovery (OpenID4VP `client_metadata` / `client_metadata_uri`)
+- [x] IACA certificate fetching for mDOC (`mdoc_iacas_uri`)
+- [x] AuthZEN client for go-trust trust evaluation
+- [x] Background refresh worker for cached trust evaluations (main server)
+- [x] Per-tenant trust configuration via `Tenant.TrustConfig`
 
-**Integration Points**:
-- Registry server: standalone /issuer-metadata endpoint (stateless)
-- Main server: per-tenant trust via CredentialIssuer persistence
-- VCTM Registry for credential display metadata
-- WebSocket protocol for trust queries during protocol flows
+**Removed (redundant REST endpoints)**:
+- ~~`/api/discover-and-trust`~~ - duplicated go-trust functionality
+- ~~`/issuer-metadata`~~ - not needed; WebSocket handlers call internal services
+- ~~Embedded TrustService~~
+- ~~`pkg/trust/x509eval/` and `pkg/trust/trustfactory/`~~
+
+**Integration**:
+- WebSocket flow handlers use internal metadata discovery services
+- Trust evaluation via AuthZEN client → go-trust endpoints
+- Per-tenant: `Tenant.TrustEndpoint` → server default → `TrustStatusUnknown`
 
 ---
 
@@ -259,12 +272,12 @@ Phase 4: Validation & Rollout (Week 8)
 
 ## Milestone Definitions
 
-### M1: Trust Integration (End of Phase 1) - IN PROGRESS
+### M1: Trust Integration (End of Phase 1) - COMPLETE
 - ✅ VCTM Registry merged
-- ✅ TrustService wrapping go-trust evaluators
-- ✅ JIT discover-and-trust endpoint
+- ✅ `/issuer-metadata` endpoint on registry (calls go-trust via AuthZEN)
+- ✅ Per-tenant trust endpoint configuration (Tenant.TrustEndpoint)
 - ✅ Trust fields in CredentialIssuer (TrustStatus, TrustFramework, TrustEvaluatedAt)
-- ⬜ Per-tenant TrustEvaluator configuration
+- ✅ Background refresh worker for stale trust evaluations
 - ⬜ Admin API integration (evaluate on issuer create/update)
 - ⬜ Frontend can display trust indicators
 
@@ -321,69 +334,73 @@ Phase 4: Validation & Rollout (Week 8)
 
 ### ✅ Completed in `feature/trust-evaluation` branch
 
-1. **TrustService** (`internal/service/trust.go`): Wraps go-trust evaluators
-   for issuer/verifier trust evaluation with multi-framework support.
-
-2. **JIT Trust Endpoint** (`internal/api/discover_trust.go`):
-   - `POST /api/discover-and-trust` - Evaluate issuer trust on-demand
-   - Fetches issuer metadata and IACA certificates
-   - Returns trust status, framework, and certificate chain
-
-3. **Trust Fields in CredentialIssuer** (`internal/domain/credential.go`):
+1. **Per-tenant Trust Caching** (`internal/domain/credential.go`):
    - `TrustStatus` (trusted/untrusted/unknown)
    - `TrustFramework` (oidf/ebsi/x509/etc.)
    - `TrustEvaluatedAt` (for TTL-based refresh)
 
-4. **API Version Capabilities** (`internal/api/version.go`):
-   - Version discovery endpoint
-   - Capability negotiation structure
+2. **Per-tenant Trust Endpoint** (`internal/domain/tenant.go`):
+   - `TrustEndpoint` - go-trust service URL for this tenant
+   - Falls back to server-wide default endpoint
 
-### 🔄 Gaps Identified
+3. **Issuer Metadata Endpoint** (`internal/registry/issuer_metadata.go`):
+   - `GET /issuer-metadata?issuer={url}` on registry server
+   - Fetches OpenID4VCI metadata from issuer
+   - Evaluates trust via go-trust (AuthZEN)
+   - Returns combined metadata + trust status + certificates
+   - Caches to CredentialIssuer when issuerStore available
+
+4. **Background Trust Refresh** (`internal/registry/trust_refresh.go`):
+   - Worker refreshes stale trust evaluations
+   - Per-tenant endpoint resolution
+   - Configurable refresh interval and TTL
+
+5. **Admin API Trust Config** (`internal/api/admin_handlers.go`):
+   - Tenant trust_endpoint in create/update endpoints
+
+### ⬜ Gaps / Next Steps
 
 | Gap | Description | Priority |
 |-----|-------------|----------|
-| **Per-tenant TrustEvaluator** | TrustService needs per-tenant go-trust config | High |
-| **Admin API integration** | Create/update issuer should trigger trust eval | High |
-| **Cache persistence** | discover-and-trust should cache to CredentialIssuer | Medium |
-| **TTL refresh** | Background job to refresh stale trust status | Medium |
-| **go-trust config per tenant** | How do tenants configure their trust anchors? | High |
+| **Admin issuer trust eval** | Create/update issuer should trigger trust eval | Medium |
+| **Frontend trust display** | Frontend needs to call /issuer-metadata and display results | Medium |
+| **WebSocket protocol** | The main proxy-elimination work (API v2) | High |
 
-### Open Questions
+### Open Questions (Resolved)
 
-1. **Per-Tenant Trust Configuration**: How is go-trust configured per tenant?
-   - Option A: Tenant-specific config files (e.g., `/config/tenants/{id}/trust.yaml`)
-   - Option B: Database-stored trust anchors per tenant
-   - Option C: Tenant profile references shared trust configs
+1. **Per-Tenant Trust Configuration**: ✅ RESOLVED
+   - Each tenant has `trust_endpoint` field (go-trust service URL)
+   - Falls back to server-wide `default_endpoint` in registry config
+   - go-trust handles all trust anchors, federation config, etc.
 
-2. **Trust TTL Policy**: How long should cached trust be valid?
-   - Suggested: 24 hours for federation-based, 1 hour for IACA/X.509
+2. **Trust TTL Policy**: ✅ RESOLVED
+   - Per-tenant `trust_ttl` for cache validity
+   - Server-wide `refresh_interval` for background refresh
+   - Default: 24 hours TTL, 1 hour refresh interval
 
-3. **Trust Refresh Strategy**: Eager vs lazy refresh?
-   - Eager: Background job refreshes all issuers periodically
-   - Lazy: Refresh on access when TTL expired
+3. **Trust Refresh Strategy**: ✅ RESOLVED
+   - Background worker refreshes stale trust (eager refresh)
+   - Also refreshes on issuer-metadata request if TTL expired
 
-4. **Existing Issuers Migration**: How to populate trust for existing issuers?
+4. **Existing Issuers Migration**: ⬜ TODO
    - Migration script to evaluate all existing CredentialIssuer records
 
 ### Recommended Next Steps
 
 **Immediate (Complete Trust Integration):**
 
-1. **Wire per-tenant TrustEvaluator config** - Determine how tenants configure
-   trust anchors and implement config loading per tenant.
+1. **Integrate with Admin Issuer API** - When `POST /admin/tenants/:id/issuers`
+   is called, call registry `/issuer-metadata` to populate trust fields.
 
-2. **Integrate with Admin Issuer API** - When `POST /admin/tenants/:id/issuers`
-   is called, invoke TrustService to evaluate and populate trust fields.
-
-3. **Persist from discover-and-trust** - Option to save JIT results to
-   CredentialIssuer for future lookups.
+2. **Frontend trust display** - Call registry `/issuer-metadata` endpoint to
+   get combined metadata + trust status for display to users.
 
 **Near-term (WebSocket Protocol):**
 
-4. **Begin WebSocket endpoint** (`/api/v2/wallet`) - This is the bulk of
+3. **Begin WebSocket endpoint** (`/api/v2/wallet`) - This is the bulk of
    proxy elimination work.
 
-5. **OID4VCI flow handler** - First protocol to implement over WebSocket.
+4. **OID4VCI flow handler** - First protocol to implement over WebSocket.
 
 **Example Admin API integration:**
 ```go
@@ -391,16 +408,15 @@ Phase 4: Validation & Rollout (Week 8)
 func (h *AdminHandler) CreateIssuer(c *gin.Context) {
     // ... existing validation ...
     
-    // Evaluate trust for the new issuer
-    if h.trustService != nil {
-        trustResult, err := h.trustService.EvaluateIssuer(c.Request.Context(), 
-            req.CredentialIssuerIdentifier, tenant.ID)
-        if err == nil {
-            issuer.TrustStatus = domain.TrustStatus(trustResult.Status)
-            issuer.TrustFramework = trustResult.Framework
-            now := time.Now()
-            issuer.TrustEvaluatedAt = &now
-        }
+    // Call registry /issuer-metadata to get trust status
+    // (registry calls go-trust via AuthZEN)
+    metadataResp, err := h.registryClient.GetIssuerMetadata(c.Request.Context(),
+        req.CredentialIssuerIdentifier, tenantID)
+    if err == nil {
+        issuer.TrustStatus = domain.TrustStatus(metadataResp.TrustStatus)
+        issuer.TrustFramework = metadataResp.TrustFramework
+        now := time.Now()
+        issuer.TrustEvaluatedAt = &now
     }
     
     // ... save issuer ...

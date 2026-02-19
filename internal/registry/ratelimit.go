@@ -16,6 +16,8 @@ type contextKey string
 const (
 	// AuthenticatedKey is the context key for authentication status
 	AuthenticatedKey contextKey = "authenticated"
+	// TenantIDKey is the context key for tenant ID from JWT
+	TenantIDKey contextKey = "tenant_id"
 )
 
 // RateLimiter manages per-client rate limiting

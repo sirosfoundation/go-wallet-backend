@@ -2,24 +2,25 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust/authzen"
 	"go.uber.org/zap"
 )
 
 // TrustRefreshWorker periodically refreshes stale trust evaluations in the background.
-// It uses the same logic as IssuerMetadataHandler but operates on all issuers with
+// It calls go-trust endpoints (AuthZEN) to re-evaluate trust for issuers with
 // expired trust evaluations.
 type TrustRefreshWorker struct {
-	trustService         *service.TrustService
-	issuerStore          storage.IssuerStore
-	tenantStore          storage.TenantStore
+	issuerStore            storage.IssuerStore
+	tenantStore            storage.TenantStore
+	defaultTrustEndpoint   string
 	defaultRefreshInterval time.Duration
-	logger               *zap.Logger
+	logger                 *zap.Logger
 
 	mu      sync.Mutex
 	running bool
@@ -29,26 +30,31 @@ type TrustRefreshWorker struct {
 
 // TrustRefreshConfig configures the TrustRefreshWorker
 type TrustRefreshConfig struct {
-	// DefaultRefreshInterval is the default interval for checking stale trust (if tenant has none configured)
+	// DefaultTrustEndpoint is the go-trust endpoint to use when tenant has none configured
+	DefaultTrustEndpoint string
+	// DefaultRefreshInterval is the interval for checking stale trust
 	DefaultRefreshInterval time.Duration
 }
 
 // NewTrustRefreshWorker creates a new TrustRefreshWorker
 func NewTrustRefreshWorker(
-	trustService *service.TrustService,
 	issuerStore storage.IssuerStore,
 	tenantStore storage.TenantStore,
 	config *TrustRefreshConfig,
 	logger *zap.Logger,
 ) *TrustRefreshWorker {
 	interval := 1 * time.Hour // Default 1 hour
-	if config != nil && config.DefaultRefreshInterval > 0 {
-		interval = config.DefaultRefreshInterval
+	endpoint := ""
+	if config != nil {
+		if config.DefaultRefreshInterval > 0 {
+			interval = config.DefaultRefreshInterval
+		}
+		endpoint = config.DefaultTrustEndpoint
 	}
 	return &TrustRefreshWorker{
-		trustService:           trustService,
 		issuerStore:            issuerStore,
 		tenantStore:            tenantStore,
+		defaultTrustEndpoint:   endpoint,
 		defaultRefreshInterval: interval,
 		logger:                 logger.Named("trust-refresh"),
 	}
@@ -171,29 +177,58 @@ func (w *TrustRefreshWorker) refreshTenant(ctx context.Context, tenant *domain.T
 
 // refreshIssuer re-evaluates trust for a specific issuer
 func (w *TrustRefreshWorker) refreshIssuer(ctx context.Context, tenant *domain.Tenant, issuer *domain.CredentialIssuer) error {
-	if w.trustService == nil {
-		// No trust service configured, just update timestamp
-		now := time.Now()
+	// Determine which trust endpoint to use
+	trustEndpoint := w.defaultTrustEndpoint
+	if tenant.TrustConfig.TrustEndpoint != "" {
+		trustEndpoint = tenant.TrustConfig.TrustEndpoint
+	}
+
+	now := time.Now()
+
+	// No trust endpoint configured - keep existing status, just update timestamp
+	if trustEndpoint == "" {
 		issuer.TrustEvaluatedAt = &now
 		return w.issuerStore.Update(ctx, issuer)
 	}
 
-	// Evaluate trust (without fetching metadata again for refresh)
-	// For background refresh, we just re-evaluate with existing information
-	trustResp, err := w.trustService.EvaluateIssuer(ctx, issuer.CredentialIssuerIdentifier, "", nil)
+	// Create AuthZEN evaluator for this endpoint
+	evaluator, err := authzen.NewEvaluator(&authzen.Config{
+		BaseURL: trustEndpoint,
+		Timeout: 15 * time.Second,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create AuthZEN evaluator: %w", err)
+	}
+
+	// Evaluate trust (without certificates for refresh - just entity identifier)
+	trustResp, err := evaluator.EvaluateX5C(ctx, issuer.CredentialIssuerIdentifier, nil, "issue")
+	if err != nil {
+		return fmt.Errorf("trust evaluation failed: %w", err)
 	}
 
 	// Update issuer
-	now := time.Now()
-	if trustResp.Trusted {
+	if trustResp.Decision {
 		issuer.TrustStatus = domain.TrustStatusTrusted
 	} else {
 		issuer.TrustStatus = domain.TrustStatusUntrusted
 	}
-	issuer.TrustFramework = trustResp.TrustFramework
+	issuer.TrustFramework = detectTrustFramework(trustResp.TrustMetadata)
 	issuer.TrustEvaluatedAt = &now
 
 	return w.issuerStore.Update(ctx, issuer)
+}
+
+// detectTrustFramework attempts to identify the trust framework from metadata
+func detectTrustFramework(metadata interface{}) string {
+	if metadata == nil {
+		return ""
+	}
+
+	if m, ok := metadata.(map[string]interface{}); ok {
+		if tf, ok := m["trust_framework"].(string); ok {
+			return tf
+		}
+	}
+
+	return ""
 }

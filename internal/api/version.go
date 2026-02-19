@@ -13,12 +13,9 @@ const (
 	// APIVersion1 is the original API version (backward compatible).
 	APIVersion1 = 1
 
-	// APIVersion2 adds the discover-and-trust endpoint for JIT (just-in-time)
-	// trust evaluation of issuers and verifiers not pre-registered via VCTM.
-	APIVersion2 = 2
-
 	// CurrentAPIVersion is the highest API version supported by this server.
-	CurrentAPIVersion = APIVersion2
+	// Trust evaluation is handled internally via go-trust (AuthZEN) endpoints.
+	CurrentAPIVersion = APIVersion1
 )
 
 // APICapabilities describes the features available at each API version.
@@ -29,14 +26,6 @@ var APICapabilities = map[int][]string{
 		"proxy",
 		"multi-tenancy",
 		"vctm-registry", // VCTM caching with pre-computed trust
-	},
-	APIVersion2: {
-		"webauthn",
-		"storage",
-		"proxy",
-		"multi-tenancy",
-		"vctm-registry",      // VCTM caching with pre-computed trust
-		"discover-and-trust", // JIT trust evaluation for unknown issuers
 	},
 }
 
