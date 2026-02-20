@@ -15,6 +15,7 @@ type Config struct {
 	Logging        LoggingConfig        `yaml:"logging" envconfig:"LOGGING"`
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
+	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -67,6 +68,17 @@ type WalletProviderConfig struct {
 	PrivateKeyPath  string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
 	CertificatePath string `yaml:"certificate_path" envconfig:"CERTIFICATE_PATH"`
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
+}
+
+// TrustConfig contains trust evaluation configuration
+type TrustConfig struct {
+	// DefaultEndpoint is the go-trust PDP endpoint for trust evaluation.
+	// Tenants can override this with their own endpoint.
+	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
+	// RegistryURL is the URL for the VCTM registry service.
+	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
+	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 }
 
 // Load loads configuration from file and environment variables
@@ -138,6 +150,9 @@ func defaultConfig() *Config {
 			ExpiryHours: 24,
 			RefreshDays: 7,
 			Issuer:      "wallet-backend",
+		},
+		Trust: TrustConfig{
+			Timeout: 30, // seconds
 		},
 	}
 }

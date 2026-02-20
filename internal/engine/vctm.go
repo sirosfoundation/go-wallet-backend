@@ -22,16 +22,20 @@ type VCTMHandler struct {
 }
 
 // NewVCTMHandler creates a new VCTM flow handler
-func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger) (FlowHandler, error) {
-	// Default registry URL
-	registryURL := "http://localhost:8082" // Registry server default port
-	// TODO: Make configurable via cfg
+func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
+	// Get registry URL from config, or use default
+	registryURL := cfg.Trust.RegistryURL
+	if registryURL == "" {
+		registryURL = "http://localhost:8082" // Registry server default port
+	}
 
 	return &VCTMHandler{
 		BaseHandler: BaseHandler{
-			Flow:   flow,
-			Config: cfg,
-			Logger: logger,
+			Flow:     flow,
+			Config:   cfg,
+			Logger:   logger,
+			TrustSvc: trustSvc,
+			Registry: registry,
 		},
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,

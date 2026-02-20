@@ -67,6 +67,9 @@ type Manager struct {
 
 	flowHandlers map[Protocol]FlowHandlerFactory
 	handlersMu   sync.RWMutex
+
+	trustService   *TrustService
+	registryClient *RegistryClient
 }
 
 // NewManager creates a new session manager
@@ -82,9 +85,11 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 				return true
 			},
 		},
-		sessions:     make(map[string]*Session),
-		userIndex:    make(map[string]*Session),
-		flowHandlers: make(map[Protocol]FlowHandlerFactory),
+		sessions:       make(map[string]*Session),
+		userIndex:      make(map[string]*Session),
+		flowHandlers:   make(map[Protocol]FlowHandlerFactory),
+		trustService:   NewTrustService(cfg, logger),
+		registryClient: NewRegistryClient(cfg, logger),
 	}
 }
 
@@ -284,7 +289,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// Create handler
-	handler, err := factory(flow, m.cfg, logger)
+	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient)
 	if err != nil {
 		session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))

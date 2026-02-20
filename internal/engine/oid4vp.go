@@ -24,12 +24,14 @@ type OID4VPHandler struct {
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
-func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger) (FlowHandler, error) {
+func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
-			Flow:   flow,
-			Config: cfg,
-			Logger: logger,
+			Flow:     flow,
+			Config:   cfg,
+			Logger:   logger,
+			TrustSvc: trustSvc,
+			Registry: registry,
 		},
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -329,11 +331,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		authReq.PresentationDefinition = pd
 	}
 
-	// Build verifier info
+	// Build verifier info with name and logo from metadata
 	verifier := &VerifierInfo{
-		Name:      authReq.ClientID,
-		Trusted:   true, // TODO: Implement actual trust evaluation
-		Framework: "self-signed",
+		Name: authReq.ClientID,
 	}
 
 	if clientMeta != nil {
@@ -343,6 +343,23 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		if clientMeta.LogoURI != "" {
 			verifier.Logo = &LogoInfo{URI: clientMeta.LogoURI}
 		}
+	}
+
+	// Evaluate trust via TrustService
+	trustEndpoint := "" // TODO: Look up tenant's trust endpoint from session.TenantID
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		// In future: load tenant config and get trust endpoint
+		// trustEndpoint = tenant.TrustConfig.TrustEndpoint
+	}
+
+	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint)
+	if err != nil {
+		h.Logger.Warn("Verifier trust evaluation failed", zap.String("verifier", authReq.ClientID), zap.Error(err))
+		verifier.Trusted = false
+		verifier.Framework = "error"
+	} else {
+		verifier.Trusted = trustInfo.Trusted
+		verifier.Framework = trustInfo.Framework
 	}
 
 	return verifier, nil

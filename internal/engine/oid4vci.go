@@ -23,12 +23,14 @@ type OID4VCIHandler struct {
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
-func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger) (FlowHandler, error) {
+func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
 	return &OID4VCIHandler{
 		BaseHandler: BaseHandler{
-			Flow:   flow,
-			Config: cfg,
-			Logger: logger,
+			Flow:     flow,
+			Config:   cfg,
+			Logger:   logger,
+			TrustSvc: trustSvc,
+			Registry: registry,
 		},
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -181,8 +183,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return nil
 	}
 
-	// Step 9: Complete with issued credential
-	results := h.buildCredentialResults(credential, selectedConfig, trust)
+	// Step 9: Complete with issued credential (fetch VCTM for display)
+	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
 	return h.Complete(results, "")
 }
 
@@ -293,12 +295,22 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
 	h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
-	// TODO: Implement actual trust evaluation using pkg/trust
-	// For now, return basic trust info
-	trust := &TrustInfo{
-		Trusted:   true,
-		Framework: "self-signed",
-		Reason:    "Trust evaluation not fully implemented",
+	// Get tenant trust endpoint (if configured)
+	// For now, use the default trust endpoint
+	trustEndpoint := "" // TODO: Look up tenant's trust endpoint from session.TenantID
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		// In future: load tenant config and get trust endpoint
+		// trustEndpoint = tenant.TrustConfig.TrustEndpoint
+	}
+
+	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint)
+	if err != nil {
+		h.Logger.Error("Trust evaluation failed", zap.String("issuer", issuer), zap.Error(err))
+		trust = &TrustInfo{
+			Trusted:   false,
+			Framework: "error",
+			Reason:    "Trust evaluation error: " + err.Error(),
+		}
 	}
 
 	h.Progress(StepTrustEvaluated, trust)
@@ -627,8 +639,14 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	return &credResp, nil
 }
 
-func (h *OID4VCIHandler) buildCredentialResults(resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
+func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
 	var results []CredentialResult
+
+	// Fetch VCTM for display metadata embedding
+	var typeMetadata json.RawMessage
+	if config.VCT != "" && h.Registry != nil {
+		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
+	}
 
 	if resp.Credential != nil {
 		credStr := ""
@@ -640,9 +658,10 @@ func (h *OID4VCIHandler) buildCredentialResults(resp *CredentialResponse, config
 			credStr = string(bytes)
 		}
 		results = append(results, CredentialResult{
-			Format:     config.Format,
-			Credential: credStr,
-			VCT:        config.VCT,
+			Format:       config.Format,
+			Credential:   credStr,
+			VCT:          config.VCT,
+			TypeMetadata: typeMetadata,
 		})
 	}
 
@@ -656,9 +675,10 @@ func (h *OID4VCIHandler) buildCredentialResults(resp *CredentialResponse, config
 			credStr = string(bytes)
 		}
 		results = append(results, CredentialResult{
-			Format:     config.Format,
-			Credential: credStr,
-			VCT:        config.VCT,
+			Format:       config.Format,
+			Credential:   credStr,
+			VCT:          config.VCT,
+			TypeMetadata: typeMetadata,
 		})
 	}
 
