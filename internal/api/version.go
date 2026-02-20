@@ -33,7 +33,7 @@ var APICapabilities = map[int][]string{
 type StatusResponse struct {
 	Status       string   `json:"status"`
 	Service      string   `json:"service"`
-	Mode         string   `json:"mode"`
+	Roles        []string `json:"roles"`
 	APIVersion   int      `json:"api_version"`
 	Capabilities []string `json:"capabilities,omitempty"`
 }

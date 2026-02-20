@@ -20,16 +20,16 @@ type Handlers struct {
 	services *service.Services
 	cfg      *config.Config
 	logger   *zap.Logger
-	mode     string
+	roles    []string
 }
 
 // NewHandlers creates a new Handlers instance
-func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Logger, mode string) *Handlers {
+func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
 	return &Handlers{
 		services: services,
 		cfg:      cfg,
 		logger:   logger.Named("handlers"),
-		mode:     mode,
+		roles:    roles,
 	}
 }
 
@@ -39,7 +39,7 @@ func (h *Handlers) Status(c *gin.Context) {
 	c.JSON(200, StatusResponse{
 		Status:       "ok",
 		Service:      "wallet-backend",
-		Mode:         h.mode,
+		Roles:        h.roles,
 		APIVersion:   CurrentAPIVersion,
 		Capabilities: APICapabilities[CurrentAPIVersion],
 	})

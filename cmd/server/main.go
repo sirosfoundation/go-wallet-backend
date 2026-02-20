@@ -15,7 +15,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
-	modeall "github.com/sirosfoundation/go-wallet-backend/internal/modes/all"
 	modebackend "github.com/sirosfoundation/go-wallet-backend/internal/modes/backend"
 	modeengine "github.com/sirosfoundation/go-wallet-backend/internal/modes/engine"
 	moderegistry "github.com/sirosfoundation/go-wallet-backend/internal/modes/registry"
@@ -25,7 +24,6 @@ import (
 
 // Ensure mode packages are registered
 var (
-	_ = modeall.Config{}
 	_ = modebackend.Config{}
 	_ = modeengine.Config{}
 	_ = moderegistry.Config{}
@@ -34,7 +32,7 @@ var (
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
-	modeFlag           = flag.String("mode", "backend", "Operating mode: all, backend, registry, engine")
+	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine (comma-separated or 'all')")
 	version            = "dev"
 	buildTime          = "unknown"
 )
@@ -42,24 +40,25 @@ var (
 func main() {
 	flag.Parse()
 
-	// Parse mode
-	mode, err := modes.ParseMode(*modeFlag)
+	// Parse roles (supports comma-separated list or "all")
+	roles, err := modes.ParseRoles(*modeFlag)
 	if err != nil {
 		log.Fatalf("Invalid mode: %v", err)
 	}
+	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for most modes)
+	// Load backend configuration (needed for backend and engine roles)
 	var backendCfg *config.Config
-	if mode == modes.ModeBackend || mode == modes.ModeAll || mode == modes.ModeEngine {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
 		}
 	}
 
-	// Load registry configuration (needed for registry or all modes)
+	// Load registry configuration (needed for registry role)
 	var registryCfg *registry.Config
-	if mode == modes.ModeRegistry || mode == modes.ModeAll {
+	if roles.Has(modes.RoleRegistry) {
 		registryCfg, err = loadRegistryConfig(*registryConfigFile)
 		if err != nil {
 			log.Fatalf("Failed to load registry configuration: %v", err)
@@ -86,40 +85,49 @@ func main() {
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
 		zap.String("build_time", buildTime),
-		zap.String("mode", string(mode)),
+		zap.Strings("roles", roleStrings),
 	)
 
-	// Create mode-specific runner configuration
-	var runnerCfg interface{}
-	switch mode {
-	case modes.ModeBackend:
-		runnerCfg = &modebackend.Config{
+	// Create runners for each active role
+	var runners []modes.Runner
+
+	if roles.Has(modes.RoleBackend) {
+		runner, err := modebackend.New(&modebackend.Config{
 			Config: backendCfg,
-			Logger: logger,
-			Mode:   string(mode),
+			Logger: logger.Named("backend"),
+			Roles:  roleStrings,
+		})
+		if err != nil {
+			logger.Fatal("Failed to create backend runner", zap.Error(err))
 		}
-	case modes.ModeRegistry:
-		runnerCfg = &moderegistry.Config{
-			Config: registryCfg,
-			Logger: logger,
-		}
-	case modes.ModeEngine:
-		runnerCfg = &modeengine.Config{
-			Config: backendCfg,
-			Logger: logger,
-		}
-	case modes.ModeAll:
-		runnerCfg = &modeall.Config{
-			BackendConfig:  backendCfg,
-			RegistryConfig: registryCfg,
-			Logger:         logger,
-		}
+		runners = append(runners, runner)
 	}
 
-	// Create runner for the mode
-	runner, err := modes.NewRunner(mode, runnerCfg)
-	if err != nil {
-		logger.Fatal("Failed to create runner", zap.Error(err))
+	if roles.Has(modes.RoleRegistry) {
+		runner, err := moderegistry.New(&moderegistry.Config{
+			Config: registryCfg,
+			Logger: logger.Named("registry"),
+		})
+		if err != nil {
+			logger.Fatal("Failed to create registry runner", zap.Error(err))
+		}
+		runners = append(runners, runner)
+	}
+
+	if roles.Has(modes.RoleEngine) {
+		runner, err := modeengine.New(&modeengine.Config{
+			Config: backendCfg,
+			Logger: logger.Named("engine"),
+			Roles:  roleStrings,
+		})
+		if err != nil {
+			logger.Fatal("Failed to create engine runner", zap.Error(err))
+		}
+		runners = append(runners, runner)
+	}
+
+	if len(runners) == 0 {
+		logger.Fatal("No runners configured")
 	}
 
 	// Set up signal handling
@@ -127,11 +135,17 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start runner in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- runner.Run(ctx)
-	}()
+	// Start all runners in goroutines
+	errCh := make(chan error, len(runners))
+	for _, runner := range runners {
+		r := runner // capture for goroutine
+		go func() {
+			logger.Info("Starting role", zap.String("role", string(r.Role())))
+			if err := r.Run(ctx); err != nil {
+				errCh <- fmt.Errorf("%s error: %w", r.Role(), err)
+			}
+		}()
+	}
 
 	// Wait for signal or error
 	select {
@@ -145,13 +159,18 @@ func main() {
 
 	// Graceful shutdown
 	cancel()
-	logger.Info("Shutting down...")
+	logger.Info("Shutting down...", zap.Strings("roles", roleStrings))
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	if err := runner.Shutdown(shutdownCtx); err != nil {
-		logger.Error("Shutdown error", zap.Error(err))
+	// Shutdown all runners
+	for _, runner := range runners {
+		if err := runner.Shutdown(shutdownCtx); err != nil {
+			logger.Error("Shutdown error",
+				zap.String("role", string(runner.Role())),
+				zap.Error(err))
+		}
 	}
 
 	logger.Info("Server exited")

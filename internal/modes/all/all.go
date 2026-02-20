@@ -40,11 +40,11 @@ type Runner struct {
 
 // New creates a new all-mode runner
 func New(cfg *Config) (*Runner, error) {
-	// Create backend runner
+	// Create backend runner with all roles
 	backendRunner, err := modebackend.New(&modebackend.Config{
 		Config: cfg.BackendConfig,
 		Logger: cfg.Logger.Named("backend"),
-		Mode:   "all", // Report "all" mode to indicate engine is available
+		Roles:  []string{"backend", "registry"}, // Report active roles
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backend runner: %w", err)
@@ -70,7 +70,12 @@ func New(cfg *Config) (*Runner, error) {
 	}, nil
 }
 
-// Name returns the mode name
+// Role returns the primary role (for compatibility)
+func (r *Runner) Role() modes.Role {
+	return modes.RoleBackend // Primary role is backend
+}
+
+// Name returns the mode name (deprecated, use Role())
 func (r *Runner) Name() modes.Mode {
 	return modes.ModeAll
 }

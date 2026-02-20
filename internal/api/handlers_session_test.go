@@ -41,7 +41,7 @@ func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.Us
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
-	handlers := NewHandlers(services, cfg, logger, "test")
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
 
 	// Create a test user
 	ctx := context.Background()
@@ -423,7 +423,7 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
-	handlers := NewHandlers(services, cfg, logger, "test")
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
 
 	// Create user with multiple credentials for this test
 	ctx := context.Background()

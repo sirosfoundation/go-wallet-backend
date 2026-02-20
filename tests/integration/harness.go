@@ -98,8 +98,8 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	// Create services
 	h.Services = service.NewServices(h.Storage, h.Config, logger)
 
-	// Create handlers (using "test" mode for integration tests)
-	handlers := api.NewHandlers(h.Services, h.Config, logger, "test")
+	// Create handlers (using "test" role for integration tests)
+	handlers := api.NewHandlers(h.Services, h.Config, logger, []string{"test"})
 
 	// Setup router
 	h.Router = gin.New()

@@ -44,7 +44,12 @@ func New(cfg *Config) (*Runner, error) {
 	return &Runner{cfg: cfg}, nil
 }
 
-// Name returns the mode name
+// Role returns the role this runner implements
+func (r *Runner) Role() modes.Role {
+	return modes.RoleRegistry
+}
+
+// Name returns the mode name (deprecated, use Role())
 func (r *Runner) Name() modes.Mode {
 	return modes.ModeRegistry
 }

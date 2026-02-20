@@ -7,7 +7,9 @@
     "multi-tenancy",
     "vctm-registry"
   ],
-  "mode": "test",
+  "roles": [
+    "test"
+  ],
   "service": "wallet-backend",
   "status": "ok"
 }

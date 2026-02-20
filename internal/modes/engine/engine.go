@@ -31,6 +31,7 @@ func init() {
 type Config struct {
 	Config *config.Config
 	Logger *zap.Logger
+	Roles  []string // Active roles (for status endpoint)
 }
 
 // Runner implements the engine mode
@@ -45,7 +46,12 @@ func New(cfg *Config) (*Runner, error) {
 	return &Runner{cfg: cfg}, nil
 }
 
-// Name returns the mode name
+// Role returns the role this runner implements
+func (r *Runner) Role() modes.Role {
+	return modes.RoleEngine
+}
+
+// Name returns the mode name (deprecated, use Role())
 func (r *Runner) Name() modes.Mode {
 	return modes.ModeEngine
 }
@@ -72,12 +78,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	router.Use(gin.Recovery())
 	router.Use(requestLogger(logger))
 
+	// Determine roles for status endpoint
+	roles := r.cfg.Roles
+	if len(roles) == 0 {
+		roles = []string{"engine"}
+	}
+
 	// Health endpoint
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, api.StatusResponse{
 			Status:       "ok",
 			Service:      "wallet-backend",
-			Mode:         "engine",
+			Roles:        roles,
 			APIVersion:   api.CurrentAPIVersion,
 			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
 		})
@@ -86,7 +98,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		c.JSON(http.StatusOK, api.StatusResponse{
 			Status:       "ok",
 			Service:      "wallet-backend",
-			Mode:         "engine",
+			Roles:        roles,
 			APIVersion:   api.CurrentAPIVersion,
 			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
 		})
