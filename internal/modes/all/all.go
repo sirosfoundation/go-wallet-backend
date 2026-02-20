@@ -44,6 +44,7 @@ func New(cfg *Config) (*Runner, error) {
 	backendRunner, err := modebackend.New(&modebackend.Config{
 		Config: cfg.BackendConfig,
 		Logger: cfg.Logger.Named("backend"),
+		Mode:   "all", // Report "all" mode to indicate engine is available
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create backend runner: %w", err)

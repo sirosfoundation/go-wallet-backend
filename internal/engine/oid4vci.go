@@ -47,12 +47,12 @@ type CredentialOffer struct {
 
 // IssuerMetadata represents OpenID4VCI issuer metadata
 type IssuerMetadata struct {
-	CredentialIssuer                   string                    `json:"credential_issuer"`
-	CredentialEndpoint                 string                    `json:"credential_endpoint"`
-	TokenEndpoint                      string                    `json:"token_endpoint,omitempty"`
-	AuthorizationServer                string                    `json:"authorization_server,omitempty"`
-	Display                            []IssuerDisplay           `json:"display,omitempty"`
-	CredentialConfigurationsSupported  map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	CredentialIssuer                  string                      `json:"credential_issuer"`
+	CredentialEndpoint                string                      `json:"credential_endpoint"`
+	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
+	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
+	Display                           []IssuerDisplay             `json:"display,omitempty"`
+	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 }
 
 // IssuerDisplay represents issuer display information
@@ -64,50 +64,50 @@ type IssuerDisplay struct {
 
 // CredentialConfig represents a credential configuration
 type CredentialConfig struct {
-	Format       string             `json:"format"`
-	VCT          string             `json:"vct,omitempty"`
-	Scope        string             `json:"scope,omitempty"`
-	Display      []CredentialDisplay `json:"display,omitempty"`
+	Format              string                 `json:"format"`
+	VCT                 string                 `json:"vct,omitempty"`
+	Scope               string                 `json:"scope,omitempty"`
+	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
-	Claims       map[string]interface{} `json:"claims,omitempty"`
+	Claims              map[string]interface{} `json:"claims,omitempty"`
 }
 
 // CredentialDisplay represents credential display information
 type CredentialDisplay struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Locale      string `json:"locale,omitempty"`
-	Logo        *LogoInfo `json:"logo,omitempty"`
-	TextColor   string `json:"text_color,omitempty"`
-	BackgroundColor string `json:"background_color,omitempty"`
+	Name            string    `json:"name"`
+	Description     string    `json:"description,omitempty"`
+	Locale          string    `json:"locale,omitempty"`
+	Logo            *LogoInfo `json:"logo,omitempty"`
+	TextColor       string    `json:"text_color,omitempty"`
+	BackgroundColor string    `json:"background_color,omitempty"`
 }
 
 // TokenResponse represents OAuth token endpoint response
 type TokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	CNonce       string `json:"c_nonce,omitempty"`
-	CNonceExpiresIn int `json:"c_nonce_expires_in,omitempty"`
+	AccessToken     string `json:"access_token"`
+	TokenType       string `json:"token_type"`
+	ExpiresIn       int    `json:"expires_in,omitempty"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+	CNonce          string `json:"c_nonce,omitempty"`
+	CNonceExpiresIn int    `json:"c_nonce_expires_in,omitempty"`
 }
 
 // CredentialResponse represents credential endpoint response
 type CredentialResponse struct {
-	Credential     interface{} `json:"credential,omitempty"`
-	Credentials    []interface{} `json:"credentials,omitempty"`
-	CNonce         string      `json:"c_nonce,omitempty"`
-	CNonceExpiresIn int        `json:"c_nonce_expires_in,omitempty"`
-	TransactionID  string      `json:"transaction_id,omitempty"`
-	NotificationID string      `json:"notification_id,omitempty"`
+	Credential      interface{}   `json:"credential,omitempty"`
+	Credentials     []interface{} `json:"credentials,omitempty"`
+	CNonce          string        `json:"c_nonce,omitempty"`
+	CNonceExpiresIn int           `json:"c_nonce_expires_in,omitempty"`
+	TransactionID   string        `json:"transaction_id,omitempty"`
+	NotificationID  string        `json:"notification_id,omitempty"`
 }
 
 // AvailableCredential represents a credential available for selection
 type AvailableCredential struct {
-	ID      string            `json:"id"`
+	ID      string             `json:"id"`
 	Display *CredentialDisplay `json:"display,omitempty"`
-	Format  string            `json:"format"`
-	VCT     string            `json:"vct,omitempty"`
+	Format  string             `json:"format"`
+	VCT     string             `json:"vct,omitempty"`
 }
 
 // Execute runs the OID4VCI flow
@@ -224,7 +224,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 	h.Progress(StepOfferParsed, map[string]interface{}{
 		"credential_issuer":            offer.CredentialIssuer,
 		"credential_configuration_ids": offer.CredentialConfigurationIDs,
-		"grants":                        offer.Grants,
+		"grants":                       offer.Grants,
 	})
 
 	return &offer, nil
@@ -282,9 +282,9 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 	}
 
 	h.Progress(StepMetadataFetched, map[string]interface{}{
-		"credential_issuer":    metadata.CredentialIssuer,
-		"credential_endpoint":  metadata.CredentialEndpoint,
-		"display":              metadata.Display,
+		"credential_issuer":   metadata.CredentialIssuer,
+		"credential_endpoint": metadata.CredentialEndpoint,
+		"display":             metadata.Display,
 	})
 
 	return &metadata, nil
@@ -380,7 +380,7 @@ func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *Credent
 
 func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *IssuerMetadata, grant map[string]interface{}) (*TokenResponse, error) {
 	preAuthCode, _ := grant["pre-authorized_code"].(string)
-	
+
 	// Check if TX code required
 	if txCodeRequired, ok := grant["tx_code"]; ok && txCodeRequired != nil {
 		// Request TX code from user
@@ -459,10 +459,10 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 
 	// Fetch OAuth metadata
 	oauthMetadataURL := strings.TrimSuffix(authServer, "/") + "/.well-known/oauth-authorization-server"
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
-		return nil, err  
+		return nil, err
 	}
 
 	resp, err := h.httpClient.Do(req)
@@ -489,7 +489,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	// Build authorization URL with PKCE
 	// Note: In a real implementation, we'd use proper PKCE and state
 	redirectURI := h.Config.Server.BaseURL + "/callback"
-	
+
 	authURL, _ := url.Parse(authEndpoint)
 	q := authURL.Query()
 	q.Set("response_type", "code")

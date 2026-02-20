@@ -55,12 +55,12 @@ const (
 	StepDeferred             FlowStep = "deferred"
 
 	// OID4VP specific
-	StepParsingRequest         FlowStep = "parsing_request"
-	StepRequestParsed          FlowStep = "request_parsed"
+	StepParsingRequest          FlowStep = "parsing_request"
+	StepRequestParsed           FlowStep = "request_parsed"
 	StepEvaluatingVerifierTrust FlowStep = "evaluating_verifier_trust"
-	StepMatchCredentials       FlowStep = "match_credentials"
-	StepAwaitingConsent        FlowStep = "awaiting_consent"
-	StepSubmittingResponse     FlowStep = "submitting_response"
+	StepMatchCredentials        FlowStep = "match_credentials"
+	StepAwaitingConsent         FlowStep = "awaiting_consent"
+	StepSubmittingResponse      FlowStep = "submitting_response"
 )
 
 // ErrorCode represents a protocol error code
@@ -141,12 +141,12 @@ type FlowActionMessage struct {
 
 // FlowAction types
 const (
-	ActionSelectCredential     = "select_credential"
+	ActionSelectCredential      = "select_credential"
 	ActionAuthorizationComplete = "authorization_complete"
-	ActionProvidePin           = "provide_pin"
-	ActionCredentialsMatched   = "credentials_matched"
-	ActionConsent              = "consent"
-	ActionDecline              = "decline"
+	ActionProvidePin            = "provide_pin"
+	ActionCredentialsMatched    = "credentials_matched"
+	ActionConsent               = "consent"
+	ActionDecline               = "decline"
 )
 
 // FlowCompleteMessage indicates successful flow completion
@@ -160,8 +160,8 @@ type FlowCompleteMessage struct {
 // FlowErrorMessage indicates a flow error
 type FlowErrorMessage struct {
 	Message
-	Step  FlowStep   `json:"step,omitempty"`
-	Error FlowError  `json:"error"`
+	Step  FlowStep  `json:"step,omitempty"`
+	Error FlowError `json:"error"`
 }
 
 // FlowError contains error details
@@ -174,16 +174,16 @@ type FlowError struct {
 // SignRequestMessage requests client-side signing
 type SignRequestMessage struct {
 	Message
-	Action SignAction          `json:"action"`
-	Params SignRequestParams   `json:"params"`
+	Action SignAction        `json:"action"`
+	Params SignRequestParams `json:"params"`
 }
 
 // SignRequestParams contains signing parameters
 type SignRequestParams struct {
-	Audience            string             `json:"audience,omitempty"`
-	Nonce               string             `json:"nonce,omitempty"`
-	ProofType           string             `json:"proof_type,omitempty"`
-	CredentialsToInclude []CredentialRef   `json:"credentials_to_include,omitempty"`
+	Audience             string          `json:"audience,omitempty"`
+	Nonce                string          `json:"nonce,omitempty"`
+	ProofType            string          `json:"proof_type,omitempty"`
+	CredentialsToInclude []CredentialRef `json:"credentials_to_include,omitempty"`
 }
 
 // CredentialRef references a credential for signing
@@ -253,11 +253,11 @@ type CredentialMatch struct {
 
 // MatchedCredential represents a credential with consent info
 type MatchedCredential struct {
-	InputDescriptorID   string          `json:"input_descriptor_id"`
-	CredentialID        string          `json:"credential_id"`
-	CredentialDisplay   json.RawMessage `json:"credential_display,omitempty"`
-	DisclosableClaims   []string        `json:"disclosable_claims,omitempty"`
-	RequiredClaims      []string        `json:"required_claims,omitempty"`
+	InputDescriptorID string          `json:"input_descriptor_id"`
+	CredentialID      string          `json:"credential_id"`
+	CredentialDisplay json.RawMessage `json:"credential_display,omitempty"`
+	DisclosableClaims []string        `json:"disclosable_claims,omitempty"`
+	RequiredClaims    []string        `json:"required_claims,omitempty"`
 }
 
 // ConsentSelection represents user's disclosure selection

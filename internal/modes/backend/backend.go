@@ -33,6 +33,7 @@ func init() {
 type Config struct {
 	Config *config.Config
 	Logger *zap.Logger
+	Mode   string // Operating mode (backend, all, etc.)
 }
 
 // Runner implements the backend mode
@@ -79,8 +80,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Initialize services
 	services := service.NewServices(store, cfg, logger)
 
+	// Determine mode for status endpoint
+	mode := r.cfg.Mode
+	if mode == "" {
+		mode = "backend"
+	}
+
 	// Initialize public HTTP server
-	router := setupRouter(cfg, services, store, logger)
+	router := setupRouter(cfg, services, store, logger, mode)
 
 	r.srv = &http.Server{
 		Addr:         cfg.Server.Address(),
@@ -157,7 +164,7 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger) *gin.Engine {
+func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger, mode string) *gin.Engine {
 	// Set Gin mode
 	if cfg.Logging.Level == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -180,7 +187,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	}))
 
 	// Initialize API handlers
-	handlers := api.NewHandlers(services, cfg, logger)
+	handlers := api.NewHandlers(services, cfg, logger, mode)
 
 	// Root-level health/status endpoints (no tenant required)
 	router.GET("/status", handlers.Status)

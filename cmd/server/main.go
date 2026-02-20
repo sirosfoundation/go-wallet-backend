@@ -96,6 +96,7 @@ func main() {
 		runnerCfg = &modebackend.Config{
 			Config: backendCfg,
 			Logger: logger,
+			Mode:   string(mode),
 		}
 	case modes.ModeRegistry:
 		runnerCfg = &moderegistry.Config{

@@ -78,7 +78,7 @@ func (h *VCTMHandler) Execute(ctx context.Context, msg *FlowStartMessage) error 
 	completeMsg := FlowCompleteMessage{
 		Message: Message{
 			Type:      TypeFlowComplete,
-			FlowID:   h.Flow.ID,
+			FlowID:    h.Flow.ID,
 			Timestamp: Now(),
 		},
 		TypeMetadata: metadataJSON,

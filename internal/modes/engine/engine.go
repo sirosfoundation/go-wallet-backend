@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -73,7 +74,22 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// Health endpoint
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "mode": "engine"})
+		c.JSON(http.StatusOK, api.StatusResponse{
+			Status:       "ok",
+			Service:      "wallet-backend",
+			Mode:         "engine",
+			APIVersion:   api.CurrentAPIVersion,
+			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
+		})
+	})
+	router.GET("/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, api.StatusResponse{
+			Status:       "ok",
+			Service:      "wallet-backend",
+			Mode:         "engine",
+			APIVersion:   api.CurrentAPIVersion,
+			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
+		})
 	})
 
 	// WebSocket v2 endpoint

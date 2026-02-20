@@ -41,36 +41,36 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger) (FlowH
 
 // AuthorizationRequest represents an OpenID4VP authorization request
 type AuthorizationRequest struct {
-	ResponseType            string                  `json:"response_type"`
-	ClientID                string                  `json:"client_id"`
-	ResponseMode            string                  `json:"response_mode,omitempty"`
-	ResponseURI             string                  `json:"response_uri,omitempty"`
-	RedirectURI             string                  `json:"redirect_uri,omitempty"`
-	Nonce                   string                  `json:"nonce,omitempty"`
-	State                   string                  `json:"state,omitempty"`
-	Scope                   string                  `json:"scope,omitempty"`
-	PresentationDefinition  *PresentationDefinition `json:"presentation_definition,omitempty"`
-	PresentationDefinitionURI string               `json:"presentation_definition_uri,omitempty"`
-	ClientMetadata          *ClientMetadata         `json:"client_metadata,omitempty"`
-	ClientMetadataURI       string                  `json:"client_metadata_uri,omitempty"`
+	ResponseType              string                  `json:"response_type"`
+	ClientID                  string                  `json:"client_id"`
+	ResponseMode              string                  `json:"response_mode,omitempty"`
+	ResponseURI               string                  `json:"response_uri,omitempty"`
+	RedirectURI               string                  `json:"redirect_uri,omitempty"`
+	Nonce                     string                  `json:"nonce,omitempty"`
+	State                     string                  `json:"state,omitempty"`
+	Scope                     string                  `json:"scope,omitempty"`
+	PresentationDefinition    *PresentationDefinition `json:"presentation_definition,omitempty"`
+	PresentationDefinitionURI string                  `json:"presentation_definition_uri,omitempty"`
+	ClientMetadata            *ClientMetadata         `json:"client_metadata,omitempty"`
+	ClientMetadataURI         string                  `json:"client_metadata_uri,omitempty"`
 }
 
 // PresentationDefinition represents a DIF Presentation Definition
 type PresentationDefinition struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name,omitempty"`
-	Purpose          string            `json:"purpose,omitempty"`
-	InputDescriptors []InputDescriptor `json:"input_descriptors"`
+	ID               string                 `json:"id"`
+	Name             string                 `json:"name,omitempty"`
+	Purpose          string                 `json:"purpose,omitempty"`
+	InputDescriptors []InputDescriptor      `json:"input_descriptors"`
 	Format           map[string]interface{} `json:"format,omitempty"`
 }
 
 // InputDescriptor represents a single input requirement
 type InputDescriptor struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name,omitempty"`
-	Purpose     string            `json:"purpose,omitempty"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name,omitempty"`
+	Purpose     string                 `json:"purpose,omitempty"`
 	Format      map[string]interface{} `json:"format,omitempty"`
-	Constraints *Constraints      `json:"constraints,omitempty"`
+	Constraints *Constraints           `json:"constraints,omitempty"`
 }
 
 // Constraints represents input descriptor constraints
@@ -88,10 +88,10 @@ type Field struct {
 
 // ClientMetadata represents verifier/client metadata
 type ClientMetadata struct {
-	ClientName   string    `json:"client_name,omitempty"`
-	LogoURI      string    `json:"logo_uri,omitempty"`
-	ClientPurpose string   `json:"client_purpose,omitempty"`
-	VPFormats    map[string]interface{} `json:"vp_formats,omitempty"`
+	ClientName    string                 `json:"client_name,omitempty"`
+	LogoURI       string                 `json:"logo_uri,omitempty"`
+	ClientPurpose string                 `json:"client_purpose,omitempty"`
+	VPFormats     map[string]interface{} `json:"vp_formats,omitempty"`
 }
 
 // RequestedClaim describes a claim being requested
@@ -209,14 +209,14 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 	q := u.Query()
 
 	authReq := &AuthorizationRequest{
-		ResponseType:          q.Get("response_type"),
-		ClientID:              q.Get("client_id"),
-		ResponseMode:          q.Get("response_mode"),
-		ResponseURI:           q.Get("response_uri"),
-		RedirectURI:           q.Get("redirect_uri"),
-		Nonce:                 q.Get("nonce"),
-		State:                 q.Get("state"),
-		Scope:                 q.Get("scope"),
+		ResponseType: q.Get("response_type"),
+		ClientID:     q.Get("client_id"),
+		ResponseMode: q.Get("response_mode"),
+		ResponseURI:  q.Get("response_uri"),
+		RedirectURI:  q.Get("redirect_uri"),
+		Nonce:        q.Get("nonce"),
+		State:        q.Get("state"),
+		Scope:        q.Get("scope"),
 	}
 
 	// Parse presentation_definition if inline

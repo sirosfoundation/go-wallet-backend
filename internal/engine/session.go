@@ -17,28 +17,28 @@ import (
 )
 
 var (
-	ErrSessionNotFound    = errors.New("session not found")
-	ErrFlowNotFound       = errors.New("flow not found")
-	ErrFlowTimeout        = errors.New("flow timeout")
-	ErrUnexpectedMessage  = errors.New("unexpected message")
-	ErrSignTimeout        = errors.New("sign request timeout")
+	ErrSessionNotFound   = errors.New("session not found")
+	ErrFlowNotFound      = errors.New("flow not found")
+	ErrFlowTimeout       = errors.New("flow timeout")
+	ErrUnexpectedMessage = errors.New("unexpected message")
+	ErrSignTimeout       = errors.New("sign request timeout")
 )
 
 // Session represents an authenticated WebSocket session
 type Session struct {
-	ID        string
-	UserID    string
-	TenantID  string
-	conn      *websocket.Conn
-	sendMu    sync.Mutex
-	flows     map[string]*Flow
-	flowsMu   sync.RWMutex
-	logger    *zap.Logger
-	
+	ID       string
+	UserID   string
+	TenantID string
+	conn     *websocket.Conn
+	sendMu   sync.Mutex
+	flows    map[string]*Flow
+	flowsMu  sync.RWMutex
+	logger   *zap.Logger
+
 	// Channels for flow coordination
-	actionCh  chan *FlowActionMessage
-	signCh    chan *SignResponseMessage
-	closeCh   chan struct{}
+	actionCh chan *FlowActionMessage
+	signCh   chan *SignResponseMessage
+	closeCh  chan struct{}
 }
 
 // Flow represents an active credential flow
@@ -49,10 +49,10 @@ type Flow struct {
 	State     FlowStep
 	StartTime time.Time
 	Handler   FlowHandler
-	
+
 	// Flow-specific data
-	Data      map[string]interface{}
-	mu        sync.RWMutex
+	Data map[string]interface{}
+	mu   sync.RWMutex
 }
 
 // Manager manages WebSocket sessions and flows
@@ -381,7 +381,7 @@ func (m *Manager) sendError(conn *websocket.Conn, flowID string, code ErrorCode,
 	msg := ErrorMessage{
 		Message: Message{
 			Type:      TypeError,
-			FlowID:   flowID,
+			FlowID:    flowID,
 			Timestamp: Now(),
 		},
 		Code:    code,
@@ -445,7 +445,7 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 	msg := FlowProgressMessage{
 		Message: Message{
 			Type:      TypeFlowProgress,
-			FlowID:   flowID,
+			FlowID:    flowID,
 			Timestamp: Now(),
 		},
 		Step:    step,
@@ -459,7 +459,7 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 	msg := FlowCompleteMessage{
 		Message: Message{
 			Type:      TypeFlowComplete,
-			FlowID:   flowID,
+			FlowID:    flowID,
 			Timestamp: Now(),
 		},
 		Credentials: credentials,
@@ -473,7 +473,7 @@ func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, me
 	msg := FlowErrorMessage{
 		Message: Message{
 			Type:      TypeFlowError,
-			FlowID:   flowID,
+			FlowID:    flowID,
 			Timestamp: Now(),
 		},
 		Step: step,
@@ -492,7 +492,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	msg := SignRequestMessage{
 		Message: Message{
 			Type:      TypeSignRequest,
-			FlowID:   flowID,
+			FlowID:    flowID,
 			MessageID: messageID,
 			Timestamp: Now(),
 		},
