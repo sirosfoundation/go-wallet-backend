@@ -91,7 +91,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			Service:      "wallet-backend",
 			Roles:        roles,
 			APIVersion:   api.CurrentAPIVersion,
-			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
+			Capabilities: api.CapabilitiesForRoles(roles),
 		})
 	})
 	router.GET("/status", func(c *gin.Context) {
@@ -100,7 +100,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			Service:      "wallet-backend",
 			Roles:        roles,
 			APIVersion:   api.CurrentAPIVersion,
-			Capabilities: api.APICapabilities[api.CurrentAPIVersion],
+			Capabilities: api.CapabilitiesForRoles(roles),
 		})
 	})
 
