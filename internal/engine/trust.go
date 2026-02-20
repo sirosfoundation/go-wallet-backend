@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
@@ -12,6 +13,22 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust/authzen"
 )
+
+// tenantTransport is an HTTP RoundTripper that adds X-Tenant-ID from context.
+type tenantTransport struct {
+	base http.RoundTripper
+}
+
+func (t *tenantTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Extract tenant ID from context and add to request
+	if tenantID := TenantFromContext(req.Context()); tenantID != "" {
+		// Clone request to avoid mutating the original
+		req2 := req.Clone(req.Context())
+		req2.Header.Set("X-Tenant-ID", tenantID)
+		req = req2
+	}
+	return t.base.RoundTrip(req)
+}
 
 // TrustService provides trust evaluation for engine flows.
 // It manages evaluators per trust endpoint with caching.
@@ -66,10 +83,18 @@ func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error
 		timeout = 30 * time.Second
 	}
 
-	eval, err := authzen.NewEvaluator(&authzen.Config{
+	// Create HTTP client with tenant transport for X-Tenant-ID propagation
+	httpClient := &http.Client{
+		Timeout: timeout,
+		Transport: &tenantTransport{
+			base: http.DefaultTransport,
+		},
+	}
+
+	eval, err := authzen.NewEvaluatorWithHTTPClient(&authzen.Config{
 		BaseURL: endpoint,
 		Timeout: timeout,
-	})
+	}, httpClient)
 	if err != nil {
 		return nil, err
 	}

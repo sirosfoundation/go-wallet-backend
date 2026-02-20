@@ -118,6 +118,11 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.cancel = cancel
 	defer cancel()
 
+	// Add tenant context for X-Tenant-ID propagation
+	if h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		ctx = ContextWithTenant(ctx, h.Flow.Session.TenantID)
+	}
+
 	// Step 1: Parse credential offer
 	offer, err := h.parseOffer(ctx, msg)
 	if err != nil {

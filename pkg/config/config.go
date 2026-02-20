@@ -16,6 +16,7 @@ type Config struct {
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
+	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -79,6 +80,24 @@ type TrustConfig struct {
 	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
 	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+}
+
+// SessionStoreConfig contains WebSocket session store configuration
+type SessionStoreConfig struct {
+	// Type is the session store type: "memory" or "redis"
+	Type string `yaml:"type" envconfig:"TYPE"`
+	// Redis contains Redis-specific configuration
+	Redis RedisConfig `yaml:"redis" envconfig:"REDIS"`
+	// DefaultTTL is the default session TTL in hours
+	DefaultTTLHours int `yaml:"default_ttl_hours" envconfig:"DEFAULT_TTL_HOURS"`
+}
+
+// RedisConfig contains Redis connection configuration
+type RedisConfig struct {
+	Address   string `yaml:"address" envconfig:"ADDRESS"`
+	Password  string `yaml:"password" envconfig:"PASSWORD"`
+	DB        int    `yaml:"db" envconfig:"DB"`
+	KeyPrefix string `yaml:"key_prefix" envconfig:"KEY_PREFIX"`
 }
 
 // Load loads configuration from file and environment variables
@@ -153,6 +172,14 @@ func defaultConfig() *Config {
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
+		},
+		SessionStore: SessionStoreConfig{
+			Type:            "memory",
+			DefaultTTLHours: 24,
+			Redis: RedisConfig{
+				Address:   "localhost:6379",
+				KeyPrefix: "ws:session:",
+			},
 		},
 	}
 }

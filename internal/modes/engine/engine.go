@@ -64,6 +64,23 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Create WebSocket manager
 	r.manager = wsengine.NewManager(cfg, logger)
 
+	// Configure session store based on config
+	if cfg.SessionStore.Type == "redis" {
+		redisStore, err := wsengine.NewRedisSessionStore(&wsengine.RedisSessionConfig{
+			Address:    cfg.SessionStore.Redis.Address,
+			Password:   cfg.SessionStore.Redis.Password,
+			DB:         cfg.SessionStore.Redis.DB,
+			KeyPrefix:  cfg.SessionStore.Redis.KeyPrefix,
+			DefaultTTL: time.Duration(cfg.SessionStore.DefaultTTLHours) * time.Hour,
+		}, logger)
+		if err != nil {
+			logger.Warn("Failed to connect to Redis, falling back to memory store", zap.Error(err))
+		} else {
+			r.manager.SetSessionStore(redisStore)
+			logger.Info("Using Redis session store", zap.String("address", cfg.SessionStore.Redis.Address))
+		}
+	}
+
 	// Register flow handlers
 	r.manager.RegisterFlowHandler(wsengine.ProtocolOID4VCI, wsengine.NewOID4VCIHandler)
 	r.manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)

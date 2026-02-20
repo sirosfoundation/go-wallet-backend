@@ -53,6 +53,7 @@ type VCTMetadata struct {
 
 // FetchTypeMetadata fetches VCTM for the given VCT identifier.
 // Returns nil, nil if the VCT is not found (no error).
+// If the context contains a tenant ID (via ContextWithTenant), it is sent as X-Tenant-ID header.
 func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*VCTMetadata, error) {
 	if vct == "" {
 		return nil, nil
@@ -64,6 +65,11 @@ func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*V
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Add X-Tenant-ID from context for adaptive routing
+	if tenantID := TenantFromContext(ctx); tenantID != "" {
+		req.Header.Set("X-Tenant-ID", tenantID)
 	}
 
 	resp, err := rc.httpClient.Do(req)

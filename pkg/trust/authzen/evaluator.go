@@ -8,6 +8,7 @@ package authzen
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -52,6 +53,27 @@ func NewEvaluator(cfg *Config) (*Evaluator, error) {
 	}
 
 	client := authzenclient.New(cfg.BaseURL, authzenclient.WithTimeout(timeout))
+
+	return &Evaluator{
+		client:       client,
+		healthy:      true,
+		healthPeriod: healthPeriod,
+	}, nil
+}
+
+// NewEvaluatorWithHTTPClient creates an AuthZEN evaluator with a custom HTTP client.
+// This allows for custom transport configuration (e.g., adding X-Tenant-ID headers).
+func NewEvaluatorWithHTTPClient(cfg *Config, httpClient *http.Client) (*Evaluator, error) {
+	if cfg == nil || cfg.BaseURL == "" {
+		return nil, fmt.Errorf("BaseURL is required")
+	}
+
+	healthPeriod := cfg.HealthCheckPeriod
+	if healthPeriod == 0 {
+		healthPeriod = 1 * time.Minute
+	}
+
+	client := authzenclient.New(cfg.BaseURL, authzenclient.WithHTTPClient(httpClient))
 
 	return &Evaluator{
 		client:       client,

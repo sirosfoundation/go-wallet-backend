@@ -62,7 +62,7 @@ type Manager struct {
 	upgrader websocket.Upgrader
 
 	sessionsMu sync.RWMutex
-	sessions   map[string]*Session // sessionID -> session
+	sessions   map[string]*Session // sessionID -> session (active connections only)
 	userIndex  map[string]*Session // userID -> session (last connection wins)
 
 	flowHandlers map[Protocol]FlowHandlerFactory
@@ -70,11 +70,14 @@ type Manager struct {
 
 	trustService   *TrustService
 	registryClient *RegistryClient
+
+	// Persistent session store (optional, for horizontal scaling)
+	sessionStore SessionStore
 }
 
 // NewManager creates a new session manager
 func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		cfg:    cfg,
 		logger: logger.Named("engine"),
 		upgrader: websocket.Upgrader{
@@ -90,7 +93,14 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		flowHandlers:   make(map[Protocol]FlowHandlerFactory),
 		trustService:   NewTrustService(cfg, logger),
 		registryClient: NewRegistryClient(cfg, logger),
+		sessionStore:   NewMemorySessionStore(logger), // Default to memory
 	}
+	return m
+}
+
+// SetSessionStore sets the session store (for Redis scaling)
+func (m *Manager) SetSessionStore(store SessionStore) {
+	m.sessionStore = store
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -330,10 +340,28 @@ func (m *Manager) registerSession(session *Session) {
 		m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
 		_ = existing.conn.Close()
 		delete(m.sessions, existing.ID)
+		// Also remove from persistent store
+		if m.sessionStore != nil {
+			_ = m.sessionStore.DeleteByUser(context.Background(), session.UserID)
+		}
 	}
 
 	m.sessions[session.ID] = session
 	m.userIndex[session.UserID] = session
+
+	// Persist to store
+	if m.sessionStore != nil {
+		sessionData := &SessionData{
+			ID:        session.ID,
+			UserID:    session.UserID,
+			TenantID:  session.TenantID,
+			CreatedAt: time.Now(),
+			ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
+		}
+		if err := m.sessionStore.Put(context.Background(), sessionData); err != nil {
+			m.logger.Warn("Failed to persist session", zap.Error(err))
+		}
+	}
 }
 
 func (m *Manager) unregisterSession(session *Session) {
@@ -344,6 +372,12 @@ func (m *Manager) unregisterSession(session *Session) {
 	if current, ok := m.userIndex[session.UserID]; ok && current == session {
 		delete(m.userIndex, session.UserID)
 	}
+
+	// Remove from persistent store
+	if m.sessionStore != nil {
+		_ = m.sessionStore.Delete(context.Background(), session.ID)
+	}
+
 	session.logger.Info("Session closed")
 }
 
@@ -417,6 +451,22 @@ func (m *Manager) GetSessionByUser(userID string) (*Session, error) {
 	return session, nil
 }
 
+// ListSessions returns all sessions for a tenant from the persistent store
+func (m *Manager) ListSessions(ctx context.Context, tenantID string) ([]*SessionData, error) {
+	if m.sessionStore == nil {
+		return nil, nil
+	}
+	return m.sessionStore.List(ctx, tenantID)
+}
+
+// CleanupSessions removes expired sessions from the persistent store
+func (m *Manager) CleanupSessions(ctx context.Context) (int64, error) {
+	if m.sessionStore == nil {
+		return 0, nil
+	}
+	return m.sessionStore.Cleanup(ctx)
+}
+
 // Close closes all sessions
 func (m *Manager) Close() {
 	m.sessionsMu.Lock()
@@ -427,6 +477,11 @@ func (m *Manager) Close() {
 	}
 	m.sessions = make(map[string]*Session)
 	m.userIndex = make(map[string]*Session)
+
+	// Close session store
+	if m.sessionStore != nil {
+		_ = m.sessionStore.Close()
+	}
 }
 
 // Send sends a message to the client

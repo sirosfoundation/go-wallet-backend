@@ -119,6 +119,11 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	h.cancel = cancel
 	defer cancel()
 
+	// Add tenant context for X-Tenant-ID propagation
+	if h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		ctx = ContextWithTenant(ctx, h.Flow.Session.TenantID)
+	}
+
 	// Step 1: Parse authorization request
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
