@@ -10,12 +10,23 @@ import (
 
 // Config represents the application configuration
 type Config struct {
+	// Mode is the application mode: "production" or "development"
+	// In development mode, security checks (proxy filtering, etc.) are relaxed.
+	Mode           string               `yaml:"mode" envconfig:"MODE"`
 	Server         ServerConfig         `yaml:"server" envconfig:"SERVER"`
 	Storage        StorageConfig        `yaml:"storage" envconfig:"STORAGE"`
 	Logging        LoggingConfig        `yaml:"logging" envconfig:"LOGGING"`
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
+	Proxy          ProxyConfig          `yaml:"proxy" envconfig:"PROXY"`
+	RateLimit      RateLimitConfig      `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
+	OHTTP          OHTTPConfig          `yaml:"ohttp" envconfig:"OHTTP"`
+}
+
+// IsDevelopment returns true if running in development mode.
+func (c *Config) IsDevelopment() bool {
+	return c.Mode == "development" || c.Mode == "dev"
 }
 
 // ServerConfig contains HTTP server configuration
@@ -98,6 +109,86 @@ type AuthZENConfig struct {
 	UseDiscovery bool `yaml:"use_discovery" envconfig:"USE_DISCOVERY"`
 }
 
+// ProxyConfig contains HTTP proxy security configuration.
+//
+// Security model (all individually configurable):
+//   - RequireHTTPS is the PRIMARY defense against SSRF. Cloud metadata endpoints
+//     and internal services don't have valid TLS certificates.
+//   - BlockLoopback prevents access to localhost services.
+//   - BlockLinkLocal blocks cloud metadata at 169.254.169.254.
+//   - BlockRFC1918 is defense-in-depth (can be bypassed via DNS rebinding).
+//
+// In development mode, set all Block* options to false to allow local testing.
+type ProxyConfig struct {
+	// Enabled turns proxy filtering on/off (default: true)
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// RequireHTTPS requires all proxied URLs to use HTTPS (PRIMARY SSRF defense)
+	RequireHTTPS bool `yaml:"require_https" envconfig:"REQUIRE_HTTPS"`
+	// BlockLoopback blocks localhost and 127.0.0.0/8
+	BlockLoopback bool `yaml:"block_loopback" envconfig:"BLOCK_LOOPBACK"`
+	// BlockLinkLocal blocks link-local addresses (169.254.0.0/16) including cloud metadata
+	BlockLinkLocal bool `yaml:"block_link_local" envconfig:"BLOCK_LINK_LOCAL"`
+	// BlockRFC1918 blocks RFC 1918 private addresses (defense-in-depth)
+	BlockRFC1918 bool `yaml:"block_rfc1918" envconfig:"BLOCK_RFC1918"`
+	// BlockedHosts is a list of blocked hostnames
+	BlockedHosts []string `yaml:"blocked_hosts" envconfig:"BLOCKED_HOSTS"`
+	// Timeout is the proxy request timeout in seconds
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+	// SeenHostsTTL is how long to remember contacted hosts (seconds, 0 = forever)
+	SeenHostsTTL int `yaml:"seen_hosts_ttl" envconfig:"SEEN_HOSTS_TTL"`
+	// MaxSeenHosts limits the seen hosts cache size
+	MaxSeenHosts int `yaml:"max_seen_hosts" envconfig:"MAX_SEEN_HOSTS"`
+}
+
+// RateLimitConfig contains rate limiting configuration
+type RateLimitConfig struct {
+	// Enabled turns rate limiting on/off
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// RequestsPerMinute is the max requests per minute per user/IP
+	RequestsPerMinute int `yaml:"requests_per_minute" envconfig:"REQUESTS_PER_MINUTE"`
+	// BurstSize allows temporary bursts above the limit
+	BurstSize int `yaml:"burst_size" envconfig:"BURST_SIZE"`
+	// ProxyRequestsPerMinute is a stricter limit for proxy requests
+	ProxyRequestsPerMinute int `yaml:"proxy_requests_per_minute" envconfig:"PROXY_REQUESTS_PER_MINUTE"`
+	// ProxyBurstSize is the burst size for proxy requests
+	ProxyBurstSize int `yaml:"proxy_burst_size" envconfig:"PROXY_BURST_SIZE"`
+}
+
+// OHTTPConfig contains Oblivious HTTP (RFC 9458) configuration.
+//
+// OHTTP provides IP unlinkability between wallet users and target servers
+// (issuers, verifiers). Two modes are supported:
+//
+//  1. Integrated relay: Backend acts as both relay and gateway. The wallet's IP
+//     is hidden from target servers, but the backend sees both.
+//
+//  2. External relay: An external relay forwards to the backend gateway. This
+//     provides full privacy separation (relay sees wallet IP, gateway sees
+//     target URL, neither sees both).
+type OHTTPConfig struct {
+	// Enabled turns OHTTP on/off (default: false, opt-in)
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// KeyID identifies the gateway key (1-255, for key rotation)
+	KeyID uint8 `yaml:"key_id" envconfig:"KEY_ID"`
+
+	// PrivateKeyFile is the path to the gateway's private key file.
+	// If empty, a new ephemeral key is generated on each startup (not recommended for production).
+	// If the file doesn't exist and CreateKey is true, a new key will be generated and saved.
+	PrivateKeyFile string `yaml:"private_key_file" envconfig:"PRIVATE_KEY_FILE"`
+
+	// CreateKey creates and saves a new private key if the file doesn't exist.
+	CreateKey bool `yaml:"create_key" envconfig:"CREATE_KEY"`
+
+	// IntegratedRelay enables the /api/relay endpoint for frontend use.
+	// When true, the frontend can send OHTTP requests directly to the backend.
+	// When false, an external relay must be used.
+	IntegratedRelay bool `yaml:"integrated_relay" envconfig:"INTEGRATED_RELAY"`
+
+	// MaxRequestSize limits the size of OHTTP requests in bytes (default: 1MB)
+	MaxRequestSize int64 `yaml:"max_request_size" envconfig:"MAX_REQUEST_SIZE"`
+}
+
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
 	// Start with defaults
@@ -134,12 +225,31 @@ func Load(configFile string) (*Config, error) {
 		cfg.Server.BaseURL = fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port)
 	}
 
+	// Apply development mode overrides if configured
+	if cfg.IsDevelopment() {
+		applyDevelopmentDefaults(cfg)
+	}
+
 	return cfg, nil
+}
+
+// applyDevelopmentDefaults relaxes security settings for local development.
+func applyDevelopmentDefaults(cfg *Config) {
+	// Relax proxy security for local testing
+	cfg.Proxy.RequireHTTPS = false
+	cfg.Proxy.BlockLoopback = false
+	cfg.Proxy.BlockLinkLocal = false
+	cfg.Proxy.BlockRFC1918 = false
+	cfg.Proxy.BlockedHosts = nil
+
+	// Optionally disable rate limiting in dev
+	// cfg.RateLimit.Enabled = false
 }
 
 // defaultConfig returns a Config with sensible default values
 func defaultConfig() *Config {
 	return &Config{
+		Mode: "production", // Default to production (secure)
 		Server: ServerConfig{
 			Host:      "0.0.0.0",
 			Port:      8080,
@@ -173,6 +283,33 @@ func defaultConfig() *Config {
 			AuthZEN: AuthZENConfig{
 				Timeout: 30,
 			},
+		},
+		Proxy: ProxyConfig{
+			Enabled:        true,
+			RequireHTTPS:   true,  // Primary SSRF defense
+			BlockLoopback:  true,  // Block localhost access
+			BlockLinkLocal: true,  // Block cloud metadata (169.254.169.254)
+			BlockRFC1918:   true,  // Defense-in-depth
+			BlockedHosts: []string{
+				"metadata.google.internal",
+			},
+			Timeout:      30,
+			SeenHostsTTL: 3600, // 1 hour
+			MaxSeenHosts: 100,
+		},
+		RateLimit: RateLimitConfig{
+			Enabled:                true,
+			RequestsPerMinute:      120,
+			BurstSize:              20,
+			ProxyRequestsPerMinute: 30, // Stricter for proxy
+			ProxyBurstSize:         5,
+		},
+		OHTTP: OHTTPConfig{
+			Enabled:         false, // Opt-in feature
+			KeyID:           1,
+			IntegratedRelay: true,              // Default to integrated mode
+			MaxRequestSize:  1 << 20,           // 1 MB
+			CreateKey:       true,              // Auto-generate if missing
 		},
 	}
 }
