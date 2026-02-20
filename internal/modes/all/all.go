@@ -33,9 +33,9 @@ type Config struct {
 
 // Runner implements the all mode (runs all services)
 type Runner struct {
-	cfg             *Config
-	backendRunner   *modebackend.Runner
-	registryRunner  *moderegistry.Runner
+	cfg            *Config
+	backendRunner  *modebackend.Runner
+	registryRunner *moderegistry.Runner
 }
 
 // New creates a new all-mode runner

@@ -37,10 +37,10 @@ type Config struct {
 
 // Runner implements the backend mode
 type Runner struct {
-	cfg       *Config
-	store     backend.Backend
-	srv       *http.Server
-	adminSrv  *http.Server
+	cfg      *Config
+	store    backend.Backend
+	srv      *http.Server
+	adminSrv *http.Server
 }
 
 // New creates a new backend runner
