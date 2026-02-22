@@ -15,19 +15,10 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
-	modebackend "github.com/sirosfoundation/go-wallet-backend/internal/modes/backend"
-	modeengine "github.com/sirosfoundation/go-wallet-backend/internal/modes/engine"
-	moderegistry "github.com/sirosfoundation/go-wallet-backend/internal/modes/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
+	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
-)
-
-// Ensure mode packages are registered
-var (
-	_ = modebackend.Config{}
-	_ = modeengine.Config{}
-	_ = moderegistry.Config{}
 )
 
 var (
@@ -95,46 +86,58 @@ func main() {
 		zap.Strings("roles", roleStrings),
 	)
 
-	// Create runners for each active role
-	var runners []modes.Runner
+	// Build server configuration
+	serverCfg := server.DefaultServerConfig()
+	serverCfg.Roles = roleStrings
 
+	if backendCfg != nil {
+		serverCfg.HTTPAddress = backendCfg.Server.Host
+		serverCfg.HTTPPort = backendCfg.Server.Port
+		serverCfg.WSAddress = backendCfg.Server.Host
+		serverCfg.WSPort = backendCfg.Server.EnginePort
+		serverCfg.AdminPort = backendCfg.Server.AdminPort
+		serverCfg.AdminToken = backendCfg.Server.AdminToken
+		serverCfg.CORS = backendCfg.Server.CORS
+		serverCfg.LoggingLevel = backendCfg.Logging.Level
+	} else if registryCfg != nil {
+		// Registry-only mode - use registry server config
+		serverCfg.HTTPAddress = registryCfg.Server.Host
+		serverCfg.HTTPPort = registryCfg.Server.Port
+		serverCfg.LoggingLevel = registryCfg.Logging.Level
+	}
+
+	// Create unified server manager
+	mgr := server.NewManager(serverCfg, logger)
+
+	// Track closeable resources
+	type closeable interface{ Close() error }
+	var resources []closeable
+
+	// Add providers based on roles
 	if roles.Has(modes.RoleBackend) {
-		runner, err := modebackend.New(&modebackend.Config{
-			Config: backendCfg,
-			Logger: logger.Named("backend"),
-			Roles:  roleStrings,
-		})
+		provider, err := server.NewBackendProvider(backendCfg, logger, roleStrings)
 		if err != nil {
-			logger.Fatal("Failed to create backend runner", zap.Error(err))
+			logger.Fatal("Failed to create backend provider", zap.Error(err))
 		}
-		runners = append(runners, runner)
+		mgr.AddProvider(provider)
+		resources = append(resources, provider)
 	}
 
 	if roles.Has(modes.RoleRegistry) {
-		runner, err := moderegistry.New(&moderegistry.Config{
-			Config: registryCfg,
-			Logger: logger.Named("registry"),
-		})
+		provider, err := server.NewRegistryProvider(registryCfg, logger)
 		if err != nil {
-			logger.Fatal("Failed to create registry runner", zap.Error(err))
+			logger.Fatal("Failed to create registry provider", zap.Error(err))
 		}
-		runners = append(runners, runner)
+		mgr.AddProvider(provider)
+		resources = append(resources, provider)
 	}
 
 	if roles.Has(modes.RoleEngine) {
-		runner, err := modeengine.New(&modeengine.Config{
-			Config: backendCfg,
-			Logger: logger.Named("engine"),
-			Roles:  roleStrings,
-		})
+		provider, err := server.NewEngineProvider(backendCfg, logger)
 		if err != nil {
-			logger.Fatal("Failed to create engine runner", zap.Error(err))
+			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
-		runners = append(runners, runner)
-	}
-
-	if len(runners) == 0 {
-		logger.Fatal("No runners configured")
+		mgr.AddProvider(provider)
 	}
 
 	// Set up signal handling
@@ -142,41 +145,29 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start all runners in goroutines
-	errCh := make(chan error, len(runners))
-	for _, runner := range runners {
-		r := runner // capture for goroutine
-		go func() {
-			logger.Info("Starting role", zap.String("role", string(r.Role())))
-			if err := r.Run(ctx); err != nil {
-				errCh <- fmt.Errorf("%s error: %w", r.Role(), err)
-			}
-		}()
+	// Start all servers
+	if err := mgr.Start(ctx); err != nil {
+		logger.Fatal("Failed to start servers", zap.Error(err))
 	}
 
-	// Wait for signal or error
-	select {
-	case <-quit:
-		logger.Info("Received shutdown signal")
-	case err := <-errCh:
-		if err != nil {
-			logger.Error("Runner error", zap.Error(err))
-		}
-	}
+	// Wait for shutdown signal
+	<-quit
+	logger.Info("Received shutdown signal")
+	cancel()
 
 	// Graceful shutdown
-	cancel()
 	logger.Info("Shutting down...", zap.Strings("roles", roleStrings))
-
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	// Shutdown all runners
-	for _, runner := range runners {
-		if err := runner.Shutdown(shutdownCtx); err != nil {
-			logger.Error("Shutdown error",
-				zap.String("role", string(runner.Role())),
-				zap.Error(err))
+	if err := mgr.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Server shutdown error", zap.Error(err))
+	}
+
+	// Cleanup resources
+	for _, r := range resources {
+		if err := r.Close(); err != nil {
+			logger.Error("Resource cleanup error", zap.Error(err))
 		}
 	}
 
