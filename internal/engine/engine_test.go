@@ -19,7 +19,11 @@ func testLogger() *zap.Logger {
 }
 
 func testConfig() *config.Config {
-	return &config.Config{}
+	return &config.Config{
+		Server: config.ServerConfig{
+			RegistryPort: 8097,
+		},
+	}
 }
 
 func TestNewTrustService(t *testing.T) {
@@ -194,7 +198,7 @@ func TestRegistryClient_registryURL_Default(t *testing.T) {
 	logger := testLogger()
 	rc := NewRegistryClient(cfg, logger)
 
-	assert.Equal(t, "http://localhost:8082", rc.registryURL())
+	assert.Equal(t, "http://localhost:8097", rc.registryURL())
 }
 
 func TestRegistryClient_registryURL_Configured(t *testing.T) {

@@ -26,7 +26,7 @@ func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc
 	// Get registry URL from config, or use default
 	registryURL := cfg.Trust.RegistryURL
 	if registryURL == "" {
-		registryURL = "http://localhost:8082" // Registry server default port
+		registryURL = fmt.Sprintf("http://localhost:%d", cfg.Server.RegistryPort)
 	}
 
 	return &VCTMHandler{

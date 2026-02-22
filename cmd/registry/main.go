@@ -13,10 +13,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"gopkg.in/yaml.v3"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
 )
 
 func main() {
@@ -38,7 +38,10 @@ func main() {
 	}
 
 	// Initialize logger
-	logger, err := initLogger(config.Logging)
+	logger, err := logging.NewLogger(logging.Config{
+		Level:  config.Logging.Level,
+		Format: config.Logging.Format,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
@@ -162,24 +165,6 @@ func loadConfig(path string) (*registry.Config, error) {
 	}
 
 	return config, nil
-}
-
-// initLogger initializes the zap logger
-func initLogger(config registry.LoggingConfig) (*zap.Logger, error) {
-	var level zapcore.Level
-	if err := level.UnmarshalText([]byte(config.Level)); err != nil {
-		level = zapcore.InfoLevel
-	}
-
-	var zapConfig zap.Config
-	if config.Format == "json" {
-		zapConfig = zap.NewProductionConfig()
-	} else {
-		zapConfig = zap.NewDevelopmentConfig()
-	}
-	zapConfig.Level = zap.NewAtomicLevelAt(level)
-
-	return zapConfig.Build()
 }
 
 // requestLogger returns a Gin middleware for logging requests

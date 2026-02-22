@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
@@ -94,6 +95,14 @@ func (r *Runner) Run(ctx context.Context) error {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(requestLogger(logger))
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     cfg.Server.CORS.AllowedOrigins,
+		AllowMethods:     cfg.Server.CORS.AllowedMethods,
+		AllowHeaders:     cfg.Server.CORS.AllowedHeaders,
+		ExposeHeaders:    cfg.Server.CORS.ExposedHeaders,
+		AllowCredentials: cfg.Server.CORS.AllowCredentials,
+		MaxAge:           time.Duration(cfg.Server.CORS.MaxAge) * time.Second,
+	}))
 
 	// Determine roles for status endpoint
 	roles := r.cfg.Roles
@@ -127,7 +136,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	})
 
 	// Create server
-	addr := cfg.Server.Address()
+	addr := cfg.Server.EngineAddress()
 	r.srv = &http.Server{
 		Addr:         addr,
 		Handler:      router,

@@ -183,12 +183,12 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	router.Use(gin.Recovery())
 	router.Use(middleware.Logger(logger))
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"}, // TODO: Make configurable
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match", "X-Tenant-ID"},
-		ExposeHeaders:    []string{"X-Private-Data-ETag"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
+		AllowOrigins:     cfg.Server.CORS.AllowedOrigins,
+		AllowMethods:     cfg.Server.CORS.AllowedMethods,
+		AllowHeaders:     cfg.Server.CORS.AllowedHeaders,
+		ExposeHeaders:    cfg.Server.CORS.ExposedHeaders,
+		AllowCredentials: cfg.Server.CORS.AllowCredentials,
+		MaxAge:           time.Duration(cfg.Server.CORS.MaxAge) * time.Second,
 	}))
 
 	// Initialize API handlers

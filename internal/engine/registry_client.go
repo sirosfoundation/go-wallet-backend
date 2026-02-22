@@ -38,7 +38,7 @@ func (rc *RegistryClient) registryURL() string {
 	if rc.cfg.Trust.RegistryURL != "" {
 		return rc.cfg.Trust.RegistryURL
 	}
-	return "http://localhost:8082" // Default
+	return fmt.Sprintf("http://localhost:%d", rc.cfg.Server.RegistryPort)
 }
 
 // VCTMetadata represents the type metadata returned by the registry.

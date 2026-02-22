@@ -20,6 +20,7 @@ import (
 	moderegistry "github.com/sirosfoundation/go-wallet-backend/internal/modes/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
 )
 
 // Ensure mode packages are registered
@@ -71,9 +72,15 @@ func main() {
 	// Initialize logger (use backend config if available, otherwise registry)
 	var logger *zap.Logger
 	if backendCfg != nil {
-		logger, err = initLogger(backendCfg.Logging)
+		logger, err = logging.NewLogger(logging.Config{
+			Level:  backendCfg.Logging.Level,
+			Format: backendCfg.Logging.Format,
+		})
 	} else if registryCfg != nil {
-		logger, err = initLoggerFromRegistry(registryCfg.Logging)
+		logger, err = logging.NewLogger(logging.Config{
+			Level:  registryCfg.Logging.Level,
+			Format: registryCfg.Logging.Format,
+		})
 	} else {
 		logger, err = zap.NewProduction()
 	}
@@ -195,54 +202,4 @@ func loadRegistryConfig(path string) (*registry.Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
-	var zapCfg zap.Config
-
-	if cfg.Format == "json" {
-		zapCfg = zap.NewProductionConfig()
-	} else {
-		zapCfg = zap.NewDevelopmentConfig()
-	}
-
-	switch cfg.Level {
-	case "debug":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
-	case "info":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	case "warn":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
-	case "error":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
-	default:
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	}
-
-	return zapCfg.Build()
-}
-
-func initLoggerFromRegistry(cfg registry.LoggingConfig) (*zap.Logger, error) {
-	var zapCfg zap.Config
-
-	if cfg.Format == "json" {
-		zapCfg = zap.NewProductionConfig()
-	} else {
-		zapCfg = zap.NewDevelopmentConfig()
-	}
-
-	switch cfg.Level {
-	case "debug":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
-	case "info":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	case "warn":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.WarnLevel)
-	case "error":
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
-	default:
-		zapCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	}
-
-	return zapCfg.Build()
 }
