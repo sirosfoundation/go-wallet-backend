@@ -276,8 +276,10 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 			verifierGroup.GET("/all", handlers.GetAllVerifiers)
 		}
 
-		// Proxy routes
-		protected.POST("/proxy", handlers.ProxyRequest)
+		// Proxy routes (can be disabled via features.proxy_enabled)
+		if cfg.Features.ProxyEnabled {
+			protected.POST("/proxy", handlers.ProxyRequest)
+		}
 
 		// Helper routes
 		protected.POST("/helper/get-cert", handlers.GetCertificate)

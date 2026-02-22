@@ -36,6 +36,15 @@ var roleCapabilities = map[string][]string{
 	"engine": {
 		"websocket", // WebSocket v2 protocol at /api/v2/wallet
 	},
+	"auth": {
+		"webauthn", // WebAuthn registration/authentication
+		"session",  // Session management (account-info, settings)
+	},
+	"storage": {
+		"credentials",   // VC storage and retrieval
+		"presentations", // VP storage and retrieval
+		"private-data",  // Encrypted keystore data
+	},
 }
 
 // APICapabilities describes the features available at each API version.

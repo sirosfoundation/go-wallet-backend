@@ -24,10 +24,12 @@ const (
 	RoleBackend  Role = "backend"
 	RoleRegistry Role = "registry"
 	RoleEngine   Role = "engine"
+	RoleAuth     Role = "auth"
+	RoleStorage  Role = "storage"
 )
 
 // ValidRoles lists all valid operating roles
-var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine}
+var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage}
 
 // IsValid checks if a role string is valid
 func (r Role) IsValid() bool {

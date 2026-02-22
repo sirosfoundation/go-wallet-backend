@@ -17,6 +17,7 @@ type Config struct {
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
 	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
+	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -188,6 +189,20 @@ type TrustConfig struct {
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 }
 
+// FeaturesConfig contains feature flags for controlling behavior
+type FeaturesConfig struct {
+	// ProxyEnabled controls whether the /proxy endpoint is available.
+	// Set to false to disable the proxy (requires WebSocket engine for flows).
+	// Default: true (for backward compatibility)
+	ProxyEnabled bool `yaml:"proxy_enabled" envconfig:"PROXY_ENABLED"`
+
+	// WebSocketRequired forces WebSocket transport for credential flows.
+	// When true, the proxy endpoint will return an error directing clients
+	// to use the WebSocket transport instead.
+	// Default: false
+	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
+}
+
 // SessionStoreConfig contains WebSocket session store configuration
 type SessionStoreConfig struct {
 	// Type is the session store type: "memory" or "redis"
@@ -295,6 +310,10 @@ func defaultConfig() *Config {
 				Address:   "localhost:6379",
 				KeyPrefix: "ws:session:",
 			},
+		},
+		Features: FeaturesConfig{
+			ProxyEnabled:      true,  // Default: proxy enabled for backward compatibility
+			WebSocketRequired: false, // Default: proxy still allowed
 		},
 	}
 }
