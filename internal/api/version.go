@@ -29,6 +29,7 @@ var roleCapabilities = map[string][]string{
 		"webauthn",
 		"storage",
 		"proxy",
+		"refresh-tokens",
 	},
 	"registry": {
 		"vctm-registry",
@@ -37,8 +38,9 @@ var roleCapabilities = map[string][]string{
 		"websocket", // WebSocket v2 protocol at /api/v2/wallet
 	},
 	"auth": {
-		"webauthn", // WebAuthn registration/authentication
-		"session",  // Session management (account-info, settings)
+		"webauthn",       // WebAuthn registration/authentication
+		"session",        // Session management (account-info, settings)
+		"refresh-tokens", // Token refresh via /user/token/refresh
 	},
 	"storage": {
 		"credentials",   // VC storage and retrieval
@@ -56,6 +58,7 @@ var APICapabilities = map[int][]string{
 		"proxy",
 		"multi-tenancy",
 		"vctm-registry",
+		"refresh-tokens",
 	},
 }
 
