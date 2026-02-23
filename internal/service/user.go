@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -153,17 +155,31 @@ func (s *UserService) generateToken(user *domain.User, tenantID domain.TenantID)
 	if tid == "" {
 		tid = string(domain.DefaultTenantID)
 	}
+
+	now := time.Now()
+	jti := generateJTI() // Generate unique token ID
+
 	claims := jwt.MapClaims{
 		"user_id":   user.UUID.String(),
 		"did":       user.DID,
 		"tenant_id": tid,
 		"iss":       s.cfg.JWT.Issuer,
-		"exp":       time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
-		"iat":       time.Now().Unix(),
+		"aud":       s.cfg.Server.RPID,                                                  // Audience: the RP ID
+		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),   // Expiry
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),                                                          // Not Before: token valid from now
+		"jti":       jti,                                                                  // JWT ID: unique identifier for revocation
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.JWT.Secret))
+}
+
+// generateJTI generates a unique JWT ID
+func generateJTI() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // GenerateTokenForUser generates a JWT token for a user (used after WebAuthn auth)

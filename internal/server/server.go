@@ -64,7 +64,7 @@ type ServerConfig struct {
 	AdminToken string
 
 	// Common settings
-	CORS        config.CORSConfig
+	CORS         config.CORSConfig
 	LoggingLevel string
 
 	// Active roles for status endpoint
@@ -83,17 +83,17 @@ func DefaultServerConfig() *ServerConfig {
 
 // Manager manages HTTP servers and combines multiple RouteProviders
 type Manager struct {
-	cfg        *ServerConfig
-	logger     *zap.Logger
-	
-	providers  []RouteProvider
-	
-	httpServer *http.Server
-	wsServer   *http.Server   // Only used if WSSeparate
+	cfg    *ServerConfig
+	logger *zap.Logger
+
+	providers []RouteProvider
+
+	httpServer  *http.Server
+	wsServer    *http.Server // Only used if WSSeparate
 	adminServer *http.Server
-	
+
 	httpRouter *gin.Engine
-	wsRouter   *gin.Engine    // Only used if WSSeparate
+	wsRouter   *gin.Engine // Only used if WSSeparate
 }
 
 // NewManager creates a new server manager

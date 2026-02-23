@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -14,6 +15,11 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+// TokenBlacklistChecker is an interface for checking if a token is blacklisted
+type TokenBlacklistChecker interface {
+	IsBlacklisted(ctx context.Context, jti string) bool
+}
 
 // GenerateAdminToken generates a secure random token for admin API authentication
 func GenerateAdminToken() (string, error) {
@@ -65,6 +71,11 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 // The JWT tenant_id claim is authoritative for authenticated requests.
 // If X-Tenant-ID header is provided and differs from JWT, a warning is logged but JWT wins.
 func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger) gin.HandlerFunc {
+	return AuthMiddlewareWithBlacklist(cfg, store, nil, logger)
+}
+
+// AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
+func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -109,6 +120,19 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 			c.JSON(401, gin.H{"error": "Invalid token claims"})
 			c.Abort()
 			return
+		}
+
+		// Check if token is blacklisted (if blacklist is configured)
+		if blacklist != nil {
+			jti, _ := claims["jti"].(string)
+			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
+				logger.Warn("Blacklisted token used",
+					zap.String("jti", jti),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Get user_id from claims

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -122,6 +123,8 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 			c.JSON(410, gin.H{"error": "Challenge expired"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Verification failed"})
+		case errors.Is(err, service.ErrAAGUIDBlacklisted):
+			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete registration"})
 		}
@@ -206,6 +209,34 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	// Set private data ETag header if available
 	if len(resp.PrivateData) > 0 {
 		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
+	}
+
+	c.JSON(200, resp)
+}
+
+// RefreshToken exchanges a valid refresh token for a new access token
+func (h *Handlers) RefreshToken(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	var req service.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.RefreshAccessToken(c.Request.Context(), &req)
+	if err != nil {
+		h.logger.Warn("Token refresh failed", zap.Error(err))
+		switch {
+		case errors.Is(err, service.ErrInvalidRefreshToken):
+			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
+		default:
+			c.JSON(500, gin.H{"error": "Failed to refresh token"})
+		}
+		return
 	}
 
 	c.JSON(200, resp)
@@ -859,6 +890,49 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	c.Status(204)
 }
 
+// Logout invalidates the current session by blacklisting the JWT
+func (h *Handlers) Logout(c *gin.Context) {
+	// Get the token from context (set by auth middleware)
+	tokenString, exists := c.Get("token")
+	if !exists {
+		// No token? Already logged out effectively
+		c.Status(200)
+		return
+	}
+
+	// Parse the token to get claims (we need jti and exp)
+	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
+		return []byte(h.cfg.JWT.Secret), nil
+	})
+
+	if token != nil && token.Claims != nil {
+		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			jti, _ := claims["jti"].(string)
+			if jti != "" && h.services.TokenBlacklist != nil {
+				// Get expiry time for blacklist entry
+				var expiry time.Time
+				if exp, ok := claims["exp"].(float64); ok {
+					expiry = time.Unix(int64(exp), 0)
+				} else {
+					// Default to 24 hours if no expiry (shouldn't happen)
+					expiry = time.Now().Add(24 * time.Hour)
+				}
+
+				// Add to blacklist
+				if err := h.services.TokenBlacklist.Add(c.Request.Context(), jti, expiry); err != nil {
+					h.logger.Warn("Failed to blacklist token", zap.Error(err))
+				} else {
+					h.logger.Info("User logged out, token blacklisted",
+						zap.String("jti", jti),
+					)
+				}
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{"message": "Logged out successfully"})
+}
+
 // DeleteUser deletes the current user and all associated data
 func (h *Handlers) DeleteUser(c *gin.Context) {
 	userID, exists := c.Get("user_id")
@@ -1062,6 +1136,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Registration response could not be verified"})
+		case errors.Is(err, service.ErrAAGUIDBlacklisted):
+			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		case errors.Is(err, service.ErrPrivateDataConflict):
 			// Get current ETag
 			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))

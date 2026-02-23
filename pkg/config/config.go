@@ -18,6 +18,7 @@ type Config struct {
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
 	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
 	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
+	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -203,6 +204,100 @@ type FeaturesConfig struct {
 	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
 }
 
+// SecurityConfig contains security-related configuration
+type SecurityConfig struct {
+	// AuthRateLimit contains rate limiting configuration for auth endpoints
+	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
+
+	// AAGUIDBlacklist contains AAGUID blacklist configuration for WebAuthn
+	AAGUIDBlacklist AAGUIDBlacklistConfig `yaml:"aaguid_blacklist" envconfig:"AAGUID_BLACKLIST"`
+
+	// ChallengeCleanup contains challenge cleanup worker configuration
+	ChallengeCleanup ChallengeCleanupConfig `yaml:"challenge_cleanup" envconfig:"CHALLENGE_CLEANUP"`
+
+	// TokenBlacklist contains token blacklist/revocation configuration
+	TokenBlacklist TokenBlacklistConfig `yaml:"token_blacklist" envconfig:"TOKEN_BLACKLIST"`
+}
+
+// AuthRateLimitConfig contains rate limiting configuration for auth endpoints
+type AuthRateLimitConfig struct {
+	// Enabled controls whether rate limiting is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// MaxAttempts is the maximum number of login/registration attempts per window
+	// Default: 10
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+
+	// WindowSeconds is the time window for rate limiting (in seconds)
+	// Default: 60 (1 minute)
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+
+	// LockoutSeconds is how long to lock out after exceeding the limit
+	// Default: 300 (5 minutes)
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// SetDefaults sets default values for auth rate limiting
+func (c *AuthRateLimitConfig) SetDefaults() {
+	if c.MaxAttempts == 0 {
+		c.MaxAttempts = 10
+	}
+	if c.WindowSeconds == 0 {
+		c.WindowSeconds = 60
+	}
+	if c.LockoutSeconds == 0 {
+		c.LockoutSeconds = 300
+	}
+}
+
+// AAGUIDBlacklistConfig contains AAGUID blacklist configuration
+type AAGUIDBlacklistConfig struct {
+	// Enabled controls whether AAGUID blacklist checking is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// AAGUIDs is a list of blocked AAGUIDs (hex-encoded UUIDs without dashes)
+	// Example: ["00000000000000000000000000000000"] to block zero AAGUID
+	AAGUIDs []string `yaml:"aaguids" envconfig:"AAGUIDS"`
+
+	// RejectUnknown rejects authenticators with zero/unknown AAGUIDs
+	// Default: false (permissive - allows unknown authenticators)
+	RejectUnknown bool `yaml:"reject_unknown" envconfig:"REJECT_UNKNOWN"`
+}
+
+// ChallengeCleanupConfig contains challenge cleanup worker configuration
+type ChallengeCleanupConfig struct {
+	// Enabled controls whether the cleanup worker runs
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// IntervalSeconds is how often to run cleanup (in seconds)
+	// Default: 300 (5 minutes)
+	IntervalSeconds int `yaml:"interval_seconds" envconfig:"INTERVAL_SECONDS"`
+}
+
+// SetDefaults sets default values for challenge cleanup
+func (c *ChallengeCleanupConfig) SetDefaults() {
+	if c.IntervalSeconds == 0 {
+		c.IntervalSeconds = 300
+	}
+}
+
+// TokenBlacklistConfig contains token blacklist/revocation configuration
+type TokenBlacklistConfig struct {
+	// Enabled controls whether token blacklist checking is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
+	// Default: 3600 (1 hour)
+	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+}
+
+// SetDefaults sets default values for token blacklist
+func (c *TokenBlacklistConfig) SetDefaults() {
+	if c.CleanupIntervalSeconds == 0 {
+		c.CleanupIntervalSeconds = 3600
+	}
+}
+
 // SessionStoreConfig contains WebSocket session store configuration
 type SessionStoreConfig struct {
 	// Type is the session store type: "memory" or "redis"
@@ -314,6 +409,27 @@ func defaultConfig() *Config {
 		Features: FeaturesConfig{
 			ProxyEnabled:      true,  // Default: proxy enabled for backward compatibility
 			WebSocketRequired: false, // Default: proxy still allowed
+		},
+		Security: SecurityConfig{
+			AuthRateLimit: AuthRateLimitConfig{
+				Enabled:        true,
+				MaxAttempts:    10,
+				WindowSeconds:  60,
+				LockoutSeconds: 300,
+			},
+			AAGUIDBlacklist: AAGUIDBlacklistConfig{
+				Enabled:       false, // Disabled by default
+				AAGUIDs:       []string{},
+				RejectUnknown: false,
+			},
+			ChallengeCleanup: ChallengeCleanupConfig{
+				Enabled:         true, // Enabled by default to prevent storage leaks
+				IntervalSeconds: 300,
+			},
+			TokenBlacklist: TokenBlacklistConfig{
+				Enabled:                true, // Enabled by default for security
+				CleanupIntervalSeconds: 3600,
+			},
 		},
 	}
 }

@@ -55,14 +55,23 @@ func IsTenantRedirectError(err error) (*TenantRedirectError, bool) {
 
 // WebAuthnService handles WebAuthn authentication
 type WebAuthnService struct {
-	store    storage.Store
-	cfg      *config.Config
-	logger   *zap.Logger
-	webauthn *webauthn.WebAuthn
+	store          storage.Store
+	cfg            *config.Config
+	logger         *zap.Logger
+	webauthn       *webauthn.WebAuthn
+	aaguidValidator *AAGUIDValidator
 }
+
+// ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
+var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
 
 // NewWebAuthnService creates a new WebAuthnService
 func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Logger) (*WebAuthnService, error) {
+	return NewWebAuthnServiceWithValidator(store, cfg, logger, nil)
+}
+
+// NewWebAuthnServiceWithValidator creates a new WebAuthnService with an AAGUID validator
+func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, logger *zap.Logger, validator *AAGUIDValidator) (*WebAuthnService, error) {
 	wconfig := &webauthn.Config{
 		RPDisplayName: cfg.Server.RPName,
 		RPID:          cfg.Server.RPID,
@@ -75,10 +84,11 @@ func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Log
 	}
 
 	return &WebAuthnService{
-		store:    store,
-		cfg:      cfg,
-		logger:   logger.Named("webauthn-service"),
-		webauthn: wa,
+		store:          store,
+		cfg:            cfg,
+		logger:         logger.Named("webauthn-service"),
+		webauthn:       wa,
+		aaguidValidator: validator,
 	}, nil
 }
 
@@ -457,6 +467,23 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		return nil, ErrVerificationFailed
 	}
 
+	// Validate AAGUID if validator is configured
+	if s.aaguidValidator != nil {
+		result := s.aaguidValidator.Validate(credential.Authenticator.AAGUID)
+		if !result.Allowed {
+			s.logger.Warn("Registration blocked by AAGUID policy",
+				zap.String("aaguid", result.AAGUID),
+				zap.String("reason", result.Reason()),
+				zap.Bool("is_zero", result.IsZero),
+				zap.Bool("is_blacklisted", result.IsBlacklisted),
+			)
+			return nil, ErrAAGUIDBlacklisted
+		}
+		s.logger.Debug("AAGUID validation passed",
+			zap.String("aaguid", result.AAGUID),
+		)
+	}
+
 	// Create the user with the credential
 	credNickname := req.Nickname
 	if credNickname == "" {
@@ -635,6 +662,7 @@ type FinishLoginRequest struct {
 type FinishLoginResponse struct {
 	UUID              string                   `json:"uuid"`
 	Token             string                   `json:"appToken"`
+	RefreshToken      string                   `json:"refreshToken,omitempty"` // Optional refresh token
 	DisplayName       string                   `json:"displayName"`
 	Username          string                   `json:"username,omitempty"`
 	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
@@ -839,6 +867,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
+	// Generate refresh token (if enabled)
+	refreshToken, _ := s.generateRefreshToken(user, tenantID) // Ignore error, refresh is optional
+
 	displayName := ""
 	if user.DisplayName != nil {
 		displayName = *user.DisplayName
@@ -864,6 +895,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	return &FinishLoginResponse{
 		UUID:              userID.String(),
 		Token:             token,
+		RefreshToken:      refreshToken,
 		DisplayName:       displayName,
 		Username:          username,
 		PrivateData:       user.PrivateData,
@@ -879,17 +911,135 @@ func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.Tenan
 		tenantID = domain.DefaultTenantID
 	}
 
+	now := time.Now()
+	jti := generateChallengeID() // Generate unique token ID
+
 	claims := jwt.MapClaims{
 		"user_id":   user.UUID.String(),
 		"did":       user.DID,
 		"tenant_id": string(tenantID),
-		"iat":       time.Now().Unix(),
-		"exp":       time.Now().Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),                                                        // Not Before: token valid from now
+		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),  // Expiry
 		"iss":       s.cfg.JWT.Issuer,
+		"aud":       s.cfg.Server.RPID,                                                  // Audience: the RP ID
+		"jti":       jti,                                                                // JWT ID: unique identifier for revocation
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.JWT.Secret))
+}
+
+// generateRefreshToken creates a long-lived refresh token for token renewal
+func (s *WebAuthnService) generateRefreshToken(user *domain.User, tenantID domain.TenantID) (string, error) {
+	if s.cfg.JWT.RefreshDays <= 0 {
+		// Refresh tokens disabled
+		return "", nil
+	}
+
+	if tenantID == "" {
+		tenantID = domain.DefaultTenantID
+	}
+
+	now := time.Now()
+	jti := generateChallengeID()
+
+	claims := jwt.MapClaims{
+		"user_id":   user.UUID.String(),
+		"tenant_id": string(tenantID),
+		"type":      "refresh", // Mark as refresh token
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),
+		"exp":       now.AddDate(0, 0, s.cfg.JWT.RefreshDays).Unix(), // Expires in RefreshDays
+		"iss":       s.cfg.JWT.Issuer,
+		"aud":       s.cfg.Server.RPID,
+		"jti":       jti,
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(s.cfg.JWT.Secret))
+}
+
+// ErrInvalidRefreshToken indicates the refresh token is invalid or expired
+var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
+
+// RefreshTokenRequest contains the request for refreshing an access token
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refreshToken"`
+}
+
+// RefreshTokenResponse contains the new tokens
+type RefreshTokenResponse struct {
+	Token        string `json:"appToken"`
+	RefreshToken string `json:"refreshToken,omitempty"`
+}
+
+// RefreshAccessToken exchanges a valid refresh token for a new access token
+func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTokenRequest) (*RefreshTokenResponse, error) {
+	if s.cfg.JWT.RefreshDays <= 0 {
+		return nil, fmt.Errorf("refresh tokens are disabled")
+	}
+
+	// Parse the refresh token
+	token, err := jwt.Parse(req.RefreshToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return []byte(s.cfg.JWT.Secret), nil
+	})
+
+	if err != nil || !token.Valid {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// Verify this is a refresh token
+	tokenType, _ := claims["type"].(string)
+	if tokenType != "refresh" {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// Extract user and tenant info
+	userIDStr, ok := claims["user_id"].(string)
+	if !ok {
+		return nil, ErrInvalidRefreshToken
+	}
+	userID := domain.UserIDFromString(userIDStr)
+
+	tenantIDStr, _ := claims["tenant_id"].(string)
+	tenantID := domain.TenantID(tenantIDStr)
+
+	// Get the user (verify they still exist)
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		s.logger.Warn("Refresh token for non-existent user",
+			zap.String("user_id", userIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// Generate new access token
+	accessToken, err := s.generateToken(user, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+
+	// Generate new refresh token (rotation for security)
+	newRefreshToken, _ := s.generateRefreshToken(user, tenantID)
+
+	s.logger.Info("Access token refreshed",
+		zap.String("user_id", userIDStr),
+		zap.String("tenant_id", tenantIDStr),
+	)
+
+	return &RefreshTokenResponse{
+		Token:        accessToken,
+		RefreshToken: newRefreshToken,
+	}, nil
 }
 
 func generateChallengeID() string {
@@ -1095,6 +1245,19 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	if err != nil {
 		s.logger.Error("Failed to verify registration", zap.Error(err))
 		return nil, ErrVerificationFailed
+	}
+
+	// Validate AAGUID if validator is configured
+	if s.aaguidValidator != nil {
+		result := s.aaguidValidator.Validate(credential.Authenticator.AAGUID)
+		if !result.Allowed {
+			s.logger.Warn("Add credential blocked by AAGUID policy",
+				zap.String("aaguid", result.AAGUID),
+				zap.String("reason", result.Reason()),
+				zap.String("user_id", userID.String()),
+			)
+			return nil, ErrAAGUIDBlacklisted
+		}
 	}
 
 	// Check private data ETag if updating
@@ -1361,6 +1524,9 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
+	// Generate refresh token (if enabled)
+	refreshToken, _ := s.generateRefreshToken(user, tenantID)
+
 	// Clean up challenge
 	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
@@ -1382,6 +1548,7 @@ func (s *WebAuthnService) FinishTenantLogin(ctx context.Context, tenantID domain
 	return &FinishLoginResponse{
 		UUID:              userID.String(),
 		Token:             token,
+		RefreshToken:      refreshToken,
 		DisplayName:       displayName,
 		PrivateData:       user.PrivateData,
 		WebauthnRpId:      s.cfg.Server.RPID,

@@ -48,7 +48,7 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 }
 
 func (p *AuthProvider) Transport() Transport { return TransportHTTP }
-func (p *AuthProvider) Name() string                { return "auth" }
+func (p *AuthProvider) Name() string         { return "auth" }
 
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Public auth routes (no authentication required)
@@ -101,7 +101,7 @@ func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.L
 }
 
 func (p *StorageProvider) Transport() Transport { return TransportHTTP }
-func (p *StorageProvider) Name() string                { return "storage" }
+func (p *StorageProvider) Name() string         { return "storage" }
 
 func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Protected storage routes
@@ -160,7 +160,7 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger) (*EngineProvider,
 }
 
 func (p *EngineProvider) Transport() Transport { return TransportWebSocket }
-func (p *EngineProvider) Name() string                { return "engine" }
+func (p *EngineProvider) Name() string         { return "engine" }
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
@@ -216,7 +216,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 }
 
 func (p *BackendProvider) Transport() Transport { return TransportHTTP }
-func (p *BackendProvider) Name() string                { return "backend" }
+func (p *BackendProvider) Name() string         { return "backend" }
 
 func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register both auth and storage routes
