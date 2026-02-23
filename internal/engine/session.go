@@ -127,13 +127,13 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	// Wait for handshake message
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	_, message, err := conn.ReadMessage()
 	if err != nil {
 		m.logger.Error("Failed to read handshake", zap.Error(err))
 		return
 	}
-	conn.SetReadDeadline(time.Time{}) // Clear deadline
+	_ = conn.SetReadDeadline(time.Time{}) // Clear deadline
 
 	// Parse handshake
 	var msg Message
@@ -235,7 +235,7 @@ func (m *Manager) handleSession(session *Session) {
 		case TypeFlowStart:
 			var startMsg FlowStartMessage
 			if err := json.Unmarshal(message, &startMsg); err != nil {
-				session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_start format")
+				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_start format")
 				continue
 			}
 			go m.handleFlowStart(session, &startMsg)
@@ -243,7 +243,7 @@ func (m *Manager) handleSession(session *Session) {
 		case TypeFlowAction:
 			var actionMsg FlowActionMessage
 			if err := json.Unmarshal(message, &actionMsg); err != nil {
-				session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
+				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
 				continue
 			}
 			// Route to the flow
@@ -286,7 +286,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	m.handlersMu.RUnlock()
 
 	if !ok {
-		session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
+		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
 		return
 	}
 
@@ -303,7 +303,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	// Create handler
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient)
 	if err != nil {
-		session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
+		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}

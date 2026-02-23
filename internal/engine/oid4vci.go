@@ -126,7 +126,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 1: Parse credential offer
 	offer, err := h.parseOffer(ctx, msg)
 	if err != nil {
-		h.Error(StepParsingOffer, ErrCodeOfferParseError, err.Error())
+		_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, err.Error())
 		return err
 	}
 	h.SetData("offer", offer)
@@ -134,7 +134,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 2: Fetch issuer metadata
 	metadata, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
-		h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, err.Error())
+		_ = h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, err.Error())
 		return err
 	}
 	h.SetData("metadata", metadata)
@@ -142,7 +142,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 3: Evaluate trust
 	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata)
 	if err != nil {
-		h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, err.Error())
+		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, err.Error())
 		return err
 	}
 
@@ -164,7 +164,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	if h.needsProof(selectedConfig) {
 		proof, err := h.requestProof(ctx, metadata.CredentialIssuer, token.CNonce)
 		if err != nil {
-			h.Error(StepRequestingCredential, ErrCodeSignError, err.Error())
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, err.Error())
 			return err
 		}
 		proofJWT = proof
@@ -179,7 +179,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 8: Handle deferred or immediate issuance
 	if credential.TransactionID != "" {
 		// Deferred issuance - poll for credential
-		h.Progress(StepDeferred, map[string]interface{}{
+		_ = h.Progress(StepDeferred, map[string]interface{}{
 			"transaction_id": credential.TransactionID,
 			"interval":       5,
 			"message":        "Credential issuance is pending",
@@ -188,7 +188,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Poll for deferred credential
 		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID)
 		if err != nil {
-			h.Error(StepDeferred, ErrCodeCredentialError, "Deferred credential polling failed: "+err.Error())
+			_ = h.Error(StepDeferred, ErrCodeCredentialError, "Deferred credential polling failed: "+err.Error())
 			return err
 		}
 
@@ -203,7 +203,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 }
 
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
-	h.ProgressMessage(StepParsingOffer, "Parsing credential offer")
+	_ = h.ProgressMessage(StepParsingOffer, "Parsing credential offer")
 
 	var offerStr string
 
@@ -237,7 +237,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 		return nil, fmt.Errorf("invalid offer JSON: %w", err)
 	}
 
-	h.Progress(StepOfferParsed, map[string]interface{}{
+	_ = h.Progress(StepOfferParsed, map[string]interface{}{
 		"credential_issuer":            offer.CredentialIssuer,
 		"credential_configuration_ids": offer.CredentialConfigurationIDs,
 		"grants":                       offer.Grants,
@@ -256,7 +256,7 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch offer: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("offer fetch returned status %d", resp.StatusCode)
@@ -271,7 +271,7 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 }
 
 func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*IssuerMetadata, error) {
-	h.ProgressMessage(StepFetchingMetadata, "Fetching issuer metadata")
+	_ = h.ProgressMessage(StepFetchingMetadata, "Fetching issuer metadata")
 
 	// Fetch from well-known endpoint
 	metadataURL := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-credential-issuer"
@@ -285,7 +285,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -297,7 +297,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
-	h.Progress(StepMetadataFetched, map[string]interface{}{
+	_ = h.Progress(StepMetadataFetched, map[string]interface{}{
 		"credential_issuer":   metadata.CredentialIssuer,
 		"credential_endpoint": metadata.CredentialEndpoint,
 		"display":             metadata.Display,
@@ -307,7 +307,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 }
 
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
-	h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
+	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
 	// Get tenant trust endpoint from session (if configured)
 	trustEndpoint := ""
@@ -325,7 +325,7 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		}
 	}
 
-	h.Progress(StepTrustEvaluated, trust)
+	_ = h.Progress(StepTrustEvaluated, trust)
 	return trust, nil
 }
 
@@ -357,7 +357,7 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	}
 
 	// Send selection request
-	h.Progress(StepAwaitingSelection, map[string]interface{}{
+	_ = h.Progress(StepAwaitingSelection, map[string]interface{}{
 		"available_credentials": available,
 	})
 
@@ -372,13 +372,13 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		CredentialConfigurationID string `json:"credential_configuration_id"`
 	}
 	if err := json.Unmarshal(action.Payload, &selection); err != nil {
-		h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid selection payload")
+		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid selection payload")
 		return nil, err
 	}
 
 	config, ok := metadata.CredentialConfigurationsSupported[selection.CredentialConfigurationID]
 	if !ok {
-		h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
+		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
 		return nil, errors.New("invalid credential configuration")
 	}
 
@@ -408,7 +408,7 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 	// Check if TX code required
 	if txCodeRequired, ok := grant["tx_code"]; ok && txCodeRequired != nil {
 		// Request TX code from user
-		h.Progress(StepAuthorizationReq, map[string]interface{}{
+		_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
 			"type":    "tx_code",
 			"message": "Please enter the transaction code",
 		})
@@ -432,7 +432,7 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 }
 
 func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *IssuerMetadata, code, txCode string) (*TokenResponse, error) {
-	h.ProgressMessage(StepExchangingToken, "Exchanging pre-authorized code for token")
+	_ = h.ProgressMessage(StepExchangingToken, "Exchanging pre-authorized code for token")
 
 	tokenEndpoint := metadata.TokenEndpoint
 	if tokenEndpoint == "" {
@@ -457,11 +457,11 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
+		_ = h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
 		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -470,7 +470,7 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
-	h.ProgressMessage(StepTokenObtained, "Access token obtained")
+	_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
 	return &token, nil
 }
 
@@ -494,7 +494,7 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 		// Fallback: construct auth URL directly
 		return h.startAuthorizationFlow(ctx, offer, metadata, authServer+"/authorize")
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusOK {
 		var oauthMeta struct {
@@ -527,7 +527,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 	authURL.RawQuery = q.Encode()
 
-	h.Progress(StepAuthorizationReq, map[string]interface{}{
+	_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
 		"authorization_url":     authURL.String(),
 		"expected_redirect_uri": redirectURI,
 	})
@@ -543,7 +543,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		State string `json:"state"`
 	}
 	if err := json.Unmarshal(action.Payload, &authResult); err != nil {
-		h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "Invalid authorization response")
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "Invalid authorization response")
 		return nil, err
 	}
 
@@ -552,7 +552,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 }
 
 func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerMetadata, code, redirectURI string) (*TokenResponse, error) {
-	h.ProgressMessage(StepExchangingToken, "Exchanging authorization code for token")
+	_ = h.ProgressMessage(StepExchangingToken, "Exchanging authorization code for token")
 
 	tokenEndpoint := metadata.TokenEndpoint
 	if tokenEndpoint == "" {
@@ -574,11 +574,11 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	if err != nil {
 		return nil, fmt.Errorf("token request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
+		_ = h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
 		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -587,12 +587,12 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
-	h.ProgressMessage(StepTokenObtained, "Access token obtained")
+	_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
 	return &token, nil
 }
 
 func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
-	return config.ProofTypesSupported != nil && len(config.ProofTypesSupported) > 0
+	return len(config.ProofTypesSupported) > 0
 }
 
 func (h *OID4VCIHandler) requestProof(ctx context.Context, audience, nonce string) (string, error) {
@@ -608,7 +608,7 @@ func (h *OID4VCIHandler) requestProof(ctx context.Context, audience, nonce strin
 }
 
 func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, config *CredentialConfig, proofJWT string) (*CredentialResponse, error) {
-	h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
+	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
 		"format": config.Format,
@@ -635,11 +635,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	if err != nil {
 		return nil, fmt.Errorf("credential request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
-		h.Error(StepRequestingCredential, ErrCodeCredentialError, string(body))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, string(body))
 		return nil, fmt.Errorf("credential endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -669,7 +669,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		}
 
 		// Send progress update
-		h.Progress(StepDeferred, map[string]interface{}{
+		_ = h.Progress(StepDeferred, map[string]interface{}{
 			"transaction_id": transactionID,
 			"attempt":        attempt + 1,
 			"max_attempts":   maxAttempts,
@@ -696,7 +696,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		}
 
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		switch resp.StatusCode {
 		case http.StatusOK:

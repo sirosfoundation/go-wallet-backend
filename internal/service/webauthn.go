@@ -783,7 +783,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	handleTenantHash, isV1Handle := domain.TenantHashFromHandle(userHandle)
 	if isV1Handle == nil {
 		// V1 handle: verify tenant hash matches the credential's tenant
-		credTenantID := domain.TenantID(matchedCred.TenantID)
+		credTenantID := domain.TenantID(matchedCred.TenantID) //nolint:unconvert
 		if credTenantID == "" {
 			credTenantID = domain.DefaultTenantID
 		}

@@ -61,14 +61,14 @@ func (h *VCTMHandler) Execute(ctx context.Context, msg *FlowStartMessage) error 
 	defer cancel()
 
 	if msg.VCT == "" {
-		h.Error("", ErrCodeInvalidMessage, "VCT parameter is required")
+		_ = h.Error("", ErrCodeInvalidMessage, "VCT parameter is required")
 		return fmt.Errorf("VCT parameter required")
 	}
 
 	// Lookup type metadata
 	metadata, err := h.lookupVCT(ctx, msg.VCT)
 	if err != nil {
-		h.Error("", ErrCodeMetadataFetchErr, err.Error())
+		_ = h.Error("", ErrCodeMetadataFetchErr, err.Error())
 		return err
 	}
 
@@ -106,7 +106,7 @@ func (h *VCTMHandler) lookupVCT(ctx context.Context, vct string) (*TypeMetadata,
 		// Try direct VCT URL as fallback
 		return h.lookupVCTDirect(ctx, vct)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
 		// Try direct VCT URL
@@ -138,7 +138,7 @@ func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) (*TypeMet
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch VCT: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

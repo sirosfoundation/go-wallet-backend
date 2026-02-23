@@ -188,7 +188,7 @@ func Register(role Role, factory RunnerFactory) {
 // NewRunner creates a runner for the given role
 // Deprecated: Use NewRunnerForRole instead
 func NewRunner(mode Mode, cfg interface{}) (Runner, error) {
-	return NewRunnerForRole(Role(mode), cfg)
+	return NewRunnerForRole(mode, cfg)
 }
 
 // NewRunnerForRole creates a runner for the given role

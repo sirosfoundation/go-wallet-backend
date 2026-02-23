@@ -77,7 +77,7 @@ func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*V
 		rc.logger.Debug("Registry fetch failed", zap.String("vct", vct), zap.Error(err))
 		return nil, nil // Don't fail the whole flow if registry is unavailable
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil // VCT not in registry

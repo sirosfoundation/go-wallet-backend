@@ -127,7 +127,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 1: Parse authorization request
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
-		h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
+		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
 		return err
 	}
 	h.SetData("auth_request", authReq)
@@ -135,13 +135,13 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 2: Evaluate verifier trust
 	verifier, err := h.evaluateVerifierTrust(ctx, authReq)
 	if err != nil {
-		h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, err.Error())
+		_ = h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, err.Error())
 		return err
 	}
 
 	// Step 3: Send parsed request info to client
 	requestedClaims := h.extractRequestedClaims(authReq.PresentationDefinition)
-	h.Progress(StepRequestParsed, map[string]interface{}{
+	_ = h.Progress(StepRequestParsed, map[string]interface{}{
 		"verifier":                verifier,
 		"presentation_definition": authReq.PresentationDefinition,
 		"requested_claims":        requestedClaims,
@@ -154,7 +154,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	if len(matches) == 0 {
-		h.Error(StepMatchCredentials, ErrCodePresentationError, "No matching credentials found")
+		_ = h.Error(StepMatchCredentials, ErrCodePresentationError, "No matching credentials found")
 		return errors.New("no matching credentials")
 	}
 
@@ -167,14 +167,14 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 6: Request VP signing from client
 	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials)
 	if err != nil {
-		h.Error(StepSubmittingResponse, ErrCodeSignError, err.Error())
+		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, err.Error())
 		return err
 	}
 
 	// Step 7: Submit VP response to verifier
 	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
 	if err != nil {
-		h.Error(StepSubmittingResponse, ErrCodePresentationError, err.Error())
+		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, err.Error())
 		return err
 	}
 
@@ -183,7 +183,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 }
 
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
-	h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
+	_ = h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
 
 	var authReq AuthorizationRequest
 
@@ -285,7 +285,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("request fetch returned status %d", resp.StatusCode)
@@ -312,7 +312,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 }
 
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
-	h.ProgressMessage(StepEvaluatingVerifierTrust, "Evaluating verifier trust")
+	_ = h.ProgressMessage(StepEvaluatingVerifierTrust, "Evaluating verifier trust")
 
 	// Fetch client metadata if needed
 	var clientMeta *ClientMetadata
@@ -380,7 +380,7 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("metadata fetch returned status %d", resp.StatusCode)
@@ -404,7 +404,7 @@ func (h *OID4VPHandler) fetchPresentationDefinition(ctx context.Context, uri str
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("presentation definition fetch returned status %d", resp.StatusCode)
@@ -451,7 +451,7 @@ func (h *OID4VPHandler) extractRequestedClaims(pd *PresentationDefinition) []Req
 
 func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, pd *PresentationDefinition) ([]CredentialMatch, error) {
 	// Send presentation_definition to client for local matching
-	h.Progress(StepMatchCredentials, map[string]interface{}{
+	_ = h.Progress(StepMatchCredentials, map[string]interface{}{
 		"presentation_definition": pd,
 	})
 
@@ -489,7 +489,7 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 		}
 	}
 
-	h.Progress(StepAwaitingConsent, map[string]interface{}{
+	_ = h.Progress(StepAwaitingConsent, map[string]interface{}{
 		"matched_credentials": matchedCredentials,
 		"verifier":            verifier,
 	})
@@ -505,7 +505,7 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 			Reason string `json:"reason"`
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
-		h.Error(StepAwaitingConsent, ErrCodePresentationError, "User declined: "+decline.Reason)
+		_ = h.Error(StepAwaitingConsent, ErrCodePresentationError, "User declined: "+decline.Reason)
 		return nil, errors.New("user declined presentation")
 	}
 
@@ -521,10 +521,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	// Convert selections to credential refs
 	credRefs := make([]CredentialRef, len(selected))
 	for i, s := range selected {
-		credRefs[i] = CredentialRef{
-			CredentialID:    s.CredentialID,
-			DisclosedClaims: s.DisclosedClaims,
-		}
+		credRefs[i] = CredentialRef(s)
 	}
 
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
@@ -540,7 +537,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 }
 
 func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) (string, error) {
-	h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
+	_ = h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
 
 	// Determine response endpoint
 	responseEndpoint := authReq.ResponseURI
@@ -591,7 +588,7 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	if err != nil {
 		return "", fmt.Errorf("failed to submit response: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	// Check for redirect
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
