@@ -48,9 +48,10 @@ func testConfig() *config.Config {
 		},
 		Security: config.SecurityConfig{
 			AuthRateLimit: config.AuthRateLimitConfig{
-				Enabled:         true,
-				RequestsPerMin:  100,
-				LockoutDuration: 60,
+				Enabled:        true,
+				MaxAttempts:    100,
+				WindowSeconds:  60,
+				LockoutSeconds: 300,
 			},
 		},
 	}

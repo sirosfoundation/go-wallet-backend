@@ -144,13 +144,13 @@ func TestProxyService_StripsFingerprintingHeaders(t *testing.T) {
 		URL:    server.URL,
 		Method: "GET",
 		Headers: map[string]string{
-			"user-agent":          "Mozilla/5.0 (fingerprint)",
-			"accept-language":     "en-US,en;q=0.9",
-			"sec-ch-ua":           "\"Chromium\";v=\"100\"",
-			"sec-ch-ua-platform":  "Linux",
-			"x-forwarded-for":     "192.168.1.1",
-			"Authorization":       "Bearer token", // Should NOT be stripped
-			"X-Custom-Header":     "custom",       // Should NOT be stripped
+			"user-agent":         "Mozilla/5.0 (fingerprint)",
+			"accept-language":    "en-US,en;q=0.9",
+			"sec-ch-ua":          "\"Chromium\";v=\"100\"",
+			"sec-ch-ua-platform": "Linux",
+			"x-forwarded-for":    "192.168.1.1",
+			"Authorization":      "Bearer token", // Should NOT be stripped
+			"X-Custom-Header":    "custom",       // Should NOT be stripped
 		},
 	})
 	if err != nil {
