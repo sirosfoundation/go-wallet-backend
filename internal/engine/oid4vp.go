@@ -351,10 +351,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	// Evaluate trust via TrustService
-	trustEndpoint := "" // TODO: Look up tenant's trust endpoint from session.TenantID
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
-		// In future: load tenant config and get trust endpoint
-		// trustEndpoint = tenant.TrustConfig.TrustEndpoint
+	// Get tenant trust endpoint from session (if configured)
+	trustEndpoint := ""
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TrustEndpoint != "" {
+		trustEndpoint = h.Flow.Session.TrustEndpoint
 	}
 
 	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint)
@@ -481,7 +481,11 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 			InputDescriptorID: m.InputDescriptorID,
 			CredentialID:      m.CredentialID,
 			DisclosableClaims: m.AvailableClaims,
-			// TODO: Fetch credential display from VCTM
+		}
+
+		// Fetch credential display from VCTM if available
+		if m.VCT != "" && h.Registry != nil {
+			matchedCredentials[i].CredentialDisplay = h.Registry.FetchTypeMetadataJSON(ctx, m.VCT)
 		}
 	}
 

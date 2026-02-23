@@ -178,14 +178,23 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 	// Step 8: Handle deferred or immediate issuance
 	if credential.TransactionID != "" {
-		// Deferred issuance
+		// Deferred issuance - poll for credential
 		h.Progress(StepDeferred, map[string]interface{}{
 			"transaction_id": credential.TransactionID,
 			"interval":       5,
 			"message":        "Credential issuance is pending",
 		})
-		// TODO: Implement polling
-		return nil
+
+		// Poll for deferred credential
+		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID)
+		if err != nil {
+			h.Error(StepDeferred, ErrCodeCredentialError, "Deferred credential polling failed: "+err.Error())
+			return err
+		}
+
+		// Complete with the issued credential
+		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		return h.Complete(results, "")
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
@@ -300,12 +309,10 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
 	h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
-	// Get tenant trust endpoint (if configured)
-	// For now, use the default trust endpoint
-	trustEndpoint := "" // TODO: Look up tenant's trust endpoint from session.TenantID
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
-		// In future: load tenant config and get trust endpoint
-		// trustEndpoint = tenant.TrustConfig.TrustEndpoint
+	// Get tenant trust endpoint from session (if configured)
+	trustEndpoint := ""
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TrustEndpoint != "" {
+		trustEndpoint = h.Flow.Session.TrustEndpoint
 	}
 
 	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint)
@@ -642,6 +649,92 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	}
 
 	return &credResp, nil
+}
+
+// pollDeferredCredential polls the deferred credential endpoint until the credential is ready
+// or the polling times out.
+func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string) (*CredentialResponse, error) {
+	// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
+	deferredEndpoint := strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential"
+
+	// Default polling interval and max attempts
+	interval := 5 * time.Second
+	maxAttempts := 60 // 5 minutes at 5 second intervals
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+
+		// Send progress update
+		h.Progress(StepDeferred, map[string]interface{}{
+			"transaction_id": transactionID,
+			"attempt":        attempt + 1,
+			"max_attempts":   maxAttempts,
+			"message":        fmt.Sprintf("Polling for credential (attempt %d/%d)", attempt+1, maxAttempts),
+		})
+
+		// Build request body
+		reqBody := map[string]interface{}{
+			"transaction_id": transactionID,
+		}
+		bodyBytes, _ := json.Marshal(reqBody)
+
+		req, err := http.NewRequestWithContext(ctx, "POST", deferredEndpoint, strings.NewReader(string(bodyBytes)))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
+			continue // Retry on network errors
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		switch resp.StatusCode {
+		case http.StatusOK:
+			// Credential is ready
+			var credResp CredentialResponse
+			if err := json.Unmarshal(body, &credResp); err != nil {
+				return nil, fmt.Errorf("failed to parse deferred credential response: %w", err)
+			}
+			h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
+			return &credResp, nil
+
+		case http.StatusAccepted:
+			// Still pending, continue polling
+			// Check for new interval if provided in response
+			var pendingResp struct {
+				Interval int `json:"interval,omitempty"`
+			}
+			if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
+				interval = time.Duration(pendingResp.Interval) * time.Second
+			}
+			h.Logger.Debug("Deferred credential still pending",
+				zap.String("transaction_id", transactionID),
+				zap.Int("attempt", attempt+1))
+			continue
+
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+			// Non-retryable errors
+			return nil, fmt.Errorf("deferred credential request failed with status %d: %s", resp.StatusCode, string(body))
+
+		default:
+			h.Logger.Warn("Unexpected deferred response status",
+				zap.Int("status", resp.StatusCode),
+				zap.String("body", string(body)))
+			continue // Retry on unexpected responses
+		}
+	}
+
+	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
 }
 
 func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {

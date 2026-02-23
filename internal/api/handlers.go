@@ -706,7 +706,7 @@ func (h *Handlers) GetAllVerifiers(c *gin.Context) {
 	c.JSON(200, verifiers)
 }
 
-// Proxy handler
+// ProxyRequest handles proxied HTTP requests
 func (h *Handlers) ProxyRequest(c *gin.Context) {
 	var req service.ProxyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

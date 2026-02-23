@@ -26,14 +26,15 @@ var (
 
 // Session represents an authenticated WebSocket session
 type Session struct {
-	ID       string
-	UserID   string
-	TenantID string
-	conn     *websocket.Conn
-	sendMu   sync.Mutex
-	flows    map[string]*Flow
-	flowsMu  sync.RWMutex
-	logger   *zap.Logger
+	ID            string
+	UserID        string
+	TenantID      string
+	TrustEndpoint string // Tenant-specific trust endpoint (if configured)
+	conn          *websocket.Conn
+	sendMu        sync.Mutex
+	flows         map[string]*Flow
+	flowsMu       sync.RWMutex
+	logger        *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -154,7 +155,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	userID, tenantID, err := m.validateToken(handshake.AppToken)
+	userID, tenantID, trustEndpoint, err := m.validateToken(handshake.AppToken)
 	if err != nil {
 		m.logger.Warn("Authentication failed", zap.Error(err))
 		m.sendError(conn, "", ErrCodeAuthFailed, "Invalid or expired token")
@@ -163,15 +164,16 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 
 	// Create session
 	session := &Session{
-		ID:       uuid.New().String(),
-		UserID:   userID,
-		TenantID: tenantID,
-		conn:     conn,
-		flows:    make(map[string]*Flow),
-		logger:   m.logger.With(zap.String("session", userID[:8])),
-		actionCh: make(chan *FlowActionMessage, 10),
-		signCh:   make(chan *SignResponseMessage, 10),
-		closeCh:  make(chan struct{}),
+		ID:            uuid.New().String(),
+		UserID:        userID,
+		TenantID:      tenantID,
+		TrustEndpoint: trustEndpoint,
+		conn:          conn,
+		flows:         make(map[string]*Flow),
+		logger:        m.logger.With(zap.String("session", userID[:8])),
+		actionCh:      make(chan *FlowActionMessage, 10),
+		signCh:        make(chan *SignResponseMessage, 10),
+		closeCh:       make(chan struct{}),
 	}
 
 	// Register session
@@ -381,7 +383,7 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed")
 }
 
-func (m *Manager) validateToken(tokenString string) (userID, tenantID string, err error) {
+func (m *Manager) validateToken(tokenString string) (userID, tenantID, trustEndpoint string, err error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
@@ -390,19 +392,20 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 	})
 
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
 		userID, _ = claims["user_id"].(string)
 		tenantID, _ = claims["tenant_id"].(string)
+		trustEndpoint, _ = claims["trust_endpoint"].(string)
 		if userID == "" {
-			return "", "", errors.New("invalid token claims: missing user_id")
+			return "", "", "", errors.New("invalid token claims: missing user_id")
 		}
-		return userID, tenantID, nil
+		return userID, tenantID, trustEndpoint, nil
 	}
 
-	return "", "", errors.New("invalid token")
+	return "", "", "", errors.New("invalid token")
 }
 
 func (m *Manager) getCapabilities() []string {

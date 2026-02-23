@@ -27,6 +27,51 @@ This is a proof of concept re-implementation of wwWallet/wallet-backend-server i
 - **Cloud-Native**: Stateless design for horizontal scaling
 - **Zero MySQL Dependency**: Choose from multiple storage backends
 - **Standards-Compliant**: Implements W3C Verifiable Credentials and DID standards
+- **Trust Delegation**: AuthZEN-based trust evaluation via go-trust PDP
+
+## Trust Management
+
+Trust evaluation is delegated to an external AuthZEN PDP (Policy Decision Point), typically [go-trust](https://github.com/sirosfoundation/go-trust). This design ensures:
+
+- **Consistent trust policy** across all wallet operations
+- **No local trust bypasses** - all trust decisions flow through the PDP
+- **Flexible trust frameworks** - ETSI TSL, OpenID Federation, DID Web, or custom policies
+
+### Configuration
+
+```yaml
+trust:
+  # Default trust endpoint for all tenants
+  default_endpoint: "http://go-trust:6001"
+  
+  # Timeout for trust evaluation requests
+  timeout: 5s
+```
+
+### Per-Tenant Trust Override
+
+Tenants can override the default trust endpoint via their configuration:
+
+```json
+{
+  "id": "my-tenant",
+  "trust_endpoint": "https://custom-pdp.example.com"
+}
+```
+
+### Testing with Static Registries
+
+For development and testing, go-trust provides static registries:
+
+```bash
+# Start go-trust with always-trusted registry (development)
+gt --registry static:always-trusted
+
+# Start go-trust with never-trusted registry (testing rejection)
+gt --registry static:never-trusted
+```
+
+See [go-trust documentation](https://github.com/sirosfoundation/go-trust) for more details.
 
 ## Architecture
 
@@ -35,18 +80,25 @@ This is a proof of concept re-implementation of wwWallet/wallet-backend-server i
 ```
 go-wallet-backend/
 ├── cmd/
-│   └── server/          # Main application entry point
+│   ├── server/          # Main application entry point
+│   ├── registry/        # VCTM registry server
+│   └── wallet-admin/    # Admin CLI tool
 ├── internal/
 │   ├── api/             # HTTP handlers and routes
 │   ├── domain/          # Business logic and domain models
+│   ├── engine/          # Protocol engine (OID4VCI/VP state machines)
 │   ├── service/         # Service layer (keystores, issuance, etc.)
-│   └── storage/         # Storage implementations
+│   ├── storage/         # Storage implementations
+│   ├── modes/           # Server operation modes
+│   ├── metadata/        # Issuer/verifier metadata fetching
+│   └── registry/        # VCTM registry handlers
 ├── pkg/
 │   ├── config/          # Configuration management
 │   ├── middleware/      # HTTP middleware
-│   └── webauthn/        # WebAuthn utilities
-├── api/
-│   └── openapi.yaml     # API specification
+│   ├── trust/           # Trust service (AuthZEN client)
+│   └── logging/         # Structured logging
+├── docs/
+│   └── adr/             # Architecture Decision Records
 └── configs/
     └── config.yaml      # Default configuration
 ```

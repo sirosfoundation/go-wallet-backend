@@ -55,10 +55,10 @@ func IsTenantRedirectError(err error) (*TenantRedirectError, bool) {
 
 // WebAuthnService handles WebAuthn authentication
 type WebAuthnService struct {
-	store          storage.Store
-	cfg            *config.Config
-	logger         *zap.Logger
-	webauthn       *webauthn.WebAuthn
+	store           storage.Store
+	cfg             *config.Config
+	logger          *zap.Logger
+	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
 }
 
@@ -84,10 +84,10 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 	}
 
 	return &WebAuthnService{
-		store:          store,
-		cfg:            cfg,
-		logger:         logger.Named("webauthn-service"),
-		webauthn:       wa,
+		store:           store,
+		cfg:             cfg,
+		logger:          logger.Named("webauthn-service"),
+		webauthn:        wa,
 		aaguidValidator: validator,
 	}, nil
 }
@@ -919,11 +919,18 @@ func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.Tenan
 		"did":       user.DID,
 		"tenant_id": string(tenantID),
 		"iat":       now.Unix(),
-		"nbf":       now.Unix(),                                                        // Not Before: token valid from now
-		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),  // Expiry
+		"nbf":       now.Unix(),                                                       // Not Before: token valid from now
+		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(), // Expiry
 		"iss":       s.cfg.JWT.Issuer,
-		"aud":       s.cfg.Server.RPID,                                                  // Audience: the RP ID
-		"jti":       jti,                                                                // JWT ID: unique identifier for revocation
+		"aud":       s.cfg.Server.RPID, // Audience: the RP ID
+		"jti":       jti,               // JWT ID: unique identifier for revocation
+	}
+
+	// Add tenant trust endpoint if configured
+	if tenant, err := s.store.Tenants().GetByID(context.Background(), tenantID); err == nil && tenant != nil {
+		if tenant.TrustConfig.TrustEndpoint != "" {
+			claims["trust_endpoint"] = tenant.TrustConfig.TrustEndpoint
+		}
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

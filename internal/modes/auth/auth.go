@@ -168,6 +168,10 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 	// PUBLIC ROUTES (unauthenticated)
 	// Auth-related: registration, login, WebAuthn
 	// =========================================================================
+
+	// Create rate limiter for auth endpoints
+	rateLimiter := middleware.NewAuthRateLimiter(cfg.Security.AuthRateLimit, logger)
+
 	public := router.Group("/")
 	{
 		// User authentication routes
@@ -177,11 +181,18 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 			user.POST("/register", handlers.RegisterUser)
 			user.POST("/login", handlers.LoginUser)
 
-			// WebAuthn routes
-			user.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
-			user.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-			user.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-			user.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+			// WebAuthn routes - protected by rate limiting
+			webauthn := user.Group("")
+			webauthn.Use(middleware.AuthRateLimitMiddleware(rateLimiter))
+			{
+				webauthn.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
+				webauthn.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
+				webauthn.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
+				webauthn.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+			}
+
+			// Token refresh endpoint (rate limited)
+			user.POST("/token/refresh", middleware.AuthRateLimitMiddleware(rateLimiter), handlers.RefreshToken)
 		}
 
 		// Auth check helper
@@ -209,6 +220,7 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 			session.POST("/webauthn/credential/:id/delete", handlers.DeleteWebAuthnCredential)
 		}
 		protected.DELETE("/user/session", handlers.DeleteUser)
+		protected.POST("/user/logout", handlers.Logout)
 	}
 
 	return router

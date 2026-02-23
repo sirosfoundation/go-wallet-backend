@@ -103,19 +103,19 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 
 	// Copy headers but strip fingerprinting headers (privacy)
 	fingerprintHeaders := map[string]bool{
-		"user-agent":                true, // Browser/OS fingerprinting
-		"accept-language":           true, // Locale fingerprinting
-		"accept-encoding":           true, // Compression support fingerprinting
-		"sec-ch-ua":                 true, // User-Agent Client Hints
-		"sec-ch-ua-mobile":          true,
-		"sec-ch-ua-platform":        true,
-		"sec-ch-ua-arch":            true,
-		"sec-ch-ua-bitness":         true,
-		"sec-ch-ua-full-version":    true,
+		"user-agent":                 true, // Browser/OS fingerprinting
+		"accept-language":            true, // Locale fingerprinting
+		"accept-encoding":            true, // Compression support fingerprinting
+		"sec-ch-ua":                  true, // User-Agent Client Hints
+		"sec-ch-ua-mobile":           true,
+		"sec-ch-ua-platform":         true,
+		"sec-ch-ua-arch":             true,
+		"sec-ch-ua-bitness":          true,
+		"sec-ch-ua-full-version":     true,
 		"sec-ch-ua-platform-version": true,
-		"x-forwarded-for":           true, // IP forwarding
-		"x-real-ip":                 true,
-		"forwarded":                 true,
+		"x-forwarded-for":            true, // IP forwarding
+		"x-real-ip":                  true,
+		"forwarded":                  true,
 	}
 	for key, value := range req.Headers {
 		if !fingerprintHeaders[strings.ToLower(key)] {

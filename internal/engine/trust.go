@@ -31,7 +31,8 @@ func (t *tenantTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // TrustService provides trust evaluation for engine flows.
-// It manages evaluators per trust endpoint with caching.
+// All trust evaluation is delegated to a remote trust endpoint (AuthZEN PDP).
+// Per ADR-010, no local trust evaluation is performed to avoid false positives.
 type TrustService struct {
 	cfg    *config.Config
 	logger *zap.Logger
@@ -42,6 +43,7 @@ type TrustService struct {
 }
 
 // NewTrustService creates a new trust service.
+// Trust evaluation is delegated to the configured trust endpoint.
 func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
 	return &TrustService{
 		cfg:        cfg,
@@ -50,7 +52,7 @@ func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
 	}
 }
 
-// GetEvaluator returns an evaluator for the given endpoint.
+// GetEvaluator returns an AuthZEN evaluator for the given endpoint.
 // Uses the default endpoint if endpoint is empty.
 // Returns nil if no trust endpoint is configured.
 func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error) {
@@ -91,6 +93,7 @@ func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error
 		},
 	}
 
+	// Create AuthZEN evaluator for this endpoint
 	eval, err := authzen.NewEvaluatorWithHTTPClient(&authzen.Config{
 		BaseURL: endpoint,
 		Timeout: timeout,
@@ -104,7 +107,8 @@ func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error
 	return eval, nil
 }
 
-// EvaluateIssuer evaluates trust for a credential issuer.
+// EvaluateIssuer evaluates trust for a credential issuer via the trust endpoint.
+// All evaluation is delegated to the AuthZEN PDP - no local trust decisions.
 func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string) (*TrustInfo, error) {
 	eval, err := ts.GetEvaluator(trustEndpoint)
 	if err != nil {
@@ -134,7 +138,7 @@ func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, tru
 	req.KeyType = trust.KeyTypeJWK
 	req.Role = trust.RoleCredentialIssuer
 
-	// Evaluate
+	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
 	if err != nil {
 		ts.logger.Warn("Trust evaluation error",
@@ -154,7 +158,8 @@ func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, tru
 	}, nil
 }
 
-// EvaluateVerifier evaluates trust for a credential verifier.
+// EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
+// All evaluation is delegated to the AuthZEN PDP - no local trust decisions.
 func (ts *TrustService) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string) (*TrustInfo, error) {
 	eval, err := ts.GetEvaluator(trustEndpoint)
 	if err != nil {
@@ -184,7 +189,7 @@ func (ts *TrustService) EvaluateVerifier(ctx context.Context, verifierID string,
 	req.KeyType = trust.KeyTypeJWK
 	req.Role = trust.RoleCredentialVerifier
 
-	// Evaluate
+	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
 	if err != nil {
 		ts.logger.Warn("Trust evaluation error",

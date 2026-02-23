@@ -164,11 +164,11 @@ func (s *UserService) generateToken(user *domain.User, tenantID domain.TenantID)
 		"did":       user.DID,
 		"tenant_id": tid,
 		"iss":       s.cfg.JWT.Issuer,
-		"aud":       s.cfg.Server.RPID,                                                  // Audience: the RP ID
-		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(),   // Expiry
+		"aud":       s.cfg.Server.RPID,                                                // Audience: the RP ID
+		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(), // Expiry
 		"iat":       now.Unix(),
-		"nbf":       now.Unix(),                                                          // Not Before: token valid from now
-		"jti":       jti,                                                                  // JWT ID: unique identifier for revocation
+		"nbf":       now.Unix(), // Not Before: token valid from now
+		"jti":       jti,        // JWT ID: unique identifier for revocation
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
