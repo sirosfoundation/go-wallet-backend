@@ -5,7 +5,8 @@
     "storage",
     "proxy",
     "multi-tenancy",
-    "vctm-registry"
+    "vctm-registry",
+    "refresh-tokens"
   ],
   "roles": [
     "test"
