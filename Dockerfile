@@ -42,7 +42,7 @@ WORKDIR /app
 COPY --from=builder /app/server /app/server
 COPY --from=builder /app/configs /app/configs
 
-USER nonroot:nonroot
+USER 65532:65532
 
 # Expose port
 EXPOSE 8080
