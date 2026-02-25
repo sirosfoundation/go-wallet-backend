@@ -73,7 +73,58 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	}
 
 	// Protected auth routes (session management)
-	// TODO: Add session management routes when implemented in handlers
+	protected := router.Group("/")
+	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	{
+		// User session routes (authenticated)
+		session := protected.Group("/user/session")
+		{
+			session.GET("/account-info", p.handlers.GetAccountInfo)
+			session.POST("/settings", p.handlers.UpdateSettings)
+			session.GET("/private-data", p.handlers.GetPrivateData)
+			session.POST("/private-data", p.handlers.UpdatePrivateData)
+			session.DELETE("/", p.handlers.DeleteUser)
+
+			// WebAuthn credential management
+			session.POST("/webauthn/register-begin", p.handlers.StartAddWebAuthnCredential)
+			session.POST("/webauthn/register-finish", p.handlers.FinishAddWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/rename", p.handlers.RenameWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/delete", p.handlers.DeleteWebAuthnCredential)
+		}
+		protected.DELETE("/user/session", p.handlers.DeleteUser)
+
+		// Issuer routes
+		issuerGroup := protected.Group("/issuer")
+		{
+			issuerGroup.GET("/all", p.handlers.GetAllIssuers)
+		}
+
+		// Verifier routes
+		verifierGroup := protected.Group("/verifier")
+		{
+			verifierGroup.GET("/all", p.handlers.GetAllVerifiers)
+		}
+
+		// Helper routes
+		protected.POST("/helper/get-cert", p.handlers.GetCertificate)
+
+		// Proxy routes (can be disabled via features.proxy_enabled)
+		if p.cfg.Features.ProxyEnabled {
+			protected.POST("/proxy", p.handlers.ProxyRequest)
+		}
+
+		// Keystore routes
+		keystoreGroup := protected.Group("/keystore")
+		{
+			keystoreGroup.GET("/status", p.handlers.KeystoreStatus)
+		}
+
+		// Wallet provider routes
+		walletProvider := protected.Group("/wallet-provider")
+		{
+			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+		}
+	}
 }
 
 // =============================================================================
@@ -108,9 +159,17 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected := router.Group("/storage")
 	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
 	{
-		protected.GET("/private", p.handlers.GetPrivateData)
-		protected.PUT("/private", p.handlers.UpdatePrivateData)
-		// TODO: Add personal data routes when implemented in handlers
+		// Credential storage
+		protected.GET("/vc", p.handlers.GetAllCredentials)
+		protected.POST("/vc", p.handlers.StoreCredential)
+		protected.POST("/vc/update", p.handlers.UpdateCredential)
+		protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
+		protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
+
+		// Presentation storage
+		protected.GET("/vp", p.handlers.GetAllPresentations)
+		protected.POST("/vp", p.handlers.StorePresentation)
+		protected.GET("/vp/:presentation_identifier", p.handlers.GetPresentationByIdentifier)
 	}
 }
 
