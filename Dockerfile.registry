@@ -22,6 +22,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -o registry cmd/registry/main.go
 
+# Create data directory for cache - will be copied with correct ownership
+RUN mkdir -p /app/data
+
 # Runtime stage
 FROM gcr.io/distroless/static-debian12
 
@@ -32,8 +35,9 @@ COPY --from=builder /app/registry /app/registry
 COPY --from=builder /app/configs/registry.yaml /app/configs/registry.yaml
 COPY --from=builder /app/configs/registry.production.yaml /app/configs/registry.production.yaml
 
-# Create data directory for cache (will be mounted as volume in production)
-VOLUME /app/data
+# Copy data directory with nonroot ownership (65532 is the nonroot user in distroless)
+# This ensures the directory exists with correct permissions before volume mount
+COPY --from=builder --chown=65532:65532 /app/data /app/data
 
 USER nonroot:nonroot
 
