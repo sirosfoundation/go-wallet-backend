@@ -296,6 +296,41 @@ func (p *BackendProvider) Store() backend.Backend {
 	return p.store
 }
 
+// RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
+// This registers all tenant management routes on the admin API.
+func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+
+	// Tenant management routes
+	tenants := adminGroup.Group("/tenants")
+	{
+		tenants.GET("", adminHandlers.ListTenants)
+		tenants.POST("", adminHandlers.CreateTenant)
+		tenants.GET("/:id", adminHandlers.GetTenant)
+		tenants.PUT("/:id", adminHandlers.UpdateTenant)
+		tenants.DELETE("/:id", adminHandlers.DeleteTenant)
+
+		// Tenant user management
+		tenants.GET("/:id/users", adminHandlers.GetTenantUsers)
+		tenants.POST("/:id/users", adminHandlers.AddUserToTenant)
+		tenants.DELETE("/:id/users/:user_id", adminHandlers.RemoveUserFromTenant)
+
+		// Tenant issuer management
+		tenants.GET("/:id/issuers", adminHandlers.ListIssuers)
+		tenants.POST("/:id/issuers", adminHandlers.CreateIssuer)
+		tenants.GET("/:id/issuers/:issuer_id", adminHandlers.GetIssuer)
+		tenants.PUT("/:id/issuers/:issuer_id", adminHandlers.UpdateIssuer)
+		tenants.DELETE("/:id/issuers/:issuer_id", adminHandlers.DeleteIssuer)
+
+		// Tenant verifier management
+		tenants.GET("/:id/verifiers", adminHandlers.ListVerifiers)
+		tenants.POST("/:id/verifiers", adminHandlers.CreateVerifier)
+		tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
+		tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
+		tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
+	}
+}
+
 // =============================================================================
 // Registry Provider - handles VCTM registry routes
 // =============================================================================

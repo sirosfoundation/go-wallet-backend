@@ -49,6 +49,14 @@ type RouteProvider interface {
 	Name() string
 }
 
+// AdminRouteProvider allows providers to contribute admin API routes.
+// The admin server runs on a separate port with token authentication.
+type AdminRouteProvider interface {
+	// RegisterAdminRoutes adds admin routes to the protected admin group.
+	// The group already has admin auth middleware applied.
+	RegisterAdminRoutes(adminGroup *gin.RouterGroup)
+}
+
 // ServerConfig holds unified server configuration
 type ServerConfig struct {
 	// HTTP server settings (for auth, storage, backend, registry)
@@ -275,12 +283,30 @@ func (m *Manager) startAdminServer() error {
 			zap.String("token", token))
 	}
 
-	// Admin router with token auth
+	// Admin router
 	adminRouter := gin.New()
 	adminRouter.Use(gin.Recovery())
-	adminRouter.Use(middleware.AdminAuthMiddleware(token, m.logger))
 
-	// TODO: Add admin routes from providers that support it
+	// Public admin status endpoint (no auth required)
+	adminRouter.GET("/admin/status", func(c *gin.Context) {
+		c.JSON(http.StatusOK, api.StatusResponse{
+			Status:  "ok",
+			Service: "wallet-backend-admin",
+			Roles:   m.cfg.Roles,
+		})
+	})
+
+	// Protected admin routes with token auth
+	adminGroup := adminRouter.Group("/admin")
+	adminGroup.Use(middleware.AdminAuthMiddleware(token, m.logger))
+
+	// Let providers register their admin routes
+	for _, p := range m.providers {
+		if adminProvider, ok := p.(AdminRouteProvider); ok {
+			m.logger.Info("Registering admin routes", zap.String("provider", p.Name()))
+			adminProvider.RegisterAdminRoutes(adminGroup)
+		}
+	}
 
 	adminAddr := fmt.Sprintf("%s:%d", m.cfg.HTTPAddress, m.cfg.AdminPort)
 	m.adminServer = &http.Server{
