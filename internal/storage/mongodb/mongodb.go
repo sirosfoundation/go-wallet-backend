@@ -115,18 +115,30 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create challenge indexes: %w", err)
 	}
 
+	// Drop old incorrect issuers collection indexes
+	_, _ = s.issuers.collection.Indexes().DropOne(ctx, "identifier_1")
+
 	// Issuers collection indexes
 	_, err = s.issuers.collection.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "identifier", Value: 1}},
+		Keys: bson.D{
+			{Key: "credential_issuer_identifier", Value: 1},
+			{Key: "tenant_id", Value: 1},
+		},
 		Options: options.Index().SetUnique(true),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create issuer indexes: %w", err)
 	}
 
+	// Drop old incorrect verifiers collection indexes
+	_, _ = s.verifiers.collection.Indexes().DropOne(ctx, "did_1")
+
 	// Verifiers collection indexes
 	_, err = s.verifiers.collection.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "did", Value: 1}},
+		Keys: bson.D{
+			{Key: "url", Value: 1},
+			{Key: "tenant_id", Value: 1},
+		},
 		Options: options.Index().SetUnique(true),
 	})
 	if err != nil {
