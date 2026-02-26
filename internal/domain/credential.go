@@ -101,7 +101,7 @@ type Verifier struct {
 	ID       int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
 	TenantID TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	Name     string   `json:"name" bson:"name" gorm:"not null"`
-	URL      string   `json:"url" bson:"url" gorm:"not null"`
+	URL      string   `json:"url" bson:"url" gorm:"index;not null"`
 }
 
 // TableName specifies the table name for GORM
