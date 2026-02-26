@@ -882,10 +882,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 
 	// Get tenant display name for the response
 	var tenantDisplayName string
-	if tenantID != domain.DefaultTenantID {
-		if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
-			tenantDisplayName = tenant.DisplayName
-		}
+	if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
+		tenantDisplayName = tenant.DisplayName
 	}
 
 	s.logger.Info("User logged in via WebAuthn",

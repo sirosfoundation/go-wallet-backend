@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -715,6 +716,10 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	}
 
 	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
+		if errors.Is(err, storage.ErrAlreadyExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Verifier with this URL already exists in tenant"})
+			return
+		}
 		h.logger.Error("Failed to create verifier", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create verifier"})
 		return
