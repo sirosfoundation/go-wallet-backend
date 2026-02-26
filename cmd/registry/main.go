@@ -200,7 +200,6 @@ func requestLogger(logger *zap.Logger) gin.HandlerFunc {
 			zap.String("query", query),
 			zap.Int("status", status),
 			zap.Duration("latency", latency),
-			zap.String("client_ip", c.ClientIP()),
 		)
 	}
 }

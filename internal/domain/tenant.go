@@ -40,6 +40,17 @@ func (t TenantID) String() string {
 	return string(t)
 }
 
+// TrustConfig holds trust evaluation configuration for a tenant
+type TrustConfig struct {
+	// TrustEndpoint is the URL for the go-trust service.
+	// If empty, uses the default trust endpoint from server config.
+	TrustEndpoint string `json:"trust_endpoint,omitempty" bson:"trust_endpoint" gorm:"column:trust_endpoint"`
+
+	// TrustTTL is how long trust evaluations remain valid (in seconds).
+	// Default: 86400 (24 hours)
+	TrustTTL int `json:"trust_ttl,omitempty" bson:"trust_ttl" gorm:"column:trust_ttl;default:86400"`
+}
+
 // Tenant represents an organizational tenant
 type Tenant struct {
 	ID          TenantID  `json:"id" bson:"_id" gorm:"primaryKey"`
@@ -48,6 +59,9 @@ type Tenant struct {
 	Enabled     bool      `json:"enabled" bson:"enabled" gorm:"default:true"`
 	CreatedAt   time.Time `json:"created_at" bson:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt   time.Time `json:"updated_at" bson:"updated_at" gorm:"autoUpdateTime"`
+
+	// Trust configuration (embedded)
+	TrustConfig TrustConfig `json:"trust_config,omitempty" bson:"trust_config" gorm:"embedded;embeddedPrefix:trust_"`
 }
 
 // TableName specifies the table name for GORM

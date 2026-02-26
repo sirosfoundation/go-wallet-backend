@@ -32,10 +32,13 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 }
 
 // Status handles the /status endpoint
+// This endpoint returns the server status and API version for client capability detection.
 func (h *Handlers) Status(c *gin.Context) {
-	c.JSON(200, gin.H{
-		"status":  "ok",
-		"service": "wallet-backend",
+	c.JSON(200, StatusResponse{
+		Status:       "ok",
+		Service:      "wallet-backend",
+		APIVersion:   CurrentAPIVersion,
+		Capabilities: APICapabilities[CurrentAPIVersion],
 	})
 }
 

@@ -24,6 +24,56 @@ communication channel.
 - Multi-device synchronization
 - Offline operation queuing
 
+## Architecture Overview
+
+### Deployment Model
+
+The WebSocket endpoint is served by the **engine** mode of the wallet backend
+hybrid binary. The engine can be deployed in multiple configurations:
+
+| Mode | Description | Privacy |
+|------|-------------|---------|
+| Embedded (`--mode=all`) | Single binary, development use | Backend sees all flows |
+| Cloud Engine | Separate container/pod | Backend sees all flows |
+| Local Engine | Native app embeds engine | Cloud sees nothing |
+
+See `proxy-elimination-plan.md` for full deployment architecture.
+
+### Privacy Properties
+
+**Key principle**: The engine is designed to minimize data exposure:
+
+1. **Keys never leave client** - Signing happens locally via `sign_request`/`sign_response`
+2. **Client-side credential matching** - Engine sends `presentation_definition`, client
+   matches locally and returns only selected credentials
+3. **Engine sees credentials one-at-a-time** - During signing, not full inventory
+4. **Storage is separate** - Encrypted blobs go client → storage service directly
+5. **Local engine option** - Native apps can run engine locally; cloud never sees flows
+
+### Data Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           ENGINE DATA VISIBILITY                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Engine SEES:                        Engine DOES NOT SEE:                    │
+│  ─────────────                       ────────────────────                    │
+│  • Flow type (OID4VCI, OID4VP)       • Full credential inventory             │
+│  • Issuer/verifier being contacted   • Credential content (only during sign) │
+│  • Presentation definition           • Private keys                          │
+│  • One credential at signing time    • Decrypted credential store            │
+│  • Trust evaluation results          • User password/biometrics              │
+│                                                                              │
+│  Mitigations:                                                                │
+│  ────────────                                                                │
+│  • Client does credential matching locally                                   │
+│  • Local engine mode eliminates cloud visibility                             │
+│  • Minimal logging (no credential content, no nonces)                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Connection Lifecycle
 
 ### Endpoint
@@ -496,9 +546,75 @@ Server → Client:
 }
 ```
 
-#### Credential Selection
+#### Client-Side Credential Matching (Privacy-Preserving)
 
-Flow pauses for user to select which credentials to present:
+**Important**: The engine does NOT have access to the user's credential store.
+Credential matching happens client-side to preserve privacy. The engine only
+sees credentials one-at-a-time during the signing step.
+
+Server sends the presentation_definition to client for local matching:
+
+```
+Server → Client:
+{
+  "type": "flow_progress",
+  "flow_id": "<uuid>",
+  "step": "match_credentials",
+  "presentation_definition": {
+    "id": "example_presentation",
+    "input_descriptors": [
+      {
+        "id": "id_card",
+        "format": { "vc+sd-jwt": {} },
+        "constraints": {
+          "fields": [
+            { "path": ["$.given_name"], "filter": {} },
+            { "path": ["$.family_name"], "filter": {} }
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+Client performs matching locally against its encrypted credential store, then
+responds with matched credentials (without revealing the full inventory):
+
+```
+Client → Server:
+{
+  "type": "flow_action",
+  "flow_id": "<uuid>",
+  "action": "credentials_matched",
+  "matches": [
+    {
+      "input_descriptor_id": "id_card",
+      "credential_id": "local-cred-id-1",
+      "format": "vc+sd-jwt",
+      "vct": "https://example.com/id-card",
+      "available_claims": ["given_name", "family_name", "birthdate"]
+    }
+  ]
+}
+```
+
+If no credentials match:
+
+```
+Client → Server:
+{
+  "type": "flow_action",
+  "flow_id": "<uuid>",
+  "action": "credentials_matched",
+  "matches": [],
+  "no_match_reason": "no_qualifying_credentials"
+}
+```
+
+#### User Consent
+
+Server prompts for user consent with the matched credentials:
 
 ```
 Server → Client:
@@ -506,14 +622,19 @@ Server → Client:
   "type": "flow_progress",
   "flow_id": "<uuid>",
   "step": "awaiting_consent",
-  "matching_credentials": [
+  "matched_credentials": [
     {
+      "input_descriptor_id": "id_card",
       "credential_id": "local-cred-id-1",
-      "display": { "name": "My ID Card", ... },
-      "satisfies_requirements": true,
-      "disclosed_claims": ["given_name", "family_name", "birthdate"]
+      "credential_display": { "name": "ID Card", ... },  // From VCTM
+      "disclosable_claims": ["given_name", "family_name", "birthdate"],
+      "required_claims": ["given_name", "family_name"]
     }
-  ]
+  ],
+  "verifier": {
+    "name": "Example Verifier",
+    "trusted": true
+  }
 }
 ```
 
@@ -1068,17 +1189,56 @@ Per-connection rate limits:
 
 ## Privacy Considerations
 
-### Current Limitations
+### Privacy Model
 
-This design does NOT eliminate privacy binding between user and backend:
-- Server sees which issuers/verifiers user interacts with
-- Server can correlate issuance and presentation events
+The WebSocket protocol is designed with privacy in mind:
 
-These are **inherent to the backend model** chosen for CORS avoidance.
+| Property | How Achieved |
+|----------|--------------|
+| Keys never leave client | `sign_request`/`sign_response` pattern |
+| Client controls credential matching | `match_credentials` step with local matching |
+| Engine sees minimal data | Only one credential at a time during signing |
+| Full privacy option | Local engine mode for native apps |
 
-### Mitigations Available
+### Cloud Engine Limitations
 
-1. **Minimal logging**: Server SHOULD NOT log:
+When using a cloud-hosted engine, these limitations apply:
+- Engine sees which issuers/verifiers user interacts with
+- Engine can correlate issuance and presentation events
+- Engine sees credential type (vct) during flows
+
+These are **inherent to the cloud backend model** chosen for CORS avoidance.
+
+### Local Engine: Full Privacy
+
+Native apps can embed the engine locally, eliminating cloud visibility:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         LOCAL ENGINE PRIVACY MODEL                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Native App with Local Engine                                              │
+│   ────────────────────────────                                              │
+│                                                                             │
+│   Cloud services see:              Cloud services do NOT see:               │
+│   ───────────────────              ─────────────────────────                │
+│   • Login/authentication           • Which issuers contacted                │
+│   • Encrypted credential blobs     • Which verifiers contacted              │
+│   • Sync timestamps                • Presentation definitions               │
+│   • VCTM lookups (cacheable)       • Credential content                     │
+│                                    • Flow timing/correlation                │
+│                                                                             │
+│   All protocol flows happen locally on user's device.                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mitigations for Cloud Engine
+
+When local engine is not available, these mitigations reduce privacy impact:
+
+1. **Minimal logging**: Engine SHOULD NOT log:
    - Credential content
    - User-selected claims
    - Nonces (which could enable correlation)
@@ -1089,13 +1249,15 @@ These are **inherent to the backend model** chosen for CORS avoidance.
    - Flow counts by protocol (not by issuer)
    - Error rates by category (not by issuer)
 
+4. **Client-side credential matching**: Engine never sees full credential inventory
+
 ### Future Enhancements
 
-Possible privacy improvements for future versions:
+Possible additional privacy improvements:
 
 1. **OHTTP integration**: Route protocol messages through OHTTP relay
 2. **Issuer anonymization**: k-anonymity via batch requests
-3. **Split architecture**: Metadata-only backend + direct credential flows
+3. **Encrypted flows**: End-to-end encryption between client and issuer/verifier
 
 ## Implementation Notes
 

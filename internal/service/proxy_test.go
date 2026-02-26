@@ -125,6 +125,68 @@ func TestProxyService_Execute_WithHeaders(t *testing.T) {
 	}
 }
 
+// TestProxyService_StripsFingerprintingHeaders verifies privacy-sensitive headers are stripped
+func TestProxyService_StripsFingerprintingHeaders(t *testing.T) {
+	var receivedHeaders http.Header
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	logger := zap.NewNop()
+	svc := NewProxyService(cfg, logger)
+	ctx := context.Background()
+
+	_, _, err := svc.Execute(ctx, &ProxyRequest{
+		URL:    server.URL,
+		Method: "GET",
+		Headers: map[string]string{
+			"user-agent":          "Mozilla/5.0 (fingerprint)",
+			"accept-language":     "en-US,en;q=0.9",
+			"sec-ch-ua":           "\"Chromium\";v=\"100\"",
+			"sec-ch-ua-platform":  "Linux",
+			"x-forwarded-for":     "192.168.1.1",
+			"Authorization":       "Bearer token", // Should NOT be stripped
+			"X-Custom-Header":     "custom",       // Should NOT be stripped
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Fingerprinting headers should be stripped
+	if receivedHeaders.Get("Accept-Language") != "" {
+		t.Error("Accept-Language should be stripped")
+	}
+	// Note: Accept-Encoding is automatically added by Go's http.Client for compression,
+	// but client-provided values are stripped
+	if receivedHeaders.Get("Sec-Ch-Ua") != "" {
+		t.Error("Sec-CH-UA should be stripped")
+	}
+	if receivedHeaders.Get("Sec-Ch-Ua-Platform") != "" {
+		t.Error("Sec-CH-UA-Platform should be stripped")
+	}
+	if receivedHeaders.Get("X-Forwarded-For") != "" {
+		t.Error("X-Forwarded-For should be stripped")
+	}
+
+	// User-Agent should be replaced with generic value
+	if receivedHeaders.Get("User-Agent") != "SIROS-Wallet/1.0" {
+		t.Errorf("User-Agent should be SIROS-Wallet/1.0, got %s", receivedHeaders.Get("User-Agent"))
+	}
+
+	// Safe headers should still be passed
+	if receivedHeaders.Get("Authorization") != "Bearer token" {
+		t.Error("Authorization should NOT be stripped")
+	}
+	if receivedHeaders.Get("X-Custom-Header") != "custom" {
+		t.Error("X-Custom-Header should NOT be stripped")
+	}
+}
+
 func TestProxyService_Execute_POST_WithData(t *testing.T) {
 	var receivedBody []byte
 
