@@ -29,24 +29,38 @@ func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
 
 // TenantRequest represents the request body for creating/updating a tenant
 type TenantRequest struct {
-	ID          string `json:"id" binding:"required"`
-	Name        string `json:"name" binding:"required"`
-	DisplayName string `json:"display_name,omitempty"`
-	Enabled     *bool  `json:"enabled,omitempty"`
+	ID          string              `json:"id" binding:"required"`
+	Name        string              `json:"name" binding:"required"`
+	DisplayName string              `json:"display_name,omitempty"`
+	Enabled     *bool               `json:"enabled,omitempty"`
+	TrustConfig *TrustConfigRequest `json:"trust_config,omitempty"`
+}
+
+// TrustConfigRequest represents the trust configuration in API requests
+type TrustConfigRequest struct {
+	TrustEndpoint string `json:"trust_endpoint,omitempty"`
+	TrustTTL      *int   `json:"trust_ttl,omitempty"` // seconds
 }
 
 // TenantResponse represents a tenant in API responses
 type TenantResponse struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	DisplayName string    `json:"display_name,omitempty"`
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string               `json:"id"`
+	Name        string               `json:"name"`
+	DisplayName string               `json:"display_name,omitempty"`
+	Enabled     bool                 `json:"enabled"`
+	CreatedAt   time.Time            `json:"created_at"`
+	UpdatedAt   time.Time            `json:"updated_at"`
+	TrustConfig *TrustConfigResponse `json:"trust_config,omitempty"`
+}
+
+// TrustConfigResponse represents the trust configuration in API responses
+type TrustConfigResponse struct {
+	TrustEndpoint string `json:"trust_endpoint,omitempty"`
+	TrustTTL      int    `json:"trust_ttl"` // seconds
 }
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
-	return &TenantResponse{
+	resp := &TenantResponse{
 		ID:          string(t.ID),
 		Name:        t.Name,
 		DisplayName: t.DisplayName,
@@ -54,6 +68,14 @@ func tenantToResponse(t *domain.Tenant) *TenantResponse {
 		CreatedAt:   t.CreatedAt,
 		UpdatedAt:   t.UpdatedAt,
 	}
+	// Include trust config if any non-default values are set
+	if t.TrustConfig.TrustEndpoint != "" || t.TrustConfig.TrustTTL != 0 {
+		resp.TrustConfig = &TrustConfigResponse{
+			TrustEndpoint: t.TrustConfig.TrustEndpoint,
+			TrustTTL:      t.TrustConfig.TrustTTL,
+		}
+	}
+	return resp
 }
 
 // ListTenants returns all tenants
@@ -135,6 +157,14 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 		UpdatedAt:   time.Now(),
 	}
 
+	// Apply trust config if provided
+	if req.TrustConfig != nil {
+		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
+		if req.TrustConfig.TrustTTL != nil {
+			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
+		}
+	}
+
 	if err := h.store.Tenants().Create(c.Request.Context(), tenant); err != nil {
 		h.logger.Error("Failed to create tenant", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
@@ -173,6 +203,13 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	tenant.DisplayName = req.DisplayName
 	if req.Enabled != nil {
 		tenant.Enabled = *req.Enabled
+	}
+	// Update trust config if provided
+	if req.TrustConfig != nil {
+		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
+		if req.TrustConfig.TrustTTL != nil {
+			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
+		}
 	}
 	tenant.UpdatedAt = time.Now()
 
@@ -327,9 +364,11 @@ func (h *AdminHandlers) GetTenantUsers(c *gin.Context) {
 // AdminStatus returns the admin server status
 // GET /admin/status
 func (h *AdminHandlers) AdminStatus(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":  "ok",
-		"service": "wallet-backend-admin",
+	c.JSON(http.StatusOK, StatusResponse{
+		Status:       "ok",
+		Service:      "wallet-backend-admin",
+		APIVersion:   CurrentAPIVersion,
+		Capabilities: APICapabilities[CurrentAPIVersion],
 	})
 }
 
@@ -342,21 +381,31 @@ type IssuerRequest struct {
 
 // IssuerResponse represents an issuer in API responses
 type IssuerResponse struct {
-	ID                         int64  `json:"id"`
-	TenantID                   string `json:"tenant_id"`
-	CredentialIssuerIdentifier string `json:"credential_issuer_identifier"`
-	ClientID                   string `json:"client_id,omitempty"`
-	Visible                    bool   `json:"visible"`
+	ID                         int64   `json:"id"`
+	TenantID                   string  `json:"tenant_id"`
+	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier"`
+	ClientID                   string  `json:"client_id,omitempty"`
+	Visible                    bool    `json:"visible"`
+	TrustStatus                string  `json:"trust_status,omitempty"`
+	TrustFramework             string  `json:"trust_framework,omitempty"`
+	TrustEvaluatedAt           *string `json:"trust_evaluated_at,omitempty"`
 }
 
 func issuerToResponse(i *domain.CredentialIssuer) *IssuerResponse {
-	return &IssuerResponse{
+	resp := &IssuerResponse{
 		ID:                         i.ID,
 		TenantID:                   string(i.TenantID),
 		CredentialIssuerIdentifier: i.CredentialIssuerIdentifier,
 		ClientID:                   i.ClientID,
 		Visible:                    i.Visible,
+		TrustStatus:                string(i.TrustStatus),
+		TrustFramework:             i.TrustFramework,
 	}
+	if i.TrustEvaluatedAt != nil {
+		t := i.TrustEvaluatedAt.Format(time.RFC3339)
+		resp.TrustEvaluatedAt = &t
+	}
+	return resp
 }
 
 // ListIssuers returns all issuers for a tenant

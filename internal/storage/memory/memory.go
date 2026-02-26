@@ -555,6 +555,13 @@ func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssue
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check for duplicate identifier within same tenant
+	for _, existing := range s.data {
+		if existing.TenantID == issuer.TenantID && existing.CredentialIssuerIdentifier == issuer.CredentialIssuerIdentifier {
+			return storage.ErrAlreadyExists
+		}
+	}
+
 	s.nextID++
 	issuer.ID = s.nextID
 	s.data[issuer.ID] = issuer
@@ -636,6 +643,13 @@ type VerifierStore struct {
 func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Check for duplicate URL within same tenant
+	for _, existing := range s.data {
+		if existing.TenantID == verifier.TenantID && existing.URL == verifier.URL {
+			return storage.ErrAlreadyExists
+		}
+	}
 
 	s.nextID++
 	verifier.ID = s.nextID

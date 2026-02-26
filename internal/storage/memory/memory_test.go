@@ -1134,6 +1134,182 @@ func TestVerifierStore_Delete_NotFound(t *testing.T) {
 	}
 }
 
+// Multi-tenant Uniqueness Tests
+
+func TestIssuerStore_UniqueConstraint_SameTenant(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	issuers := store.Issuers()
+	tenantID := domain.DefaultTenantID
+
+	identifier := "https://issuer-duplicate.example.com"
+
+	// Create first issuer
+	issuer1 := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
+		CredentialIssuerIdentifier: identifier,
+		ClientID:                   "client1",
+		Visible:                    true,
+	}
+	err := issuers.Create(ctx, issuer1)
+	if err != nil {
+		t.Fatalf("Create() first issuer error = %v", err)
+	}
+
+	// Attempt to create second issuer with same identifier in same tenant
+	issuer2 := &domain.CredentialIssuer{
+		TenantID:                   tenantID,
+		CredentialIssuerIdentifier: identifier,
+		ClientID:                   "client2",
+		Visible:                    true,
+	}
+	err = issuers.Create(ctx, issuer2)
+	if err != storage.ErrAlreadyExists {
+		t.Errorf("Create() duplicate issuer error = %v, want ErrAlreadyExists", err)
+	}
+}
+
+func TestIssuerStore_UniqueConstraint_DifferentTenants(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	issuers := store.Issuers()
+	tenants := store.Tenants()
+
+	identifier := "https://issuer-cross-tenant.example.com"
+
+	// Create two tenants
+	tenant1 := &domain.Tenant{
+		ID:          domain.TenantID("tenant-issuer-1"),
+		Name:        "Tenant 1",
+		DisplayName: "Tenant 1",
+		Enabled:     true,
+	}
+	err := tenants.Create(ctx, tenant1)
+	if err != nil {
+		t.Fatalf("Create() tenant1 error = %v", err)
+	}
+
+	tenant2 := &domain.Tenant{
+		ID:          domain.TenantID("tenant-issuer-2"),
+		Name:        "Tenant 2",
+		DisplayName: "Tenant 2",
+		Enabled:     true,
+	}
+	err = tenants.Create(ctx, tenant2)
+	if err != nil {
+		t.Fatalf("Create() tenant2 error = %v", err)
+	}
+
+	// Create issuer in tenant 1
+	issuer1 := &domain.CredentialIssuer{
+		TenantID:                   tenant1.ID,
+		CredentialIssuerIdentifier: identifier,
+		ClientID:                   "client1",
+		Visible:                    true,
+	}
+	err = issuers.Create(ctx, issuer1)
+	if err != nil {
+		t.Fatalf("Create() issuer in tenant1 error = %v", err)
+	}
+
+	// Create issuer with same identifier in tenant 2 - should succeed
+	issuer2 := &domain.CredentialIssuer{
+		TenantID:                   tenant2.ID,
+		CredentialIssuerIdentifier: identifier,
+		ClientID:                   "client2",
+		Visible:                    true,
+	}
+	err = issuers.Create(ctx, issuer2)
+	if err != nil {
+		t.Errorf("Create() issuer with same identifier in different tenant should succeed, got error = %v", err)
+	}
+}
+
+func TestVerifierStore_UniqueConstraint_SameTenant(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenantID := domain.DefaultTenantID
+
+	url := "https://verifier-duplicate.example.com"
+
+	// Create first verifier
+	verifier1 := &domain.Verifier{
+		TenantID: tenantID,
+		Name:     "Verifier 1",
+		URL:      url,
+	}
+	err := verifiers.Create(ctx, verifier1)
+	if err != nil {
+		t.Fatalf("Create() first verifier error = %v", err)
+	}
+
+	// Attempt to create second verifier with same URL in same tenant
+	verifier2 := &domain.Verifier{
+		TenantID: tenantID,
+		Name:     "Verifier 2",
+		URL:      url,
+	}
+	err = verifiers.Create(ctx, verifier2)
+	if err != storage.ErrAlreadyExists {
+		t.Errorf("Create() duplicate verifier error = %v, want ErrAlreadyExists", err)
+	}
+}
+
+func TestVerifierStore_UniqueConstraint_DifferentTenants(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	verifiers := store.Verifiers()
+	tenants := store.Tenants()
+
+	url := "https://verifier-cross-tenant.example.com"
+
+	// Create two tenants
+	tenant1 := &domain.Tenant{
+		ID:          domain.TenantID("tenant-verifier-1"),
+		Name:        "Verifier Tenant 1",
+		DisplayName: "Verifier Tenant 1",
+		Enabled:     true,
+	}
+	err := tenants.Create(ctx, tenant1)
+	if err != nil {
+		t.Fatalf("Create() tenant1 error = %v", err)
+	}
+
+	tenant2 := &domain.Tenant{
+		ID:          domain.TenantID("tenant-verifier-2"),
+		Name:        "Verifier Tenant 2",
+		DisplayName: "Verifier Tenant 2",
+		Enabled:     true,
+	}
+	err = tenants.Create(ctx, tenant2)
+	if err != nil {
+		t.Fatalf("Create() tenant2 error = %v", err)
+	}
+
+	// Create verifier in tenant 1
+	verifier1 := &domain.Verifier{
+		TenantID: tenant1.ID,
+		Name:     "Verifier 1",
+		URL:      url,
+	}
+	err = verifiers.Create(ctx, verifier1)
+	if err != nil {
+		t.Fatalf("Create() verifier in tenant1 error = %v", err)
+	}
+
+	// Create verifier with same URL in tenant 2 - should succeed
+	verifier2 := &domain.Verifier{
+		TenantID: tenant2.ID,
+		Name:     "Verifier 2",
+		URL:      url,
+	}
+	err = verifiers.Create(ctx, verifier2)
+	if err != nil {
+		t.Errorf("Create() verifier with same URL in different tenant should succeed, got error = %v", err)
+	}
+}
+
 // Concurrency Tests
 
 func TestStore_ConcurrentUserCreation(t *testing.T) {

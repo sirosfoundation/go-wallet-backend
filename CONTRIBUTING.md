@@ -14,9 +14,22 @@ Be respectful, inclusive, and professional in all interactions.
    cd go-wallet-backend
    ```
 
-2. **Install dependencies**
+2. **Set up development environment**
    ```bash
-   go mod download
+   make setup
+   ```
+   This will:
+   - Install development tools (golangci-lint)
+   - Set up Git pre-commit hooks
+   - Download dependencies
+   - Run initial checks
+
+   Alternatively, you can do these steps manually:
+   ```bash
+   make tools                         # Install development tools
+   go mod download                    # Download dependencies
+   ln -sf ../../scripts/pre-commit.sh .git/hooks/pre-commit  # Install hook
+   chmod +x scripts/pre-commit.sh .git/hooks/pre-commit
    ```
 
 3. **Run tests**
@@ -28,6 +41,29 @@ Be respectful, inclusive, and professional in all interactions.
    ```bash
    make run
    ```
+
+## Pre-commit Hooks
+
+This project uses Git pre-commit hooks to ensure code quality. The hooks run automatically before each commit and check for:
+
+1. **Linting** - Runs `golangci-lint` to catch issues like:
+   - Code formatting (`gofmt`)
+   - Common errors (`go vet`)
+   - Security issues (`gosec`)
+   - Style inconsistencies
+
+2. **Tests** - Runs the test suite with race detection
+
+3. **Common issues** - Warns about debugging statements and TODOs
+
+4. **go.mod/go.sum** - Ensures dependencies are up to date
+
+If the pre-commit hook fails, fix the issues and try again. You can also run the lint checks manually:
+```bash
+make lint           # Run full linter
+make quick          # Quick format + vet check
+golangci-lint run   # Run golangci-lint directly
+```
 
 ## Development Workflow
 

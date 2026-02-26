@@ -21,8 +21,11 @@ type Handler struct {
 	saveCh chan struct{}
 }
 
+// HandlerOption configures the Handler
+type HandlerOption func(*Handler)
+
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger) *Handler {
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, opts ...HandlerOption) *Handler {
 	var dynamicFetcher *DynamicFetcher
 	if config != nil && config.Enabled {
 		dynamicFetcher = NewDynamicFetcher(config, logger)
@@ -39,6 +42,12 @@ func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embe
 		logger:         logger,
 		saveCh:         make(chan struct{}, 1),
 	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(h)
+	}
+
 	// Start the debounced save worker
 	go h.saveWorker()
 	return h

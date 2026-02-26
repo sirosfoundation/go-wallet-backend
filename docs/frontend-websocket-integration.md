@@ -10,11 +10,38 @@ enabling WebSocket-only configurations that eliminate the HTTP proxy entirely.
 
 ## Architecture Goals
 
-1. **Dual Transport**: HTTP/proxy and WebSocket coexist; WS preferred when configured
-2. **Transport Allow-List**: Deployments can disable HTTP proxy via configuration
+1. **Multi-Transport**: HTTP/proxy, WebSocket, and Direct coexist; preference configurable
+2. **Transport Allow-List**: Deployments can disable specific transports via configuration
 3. **Modular**: Transport abstraction allows adding new protocols easily
 4. **Extensible**: Protocol handlers can be registered dynamically
 5. **Minimal Changes**: Existing flow logic remains largely unchanged
+6. **Future-Ready**: Architecture prepares for Direct Access when ecosystem supports CORS
+
+## Transport Types
+
+| Transport | Description | Privacy | Requirements |
+|-----------|-------------|---------|--------------|
+| **HTTP Proxy** | Backend proxies all HTTP requests (with OHTTP) | Backend sees traffic (OHTTP provides metadata privacy) | Backend infrastructure |
+| **WebSocket** | Backend orchestrates flows via persistent connection | Backend sees traffic | Backend infrastructure |
+| **Direct** | Browser makes direct CORS requests to issuers/verifiers | Backend never sees traffic | Issuers/verifiers must support permissive CORS |
+
+### Direct Access Transport (Future Extension)
+
+The Direct Access transport provides the best privacy properties: the wallet backend
+never sees credential offers, authorization requests, or credential data. The browser
+communicates directly with issuers and verifiers.
+
+**Privacy Benefits:**
+- Wallet backend cannot correlate issuance/presentation activity
+- No proxy logs of credential content
+- True end-to-end between user and issuer/verifier
+
+**Ecosystem Requirements:**
+- Issuers must set `Access-Control-Allow-Origin: *` (or credential-wallet origins)
+- Issuers must allow CORS headers for DPoP, Authorization, etc.
+- Verifiers must support CORS for authorization endpoints
+
+**Current Status:** Preparing architecture now; implementation when ecosystem ready.
 
 ## Current Architecture
 
@@ -64,9 +91,13 @@ enabling WebSocket-only configurations that eliminate the HTTP proxy entirely.
 │  │  (allow-list)         │                    ↓                         │   │
 │  │                       │              /api/v2/wallet                  │   │
 │  │                       │                                              │   │
-│  │                       └──▶ [http] ──▶ HttpProxyTransport             │   │
-│  │                                       ↓                              │   │
-│  │                                  /proxy (if allowed)                 │   │
+│  │                       ├──▶ [http] ──▶ HttpProxyTransport             │   │
+│  │                       │               ↓                              │   │
+│  │                       │          /proxy (OHTTP)                      │   │
+│  │                       │                                              │   │
+│  │                       └──▶ [direct] ──▶ DirectTransport (future)     │   │
+│  │                                         ↓                            │   │
+│  │                                    Direct CORS to issuer/verifier    │   │
 │  │                                                                      │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                              │                                              │
@@ -621,6 +652,177 @@ export class WebSocketTransport implements IFlowTransport {
 }
 ```
 
+### Phase 3.5: Direct Transport (Future Extension)
+
+The Direct transport makes CORS requests directly from the browser to issuers and
+verifiers, bypassing the backend entirely for flow traffic. This provides the best
+privacy properties but requires ecosystem support for CORS.
+
+```typescript
+// src/lib/transport/DirectTransport.ts
+
+import { 
+  IFlowTransport, 
+  FlowRequest, 
+  FlowResponse, 
+  FlowProgressEvent,
+  OID4VCIFlowParams,
+  OID4VCIFlowResult,
+  OID4VPFlowParams,
+  OID4VPFlowResult,
+} from './IFlowTransport';
+
+/**
+ * DirectTransport makes HTTP requests directly from the browser to issuers/verifiers.
+ * 
+ * Privacy benefits:
+ * - Wallet backend never sees credential offers or presentation requests
+ * - No proxy logs of sensitive credential data
+ * - True end-to-end between user and issuer/verifier
+ * 
+ * Requirements:
+ * - Issuers must set permissive CORS headers:
+ *   Access-Control-Allow-Origin: * (or specific wallet origins)
+ *   Access-Control-Allow-Headers: Authorization, DPoP, Content-Type
+ * - Verifiers must allow CORS for authorization endpoints
+ * 
+ * This transport reuses the OID4VCI/OID4VP client libraries directly in the browser.
+ */
+export class DirectTransport implements IFlowTransport {
+  private progressCallbacks = new Set<(event: FlowProgressEvent) => void>();
+  private errorCallbacks = new Set<(error: Error) => void>();
+  
+  // Dependencies injected for credential operations
+  private keystore: any;  // For signing operations
+  private credentialStorage: any;  // For storing credentials
+  
+  constructor(options: { keystore: any; credentialStorage: any }) {
+    this.keystore = options.keystore;
+    this.credentialStorage = options.credentialStorage;
+  }
+  
+  // Connection is always "ready" for direct HTTP
+  async connect(): Promise<void> { /* no-op */ }
+  async disconnect(): Promise<void> { /* no-op */ }
+  isConnected(): boolean { return true; }
+  
+  /**
+   * Check if a URL supports CORS before attempting the flow.
+   * Can be used to determine if Direct transport is viable.
+   */
+  static async checkCorsSupport(url: string): Promise<boolean> {
+    try {
+      const response = await fetch(url, {
+        method: 'OPTIONS',
+        mode: 'cors',
+      });
+      // Check for required CORS headers
+      const allowOrigin = response.headers.get('Access-Control-Allow-Origin');
+      return allowOrigin === '*' || allowOrigin?.includes(window.location.origin) || false;
+    } catch {
+      return false;
+    }
+  }
+  
+  async startOID4VCIFlow(params: OID4VCIFlowParams): Promise<OID4VCIFlowResult> {
+    // TODO: Implement when ecosystem CORS support matures
+    // This will use the same OID4VCI client logic as HttpProxyTransport
+    // but with direct fetch() calls instead of proxied calls
+    throw new Error(
+      'DirectTransport for OID4VCI not yet implemented. ' +
+      'Waiting for ecosystem CORS support in issuers.'
+    );
+  }
+  
+  async startOID4VPFlow(params: OID4VPFlowParams): Promise<OID4VPFlowResult> {
+    // TODO: Implement when ecosystem CORS support matures
+    // This will use the same OID4VP client logic as HttpProxyTransport
+    // but with direct fetch() calls instead of proxied calls
+    throw new Error(
+      'DirectTransport for OID4VP not yet implemented. ' +
+      'Waiting for ecosystem CORS support in verifiers.'
+    );
+  }
+  
+  async request<T>(flowRequest: FlowRequest): Promise<FlowResponse<T>> {
+    if (flowRequest.type === 'general') {
+      const { method, url, headers, body } = flowRequest.payload as any;
+      try {
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: body ? JSON.stringify(body) : undefined,
+          mode: 'cors',
+          credentials: 'omit',  // No cookies for cross-origin
+        });
+        
+        // Check for CORS errors
+        if (!response.ok && response.type === 'opaque') {
+          return {
+            success: false,
+            error: {
+              code: 'CORS_ERROR',
+              message: 'Request blocked by CORS policy. Issuer/verifier does not support direct access.',
+            },
+          };
+        }
+        
+        const data = await response.json();
+        return {
+          success: response.ok,
+          data: data as T,
+          error: response.ok ? undefined : {
+            code: `HTTP_${response.status}`,
+            message: response.statusText,
+          },
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: {
+            code: 'DIRECT_ACCESS_ERROR',
+            message: error instanceof Error ? error.message : 'Direct access failed',
+          },
+        };
+      }
+    }
+    throw new Error(`Unsupported flow type: ${flowRequest.type}`);
+  }
+  
+  onProgress(callback: (event: FlowProgressEvent) => void): () => void {
+    this.progressCallbacks.add(callback);
+    return () => this.progressCallbacks.delete(callback);
+  }
+  
+  onError(callback: (error: Error) => void): () => void {
+    this.errorCallbacks.add(callback);
+    return () => this.errorCallbacks.delete(callback);
+  }
+}
+```
+
+**Implementation Notes:**
+
+When implementing DirectTransport fully:
+
+1. **Reuse Client Libraries**: The OID4VCI/OID4VP client libraries in `wallet-common` 
+   should be compatible - they accept an `httpClient` interface that can be swapped
+   from proxy-based to direct `fetch()`.
+
+2. **CORS Header Requirements**: Issuers/verifiers need:
+   ```
+   Access-Control-Allow-Origin: * 
+   Access-Control-Allow-Methods: GET, POST, OPTIONS
+   Access-Control-Allow-Headers: Authorization, DPoP, Content-Type, Accept
+   Access-Control-Expose-Headers: DPoP-Nonce
+   ```
+
+3. **Fallback Strategy**: DirectTransport can probe endpoints with `OPTIONS` first,
+   then fall back to proxy if CORS is not supported.
+
+4. **Hybrid Approach**: Future deployments might use Direct for CORS-enabled
+   issuers/verifiers and WebSocket/HTTP for others.
+
 ### Phase 4: Transport Context and Hook
 
 ```typescript
@@ -630,20 +832,24 @@ import React, { createContext, useContext, useMemo, useEffect, useState } from '
 import { IFlowTransport } from '@/lib/transport/IFlowTransport';
 import { HttpProxyTransport } from '@/lib/transport/HttpProxyTransport';
 import { WebSocketTransport } from '@/lib/transport/WebSocketTransport';
+import { DirectTransport } from '@/lib/transport/DirectTransport';
 import { useHttpProxy } from '@/lib/services/HttpProxy/HttpProxy';
 import { 
   WS_URL, 
   HTTP_TRANSPORT_ALLOWED, 
-  WEBSOCKET_TRANSPORT_ALLOWED 
+  WEBSOCKET_TRANSPORT_ALLOWED,
+  DIRECT_TRANSPORT_ALLOWED,
+  TRANSPORT_PREFERENCE,
+  TransportType,
 } from '@/config';
 import SessionContext from './SessionContext';
 
 interface FlowTransportContextValue {
   transport: IFlowTransport | null;
-  transportType: 'http' | 'websocket' | 'none';
+  transportType: TransportType | 'none';
   isConnected: boolean;
   reconnect: () => Promise<void>;
-  availableTransports: ('http' | 'websocket')[];
+  availableTransports: TransportType[];
 }
 
 // Null transport for when no transport is available/configured
@@ -664,24 +870,26 @@ const FlowTransportContext = createContext<FlowTransportContextValue | null>(nul
 
 export const FlowTransportProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const httpProxy = useHttpProxy();
-  const { appToken } = useContext(SessionContext);
+  const { appToken, keystore, credentialStorage } = useContext(SessionContext);
   
   const [isConnected, setIsConnected] = useState(false);
   const [wsTransport, setWsTransport] = useState<WebSocketTransport | null>(null);
   
   // Determine which transports are available based on config and allow-list
   const availableTransports = useMemo(() => {
-    const available: ('http' | 'websocket')[] = [];
+    const available: TransportType[] = [];
     if (HTTP_TRANSPORT_ALLOWED) available.push('http');
     if (WEBSOCKET_TRANSPORT_ALLOWED && WS_URL) available.push('websocket');
+    if (DIRECT_TRANSPORT_ALLOWED) available.push('direct');
     return available;
   }, []);
   
-  // Preferred transport: WebSocket if available and allowed, else HTTP if allowed
+  // Preferred transport based on TRANSPORT_PREFERENCE order
   const preferredTransport = useMemo(() => {
-    if (availableTransports.includes('websocket')) return 'websocket';
-    if (availableTransports.includes('http')) return 'http';
-    return 'none';
+    for (const pref of TRANSPORT_PREFERENCE) {
+      if (availableTransports.includes(pref)) return pref;
+    }
+    return 'none' as const;
   }, [availableTransports]);
   
   // Create HTTP transport only if allowed
@@ -689,6 +897,12 @@ export const FlowTransportProvider: React.FC<{ children: React.ReactNode }> = ({
     if (!HTTP_TRANSPORT_ALLOWED) return null;
     return new HttpProxyTransport(httpProxy);
   }, [httpProxy]);
+  
+  // Create Direct transport only if allowed
+  const directTransport = useMemo(() => {
+    if (!DIRECT_TRANSPORT_ALLOWED) return null;
+    return new DirectTransport({ keystore, credentialStorage });
+  }, [keystore, credentialStorage]);
   
   // Create and manage WebSocket transport only if allowed and configured
   useEffect(() => {
@@ -717,26 +931,34 @@ export const FlowTransportProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, [appToken]);
   
-  // Select active transport based on preference and availability
+  // Select active transport based on preference order and availability
   const { transport, transportType } = useMemo(() => {
-    // Try WebSocket first if preferred and connected
-    if (preferredTransport === 'websocket' && wsTransport && isConnected) {
-      return { transport: wsTransport, transportType: 'websocket' as const };
-    }
-    
-    // Fall back to HTTP if allowed (and WebSocket either not preferred or not connected)
-    if (HTTP_TRANSPORT_ALLOWED && httpTransport) {
-      // Only fall back if HTTP is allowed
-      // If WebSocket-only mode and WS failed, don't fall back
-      if (preferredTransport === 'websocket' && !HTTP_TRANSPORT_ALLOWED) {
-        return { transport: nullTransport, transportType: 'none' as const };
+    // Follow TRANSPORT_PREFERENCE order
+    for (const pref of TRANSPORT_PREFERENCE) {
+      if (!availableTransports.includes(pref)) continue;
+      
+      switch (pref) {
+        case 'websocket':
+          if (wsTransport && isConnected) {
+            return { transport: wsTransport, transportType: 'websocket' as const };
+          }
+          break;
+        case 'http':
+          if (httpTransport) {
+            return { transport: httpTransport, transportType: 'http' as const };
+          }
+          break;
+        case 'direct':
+          if (directTransport) {
+            return { transport: directTransport, transportType: 'direct' as const };
+          }
+          break;
       }
-      return { transport: httpTransport, transportType: 'http' as const };
     }
     
     // No transport available
     return { transport: nullTransport, transportType: 'none' as const };
-  }, [preferredTransport, wsTransport, isConnected, httpTransport]);
+  }, [availableTransports, wsTransport, isConnected, httpTransport, directTransport]);
   
   const reconnect = async () => {
     if (wsTransport && WEBSOCKET_TRANSPORT_ALLOWED) {
@@ -992,8 +1214,9 @@ src/lib/
 │   │   ├── OID4VCITypes.ts         # VCI flow types
 │   │   ├── OID4VPTypes.ts          # VP flow types
 │   │   └── index.ts
-│   ├── HttpProxyTransport.ts       # HTTP/proxy implementation
-│   ├── WebSocketTransport.ts       # WebSocket implementation
+│   ├── HttpProxyTransport.ts       # HTTP/proxy implementation (current)
+│   ├── WebSocketTransport.ts       # WebSocket implementation (new)
+│   ├── DirectTransport.ts          # Direct CORS implementation (future)
 │   └── index.ts
 ├── services/
 │   ├── HttpProxy/
@@ -1029,10 +1252,16 @@ VITE_WALLET_BACKEND_URL=https://wallet.example.com
 VITE_WS_URL=wss://wallet.example.com/api/v2/wallet
 
 # Transport allow-list (comma-separated, optional)
-# Valid values: 'http', 'websocket'
-# Default: 'http,websocket' (both enabled)
+# Valid values: 'http', 'websocket', 'direct'
+# Default: 'http,websocket' (both enabled, direct disabled)
 # Set to 'websocket' only to disable HTTP proxy entirely
+# Set to 'direct' when ecosystem supports CORS (future)
 VITE_ALLOWED_TRANSPORTS=http,websocket
+
+# Transport preference order (comma-separated, optional)
+# First transport in list that is available will be used
+# Default: 'websocket,http,direct' (prefer WebSocket)
+VITE_TRANSPORT_PREFERENCE=websocket,http,direct
 ```
 
 ### Runtime Configuration
@@ -1045,28 +1274,58 @@ export const BACKEND_URL = import.meta.env.VITE_WALLET_BACKEND_URL;
 // WebSocket URL - when set, enables WebSocket transport
 export const WS_URL = import.meta.env.VITE_WS_URL;
 
+// Transport types
+export type TransportType = 'http' | 'websocket' | 'direct';
+
 // Transport allow-list
 // Controls which transports are permitted
-// Default: both enabled for backwards compatibility
-export const ALLOWED_TRANSPORTS: ('http' | 'websocket')[] = 
+// Default: http,websocket enabled for backwards compatibility
+// 'direct' disabled by default (requires ecosystem CORS support)
+export const ALLOWED_TRANSPORTS: TransportType[] = 
   (import.meta.env.VITE_ALLOWED_TRANSPORTS || 'http,websocket')
     .split(',')
     .map((t: string) => t.trim())
-    .filter((t: string) => ['http', 'websocket'].includes(t)) as ('http' | 'websocket')[];
+    .filter((t: string) => ['http', 'websocket', 'direct'].includes(t)) as TransportType[];
+
+// Transport preference order (first available wins)
+// Default prefers WebSocket over HTTP over Direct
+export const TRANSPORT_PREFERENCE: TransportType[] =
+  (import.meta.env.VITE_TRANSPORT_PREFERENCE || 'websocket,http,direct')
+    .split(',')
+    .map((t: string) => t.trim())
+    .filter((t: string) => ['http', 'websocket', 'direct'].includes(t)) as TransportType[];
 
 // Derived convenience checks
 export const HTTP_TRANSPORT_ALLOWED = ALLOWED_TRANSPORTS.includes('http');
 export const WEBSOCKET_TRANSPORT_ALLOWED = ALLOWED_TRANSPORTS.includes('websocket');
+export const DIRECT_TRANSPORT_ALLOWED = ALLOWED_TRANSPORTS.includes('direct');
 ```
 
 ### Deployment Scenarios
 
 | Scenario | Configuration | Effect |
 |----------|--------------|--------|
-| **Default (backwards compat)** | No `VITE_ALLOWED_TRANSPORTS` | Both transports enabled |
+| **Default (backwards compat)** | No `VITE_ALLOWED_TRANSPORTS` | HTTP + WebSocket enabled |
 | **WebSocket-only (secure)** | `VITE_ALLOWED_TRANSPORTS=websocket` | HTTP proxy disabled |
 | **HTTP-only (legacy)** | `VITE_ALLOWED_TRANSPORTS=http` | WebSocket disabled |
-| **Both explicit** | `VITE_ALLOWED_TRANSPORTS=http,websocket` | Same as default |
+| **Direct-only (privacy, future)** | `VITE_ALLOWED_TRANSPORTS=direct` | No backend traffic |
+| **Hybrid with Direct** | `VITE_ALLOWED_TRANSPORTS=websocket,direct` | Direct preferred, WS fallback |
+
+### Privacy-Focused Deployment (Future)
+
+For deployments where privacy is paramount, Direct transport eliminates backend visibility:
+
+```bash
+# Maximum privacy - direct browser-to-issuer/verifier communication
+VITE_ALLOWED_TRANSPORTS=direct
+# No VITE_WALLET_BACKEND_URL or VITE_WS_URL needed for flows
+# Backend only needed for user authentication and credential storage
+```
+
+**Requirements for Direct transport:**
+1. Issuers must configure permissive CORS headers
+2. Verifiers must allow cross-origin requests to authorization endpoints
+3. DPoP and other headers must be allowed in CORS preflight
 
 ### Security Deployments
 
@@ -1106,17 +1365,30 @@ In this configuration:
 3. Update UI components to use new hooks (one at a time)
 4. Old hooks remain available for backwards compat
 
+### Step 4: Add Direct Transport (Future - When Ecosystem Ready)
+
+1. Add `DirectTransport` stub with CORS checking capability
+2. Implement OID4VCI/OID4VP flows using direct `fetch()` calls
+3. Enable via `VITE_ALLOWED_TRANSPORTS=direct`
+4. Auto-fallback to WebSocket/HTTP when CORS fails
+
 ### Ongoing: Transport Configuration
 
-Both transports are supported based on configuration:
-- **Default**: Both enabled; WebSocket preferred when `WS_URL` set
+Three transports are supported based on configuration:
+- **Default**: HTTP + WebSocket enabled; WebSocket preferred when `WS_URL` set
 - **WebSocket-only**: Set `VITE_ALLOWED_TRANSPORTS=websocket` to disable HTTP proxy
 - **HTTP-only**: Set `VITE_ALLOWED_TRANSPORTS=http` (legacy deployments)
+- **Direct-only (future)**: Set `VITE_ALLOWED_TRANSPORTS=direct` for maximum privacy
 
 Secure deployments that want to eliminate the proxy entirely should:
 1. Set `VITE_WS_URL` to the WebSocket endpoint
 2. Set `VITE_ALLOWED_TRANSPORTS=websocket`
 3. Optionally remove the `/proxy` endpoint from the backend
+
+Privacy-focused deployments (when ecosystem ready) should:
+1. Set `VITE_ALLOWED_TRANSPORTS=direct`
+2. No proxy or WebSocket endpoints needed for flow traffic
+3. Backend only needed for user auth and credential storage
 
 ## Testing Strategy
 
@@ -1285,20 +1557,33 @@ class SSETransport implements IFlowTransport {
 
 ## Summary
 
-This design enables wallet-frontend to support both HTTP/proxy and WebSocket
+This design enables wallet-frontend to support HTTP/proxy, WebSocket, and Direct
 transports through a clean abstraction layer. Key benefits:
 
 1. **Zero Breaking Changes**: Existing flows work unchanged
 2. **Configuration-Driven**: Environment variables control transport selection
-3. **Transport Allow-List**: Deployments can disable HTTP proxy entirely
-4. **Graceful Fallback**: WebSocket failure falls back to HTTP (if allowed)
-5. **Testable**: Transport abstraction enables unit testing
-6. **Extensible**: New protocols can be added without changing UI
+3. **Transport Allow-List**: Deployments can disable specific transports
+4. **Preference Order**: Configurable priority for transport selection
+5. **Graceful Fallback**: Higher-priority transport failure falls back to next
+6. **Testable**: Transport abstraction enables unit testing
+7. **Extensible**: New protocols can be added without changing UI
+8. **Privacy-Ready**: Direct transport eliminates backend traffic when ecosystem supports CORS
+
+### Transport Comparison
+
+| Transport | Privacy | Latency | Requirements | Status |
+|-----------|---------|---------|--------------|--------|
+| **HTTP Proxy** | Backend sees traffic (OHTTP helps) | Higher (2 hops) | Backend infrastructure | ✅ Current |
+| **WebSocket** | Backend sees traffic | Lower (persistent) | Backend infrastructure | ✅ Implementing |
+| **Direct** | Backend never sees traffic | Lowest (direct) | Issuer/verifier CORS | ⏳ Future |
 
 ### Quick Configuration Reference
 
 | Goal | Configuration |
 |------|--------------|
-| Default (both transports) | No special config needed |
+| Default (HTTP + WebSocket) | No special config needed |
 | WebSocket-only (no proxy) | `VITE_WS_URL=wss://...` + `VITE_ALLOWED_TRANSPORTS=websocket` |
 | HTTP-only (legacy) | `VITE_ALLOWED_TRANSPORTS=http` |
+| Direct-only (privacy, future) | `VITE_ALLOWED_TRANSPORTS=direct` |
+| Prefer WebSocket, fallback HTTP | `VITE_TRANSPORT_PREFERENCE=websocket,http` |
+| Prefer Direct, fallback WS | `VITE_TRANSPORT_PREFERENCE=direct,websocket` |

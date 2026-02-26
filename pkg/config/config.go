@@ -16,18 +16,127 @@ type Config struct {
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
+	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
+	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
+	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 }
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host       string `yaml:"host" envconfig:"HOST"`
-	Port       int    `yaml:"port" envconfig:"PORT"`
-	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
-	AdminToken string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"` // Bearer token for admin API (auto-generated if empty)
-	RPID       string `yaml:"rp_id" envconfig:"RP_ID"`
-	RPOrigin   string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
-	RPName     string `yaml:"rp_name" envconfig:"RP_NAME"`
-	BaseURL    string `yaml:"base_url" envconfig:"BASE_URL"`
+	Host         string `yaml:"host" envconfig:"HOST"`
+	Port         int    `yaml:"port" envconfig:"PORT"`
+	AdminHost    string `yaml:"admin_host" envconfig:"ADMIN_HOST"`       // Admin API bind address (defaults to Host)
+	AdminPort    int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`       // Internal admin API port (0 to disable)
+	EngineHost   string `yaml:"engine_host" envconfig:"ENGINE_HOST"`     // WebSocket engine bind address (defaults to Host)
+	EnginePort   int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`     // WebSocket engine port (defaults to Port if 0)
+	RegistryHost string `yaml:"registry_host" envconfig:"REGISTRY_HOST"` // Registry bind address (defaults to Host)
+	RegistryPort int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"` // VCTM registry port (defaults to 8097)
+	AdminToken   string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`     // Bearer token for admin API (auto-generated if empty)
+	RPID         string `yaml:"rp_id" envconfig:"RP_ID"`
+	RPOrigin     string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPName       string `yaml:"rp_name" envconfig:"RP_NAME"`
+	BaseURL      string `yaml:"base_url" envconfig:"BASE_URL"`
+
+	// CORS configuration
+	CORS CORSConfig `yaml:"cors" envconfig:"CORS"`
+
+	// ExternalURLs for split-mode deployment (when services run separately)
+	ExternalURLs ExternalURLsConfig `yaml:"external_urls" envconfig:"EXTERNAL_URLS"`
+}
+
+// CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
+type CORSConfig struct {
+	// AllowedOrigins is a list of origins that may access the resource.
+	// Use "*" to allow all origins (default for development).
+	AllowedOrigins []string `yaml:"allowed_origins" envconfig:"ALLOWED_ORIGINS"`
+
+	// AllowedMethods is a list of HTTP methods allowed for cross-origin requests.
+	AllowedMethods []string `yaml:"allowed_methods" envconfig:"ALLOWED_METHODS"`
+
+	// AllowedHeaders is a list of request headers allowed in cross-origin requests.
+	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
+
+	// ExposedHeaders is a list of headers that browsers are allowed to access.
+	ExposedHeaders []string `yaml:"exposed_headers" envconfig:"EXPOSED_HEADERS"`
+
+	// AllowCredentials indicates whether the request can include credentials.
+	// Cannot be true when AllowedOrigins is "*".
+	AllowCredentials bool `yaml:"allow_credentials" envconfig:"ALLOW_CREDENTIALS"`
+
+	// MaxAge indicates how long (in seconds) the results of a preflight request can be cached.
+	MaxAge int `yaml:"max_age" envconfig:"MAX_AGE"`
+}
+
+// SetDefaults sets default values for CORS configuration
+func (c *CORSConfig) SetDefaults() {
+	if len(c.AllowedOrigins) == 0 {
+		c.AllowedOrigins = []string{"*"}
+	}
+	if len(c.AllowedMethods) == 0 {
+		c.AllowedMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
+	}
+	if len(c.AllowedHeaders) == 0 {
+		c.AllowedHeaders = []string{
+			"Authorization", "Content-Type", "X-Tenant-ID",
+			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
+			"Upgrade", "Connection", "Sec-WebSocket-Key",
+			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+		}
+	}
+	if len(c.ExposedHeaders) == 0 {
+		c.ExposedHeaders = []string{"X-Private-Data-ETag"}
+	}
+	if c.MaxAge == 0 {
+		c.MaxAge = 43200 // 12 hours
+	}
+}
+
+// ExternalURLsConfig contains URLs for split-mode deployment
+// When services run as separate containers/pods, they need external URLs to reference each other.
+type ExternalURLsConfig struct {
+	// BackendURL is the external URL for the backend service (for engine → backend calls)
+	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
+
+	// EngineURL is the external URL for the engine service (for WebSocket connections)
+	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
+
+	// RegistryURL is the external URL for the registry service (for VCTM lookups)
+	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
+
+	// AdminURL is the external URL for the admin API (for inter-service admin calls)
+	AdminURL string `yaml:"admin_url" envconfig:"ADMIN_URL"`
+}
+
+// GetBackendURL returns the backend URL, with fallback to localhost
+func (e *ExternalURLsConfig) GetBackendURL(host string, port int) string {
+	if e.BackendURL != "" {
+		return e.BackendURL
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// GetEngineURL returns the engine URL, with fallback to localhost
+func (e *ExternalURLsConfig) GetEngineURL(host string, port int) string {
+	if e.EngineURL != "" {
+		return e.EngineURL
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// GetRegistryURL returns the registry URL, with fallback to localhost
+func (e *ExternalURLsConfig) GetRegistryURL(host string, port int) string {
+	if e.RegistryURL != "" {
+		return e.RegistryURL
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+// GetAdminURL returns the admin URL, with fallback to localhost
+func (e *ExternalURLsConfig) GetAdminURL(host string, port int) string {
+	if e.AdminURL != "" {
+		return e.AdminURL
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
 }
 
 // StorageConfig contains storage configuration
@@ -70,32 +179,141 @@ type WalletProviderConfig struct {
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 }
 
-// TrustConfig contains trust evaluation configuration (ADR 010)
+// TrustConfig contains trust evaluation configuration
 type TrustConfig struct {
-	// Type is the trust evaluator type: "none", "x509", "authzen", or "composite"
-	Type string `yaml:"type" envconfig:"TYPE"`
-	// X509 configuration for the X.509 certificate evaluator
-	X509 X509TrustConfig `yaml:"x509" envconfig:"X509"`
-	// AuthZEN configuration for the AuthZEN PDP evaluator
-	AuthZEN AuthZENConfig `yaml:"authzen" envconfig:"AUTHZEN"`
-}
-
-// X509TrustConfig contains X.509 certificate trust configuration
-type X509TrustConfig struct {
-	// RootCertPaths are paths to root CA certificate files (PEM format)
-	RootCertPaths []string `yaml:"root_cert_paths" envconfig:"ROOT_CERT_PATHS"`
-	// IntermediateCertPaths are paths to intermediate CA certificate files
-	IntermediateCertPaths []string `yaml:"intermediate_cert_paths" envconfig:"INTERMEDIATE_CERT_PATHS"`
-}
-
-// AuthZENConfig contains AuthZEN PDP configuration
-type AuthZENConfig struct {
-	// BaseURL is the base URL of the AuthZEN PDP service (e.g., "https://pdp.example.com")
-	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
-	// Timeout is the HTTP request timeout in seconds (default 30)
+	// DefaultEndpoint is the go-trust PDP endpoint for trust evaluation.
+	// Tenants can override this with their own endpoint.
+	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
+	// RegistryURL is the URL for the VCTM registry service.
+	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
+	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
-	// UseDiscovery enables .well-known/authzen-configuration discovery
-	UseDiscovery bool `yaml:"use_discovery" envconfig:"USE_DISCOVERY"`
+}
+
+// FeaturesConfig contains feature flags for controlling behavior
+type FeaturesConfig struct {
+	// ProxyEnabled controls whether the /proxy endpoint is available.
+	// Set to false to disable the proxy (requires WebSocket engine for flows).
+	// Default: true (for backward compatibility)
+	ProxyEnabled bool `yaml:"proxy_enabled" envconfig:"PROXY_ENABLED"`
+
+	// WebSocketRequired forces WebSocket transport for credential flows.
+	// When true, the proxy endpoint will return an error directing clients
+	// to use the WebSocket transport instead.
+	// Default: false
+	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
+}
+
+// SecurityConfig contains security-related configuration
+type SecurityConfig struct {
+	// AuthRateLimit contains rate limiting configuration for auth endpoints
+	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
+
+	// AAGUIDBlacklist contains AAGUID blacklist configuration for WebAuthn
+	AAGUIDBlacklist AAGUIDBlacklistConfig `yaml:"aaguid_blacklist" envconfig:"AAGUID_BLACKLIST"`
+
+	// ChallengeCleanup contains challenge cleanup worker configuration
+	ChallengeCleanup ChallengeCleanupConfig `yaml:"challenge_cleanup" envconfig:"CHALLENGE_CLEANUP"`
+
+	// TokenBlacklist contains token blacklist/revocation configuration
+	TokenBlacklist TokenBlacklistConfig `yaml:"token_blacklist" envconfig:"TOKEN_BLACKLIST"`
+}
+
+// AuthRateLimitConfig contains rate limiting configuration for auth endpoints
+type AuthRateLimitConfig struct {
+	// Enabled controls whether rate limiting is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// MaxAttempts is the maximum number of login/registration attempts per window
+	// Default: 10
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+
+	// WindowSeconds is the time window for rate limiting (in seconds)
+	// Default: 60 (1 minute)
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+
+	// LockoutSeconds is how long to lock out after exceeding the limit
+	// Default: 300 (5 minutes)
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// SetDefaults sets default values for auth rate limiting
+func (c *AuthRateLimitConfig) SetDefaults() {
+	if c.MaxAttempts == 0 {
+		c.MaxAttempts = 10
+	}
+	if c.WindowSeconds == 0 {
+		c.WindowSeconds = 60
+	}
+	if c.LockoutSeconds == 0 {
+		c.LockoutSeconds = 300
+	}
+}
+
+// AAGUIDBlacklistConfig contains AAGUID blacklist configuration
+type AAGUIDBlacklistConfig struct {
+	// Enabled controls whether AAGUID blacklist checking is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// AAGUIDs is a list of blocked AAGUIDs (hex-encoded UUIDs without dashes)
+	// Example: ["00000000000000000000000000000000"] to block zero AAGUID
+	AAGUIDs []string `yaml:"aaguids" envconfig:"AAGUIDS"`
+
+	// RejectUnknown rejects authenticators with zero/unknown AAGUIDs
+	// Default: false (permissive - allows unknown authenticators)
+	RejectUnknown bool `yaml:"reject_unknown" envconfig:"REJECT_UNKNOWN"`
+}
+
+// ChallengeCleanupConfig contains challenge cleanup worker configuration
+type ChallengeCleanupConfig struct {
+	// Enabled controls whether the cleanup worker runs
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// IntervalSeconds is how often to run cleanup (in seconds)
+	// Default: 300 (5 minutes)
+	IntervalSeconds int `yaml:"interval_seconds" envconfig:"INTERVAL_SECONDS"`
+}
+
+// SetDefaults sets default values for challenge cleanup
+func (c *ChallengeCleanupConfig) SetDefaults() {
+	if c.IntervalSeconds == 0 {
+		c.IntervalSeconds = 300
+	}
+}
+
+// TokenBlacklistConfig contains token blacklist/revocation configuration
+type TokenBlacklistConfig struct {
+	// Enabled controls whether token blacklist checking is active
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
+	// Default: 3600 (1 hour)
+	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+}
+
+// SetDefaults sets default values for token blacklist
+func (c *TokenBlacklistConfig) SetDefaults() {
+	if c.CleanupIntervalSeconds == 0 {
+		c.CleanupIntervalSeconds = 3600
+	}
+}
+
+// SessionStoreConfig contains WebSocket session store configuration
+type SessionStoreConfig struct {
+	// Type is the session store type: "memory" or "redis"
+	Type string `yaml:"type" envconfig:"TYPE"`
+	// Redis contains Redis-specific configuration
+	Redis RedisConfig `yaml:"redis" envconfig:"REDIS"`
+	// DefaultTTL is the default session TTL in hours
+	DefaultTTLHours int `yaml:"default_ttl_hours" envconfig:"DEFAULT_TTL_HOURS"`
+}
+
+// RedisConfig contains Redis connection configuration
+type RedisConfig struct {
+	Address   string `yaml:"address" envconfig:"ADDRESS"`
+	Password  string `yaml:"password" envconfig:"PASSWORD"`
+	DB        int    `yaml:"db" envconfig:"DB"`
+	KeyPrefix string `yaml:"key_prefix" envconfig:"KEY_PREFIX"`
 }
 
 // Load loads configuration from file and environment variables
@@ -134,19 +352,28 @@ func Load(configFile string) (*Config, error) {
 		cfg.Server.BaseURL = fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port)
 	}
 
+	// Ensure CORS has defaults
+	cfg.Server.CORS.SetDefaults()
+
 	return cfg, nil
 }
 
 // defaultConfig returns a Config with sensible default values
 func defaultConfig() *Config {
+	corsConfig := CORSConfig{}
+	corsConfig.SetDefaults()
+
 	return &Config{
 		Server: ServerConfig{
-			Host:      "0.0.0.0",
-			Port:      8080,
-			AdminPort: 8081, // Internal admin API port
-			RPID:      "localhost",
-			RPOrigin:  "http://localhost:8080",
-			RPName:    "Wallet Backend",
+			Host:         "0.0.0.0",
+			Port:         8080,
+			AdminPort:    8081, // Internal admin API port
+			EnginePort:   8082, // WebSocket engine port
+			RegistryPort: 8097, // VCTM registry port
+			RPID:         "localhost",
+			RPOrigin:     "http://localhost:8080",
+			RPName:       "Wallet Backend",
+			CORS:         corsConfig,
 		},
 		Storage: StorageConfig{
 			Type: "memory",
@@ -169,9 +396,39 @@ func defaultConfig() *Config {
 			Issuer:      "wallet-backend",
 		},
 		Trust: TrustConfig{
-			Type: "none",
-			AuthZEN: AuthZENConfig{
-				Timeout: 30,
+			Timeout: 30, // seconds
+		},
+		SessionStore: SessionStoreConfig{
+			Type:            "memory",
+			DefaultTTLHours: 24,
+			Redis: RedisConfig{
+				Address:   "localhost:6379",
+				KeyPrefix: "ws:session:",
+			},
+		},
+		Features: FeaturesConfig{
+			ProxyEnabled:      true,  // Default: proxy enabled for backward compatibility
+			WebSocketRequired: false, // Default: proxy still allowed
+		},
+		Security: SecurityConfig{
+			AuthRateLimit: AuthRateLimitConfig{
+				Enabled:        true,
+				MaxAttempts:    10,
+				WindowSeconds:  60,
+				LockoutSeconds: 300,
+			},
+			AAGUIDBlacklist: AAGUIDBlacklistConfig{
+				Enabled:       false, // Disabled by default
+				AAGUIDs:       []string{},
+				RejectUnknown: false,
+			},
+			ChallengeCleanup: ChallengeCleanupConfig{
+				Enabled:         true, // Enabled by default to prevent storage leaks
+				IntervalSeconds: 300,
+			},
+			TokenBlacklist: TokenBlacklistConfig{
+				Enabled:                true, // Enabled by default for security
+				CleanupIntervalSeconds: 3600,
 			},
 		},
 	}
@@ -203,6 +460,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("jwt secret is required")
 	}
 
+	// Validate CORS: AllowCredentials cannot be true with wildcard origins
+	if c.Server.CORS.AllowCredentials {
+		for _, origin := range c.Server.CORS.AllowedOrigins {
+			if origin == "*" {
+				return fmt.Errorf("CORS: allow_credentials cannot be true when allowed_origins contains '*'")
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -213,5 +479,35 @@ func (c *ServerConfig) Address() string {
 
 // AdminAddress returns the admin server address
 func (c *ServerConfig) AdminAddress() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.AdminPort)
+	host := c.AdminHost
+	if host == "" {
+		host = c.Host
+	}
+	return fmt.Sprintf("%s:%d", host, c.AdminPort)
+}
+
+// EngineAddress returns the engine server address
+func (c *ServerConfig) EngineAddress() string {
+	host := c.EngineHost
+	if host == "" {
+		host = c.Host
+	}
+	port := c.EnginePort
+	if port == 0 {
+		port = c.Port // fallback to main port for backward compatibility
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// RegistryAddress returns the registry server address
+func (c *ServerConfig) RegistryAddress() string {
+	host := c.RegistryHost
+	if host == "" {
+		host = c.Host
+	}
+	port := c.RegistryPort
+	if port == 0 {
+		port = 8097 // default registry port
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }
