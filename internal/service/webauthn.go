@@ -34,25 +34,6 @@ var (
 	ErrTenantNotFound     = errors.New("tenant not found")
 )
 
-// TenantRedirectError indicates the user should be redirected to a different tenant
-type TenantRedirectError struct {
-	CorrectTenantID domain.TenantID
-	UserID          domain.UserID
-}
-
-func (e *TenantRedirectError) Error() string {
-	return fmt.Sprintf("user belongs to tenant %s, redirect required", e.CorrectTenantID)
-}
-
-// IsTenantRedirectError checks if an error is a TenantRedirectError
-func IsTenantRedirectError(err error) (*TenantRedirectError, bool) {
-	var redirectErr *TenantRedirectError
-	if errors.As(err, &redirectErr) {
-		return redirectErr, true
-	}
-	return nil, false
-}
-
 // WebAuthnService handles WebAuthn authentication
 type WebAuthnService struct {
 	store    storage.Store
