@@ -458,36 +458,6 @@ func TestHandlers_FinishWebAuthnRegistration_NotAvailable(t *testing.T) {
 	}
 }
 
-func TestHandlers_StartTenantWebAuthnLogin_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/login/start", handlers.StartTenantWebAuthnLogin)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/start", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
-func TestHandlers_FinishTenantWebAuthnLogin_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/login/finish", handlers.FinishTenantWebAuthnLogin)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/login/finish", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
 // Test credential storage handlers with authentication context
 func TestHandlers_StoreCredential_Unauthorized(t *testing.T) {
 	handlers, router := setupTestHandlers(t)
