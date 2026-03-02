@@ -170,6 +170,11 @@ type MongoDBConfig struct {
 	Database     string `yaml:"database" envconfig:"DATABASE"`
 	Timeout      int    `yaml:"timeout" envconfig:"TIMEOUT"`             // seconds
 	PasswordPath string `yaml:"password_path" envconfig:"PASSWORD_PATH"` // Path to file containing MongoDB password
+	// TLS/mTLS configuration
+	TLSEnabled bool   `yaml:"tls_enabled" envconfig:"TLS_ENABLED"` // Enable TLS for MongoDB connection
+	CAPath     string `yaml:"ca_path" envconfig:"CA_PATH"`         // Path to CA certificate for server verification
+	CertPath   string `yaml:"cert_path" envconfig:"CERT_PATH"`     // Path to client certificate for mTLS
+	KeyPath    string `yaml:"key_path" envconfig:"KEY_PATH"`       // Path to client key for mTLS
 }
 
 // LoggingConfig contains logging configuration
@@ -533,6 +538,14 @@ func (c *Config) Validate() error {
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {
 		return fmt.Errorf("mongodb uri is required when using mongodb storage")
+	}
+
+	// Validate MongoDB mTLS configuration
+	if c.Storage.MongoDB.CertPath != "" && c.Storage.MongoDB.KeyPath == "" {
+		return fmt.Errorf("mongodb.key_path is required when mongodb.cert_path is set")
+	}
+	if c.Storage.MongoDB.KeyPath != "" && c.Storage.MongoDB.CertPath == "" {
+		return fmt.Errorf("mongodb.cert_path is required when mongodb.key_path is set")
 	}
 
 	if c.JWT.Secret == "" {
