@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,12 @@ type IssuerMetadata struct {
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	// mDOC IACA certificates URL
+	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
+	// Signed metadata JWT (contains x5c for trust evaluation)
+	SignedMetadata string `json:"signed_metadata,omitempty"`
+	// JWKS URI for issuer keys
+	JWKsURI string `json:"jwks_uri,omitempty"`
 }
 
 // IssuerDisplay represents issuer display information
@@ -315,7 +322,10 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		trustEndpoint = h.Flow.Session.TrustEndpoint
 	}
 
-	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint)
+	// Extract key material from issuer metadata for trust evaluation
+	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
+
+	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint, keyMaterial)
 	if err != nil {
 		h.Logger.Error("Trust evaluation failed", zap.String("issuer", issuer), zap.Error(err))
 		trust = &TrustInfo{
@@ -327,6 +337,140 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 
 	_ = h.Progress(StepTrustEvaluated, trust)
 	return trust, nil
+}
+
+// extractIssuerKeyMaterial extracts key material from issuer metadata for trust evaluation.
+// Priority: mdoc_iacas_uri > signed_metadata x5c > jwks_uri
+// For DIDs (issuerID starts with did:), returns nil to use resolution-only mode.
+func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata *IssuerMetadata) *KeyMaterial {
+	// Fetch IACA certificates for mDOC
+	if metadata.MdocIacasURI != "" {
+		certs, err := h.fetchIACACertificates(ctx, metadata.MdocIacasURI)
+		if err != nil {
+			h.Logger.Warn("Failed to fetch IACA certificates",
+				zap.String("uri", metadata.MdocIacasURI),
+				zap.Error(err))
+		} else if len(certs) > 0 {
+			return &KeyMaterial{
+				Type: "x5c",
+				X5C:  certs,
+			}
+		}
+	}
+
+	// Extract x5c from signed_metadata JWT header
+	if metadata.SignedMetadata != "" {
+		x5c := h.extractX5CFromJWT(metadata.SignedMetadata)
+		if len(x5c) > 0 {
+			return &KeyMaterial{
+				Type: "x5c",
+				X5C:  x5c,
+			}
+		}
+	}
+
+	// Fetch JWKS from jwks_uri
+	if metadata.JWKsURI != "" {
+		jwks, err := h.fetchJWKS(ctx, metadata.JWKsURI)
+		if err != nil {
+			h.Logger.Warn("Failed to fetch JWKS",
+				zap.String("uri", metadata.JWKsURI),
+				zap.Error(err))
+		} else {
+			return &KeyMaterial{
+				Type: "jwk",
+				JWK:  jwks,
+			}
+		}
+	}
+
+	// No key material available - will use resolution-only mode (for DIDs)
+	return nil
+}
+
+// fetchIACACertificates fetches IACA certificates from mdoc_iacas_uri
+func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", iacasURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("IACA fetch returned status %d", resp.StatusCode)
+	}
+
+	var iacasResp struct {
+		Iacas []struct {
+			Certificate string `json:"certificate"`
+		} `json:"iacas"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&iacasResp); err != nil {
+		return nil, err
+	}
+
+	certs := make([]string, 0, len(iacasResp.Iacas))
+	for _, iaca := range iacasResp.Iacas {
+		if iaca.Certificate != "" {
+			certs = append(certs, iaca.Certificate)
+		}
+	}
+
+	return certs, nil
+}
+
+// extractX5CFromJWT extracts the x5c certificate chain from a JWT header
+func (h *OID4VCIHandler) extractX5CFromJWT(jwtStr string) []string {
+	parts := strings.Split(jwtStr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil
+	}
+
+	var header struct {
+		X5C []string `json:"x5c"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil
+	}
+
+	return header.X5C
+}
+
+// fetchJWKS fetches a JWKS from a URI
+func (h *OID4VCIHandler) fetchJWKS(ctx context.Context, uri string) (interface{}, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("JWKS fetch returned status %d", resp.StatusCode)
+	}
+
+	var jwks interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return nil, err
+	}
+
+	return jwks, nil
 }
 
 func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (*CredentialConfig, error) {

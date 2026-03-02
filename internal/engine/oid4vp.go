@@ -94,6 +94,10 @@ type ClientMetadata struct {
 	LogoURI       string                 `json:"logo_uri,omitempty"`
 	ClientPurpose string                 `json:"client_purpose,omitempty"`
 	VPFormats     map[string]interface{} `json:"vp_formats,omitempty"`
+	// Key material for trust evaluation
+	JWKS    json.RawMessage `json:"jwks,omitempty"`
+	JWKsURI string          `json:"jwks_uri,omitempty"`
+	X5C     []string        `json:"x5c,omitempty"`
 }
 
 // RequestedClaim describes a claim being requested
@@ -350,6 +354,12 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
+	// Extract key material from client metadata for trust evaluation
+	var keyMaterial *KeyMaterial
+	if clientMeta != nil {
+		keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
+	}
+
 	// Evaluate trust via TrustService
 	// Get tenant trust endpoint from session (if configured)
 	trustEndpoint := ""
@@ -357,7 +367,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		trustEndpoint = h.Flow.Session.TrustEndpoint
 	}
 
-	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint)
+	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint, keyMaterial)
 	if err != nil {
 		h.Logger.Warn("Verifier trust evaluation failed", zap.String("verifier", authReq.ClientID), zap.Error(err))
 		verifier.Trusted = false
@@ -368,6 +378,72 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	return verifier, nil
+}
+
+// extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.
+// Priority: x5c > jwks > jwks_uri (for DIDs where client_id starts with did:, returns nil)
+func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMeta *ClientMetadata) *KeyMaterial {
+	// X5C certificate chain takes priority
+	if len(clientMeta.X5C) > 0 {
+		return &KeyMaterial{
+			Type: "x5c",
+			X5C:  clientMeta.X5C,
+		}
+	}
+
+	// Inline JWKS
+	if len(clientMeta.JWKS) > 0 {
+		var jwks interface{}
+		if err := json.Unmarshal(clientMeta.JWKS, &jwks); err == nil {
+			return &KeyMaterial{
+				Type: "jwk",
+				JWK:  jwks,
+			}
+		}
+		h.Logger.Warn("Failed to parse inline JWKS", zap.Error(fmt.Errorf("invalid JSON")))
+	}
+
+	// Fetch from jwks_uri
+	if clientMeta.JWKsURI != "" {
+		jwks, err := h.fetchJWKS(ctx, clientMeta.JWKsURI)
+		if err != nil {
+			h.Logger.Warn("Failed to fetch JWKS from URI", zap.String("uri", clientMeta.JWKsURI), zap.Error(err))
+		} else {
+			return &KeyMaterial{
+				Type: "jwk",
+				JWK:  jwks,
+			}
+		}
+	}
+
+	// No key material available - will use resolution-only mode (for DIDs)
+	return nil
+}
+
+// fetchJWKS fetches a JWKS from a URI
+func (h *OID4VPHandler) fetchJWKS(ctx context.Context, uri string) (interface{}, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("JWKS fetch returned status %d", resp.StatusCode)
+	}
+
+	var jwks interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return nil, err
+	}
+
+	return jwks, nil
 }
 
 func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, error) {

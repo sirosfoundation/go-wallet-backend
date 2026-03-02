@@ -35,9 +35,9 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
 		trustService := engine.NewTrustService(cfg, logger)
 
-		// Evaluate issuer trust
+		// Evaluate issuer trust (nil keyMaterial for DID resolution)
 		ctx := context.Background()
-		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "")
+		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
@@ -61,9 +61,9 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
 		trustService := engine.NewTrustService(cfg, logger)
 
-		// Evaluate issuer trust
+		// Evaluate issuer trust (nil keyMaterial for DID resolution)
 		ctx := context.Background()
-		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "")
+		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
@@ -83,7 +83,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 
 		// Evaluate - should return default (trusted, no evaluation)
 		ctx := context.Background()
-		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "")
+		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
@@ -111,7 +111,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 		trustService := engine.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		info, err := trustService.EvaluateVerifier(ctx, "https://verifier.example.com", "")
+		info, err := trustService.EvaluateVerifier(ctx, "https://verifier.example.com", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
@@ -137,7 +137,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 		trustService := engine.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		info, err := trustService.EvaluateVerifier(ctx, "https://untrusted-verifier.example.com", "")
+		info, err := trustService.EvaluateVerifier(ctx, "https://untrusted-verifier.example.com", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
@@ -169,12 +169,12 @@ func TestTrustService_EndpointOverride(t *testing.T) {
 	ctx := context.Background()
 
 	// Test with default endpoint (should be trusted)
-	info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "")
+	info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "", nil)
 	require.NoError(t, err)
 	assert.True(t, info.Trusted, "Default endpoint should allow")
 
 	// Test with override endpoint (should be denied)
-	info, err = trustService.EvaluateIssuer(ctx, "did:example:issuer", deniedSrv.URL())
+	info, err = trustService.EvaluateIssuer(ctx, "did:example:issuer", deniedSrv.URL(), nil)
 	require.NoError(t, err)
 	assert.False(t, info.Trusted, "Override endpoint should deny")
 }
@@ -224,7 +224,7 @@ func TestTrustService_Timeout(t *testing.T) {
 	trustService := engine.NewTrustService(cfg, logger)
 
 	ctx := context.Background()
-	info, err := trustService.EvaluateIssuer(ctx, "did:example:test", "")
+	info, err := trustService.EvaluateIssuer(ctx, "did:example:test", "", nil)
 
 	// Should succeed with valid server
 	require.NoError(t, err)
@@ -256,7 +256,7 @@ func TestTrustService_ConcurrentRequests(t *testing.T) {
 
 	for i := 0; i < concurrency; i++ {
 		go func(idx int) {
-			info, err := trustService.EvaluateIssuer(ctx, "did:example:concurrent-test", "")
+			info, err := trustService.EvaluateIssuer(ctx, "did:example:concurrent-test", "", nil)
 			if err != nil {
 				errors <- err
 				return

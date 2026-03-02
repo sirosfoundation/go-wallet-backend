@@ -52,6 +52,18 @@ func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
 	}
 }
 
+// KeyMaterial represents cryptographic key material for trust evaluation.
+// When provided, the key is validated against the subject binding.
+// When nil, resolution-only mode is used (only works for DIDs).
+type KeyMaterial struct {
+	// Type indicates the key format: "x5c" or "jwk"
+	Type string
+	// X5C contains base64-encoded DER certificates (for x5c type)
+	X5C []string
+	// JWK contains JWK(S) data (for jwk type)
+	JWK interface{}
+}
+
 // GetEvaluator returns an AuthZEN evaluator for the given endpoint.
 // Uses the default endpoint if endpoint is empty.
 // Returns nil if no trust endpoint is configured.
@@ -108,8 +120,9 @@ func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error
 }
 
 // EvaluateIssuer evaluates trust for a credential issuer via the trust endpoint.
-// All evaluation is delegated to the AuthZEN PDP - no local trust decisions.
-func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string) (*TrustInfo, error) {
+// If keyMaterial is provided, validates the subject-to-key binding.
+// If keyMaterial is nil, performs resolution-only (only works for DIDs).
+func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	eval, err := ts.GetEvaluator(trustEndpoint)
 	if err != nil {
 		return nil, err
@@ -129,14 +142,40 @@ func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, tru
 			Type: trust.SubjectTypeKey,
 			ID:   issuerID,
 		},
-		Resource: trust.Resource{
-			Type: trust.ResourceTypeJWK,
-			ID:   issuerID,
-		},
 	}
 	req.SubjectID = issuerID
-	req.KeyType = trust.KeyTypeJWK
 	req.Role = trust.RoleCredentialIssuer
+
+	// Set key material if provided
+	if keyMaterial != nil {
+		switch keyMaterial.Type {
+		case "x5c":
+			req.KeyType = trust.KeyTypeX5C
+			req.Resource = trust.Resource{
+				Type: trust.ResourceTypeX5C,
+				ID:   issuerID,
+				Key:  keyMaterial.X5C,
+			}
+			req.Key = keyMaterial.X5C
+			ts.logger.Debug("Trust evaluation with x5c",
+				zap.String("issuer", issuerID),
+				zap.Int("cert_count", len(keyMaterial.X5C)))
+		case "jwk":
+			req.KeyType = trust.KeyTypeJWK
+			req.Resource = trust.Resource{
+				Type: trust.ResourceTypeJWK,
+				ID:   issuerID,
+				Key:  keyMaterial.JWK,
+			}
+			req.Key = keyMaterial.JWK
+			ts.logger.Debug("Trust evaluation with JWK",
+				zap.String("issuer", issuerID))
+		}
+	} else {
+		// Resolution-only mode (for DIDs)
+		ts.logger.Debug("Trust evaluation resolution-only",
+			zap.String("issuer", issuerID))
+	}
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
@@ -159,8 +198,9 @@ func (ts *TrustService) EvaluateIssuer(ctx context.Context, issuerID string, tru
 }
 
 // EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
-// All evaluation is delegated to the AuthZEN PDP - no local trust decisions.
-func (ts *TrustService) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string) (*TrustInfo, error) {
+// If keyMaterial is provided, validates the subject-to-key binding.
+// If keyMaterial is nil, performs resolution-only (only works for DIDs).
+func (ts *TrustService) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	eval, err := ts.GetEvaluator(trustEndpoint)
 	if err != nil {
 		return nil, err
@@ -180,14 +220,40 @@ func (ts *TrustService) EvaluateVerifier(ctx context.Context, verifierID string,
 			Type: trust.SubjectTypeKey,
 			ID:   verifierID,
 		},
-		Resource: trust.Resource{
-			Type: trust.ResourceTypeJWK,
-			ID:   verifierID,
-		},
 	}
 	req.SubjectID = verifierID
-	req.KeyType = trust.KeyTypeJWK
 	req.Role = trust.RoleCredentialVerifier
+
+	// Set key material if provided
+	if keyMaterial != nil {
+		switch keyMaterial.Type {
+		case "x5c":
+			req.KeyType = trust.KeyTypeX5C
+			req.Resource = trust.Resource{
+				Type: trust.ResourceTypeX5C,
+				ID:   verifierID,
+				Key:  keyMaterial.X5C,
+			}
+			req.Key = keyMaterial.X5C
+			ts.logger.Debug("Trust evaluation with x5c",
+				zap.String("verifier", verifierID),
+				zap.Int("cert_count", len(keyMaterial.X5C)))
+		case "jwk":
+			req.KeyType = trust.KeyTypeJWK
+			req.Resource = trust.Resource{
+				Type: trust.ResourceTypeJWK,
+				ID:   verifierID,
+				Key:  keyMaterial.JWK,
+			}
+			req.Key = keyMaterial.JWK
+			ts.logger.Debug("Trust evaluation with JWK",
+				zap.String("verifier", verifierID))
+		}
+	} else {
+		// Resolution-only mode (for DIDs)
+		ts.logger.Debug("Trust evaluation resolution-only",
+			zap.String("verifier", verifierID))
+	}
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
