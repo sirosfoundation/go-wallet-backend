@@ -55,6 +55,21 @@ type ServerConfig struct {
 
 	// ExternalURLs for split-mode deployment (when services run separately)
 	ExternalURLs ExternalURLsConfig `yaml:"external_urls" envconfig:"EXTERNAL_URLS"`
+
+	// TLS configuration for HTTPS listeners
+	TLS TLSConfig `yaml:"tls" envconfig:"TLS"`
+}
+
+// TLSConfig contains TLS configuration for HTTPS listeners
+type TLSConfig struct {
+	// Enabled enables TLS for the HTTP listeners
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// CertFile is the path to the TLS certificate file
+	CertFile string `yaml:"cert_file" envconfig:"CERT_FILE"`
+	// KeyFile is the path to the TLS private key file
+	KeyFile string `yaml:"key_file" envconfig:"KEY_FILE"`
+	// MinVersion is the minimum TLS version (tls12 or tls13, default: tls12)
+	MinVersion string `yaml:"min_version" envconfig:"MIN_VERSION"`
 }
 
 // CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
@@ -524,6 +539,16 @@ func (c *Config) Validate() error {
 
 	if c.Server.RPOrigin == "" {
 		return fmt.Errorf("rp_origin is required")
+	}
+
+	// Validate TLS configuration
+	if c.Server.TLS.Enabled {
+		if c.Server.TLS.CertFile == "" {
+			return fmt.Errorf("server.tls.cert_file is required when TLS is enabled")
+		}
+		if c.Server.TLS.KeyFile == "" {
+			return fmt.Errorf("server.tls.key_file is required when TLS is enabled")
+		}
 	}
 
 	// Storage type validation
