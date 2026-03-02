@@ -19,6 +19,7 @@ import (
 // Handlers aggregates all HTTP handlers
 type Handlers struct {
 	services *service.Services
+	store    storage.Store
 	cfg      *config.Config
 	logger   *zap.Logger
 	roles    []string
@@ -34,11 +35,32 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 	}
 }
 
+// NewHandlersWithStore creates a new Handlers instance with store for health checks
+func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
+	return &Handlers{
+		services: services,
+		store:    store,
+		cfg:      cfg,
+		logger:   logger.Named("handlers"),
+		roles:    roles,
+	}
+}
+
 // Status handles the /status endpoint
 // This endpoint returns the server status and API version for client capability detection.
 func (h *Handlers) Status(c *gin.Context) {
+	status := "ok"
+
+	// Check storage health if store is available
+	if h.store != nil {
+		if err := h.store.Ping(c.Request.Context()); err != nil {
+			h.logger.Warn("Storage health check failed", zap.Error(err))
+			status = "degraded"
+		}
+	}
+
 	c.JSON(200, StatusResponse{
-		Status:       "ok",
+		Status:       status,
 		Service:      "wallet-backend",
 		Roles:        h.roles,
 		APIVersion:   CurrentAPIVersion,
