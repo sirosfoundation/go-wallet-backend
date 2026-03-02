@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
@@ -23,19 +24,20 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host         string `yaml:"host" envconfig:"HOST"`
-	Port         int    `yaml:"port" envconfig:"PORT"`
-	AdminHost    string `yaml:"admin_host" envconfig:"ADMIN_HOST"`       // Admin API bind address (defaults to Host)
-	AdminPort    int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`       // Internal admin API port (0 to disable)
-	EngineHost   string `yaml:"engine_host" envconfig:"ENGINE_HOST"`     // WebSocket engine bind address (defaults to Host)
-	EnginePort   int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`     // WebSocket engine port (defaults to Port if 0)
-	RegistryHost string `yaml:"registry_host" envconfig:"REGISTRY_HOST"` // Registry bind address (defaults to Host)
-	RegistryPort int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"` // VCTM registry port (defaults to 8097)
-	AdminToken   string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`     // Bearer token for admin API (auto-generated if empty)
-	RPID         string `yaml:"rp_id" envconfig:"RP_ID"`
-	RPOrigin     string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
-	RPName       string `yaml:"rp_name" envconfig:"RP_NAME"`
-	BaseURL      string `yaml:"base_url" envconfig:"BASE_URL"`
+	Host           string `yaml:"host" envconfig:"HOST"`
+	Port           int    `yaml:"port" envconfig:"PORT"`
+	AdminHost      string `yaml:"admin_host" envconfig:"ADMIN_HOST"`             // Admin API bind address (defaults to Host)
+	AdminPort      int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`             // Internal admin API port (0 to disable)
+	EngineHost     string `yaml:"engine_host" envconfig:"ENGINE_HOST"`           // WebSocket engine bind address (defaults to Host)
+	EnginePort     int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`           // WebSocket engine port (defaults to Port if 0)
+	RegistryHost   string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
+	RegistryPort   int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	AdminToken     string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
+	AdminTokenPath string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
+	RPID           string `yaml:"rp_id" envconfig:"RP_ID"`
+	RPOrigin       string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPName         string `yaml:"rp_name" envconfig:"RP_NAME"`
+	BaseURL        string `yaml:"base_url" envconfig:"BASE_URL"`
 
 	// CORS configuration
 	CORS CORSConfig `yaml:"cors" envconfig:"CORS"`
@@ -153,9 +155,10 @@ type SQLiteConfig struct {
 
 // MongoDBConfig contains MongoDB-specific configuration
 type MongoDBConfig struct {
-	URI      string `yaml:"uri" envconfig:"URI"`
-	Database string `yaml:"database" envconfig:"DATABASE"`
-	Timeout  int    `yaml:"timeout" envconfig:"TIMEOUT"` // seconds
+	URI          string `yaml:"uri" envconfig:"URI"`
+	Database     string `yaml:"database" envconfig:"DATABASE"`
+	Timeout      int    `yaml:"timeout" envconfig:"TIMEOUT"`             // seconds
+	PasswordPath string `yaml:"password_path" envconfig:"PASSWORD_PATH"` // Path to file containing MongoDB password
 }
 
 // LoggingConfig contains logging configuration
@@ -167,6 +170,7 @@ type LoggingConfig struct {
 // JWTConfig contains JWT configuration
 type JWTConfig struct {
 	Secret      string `yaml:"secret" envconfig:"SECRET"`
+	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
 	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
@@ -342,6 +346,11 @@ func Load(configFile string) (*Config, error) {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
 
+	// Load secrets from files if configured
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -356,6 +365,56 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// loadSecretsFromFiles loads secrets from file paths.
+// This allows sensitive values like JWT secrets and admin tokens to be stored
+// in separate files (e.g., mounted Kubernetes secrets) rather than in the
+// main configuration file or environment variables.
+func (c *Config) loadSecretsFromFiles() error {
+	var err error
+
+	// Load admin token from file
+	if c.Server.AdminTokenPath != "" {
+		c.Server.AdminToken, err = readSecretFile(c.Server.AdminTokenPath)
+		if err != nil {
+			return fmt.Errorf("admin_token_path: %w", err)
+		}
+	}
+
+	// Load JWT secret from file
+	if c.JWT.SecretPath != "" {
+		c.JWT.Secret, err = readSecretFile(c.JWT.SecretPath)
+		if err != nil {
+			return fmt.Errorf("jwt.secret_path: %w", err)
+		}
+	}
+
+	// Load MongoDB password from file and inject into URI
+	if c.Storage.MongoDB.PasswordPath != "" {
+		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
+		if err != nil {
+			return fmt.Errorf("storage.mongodb.password_path: %w", err)
+		}
+		// Replace %PASSWORD% placeholder in URI (no-op if not present)
+		c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
+	}
+
+	return nil
+}
+
+// readSecretFile reads a secret value from a file, trimming whitespace.
+// Returns an error if the file cannot be read or is empty.
+func readSecretFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+	}
+	secret := strings.TrimSpace(string(data))
+	if secret == "" {
+		return "", fmt.Errorf("file %s is empty", path)
+	}
+	return secret, nil
 }
 
 // defaultConfig returns a Config with sensible default values
