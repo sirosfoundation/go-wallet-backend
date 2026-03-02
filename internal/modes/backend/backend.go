@@ -181,7 +181,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 
 	// Middleware
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(logger))
+	router.Use(middleware.Logger(logger, "/status", "/health"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.Server.CORS.AllowedOrigins,
 		AllowMethods:     cfg.Server.CORS.AllowedMethods,
@@ -304,7 +304,7 @@ func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logg
 	router := gin.New()
 
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(logger))
+	router.Use(middleware.Logger(logger, "/admin/status"))
 
 	adminHandlers := api.NewAdminHandlers(store, logger)
 

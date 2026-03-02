@@ -243,7 +243,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(m.logger))
+	router.Use(middleware.Logger(m.logger, "/status", "/health"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     m.cfg.CORS.AllowedOrigins,
 		AllowMethods:     m.cfg.CORS.AllowedMethods,

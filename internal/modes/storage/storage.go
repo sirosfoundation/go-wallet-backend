@@ -147,7 +147,7 @@ func setupStorageRouter(cfg *config.Config, services *service.Services, store ba
 
 	// Middleware
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(logger))
+	router.Use(middleware.Logger(logger, "/status", "/health"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.Server.CORS.AllowedOrigins,
 		AllowMethods:     cfg.Server.CORS.AllowedMethods,

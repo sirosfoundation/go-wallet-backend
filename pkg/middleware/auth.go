@@ -205,22 +205,29 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 	}
 }
 
-// Logger returns a gin middleware for logging
-func Logger(logger *zap.Logger) gin.HandlerFunc {
+// Logger returns a gin middleware for logging with optional path exclusions.
+// Paths in skipPaths (e.g., "/status") will not be logged.
+func Logger(logger *zap.Logger, skipPaths ...string) gin.HandlerFunc {
+	skipSet := make(map[string]bool)
+	for _, p := range skipPaths {
+		skipSet[p] = true
+	}
+
 	return func(c *gin.Context) {
-		start := c.Request.Context()
 		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
 
 		c.Next()
+
+		// Skip logging for specified paths
+		if skipSet[path] {
+			return
+		}
 
 		logger.Info("Request",
 			zap.String("method", c.Request.Method),
 			zap.String("path", path),
-			zap.String("query", query),
+			zap.String("query", c.Request.URL.RawQuery),
 			zap.Int("status", c.Writer.Status()),
 		)
-
-		_ = start // Use the variable
 	}
 }
