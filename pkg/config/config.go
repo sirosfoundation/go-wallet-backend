@@ -20,6 +20,17 @@ type Config struct {
 	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
 	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
+	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
+}
+
+// HTTPClientConfig contains HTTP client configuration for outbound requests
+type HTTPClientConfig struct {
+	// ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080)
+	ProxyURL string `yaml:"proxy_url" envconfig:"PROXY_URL"`
+	// Timeout is the timeout for HTTP requests in seconds (default: 30)
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+	// InsecureSkipVerify disables TLS certificate verification (not recommended for production)
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
 }
 
 // ServerConfig contains HTTP server configuration
@@ -489,6 +500,9 @@ func defaultConfig() *Config {
 				Enabled:                true, // Enabled by default for security
 				CleanupIntervalSeconds: 3600,
 			},
+		},
+		HTTPClient: HTTPClientConfig{
+			Timeout: 30, // 30 seconds default
 		},
 	}
 }
