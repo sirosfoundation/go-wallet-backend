@@ -448,8 +448,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rp_origin is required")
 	}
 
-	if c.Storage.Type != "memory" && c.Storage.Type != "sqlite" && c.Storage.Type != "mongodb" {
-		return fmt.Errorf("invalid storage type: %s (must be memory, sqlite, or mongodb)", c.Storage.Type)
+	// Storage type validation
+	switch c.Storage.Type {
+	case "memory", "mongodb":
+		// Supported storage types
+	case "sqlite":
+		return fmt.Errorf("sqlite storage is not yet implemented - please use 'memory' or 'mongodb'")
+	default:
+		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {
