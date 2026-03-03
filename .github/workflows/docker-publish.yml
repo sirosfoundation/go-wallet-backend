@@ -3,7 +3,7 @@ name: Build and Publish Docker Image
 on:
   push:
     branches:
-      - main
+      - '*'
     tags:
       - 'v*'
   pull_request:
@@ -23,7 +23,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: sirosfoundation/go-wallet-backend
+  IMAGE_NAME: s-jairl/go-wallet-backend
 
 jobs:
   build-and-push:
