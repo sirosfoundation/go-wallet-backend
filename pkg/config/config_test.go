@@ -361,3 +361,35 @@ jwt:
 		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
 	}
 }
+func TestTrustConfig_GetPDPURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected string
+	}{
+		{
+			name:     "PDPURL takes precedence",
+			cfg:      TrustConfig{PDPURL: "https://new.example.com", DefaultEndpoint: "https://old.example.com"},
+			expected: "https://new.example.com",
+		},
+		{
+			name:     "fallback to DefaultEndpoint for backward compatibility",
+			cfg:      TrustConfig{DefaultEndpoint: "https://old.example.com"},
+			expected: "https://old.example.com",
+		},
+		{
+			name:     "empty when both empty (allow all mode)",
+			cfg:      TrustConfig{},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetPDPURL()
+			if got != tt.expected {
+				t.Errorf("GetPDPURL() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}

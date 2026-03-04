@@ -65,14 +65,14 @@ type KeyMaterial struct {
 }
 
 // GetEvaluator returns an AuthZEN evaluator for the given endpoint.
-// Uses the default endpoint if endpoint is empty.
-// Returns nil if no trust endpoint is configured.
+// Uses the default PDP URL from config if endpoint is empty.
+// Returns nil if no trust endpoint is configured (operating in "allow all" mode).
 func (ts *TrustService) GetEvaluator(endpoint string) (*authzen.Evaluator, error) {
 	if endpoint == "" {
-		endpoint = ts.cfg.Trust.DefaultEndpoint
+		endpoint = ts.cfg.Trust.GetPDPURL()
 	}
 	if endpoint == "" {
-		return nil, nil // No trust configured
+		return nil, nil // No trust configured - "allow all" mode
 	}
 
 	// Check cache

@@ -214,15 +214,35 @@ type WalletProviderConfig struct {
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 }
 
-// TrustConfig contains trust evaluation configuration
+// TrustConfig contains trust evaluation configuration.
+//
+// Trust evaluation operates in one of two modes:
+//   - When PDPURL is configured: "default deny" mode - all trust decisions go through the PDP
+//   - When PDPURL is empty: "allow all" mode - requests are always considered trusted
 type TrustConfig struct {
-	// DefaultEndpoint is the go-trust PDP endpoint for trust evaluation.
-	// Tenants can override this with their own endpoint.
+	// PDPURL is the URL of the AuthZEN PDP (Policy Decision Point) for trust evaluation.
+	// When set, operates in "default deny" mode - trust decisions require PDP approval.
+	// When empty, operates in "allow all" mode - requests are always considered trusted.
+	PDPURL string `yaml:"pdp_url" envconfig:"PDP_URL"`
+
+	// DefaultEndpoint is deprecated. Use PDPURL instead.
+	// Retained for backward compatibility - if PDPURL is empty and DefaultEndpoint is set,
+	// DefaultEndpoint is used.
+	// Deprecated: This field will be removed in a future release.
 	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
+
 	// RegistryURL is the URL for the VCTM registry service.
 	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
 	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+}
+
+// GetPDPURL returns the effective PDP URL, preferring PDPURL over the deprecated DefaultEndpoint.
+func (c *TrustConfig) GetPDPURL() string {
+	if c.PDPURL != "" {
+		return c.PDPURL
+	}
+	return c.DefaultEndpoint
 }
 
 // FeaturesConfig contains feature flags for controlling behavior
