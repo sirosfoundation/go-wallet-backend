@@ -2,7 +2,9 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -277,5 +279,203 @@ func TestReadinessManager_BackgroundProbe(t *testing.T) {
 	// Should have run multiple checks
 	if checkCount < 2 {
 		t.Errorf("Expected multiple background checks, got %d", checkCount)
+	}
+}
+
+// Additional edge case tests
+
+func TestReadinessManager_ContextCancellation(t *testing.T) {
+	mgr := NewReadinessManager(WithCheckTimeout(5 * time.Second))
+	mgr.AddChecker(&mockChecker{name: "slow", ready: true, checkTime: 10 * time.Second})
+
+	// Create a context that gets cancelled quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	status := mgr.CheckReady(ctx)
+	elapsed := time.Since(start)
+
+	// Should respect context cancellation, not the 5s check timeout
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("Should have respected context cancellation, took %v", elapsed)
+	}
+	if status.Ready {
+		t.Error("Expected ready=false due to context cancellation")
+	}
+}
+
+func TestReadinessManager_ConcurrentChecks(t *testing.T) {
+	checker := &mockChecker{name: "db", ready: true, checkTime: 10 * time.Millisecond}
+	mgr := NewReadinessManager(WithCacheTTL(100 * time.Millisecond))
+	mgr.AddChecker(checker)
+
+	// Run many concurrent checks
+	const numGoroutines = 100
+	done := make(chan struct{}, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			status := mgr.CheckReady(context.Background())
+			if !status.Ready {
+				t.Error("Expected ready=true")
+			}
+		}()
+	}
+
+	// Wait for all to complete
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+}
+
+func TestReadinessManager_StopMultipleTimes(t *testing.T) {
+	mgr := NewReadinessManager()
+	mgr.StartBackgroundProbe(50 * time.Millisecond)
+
+	// Stopping multiple times should be safe
+	mgr.Stop()
+	mgr.Stop()
+	mgr.Stop()
+}
+
+func TestReadinessManager_AddCheckerConcurrent(t *testing.T) {
+	mgr := NewReadinessManager()
+
+	// Add checkers concurrently while running checks
+	done := make(chan struct{}, 50)
+	for i := 0; i < 25; i++ {
+		go func(idx int) {
+			defer func() { done <- struct{}{} }()
+			mgr.AddChecker(&mockChecker{name: fmt.Sprintf("checker-%d", idx), ready: true})
+		}(i)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			mgr.CheckReady(context.Background())
+		}()
+	}
+
+	for i := 0; i < 50; i++ {
+		<-done
+	}
+}
+
+func TestReadinessManager_EmptyCheckerName(t *testing.T) {
+	mgr := NewReadinessManager()
+	mgr.AddChecker(&mockChecker{name: "", ready: true})
+
+	status := mgr.CheckReady(context.Background())
+	if !status.Ready {
+		t.Error("Expected ready=true")
+	}
+	if len(status.Checks) != 1 {
+		t.Errorf("Expected 1 check, got %d", len(status.Checks))
+	}
+}
+
+func TestReadinessManager_CheckLatency(t *testing.T) {
+	mgr := NewReadinessManager()
+	mgr.AddChecker(&mockChecker{name: "fast", ready: true, checkTime: 50 * time.Millisecond})
+
+	status := mgr.CheckReady(context.Background())
+
+	if len(status.Checks) != 1 {
+		t.Fatal("Expected 1 check")
+	}
+	// Latency should be recorded and ~50ms
+	if status.Checks[0].Latency < 40 || status.Checks[0].Latency > 100 {
+		t.Errorf("Expected latency ~50ms, got %f ms", status.Checks[0].Latency)
+	}
+}
+
+func TestReadinessManager_CheckedAtTimestamp(t *testing.T) {
+	mgr := NewReadinessManager()
+	mgr.AddChecker(&mockChecker{name: "db", ready: true})
+
+	before := time.Now()
+	status := mgr.CheckReady(context.Background())
+	after := time.Now()
+
+	if status.CheckedAt.Before(before) || status.CheckedAt.After(after) {
+		t.Errorf("CheckedAt %v should be between %v and %v", status.CheckedAt, before, after)
+	}
+}
+
+func TestReadinessManager_MultipleFailures(t *testing.T) {
+	mgr := NewReadinessManager()
+	mgr.AddChecker(&mockChecker{name: "db", ready: false, err: errors.New("db down")})
+	mgr.AddChecker(&mockChecker{name: "cache", ready: false, err: errors.New("cache down")})
+	mgr.AddChecker(&mockChecker{name: "healthy", ready: true})
+
+	status := mgr.CheckReady(context.Background())
+
+	if status.Ready {
+		t.Error("Expected ready=false with multiple failures")
+	}
+
+	// Count failures
+	failures := 0
+	for _, check := range status.Checks {
+		if !check.Ready {
+			failures++
+		}
+	}
+	if failures != 2 {
+		t.Errorf("Expected 2 failures, got %d", failures)
+	}
+}
+
+func TestReadinessStatus_JSON(t *testing.T) {
+	status := &ReadinessStatus{
+		Ready: true,
+		Checks: []CheckResult{
+			{Name: "db", Ready: true, Latency: 1.5, CheckedAt: time.Now()},
+			{Name: "cache", Ready: false, Error: "timeout", Latency: 100.0, CheckedAt: time.Now()},
+		},
+		CheckedAt: time.Now(),
+	}
+
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Failed to marshal status: %v", err)
+	}
+
+	var decoded ReadinessStatus
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Failed to unmarshal status: %v", err)
+	}
+
+	if decoded.Ready != status.Ready {
+		t.Error("Ready mismatch")
+	}
+	if len(decoded.Checks) != 2 {
+		t.Error("Checks count mismatch")
+	}
+}
+
+func TestDatabaseChecker_Timeout(t *testing.T) {
+	slowPinger := &slowMockPinger{delay: 5 * time.Second}
+	checker := NewDatabaseChecker("db", slowPinger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := checker.CheckReady(ctx)
+	if err == nil {
+		t.Error("Expected timeout error")
+	}
+}
+
+type slowMockPinger struct {
+	delay time.Duration
+}
+
+func (p *slowMockPinger) Ping(ctx context.Context) error {
+	select {
+	case <-time.After(p.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
