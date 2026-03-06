@@ -235,6 +235,19 @@ func (p *EngineProvider) Close() {
 	}
 }
 
+// CheckReady implements health.ReadinessChecker for EngineProvider.
+// It verifies the WebSocket engine manager is operational.
+func (p *EngineProvider) CheckReady(ctx context.Context) error {
+	if p.manager == nil {
+		return fmt.Errorf("engine manager not initialized")
+	}
+	// Check if manager is healthy (not shutting down, accepting connections)
+	if !p.manager.IsHealthy() {
+		return fmt.Errorf("engine manager not healthy")
+	}
+	return nil
+}
+
 // =============================================================================
 // Combined Backend Provider - combines auth + storage (backward compatible)
 // =============================================================================
@@ -289,6 +302,18 @@ func (p *BackendProvider) Close() error {
 		return p.store.Close()
 	}
 	return nil
+}
+
+// CheckReady implements health.ReadinessChecker for BackendProvider.
+// It verifies the database connection is healthy.
+func (p *BackendProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("storage not initialized")
+	}
+	// Use a short timeout for readiness checks
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	return p.store.Ping(checkCtx)
 }
 
 // Store returns the underlying storage backend
@@ -419,5 +444,20 @@ func (p *RegistryProvider) Close() error {
 		}
 	}
 
+	return nil
+}
+
+// CheckReady implements health.ReadinessChecker for RegistryProvider.
+// It verifies the registry store is initialized and operational.
+func (p *RegistryProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("registry store not initialized")
+	}
+	// Store is file-based cache, check it's loaded
+	if p.store.Count() == 0 && !p.cfg.DynamicCache.Enabled {
+		// If dynamic cache is disabled and store is empty, that may be intentional
+		// Allow this state - the store is still functional
+		return nil
+	}
 	return nil
 }

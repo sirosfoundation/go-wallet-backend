@@ -487,6 +487,16 @@ func (m *Manager) Close() {
 	}
 }
 
+// IsHealthy returns true if the manager is able to accept new connections.
+// This is used for readiness checks.
+func (m *Manager) IsHealthy() bool {
+	// Manager is healthy if it exists and has been initialized
+	// (sessions map is non-nil). During shutdown, sessions become nil.
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	return m.sessions != nil
+}
+
 // Send sends a message to the client
 func (s *Session) Send(msg interface{}) error {
 	s.sendMu.Lock()

@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
+	"github.com/sirosfoundation/go-wallet-backend/internal/health"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -55,6 +56,15 @@ type AdminRouteProvider interface {
 	// RegisterAdminRoutes adds admin routes to the protected admin group.
 	// The group already has admin auth middleware applied.
 	RegisterAdminRoutes(adminGroup *gin.RouterGroup)
+}
+
+// ReadinessCheckProvider allows providers to contribute readiness checks.
+// Providers that implement this interface will have their CheckReady method
+// called when the /readyz endpoint is accessed.
+type ReadinessCheckProvider interface {
+	// CheckReady returns nil if the provider is ready to serve requests,
+	// or an error describing why it is not ready.
+	CheckReady(ctx context.Context) error
 }
 
 // ServerConfig holds unified server configuration
@@ -102,6 +112,9 @@ type Manager struct {
 
 	httpRouter *gin.Engine
 	wsRouter   *gin.Engine // Only used if WSSeparate
+
+	// Readiness management for /readyz endpoint
+	readiness *health.ReadinessManager
 }
 
 // NewManager creates a new server manager
@@ -110,16 +123,43 @@ func NewManager(cfg *ServerConfig, logger *zap.Logger) *Manager {
 		cfg:       cfg,
 		logger:    logger,
 		providers: make([]RouteProvider, 0),
+		readiness: health.NewReadinessManager(
+			health.WithCacheTTL(2*time.Second),
+			health.WithCheckTimeout(2*time.Second),
+		),
 	}
 }
 
 // AddProvider adds a RouteProvider to the manager.
 // Call this before Start() to register all modes.
+// If the provider implements ReadinessCheckProvider, it will be registered
+// for readiness checks on the /readyz endpoint.
 func (m *Manager) AddProvider(p RouteProvider) {
 	m.providers = append(m.providers, p)
 	m.logger.Debug("Added route provider",
 		zap.String("name", p.Name()),
 		zap.String("transport", string(p.Transport())))
+
+	// Register readiness checker if provider implements it
+	if checker, ok := p.(ReadinessCheckProvider); ok {
+		m.readiness.AddChecker(&providerChecker{
+			name:    p.Name(),
+			checker: checker,
+		})
+		m.logger.Debug("Registered readiness checker",
+			zap.String("provider", p.Name()))
+	}
+}
+
+// providerChecker adapts a ReadinessCheckProvider to health.ReadinessChecker
+type providerChecker struct {
+	name    string
+	checker ReadinessCheckProvider
+}
+
+func (c *providerChecker) Name() string { return c.name }
+func (c *providerChecker) CheckReady(ctx context.Context) error {
+	return c.checker.CheckReady(ctx)
 }
 
 // Start builds routers and starts http servers
@@ -208,11 +248,21 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start background readiness probe for proactive health checking
+	// This ensures cached readiness status is fresh for burst traffic
+	m.readiness.StartBackgroundProbe(5 * time.Second)
+	m.logger.Info("Started background readiness probe", zap.Duration("interval", 5*time.Second))
+
 	return nil
 }
 
 // Shutdown gracefully shuts down all servers
 func (m *Manager) Shutdown(ctx context.Context) error {
+	// Stop background readiness probe first
+	if m.readiness != nil {
+		m.readiness.Stop()
+	}
+
 	var errs []error
 
 	if m.httpServer != nil {
@@ -243,7 +293,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(m.logger, "/status", "/health"))
+	router.Use(middleware.Logger(m.logger, "/status", "/health", "/readyz"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     m.cfg.CORS.AllowedOrigins,
 		AllowMethods:     m.cfg.CORS.AllowedMethods,
@@ -255,9 +305,10 @@ func (m *Manager) buildRouter() *gin.Engine {
 	return router
 }
 
-// addStatusEndpoints adds /health and /status routes
+// addStatusEndpoints adds /health, /status, and /readyz routes
 func (m *Manager) addStatusEndpoints(router *gin.Engine) {
-	handler := func(c *gin.Context) {
+	// /health and /status - basic liveness check
+	statusHandler := func(c *gin.Context) {
 		c.JSON(http.StatusOK, api.StatusResponse{
 			Status:       "ok",
 			Service:      "wallet-backend",
@@ -266,8 +317,26 @@ func (m *Manager) addStatusEndpoints(router *gin.Engine) {
 			Capabilities: api.CapabilitiesForRoles(m.cfg.Roles),
 		})
 	}
-	router.GET("/health", handler)
-	router.GET("/status", handler)
+	router.GET("/health", statusHandler)
+	router.GET("/status", statusHandler)
+
+	// /readyz - Kubernetes-style readiness probe
+	// Returns 200 if all mode-specific dependencies are ready,
+	// 503 if any dependency is not ready.
+	router.GET("/readyz", func(c *gin.Context) {
+		status := m.readiness.CheckReady(c.Request.Context())
+
+		if !status.Ready {
+			// Return 503 with details about what's not ready
+			m.logger.Warn("Readiness check failed",
+				zap.Any("checks", status.Checks))
+			c.JSON(http.StatusServiceUnavailable, status)
+			return
+		}
+
+		// Return 200 - ready to serve
+		c.JSON(http.StatusOK, status)
+	})
 }
 
 // startAdminServer starts the admin API server
