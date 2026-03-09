@@ -65,8 +65,45 @@ type KeyMaterial struct {
 	Type string
 	// X5C contains base64-encoded DER certificates (for x5c type)
 	X5C []string
-	// JWK contains JWK(S) data (for jwk type)
+	// JWK contains the key data (for jwk type).
+	// Can be a single JWK (map[string]any), a JWKS object ({"keys": [...]}),
+	// or already-normalized []interface{} of JWK maps.
 	JWK interface{}
+	// CredentialType is the type of credential (e.g., "PID", "mDL", vct value).
+	// Optional; used for fine-grained trust policy decisions.
+	CredentialType string
+}
+
+// NormalizeJWKS takes JWK data in various formats and returns a slice of individual
+// JWK objects suitable for the AuthZEN resource.key array.
+//
+// Accepted inputs:
+//   - map[string]any with "keys" array (JWKS) → extracts individual keys
+//   - map[string]any without "keys" (single JWK) → wraps in slice
+//   - []interface{} (already normalized) → returns as-is
+//   - nil → returns nil
+func NormalizeJWKS(jwkData interface{}) []interface{} {
+	if jwkData == nil {
+		return nil
+	}
+
+	switch v := jwkData.(type) {
+	case map[string]interface{}:
+		// Check if this is a JWKS wrapper with a "keys" array
+		if keysRaw, ok := v["keys"]; ok {
+			if keys, ok := keysRaw.([]interface{}); ok && len(keys) > 0 {
+				return keys
+			}
+		}
+		// Single JWK object
+		return []interface{}{v}
+	case []interface{}:
+		// Already a slice of keys
+		return v
+	default:
+		// Unknown format, wrap as single element
+		return []interface{}{v}
+	}
 }
 
 // TrustInfo contains trust evaluation results.
@@ -218,6 +255,11 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	req.SubjectID = subjectID
 	req.Role = role
 
+	// Set credential type if provided
+	if keyMaterial != nil && keyMaterial.CredentialType != "" {
+		req.CredentialType = keyMaterial.CredentialType
+	}
+
 	// Set key material if provided
 	if keyMaterial != nil {
 		switch keyMaterial.Type {
@@ -233,15 +275,30 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 				zap.String(logLabel, subjectID),
 				zap.Int("cert_count", len(keyMaterial.X5C)))
 		case "jwk":
+			// Normalize JWKS/JWK into a flat slice of individual JWK objects
+			normalized := NormalizeJWKS(keyMaterial.JWK)
 			req.KeyType = KeyTypeJWK
 			req.Resource = Resource{
 				Type: ResourceTypeJWK,
 				ID:   subjectID,
-				Key:  keyMaterial.JWK,
+				Key:  normalized,
 			}
-			req.Key = keyMaterial.JWK
+			req.Key = normalized
 			s.logger.Debug("Trust evaluation with JWK",
-				zap.String(logLabel, subjectID))
+				zap.String(logLabel, subjectID),
+				zap.Int("key_count", len(normalized)))
+		case "":
+			// Type not set but key material provided; try to infer
+			if len(keyMaterial.X5C) > 0 {
+				req.KeyType = KeyTypeX5C
+				req.Resource = Resource{Type: ResourceTypeX5C, ID: subjectID, Key: keyMaterial.X5C}
+				req.Key = keyMaterial.X5C
+			} else if keyMaterial.JWK != nil {
+				normalized := NormalizeJWKS(keyMaterial.JWK)
+				req.KeyType = KeyTypeJWK
+				req.Resource = Resource{Type: ResourceTypeJWK, ID: subjectID, Key: normalized}
+				req.Key = normalized
+			}
 		}
 	} else {
 		s.logger.Debug("Trust evaluation resolution-only",

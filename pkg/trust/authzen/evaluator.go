@@ -215,7 +215,9 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 		}
 		authzenReq.Resource.Key = keys
 	case trust.ResourceTypeJWK:
-		authzenReq.Resource.Key = []interface{}{req.GetKey()}
+		// JWK key material may already be normalized ([]interface{} of JWK maps)
+		// or a single JWK map. Use NormalizeJWKS to ensure correct format.
+		authzenReq.Resource.Key = trust.NormalizeJWKS(req.GetKey())
 	}
 
 	// Set action if specified

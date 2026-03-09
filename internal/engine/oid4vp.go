@@ -55,6 +55,9 @@ type AuthorizationRequest struct {
 	PresentationDefinitionURI string                  `json:"presentation_definition_uri,omitempty"`
 	ClientMetadata            *ClientMetadata         `json:"client_metadata,omitempty"`
 	ClientMetadataURI         string                  `json:"client_metadata_uri,omitempty"`
+	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
+	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
+	RequestJWT string `json:"-"`
 }
 
 // PresentationDefinition represents a DIF Presentation Definition
@@ -276,6 +279,9 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 		return nil, fmt.Errorf("failed to parse JWT payload: %w", err)
 	}
 
+	// Store the raw JWT so we can extract key material from its header later
+	authReq.RequestJWT = jwtStr
+
 	return &authReq, nil
 }
 
@@ -360,6 +366,11 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
 	}
 
+	// Fallback: extract key material from the request JWT header (x5c or jwk)
+	if keyMaterial == nil && authReq.RequestJWT != "" {
+		keyMaterial = h.extractKeyMaterialFromJWT(authReq.RequestJWT)
+	}
+
 	// Evaluate trust via TrustService
 	// Get tenant trust endpoint from session (if configured)
 	trustEndpoint := ""
@@ -417,6 +428,47 @@ func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMe
 	}
 
 	// No key material available - will use resolution-only mode (for DIDs)
+	return nil
+}
+
+// extractKeyMaterialFromJWT extracts key material (x5c or jwk) from a JWT header.
+// Returns KeyMaterial with type "x5c" if x5c header is found, "jwk" if jwk header is found,
+// or nil if neither is present.
+func (h *OID4VPHandler) extractKeyMaterialFromJWT(jwtStr string) *KeyMaterial {
+	parts := strings.Split(jwtStr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil
+	}
+
+	var header struct {
+		X5C []string       `json:"x5c"`
+		JWK map[string]any `json:"jwk"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil
+	}
+
+	// x5c takes precedence
+	if len(header.X5C) > 0 {
+		return &KeyMaterial{
+			Type: "x5c",
+			X5C:  header.X5C,
+		}
+	}
+
+	// Embedded JWK
+	if len(header.JWK) > 0 {
+		return &KeyMaterial{
+			Type: "jwk",
+			JWK:  header.JWK,
+		}
+	}
+
 	return nil
 }
 

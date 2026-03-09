@@ -277,3 +277,170 @@ func TestTrustService_ConcurrentRequests(t *testing.T) {
 		}
 	}
 }
+
+// TestTrustService_JWKKeyMaterial tests trust evaluation with JWK key material.
+func TestTrustService_JWKKeyMaterial(t *testing.T) {
+	t.Run("Single JWK trusted", func(t *testing.T) {
+		reg := static.NewAlwaysTrustedRegistry("jwk-trusted")
+		srv := testserver.New(testserver.WithRegistry(reg))
+		defer srv.Close()
+
+		cfg := &config.Config{
+			Trust: config.TrustConfig{
+				DefaultEndpoint: srv.URL(),
+				Timeout:         10,
+			},
+		}
+		logger, _ := zap.NewDevelopment()
+		trustService := engine.NewTrustService(cfg, logger)
+
+		ctx := context.Background()
+		km := &engine.KeyMaterial{
+			Type: "jwk",
+			JWK: map[string]interface{}{
+				"kty": "EC",
+				"crv": "P-256",
+				"x":   "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+				"y":   "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+				"kid": "test-key-1",
+			},
+		}
+
+		info, err := trustService.EvaluateIssuer(ctx, "https://issuer.example.com", "", km)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.True(t, info.Trusted)
+		assert.Equal(t, "authzen", info.Framework)
+	})
+
+	t.Run("JWKS wrapper trusted", func(t *testing.T) {
+		reg := static.NewAlwaysTrustedRegistry("jwks-trusted")
+		srv := testserver.New(testserver.WithRegistry(reg))
+		defer srv.Close()
+
+		cfg := &config.Config{
+			Trust: config.TrustConfig{
+				DefaultEndpoint: srv.URL(),
+				Timeout:         10,
+			},
+		}
+		logger, _ := zap.NewDevelopment()
+		trustService := engine.NewTrustService(cfg, logger)
+
+		ctx := context.Background()
+		// JWKS object with keys array (as returned by fetchJWKS)
+		km := &engine.KeyMaterial{
+			Type: "jwk",
+			JWK: map[string]interface{}{
+				"keys": []interface{}{
+					map[string]interface{}{
+						"kty": "EC",
+						"crv": "P-256",
+						"x":   "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+						"y":   "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+						"kid": "key-1",
+					},
+				},
+			},
+		}
+
+		info, err := trustService.EvaluateIssuer(ctx, "https://issuer.example.com", "", km)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.True(t, info.Trusted)
+	})
+
+	t.Run("JWK untrusted", func(t *testing.T) {
+		reg := static.NewNeverTrustedRegistry("jwk-untrusted")
+		srv := testserver.New(testserver.WithRegistry(reg))
+		defer srv.Close()
+
+		cfg := &config.Config{
+			Trust: config.TrustConfig{
+				DefaultEndpoint: srv.URL(),
+				Timeout:         10,
+			},
+		}
+		logger, _ := zap.NewDevelopment()
+		trustService := engine.NewTrustService(cfg, logger)
+
+		ctx := context.Background()
+		km := &engine.KeyMaterial{
+			Type: "jwk",
+			JWK: map[string]interface{}{
+				"kty": "EC",
+				"crv": "P-256",
+				"x":   "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+				"y":   "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+			},
+		}
+
+		info, err := trustService.EvaluateIssuer(ctx, "https://issuer.example.com", "", km)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.False(t, info.Trusted)
+	})
+
+	t.Run("JWK with credential type", func(t *testing.T) {
+		reg := static.NewAlwaysTrustedRegistry("jwk-cred-type")
+		srv := testserver.New(testserver.WithRegistry(reg))
+		defer srv.Close()
+
+		cfg := &config.Config{
+			Trust: config.TrustConfig{
+				DefaultEndpoint: srv.URL(),
+				Timeout:         10,
+			},
+		}
+		logger, _ := zap.NewDevelopment()
+		trustService := engine.NewTrustService(cfg, logger)
+
+		ctx := context.Background()
+		km := &engine.KeyMaterial{
+			Type: "jwk",
+			JWK: map[string]interface{}{
+				"kty": "EC",
+				"crv": "P-256",
+				"x":   "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+				"y":   "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+			},
+			CredentialType: "urn:eu.europa.ec.eudi:pid:1",
+		}
+
+		info, err := trustService.EvaluateIssuer(ctx, "https://issuer.example.com", "", km)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.True(t, info.Trusted)
+	})
+
+	t.Run("Verifier with JWK", func(t *testing.T) {
+		reg := static.NewAlwaysTrustedRegistry("verifier-jwk")
+		srv := testserver.New(testserver.WithRegistry(reg))
+		defer srv.Close()
+
+		cfg := &config.Config{
+			Trust: config.TrustConfig{
+				DefaultEndpoint: srv.URL(),
+				Timeout:         10,
+			},
+		}
+		logger, _ := zap.NewDevelopment()
+		trustService := engine.NewTrustService(cfg, logger)
+
+		ctx := context.Background()
+		km := &engine.KeyMaterial{
+			Type: "jwk",
+			JWK: map[string]interface{}{
+				"kty": "EC",
+				"crv": "P-256",
+				"x":   "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+				"y":   "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
+			},
+		}
+
+		info, err := trustService.EvaluateVerifier(ctx, "https://verifier.example.com", "", km)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.True(t, info.Trusted)
+	})
+}

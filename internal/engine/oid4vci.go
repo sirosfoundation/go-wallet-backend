@@ -58,8 +58,10 @@ type IssuerMetadata struct {
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 	// mDOC IACA certificates URL
 	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
-	// Signed metadata JWT (contains x5c for trust evaluation)
+	// Signed metadata JWT (contains x5c or jwk for trust evaluation)
 	SignedMetadata string `json:"signed_metadata,omitempty"`
+	// Inline JWKS for issuer keys
+	JWKS json.RawMessage `json:"jwks,omitempty"`
 	// JWKS URI for issuer keys
 	JWKsURI string `json:"jwks_uri,omitempty"`
 }
@@ -325,6 +327,11 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	// Extract key material from issuer metadata for trust evaluation
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
 
+	// Collect credential types from the offered configurations for trust policy
+	if keyMaterial != nil && keyMaterial.CredentialType == "" {
+		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
+	}
+
 	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint, keyMaterial)
 	if err != nil {
 		h.Logger.Error("Trust evaluation failed", zap.String("issuer", issuer), zap.Error(err))
@@ -339,8 +346,23 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	return trust, nil
 }
 
+// collectCredentialTypes returns a comma-separated list of VCT/doctype values
+// from the issuer metadata's credential configurations.
+func (h *OID4VCIHandler) collectCredentialTypes(metadata *IssuerMetadata) string {
+	var types []string
+	for _, cfg := range metadata.CredentialConfigurationsSupported {
+		if cfg.VCT != "" {
+			types = append(types, cfg.VCT)
+		}
+	}
+	if len(types) == 1 {
+		return types[0]
+	}
+	return strings.Join(types, ",")
+}
+
 // extractIssuerKeyMaterial extracts key material from issuer metadata for trust evaluation.
-// Priority: mdoc_iacas_uri > signed_metadata x5c > jwks_uri
+// Priority: mdoc_iacas_uri > signed_metadata (x5c or jwk) > inline jwks > jwks_uri
 // For DIDs (issuerID starts with did:), returns nil to use resolution-only mode.
 func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata *IssuerMetadata) *KeyMaterial {
 	// Fetch IACA certificates for mDOC
@@ -358,15 +380,23 @@ func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata 
 		}
 	}
 
-	// Extract x5c from signed_metadata JWT header
+	// Extract key material (x5c or jwk) from signed_metadata JWT header
 	if metadata.SignedMetadata != "" {
-		x5c := h.extractX5CFromJWT(metadata.SignedMetadata)
-		if len(x5c) > 0 {
+		if km := h.extractKeyMaterialFromJWT(metadata.SignedMetadata); km != nil {
+			return km
+		}
+	}
+
+	// Inline JWKS in metadata
+	if len(metadata.JWKS) > 0 {
+		var jwks interface{}
+		if err := json.Unmarshal(metadata.JWKS, &jwks); err == nil {
 			return &KeyMaterial{
-				Type: "x5c",
-				X5C:  x5c,
+				Type: "jwk",
+				JWK:  jwks,
 			}
 		}
+		h.Logger.Warn("Failed to parse inline JWKS from issuer metadata")
 	}
 
 	// Fetch JWKS from jwks_uri
@@ -425,8 +455,10 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 	return certs, nil
 }
 
-// extractX5CFromJWT extracts the x5c certificate chain from a JWT header
-func (h *OID4VCIHandler) extractX5CFromJWT(jwtStr string) []string {
+// extractKeyMaterialFromJWT extracts key material (x5c or jwk) from a JWT header.
+// Returns KeyMaterial with type "x5c" if x5c header is found, "jwk" if jwk header is found,
+// or nil if neither is present.
+func (h *OID4VCIHandler) extractKeyMaterialFromJWT(jwtStr string) *KeyMaterial {
 	parts := strings.Split(jwtStr, ".")
 	if len(parts) < 2 {
 		return nil
@@ -438,13 +470,30 @@ func (h *OID4VCIHandler) extractX5CFromJWT(jwtStr string) []string {
 	}
 
 	var header struct {
-		X5C []string `json:"x5c"`
+		X5C []string       `json:"x5c"`
+		JWK map[string]any `json:"jwk"`
 	}
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return nil
 	}
 
-	return header.X5C
+	// x5c takes precedence
+	if len(header.X5C) > 0 {
+		return &KeyMaterial{
+			Type: "x5c",
+			X5C:  header.X5C,
+		}
+	}
+
+	// Embedded JWK
+	if len(header.JWK) > 0 {
+		return &KeyMaterial{
+			Type: "jwk",
+			JWK:  header.JWK,
+		}
+	}
+
+	return nil
 }
 
 // fetchJWKS fetches a JWKS from a URI
