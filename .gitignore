@@ -41,5 +41,5 @@ playwright-screenshots/
 
 # VS Code MCP configuration (contains personal tokens)
 .vscode/mcp.json
-wallet-admin
+/wallet-admin
 registry_coverage.out
