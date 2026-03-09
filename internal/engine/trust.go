@@ -2,7 +2,6 @@
 package engine
 
 import (
-	"net/http"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,21 +26,23 @@ type (
 // NewTrustService creates a new trust service with the default AuthZEN evaluator factory.
 // This is a convenience wrapper for backward compatibility.
 func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
-	return trust.NewService(cfg, logger, AuthZENEvaluatorFactory)
+	return trust.NewService(cfg, logger, newAuthZENEvaluatorFactory(cfg))
 }
 
-// AuthZENEvaluatorFactory creates AuthZEN evaluators with tenant-aware transport.
-// This is the default evaluator factory used by the engine.
-func AuthZENEvaluatorFactory(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
-	httpClient := &http.Client{
-		Timeout: timeout,
-		Transport: &trust.TenantTransport{
-			Base: http.DefaultTransport,
-		},
-	}
+// newAuthZENEvaluatorFactory creates an AuthZEN evaluator factory that uses the
+// application HTTP client configuration (proxy, TLS settings) and wraps it with
+// tenant-aware transport for multi-tenant PDP routing.
+func newAuthZENEvaluatorFactory(cfg *config.Config) trust.EvaluatorFactory {
+	return func(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
+		httpClient := cfg.HTTPClient.NewHTTPClient(timeout)
+		// Wrap the transport with TenantTransport for multi-tenant support
+		httpClient.Transport = &trust.TenantTransport{
+			Base: httpClient.Transport,
+		}
 
-	return authzen.NewEvaluatorWithHTTPClient(&authzen.Config{
-		BaseURL: endpoint,
-		Timeout: timeout,
-	}, httpClient)
+		return authzen.NewEvaluatorWithHTTPClient(&authzen.Config{
+			BaseURL: endpoint,
+			Timeout: timeout,
+		}, httpClient)
+	}
 }

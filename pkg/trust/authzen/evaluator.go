@@ -114,10 +114,33 @@ func (e *Evaluator) SupportedResourceTypes() []trust.ResourceType {
 }
 
 // Healthy returns whether the evaluator is operational.
+// If the evaluator was marked unhealthy, it automatically recovers after
+// healthPeriod has elapsed, allowing a retry on the next request.
 func (e *Evaluator) Healthy() bool {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.healthy
+	healthy := e.healthy
+	lastCheck := e.lastCheck
+	healthPeriod := e.healthPeriod
+	e.mu.RUnlock()
+
+	if healthy {
+		return true
+	}
+
+	// Auto-recover: if enough time has passed since the last failure,
+	// optimistically consider the evaluator healthy to allow a retry.
+	if time.Since(lastCheck) >= healthPeriod {
+		e.mu.Lock()
+		// Double-check under write lock (another goroutine may have updated)
+		if !e.healthy && time.Since(e.lastCheck) >= e.healthPeriod {
+			e.healthy = true
+			e.lastCheck = time.Now()
+		}
+		healthy = e.healthy
+		e.mu.Unlock()
+	}
+
+	return healthy
 }
 
 // SetHealthy sets the health status (useful for circuit breaker patterns).
@@ -194,6 +217,13 @@ func (e *Evaluator) EvaluateX5C(ctx context.Context, subjectID string, certChain
 
 // toAuthZENRequest converts our request format to AuthZEN format.
 func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.EvaluationRequest, error) {
+	// Resource.ID should match subject.id per AuthZEN spec.
+	// Fall back to SubjectID if the legacy Resource.ID is empty.
+	resourceID := req.Resource.ID
+	if resourceID == "" {
+		resourceID = req.GetSubjectID()
+	}
+
 	authzenReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
 			Type: "key",
@@ -201,7 +231,7 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 		},
 		Resource: gotrust.Resource{
 			Type: string(req.GetKeyType()),
-			ID:   req.Resource.ID,
+			ID:   resourceID,
 		},
 	}
 
@@ -220,15 +250,25 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 		authzenReq.Resource.Key = trust.NormalizeJWKS(req.GetKey())
 	}
 
-	// Set action if specified
-	action := req.GetAction()
-	if action != "" {
+	// Set action from Role (preferred) or explicit Action field.
+	// Role maps to action.name in the AuthZEN Trust Registry Profile,
+	// enabling policy-based routing (e.g., "credential-issuer" vs "credential-verifier").
+	if role := req.Role; role != "" {
+		authzenReq.Action = &gotrust.Action{Name: string(role)}
+	} else if action := req.GetAction(); action != "" {
 		authzenReq.Action = &gotrust.Action{Name: action}
 	}
 
-	// Copy context
-	if req.Context != nil {
-		authzenReq.Context = req.Context
+	// Build context with credential type and any existing context data
+	ctx := req.Context
+	if req.CredentialType != "" {
+		if ctx == nil {
+			ctx = make(map[string]interface{})
+		}
+		ctx["credential_type"] = req.CredentialType
+	}
+	if ctx != nil {
+		authzenReq.Context = ctx
 	}
 
 	return authzenReq, nil

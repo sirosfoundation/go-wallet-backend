@@ -1,9 +1,13 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
@@ -31,6 +35,38 @@ type HTTPClientConfig struct {
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 	// InsecureSkipVerify disables TLS certificate verification (not recommended for production)
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+}
+
+// NewHTTPClient creates an *http.Client from the configuration, applying proxy,
+// timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
+// configured timeout. A zero-value HTTPClientConfig produces a sensible default
+// (30 s timeout, system proxy, TLS verification enabled).
+func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
+	timeout := time.Duration(c.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if timeoutOverride > 0 {
+		timeout = timeoutOverride
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if c.InsecureSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	}
+
+	if c.ProxyURL != "" {
+		proxyURL, err := url.Parse(c.ProxyURL)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
 }
 
 // ServerConfig contains HTTP server configuration
