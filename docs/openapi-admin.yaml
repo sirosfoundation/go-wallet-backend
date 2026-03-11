@@ -19,11 +19,12 @@ info:
     
     ## Security
     
-    This API does not require authentication by default, as it is designed to run on an
-    internal network. In production, you should:
+    This API requires bearer token authentication via the `Authorization` header.
+    Set `WALLET_SERVER_ADMIN_TOKEN` to configure a fixed token; if not set, a random
+    token is generated at startup and logged. In production, you should also:
     - Only expose this API on internal networks
     - Use network-level access control (firewalls, VPNs)
-    - Consider adding authentication middleware if needed
+    - Set a strong, persistent admin token via environment variable
   version: 1.0.0
   contact:
     name: SIROS Foundation
@@ -49,6 +50,8 @@ tags:
     description: Credential issuer management per tenant
   - name: Verifiers
     description: Verifier management per tenant
+  - name: Invites
+    description: Invite code management for controlled registration
 
 paths:
   /admin/status:
@@ -587,6 +590,130 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/tenants/{tenantId}/invites:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+    get:
+      tags:
+        - Invites
+      summary: List invites for a tenant
+      description: Returns all invite codes for the tenant, ordered by creation date (newest first).
+      operationId: listInvites
+      responses:
+        '200':
+          description: List of invites
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invites:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InviteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - Invites
+      summary: Create an invite code
+      description: |
+        Creates a new invite code for the tenant. The code is a 256-bit
+        cryptographically random value encoded as base64url. It is returned
+        only once in the response — it cannot be retrieved again.
+      operationId: createInvite
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteRequest'
+      responses:
+        '201':
+          description: Invite created (includes code)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/invites/{inviteId}:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/inviteId'
+    get:
+      tags:
+        - Invites
+      summary: Get a specific invite
+      description: Returns details of a specific invite. The code field is never included in GET responses.
+      operationId: getInvite
+      responses:
+        '200':
+          description: Invite details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags:
+        - Invites
+      summary: Renew or revoke an invite
+      description: |
+        Action-based update. Supported actions:
+        - `renew`: Reset to active status and extend expiry (cannot renew completed invites)
+        - `revoke`: Mark as revoked, preventing further use (cannot revoke completed invites)
+      operationId: updateInvite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateInviteRequest'
+      responses:
+        '200':
+          description: Invite updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Cannot modify a completed invite
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - Invites
+      summary: Delete an invite
+      description: Hard-deletes an invite code from the system.
+      operationId: deleteInvite
+      responses:
+        '200':
+          description: Invite deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
   parameters:
     tenantId:
@@ -628,6 +755,16 @@ components:
         type: integer
         format: int64
       example: 1
+
+    inviteId:
+      name: inviteId
+      in: path
+      required: true
+      description: The UUID of the invite
+      schema:
+        type: string
+        format: uuid
+      example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
   schemas:
     StatusResponse:
@@ -785,6 +922,85 @@ components:
           type: string
           format: uri
           example: "https://verifier.university.edu"
+
+    InviteRequest:
+      type: object
+      properties:
+        expires_in:
+          type: integer
+          description: |
+            Seconds until the invite expires. Defaults to 7 days (604800 seconds)
+            if not specified.
+          example: 604800
+        metadata:
+          type: object
+          description: |
+            Arbitrary JSON metadata to attach to the invite (e.g. intended
+            recipient email, department, notes).
+          example: {"email": "user@example.com", "department": "Engineering"}
+
+    UpdateInviteRequest:
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          type: string
+          enum: [renew, revoke]
+          description: |
+            The action to perform:
+            - `renew`: Reset status to active and extend expiry
+            - `revoke`: Mark as revoked, preventing further use
+        expires_in:
+          type: integer
+          description: Seconds until expiry (only used with `renew`, defaults to 7 days)
+          example: 604800
+
+    InviteResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique invite identifier
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        tenant_id:
+          type: string
+          example: acme-corp
+        code:
+          type: string
+          description: |
+            The invite code (base64url, 43 characters). Only returned once
+            at creation time \u2014 subsequent GET requests omit this field.
+          example: "dGhpcyBpcyBhIHNhbXBsZSBpbnZpdGUgY29kZSB2YWw"
+        status:
+          type: string
+          enum: [active, completed, revoked]
+          description: |
+            Current invite status:
+            - `active`: Available for use
+            - `completed`: Successfully used for registration
+            - `revoked`: Administratively disabled
+          example: active
+        metadata:
+          type: object
+          description: Arbitrary metadata attached at creation
+        used_by:
+          type: string
+          format: uuid
+          description: UUID of the user who used this invite (only present when status is `completed`)
+        expires_at:
+          type: string
+          format: date-time
+          example: "2025-01-22T10:00:00Z"
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-01-15T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-01-15T10:00:00Z"
 
   responses:
     BadRequest:
