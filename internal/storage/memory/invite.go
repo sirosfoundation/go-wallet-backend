@@ -83,10 +83,11 @@ func (s *InviteStore) Update(ctx context.Context, invite *domain.Invite) error {
 	return nil
 }
 
-func (s *InviteStore) Delete(ctx context.Context, id string) error {
+func (s *InviteStore) Delete(ctx context.Context, tenantID domain.TenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.data[id]; !exists {
+	inv, exists := s.data[id]
+	if !exists || inv.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
 	delete(s.data, id)

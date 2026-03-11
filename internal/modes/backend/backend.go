@@ -312,39 +312,7 @@ func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logg
 
 	admin := router.Group("/admin")
 	admin.Use(middleware.AdminAuthMiddleware(adminToken, logger))
-	{
-		tenants := admin.Group("/tenants")
-		{
-			tenants.GET("", adminHandlers.ListTenants)
-			tenants.POST("", adminHandlers.CreateTenant)
-			tenants.GET("/:id", adminHandlers.GetTenant)
-			tenants.PUT("/:id", adminHandlers.UpdateTenant)
-			tenants.DELETE("/:id", adminHandlers.DeleteTenant)
-
-			tenants.GET("/:id/users", adminHandlers.GetTenantUsers)
-			tenants.POST("/:id/users", adminHandlers.AddUserToTenant)
-			tenants.DELETE("/:id/users/:user_id", adminHandlers.RemoveUserFromTenant)
-
-			tenants.GET("/:id/issuers", adminHandlers.ListIssuers)
-			tenants.POST("/:id/issuers", adminHandlers.CreateIssuer)
-			tenants.GET("/:id/issuers/:issuer_id", adminHandlers.GetIssuer)
-			tenants.PUT("/:id/issuers/:issuer_id", adminHandlers.UpdateIssuer)
-			tenants.DELETE("/:id/issuers/:issuer_id", adminHandlers.DeleteIssuer)
-
-			tenants.GET("/:id/verifiers", adminHandlers.ListVerifiers)
-			tenants.POST("/:id/verifiers", adminHandlers.CreateVerifier)
-			tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
-			tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
-			tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
-
-			// Invite management
-			tenants.GET("/:id/invites", adminHandlers.ListInvites)
-			tenants.POST("/:id/invites", adminHandlers.CreateInvite)
-			tenants.GET("/:id/invites/:invite_id", adminHandlers.GetInvite)
-			tenants.PUT("/:id/invites/:invite_id", adminHandlers.UpdateInvite)
-			tenants.DELETE("/:id/invites/:invite_id", adminHandlers.DeleteInvite)
-		}
-	}
+	adminHandlers.RegisterRoutes(admin)
 
 	return router
 }

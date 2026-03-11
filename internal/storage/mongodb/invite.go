@@ -108,8 +108,8 @@ func (s *InviteStore) Update(ctx context.Context, invite *domain.Invite) error {
 	return nil
 }
 
-func (s *InviteStore) Delete(ctx context.Context, id string) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+func (s *InviteStore) Delete(ctx context.Context, tenantID domain.TenantID, id string) error {
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": tenantID})
 	if err != nil {
 		return fmt.Errorf("failed to delete invite: %w", err)
 	}

@@ -216,6 +216,6 @@ type InviteStore interface {
 	// Update updates an invite (for renew/revoke)
 	Update(ctx context.Context, invite *domain.Invite) error
 
-	// Delete hard-deletes an invite
-	Delete(ctx context.Context, id string) error
+	// Delete hard-deletes an invite within a tenant
+	Delete(ctx context.Context, tenantID domain.TenantID, id string) error
 }

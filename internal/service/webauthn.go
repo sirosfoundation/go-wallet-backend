@@ -425,6 +425,21 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
 
+	// Re-validate invite if one was used at BeginRegistration time.
+	// The invite may have been revoked or expired during the challenge window.
+	if challenge.InviteCode != "" && tenantID != "" {
+		invite, err := s.store.Invites().GetByCode(ctx, tenantID, challenge.InviteCode)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, ErrInvalidInvite
+			}
+			return nil, fmt.Errorf("failed to re-validate invite: %w", err)
+		}
+		if !invite.IsUsable() {
+			return nil, ErrInvalidInvite
+		}
+	}
+
 	// Create user for verification
 	userID := domain.UserIDFromString(challenge.UserID)
 	displayName := req.DisplayName
@@ -576,10 +591,11 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		// Mark invite as completed if one was used
 		if challenge.InviteCode != "" {
 			if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
-				s.logger.Warn("Failed to mark invite as completed",
+				s.logger.Error("Failed to mark invite as completed — registration will be rolled back",
 					zap.Error(err),
 					zap.String("invite_code_prefix", challenge.InviteCode[:8]),
 					zap.String("user_id", userID.String()))
+				return nil, ErrInvalidInvite
 			}
 		}
 

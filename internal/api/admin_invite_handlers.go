@@ -270,7 +270,7 @@ func (h *AdminHandlers) DeleteInvite(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.Invites().Delete(c.Request.Context(), inviteID); err != nil {
+	if err := h.store.Invites().Delete(c.Request.Context(), tenantID, inviteID); err != nil {
 		h.logger.Error("Failed to delete invite", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete invite"})
 		return
