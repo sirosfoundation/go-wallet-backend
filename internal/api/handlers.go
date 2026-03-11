@@ -115,6 +115,14 @@ func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Tenant not found"})
 			return
 		}
+		if errors.Is(err, service.ErrInviteRequired) {
+			c.JSON(403, gin.H{"error": "invite_required"})
+			return
+		}
+		if errors.Is(err, service.ErrInvalidInvite) {
+			c.JSON(403, gin.H{"error": "invite_invalid"})
+			return
+		}
 		c.JSON(500, gin.H{"error": "Failed to start registration"})
 		return
 	}
