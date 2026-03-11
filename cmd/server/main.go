@@ -39,9 +39,9 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend and engine roles)
+	// Load backend configuration (needed for backend, engine, and admin roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
@@ -138,6 +138,17 @@ func main() {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
 		mgr.AddProvider(provider)
+	}
+
+	// Admin-only mode: standalone admin API without backend auth/storage routes.
+	// Skipped when RoleBackend is active, since BackendProvider already registers admin routes.
+	if roles.Has(modes.RoleAdmin) && !roles.Has(modes.RoleBackend) {
+		provider, err := server.NewAdminProvider(backendCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to create admin provider", zap.Error(err))
+		}
+		mgr.AddProvider(provider)
+		resources = append(resources, provider)
 	}
 
 	// Set up signal handling

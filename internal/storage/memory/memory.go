@@ -19,6 +19,7 @@ type Store struct {
 	challenges    *ChallengeStore
 	issuers       *IssuerStore
 	verifiers     *VerifierStore
+	invites       *InviteStore
 }
 
 // NewStore creates a new in-memory store
@@ -32,6 +33,7 @@ func NewStore() *Store {
 		challenges:    &ChallengeStore{data: make(map[string]*domain.WebauthnChallenge)},
 		issuers:       &IssuerStore{data: make(map[int64]*domain.CredentialIssuer)},
 		verifiers:     &VerifierStore{data: make(map[int64]*domain.Verifier)},
+		invites:       &InviteStore{data: make(map[string]*domain.Invite)},
 	}
 
 	// Create default tenant
@@ -55,6 +57,7 @@ func (s *Store) Presentations() storage.PresentationStore { return s.presentatio
 func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
 func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
 func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore             { return s.invites }
 func (s *Store) Close() error                             { return nil }
 func (s *Store) Ping(ctx context.Context) error           { return nil }
 

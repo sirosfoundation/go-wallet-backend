@@ -32,6 +32,8 @@ var (
 	ErrTenantMismatch     = errors.New("tenant mismatch")
 	ErrTenantAccessDenied = errors.New("tenant user must use tenant-scoped login endpoint")
 	ErrTenantNotFound     = errors.New("tenant not found")
+	ErrInviteRequired     = errors.New("invite code required")
+	ErrInvalidInvite      = errors.New("invalid or expired invite code")
 )
 
 // TenantRedirectError indicates the user should be redirected to a different tenant
@@ -234,6 +236,7 @@ type BeginRegistrationResponse struct {
 type BeginRegistrationRequest struct {
 	DisplayName string `json:"displayName,omitempty"`
 	TenantID    string `json:"tenantId,omitempty"`
+	InviteCode  string `json:"inviteCode,omitempty"`
 }
 
 // BeginRegistration starts WebAuthn registration for a new user
@@ -243,11 +246,29 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 	var tenantID domain.TenantID
 	if req.TenantID != "" {
 		tenantID = domain.TenantID(req.TenantID)
-		if _, err := s.store.Tenants().GetByID(ctx, tenantID); err != nil {
+		tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
+		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, ErrTenantNotFound
 			}
 			return nil, fmt.Errorf("failed to verify tenant: %w", err)
+		}
+
+		// Validate invite code if tenant requires it or if one was provided
+		if tenant.RequireInvite || req.InviteCode != "" {
+			if req.InviteCode == "" {
+				return nil, ErrInviteRequired
+			}
+			invite, err := s.store.Invites().GetByCode(ctx, tenantID, req.InviteCode)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					return nil, ErrInvalidInvite
+				}
+				return nil, fmt.Errorf("failed to verify invite: %w", err)
+			}
+			if !invite.IsUsable() {
+				return nil, ErrInvalidInvite
+			}
 		}
 	}
 
@@ -294,12 +315,13 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 	// Store the challenge - session.Challenge is already a string (base64url encoded)
 	challengeID := generateChallengeID()
 	challenge := &domain.WebauthnChallenge{
-		ID:        challengeID,
-		UserID:    userID.String(),
-		TenantID:  string(tenantID),  // Empty string for global registration
-		Challenge: session.Challenge, // Already base64url encoded
-		Action:    "register",
-		ExpiresAt: time.Now().Add(5 * time.Minute),
+		ID:         challengeID,
+		UserID:     userID.String(),
+		TenantID:   string(tenantID),  // Empty string for global registration
+		Challenge:  session.Challenge, // Already base64url encoded
+		Action:     "register",
+		InviteCode: req.InviteCode, // Stored for completion in FinishRegistration
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
 	}
 
 	if err := s.store.Challenges().Create(ctx, challenge); err != nil {
@@ -550,6 +572,17 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)))
 		}
+
+		// Mark invite as completed if one was used
+		if challenge.InviteCode != "" {
+			if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
+				s.logger.Warn("Failed to mark invite as completed",
+					zap.Error(err),
+					zap.String("invite_code_prefix", challenge.InviteCode[:8]),
+					zap.String("user_id", userID.String()))
+			}
+		}
+
 		// Get tenant display name for response
 		if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
 			tenantDisplayName = tenant.DisplayName

@@ -53,12 +53,13 @@ type TrustConfig struct {
 
 // Tenant represents an organizational tenant
 type Tenant struct {
-	ID          TenantID  `json:"id" bson:"_id" gorm:"primaryKey"`
-	Name        string    `json:"name" bson:"name" gorm:"not null"`
-	DisplayName string    `json:"display_name" bson:"display_name"`
-	Enabled     bool      `json:"enabled" bson:"enabled" gorm:"default:true"`
-	CreatedAt   time.Time `json:"created_at" bson:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt   time.Time `json:"updated_at" bson:"updated_at" gorm:"autoUpdateTime"`
+	ID            TenantID  `json:"id" bson:"_id" gorm:"primaryKey"`
+	Name          string    `json:"name" bson:"name" gorm:"not null"`
+	DisplayName   string    `json:"display_name" bson:"display_name"`
+	Enabled       bool      `json:"enabled" bson:"enabled" gorm:"default:true"`
+	RequireInvite bool      `json:"require_invite" bson:"require_invite" gorm:"default:false"`
+	CreatedAt     time.Time `json:"created_at" bson:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt     time.Time `json:"updated_at" bson:"updated_at" gorm:"autoUpdateTime"`
 
 	// Trust configuration (embedded)
 	TrustConfig TrustConfig `json:"trust_config,omitempty" bson:"trust_config" gorm:"embedded;embeddedPrefix:trust_"`

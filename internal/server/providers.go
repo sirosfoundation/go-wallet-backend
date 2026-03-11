@@ -353,6 +353,107 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
 		tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
 		tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
+
+		// Tenant invite management
+		tenants.GET("/:id/invites", adminHandlers.ListInvites)
+		tenants.POST("/:id/invites", adminHandlers.CreateInvite)
+		tenants.GET("/:id/invites/:invite_id", adminHandlers.GetInvite)
+		tenants.PUT("/:id/invites/:invite_id", adminHandlers.UpdateInvite)
+		tenants.DELETE("/:id/invites/:invite_id", adminHandlers.DeleteInvite)
+	}
+}
+
+// =============================================================================
+// Admin Provider - standalone admin API (for --mode=admin deployments)
+// =============================================================================
+
+// AdminProvider provides only admin routes, without public auth/storage routes.
+// Use this when running admin as a standalone mode separate from the backend.
+type AdminProvider struct {
+	store  backend.Backend
+	logger *zap.Logger
+}
+
+// NewAdminProvider creates a standalone admin route provider
+func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, error) {
+	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	store, err := backend.New(initCtx, cfg)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize storage backend for admin: %w", err)
+	}
+
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("failed to ping storage: %w", err)
+	}
+
+	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
+
+	return &AdminProvider{
+		store:  store,
+		logger: logger,
+	}, nil
+}
+
+func (p *AdminProvider) Transport() Transport { return TransportHTTP }
+func (p *AdminProvider) Name() string         { return "admin" }
+
+// RegisterRoutes is a no-op — admin has no public routes
+func (p *AdminProvider) RegisterRoutes(router *gin.Engine) {}
+
+// Close shuts down the admin provider's storage
+func (p *AdminProvider) Close() error {
+	if p.store != nil {
+		return p.store.Close()
+	}
+	return nil
+}
+
+// CheckReady implements health.ReadinessChecker for AdminProvider.
+func (p *AdminProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("storage not initialized")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	return p.store.Ping(checkCtx)
+}
+
+// RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
+func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+
+	tenants := adminGroup.Group("/tenants")
+	{
+		tenants.GET("", adminHandlers.ListTenants)
+		tenants.POST("", adminHandlers.CreateTenant)
+		tenants.GET("/:id", adminHandlers.GetTenant)
+		tenants.PUT("/:id", adminHandlers.UpdateTenant)
+		tenants.DELETE("/:id", adminHandlers.DeleteTenant)
+
+		tenants.GET("/:id/users", adminHandlers.GetTenantUsers)
+		tenants.POST("/:id/users", adminHandlers.AddUserToTenant)
+		tenants.DELETE("/:id/users/:user_id", adminHandlers.RemoveUserFromTenant)
+
+		tenants.GET("/:id/issuers", adminHandlers.ListIssuers)
+		tenants.POST("/:id/issuers", adminHandlers.CreateIssuer)
+		tenants.GET("/:id/issuers/:issuer_id", adminHandlers.GetIssuer)
+		tenants.PUT("/:id/issuers/:issuer_id", adminHandlers.UpdateIssuer)
+		tenants.DELETE("/:id/issuers/:issuer_id", adminHandlers.DeleteIssuer)
+
+		tenants.GET("/:id/verifiers", adminHandlers.ListVerifiers)
+		tenants.POST("/:id/verifiers", adminHandlers.CreateVerifier)
+		tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
+		tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
+		tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
+
+		tenants.GET("/:id/invites", adminHandlers.ListInvites)
+		tenants.POST("/:id/invites", adminHandlers.CreateInvite)
+		tenants.GET("/:id/invites/:invite_id", adminHandlers.GetInvite)
+		tenants.PUT("/:id/invites/:invite_id", adminHandlers.UpdateInvite)
+		tenants.DELETE("/:id/invites/:invite_id", adminHandlers.DeleteInvite)
 	}
 }
 

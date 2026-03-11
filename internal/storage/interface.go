@@ -187,10 +187,35 @@ type Store interface {
 	Challenges() ChallengeStore
 	Issuers() IssuerStore
 	Verifiers() VerifierStore
+	Invites() InviteStore
 
 	// Close closes the storage connection
 	Close() error
 
 	// Ping checks if the storage is alive
 	Ping(ctx context.Context) error
+}
+
+// InviteStore defines the interface for invite code storage
+type InviteStore interface {
+	// Create creates a new invite
+	Create(ctx context.Context, invite *domain.Invite) error
+
+	// GetByCode retrieves an invite by its code within a tenant
+	GetByCode(ctx context.Context, tenantID domain.TenantID, code string) (*domain.Invite, error)
+
+	// GetByID retrieves an invite by its ID
+	GetByID(ctx context.Context, id string) (*domain.Invite, error)
+
+	// GetAllByTenant retrieves all invites for a tenant
+	GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.Invite, error)
+
+	// MarkCompleted atomically marks an active invite as completed
+	MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error
+
+	// Update updates an invite (for renew/revoke)
+	Update(ctx context.Context, invite *domain.Invite) error
+
+	// Delete hard-deletes an invite
+	Delete(ctx context.Context, id string) error
 }

@@ -336,6 +336,13 @@ func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logg
 			tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
 			tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
 			tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
+
+			// Invite management
+			tenants.GET("/:id/invites", adminHandlers.ListInvites)
+			tenants.POST("/:id/invites", adminHandlers.CreateInvite)
+			tenants.GET("/:id/invites/:invite_id", adminHandlers.GetInvite)
+			tenants.PUT("/:id/invites/:invite_id", adminHandlers.UpdateInvite)
+			tenants.DELETE("/:id/invites/:invite_id", adminHandlers.DeleteInvite)
 		}
 	}
 

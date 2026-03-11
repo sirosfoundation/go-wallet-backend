@@ -26,10 +26,11 @@ const (
 	RoleEngine   Role = "engine"
 	RoleAuth     Role = "auth"
 	RoleStorage  Role = "storage"
+	RoleAdmin    Role = "admin"
 )
 
 // ValidRoles lists all valid operating roles
-var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage}
+var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage, RoleAdmin}
 
 // IsValid checks if a role string is valid
 func (r Role) IsValid() bool {
@@ -106,7 +107,7 @@ func ParseRoles(s string) (*RoleSet, error) {
 
 	// Handle "all" as a special case
 	if s == "all" {
-		return NewRoleSet([]Role{RoleBackend, RoleRegistry, RoleEngine}), nil
+		return NewRoleSet([]Role{RoleBackend, RoleRegistry, RoleEngine, RoleAdmin}), nil
 	}
 
 	parts := strings.Split(s, ",")

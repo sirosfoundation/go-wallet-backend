@@ -245,6 +245,7 @@ func (m *mockBackend) Presentations() storage.PresentationStore {
 func (m *mockBackend) Challenges() storage.ChallengeStore { return nil }
 func (m *mockBackend) Issuers() storage.IssuerStore       { return nil }
 func (m *mockBackend) Verifiers() storage.VerifierStore   { return nil }
+func (m *mockBackend) Invites() storage.InviteStore       { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
