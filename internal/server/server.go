@@ -50,6 +50,12 @@ type RouteProvider interface {
 	Name() string
 }
 
+// StartableProvider allows providers to perform background initialization
+// (e.g. starting pollers or fetchers) after routes have been registered.
+type StartableProvider interface {
+	Start(ctx context.Context) error
+}
+
 // AdminRouteProvider allows providers to contribute admin API routes.
 // The admin server runs on a separate port with token authentication.
 type AdminRouteProvider interface {
@@ -245,6 +251,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	if m.cfg.AdminPort > 0 {
 		if err := m.startAdminServer(); err != nil {
 			return fmt.Errorf("failed to start admin server: %w", err)
+		}
+	}
+
+	// Start providers that need background initialization (e.g. registry fetcher)
+	for _, p := range m.providers {
+		if sp, ok := p.(StartableProvider); ok {
+			m.logger.Info("Starting provider background tasks", zap.String("mode", p.Name()))
+			if err := sp.Start(ctx); err != nil {
+				return fmt.Errorf("failed to start provider %s: %w", p.Name(), err)
+			}
 		}
 	}
 
