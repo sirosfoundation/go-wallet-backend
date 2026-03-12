@@ -13,13 +13,13 @@ import (
 // Config holds the registry server configuration
 type Config struct {
 	// Server configuration
-	Server ServerConfig `yaml:"server" envconfig:"SERVER"`
+	Server ServerConfig `yaml:"server"`
 
 	// Registry source configuration
-	Source SourceConfig `yaml:"source" envconfig:"SOURCE"`
+	Source SourceConfig `yaml:"source"`
 
 	// Cache configuration
-	Cache CacheConfig `yaml:"cache" envconfig:"CACHE"`
+	Cache CacheConfig `yaml:"cache"`
 
 	// DynamicCache configuration for on-demand URL fetching
 	DynamicCache DynamicCacheConfig `yaml:"dynamic_cache" envconfig:"DYNAMIC_CACHE"`
@@ -28,22 +28,22 @@ type Config struct {
 	ImageEmbed embed.Config `yaml:"image_embed" envconfig:"IMAGE_EMBED"`
 
 	// Filter configuration for include/exclude patterns
-	Filter FilterConfig `yaml:"filter" envconfig:"FILTER"`
+	Filter FilterConfig `yaml:"filter"`
 
 	// Rate limiting configuration
 	RateLimit RateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
 
 	// JWT configuration for authentication
-	JWT JWTConfig `yaml:"jwt" envconfig:"JWT"`
+	JWT JWTConfig `yaml:"jwt"`
 
 	// Logging configuration
-	Logging LoggingConfig `yaml:"logging" envconfig:"LOGGING"`
+	Logging LoggingConfig `yaml:"logging"`
 }
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host string `yaml:"host" envconfig:"HOST"`
-	Port int    `yaml:"port" envconfig:"PORT"`
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
 }
 
 // Address returns the server address in host:port format
@@ -54,19 +54,19 @@ func (c ServerConfig) Address() string {
 // SourceConfig contains upstream registry source configuration
 type SourceConfig struct {
 	// URL of the upstream registry index (e.g., https://registry.siros.org/.well-known/vctm-registry.json)
-	URL string `yaml:"url" envconfig:"URL"`
+	URL string `yaml:"url"`
 
 	// PollInterval is how often to poll the upstream registry for updates
 	PollInterval time.Duration `yaml:"poll_interval" envconfig:"POLL_INTERVAL"`
 
 	// Timeout for HTTP requests to the upstream registry
-	Timeout time.Duration `yaml:"timeout" envconfig:"TIMEOUT"`
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // CacheConfig contains disk cache configuration
 type CacheConfig struct {
 	// Path to the cache file (JSON format)
-	Path string `yaml:"path" envconfig:"PATH"`
+	Path string `yaml:"path"`
 
 	// MaxAge is the maximum age of cached data before forcing a refresh
 	MaxAge time.Duration `yaml:"max_age" envconfig:"MAX_AGE"`
@@ -75,7 +75,7 @@ type CacheConfig struct {
 // DynamicCacheConfig contains configuration for on-demand URL fetching
 type DynamicCacheConfig struct {
 	// Enabled controls whether dynamic URL fetching is active
-	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	Enabled bool `yaml:"enabled"`
 
 	// DefaultTTL is the default cache TTL for dynamically fetched VCTMs
 	// when no HTTP cache headers are present
@@ -90,7 +90,7 @@ type DynamicCacheConfig struct {
 	MinTTL time.Duration `yaml:"min_ttl" envconfig:"MIN_TTL"`
 
 	// Timeout for HTTP requests when fetching VCTMs dynamically
-	Timeout time.Duration `yaml:"timeout" envconfig:"TIMEOUT"`
+	Timeout time.Duration `yaml:"timeout"`
 
 	// AllowedHosts is an optional list of host patterns (regexps) that are
 	// allowed for dynamic fetching. If empty, all HTTPS hosts are allowed.
@@ -194,7 +194,7 @@ func (f *FilterConfig) Matches(vctID string) bool {
 // RateLimitConfig contains rate limiting configuration
 type RateLimitConfig struct {
 	// Enabled controls whether rate limiting is active
-	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	Enabled bool `yaml:"enabled"`
 
 	// AuthenticatedRPM is requests per minute for authenticated clients
 	AuthenticatedRPM int `yaml:"authenticated_rpm" envconfig:"AUTHENTICATED_RPM"`
@@ -209,10 +209,10 @@ type RateLimitConfig struct {
 // JWTConfig contains JWT validation configuration
 type JWTConfig struct {
 	// Secret is the shared secret for validating JWT signatures (HMAC)
-	Secret string `yaml:"secret" envconfig:"SECRET"`
+	Secret string `yaml:"secret"`
 
 	// Issuer is the expected issuer claim in the JWT
-	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	Issuer string `yaml:"issuer"`
 
 	// RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed)
 	RequireAuth bool `yaml:"require_auth" envconfig:"REQUIRE_AUTH"`
@@ -220,8 +220,8 @@ type JWTConfig struct {
 
 // LoggingConfig contains logging configuration
 type LoggingConfig struct {
-	Level  string `yaml:"level" envconfig:"LEVEL"`   // debug, info, warn, error
-	Format string `yaml:"format" envconfig:"FORMAT"` // json, text
+	Level  string `yaml:"level"`  // debug, info, warn, error
+	Format string `yaml:"format"` // json, text
 }
 
 // DefaultConfig returns a Config with sensible default values
