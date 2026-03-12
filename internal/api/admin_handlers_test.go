@@ -178,6 +178,42 @@ func TestAdminHandlers_CreateTenant(t *testing.T) {
 			t.Error("Expected tenant to be disabled")
 		}
 	})
+
+	t.Run("with require_invite true", func(t *testing.T) {
+		body := `{"id": "invite-tenant", "name": "Invite Tenant", "require_invite": true}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+		}
+
+		var tenant TenantResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
+		if !tenant.RequireInvite {
+			t.Error("Expected require_invite to be true")
+		}
+	})
+
+	t.Run("default require_invite is false", func(t *testing.T) {
+		body := `{"id": "no-invite-tenant", "name": "No Invite Tenant"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+		}
+
+		var tenant TenantResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
+		if tenant.RequireInvite {
+			t.Error("Expected require_invite to default to false")
+		}
+	})
 }
 
 func TestAdminHandlers_GetTenant(t *testing.T) {
@@ -249,6 +285,24 @@ func TestAdminHandlers_UpdateTenant(t *testing.T) {
 		}
 		if tenant.Enabled {
 			t.Error("Expected tenant to be disabled after update")
+		}
+	})
+
+	t.Run("update require_invite", func(t *testing.T) {
+		body := `{"id": "update-test", "name": "Updated Name", "require_invite": true}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/admin/tenants/update-test", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var tenant TenantResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
+		if !tenant.RequireInvite {
+			t.Error("Expected require_invite to be true after update")
 		}
 	})
 
