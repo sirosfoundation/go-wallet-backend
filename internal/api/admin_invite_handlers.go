@@ -15,7 +15,8 @@ import (
 
 // CreateInviteRequest represents the request body for creating an invite
 type CreateInviteRequest struct {
-	ExpiresIn int              `json:"expires_in"` // seconds until expiry (default: 7 days)
+	Code      string           `json:"code,omitempty"` // optional: use this code instead of generating one
+	ExpiresIn int              `json:"expires_in"`     // seconds until expiry (default: 7 days)
 	Metadata  *json.RawMessage `json:"metadata,omitempty"`
 }
 
@@ -84,11 +85,15 @@ func (h *AdminHandlers) CreateInvite(c *gin.Context) {
 		expiresIn = req.ExpiresIn
 	}
 
-	code, err := domain.GenerateInviteCode()
-	if err != nil {
-		h.logger.Error("Failed to generate invite code", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate invite code"})
-		return
+	code := req.Code
+	if code == "" {
+		var err error
+		code, err = domain.GenerateInviteCode()
+		if err != nil {
+			h.logger.Error("Failed to generate invite code", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate invite code"})
+			return
+		}
 	}
 
 	now := time.Now()

@@ -620,9 +620,10 @@ paths:
         - Invites
       summary: Create an invite code
       description: |
-        Creates a new invite code for the tenant. The code is a 256-bit
-        cryptographically random value encoded as base64url. It is returned
-        only once in the response — it cannot be retrieved again.
+        Creates a new invite code for the tenant. If no `code` is provided in the
+        request body, a 256-bit cryptographically random value encoded as base64url
+        is generated. The code is returned only once in the response — it cannot be
+        retrieved again.
       operationId: createInvite
       requestBody:
         content:
@@ -926,6 +927,12 @@ components:
     InviteRequest:
       type: object
       properties:
+        code:
+          type: string
+          description: |
+            Optional invite code to use. If omitted, a cryptographically secure
+            256-bit code (base64url, 43 characters) is generated automatically.
+          example: "my-custom-invite-code"
         expires_in:
           type: integer
           description: |
