@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 // Handler handles HTTP requests for the registry
@@ -16,6 +17,9 @@ type Handler struct {
 	imageEmbedder  *embed.ImageEmbedder
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
+
+	// sfGroup deduplicates concurrent dynamic fetches for the same VCT
+	sfGroup singleflight.Group
 
 	// Debounced save mechanism
 	saveCh chan struct{}
@@ -132,7 +136,11 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 			existingEntry = entry
 		}
 
-		result, err := h.dynamicFetcher.Fetch(c.Request.Context(), vctID, existingEntry)
+		// Deduplicate concurrent fetches for the same VCT
+		v, err, _ := h.sfGroup.Do(vctID, func() (interface{}, error) {
+			return h.dynamicFetcher.Fetch(c.Request.Context(), vctID, existingEntry)
+		})
+
 		if err != nil {
 			h.logger.Warn("dynamic fetch failed",
 				zap.String("vct", vctID),
@@ -153,12 +161,14 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 			return
 		}
 
+		result := v.(*FetchResult)
+
 		// Handle 304 Not Modified
 		if result.NotModified && existingEntry != nil {
 			// Refresh the expiration time without mutating the shared cached entry directly.
 			updatedEntry := *existingEntry
-			updatedEntry.ExpiresAt = h.dynamicFetcher.calculateExpiresAt(nil)
-			updatedEntry.FetchedAt = updatedEntry.ExpiresAt.Add(-h.config.DefaultTTL) // Approximate
+			updatedEntry.ExpiresAt = h.dynamicFetcher.calculateExpiresAt(result.Headers)
+			updatedEntry.FetchedAt = time.Now()
 			h.store.Set(vctID, &updatedEntry)
 			c.Header("X-Cache-Status", "revalidated")
 			h.serveEntry(c, &updatedEntry)
@@ -261,4 +271,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/type-metadata", h.GetTypeMetadata)
 	r.GET("/credentials", h.ListCredentials)
 	r.GET("/status", h.GetStatus)
+}
+
+// Close shuts down the handler's background goroutines.
+// It signals the saveWorker to perform a final save and exit.
+func (h *Handler) Close() {
+	close(h.saveCh)
 }
