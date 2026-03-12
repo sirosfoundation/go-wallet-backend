@@ -29,11 +29,12 @@ func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
 
 // TenantRequest represents the request body for creating/updating a tenant
 type TenantRequest struct {
-	ID          string              `json:"id" binding:"required"`
-	Name        string              `json:"name" binding:"required"`
-	DisplayName string              `json:"display_name,omitempty"`
-	Enabled     *bool               `json:"enabled,omitempty"`
-	TrustConfig *TrustConfigRequest `json:"trust_config,omitempty"`
+	ID            string              `json:"id" binding:"required"`
+	Name          string              `json:"name" binding:"required"`
+	DisplayName   string              `json:"display_name,omitempty"`
+	Enabled       *bool               `json:"enabled,omitempty"`
+	RequireInvite *bool               `json:"require_invite,omitempty"`
+	TrustConfig   *TrustConfigRequest `json:"trust_config,omitempty"`
 }
 
 // TrustConfigRequest represents the trust configuration in API requests
@@ -44,13 +45,14 @@ type TrustConfigRequest struct {
 
 // TenantResponse represents a tenant in API responses
 type TenantResponse struct {
-	ID          string               `json:"id"`
-	Name        string               `json:"name"`
-	DisplayName string               `json:"display_name,omitempty"`
-	Enabled     bool                 `json:"enabled"`
-	CreatedAt   time.Time            `json:"created_at"`
-	UpdatedAt   time.Time            `json:"updated_at"`
-	TrustConfig *TrustConfigResponse `json:"trust_config,omitempty"`
+	ID            string               `json:"id"`
+	Name          string               `json:"name"`
+	DisplayName   string               `json:"display_name,omitempty"`
+	Enabled       bool                 `json:"enabled"`
+	RequireInvite bool                 `json:"require_invite"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
+	TrustConfig   *TrustConfigResponse `json:"trust_config,omitempty"`
 }
 
 // TrustConfigResponse represents the trust configuration in API responses
@@ -61,12 +63,13 @@ type TrustConfigResponse struct {
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
 	resp := &TenantResponse{
-		ID:          string(t.ID),
-		Name:        t.Name,
-		DisplayName: t.DisplayName,
-		Enabled:     t.Enabled,
-		CreatedAt:   t.CreatedAt,
-		UpdatedAt:   t.UpdatedAt,
+		ID:            string(t.ID),
+		Name:          t.Name,
+		DisplayName:   t.DisplayName,
+		Enabled:       t.Enabled,
+		RequireInvite: t.RequireInvite,
+		CreatedAt:     t.CreatedAt,
+		UpdatedAt:     t.UpdatedAt,
 	}
 	// Include trust config if any non-default values are set
 	if t.TrustConfig.TrustEndpoint != "" || t.TrustConfig.TrustTTL != 0 {
@@ -148,13 +151,19 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 		displayName = req.Name
 	}
 
+	requireInvite := false
+	if req.RequireInvite != nil {
+		requireInvite = *req.RequireInvite
+	}
+
 	tenant := &domain.Tenant{
-		ID:          tenantID,
-		Name:        req.Name,
-		DisplayName: displayName,
-		Enabled:     enabled,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		ID:            tenantID,
+		Name:          req.Name,
+		DisplayName:   displayName,
+		Enabled:       enabled,
+		RequireInvite: requireInvite,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 
 	// Apply trust config if provided
@@ -203,6 +212,9 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	tenant.DisplayName = req.DisplayName
 	if req.Enabled != nil {
 		tenant.Enabled = *req.Enabled
+	}
+	if req.RequireInvite != nil {
+		tenant.RequireInvite = *req.RequireInvite
 	}
 	// Update trust config if provided
 	if req.TrustConfig != nil {
