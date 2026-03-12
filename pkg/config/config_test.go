@@ -361,3 +361,193 @@ jwt:
 		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
 	}
 }
+func TestTrustConfig_GetPDPURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected string
+	}{
+		{
+			name:     "PDPURL takes precedence",
+			cfg:      TrustConfig{PDPURL: "https://new.example.com", DefaultEndpoint: "https://old.example.com"},
+			expected: "https://new.example.com",
+		},
+		{
+			name:     "fallback to DefaultEndpoint for backward compatibility",
+			cfg:      TrustConfig{DefaultEndpoint: "https://old.example.com"},
+			expected: "https://old.example.com",
+		},
+		{
+			name:     "empty when both empty (allow all mode)",
+			cfg:      TrustConfig{},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetPDPURL()
+			if got != tt.expected {
+				t.Errorf("GetPDPURL() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestFlowTrustConfig_IsExplicitlyDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      FlowTrustConfig
+		expected bool
+	}{
+		{"empty means not disabled", FlowTrustConfig{}, false},
+		{"url means not disabled", FlowTrustConfig{PDPURL: "https://pdp.example.com"}, false},
+		{"none means disabled", FlowTrustConfig{PDPURL: "none"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsExplicitlyDisabled(); got != tt.expected {
+				t.Errorf("IsExplicitlyDisabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTrustConfig_GetIssuerPDPURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected string
+	}{
+		{
+			name:     "issuer explicitly disabled returns empty",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com", Issuer: FlowTrustConfig{PDPURL: "none"}},
+			expected: "",
+		},
+		{
+			name:     "issuer flow-specific URL takes precedence",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com", Issuer: FlowTrustConfig{PDPURL: "https://issuer.example.com"}},
+			expected: "https://issuer.example.com",
+		},
+		{
+			name:     "falls back to global PDPURL",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com"},
+			expected: "https://global.example.com",
+		},
+		{
+			name:     "falls back to deprecated DefaultEndpoint",
+			cfg:      TrustConfig{DefaultEndpoint: "https://old.example.com"},
+			expected: "https://old.example.com",
+		},
+		{
+			name:     "empty when nothing configured",
+			cfg:      TrustConfig{},
+			expected: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetIssuerPDPURL(); got != tt.expected {
+				t.Errorf("GetIssuerPDPURL() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTrustConfig_GetVerifierPDPURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected string
+	}{
+		{
+			name:     "verifier explicitly disabled returns empty",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com", Verifier: FlowTrustConfig{PDPURL: "none"}},
+			expected: "",
+		},
+		{
+			name:     "verifier flow-specific URL takes precedence",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com", Verifier: FlowTrustConfig{PDPURL: "https://verifier.example.com"}},
+			expected: "https://verifier.example.com",
+		},
+		{
+			name:     "falls back to global PDPURL",
+			cfg:      TrustConfig{PDPURL: "https://global.example.com"},
+			expected: "https://global.example.com",
+		},
+		{
+			name:     "empty when nothing configured",
+			cfg:      TrustConfig{},
+			expected: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetVerifierPDPURL(); got != tt.expected {
+				t.Errorf("GetVerifierPDPURL() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTrustConfig_IsIssuerTrustEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected bool
+	}{
+		{"enabled via global PDPURL", TrustConfig{PDPURL: "https://pdp.example.com"}, true},
+		{"enabled via issuer flow URL", TrustConfig{Issuer: FlowTrustConfig{PDPURL: "https://issuer-pdp.example.com"}}, true},
+		{"disabled when nothing configured", TrustConfig{}, false},
+		{"disabled via explicit none", TrustConfig{PDPURL: "https://global.example.com", Issuer: FlowTrustConfig{PDPURL: "none"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsIssuerTrustEnabled(); got != tt.expected {
+				t.Errorf("IsIssuerTrustEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTrustConfig_IsVerifierTrustEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      TrustConfig
+		expected bool
+	}{
+		{"enabled via global PDPURL", TrustConfig{PDPURL: "https://pdp.example.com"}, true},
+		{"enabled via verifier flow URL", TrustConfig{Verifier: FlowTrustConfig{PDPURL: "https://verifier-pdp.example.com"}}, true},
+		{"disabled when nothing configured", TrustConfig{}, false},
+		{"disabled via explicit none", TrustConfig{PDPURL: "https://global.example.com", Verifier: FlowTrustConfig{PDPURL: "none"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsVerifierTrustEnabled(); got != tt.expected {
+				t.Errorf("IsVerifierTrustEnabled() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestTrustConfig_IndependentFlowConfig(t *testing.T) {
+	// Issuer uses a specific PDP, verifier trust is disabled
+	cfg := TrustConfig{
+		PDPURL:   "https://global.example.com",
+		Issuer:   FlowTrustConfig{PDPURL: "https://issuer-pdp.example.com"},
+		Verifier: FlowTrustConfig{PDPURL: "none"},
+	}
+
+	if !cfg.IsIssuerTrustEnabled() {
+		t.Error("Expected issuer trust to be enabled")
+	}
+	if cfg.IsVerifierTrustEnabled() {
+		t.Error("Expected verifier trust to be disabled")
+	}
+	if got := cfg.GetIssuerPDPURL(); got != "https://issuer-pdp.example.com" {
+		t.Errorf("GetIssuerPDPURL() = %v, want https://issuer-pdp.example.com", got)
+	}
+	if got := cfg.GetVerifierPDPURL(); got != "" {
+		t.Errorf("GetVerifierPDPURL() = %v, want empty", got)
+	}
+}

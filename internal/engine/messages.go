@@ -5,6 +5,8 @@ package engine
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // Protocol identifies the type of credential flow
@@ -221,13 +223,9 @@ type CredentialResult struct {
 	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
 }
 
-// TrustInfo contains trust evaluation results
-type TrustInfo struct {
-	Trusted      bool     `json:"trusted"`
-	Framework    string   `json:"framework,omitempty"`
-	Reason       string   `json:"reason,omitempty"`
-	Certificates []string `json:"certificates,omitempty"`
-}
+// TrustInfo contains trust evaluation results.
+// Deprecated: Use trust.TrustInfo directly when writing new code.
+type TrustInfo = trust.TrustInfo
 
 // VerifierInfo contains verifier metadata
 type VerifierInfo struct {

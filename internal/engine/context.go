@@ -1,25 +1,21 @@
 // Package engine provides WebSocket v2 protocol implementation.
 package engine
 
-import "context"
+import (
+	"context"
 
-// Context keys for tenant propagation
-type contextKey string
-
-const (
-	// TenantIDKey is the context key for tenant ID
-	TenantIDKey contextKey = "tenant_id"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // ContextWithTenant returns a context with the tenant ID set.
+// Delegates to trust.ContextWithTenant so the tenant ID is propagated
+// to both trust evaluation and registry client requests.
 func ContextWithTenant(ctx context.Context, tenantID string) context.Context {
-	return context.WithValue(ctx, TenantIDKey, tenantID)
+	return trust.ContextWithTenant(ctx, tenantID)
 }
 
 // TenantFromContext extracts the tenant ID from context.
+// Delegates to trust.TenantFromContext for consistent key usage.
 func TenantFromContext(ctx context.Context) string {
-	if tenantID, ok := ctx.Value(TenantIDKey).(string); ok {
-		return tenantID
-	}
-	return ""
+	return trust.TenantFromContext(ctx)
 }

@@ -1,9 +1,13 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
@@ -31,6 +35,38 @@ type HTTPClientConfig struct {
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 	// InsecureSkipVerify disables TLS certificate verification (not recommended for production)
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+}
+
+// NewHTTPClient creates an *http.Client from the configuration, applying proxy,
+// timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
+// configured timeout. A zero-value HTTPClientConfig produces a sensible default
+// (30 s timeout, system proxy, TLS verification enabled).
+func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
+	timeout := time.Duration(c.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if timeoutOverride > 0 {
+		timeout = timeoutOverride
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if c.InsecureSkipVerify {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	}
+
+	if c.ProxyURL != "" {
+		proxyURL, err := url.Parse(c.ProxyURL)
+		if err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
 }
 
 // ServerConfig contains HTTP server configuration
@@ -214,15 +250,107 @@ type WalletProviderConfig struct {
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 }
 
-// TrustConfig contains trust evaluation configuration
+// FlowTrustConfig contains per-flow trust evaluation overrides.
+// Each flow (issuer/verifier) can independently configure trust evaluation.
+//
+// The pdp_url field controls both which PDP to use and whether trust is enabled:
+//   - Not set (empty): inherit the global trust configuration
+//   - Set to a URL: use that PDP for this flow (implies trust is enabled)
+//   - Set to "none": explicitly disable trust evaluation for this flow ("allow all")
+type FlowTrustConfig struct {
+	// PDPURL overrides the global PDP URL for this specific flow.
+	// Empty inherits from global. Set to "none" to explicitly disable trust.
+	PDPURL string `yaml:"pdp_url" envconfig:"PDP_URL"`
+}
+
+// IsExplicitlyDisabled returns true if trust is explicitly disabled for this flow
+// by setting pdp_url to "none".
+func (c *FlowTrustConfig) IsExplicitlyDisabled() bool {
+	return c.PDPURL == "none"
+}
+
+// TrustConfig contains trust evaluation configuration.
+//
+// Trust evaluation operates in one of two modes:
+//   - When PDPURL is configured: "default deny" mode - all trust decisions go through the PDP
+//   - When PDPURL is empty: "allow all" mode - requests are always considered trusted
+//
+// Per-flow overrides allow independent trust configuration for issuer (OID4VCI)
+// and verifier (OID4VP) flows. Setting a per-flow pdp_url implies trust is enabled
+// for that flow. Setting it to "none" explicitly disables trust for that flow.
+// Configuration applies equally regardless of transport (proxy/websockets).
 type TrustConfig struct {
-	// DefaultEndpoint is the go-trust PDP endpoint for trust evaluation.
-	// Tenants can override this with their own endpoint.
+	// PDPURL is the URL of the AuthZEN PDP (Policy Decision Point) for trust evaluation.
+	// When set, operates in "default deny" mode - trust decisions require PDP approval.
+	// When empty, operates in "allow all" mode - requests are always considered trusted.
+	PDPURL string `yaml:"pdp_url" envconfig:"PDP_URL"`
+
+	// DefaultEndpoint is deprecated. Use PDPURL instead.
+	// Retained for backward compatibility - if PDPURL is empty and DefaultEndpoint is set,
+	// DefaultEndpoint is used.
+	// Deprecated: This field will be removed in a future release.
 	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
+
 	// RegistryURL is the URL for the VCTM registry service.
 	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
 	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+
+	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
+	// When not set, inherits the global trust configuration.
+	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
+
+	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
+	// When not set, inherits the global trust configuration.
+	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
+}
+
+// GetPDPURL returns the effective global PDP URL, preferring PDPURL over the deprecated DefaultEndpoint.
+func (c *TrustConfig) GetPDPURL() string {
+	if c.PDPURL != "" {
+		return c.PDPURL
+	}
+	return c.DefaultEndpoint
+}
+
+// GetIssuerPDPURL returns the effective PDP URL for issuer (OID4VCI) flows.
+// Returns empty string if trust is explicitly disabled for this flow.
+// Priority: flow-specific PDPURL > global PDPURL > deprecated DefaultEndpoint.
+func (c *TrustConfig) GetIssuerPDPURL() string {
+	if c.Issuer.IsExplicitlyDisabled() {
+		return ""
+	}
+	if c.Issuer.PDPURL != "" {
+		return c.Issuer.PDPURL
+	}
+	return c.GetPDPURL()
+}
+
+// GetVerifierPDPURL returns the effective PDP URL for verifier (OID4VP) flows.
+// Returns empty string if trust is explicitly disabled for this flow.
+// Priority: flow-specific PDPURL > global PDPURL > deprecated DefaultEndpoint.
+func (c *TrustConfig) GetVerifierPDPURL() string {
+	if c.Verifier.IsExplicitlyDisabled() {
+		return ""
+	}
+	if c.Verifier.PDPURL != "" {
+		return c.Verifier.PDPURL
+	}
+	return c.GetPDPURL()
+}
+
+// IsIssuerTrustEnabled returns whether trust evaluation is enabled for issuer flows.
+// Trust is enabled if a PDP URL is configured (flow-specific or global) and not
+// explicitly disabled via pdp_url: "none".
+func (c *TrustConfig) IsIssuerTrustEnabled() bool {
+	return c.GetIssuerPDPURL() != ""
+}
+
+// IsVerifierTrustEnabled returns whether trust evaluation is enabled for verifier flows.
+// Trust is enabled if a PDP URL is configured (flow-specific or global) and not
+// explicitly disabled via pdp_url: "none".
+func (c *TrustConfig) IsVerifierTrustEnabled() bool {
+	return c.GetVerifierPDPURL() != ""
 }
 
 // FeaturesConfig contains feature flags for controlling behavior

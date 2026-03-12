@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/health"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -39,6 +40,9 @@ type TestHarness struct {
 
 	// BaseURL is the URL of the test server
 	BaseURL string
+
+	// Readiness manager for /readyz tests
+	Readiness *health.ReadinessManager
 }
 
 // TestHarnessOption configures the test harness
@@ -98,13 +102,17 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	// Create services
 	h.Services = service.NewServices(h.Storage, h.Config, logger)
 
+	// Create readiness manager with storage checker
+	h.Readiness = health.NewReadinessManager()
+	h.Readiness.AddChecker(health.NewDatabaseChecker("storage", h.Storage))
+
 	// Create handlers (using "test" role for integration tests)
 	handlers := api.NewHandlers(h.Services, h.Config, logger, []string{"test"})
 
 	// Setup router
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
-	setupRoutes(h.Router, handlers, h.Config, h.Storage, logger)
+	setupRoutes(h.Router, handlers, h.Config, h.Storage, h.Readiness, logger)
 
 	// Create test server
 	h.Server = httptest.NewServer(h.Router)
@@ -119,12 +127,23 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 }
 
 // setupRoutes configures all API routes (mirrors the main server setup)
-func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store storage.Store, logger *zap.Logger) {
+func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store storage.Store, readiness *health.ReadinessManager, logger *zap.Logger) {
 	// Create auth middleware
 	auth := middleware.AuthMiddleware(cfg, store, logger)
 
 	// Health/status (public)
 	r.GET("/status", h.Status)
+	r.GET("/health", h.Status)
+
+	// Readiness probe (Kubernetes-style)
+	r.GET("/readyz", func(c *gin.Context) {
+		status := readiness.CheckReady(c.Request.Context())
+		if !status.Ready {
+			c.JSON(http.StatusServiceUnavailable, status)
+			return
+		}
+		c.JSON(http.StatusOK, status)
+	})
 
 	// User routes (deprecated password-based - public)
 	r.POST("/user/register", h.RegisterUser)

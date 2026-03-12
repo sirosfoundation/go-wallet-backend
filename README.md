@@ -115,6 +115,7 @@ The storage layer is fully abstracted using the backend pattern:
 - **ChallengeStore**: WebAuthn challenge management
 - **IssuerStore**: Credential issuer management
 - **VerifierStore**: Verifier management
+- **InviteStore**: Invite code management for controlled registration
 
 #### Backend Implementations
 

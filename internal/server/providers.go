@@ -235,6 +235,19 @@ func (p *EngineProvider) Close() {
 	}
 }
 
+// CheckReady implements health.ReadinessChecker for EngineProvider.
+// It verifies the WebSocket engine manager is operational.
+func (p *EngineProvider) CheckReady(ctx context.Context) error {
+	if p.manager == nil {
+		return fmt.Errorf("engine manager not initialized")
+	}
+	// Check if manager is healthy (not shutting down, accepting connections)
+	if !p.manager.IsHealthy() {
+		return fmt.Errorf("engine manager not healthy")
+	}
+	return nil
+}
+
 // =============================================================================
 // Combined Backend Provider - combines auth + storage (backward compatible)
 // =============================================================================
@@ -291,44 +304,91 @@ func (p *BackendProvider) Close() error {
 	return nil
 }
 
+// CheckReady implements health.ReadinessChecker for BackendProvider.
+// It verifies the database connection is healthy.
+func (p *BackendProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("storage not initialized")
+	}
+	// Use a short timeout for readiness checks
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	return p.store.Ping(checkCtx)
+}
+
 // Store returns the underlying storage backend
 func (p *BackendProvider) Store() backend.Backend {
 	return p.store
 }
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
-// This registers all tenant management routes on the admin API.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers.RegisterRoutes(adminGroup)
+}
 
-	// Tenant management routes
-	tenants := adminGroup.Group("/tenants")
-	{
-		tenants.GET("", adminHandlers.ListTenants)
-		tenants.POST("", adminHandlers.CreateTenant)
-		tenants.GET("/:id", adminHandlers.GetTenant)
-		tenants.PUT("/:id", adminHandlers.UpdateTenant)
-		tenants.DELETE("/:id", adminHandlers.DeleteTenant)
+// =============================================================================
+// Admin Provider - standalone admin API (for --mode=admin deployments)
+// =============================================================================
 
-		// Tenant user management
-		tenants.GET("/:id/users", adminHandlers.GetTenantUsers)
-		tenants.POST("/:id/users", adminHandlers.AddUserToTenant)
-		tenants.DELETE("/:id/users/:user_id", adminHandlers.RemoveUserFromTenant)
+// AdminProvider provides only admin routes, without public auth/storage routes.
+// Use this when running admin as a standalone mode separate from the backend.
+type AdminProvider struct {
+	store  backend.Backend
+	logger *zap.Logger
+}
 
-		// Tenant issuer management
-		tenants.GET("/:id/issuers", adminHandlers.ListIssuers)
-		tenants.POST("/:id/issuers", adminHandlers.CreateIssuer)
-		tenants.GET("/:id/issuers/:issuer_id", adminHandlers.GetIssuer)
-		tenants.PUT("/:id/issuers/:issuer_id", adminHandlers.UpdateIssuer)
-		tenants.DELETE("/:id/issuers/:issuer_id", adminHandlers.DeleteIssuer)
-
-		// Tenant verifier management
-		tenants.GET("/:id/verifiers", adminHandlers.ListVerifiers)
-		tenants.POST("/:id/verifiers", adminHandlers.CreateVerifier)
-		tenants.GET("/:id/verifiers/:verifier_id", adminHandlers.GetVerifier)
-		tenants.PUT("/:id/verifiers/:verifier_id", adminHandlers.UpdateVerifier)
-		tenants.DELETE("/:id/verifiers/:verifier_id", adminHandlers.DeleteVerifier)
+// NewAdminProvider creates a standalone admin route provider
+func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, error) {
+	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	store, err := backend.New(initCtx, cfg)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize storage backend for admin: %w", err)
 	}
+
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := store.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("failed to ping storage: %w", err)
+	}
+
+	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
+
+	return &AdminProvider{
+		store:  store,
+		logger: logger,
+	}, nil
+}
+
+func (p *AdminProvider) Transport() Transport { return TransportHTTP }
+func (p *AdminProvider) Name() string         { return "admin" }
+
+// RegisterRoutes is a no-op — admin has no public routes
+func (p *AdminProvider) RegisterRoutes(router *gin.Engine) {}
+
+// Close shuts down the admin provider's storage
+func (p *AdminProvider) Close() error {
+	if p.store != nil {
+		return p.store.Close()
+	}
+	return nil
+}
+
+// CheckReady implements health.ReadinessChecker for AdminProvider.
+func (p *AdminProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("storage not initialized")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	return p.store.Ping(checkCtx)
+}
+
+// RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
+func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers.RegisterRoutes(adminGroup)
 }
 
 // =============================================================================
@@ -419,5 +479,20 @@ func (p *RegistryProvider) Close() error {
 		}
 	}
 
+	return nil
+}
+
+// CheckReady implements health.ReadinessChecker for RegistryProvider.
+// It verifies the registry store is initialized and operational.
+func (p *RegistryProvider) CheckReady(ctx context.Context) error {
+	if p.store == nil {
+		return fmt.Errorf("registry store not initialized")
+	}
+	// Store is file-based cache, check it's loaded
+	if p.store.Count() == 0 && !p.cfg.DynamicCache.Enabled {
+		// If dynamic cache is disabled and store is empty, that may be intentional
+		// Allow this state - the store is still functional
+		return nil
+	}
 	return nil
 }

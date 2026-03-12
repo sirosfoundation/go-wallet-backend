@@ -27,9 +27,7 @@ func NewRegistryClient(cfg *config.Config, logger *zap.Logger) *RegistryClient {
 	return &RegistryClient{
 		cfg:    cfg,
 		logger: logger.Named("registry_client"),
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient: cfg.HTTPClient.NewHTTPClient(10 * time.Second),
 	}
 }
 

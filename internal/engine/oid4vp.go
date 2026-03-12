@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // OID4VPHandler handles OpenID4VP credential presentation flows
@@ -33,9 +33,7 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		httpClient: cfg.HTTPClient.NewHTTPClient(0),
 	}, nil
 }
 
@@ -55,6 +53,9 @@ type AuthorizationRequest struct {
 	PresentationDefinitionURI string                  `json:"presentation_definition_uri,omitempty"`
 	ClientMetadata            *ClientMetadata         `json:"client_metadata,omitempty"`
 	ClientMetadataURI         string                  `json:"client_metadata_uri,omitempty"`
+	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
+	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
+	RequestJWT string `json:"-"`
 }
 
 // PresentationDefinition represents a DIF Presentation Definition
@@ -276,6 +277,9 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 		return nil, fmt.Errorf("failed to parse JWT payload: %w", err)
 	}
 
+	// Store the raw JWT so we can extract key material from its header later
+	authReq.RequestJWT = jwtStr
+
 	return &authReq, nil
 }
 
@@ -360,6 +364,11 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
 	}
 
+	// Fallback: extract key material from the request JWT header (x5c or jwk)
+	if keyMaterial == nil && authReq.RequestJWT != "" {
+		keyMaterial = trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
+	}
+
 	// Evaluate trust via TrustService
 	// Get tenant trust endpoint from session (if configured)
 	trustEndpoint := ""
@@ -375,6 +384,20 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	} else {
 		verifier.Trusted = trustInfo.Trusted
 		verifier.Framework = trustInfo.Framework
+	}
+
+	// Enforce trust decision: block untrusted verifiers when a PDP URL is configured.
+	// Trust is enforced iff a PDP endpoint is present (global config or session override).
+	trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
+	if trustEnforced && !verifier.Trusted {
+		reason := "verifier not trusted"
+		if trustInfo != nil && trustInfo.Reason != "" {
+			reason = trustInfo.Reason
+		}
+		h.Logger.Warn("Blocking untrusted verifier",
+			zap.String("verifier", authReq.ClientID),
+			zap.String("reason", reason))
+		return nil, fmt.Errorf("untrusted verifier %s: %s", authReq.ClientID, reason)
 	}
 
 	return verifier, nil
@@ -405,7 +428,7 @@ func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMe
 
 	// Fetch from jwks_uri
 	if clientMeta.JWKsURI != "" {
-		jwks, err := h.fetchJWKS(ctx, clientMeta.JWKsURI)
+		jwks, err := trust.FetchJWKS(ctx, clientMeta.JWKsURI, h.httpClient)
 		if err != nil {
 			h.Logger.Warn("Failed to fetch JWKS from URI", zap.String("uri", clientMeta.JWKsURI), zap.Error(err))
 		} else {
@@ -418,32 +441,6 @@ func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMe
 
 	// No key material available - will use resolution-only mode (for DIDs)
 	return nil
-}
-
-// fetchJWKS fetches a JWKS from a URI
-func (h *OID4VPHandler) fetchJWKS(ctx context.Context, uri string) (interface{}, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("JWKS fetch returned status %d", resp.StatusCode)
-	}
-
-	var jwks interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		return nil, err
-	}
-
-	return jwks, nil
 }
 
 func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, error) {

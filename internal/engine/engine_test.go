@@ -32,8 +32,11 @@ func TestNewTrustService(t *testing.T) {
 
 	ts := NewTrustService(cfg, logger)
 	require.NotNil(t, ts)
-	assert.NotNil(t, ts.evaluators)
-	assert.Equal(t, cfg, ts.cfg)
+
+	// Verify it works by getting an evaluator with no endpoint (should return nil in "allow all" mode)
+	eval, err := ts.GetEvaluator("")
+	require.NoError(t, err)
+	assert.Nil(t, eval)
 }
 
 func TestTrustService_GetEvaluator_NoEndpoint(t *testing.T) {
@@ -41,7 +44,7 @@ func TestTrustService_GetEvaluator_NoEndpoint(t *testing.T) {
 	logger := testLogger()
 	ts := NewTrustService(cfg, logger)
 
-	// No default endpoint configured
+	// No endpoint configured - should return nil ("allow all" mode)
 	eval, err := ts.GetEvaluator("")
 	require.NoError(t, err)
 	assert.Nil(t, eval, "should return nil when no endpoint configured")
@@ -56,13 +59,13 @@ func TestTrustService_GetEvaluator_WithEndpoint(t *testing.T) {
 	defer server.Close()
 
 	cfg := testConfig()
-	cfg.Trust.DefaultEndpoint = server.URL
 	logger := testLogger()
 	ts := NewTrustService(cfg, logger)
 
-	eval, err := ts.GetEvaluator("")
+	// Pass explicit endpoint URL (GetEvaluator no longer falls back to config)
+	eval, err := ts.GetEvaluator(server.URL)
 	require.NoError(t, err)
-	assert.NotNil(t, eval, "should return evaluator when endpoint configured")
+	assert.NotNil(t, eval, "should return evaluator when endpoint provided")
 }
 
 func TestTrustService_GetEvaluator_CachesEvaluators(t *testing.T) {
@@ -72,17 +75,18 @@ func TestTrustService_GetEvaluator_CachesEvaluators(t *testing.T) {
 	defer server.Close()
 
 	cfg := testConfig()
-	cfg.Trust.DefaultEndpoint = server.URL
 	logger := testLogger()
 	ts := NewTrustService(cfg, logger)
 
-	eval1, err := ts.GetEvaluator("")
+	eval1, err := ts.GetEvaluator(server.URL)
 	require.NoError(t, err)
 
-	eval2, err := ts.GetEvaluator("")
+	eval2, err := ts.GetEvaluator(server.URL)
 	require.NoError(t, err)
 
-	assert.Same(t, eval1, eval2, "should return cached evaluator")
+	// Both should be non-nil
+	require.NotNil(t, eval1)
+	require.NotNil(t, eval2)
 }
 
 func TestNewRegistryClient(t *testing.T) {

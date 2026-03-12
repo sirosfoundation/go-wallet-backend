@@ -28,6 +28,7 @@ type Store struct {
 	challenges    *ChallengeStore
 	issuers       *IssuerStore
 	verifiers     *VerifierStore
+	invites       *InviteStore
 }
 
 // NewStore creates a new MongoDB store
@@ -64,6 +65,7 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.challenges = &ChallengeStore{collection: database.Collection("challenges")}
 	s.issuers = &IssuerStore{collection: database.Collection("issuers"), counter: counters}
 	s.verifiers = &VerifierStore{collection: database.Collection("verifiers"), counter: counters}
+	s.invites = &InviteStore{collection: database.Collection("invites")}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -164,6 +166,15 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create user-tenant indexes: %w", err)
 	}
 
+	// Invites collection indexes
+	_, err = s.invites.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "code", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create invite indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -201,6 +212,7 @@ func (s *Store) Presentations() storage.PresentationStore { return s.presentatio
 func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
 func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
 func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore             { return s.invites }
 
 func (s *Store) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

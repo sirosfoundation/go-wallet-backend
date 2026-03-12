@@ -812,3 +812,42 @@ func (h *AdminHandlers) DeleteVerifier(c *gin.Context) {
 		zap.Int64("verifier_id", verifierID))
 	c.JSON(http.StatusOK, gin.H{"message": "Verifier deleted"})
 }
+
+// RegisterRoutes registers all admin routes on the given router group.
+// This is the single source of truth for admin route definitions.
+func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
+	tenants := adminGroup.Group("/tenants")
+	{
+		tenants.GET("", h.ListTenants)
+		tenants.POST("", h.CreateTenant)
+		tenants.GET("/:id", h.GetTenant)
+		tenants.PUT("/:id", h.UpdateTenant)
+		tenants.DELETE("/:id", h.DeleteTenant)
+
+		// User management
+		tenants.GET("/:id/users", h.GetTenantUsers)
+		tenants.POST("/:id/users", h.AddUserToTenant)
+		tenants.DELETE("/:id/users/:user_id", h.RemoveUserFromTenant)
+
+		// Issuer management
+		tenants.GET("/:id/issuers", h.ListIssuers)
+		tenants.POST("/:id/issuers", h.CreateIssuer)
+		tenants.GET("/:id/issuers/:issuer_id", h.GetIssuer)
+		tenants.PUT("/:id/issuers/:issuer_id", h.UpdateIssuer)
+		tenants.DELETE("/:id/issuers/:issuer_id", h.DeleteIssuer)
+
+		// Verifier management
+		tenants.GET("/:id/verifiers", h.ListVerifiers)
+		tenants.POST("/:id/verifiers", h.CreateVerifier)
+		tenants.GET("/:id/verifiers/:verifier_id", h.GetVerifier)
+		tenants.PUT("/:id/verifiers/:verifier_id", h.UpdateVerifier)
+		tenants.DELETE("/:id/verifiers/:verifier_id", h.DeleteVerifier)
+
+		// Invite management
+		tenants.GET("/:id/invites", h.ListInvites)
+		tenants.POST("/:id/invites", h.CreateInvite)
+		tenants.GET("/:id/invites/:invite_id", h.GetInvite)
+		tenants.PUT("/:id/invites/:invite_id", h.UpdateInvite)
+		tenants.DELETE("/:id/invites/:invite_id", h.DeleteInvite)
+	}
+}

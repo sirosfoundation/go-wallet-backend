@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
@@ -33,9 +33,7 @@ func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trust
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		httpClient: cfg.HTTPClient.NewHTTPClient(0),
 	}, nil
 }
 
@@ -58,8 +56,10 @@ type IssuerMetadata struct {
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 	// mDOC IACA certificates URL
 	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
-	// Signed metadata JWT (contains x5c for trust evaluation)
+	// Signed metadata JWT (contains x5c or jwk for trust evaluation)
 	SignedMetadata string `json:"signed_metadata,omitempty"`
+	// Inline JWKS for issuer keys
+	JWKS json.RawMessage `json:"jwks,omitempty"`
 	// JWKS URI for issuer keys
 	JWKsURI string `json:"jwks_uri,omitempty"`
 }
@@ -325,22 +325,57 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	// Extract key material from issuer metadata for trust evaluation
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
 
-	trust, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint, keyMaterial)
+	// Collect credential types from the offered configurations for trust policy
+	if keyMaterial != nil && keyMaterial.CredentialType == "" {
+		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
+	}
+
+	info, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint, keyMaterial)
 	if err != nil {
 		h.Logger.Error("Trust evaluation failed", zap.String("issuer", issuer), zap.Error(err))
-		trust = &TrustInfo{
+		info = &TrustInfo{
 			Trusted:   false,
 			Framework: "error",
 			Reason:    "Trust evaluation error: " + err.Error(),
 		}
 	}
 
-	_ = h.Progress(StepTrustEvaluated, trust)
-	return trust, nil
+	_ = h.Progress(StepTrustEvaluated, info)
+
+	// Enforce trust decision: block untrusted issuers when a PDP URL is configured.
+	// Trust is enforced iff a PDP endpoint is present (global config or session override).
+	trustEnforced := h.TrustSvc.IsIssuerTrustEnabled() || trustEndpoint != ""
+	if trustEnforced && !info.Trusted {
+		reason := info.Reason
+		if reason == "" {
+			reason = "issuer not trusted"
+		}
+		h.Logger.Warn("Blocking untrusted issuer",
+			zap.String("issuer", issuer),
+			zap.String("reason", reason))
+		return info, fmt.Errorf("untrusted issuer %s: %s", issuer, reason)
+	}
+
+	return info, nil
+}
+
+// collectCredentialTypes returns a comma-separated list of VCT/doctype values
+// from the issuer metadata's credential configurations.
+func (h *OID4VCIHandler) collectCredentialTypes(metadata *IssuerMetadata) string {
+	var types []string
+	for _, cfg := range metadata.CredentialConfigurationsSupported {
+		if cfg.VCT != "" {
+			types = append(types, cfg.VCT)
+		}
+	}
+	if len(types) == 1 {
+		return types[0]
+	}
+	return strings.Join(types, ",")
 }
 
 // extractIssuerKeyMaterial extracts key material from issuer metadata for trust evaluation.
-// Priority: mdoc_iacas_uri > signed_metadata x5c > jwks_uri
+// Priority: mdoc_iacas_uri > signed_metadata (x5c or jwk) > inline jwks > jwks_uri
 // For DIDs (issuerID starts with did:), returns nil to use resolution-only mode.
 func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata *IssuerMetadata) *KeyMaterial {
 	// Fetch IACA certificates for mDOC
@@ -358,20 +393,38 @@ func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata 
 		}
 	}
 
-	// Extract x5c from signed_metadata JWT header
+	// Verify and extract key material from signed_metadata JWT.
+	// Uses signature verification to prevent header injection attacks.
 	if metadata.SignedMetadata != "" {
-		x5c := h.extractX5CFromJWT(metadata.SignedMetadata)
-		if len(x5c) > 0 {
+		km, err := trust.VerifyJWTWithEmbeddedKey(metadata.SignedMetadata)
+		if err != nil {
+			h.Logger.Warn("signed_metadata JWT verification failed, trying header extraction as fallback",
+				zap.Error(err))
+			// Fall back to unverified extraction if the issuer uses a non-standard algorithm.
+			// The PDP will still validate the key material against its trust registries.
+			if km := trust.ExtractKeyMaterialFromJWT(metadata.SignedMetadata); km != nil {
+				return km
+			}
+		} else {
+			return km
+		}
+	}
+
+	// Inline JWKS in metadata
+	if len(metadata.JWKS) > 0 {
+		var jwks interface{}
+		if err := json.Unmarshal(metadata.JWKS, &jwks); err == nil {
 			return &KeyMaterial{
-				Type: "x5c",
-				X5C:  x5c,
+				Type: "jwk",
+				JWK:  jwks,
 			}
 		}
+		h.Logger.Warn("Failed to parse inline JWKS from issuer metadata")
 	}
 
 	// Fetch JWKS from jwks_uri
 	if metadata.JWKsURI != "" {
-		jwks, err := h.fetchJWKS(ctx, metadata.JWKsURI)
+		jwks, err := trust.FetchJWKS(ctx, metadata.JWKsURI, h.httpClient)
 		if err != nil {
 			h.Logger.Warn("Failed to fetch JWKS",
 				zap.String("uri", metadata.JWKsURI),
@@ -423,54 +476,6 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 	}
 
 	return certs, nil
-}
-
-// extractX5CFromJWT extracts the x5c certificate chain from a JWT header
-func (h *OID4VCIHandler) extractX5CFromJWT(jwtStr string) []string {
-	parts := strings.Split(jwtStr, ".")
-	if len(parts) < 2 {
-		return nil
-	}
-
-	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return nil
-	}
-
-	var header struct {
-		X5C []string `json:"x5c"`
-	}
-	if err := json.Unmarshal(headerBytes, &header); err != nil {
-		return nil
-	}
-
-	return header.X5C
-}
-
-// fetchJWKS fetches a JWKS from a URI
-func (h *OID4VCIHandler) fetchJWKS(ctx context.Context, uri string) (interface{}, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("JWKS fetch returned status %d", resp.StatusCode)
-	}
-
-	var jwks interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		return nil, err
-	}
-
-	return jwks, nil
 }
 
 func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (*CredentialConfig, error) {

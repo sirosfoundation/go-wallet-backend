@@ -37,9 +37,7 @@ func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient: cfg.HTTPClient.NewHTTPClient(10 * time.Second),
 		registryURL: registryURL,
 	}, nil
 }
