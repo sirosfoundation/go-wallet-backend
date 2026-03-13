@@ -18,7 +18,13 @@ const (
 	AuthenticatedKey contextKey = "authenticated"
 	// TenantIDKey is the context key for tenant ID from JWT
 	TenantIDKey contextKey = "tenant_id"
-	// anonymousKey is used for rate limiting anonymous requests (privacy: no IP tracking)
+	// anonymousKey is used for rate limiting anonymous requests.
+	// All unauthenticated requests share a single bucket by design:
+	// tracking per-IP buckets would undermine the privacy guarantee
+	// (no IP tracking). The trade-off is that one misbehaving client
+	// can exhaust the anonymous quota for everyone; deploy an external
+	// reverse-proxy rate limiter (nginx, Cloudflare, etc.) if per-IP
+	// fairness is required.
 	anonymousKey = "_anonymous"
 )
 

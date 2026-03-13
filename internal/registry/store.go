@@ -207,10 +207,21 @@ func (s *Store) Delete(vctID string) {
 	delete(s.entries, vctID)
 }
 
-// Update atomically replaces all entries and updates metadata
+// Update atomically replaces all registry-sourced entries and updates metadata.
+// Dynamically-fetched entries (IsDynamic == true) that are not present in the
+// new set are preserved so that on-demand fetches survive polling cycles.
 func (s *Store) Update(entries map[string]*VCTMEntry, sourceURL string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Carry over dynamic entries that are not in the new registry set
+	for id, existing := range s.entries {
+		if existing.IsDynamic {
+			if _, overwritten := entries[id]; !overwritten {
+				entries[id] = existing
+			}
+		}
+	}
 
 	s.entries = entries
 	s.sourceURL = sourceURL

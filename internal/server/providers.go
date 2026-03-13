@@ -472,6 +472,11 @@ func (p *RegistryProvider) Close() error {
 		p.fetcher.Stop()
 	}
 
+	// Stop handler background goroutines (performs final save)
+	if p.handler != nil {
+		p.handler.Close()
+	}
+
 	// Save cache
 	if p.store != nil {
 		if err := p.store.Save(); err != nil {
