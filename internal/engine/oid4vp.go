@@ -39,10 +39,19 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 
 // OID4VP data structures
 
+// ClientIDScheme constants for OID4VP client identification
+const (
+	ClientIDSchemeRedirectURI         = "redirect_uri"
+	ClientIDSchemeDID                 = "did"
+	ClientIDSchemeX509SANDNS          = "x509_san_dns"
+	ClientIDSchemeVerifierAttestation = "verifier_attestation"
+)
+
 // AuthorizationRequest represents an OpenID4VP authorization request
 type AuthorizationRequest struct {
 	ResponseType              string                  `json:"response_type"`
 	ClientID                  string                  `json:"client_id"`
+	ClientIDScheme            string                  `json:"client_id_scheme,omitempty"`
 	ResponseMode              string                  `json:"response_mode,omitempty"`
 	ResponseURI               string                  `json:"response_uri,omitempty"`
 	RedirectURI               string                  `json:"redirect_uri,omitempty"`
@@ -135,6 +144,12 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
 		return err
 	}
+
+	// Infer client_id_scheme if not explicitly provided
+	if authReq.ClientIDScheme == "" {
+		authReq.ClientIDScheme = inferClientIDScheme(authReq.ClientID)
+	}
+
 	h.SetData("auth_request", authReq)
 
 	// Step 2: Evaluate verifier trust
@@ -221,14 +236,15 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 	q := u.Query()
 
 	authReq := &AuthorizationRequest{
-		ResponseType: q.Get("response_type"),
-		ClientID:     q.Get("client_id"),
-		ResponseMode: q.Get("response_mode"),
-		ResponseURI:  q.Get("response_uri"),
-		RedirectURI:  q.Get("redirect_uri"),
-		Nonce:        q.Get("nonce"),
-		State:        q.Get("state"),
-		Scope:        q.Get("scope"),
+		ResponseType:   q.Get("response_type"),
+		ClientID:       q.Get("client_id"),
+		ClientIDScheme: q.Get("client_id_scheme"),
+		ResponseMode:   q.Get("response_mode"),
+		ResponseURI:    q.Get("response_uri"),
+		RedirectURI:    q.Get("redirect_uri"),
+		Nonce:          q.Get("nonce"),
+		State:          q.Get("state"),
+		Scope:          q.Get("scope"),
 	}
 
 	// Parse presentation_definition if inline
@@ -346,7 +362,8 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	// Build verifier info with name and logo from metadata
 	verifier := &VerifierInfo{
-		Name: authReq.ClientID,
+		Name:           authReq.ClientID,
+		ClientIDScheme: authReq.ClientIDScheme,
 	}
 
 	if clientMeta != nil {
@@ -358,19 +375,51 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
-	// Extract key material from client metadata for trust evaluation
+	// Scheme-aware key material extraction and JWT verification
 	var keyMaterial *KeyMaterial
-	if clientMeta != nil {
-		keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
-	}
+	var err error
+	switch authReq.ClientIDScheme {
+	case ClientIDSchemeDID:
+		// DID scheme: request MUST be JWT-secured; verify signature with embedded key
+		keyMaterial, err = h.verifyDIDRequest(authReq)
+		if err != nil {
+			return nil, fmt.Errorf("DID verifier request validation failed: %w", err)
+		}
 
-	// Fallback: extract key material from the request JWT header (x5c or jwk)
-	if keyMaterial == nil && authReq.RequestJWT != "" {
-		keyMaterial = trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
+	case ClientIDSchemeX509SANDNS:
+		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("x509_san_dns scheme requires a signed request JWT")
+		}
+		km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if verifyErr != nil {
+			return nil, fmt.Errorf("x509_san_dns JWT verification failed: %w", verifyErr)
+		}
+		if km.Type != "x5c" {
+			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
+		}
+		keyMaterial = km
+
+	default:
+		// redirect_uri and other schemes: extract key material best-effort
+		if clientMeta != nil {
+			keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
+		}
+		// Fallback: extract key material from the request JWT header
+		if keyMaterial == nil && authReq.RequestJWT != "" {
+			// Verify JWT signature if present (opportunistic verification)
+			km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+			if verifyErr != nil {
+				h.Logger.Warn("Request JWT signature verification failed, falling back to header extraction",
+					zap.Error(verifyErr))
+				keyMaterial = trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
+			} else {
+				keyMaterial = km
+			}
+		}
 	}
 
 	// Evaluate trust via TrustService
-	// Get tenant trust endpoint from session (if configured)
 	trustEndpoint := ""
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TrustEndpoint != "" {
 		trustEndpoint = h.Flow.Session.TrustEndpoint
@@ -387,7 +436,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	// Enforce trust decision: block untrusted verifiers when a PDP URL is configured.
-	// Trust is enforced iff a PDP endpoint is present (global config or session override).
 	trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
 	if trustEnforced && !verifier.Trusted {
 		reason := "verifier not trusted"
@@ -401,6 +449,33 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	return verifier, nil
+}
+
+// verifyDIDRequest validates a DID-identified verifier's request.
+// Per OID4VP, when client_id_scheme=did, the request MUST be a signed JWT
+// and the JWT's key material must bind to the DID (verified by the PDP).
+func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMaterial, error) {
+	// Validate client_id is a valid DID
+	if !strings.HasPrefix(authReq.ClientID, "did:") {
+		return nil, errors.New("client_id_scheme=did but client_id is not a DID")
+	}
+	parts := strings.SplitN(authReq.ClientID, ":", 3)
+	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
+		return nil, fmt.Errorf("invalid DID format: %s", authReq.ClientID)
+	}
+
+	// Request must be JWT-secured
+	if authReq.RequestJWT == "" {
+		return nil, errors.New("client_id_scheme=did requires a signed request JWT")
+	}
+
+	// Verify JWT signature with embedded key material
+	km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+	if err != nil {
+		return nil, fmt.Errorf("DID request JWT verification failed: %w", err)
+	}
+
+	return km, nil
 }
 
 // extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.
@@ -723,4 +798,13 @@ func (h *OID4VPHandler) buildPresentationSubmission(pd *PresentationDefinition) 
 		"definition_id":  pd.ID,
 		"descriptor_map": descriptorMap,
 	}
+}
+
+// inferClientIDScheme infers the client_id_scheme from the client_id format
+// when the verifier does not provide it explicitly.
+func inferClientIDScheme(clientID string) string {
+	if strings.HasPrefix(clientID, "did:") {
+		return ClientIDSchemeDID
+	}
+	return ClientIDSchemeRedirectURI
 }
