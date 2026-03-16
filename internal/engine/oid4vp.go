@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
@@ -24,14 +27,15 @@ type OID4VPHandler struct {
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
-func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
+func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
-			Flow:     flow,
-			Config:   cfg,
-			Logger:   logger,
-			TrustSvc: trustSvc,
-			Registry: registry,
+			Flow:      flow,
+			Config:    cfg,
+			Logger:    logger,
+			TrustSvc:  trustSvc,
+			Registry:  registry,
+			Verifiers: verifiers,
 		},
 		httpClient: cfg.HTTPClient.NewHTTPClient(0),
 	}, nil
@@ -425,6 +429,25 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		trustEndpoint = h.Flow.Session.TrustEndpoint
 	}
 
+	// Check cached trust result (skip PDP call if fresh)
+	const trustCacheTTL = 5 * time.Minute
+	if cached := h.getCachedVerifierTrust(ctx, authReq.ClientID); cached != nil {
+		if cached.TrustEvaluatedAt != nil && time.Since(*cached.TrustEvaluatedAt) < trustCacheTTL {
+			h.Logger.Debug("Using cached verifier trust",
+				zap.String("client_id", authReq.ClientID),
+				zap.String("status", string(cached.TrustStatus)))
+			verifier.Trusted = cached.TrustStatus == domain.TrustStatusTrusted
+			verifier.Framework = cached.TrustFramework
+
+			// Still enforce trust even from cache
+			trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
+			if trustEnforced && !verifier.Trusted {
+				return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
+			}
+			return verifier, nil
+		}
+	}
+
 	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint, keyMaterial)
 	if err != nil {
 		h.Logger.Warn("Verifier trust evaluation failed", zap.String("verifier", authReq.ClientID), zap.Error(err))
@@ -434,6 +457,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		verifier.Trusted = trustInfo.Trusted
 		verifier.Framework = trustInfo.Framework
 	}
+
+	// Cache trust evaluation result (best-effort, don't block the flow)
+	h.cacheVerifierTrust(ctx, authReq, verifier)
 
 	// Enforce trust decision: block untrusted verifiers when a PDP URL is configured.
 	trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
@@ -476,6 +502,63 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 	}
 
 	return km, nil
+}
+
+// getCachedVerifierTrust checks if a cached trust evaluation exists for the given client_id.
+// Returns nil if no cache is available or lookup fails.
+func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, clientID string) *domain.Verifier {
+	if h.Verifiers == nil {
+		return nil
+	}
+
+	tenantID := domain.TenantID("default")
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		tenantID = domain.TenantID(h.Flow.Session.TenantID)
+	}
+
+	cached, err := h.Verifiers.GetByClientID(ctx, tenantID, clientID)
+	if err != nil {
+		return nil // Not found or error — proceed with fresh evaluation
+	}
+	return cached
+}
+
+// cacheVerifierTrust persists verifier trust evaluation results for future lookups.
+// This is best-effort — failures are logged but don't affect the flow.
+func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) {
+	if h.Verifiers == nil {
+		return // No store available (standalone engine mode)
+	}
+
+	tenantID := domain.TenantID("default")
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		tenantID = domain.TenantID(h.Flow.Session.TenantID)
+	}
+
+	var trustStatus domain.TrustStatus
+	if verifier.Trusted {
+		trustStatus = domain.TrustStatusTrusted
+	} else {
+		trustStatus = domain.TrustStatusUntrusted
+	}
+
+	now := time.Now()
+	v := &domain.Verifier{
+		TenantID:         tenantID,
+		Name:             verifier.Name,
+		URL:              authReq.ClientID,
+		ClientID:         authReq.ClientID,
+		ClientIDScheme:   authReq.ClientIDScheme,
+		TrustStatus:      trustStatus,
+		TrustFramework:   verifier.Framework,
+		TrustEvaluatedAt: &now,
+	}
+
+	if err := h.Verifiers.Upsert(ctx, v); err != nil {
+		h.Logger.Warn("Failed to cache verifier trust result",
+			zap.String("client_id", authReq.ClientID),
+			zap.Error(err))
+	}
 }
 
 // extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.

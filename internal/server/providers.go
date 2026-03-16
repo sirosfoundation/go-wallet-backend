@@ -15,6 +15,7 @@ import (
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -184,10 +185,16 @@ type EngineProvider struct {
 	manager *wsengine.Manager
 }
 
-// NewEngineProvider creates a new WebSocket engine route provider
-func NewEngineProvider(cfg *config.Config, logger *zap.Logger) (*EngineProvider, error) {
+// NewEngineProvider creates a new WebSocket engine route provider.
+// If store is non-nil, the engine will cache verifier trust evaluations.
+func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore) (*EngineProvider, error) {
 	// Create WebSocket manager
 	manager := wsengine.NewManager(cfg, logger)
+
+	// Wire verifier store for trust caching
+	if store != nil {
+		manager.SetVerifierStore(store)
+	}
 
 	// Configure session store based on config
 	if cfg.SessionStore.Type == "redis" {

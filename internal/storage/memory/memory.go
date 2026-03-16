@@ -712,3 +712,35 @@ func (s *VerifierStore) Delete(ctx context.Context, tenantID domain.TenantID, id
 	delete(s.data, id)
 	return nil
 }
+
+func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.TenantID, clientID string) (*domain.Verifier, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, v := range s.data {
+		if v.TenantID == tenantID && v.ClientID == clientID {
+			return v, nil
+		}
+	}
+	return nil, storage.ErrNotFound
+}
+
+func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find existing by (tenantID, clientID)
+	for id, existing := range s.data {
+		if existing.TenantID == verifier.TenantID && existing.ClientID == verifier.ClientID {
+			verifier.ID = id
+			s.data[id] = verifier
+			return nil
+		}
+	}
+
+	// Insert new
+	s.nextID++
+	verifier.ID = s.nextID
+	s.data[verifier.ID] = verifier
+	return nil
+}

@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -71,6 +72,7 @@ type Manager struct {
 
 	trustService   *TrustService
 	registryClient *RegistryClient
+	verifierStore  storage.VerifierStore
 
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
@@ -102,6 +104,11 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 // SetSessionStore sets the session store (for Redis scaling)
 func (m *Manager) SetSessionStore(store SessionStore) {
 	m.sessionStore = store
+}
+
+// SetVerifierStore sets the verifier store for trust caching
+func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
+	m.verifierStore = store
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -301,7 +308,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// Create handler
-	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient)
+	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore)
 	if err != nil {
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))

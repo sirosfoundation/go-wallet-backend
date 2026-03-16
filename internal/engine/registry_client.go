@@ -25,8 +25,8 @@ type RegistryClient struct {
 // NewRegistryClient creates a new registry client.
 func NewRegistryClient(cfg *config.Config, logger *zap.Logger) *RegistryClient {
 	return &RegistryClient{
-		cfg:    cfg,
-		logger: logger.Named("registry_client"),
+		cfg:        cfg,
+		logger:     logger.Named("registry_client"),
 		httpClient: cfg.HTTPClient.NewHTTPClient(10 * time.Second),
 	}
 }
