@@ -625,18 +625,26 @@ type VerifierRequest struct {
 
 // VerifierResponse represents a verifier in API responses
 type VerifierResponse struct {
-	ID       int64  `json:"id"`
-	TenantID string `json:"tenant_id"`
-	Name     string `json:"name"`
-	URL      string `json:"url"`
+	ID             int64  `json:"id"`
+	TenantID       string `json:"tenant_id"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	ClientID       string `json:"client_id,omitempty"`
+	ClientIDScheme string `json:"client_id_scheme,omitempty"`
+	TrustStatus    string `json:"trust_status,omitempty"`
+	TrustFramework string `json:"trust_framework,omitempty"`
 }
 
 func verifierToResponse(v *domain.Verifier) *VerifierResponse {
 	return &VerifierResponse{
-		ID:       v.ID,
-		TenantID: string(v.TenantID),
-		Name:     v.Name,
-		URL:      v.URL,
+		ID:             v.ID,
+		TenantID:       string(v.TenantID),
+		Name:           v.Name,
+		URL:            v.URL,
+		ClientID:       v.ClientID,
+		ClientIDScheme: v.ClientIDScheme,
+		TrustStatus:    string(v.TrustStatus),
+		TrustFramework: v.TrustFramework,
 	}
 }
 

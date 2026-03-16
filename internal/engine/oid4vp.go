@@ -368,6 +368,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	verifier := &VerifierInfo{
 		Name:           authReq.ClientID,
 		ClientIDScheme: authReq.ClientIDScheme,
+		Domain:         extractDomain(authReq.ClientID),
 	}
 
 	if clientMeta != nil {
@@ -437,6 +438,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 				zap.String("client_id", authReq.ClientID),
 				zap.String("status", string(cached.TrustStatus)))
 			verifier.Trusted = cached.TrustStatus == domain.TrustStatusTrusted
+			verifier.TrustedStatus = string(cached.TrustStatus)
 			verifier.Framework = cached.TrustFramework
 
 			// Still enforce trust even from cache
@@ -452,10 +454,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	if err != nil {
 		h.Logger.Warn("Verifier trust evaluation failed", zap.String("verifier", authReq.ClientID), zap.Error(err))
 		verifier.Trusted = false
+		verifier.TrustedStatus = string(domain.TrustStatusUnknown)
 		verifier.Framework = "error"
+		verifier.Reason = err.Error()
 	} else {
 		verifier.Trusted = trustInfo.Trusted
 		verifier.Framework = trustInfo.Framework
+		verifier.Reason = trustInfo.Reason
+		if trustInfo.Trusted {
+			verifier.TrustedStatus = string(domain.TrustStatusTrusted)
+		} else {
+			verifier.TrustedStatus = string(domain.TrustStatusUntrusted)
+		}
 	}
 
 	// Cache trust evaluation result (best-effort, don't block the flow)
@@ -559,6 +569,21 @@ func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *Authori
 			zap.String("client_id", authReq.ClientID),
 			zap.Error(err))
 	}
+}
+
+// extractDomain extracts a domain name from a client_id (URL or DID).
+func extractDomain(clientID string) string {
+	if strings.HasPrefix(clientID, "did:web:") {
+		// did:web:example.com → example.com (colons become dots in full spec, but the host is the 3rd segment)
+		parts := strings.SplitN(clientID, ":", 4)
+		if len(parts) >= 3 {
+			return parts[2]
+		}
+	}
+	if u, err := url.Parse(clientID); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return ""
 }
 
 // extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.

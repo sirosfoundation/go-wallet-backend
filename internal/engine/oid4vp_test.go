@@ -126,3 +126,26 @@ func padBytes(b []byte, length int) []byte {
 	copy(padded[length-len(b):], b)
 	return padded
 }
+
+func TestExtractDomain(t *testing.T) {
+	tests := []struct {
+		name     string
+		clientID string
+		want     string
+	}{
+		{"did:web", "did:web:verifier.example.com", "verifier.example.com"},
+		{"did:web with path", "did:web:verifier.example.com:path:to", "verifier.example.com"},
+		{"did:key", "did:key:z6MkhaXg", ""},
+		{"https URL", "https://verifier.example.com/callback", "verifier.example.com"},
+		{"http URL with port", "http://localhost:8080/auth", "localhost:8080"},
+		{"plain string", "my-verifier", ""},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractDomain(tt.clientID)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
