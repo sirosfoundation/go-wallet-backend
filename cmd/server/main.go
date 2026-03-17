@@ -17,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
 )
@@ -114,13 +115,15 @@ func main() {
 	var resources []closeable
 
 	// Add providers based on roles
+	var backendProvider *server.BackendProvider
 	if roles.Has(modes.RoleBackend) {
-		provider, err := server.NewBackendProvider(backendCfg, logger, roleStrings)
+		var err error
+		backendProvider, err = server.NewBackendProvider(backendCfg, logger, roleStrings)
 		if err != nil {
 			logger.Fatal("Failed to create backend provider", zap.Error(err))
 		}
-		mgr.AddProvider(provider)
-		resources = append(resources, provider)
+		mgr.AddProvider(backendProvider)
+		resources = append(resources, backendProvider)
 	}
 
 	if roles.Has(modes.RoleRegistry) {
@@ -133,7 +136,12 @@ func main() {
 	}
 
 	if roles.Has(modes.RoleEngine) {
-		provider, err := server.NewEngineProvider(backendCfg, logger)
+		// Wire verifier store from backend if available (for trust caching)
+		var verifierStore storage.VerifierStore
+		if backendProvider != nil {
+			verifierStore = backendProvider.Store().Verifiers()
+		}
+		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}

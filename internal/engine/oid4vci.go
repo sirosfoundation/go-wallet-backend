@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
@@ -24,7 +25,7 @@ type OID4VCIHandler struct {
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
-func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
+func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
 	return &OID4VCIHandler{
 		BaseHandler: BaseHandler{
 			Flow:     flow,

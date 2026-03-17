@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -22,7 +23,7 @@ type VCTMHandler struct {
 }
 
 // NewVCTMHandler creates a new VCTM flow handler
-func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient) (FlowHandler, error) {
+func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
 	// Get registry URL from config, or use default
 	registryURL := cfg.Trust.RegistryURL
 	if registryURL == "" {
@@ -37,7 +38,7 @@ func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient: cfg.HTTPClient.NewHTTPClient(10 * time.Second),
+		httpClient:  cfg.HTTPClient.NewHTTPClient(10 * time.Second),
 		registryURL: registryURL,
 	}, nil
 }

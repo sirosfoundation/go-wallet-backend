@@ -110,10 +110,15 @@ func (CredentialIssuer) TableName() string {
 
 // Verifier represents a trusted verifier
 type Verifier struct {
-	ID       int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
-	TenantID TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
-	Name     string   `json:"name" bson:"name" gorm:"not null"`
-	URL      string   `json:"url" bson:"url" gorm:"index;not null"`
+	ID               int64       `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID         TenantID    `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
+	Name             string      `json:"name" bson:"name" gorm:"not null"`
+	URL              string      `json:"url" bson:"url" gorm:"index;not null"`
+	ClientID         string      `json:"clientId,omitempty" bson:"client_id" gorm:"index"`
+	ClientIDScheme   string      `json:"clientIdScheme,omitempty" bson:"client_id_scheme"`
+	TrustStatus      TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
+	TrustFramework   string      `json:"trustFramework,omitempty" bson:"trust_framework"`
+	TrustEvaluatedAt *time.Time  `json:"trustEvaluatedAt,omitempty" bson:"trust_evaluated_at"`
 }
 
 // TableName specifies the table name for GORM

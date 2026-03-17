@@ -167,6 +167,9 @@ type VerifierStore interface {
 	// GetByID retrieves a verifier by ID
 	GetByID(ctx context.Context, tenantID domain.TenantID, id int64) (*domain.Verifier, error)
 
+	// GetByClientID retrieves a verifier by client_id within a tenant
+	GetByClientID(ctx context.Context, tenantID domain.TenantID, clientID string) (*domain.Verifier, error)
+
 	// GetAll retrieves all verifiers for a tenant
 	GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error)
 
@@ -175,6 +178,9 @@ type VerifierStore interface {
 
 	// Delete deletes a verifier
 	Delete(ctx context.Context, tenantID domain.TenantID, id int64) error
+
+	// Upsert creates or updates a verifier by (tenantID, clientID)
+	Upsert(ctx context.Context, verifier *domain.Verifier) error
 }
 
 // Store aggregates all storage interfaces

@@ -229,10 +229,14 @@ type TrustInfo = trust.TrustInfo
 
 // VerifierInfo contains verifier metadata
 type VerifierInfo struct {
-	Name      string    `json:"name"`
-	Logo      *LogoInfo `json:"logo,omitempty"`
-	Trusted   bool      `json:"trusted"`
-	Framework string    `json:"framework,omitempty"`
+	Name           string    `json:"name"`
+	Logo           *LogoInfo `json:"logo,omitempty"`
+	Trusted        bool      `json:"trusted"`
+	TrustedStatus  string    `json:"trusted_status,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	Domain         string    `json:"domain,omitempty"`
+	Framework      string    `json:"framework,omitempty"`
+	ClientIDScheme string    `json:"client_id_scheme,omitempty"`
 }
 
 // LogoInfo contains logo metadata
