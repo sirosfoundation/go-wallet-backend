@@ -1,0 +1,41 @@
+# Example tenant configuration for wallet-admin sync
+#
+# Usage:
+#   wallet-admin sync --config tenants.yaml            # apply
+#   wallet-admin sync --config tenants.yaml --dry-run  # preview
+#   wallet-admin sync --config tenants.yaml --prune    # apply + delete extras
+#
+# Matching rules:
+#   - Tenants are matched by id
+#   - Issuers are matched by credential_issuer_identifier within a tenant
+#   - Verifiers are matched by name within a tenant
+
+tenants:
+  - id: default
+    name: Default Tenant
+    display_name: Default
+    enabled: true
+    trust_config:
+      trust_endpoint: https://trust.example.com/authzen
+      trust_ttl: 86400  # seconds (24 hours)
+    issuers:
+      - credential_issuer_identifier: https://issuer.example.com
+        client_id: wallet-client
+        visible: true
+      - credential_issuer_identifier: https://pid-issuer.example.com
+        visible: true
+    verifiers:
+      - name: Example Verifier
+        url: https://verifier.example.com
+
+  - id: staging
+    name: Staging Tenant
+    display_name: Staging Environment
+    enabled: true
+    issuers:
+      - credential_issuer_identifier: https://staging-issuer.example.com
+        client_id: staging-client
+        visible: true
+    verifiers:
+      - name: Staging Verifier
+        url: https://staging-verifier.example.com

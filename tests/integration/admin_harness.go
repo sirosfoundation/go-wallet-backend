@@ -60,7 +60,7 @@ func NewAdminTestHarness(t *testing.T) *AdminTestHarness {
 	// Setup router
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
-	h.Router.Use(middleware.Logger(logger))
+	h.Router.Use(middleware.Logger(logger, "/status", "/health", "/admin/status"))
 	setupAdminRoutes(h.Router, adminHandlers, testToken, logger)
 
 	// Create test server

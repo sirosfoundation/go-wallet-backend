@@ -101,6 +101,27 @@ docker-run-registry: docker-build-registry ## Build and run registry Docker cont
 
 docker-build-all: docker-build docker-build-registry ## Build all Docker images
 
+tools: ## Install development tools
+	@echo "Installing development tools..."
+	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	@echo "✓ Development tools installed"
+
+setup: ## Set up development environment (run once after cloning)
+	@echo "Setting up development environment..."
+	@bash scripts/setup-dev.sh
+
+fmt: ## Format all Go code
+	@echo "Formatting Go code..."
+	@gofmt -s -w .
+	@echo "✓ Code formatted"
+
+vet: ## Run go vet
+	@echo "Running go vet..."
+	@go vet ./...
+	@echo "✓ Vet passed"
+
+quick: fmt vet ## Quick checks (fmt + vet) before commit
+
 deps: ## Download dependencies
 	@echo "Downloading dependencies..."
 	@go mod download

@@ -263,3 +263,50 @@ func (s *VerifierStore) Delete(ctx context.Context, tenantID domain.TenantID, id
 	}
 	return nil
 }
+
+func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.TenantID, clientID string) (*domain.Verifier, error) {
+	var verifier domain.Verifier
+	err := s.collection.FindOne(ctx, bson.M{"tenant_id": string(tenantID), "client_id": clientID}).Decode(&verifier)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get verifier by client_id: %w", err)
+	}
+	return &verifier, nil
+}
+
+func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) error {
+	filter := bson.M{
+		"tenant_id": string(verifier.TenantID),
+		"client_id": verifier.ClientID,
+	}
+
+	// Try to find existing
+	var existing domain.Verifier
+	err := s.collection.FindOne(ctx, filter).Decode(&existing)
+	if err == nil {
+		// Update existing, preserve the ID
+		verifier.ID = existing.ID
+		_, err := s.collection.ReplaceOne(ctx, bson.M{"_id": existing.ID}, verifier)
+		if err != nil {
+			return fmt.Errorf("failed to update verifier: %w", err)
+		}
+		return nil
+	}
+	if err != mongo.ErrNoDocuments {
+		return fmt.Errorf("failed to check existing verifier: %w", err)
+	}
+
+	// Insert new
+	id, err := s.getNextID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get next verifier ID: %w", err)
+	}
+	verifier.ID = id
+	_, err = s.collection.InsertOne(ctx, verifier)
+	if err != nil {
+		return fmt.Errorf("failed to create verifier: %w", err)
+	}
+	return nil
+}

@@ -19,6 +19,7 @@ type Store struct {
 	challenges    *ChallengeStore
 	issuers       *IssuerStore
 	verifiers     *VerifierStore
+	invites       *InviteStore
 }
 
 // NewStore creates a new in-memory store
@@ -32,6 +33,7 @@ func NewStore() *Store {
 		challenges:    &ChallengeStore{data: make(map[string]*domain.WebauthnChallenge)},
 		issuers:       &IssuerStore{data: make(map[int64]*domain.CredentialIssuer)},
 		verifiers:     &VerifierStore{data: make(map[int64]*domain.Verifier)},
+		invites:       &InviteStore{data: make(map[string]*domain.Invite)},
 	}
 
 	// Create default tenant
@@ -55,6 +57,7 @@ func (s *Store) Presentations() storage.PresentationStore { return s.presentatio
 func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
 func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
 func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore             { return s.invites }
 func (s *Store) Close() error                             { return nil }
 func (s *Store) Ping(ctx context.Context) error           { return nil }
 
@@ -555,6 +558,13 @@ func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssue
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check for duplicate identifier within same tenant
+	for _, existing := range s.data {
+		if existing.TenantID == issuer.TenantID && existing.CredentialIssuerIdentifier == issuer.CredentialIssuerIdentifier {
+			return storage.ErrAlreadyExists
+		}
+	}
+
 	s.nextID++
 	issuer.ID = s.nextID
 	s.data[issuer.ID] = issuer
@@ -637,6 +647,13 @@ func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Check for duplicate URL within same tenant
+	for _, existing := range s.data {
+		if existing.TenantID == verifier.TenantID && existing.URL == verifier.URL {
+			return storage.ErrAlreadyExists
+		}
+	}
+
 	s.nextID++
 	verifier.ID = s.nextID
 	s.data[verifier.ID] = verifier
@@ -693,5 +710,37 @@ func (s *VerifierStore) Delete(ctx context.Context, tenantID domain.TenantID, id
 	}
 
 	delete(s.data, id)
+	return nil
+}
+
+func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.TenantID, clientID string) (*domain.Verifier, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, v := range s.data {
+		if v.TenantID == tenantID && v.ClientID == clientID {
+			return v, nil
+		}
+	}
+	return nil, storage.ErrNotFound
+}
+
+func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find existing by (tenantID, clientID)
+	for id, existing := range s.data {
+		if existing.TenantID == verifier.TenantID && existing.ClientID == verifier.ClientID {
+			verifier.ID = id
+			s.data[id] = verifier
+			return nil
+		}
+	}
+
+	// Insert new
+	s.nextID++
+	verifier.ID = s.nextID
+	s.data[verifier.ID] = verifier
 	return nil
 }

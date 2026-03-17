@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -18,24 +19,52 @@ import (
 // Handlers aggregates all HTTP handlers
 type Handlers struct {
 	services *service.Services
+	store    storage.Store
 	cfg      *config.Config
 	logger   *zap.Logger
+	roles    []string
 }
 
 // NewHandlers creates a new Handlers instance
-func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Logger) *Handlers {
+func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
 	return &Handlers{
 		services: services,
 		cfg:      cfg,
 		logger:   logger.Named("handlers"),
+		roles:    roles,
+	}
+}
+
+// NewHandlersWithStore creates a new Handlers instance with store for health checks
+func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
+	return &Handlers{
+		services: services,
+		store:    store,
+		cfg:      cfg,
+		logger:   logger.Named("handlers"),
+		roles:    roles,
 	}
 }
 
 // Status handles the /status endpoint
+// This endpoint returns the server status and API version for client capability detection.
 func (h *Handlers) Status(c *gin.Context) {
-	c.JSON(200, gin.H{
-		"status":  "ok",
-		"service": "wallet-backend",
+	status := "ok"
+
+	// Check storage health if store is available
+	if h.store != nil {
+		if err := h.store.Ping(c.Request.Context()); err != nil {
+			h.logger.Warn("Storage health check failed", zap.Error(err))
+			status = "degraded"
+		}
+	}
+
+	c.JSON(200, StatusResponse{
+		Status:       status,
+		Service:      "wallet-backend",
+		Roles:        h.roles,
+		APIVersion:   CurrentAPIVersion,
+		Capabilities: APICapabilities[CurrentAPIVersion],
 	})
 }
 
@@ -86,6 +115,14 @@ func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Tenant not found"})
 			return
 		}
+		if errors.Is(err, service.ErrInviteRequired) {
+			c.JSON(403, gin.H{"error": "invite_required"})
+			return
+		}
+		if errors.Is(err, service.ErrInvalidInvite) {
+			c.JSON(403, gin.H{"error": "invite_invalid"})
+			return
+		}
 		c.JSON(500, gin.H{"error": "Failed to start registration"})
 		return
 	}
@@ -116,6 +153,8 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 			c.JSON(410, gin.H{"error": "Challenge expired"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Verification failed"})
+		case errors.Is(err, service.ErrAAGUIDBlacklisted):
+			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete registration"})
 		}
@@ -186,6 +225,34 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	// Set private data ETag header if available
 	if len(resp.PrivateData) > 0 {
 		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
+	}
+
+	c.JSON(200, resp)
+}
+
+// RefreshToken exchanges a valid refresh token for a new access token
+func (h *Handlers) RefreshToken(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+
+	var req service.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.RefreshAccessToken(c.Request.Context(), &req)
+	if err != nil {
+		h.logger.Warn("Token refresh failed", zap.Error(err))
+		switch {
+		case errors.Is(err, service.ErrInvalidRefreshToken):
+			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
+		default:
+			c.JSON(500, gin.H{"error": "Failed to refresh token"})
+		}
+		return
 	}
 
 	c.JSON(200, resp)
@@ -559,7 +626,7 @@ func (h *Handlers) GetAllVerifiers(c *gin.Context) {
 	c.JSON(200, verifiers)
 }
 
-// Proxy handler
+// ProxyRequest handles proxied HTTP requests
 func (h *Handlers) ProxyRequest(c *gin.Context) {
 	var req service.ProxyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -741,6 +808,49 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 
 	c.Header("X-Private-Data-ETag", newEtag)
 	c.Status(204)
+}
+
+// Logout invalidates the current session by blacklisting the JWT
+func (h *Handlers) Logout(c *gin.Context) {
+	// Get the token from context (set by auth middleware)
+	tokenString, exists := c.Get("token")
+	if !exists {
+		// No token? Already logged out effectively
+		c.Status(200)
+		return
+	}
+
+	// Parse the token to get claims (we need jti and exp)
+	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
+		return []byte(h.cfg.JWT.Secret), nil
+	})
+
+	if token != nil && token.Claims != nil {
+		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			jti, _ := claims["jti"].(string)
+			if jti != "" && h.services.TokenBlacklist != nil {
+				// Get expiry time for blacklist entry
+				var expiry time.Time
+				if exp, ok := claims["exp"].(float64); ok {
+					expiry = time.Unix(int64(exp), 0)
+				} else {
+					// Default to 24 hours if no expiry (shouldn't happen)
+					expiry = time.Now().Add(24 * time.Hour)
+				}
+
+				// Add to blacklist
+				if err := h.services.TokenBlacklist.Add(c.Request.Context(), jti, expiry); err != nil {
+					h.logger.Warn("Failed to blacklist token", zap.Error(err))
+				} else {
+					h.logger.Info("User logged out, token blacklisted",
+						zap.String("jti", jti),
+					)
+				}
+			}
+		}
+	}
+
+	c.JSON(200, gin.H{"message": "Logged out successfully"})
 }
 
 // DeleteUser deletes the current user and all associated data
@@ -946,6 +1056,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Registration response could not be verified"})
+		case errors.Is(err, service.ErrAAGUIDBlacklisted):
+			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		case errors.Is(err, service.ErrPrivateDataConflict):
 			// Get current ETag
 			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))

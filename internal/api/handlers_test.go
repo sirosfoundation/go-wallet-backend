@@ -42,7 +42,7 @@ func setupTestHandlers(t *testing.T) (*Handlers, *gin.Engine) {
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
-	handlers := NewHandlers(services, cfg, logger)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
 
 	router := gin.New()
 	return handlers, router
@@ -54,7 +54,7 @@ func TestNewHandlers(t *testing.T) {
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
 
-	handlers := NewHandlers(services, cfg, logger)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
 
 	if handlers == nil {
 		t.Fatal("Expected handlers to not be nil")

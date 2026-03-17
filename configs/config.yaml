@@ -1,10 +1,58 @@
 server:
   host: "0.0.0.0"
   port: 8080
+  # Per-service bind addresses (default to 'host' if not specified)
+  # admin_host: "127.0.0.1"    # Bind admin API to localhost only
+  admin_port: 8081
+  # engine_host: "0.0.0.0"     # Bind engine to all interfaces
+  engine_port: 8082
+  # registry_host: "127.0.0.1" # Bind registry to localhost only
+  registry_port: 8097
   rp_id: "localhost"
   rp_origin: "http://localhost:8080"
   rp_name: "Wallet Backend"
   base_url: "http://localhost:8080"
+
+  # CORS configuration
+  cors:
+    # Allowed origins (use ["*"] for development, specific origins for production)
+    allowed_origins:
+      - "*"
+    # HTTP methods allowed
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+    # Request headers allowed
+    allowed_headers:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Tenant-ID"
+      - "If-None-Match"
+      - "X-Private-Data-If-Match"
+      - "X-Private-Data-If-None-Match"
+      - "Upgrade"
+      - "Connection"
+      - "Sec-WebSocket-Key"
+      - "Sec-WebSocket-Version"
+      - "Sec-WebSocket-Protocol"
+    # Response headers exposed to browser
+    exposed_headers:
+      - "X-Private-Data-ETag"
+    # Allow credentials (cannot be true with allowed_origins: ["*"])
+    allow_credentials: false
+    # Preflight cache duration in seconds
+    max_age: 43200
+
+  # External URLs for split-mode deployment
+  # (optional - defaults to localhost with respective ports)
+  # external_urls:
+  #   backend_url: "https://backend.example.com"
+  #   engine_url: "wss://engine.example.com"
+  #   registry_url: "https://registry.example.com"
+  #   admin_url: "https://admin.example.com"
 
 storage:
   type: "memory"  # Options: memory, sqlite, mongodb

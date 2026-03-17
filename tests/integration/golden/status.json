@@ -1,4 +1,16 @@
 {
+  "api_version": 1,
+  "capabilities": [
+    "webauthn",
+    "storage",
+    "proxy",
+    "multi-tenancy",
+    "vctm-registry",
+    "refresh-tokens"
+  ],
+  "roles": [
+    "test"
+  ],
   "service": "wallet-backend",
   "status": "ok"
 }

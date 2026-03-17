@@ -39,6 +39,9 @@ type FetchResult struct {
 
 	// NotModified is true if the server returned 304 Not Modified
 	NotModified bool
+
+	// Headers contains the response headers (available even on 304)
+	Headers http.Header
 }
 
 // Fetch fetches a VCTM from a URL
@@ -100,7 +103,7 @@ func (f *DynamicFetcher) Fetch(ctx context.Context, vctURL string, existingEntry
 	// Handle 304 Not Modified
 	if resp.StatusCode == http.StatusNotModified {
 		f.logger.Debug("VCTM not modified", zap.String("url", vctURL))
-		return &FetchResult{NotModified: true}, nil
+		return &FetchResult{NotModified: true, Headers: resp.Header}, nil
 	}
 
 	// Check for errors

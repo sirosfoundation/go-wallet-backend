@@ -38,6 +38,8 @@ type Backend interface {
 	Issuers() storage.IssuerStore
 	// Verifiers returns the verifier store
 	Verifiers() storage.VerifierStore
+	// Invites returns the invite store
+	Invites() storage.InviteStore
 	// Ping checks if the storage is alive
 	Ping(ctx context.Context) error
 	// Close closes the storage connection
@@ -57,6 +59,7 @@ func (b *memoryBackend) Presentations() storage.PresentationStore { return b.sto
 func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.store.Challenges() }
 func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
+func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
 func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                             { return nil }
 
@@ -73,6 +76,7 @@ func (b *mongoBackend) Presentations() storage.PresentationStore { return b.stor
 func (b *mongoBackend) Challenges() storage.ChallengeStore       { return b.store.Challenges() }
 func (b *mongoBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *mongoBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
+func (b *mongoBackend) Invites() storage.InviteStore             { return b.store.Invites() }
 func (b *mongoBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
 func (b *mongoBackend) Close() error                             { return b.store.Close() }
 

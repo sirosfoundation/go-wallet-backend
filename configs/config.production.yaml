@@ -3,10 +3,55 @@
 server:
   host: "0.0.0.0"
   port: 8080
+  # Per-service bind addresses (defaults to 'host' if not specified)
+  admin_host: "127.0.0.1"    # Bind admin API to localhost only for security
+  admin_port: 8081
+  # engine_host: "0.0.0.0"   # Bind engine to all interfaces (uses 'host' by default)
+  engine_port: 8082
+  # registry_host: "0.0.0.0" # Bind registry to all interfaces (uses 'host' by default)
+  registry_port: 8097
   rp_id: "wallet.example.com"
   rp_origin: "https://wallet.example.com"
   rp_name: "Example Wallet"
   base_url: "https://wallet.example.com"
+
+  # CORS configuration for production
+  cors:
+    # Specify exact origins in production
+    allowed_origins:
+      - "https://wallet.example.com"
+      - "https://app.example.com"
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+    allowed_headers:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Tenant-ID"
+      - "If-None-Match"
+      - "X-Private-Data-If-Match"
+      - "X-Private-Data-If-None-Match"
+      - "Upgrade"
+      - "Connection"
+      - "Sec-WebSocket-Key"
+      - "Sec-WebSocket-Version"
+      - "Sec-WebSocket-Protocol"
+    exposed_headers:
+      - "X-Private-Data-ETag"
+    # Can be true with specific origins
+    allow_credentials: true
+    max_age: 43200
+
+  # External URLs for split-mode deployment
+  # Use these when running services as separate containers/pods
+  external_urls:
+    backend_url: "https://api.wallet.example.com"
+    engine_url: "wss://ws.wallet.example.com"
+    registry_url: "https://registry.wallet.example.com"
+    admin_url: "https://admin.wallet.example.com"
 
 storage:
   type: "mongodb"
