@@ -161,8 +161,8 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 	}
 
 	err := cfg.Validate()
-	if err != nil {
-		t.Errorf("Validate() error = %v", err)
+	if err == nil {
+		t.Error("Validate() expected error for deprecated sqlite storage, got nil")
 	}
 }
 
@@ -328,9 +328,7 @@ server:
   rp_id: example.com
   rp_origin: http://example.com:8081
 storage:
-  type: sqlite
-  sqlite:
-    path: /custom/path.db
+  type: memory
 jwt:
   secret: test-secret
   expiry_hours: 48
@@ -351,11 +349,8 @@ jwt:
 	if cfg.Server.Port != 8081 {
 		t.Errorf("Expected port 8081, got %d (default 8080 was applied)", cfg.Server.Port)
 	}
-	if cfg.Storage.Type != "sqlite" {
-		t.Errorf("Expected storage type 'sqlite', got %q", cfg.Storage.Type)
-	}
-	if cfg.Storage.SQLite.Path != "/custom/path.db" {
-		t.Errorf("Expected SQLite path '/custom/path.db', got %q", cfg.Storage.SQLite.Path)
+	if cfg.Storage.Type != "memory" {
+		t.Errorf("Expected storage type 'memory', got %q", cfg.Storage.Type)
 	}
 	if cfg.JWT.ExpiryHours != 48 {
 		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
