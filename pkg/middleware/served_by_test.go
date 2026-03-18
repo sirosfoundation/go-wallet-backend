@@ -18,7 +18,7 @@ func TestServedByMiddleware(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest("GET", "/test", nil)
 	router.ServeHTTP(w, req)
 
 	if got := w.Header().Get("X-Served-By"); got != "test-node-1" {

@@ -546,3 +546,30 @@ func TestTrustConfig_IndependentFlowConfig(t *testing.T) {
 		t.Errorf("GetVerifierPDPURL() = %v, want empty", got)
 	}
 }
+
+func TestServerConfig_ResolvedServedBy(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+
+	t.Run("nil defaults to hostname", func(t *testing.T) {
+		cfg := ServerConfig{ServedByHeader: nil}
+		got := cfg.ResolvedServedBy()
+		// Should return something non-empty (hostname or "unknown")
+		if got == "" {
+			t.Error("ResolvedServedBy() should return hostname when nil, got empty")
+		}
+	})
+
+	t.Run("custom value", func(t *testing.T) {
+		cfg := ServerConfig{ServedByHeader: strPtr("custom-node")}
+		if got := cfg.ResolvedServedBy(); got != "custom-node" {
+			t.Errorf("ResolvedServedBy() = %q, want %q", got, "custom-node")
+		}
+	})
+
+	t.Run("empty string disables header", func(t *testing.T) {
+		cfg := ServerConfig{ServedByHeader: strPtr("")}
+		if got := cfg.ResolvedServedBy(); got != "" {
+			t.Errorf("ResolvedServedBy() = %q, want %q", got, "")
+		}
+	})
+}

@@ -345,3 +345,24 @@ func TestFilterConfig_Matches(t *testing.T) {
 		})
 	}
 }
+
+func TestServerConfig_ResolvedServedBy(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+
+	t.Run("nil defaults to hostname", func(t *testing.T) {
+		cfg := ServerConfig{Host: "0.0.0.0", Port: 8097, ServedByHeader: nil}
+		got := cfg.ResolvedServedBy()
+		// Should return something non-empty (hostname or "unknown")
+		assert.NotEmpty(t, got, "ResolvedServedBy() should return hostname when nil")
+	})
+
+	t.Run("custom value", func(t *testing.T) {
+		cfg := ServerConfig{Host: "0.0.0.0", Port: 8097, ServedByHeader: strPtr("custom-node")}
+		assert.Equal(t, "custom-node", cfg.ResolvedServedBy())
+	})
+
+	t.Run("empty string disables header", func(t *testing.T) {
+		cfg := ServerConfig{Host: "0.0.0.0", Port: 8097, ServedByHeader: strPtr("")}
+		assert.Equal(t, "", cfg.ResolvedServedBy())
+	})
+}

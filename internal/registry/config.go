@@ -56,7 +56,10 @@ func (c ServerConfig) Address() string {
 // ResolvedServedBy returns the resolved X-Served-By header value.
 func (c ServerConfig) ResolvedServedBy() string {
 	if c.ServedByHeader == nil {
-		h, _ := os.Hostname()
+		h, err := os.Hostname()
+		if err != nil {
+			return "unknown"
+		}
 		return h
 	}
 	return *c.ServedByHeader

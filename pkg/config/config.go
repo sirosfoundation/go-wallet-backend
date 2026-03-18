@@ -767,7 +767,10 @@ func (c *ServerConfig) RegistryAddress() string {
 // or empty string if explicitly set to "" (disabled).
 func (c *ServerConfig) ResolvedServedBy() string {
 	if c.ServedByHeader == nil {
-		h, _ := os.Hostname()
+		h, err := os.Hostname()
+		if err != nil {
+			return "unknown"
+		}
 		return h
 	}
 	return *c.ServedByHeader
