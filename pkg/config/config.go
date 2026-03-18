@@ -124,9 +124,13 @@ func (t *TLSConfig) TLSMinVersion() uint16 {
 }
 
 // ListenAndServe starts srv using TLS if t is enabled, plain HTTP otherwise.
+// If TLS is enabled, it merges the MinVersion setting into any existing TLSConfig.
 func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
 	if t.Enabled {
-		srv.TLSConfig = &tls.Config{MinVersion: t.TLSMinVersion()}
+		if srv.TLSConfig == nil {
+			srv.TLSConfig = &tls.Config{}
+		}
+		srv.TLSConfig.MinVersion = t.TLSMinVersion()
 		return srv.ListenAndServeTLS(t.CertFile, t.KeyFile)
 	}
 	return srv.ListenAndServe()

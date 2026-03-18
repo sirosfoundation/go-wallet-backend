@@ -173,6 +173,44 @@ func TestConfig_Validate(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "TLS enabled without cert_file",
+			modify: func(c *Config) {
+				c.Server.TLS.Enabled = true
+				c.Server.TLS.CertFile = ""
+				c.Server.TLS.KeyFile = "/path/to/key.pem"
+			},
+			expectError: true,
+			errorMsg:    "server.tls.cert_file is required when TLS is enabled",
+		},
+		{
+			name: "TLS enabled without key_file",
+			modify: func(c *Config) {
+				c.Server.TLS.Enabled = true
+				c.Server.TLS.CertFile = "/path/to/cert.pem"
+				c.Server.TLS.KeyFile = ""
+			},
+			expectError: true,
+			errorMsg:    "server.tls.key_file is required when TLS is enabled",
+		},
+		{
+			name: "TLS enabled with valid cert and key",
+			modify: func(c *Config) {
+				c.Server.TLS.Enabled = true
+				c.Server.TLS.CertFile = "/path/to/cert.pem"
+				c.Server.TLS.KeyFile = "/path/to/key.pem"
+			},
+			expectError: false,
+		},
+		{
+			name: "TLS disabled - no cert/key required",
+			modify: func(c *Config) {
+				c.Server.TLS.Enabled = false
+				c.Server.TLS.CertFile = ""
+				c.Server.TLS.KeyFile = ""
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
