@@ -49,7 +49,9 @@ type IssuerDiscoveryResult struct {
 
 // DiscoverIssuer fetches OpenID4VCI issuer metadata and optional IACA certificates.
 // This is used internally by WebSocket flow handlers during credential issuance.
-// If httpClient is nil, a default client is used.
+// httpClient should be a centralized HTTP client with proxy/TLS settings applied.
+// If nil, a default client is used (suitable for testing only - production code
+// should pass a configured client).
 func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Client) *IssuerDiscoveryResult {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}

@@ -22,7 +22,9 @@ type DynamicFetcher struct {
 }
 
 // NewDynamicFetcher creates a new dynamic fetcher.
-// If httpClient is nil, a default client with the configured timeout is used.
+// httpClient should be a centralized HTTP client with proxy/TLS settings applied.
+// If nil, a default client is used (suitable for testing only - production code
+// should always pass a configured client via HTTPClientConfig).
 func NewDynamicFetcher(config *DynamicCacheConfig, logger *zap.Logger, httpClient *http.Client) *DynamicFetcher {
 	if httpClient == nil {
 		httpClient = &http.Client{

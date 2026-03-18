@@ -54,7 +54,9 @@ type VerifierDiscoveryResult struct {
 
 // DiscoverVerifier fetches verifier metadata from client_metadata_uri.
 // This is used internally by WebSocket flow handlers during credential presentation.
-// If httpClient is nil, a default client is used.
+// httpClient should be a centralized HTTP client with proxy/TLS settings applied.
+// If nil, a default client is used (suitable for testing only - production code
+// should pass a configured client).
 func DiscoverVerifier(ctx context.Context, clientMetadataURI string, httpClient *http.Client) *VerifierDiscoveryResult {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}

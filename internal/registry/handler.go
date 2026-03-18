@@ -17,6 +17,7 @@ type Handler struct {
 	imageEmbedder  *embed.ImageEmbedder
 	config         *DynamicCacheConfig
 	logger         *zap.Logger
+	httpClient     *http.Client
 
 	// sfGroup deduplicates concurrent dynamic fetches for the same VCT
 	sfGroup singleflight.Group
@@ -28,32 +29,37 @@ type Handler struct {
 // HandlerOption configures the Handler
 type HandlerOption func(*Handler)
 
+// WithHTTPClient sets the HTTP client for outbound requests
+func WithHTTPClient(client *http.Client) HandlerOption {
+	return func(h *Handler) {
+		h.httpClient = client
+	}
+}
+
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, httpClient *http.Client, opts ...HandlerOption) *Handler {
-	var dynamicFetcher *DynamicFetcher
-	if config != nil && config.Enabled {
-		dynamicFetcher = NewDynamicFetcher(config, logger, httpClient)
-	}
-	var imageEmbedder *embed.ImageEmbedder
-	if imageEmbedConfig == nil || imageEmbedConfig.Enabled {
-		var embedOpts []embed.Option
-		if httpClient != nil {
-			embedOpts = append(embedOpts, embed.WithHTTPClient(httpClient))
-		}
-		imageEmbedder = embed.NewImageEmbedder(imageEmbedConfig, logger, embedOpts...)
-	}
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		store:          store,
-		dynamicFetcher: dynamicFetcher,
-		imageEmbedder:  imageEmbedder,
-		config:         config,
-		logger:         logger,
-		saveCh:         make(chan struct{}, 1),
+		store:  store,
+		config: config,
+		logger: logger,
+		saveCh: make(chan struct{}, 1),
 	}
 
-	// Apply options
+	// Apply options first so httpClient is set
 	for _, opt := range opts {
 		opt(h)
+	}
+
+	// Initialize sub-components with the configured HTTP client
+	if config != nil && config.Enabled {
+		h.dynamicFetcher = NewDynamicFetcher(config, logger, h.httpClient)
+	}
+	if imageEmbedConfig == nil || imageEmbedConfig.Enabled {
+		var embedOpts []embed.Option
+		if h.httpClient != nil {
+			embedOpts = append(embedOpts, embed.WithHTTPClient(h.httpClient))
+		}
+		h.imageEmbedder = embed.NewImageEmbedder(imageEmbedConfig, logger, embedOpts...)
 	}
 
 	// Start the debounced save worker

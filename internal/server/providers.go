@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -404,12 +405,13 @@ func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 
 // RegistryProvider provides VCTM registry routes
 type RegistryProvider struct {
-	cfg     *registry.Config
-	logger  *zap.Logger
-	store   *registry.Store
-	fetcher *registry.Fetcher
-	handler *registry.Handler
-	cancel  context.CancelFunc
+	cfg        *registry.Config
+	logger     *zap.Logger
+	store      *registry.Store
+	fetcher    *registry.Fetcher
+	handler    *registry.Handler
+	httpClient *http.Client
+	cancel     context.CancelFunc
 }
 
 // NewRegistryProvider creates a new registry route provider
@@ -424,14 +426,19 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 			zap.Time("last_updated", store.LastUpdated()))
 	}
 
-	// Create handler
-	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger, nil)
+	// Create centralized HTTP client using config
+	httpClient := cfg.HTTPClient.NewHTTPClient(cfg.Source.Timeout)
+
+	// Create handler with HTTP client option
+	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger,
+		registry.WithHTTPClient(httpClient))
 
 	return &RegistryProvider{
-		cfg:     cfg,
-		logger:  logger,
-		store:   store,
-		handler: handler,
+		cfg:        cfg,
+		logger:     logger,
+		store:      store,
+		handler:    handler,
+		httpClient: httpClient,
 	}, nil
 }
 
@@ -462,7 +469,7 @@ func (p *RegistryProvider) Start(ctx context.Context) error {
 	fetchCtx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 
-	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger, nil)
+	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger, p.httpClient)
 	if err := p.fetcher.Start(fetchCtx); err != nil {
 		return fmt.Errorf("failed to start registry fetcher: %w", err)
 	}

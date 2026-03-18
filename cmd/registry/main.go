@@ -62,11 +62,14 @@ func main() {
 			zap.Time("last_updated", store.LastUpdated()))
 	}
 
+	// Create centralized HTTP client
+	httpClient := config.HTTPClient.NewHTTPClient(config.Source.Timeout)
+
 	// Create fetcher and start polling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fetcher := registry.NewFetcher(config, store, logger, nil)
+	fetcher := registry.NewFetcher(config, store, logger, httpClient)
 	if err := fetcher.Start(ctx); err != nil {
 		logger.Error("failed to start fetcher", zap.Error(err))
 	}
@@ -97,7 +100,8 @@ func main() {
 	router.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handlers
-	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger, nil)
+	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger,
+		registry.WithHTTPClient(httpClient))
 	handler.RegisterRoutes(router)
 
 	// Create HTTP server

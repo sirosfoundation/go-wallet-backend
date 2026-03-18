@@ -65,7 +65,9 @@ type Fetcher struct {
 }
 
 // NewFetcher creates a new registry fetcher.
-// If httpClient is nil, a default client with the configured timeout is used.
+// httpClient should be a centralized HTTP client with proxy/TLS settings applied.
+// If nil, a default client is used (suitable for testing only - production code
+// should always pass a configured client via HTTPClientConfig).
 func NewFetcher(config *Config, store *Store, logger *zap.Logger, httpClient *http.Client) *Fetcher {
 	if httpClient == nil {
 		httpClient = &http.Client{
