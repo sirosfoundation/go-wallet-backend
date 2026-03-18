@@ -113,6 +113,29 @@ type TLSConfig struct {
 	MinVersion string `yaml:"min_version" envconfig:"MIN_VERSION"`
 }
 
+// TLSMinVersion returns the tls.Config MinVersion constant for the configured value.
+func (t *TLSConfig) TLSMinVersion() uint16 {
+	switch strings.ToLower(t.MinVersion) {
+	case "tls13", "1.3":
+		return tls.VersionTLS13
+	default:
+		return tls.VersionTLS12
+	}
+}
+
+// ListenAndServe starts srv using TLS if t is enabled, plain HTTP otherwise.
+// If TLS is enabled, it merges the MinVersion setting into any existing TLSConfig.
+func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
+	if t.Enabled {
+		if srv.TLSConfig == nil {
+			srv.TLSConfig = &tls.Config{}
+		}
+		srv.TLSConfig.MinVersion = t.TLSMinVersion()
+		return srv.ListenAndServeTLS(t.CertFile, t.KeyFile)
+	}
+	return srv.ListenAndServe()
+}
+
 // CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
 type CORSConfig struct {
 	// AllowedOrigins is a list of origins that may access the resource.

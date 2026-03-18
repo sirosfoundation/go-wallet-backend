@@ -154,7 +154,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		logger.Info("Engine server listening",
 			zap.String("address", addr),
 			zap.String("endpoint", "/api/v2/wallet"))
-		if err := r.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := cfg.Server.TLS.ListenAndServe(r.srv); err != nil && err != http.ErrServerClosed {
 			logger.Error("Engine server error", zap.Error(err))
 		}
 	}()

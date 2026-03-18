@@ -573,3 +573,94 @@ func TestServerConfig_ResolvedServedBy(t *testing.T) {
 		}
 	})
 }
+
+func TestTLSConfig_TLSMinVersion(t *testing.T) {
+	tests := []struct {
+		name       string
+		minVersion string
+		expected   uint16
+	}{
+		{"default empty returns TLS 1.2", "", 0x0303},  // tls.VersionTLS12
+		{"tls12 returns TLS 1.2", "tls12", 0x0303},
+		{"TLS12 uppercase returns TLS 1.2", "TLS12", 0x0303},
+		{"1.2 returns TLS 1.2", "1.2", 0x0303},
+		{"tls13 returns TLS 1.3", "tls13", 0x0304},  // tls.VersionTLS13
+		{"TLS13 uppercase returns TLS 1.3", "TLS13", 0x0304},
+		{"1.3 returns TLS 1.3", "1.3", 0x0304},
+		{"unknown falls back to TLS 1.2", "invalid", 0x0303},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := TLSConfig{MinVersion: tt.minVersion}
+			if got := cfg.TLSMinVersion(); got != tt.expected {
+				t.Errorf("TLSMinVersion() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		certFile  string
+		keyFile   string
+		wantError bool
+	}{
+		{"valid TLS config", "/path/to/cert.pem", "/path/to/key.pem", false},
+		{"missing cert_file", "", "/path/to/key.pem", true},
+		{"missing key_file", "/path/to/cert.pem", "", true},
+		{"missing both", "", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Server: ServerConfig{
+					Host:     "localhost",
+					Port:     8080,
+					RPID:     "localhost",
+					RPOrigin: "http://localhost:8080",
+					TLS: TLSConfig{
+						Enabled:  true,
+						CertFile: tt.certFile,
+						KeyFile:  tt.keyFile,
+					},
+				},
+				Storage: StorageConfig{Type: "memory"},
+				JWT:     JWTConfig{Secret: "test"},
+			}
+
+			err := cfg.Validate()
+			if tt.wantError && err == nil {
+				t.Error("Expected validation error, got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Errorf("Unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
+	cfg := &Config{
+		Server: ServerConfig{
+			Host:     "localhost",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			TLS: TLSConfig{
+				Enabled:  false,
+				CertFile: "", // empty is fine when disabled
+				KeyFile:  "", // empty is fine when disabled
+			},
+		},
+		Storage: StorageConfig{Type: "memory"},
+		JWT:     JWTConfig{Secret: "test"},
+	}
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("Validate() error = %v, expected nil when TLS disabled", err)
+	}
+}

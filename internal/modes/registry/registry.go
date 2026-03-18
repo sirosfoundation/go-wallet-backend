@@ -126,7 +126,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Start server
 	go func() {
 		logger.Info("Registry server listening", zap.String("address", cfg.Server.Address()))
-		if err := r.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := cfg.Server.TLS.ListenAndServe(r.srv); err != nil && err != http.ErrServerClosed {
 			logger.Error("Registry server error", zap.Error(err))
 		}
 	}()

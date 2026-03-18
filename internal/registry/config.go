@@ -294,6 +294,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
 	}
 
+	// Validate TLS configuration
+	if c.Server.TLS.Enabled {
+		if c.Server.TLS.CertFile == "" {
+			return fmt.Errorf("server.tls.cert_file is required when TLS is enabled")
+		}
+		if c.Server.TLS.KeyFile == "" {
+			return fmt.Errorf("server.tls.key_file is required when TLS is enabled")
+		}
+	}
+
 	if c.Source.URL == "" {
 		return fmt.Errorf("source URL is required")
 	}

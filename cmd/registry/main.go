@@ -116,7 +116,7 @@ func main() {
 	// Start server in a goroutine
 	go func() {
 		logger.Info("server listening", zap.String("address", config.Server.Address()))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := config.Server.TLS.ListenAndServe(srv); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("server error", zap.Error(err))
 		}
 	}()

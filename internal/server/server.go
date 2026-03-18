@@ -91,6 +91,9 @@ type ServerConfig struct {
 	CORS         config.CORSConfig
 	LoggingLevel string
 
+	// TLS configuration
+	TLS config.TLSConfig
+
 	// Active roles for status endpoint
 	Roles []string
 }
@@ -220,7 +223,7 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	go func() {
 		m.logger.Info("HTTP server listening", zap.String("address", httpAddr))
-		if err := m.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := m.cfg.TLS.ListenAndServe(m.httpServer); err != nil && err != http.ErrServerClosed {
 			m.logger.Error("HTTP server error", zap.Error(err))
 		}
 	}()
@@ -241,7 +244,7 @@ func (m *Manager) Start(ctx context.Context) error {
 
 		go func() {
 			m.logger.Info("WebSocket server listening", zap.String("address", wsAddr))
-			if err := m.wsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := m.cfg.TLS.ListenAndServe(m.wsServer); err != nil && err != http.ErrServerClosed {
 				m.logger.Error("WebSocket server error", zap.Error(err))
 			}
 		}()
@@ -404,7 +407,7 @@ func (m *Manager) startAdminServer() error {
 
 	go func() {
 		m.logger.Info("Admin server listening", zap.String("address", adminAddr))
-		if err := m.adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := m.cfg.TLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
 			m.logger.Error("Admin server error", zap.Error(err))
 		}
 	}()
