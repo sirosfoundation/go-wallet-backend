@@ -337,6 +337,39 @@ func TestTenantNeedsUpdate(t *testing.T) {
 			t.Error("expected update needed for trust_ttl change")
 		}
 	})
+
+	t.Run("require_invite changed true to false", func(t *testing.T) {
+		desired := SyncTenant{ID: "t1", Name: "T1", RequireInvite: boolPtr(false)}
+		existing := syncTenantResp{ID: "t1", Name: "T1", Enabled: true, RequireInvite: true}
+		if !tenantNeedsUpdate(desired, existing) {
+			t.Error("expected update needed for require_invite change")
+		}
+	})
+
+	t.Run("require_invite changed false to true", func(t *testing.T) {
+		desired := SyncTenant{ID: "t1", Name: "T1", RequireInvite: boolPtr(true)}
+		existing := syncTenantResp{ID: "t1", Name: "T1", Enabled: true, RequireInvite: false}
+		if !tenantNeedsUpdate(desired, existing) {
+			t.Error("expected update needed for require_invite change")
+		}
+	})
+
+	t.Run("require_invite nil does not trigger update", func(t *testing.T) {
+		// When require_invite is nil in config, we don't manage it - no update needed
+		desired := SyncTenant{ID: "t1", Name: "T1", RequireInvite: nil}
+		existing := syncTenantResp{ID: "t1", Name: "T1", Enabled: true, RequireInvite: true}
+		if tenantNeedsUpdate(desired, existing) {
+			t.Error("expected no update: nil require_invite means 'do not manage'")
+		}
+	})
+
+	t.Run("require_invite matches existing", func(t *testing.T) {
+		desired := SyncTenant{ID: "t1", Name: "T1", RequireInvite: boolPtr(true)}
+		existing := syncTenantResp{ID: "t1", Name: "T1", Enabled: true, RequireInvite: true}
+		if tenantNeedsUpdate(desired, existing) {
+			t.Error("expected no update: require_invite matches")
+		}
+	})
 }
 
 // --- issuerNeedsUpdate tests ---
@@ -448,6 +481,27 @@ func TestBuildTenantRequestBody(t *testing.T) {
 		}
 		if tc["trust_ttl"] != 7200 {
 			t.Errorf("expected trust_ttl 7200, got %v", tc["trust_ttl"])
+		}
+	})
+
+	t.Run("require_invite true", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{ID: "t1", Name: "T1", RequireInvite: boolPtr(true)})
+		if body["require_invite"] != true {
+			t.Errorf("expected require_invite true, got %v", body["require_invite"])
+		}
+	})
+
+	t.Run("require_invite false", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{ID: "t1", Name: "T1", RequireInvite: boolPtr(false)})
+		if body["require_invite"] != false {
+			t.Errorf("expected require_invite false, got %v", body["require_invite"])
+		}
+	})
+
+	t.Run("require_invite nil - omitted from body", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{ID: "t1", Name: "T1", RequireInvite: nil})
+		if _, ok := body["require_invite"]; ok {
+			t.Error("require_invite should not be set when nil")
 		}
 	})
 }
