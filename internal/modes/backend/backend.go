@@ -105,7 +105,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Start public server
 	go func() {
 		logger.Info("Backend server listening", zap.String("address", cfg.Server.Address()))
-		if err := r.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := cfg.Server.TLS.ListenAndServe(r.srv); err != nil && err != http.ErrServerClosed {
 			logger.Error("Backend server error", zap.Error(err))
 		}
 	}()
@@ -133,7 +133,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		go func() {
 			logger.Info("Admin server listening", zap.String("address", cfg.Server.AdminAddress()))
-			if err := r.adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := cfg.Server.TLS.ListenAndServe(r.adminSrv); err != nil && err != http.ErrServerClosed {
 				logger.Error("Admin server error", zap.Error(err))
 			}
 		}()

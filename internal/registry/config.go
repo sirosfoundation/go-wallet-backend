@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
+	pkgconfig "github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // Config holds the registry server configuration
@@ -43,9 +44,10 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host           string  `yaml:"host"`
-	Port           int     `yaml:"port"`
-	ServedByHeader *string `yaml:"served_by_header"`
+	Host           string              `yaml:"host"`
+	Port           int                 `yaml:"port"`
+	ServedByHeader *string             `yaml:"served_by_header"`
+	TLS            pkgconfig.TLSConfig `yaml:"tls"`
 }
 
 // Address returns the server address in host:port format
