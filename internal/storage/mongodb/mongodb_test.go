@@ -573,3 +573,60 @@ func TestIndexes_FieldNamesMatchDomainModels(t *testing.T) {
 		})
 	}
 }
+
+// TestNewStore_TLSErrors tests TLS configuration error paths that don't require MongoDB connection
+func TestNewStore_TLSErrors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("missing CA file", func(t *testing.T) {
+		cfg := &config.MongoDBConfig{
+			URI:        "mongodb://localhost:27017",
+			Database:   "test",
+			Timeout:    5,
+			TLSEnabled: true,
+			CAPath:     "/nonexistent/ca.pem",
+		}
+
+		_, err := NewStore(ctx, cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to read MongoDB CA certificate")
+	})
+
+	t.Run("invalid CA PEM", func(t *testing.T) {
+		// Create temp file with invalid PEM content
+		tmpFile, err := os.CreateTemp("", "invalid-ca-*.pem")
+		require.NoError(t, err)
+		defer os.Remove(tmpFile.Name())
+
+		_, err = tmpFile.WriteString("not a valid PEM certificate")
+		require.NoError(t, err)
+		tmpFile.Close()
+
+		cfg := &config.MongoDBConfig{
+			URI:        "mongodb://localhost:27017",
+			Database:   "test",
+			Timeout:    5,
+			TLSEnabled: true,
+			CAPath:     tmpFile.Name(),
+		}
+
+		_, err = NewStore(ctx, cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse MongoDB CA certificate")
+	})
+
+	t.Run("missing client cert file", func(t *testing.T) {
+		cfg := &config.MongoDBConfig{
+			URI:        "mongodb://localhost:27017",
+			Database:   "test",
+			Timeout:    5,
+			TLSEnabled: true,
+			CertPath:   "/nonexistent/cert.pem",
+			KeyPath:    "/nonexistent/key.pem",
+		}
+
+		_, err := NewStore(ctx, cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to load MongoDB client certificate")
+	})
+}
