@@ -118,7 +118,7 @@ func TestNewDynamicFetcher(t *testing.T) {
 	}
 	logger := testDynamicLogger()
 
-	fetcher := NewDynamicFetcher(config, logger)
+	fetcher := NewDynamicFetcher(config, logger, nil)
 
 	require.NotNil(t, fetcher)
 	assert.Equal(t, config, fetcher.config)
@@ -153,7 +153,7 @@ func TestDynamicFetcher_Fetch_Success(t *testing.T) {
 	}
 	require.NoError(t, config.Compile())
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 	// Use TLS client from test server
 	fetcher.client = server.Client()
 
@@ -196,7 +196,7 @@ func TestDynamicFetcher_Fetch_304NotModified(t *testing.T) {
 	}
 	require.NoError(t, config.Compile())
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 	fetcher.client = server.Client()
 
 	existingEntry := &VCTMEntry{
@@ -217,7 +217,7 @@ func TestDynamicFetcher_Fetch_DisabledError(t *testing.T) {
 		Enabled: false,
 	}
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 
 	_, err := fetcher.Fetch(context.Background(), "https://example.com", nil)
 	assert.Error(t, err)
@@ -233,7 +233,7 @@ func TestDynamicFetcher_Fetch_HTTPSOnly(t *testing.T) {
 		Timeout:    30 * time.Second,
 	}
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 
 	_, err := fetcher.Fetch(context.Background(), "http://example.com", nil)
 	assert.Error(t, err)
@@ -258,7 +258,7 @@ func TestDynamicFetcher_Fetch_HostNotAllowed(t *testing.T) {
 	}
 	require.NoError(t, config.Compile())
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 	fetcher.client = server.Client()
 
 	// Try to fetch from the test server (which is 127.0.0.1, not trusted.com)
@@ -283,7 +283,7 @@ func TestDynamicFetcher_Fetch_ServerError(t *testing.T) {
 	}
 	require.NoError(t, config.Compile())
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 	fetcher.client = server.Client()
 
 	_, err := fetcher.Fetch(context.Background(), server.URL, nil)
@@ -308,7 +308,7 @@ func TestDynamicFetcher_Fetch_InvalidJSON(t *testing.T) {
 	}
 	require.NoError(t, config.Compile())
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 	fetcher.client = server.Client()
 
 	_, err := fetcher.Fetch(context.Background(), server.URL, nil)
@@ -349,7 +349,7 @@ func TestCalculateExpiresAt(t *testing.T) {
 		Timeout:    30 * time.Second,
 	}
 
-	fetcher := NewDynamicFetcher(config, testDynamicLogger())
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
 
 	t.Run("default TTL when no headers", func(t *testing.T) {
 		headers := http.Header{}

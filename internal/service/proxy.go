@@ -40,14 +40,18 @@ type ProxyResponse struct {
 
 // NewProxyService creates a new ProxyService
 func NewProxyService(cfg *config.Config, logger *zap.Logger) *ProxyService {
+	// Use configured timeout, falling back to a reasonable default
+	timeout := time.Duration(cfg.HTTPClient.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	client := cfg.HTTPClient.NewHTTPClient(timeout)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// Don't follow redirects - return them to the client
+		return http.ErrUseLastResponse
+	}
 	return &ProxyService{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				// Don't follow redirects - return them to the client
-				return http.ErrUseLastResponse
-			},
-		},
+		client: client,
 		cfg:    cfg,
 		logger: logger.Named("proxy-service"),
 	}

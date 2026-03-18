@@ -23,7 +23,7 @@ func TestNewFetcher(t *testing.T) {
 	store := NewStore("")
 	logger := testLogger()
 
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	require.NotNil(t, fetcher)
 	assert.Equal(t, config, fetcher.config)
@@ -79,7 +79,7 @@ func TestFetcher_FetchIndex(t *testing.T) {
 	store := NewStore("")
 	logger := testLogger()
 
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	result, err := fetcher.fetchIndex(context.Background())
 	require.NoError(t, err)
@@ -101,7 +101,7 @@ func TestFetcher_FetchIndex_ServerError(t *testing.T) {
 	store := NewStore("")
 	logger := testLogger()
 
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	_, err := fetcher.fetchIndex(context.Background())
 	require.Error(t, err)
@@ -120,7 +120,7 @@ func TestFetcher_FetchIndex_InvalidJSON(t *testing.T) {
 	store := NewStore("")
 	logger := testLogger()
 
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	_, err := fetcher.fetchIndex(context.Background())
 	require.Error(t, err)
@@ -139,7 +139,7 @@ func TestFetcher_FetchVCTM(t *testing.T) {
 	config := DefaultConfig()
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	cred := &RegistryCredential{
 		VCT:          "https://example.com/credential/v1",
@@ -176,7 +176,7 @@ func TestFetcher_FetchVCTM_NoURL(t *testing.T) {
 	config := DefaultConfig()
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	cred := &RegistryCredential{
 		VCT:          "https://example.com/credential/v1",
@@ -212,7 +212,7 @@ func TestFetcher_FetchVCTM_FallbackToMetadataJSON(t *testing.T) {
 	config := DefaultConfig()
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	cred := &RegistryCredential{
 		VCT:     "https://example.com/credential/v1",
@@ -238,7 +238,7 @@ func TestFetcher_FetchVCTM_ServerError(t *testing.T) {
 	config := DefaultConfig()
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	cred := &RegistryCredential{
 		VCT: "https://example.com/credential/v1",
@@ -262,7 +262,7 @@ func TestFetcher_FetchVCTM_InvalidJSON(t *testing.T) {
 	config := DefaultConfig()
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	cred := &RegistryCredential{
 		VCT: "https://example.com/credential/v1",
@@ -306,7 +306,7 @@ func TestFetcher_Fetch_WithFilter(t *testing.T) {
 
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	err := fetcher.Fetch(context.Background())
 	require.NoError(t, err)
@@ -341,7 +341,7 @@ func TestFetcher_Fetch_UpdatesStore(t *testing.T) {
 	tempDir := t.TempDir()
 	store := NewStore(tempDir + "/cache.json")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	err := fetcher.Fetch(context.Background())
 	require.NoError(t, err)
@@ -370,7 +370,7 @@ func TestFetcher_StartAndStop(t *testing.T) {
 
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -404,7 +404,7 @@ func TestFetcher_ContextCancellation(t *testing.T) {
 
 	store := NewStore("")
 	logger := testLogger()
-	fetcher := NewFetcher(config, store, logger)
+	fetcher := NewFetcher(config, store, logger, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
