@@ -2,7 +2,10 @@ package mongodb
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -36,6 +39,29 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	clientOptions := options.Client().
 		ApplyURI(cfg.URI).
 		SetConnectTimeout(time.Duration(cfg.Timeout) * time.Second)
+
+	if cfg.TLSEnabled {
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if cfg.CAPath != "" {
+			caCert, err := os.ReadFile(cfg.CAPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read MongoDB CA certificate: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse MongoDB CA certificate")
+			}
+			tlsCfg.RootCAs = pool
+		}
+		if cfg.CertPath != "" && cfg.KeyPath != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load MongoDB client certificate: %w", err)
+			}
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		}
+		clientOptions.SetTLSConfig(tlsCfg)
+	}
 
 	client, err := mongo.Connect(ctx, clientOptions)
 	if err != nil {
