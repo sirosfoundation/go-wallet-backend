@@ -16,6 +16,7 @@ import (
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 func init() {
@@ -95,6 +96,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(requestLogger(logger))
+	if v := cfg.Server.ResolvedServedBy(); v != "" {
+		router.Use(middleware.ServedByMiddleware(v))
+	}
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.Server.CORS.AllowedOrigins,
 		AllowMethods:     cfg.Server.CORS.AllowedMethods,

@@ -4,6 +4,7 @@ package registry
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"time"
 
@@ -42,13 +43,23 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host string `yaml:"host"`
-	Port int    `yaml:"port"`
+	Host           string  `yaml:"host"`
+	Port           int     `yaml:"port"`
+	ServedByHeader *string `yaml:"served_by_header"`
 }
 
 // Address returns the server address in host:port format
 func (c ServerConfig) Address() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// ResolvedServedBy returns the resolved X-Served-By header value.
+func (c ServerConfig) ResolvedServedBy() string {
+	if c.ServedByHeader == nil {
+		h, _ := os.Hostname()
+		return h
+	}
+	return *c.ServedByHeader
 }
 
 // SourceConfig contains upstream registry source configuration
