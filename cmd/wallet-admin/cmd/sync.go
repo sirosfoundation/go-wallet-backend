@@ -19,13 +19,14 @@ type SyncConfig struct {
 
 // SyncTenant defines the desired state for a tenant.
 type SyncTenant struct {
-	ID          string           `yaml:"id"`
-	Name        string           `yaml:"name"`
-	DisplayName string           `yaml:"display_name,omitempty"`
-	Enabled     *bool            `yaml:"enabled,omitempty"`
-	TrustConfig *SyncTrustConfig `yaml:"trust_config,omitempty"`
-	Issuers     []SyncIssuer     `yaml:"issuers,omitempty"`
-	Verifiers   []SyncVerifier   `yaml:"verifiers,omitempty"`
+	ID            string           `yaml:"id"`
+	Name          string           `yaml:"name"`
+	DisplayName   string           `yaml:"display_name,omitempty"`
+	Enabled       *bool            `yaml:"enabled,omitempty"`
+	RequireInvite *bool            `yaml:"require_invite,omitempty"`
+	TrustConfig   *SyncTrustConfig `yaml:"trust_config,omitempty"`
+	Issuers       []SyncIssuer     `yaml:"issuers,omitempty"`
+	Verifiers     []SyncVerifier   `yaml:"verifiers,omitempty"`
 }
 
 // SyncTrustConfig defines trust evaluation configuration for a tenant.
@@ -50,11 +51,12 @@ type SyncVerifier struct {
 // --- API response types for sync (extended to include trust_config) ---
 
 type syncTenantResp struct {
-	ID          string               `json:"id"`
-	Name        string               `json:"name"`
-	DisplayName string               `json:"display_name,omitempty"`
-	Enabled     bool                 `json:"enabled"`
-	TrustConfig *syncTrustConfigResp `json:"trust_config,omitempty"`
+	ID            string               `json:"id"`
+	Name          string               `json:"name"`
+	DisplayName   string               `json:"display_name,omitempty"`
+	Enabled       bool                 `json:"enabled"`
+	RequireInvite bool                 `json:"require_invite"`
+	TrustConfig   *syncTrustConfigResp `json:"trust_config,omitempty"`
 }
 
 type syncTrustConfigResp struct {
@@ -361,6 +363,10 @@ func tenantNeedsUpdate(desired SyncTenant, existing syncTenantResp) bool {
 	if desiredEnabled != existing.Enabled {
 		return true
 	}
+	// Check require_invite
+	if desired.RequireInvite != nil && *desired.RequireInvite != existing.RequireInvite {
+		return true
+	}
 	// Check trust config
 	if desired.TrustConfig != nil {
 		if existing.TrustConfig == nil {
@@ -388,6 +394,9 @@ func buildTenantRequestBody(t SyncTenant) map[string]interface{} {
 	}
 	if t.DisplayName != "" {
 		body["display_name"] = t.DisplayName
+	}
+	if t.RequireInvite != nil {
+		body["require_invite"] = *t.RequireInvite
 	}
 	if t.TrustConfig != nil {
 		tc := map[string]interface{}{}
