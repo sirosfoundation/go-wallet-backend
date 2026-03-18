@@ -92,6 +92,11 @@ type ServerConfig struct {
 	// ExternalURLs for split-mode deployment (when services run separately)
 	ExternalURLs ExternalURLsConfig `yaml:"external_urls" envconfig:"EXTERNAL_URLS"`
 
+	// ServedByHeader sets the X-Served-By response header value.
+	// If nil (not configured), defaults to the system hostname.
+	// If set to empty string, the header is disabled.
+	ServedByHeader *string `yaml:"served_by_header" envconfig:"SERVED_BY_HEADER"`
+
 	// TLS configuration for HTTPS listeners
 	TLS TLSConfig `yaml:"tls" envconfig:"TLS"`
 }
@@ -755,4 +760,18 @@ func (c *ServerConfig) RegistryAddress() string {
 		port = 8097 // default registry port
 	}
 	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// ResolvedServedBy returns the resolved X-Served-By header value.
+// Returns the system hostname if not configured, the configured value if set,
+// or empty string if explicitly set to "" (disabled).
+func (c *ServerConfig) ResolvedServedBy() string {
+	if c.ServedByHeader == nil {
+		h, err := os.Hostname()
+		if err != nil {
+			return "unknown"
+		}
+		return h
+	}
+	return *c.ServedByHeader
 }
