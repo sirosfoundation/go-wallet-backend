@@ -64,14 +64,18 @@ type Fetcher struct {
 	stopOnce sync.Once
 }
 
-// NewFetcher creates a new registry fetcher
-func NewFetcher(config *Config, store *Store, logger *zap.Logger) *Fetcher {
+// NewFetcher creates a new registry fetcher.
+// If httpClient is nil, a default client with the configured timeout is used.
+func NewFetcher(config *Config, store *Store, logger *zap.Logger, httpClient *http.Client) *Fetcher {
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: config.Source.Timeout,
+		}
+	}
 	return &Fetcher{
 		config: config,
 		store:  store,
-		client: &http.Client{
-			Timeout: config.Source.Timeout,
-		},
+		client: httpClient,
 		logger: logger,
 		stopCh: make(chan struct{}),
 	}

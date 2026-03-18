@@ -425,7 +425,7 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 	}
 
 	// Create handler
-	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger)
+	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger, nil)
 
 	return &RegistryProvider{
 		cfg:     cfg,
@@ -462,7 +462,7 @@ func (p *RegistryProvider) Start(ctx context.Context) error {
 	fetchCtx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 
-	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger)
+	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger, nil)
 	if err := p.fetcher.Start(fetchCtx); err != nil {
 		return fmt.Errorf("failed to start registry fetcher: %w", err)
 	}

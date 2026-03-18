@@ -54,10 +54,14 @@ type VerifierDiscoveryResult struct {
 
 // DiscoverVerifier fetches verifier metadata from client_metadata_uri.
 // This is used internally by WebSocket flow handlers during credential presentation.
-func DiscoverVerifier(ctx context.Context, clientMetadataURI string) *VerifierDiscoveryResult {
+// If httpClient is nil, a default client is used.
+func DiscoverVerifier(ctx context.Context, clientMetadataURI string, httpClient *http.Client) *VerifierDiscoveryResult {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
 	result := &VerifierDiscoveryResult{}
 
-	metadata, err := fetchVerifierMetadata(ctx, clientMetadataURI)
+	metadata, err := fetchVerifierMetadata(ctx, clientMetadataURI, httpClient)
 	if err != nil {
 		result.Error = fmt.Errorf("fetching verifier metadata: %w", err)
 		return result
@@ -93,7 +97,7 @@ func ParseInlineVerifierMetadata(clientMetadata json.RawMessage) *VerifierDiscov
 }
 
 // fetchVerifierMetadata fetches verifier metadata from client_metadata_uri
-func fetchVerifierMetadata(ctx context.Context, metadataURI string) (*VerifierMetadata, error) {
+func fetchVerifierMetadata(ctx context.Context, metadataURI string, client *http.Client) (*VerifierMetadata, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURI, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
@@ -101,7 +105,6 @@ func fetchVerifierMetadata(ctx context.Context, metadataURI string) (*VerifierMe
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)

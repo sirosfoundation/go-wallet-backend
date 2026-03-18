@@ -49,11 +49,15 @@ type IssuerDiscoveryResult struct {
 
 // DiscoverIssuer fetches OpenID4VCI issuer metadata and optional IACA certificates.
 // This is used internally by WebSocket flow handlers during credential issuance.
-func DiscoverIssuer(ctx context.Context, issuerURL string) *IssuerDiscoveryResult {
+// If httpClient is nil, a default client is used.
+func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Client) *IssuerDiscoveryResult {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
 	result := &IssuerDiscoveryResult{}
 
 	// Fetch issuer metadata from well-known endpoint
-	metadata, err := fetchIssuerMetadata(ctx, issuerURL)
+	metadata, err := fetchIssuerMetadata(ctx, issuerURL, httpClient)
 	if err != nil {
 		result.Error = fmt.Errorf("fetching issuer metadata: %w", err)
 		return result
@@ -62,7 +66,7 @@ func DiscoverIssuer(ctx context.Context, issuerURL string) *IssuerDiscoveryResul
 
 	// Fetch IACA certificates if available (mDOC)
 	if metadata.MdocIacasURI != "" {
-		certs, err := fetchIACACertificates(ctx, metadata.MdocIacasURI)
+		certs, err := fetchIACACertificates(ctx, metadata.MdocIacasURI, httpClient)
 		if err != nil {
 			// Partial success - metadata OK but IACA failed
 			result.Partial = true
@@ -76,7 +80,7 @@ func DiscoverIssuer(ctx context.Context, issuerURL string) *IssuerDiscoveryResul
 }
 
 // fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint
-func fetchIssuerMetadata(ctx context.Context, issuerURL string) (*IssuerMetadata, error) {
+func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Client) (*IssuerMetadata, error) {
 	wellKnownURL := issuerURL + "/.well-known/openid-credential-issuer"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
@@ -86,7 +90,6 @@ func fetchIssuerMetadata(ctx context.Context, issuerURL string) (*IssuerMetadata
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)
@@ -107,7 +110,7 @@ func fetchIssuerMetadata(ctx context.Context, issuerURL string) (*IssuerMetadata
 }
 
 // fetchIACACertificates fetches IACA certificates from mdoc_iacas_uri
-func fetchIACACertificates(ctx context.Context, iacasURL string) ([]string, error) {
+func fetchIACACertificates(ctx context.Context, iacasURL string, client *http.Client) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, iacasURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
@@ -115,7 +118,6 @@ func fetchIACACertificates(ctx context.Context, iacasURL string) ([]string, erro
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)

@@ -66,7 +66,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fetcher := registry.NewFetcher(config, store, logger)
+	fetcher := registry.NewFetcher(config, store, logger, nil)
 	if err := fetcher.Start(ctx); err != nil {
 		logger.Error("failed to start fetcher", zap.Error(err))
 	}
@@ -97,7 +97,7 @@ func main() {
 	router.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handlers
-	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger)
+	handler := registry.NewHandler(store, &config.DynamicCache, &config.ImageEmbed, logger, nil)
 	handler.RegisterRoutes(router)
 
 	// Create HTTP server

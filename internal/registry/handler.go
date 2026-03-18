@@ -29,14 +29,18 @@ type Handler struct {
 type HandlerOption func(*Handler)
 
 // NewHandler creates a new registry handler
-func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, opts ...HandlerOption) *Handler {
+func NewHandler(store *Store, config *DynamicCacheConfig, imageEmbedConfig *embed.Config, logger *zap.Logger, httpClient *http.Client, opts ...HandlerOption) *Handler {
 	var dynamicFetcher *DynamicFetcher
 	if config != nil && config.Enabled {
-		dynamicFetcher = NewDynamicFetcher(config, logger)
+		dynamicFetcher = NewDynamicFetcher(config, logger, httpClient)
 	}
 	var imageEmbedder *embed.ImageEmbedder
 	if imageEmbedConfig == nil || imageEmbedConfig.Enabled {
-		imageEmbedder = embed.NewImageEmbedder(imageEmbedConfig, logger)
+		var embedOpts []embed.Option
+		if httpClient != nil {
+			embedOpts = append(embedOpts, embed.WithHTTPClient(httpClient))
+		}
+		imageEmbedder = embed.NewImageEmbedder(imageEmbedConfig, logger, embedOpts...)
 	}
 	h := &Handler{
 		store:          store,

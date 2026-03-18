@@ -78,7 +78,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	fetchCtx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	r.fetcher = registry.NewFetcher(cfg, r.store, logger)
+	r.fetcher = registry.NewFetcher(cfg, r.store, logger, nil)
 	if err := r.fetcher.Start(fetchCtx); err != nil {
 		logger.Error("Failed to start fetcher", zap.Error(err))
 	}
@@ -107,7 +107,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	router.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handlers
-	handler := registry.NewHandler(r.store, &cfg.DynamicCache, &cfg.ImageEmbed, logger)
+	handler := registry.NewHandler(r.store, &cfg.DynamicCache, &cfg.ImageEmbed, logger, nil)
 	handler.RegisterRoutes(router)
 
 	// Create HTTP server

@@ -21,12 +21,16 @@ type DynamicFetcher struct {
 	logger *zap.Logger
 }
 
-// NewDynamicFetcher creates a new dynamic fetcher
-func NewDynamicFetcher(config *DynamicCacheConfig, logger *zap.Logger) *DynamicFetcher {
-	return &DynamicFetcher{
-		client: &http.Client{
+// NewDynamicFetcher creates a new dynamic fetcher.
+// If httpClient is nil, a default client with the configured timeout is used.
+func NewDynamicFetcher(config *DynamicCacheConfig, logger *zap.Logger, httpClient *http.Client) *DynamicFetcher {
+	if httpClient == nil {
+		httpClient = &http.Client{
 			Timeout: config.Timeout,
-		},
+		}
+	}
+	return &DynamicFetcher{
+		client: httpClient,
 		config: config,
 		logger: logger,
 	}
