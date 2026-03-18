@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -114,7 +115,7 @@ func TestReadinessManager_CheckTimeout(t *testing.T) {
 }
 
 func TestReadinessManager_Caching(t *testing.T) {
-	checkCount := 0
+	var checkCount atomic.Int64
 	checker := &mockChecker{name: "db", ready: true}
 
 	mgr := NewReadinessManager(WithCacheTTL(500 * time.Millisecond))
@@ -127,14 +128,14 @@ func TestReadinessManager_Caching(t *testing.T) {
 
 	// First call - should run check
 	mgr.CheckReady(context.Background())
-	if checkCount != 1 {
-		t.Errorf("Expected 1 check, got %d", checkCount)
+	if checkCount.Load() != 1 {
+		t.Errorf("Expected 1 check, got %d", checkCount.Load())
 	}
 
 	// Immediate second call - should use cache
 	mgr.CheckReady(context.Background())
-	if checkCount != 1 {
-		t.Errorf("Expected 1 check (cached), got %d", checkCount)
+	if checkCount.Load() != 1 {
+		t.Errorf("Expected 1 check (cached), got %d", checkCount.Load())
 	}
 
 	// Wait for cache to expire
@@ -142,18 +143,18 @@ func TestReadinessManager_Caching(t *testing.T) {
 
 	// Third call - should run check again
 	mgr.CheckReady(context.Background())
-	if checkCount != 2 {
-		t.Errorf("Expected 2 checks after cache expiry, got %d", checkCount)
+	if checkCount.Load() != 2 {
+		t.Errorf("Expected 2 checks after cache expiry, got %d", checkCount.Load())
 	}
 }
 
 type countingChecker struct {
 	ReadinessChecker
-	count *int
+	count *atomic.Int64
 }
 
 func (c *countingChecker) CheckReady(ctx context.Context) error {
-	*c.count++
+	c.count.Add(1)
 	return c.ReadinessChecker.CheckReady(ctx)
 }
 
@@ -254,7 +255,7 @@ func (m *mockPinger) Ping(ctx context.Context) error {
 }
 
 func TestReadinessManager_BackgroundProbe(t *testing.T) {
-	checkCount := 0
+	var checkCount atomic.Int64
 	checker := &countingChecker{
 		ReadinessChecker: &mockChecker{name: "db", ready: true},
 		count:            &checkCount,
@@ -269,7 +270,7 @@ func TestReadinessManager_BackgroundProbe(t *testing.T) {
 
 	// Initial check runs immediately
 	time.Sleep(10 * time.Millisecond)
-	if checkCount < 1 {
+	if checkCount.Load() < 1 {
 		t.Error("Expected at least 1 background check")
 	}
 
@@ -277,8 +278,8 @@ func TestReadinessManager_BackgroundProbe(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Should have run multiple checks
-	if checkCount < 2 {
-		t.Errorf("Expected multiple background checks, got %d", checkCount)
+	if checkCount.Load() < 2 {
+		t.Errorf("Expected multiple background checks, got %d", checkCount.Load())
 	}
 }
 
