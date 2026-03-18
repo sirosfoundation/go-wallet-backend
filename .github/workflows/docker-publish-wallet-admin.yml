@@ -1,4 +1,4 @@
-name: Build and Publish Docker Image
+name: Build and Publish Wallet Admin Docker Image
 
 on:
   push:
@@ -23,7 +23,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: sirosfoundation/go-wallet-backend
+  IMAGE_NAME: sirosfoundation/go-wallet-admin
 
 jobs:
   build-and-push:
@@ -98,7 +98,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.wallet-admin
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags || steps.meta.outputs.tags }}
