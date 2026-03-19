@@ -337,3 +337,20 @@ func TestDefaultURLExtractor(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if !cfg.Enabled {
+		t.Error("DefaultConfig().Enabled should be true")
+	}
+	if cfg.MaxImageSize != 1024*1024 {
+		t.Errorf("DefaultConfig().MaxImageSize = %d, want %d", cfg.MaxImageSize, 1024*1024)
+	}
+	if cfg.Timeout != 10*time.Second {
+		t.Errorf("DefaultConfig().Timeout = %v, want %v", cfg.Timeout, 10*time.Second)
+	}
+	if cfg.ConcurrentFetches != 5 {
+		t.Errorf("DefaultConfig().ConcurrentFetches = %d, want %d", cfg.ConcurrentFetches, 5)
+	}
+}

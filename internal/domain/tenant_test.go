@@ -297,3 +297,34 @@ func TestTenantRoles(t *testing.T) {
 		t.Errorf("TenantRoleAdmin = %v, want %v", TenantRoleAdmin, "admin")
 	}
 }
+
+func TestUserIDFromHandle(t *testing.T) {
+	// Test with v1 binary format
+	tenantID := TenantID("test-tenant")
+	userID := NewUserID()
+	handle := EncodeUserHandle(tenantID, userID)
+
+	gotUserID, err := UserIDFromHandle(handle)
+	if err != nil {
+		t.Fatalf("UserIDFromHandle() error = %v", err)
+	}
+	if gotUserID.String() != userID.String() {
+		t.Errorf("UserIDFromHandle() = %v, want %v", gotUserID.String(), userID.String())
+	}
+
+	// Test with legacy string format
+	legacyHandle := []byte("test-tenant:550e8400-e29b-41d4-a716-446655440000")
+	gotUserID, err = UserIDFromHandle(legacyHandle)
+	if err != nil {
+		t.Fatalf("UserIDFromHandle() error = %v", err)
+	}
+	if gotUserID.String() != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("UserIDFromHandle() = %v, want %v", gotUserID.String(), "550e8400-e29b-41d4-a716-446655440000")
+	}
+
+	// Test with invalid handle
+	_, err = UserIDFromHandle([]byte{})
+	if err == nil {
+		t.Error("UserIDFromHandle() expected error with empty handle")
+	}
+}

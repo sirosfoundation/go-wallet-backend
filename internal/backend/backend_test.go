@@ -151,3 +151,32 @@ func TestMemoryBackend_Ping(t *testing.T) {
 		t.Errorf("expected no error on Ping(), got %v", err)
 	}
 }
+
+func TestMemoryBackend_Invites(t *testing.T) {
+	cfg := &config.Config{
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+	}
+
+	backend, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+
+	// Test Invites store
+	if backend.Invites() == nil {
+		t.Error("expected Invites() to return non-nil store")
+	}
+}
+
+func TestBackendTypes(t *testing.T) {
+	// Test that the type constants are defined correctly
+	if TypeMemory != "memory" {
+		t.Errorf("TypeMemory = %q, want %q", TypeMemory, "memory")
+	}
+	if TypeMongoDB != "mongodb" {
+		t.Errorf("TypeMongoDB = %q, want %q", TypeMongoDB, "mongodb")
+	}
+}

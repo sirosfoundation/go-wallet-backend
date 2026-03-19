@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestConfig_Validate(t *testing.T) {
@@ -662,5 +663,325 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 	err := cfg.Validate()
 	if err != nil {
 		t.Errorf("Validate() error = %v, expected nil when TLS disabled", err)
+	}
+}
+
+// =============================================================================
+// ExternalURLsConfig tests
+// =============================================================================
+
+func TestExternalURLsConfig_GetBackendURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ExternalURLsConfig
+		host     string
+		port     int
+		expected string
+	}{
+		{
+			name:     "configured URL used",
+			config:   ExternalURLsConfig{BackendURL: "https://api.example.com"},
+			host:     "localhost",
+			port:     8080,
+			expected: "https://api.example.com",
+		},
+		{
+			name:     "fallback to host:port",
+			config:   ExternalURLsConfig{BackendURL: ""},
+			host:     "localhost",
+			port:     8080,
+			expected: "http://localhost:8080",
+		},
+		{
+			name:     "fallback with custom port",
+			config:   ExternalURLsConfig{},
+			host:     "0.0.0.0",
+			port:     9000,
+			expected: "http://0.0.0.0:9000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetBackendURL(tt.host, tt.port)
+			if got != tt.expected {
+				t.Errorf("GetBackendURL() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExternalURLsConfig_GetEngineURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ExternalURLsConfig
+		host     string
+		port     int
+		expected string
+	}{
+		{
+			name:     "configured URL used",
+			config:   ExternalURLsConfig{EngineURL: "wss://engine.example.com"},
+			host:     "localhost",
+			port:     8081,
+			expected: "wss://engine.example.com",
+		},
+		{
+			name:     "fallback to host:port",
+			config:   ExternalURLsConfig{},
+			host:     "localhost",
+			port:     8081,
+			expected: "http://localhost:8081",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetEngineURL(tt.host, tt.port)
+			if got != tt.expected {
+				t.Errorf("GetEngineURL() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExternalURLsConfig_GetRegistryURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ExternalURLsConfig
+		host     string
+		port     int
+		expected string
+	}{
+		{
+			name:     "configured URL used",
+			config:   ExternalURLsConfig{RegistryURL: "https://registry.example.com"},
+			host:     "localhost",
+			port:     8082,
+			expected: "https://registry.example.com",
+		},
+		{
+			name:     "fallback to host:port",
+			config:   ExternalURLsConfig{},
+			host:     "0.0.0.0",
+			port:     8082,
+			expected: "http://0.0.0.0:8082",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetRegistryURL(tt.host, tt.port)
+			if got != tt.expected {
+				t.Errorf("GetRegistryURL() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExternalURLsConfig_GetAdminURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ExternalURLsConfig
+		host     string
+		port     int
+		expected string
+	}{
+		{
+			name:     "configured URL used",
+			config:   ExternalURLsConfig{AdminURL: "https://admin.example.com"},
+			host:     "localhost",
+			port:     9090,
+			expected: "https://admin.example.com",
+		},
+		{
+			name:     "fallback to host:port",
+			config:   ExternalURLsConfig{},
+			host:     "localhost",
+			port:     9090,
+			expected: "http://localhost:9090",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.GetAdminURL(tt.host, tt.port)
+			if got != tt.expected {
+				t.Errorf("GetAdminURL() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// ServerConfig address tests
+// =============================================================================
+
+func TestServerConfig_AdminAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ServerConfig
+		expected string
+	}{
+		{
+			name: "default port",
+			config: ServerConfig{
+				Host:      "localhost",
+				AdminPort: 9090,
+			},
+			expected: "localhost:9090",
+		},
+		{
+			name: "all interfaces",
+			config: ServerConfig{
+				Host:      "0.0.0.0",
+				AdminPort: 8090,
+			},
+			expected: "0.0.0.0:8090",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.AdminAddress()
+			if got != tt.expected {
+				t.Errorf("AdminAddress() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestServerConfig_EngineAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ServerConfig
+		expected string
+	}{
+		{
+			name: "separate engine port",
+			config: ServerConfig{
+				Host:       "localhost",
+				Port:       8080,
+				EnginePort: 8081,
+			},
+			expected: "localhost:8081",
+		},
+		{
+			name: "fallback to main port",
+			config: ServerConfig{
+				Host:       "localhost",
+				Port:       8080,
+				EnginePort: 0, // Not set
+			},
+			expected: "localhost:8080",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.EngineAddress()
+			if got != tt.expected {
+				t.Errorf("EngineAddress() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestServerConfig_RegistryAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ServerConfig
+		expected string
+	}{
+		{
+			name: "separate registry port",
+			config: ServerConfig{
+				Host:         "localhost",
+				Port:         8080,
+				RegistryPort: 8082,
+			},
+			expected: "localhost:8082",
+		},
+		{
+			name: "default port when not set",
+			config: ServerConfig{
+				Host:         "0.0.0.0",
+				Port:         8080,
+				RegistryPort: 0,
+			},
+			expected: "0.0.0.0:8097", // default registry port
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.config.RegistryAddress()
+			if got != tt.expected {
+				t.Errorf("RegistryAddress() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// HTTPClientConfig tests
+// =============================================================================
+
+func TestHTTPClientConfig_NewHTTPClient_NoProxy(t *testing.T) {
+	cfg := HTTPClientConfig{
+		ProxyURL: "",
+		Timeout:  10,
+	}
+
+	client := cfg.NewHTTPClient(0)
+	if client == nil {
+		t.Fatal("NewHTTPClient() returned nil")
+	}
+}
+
+func TestHTTPClientConfig_NewHTTPClient_WithProxy(t *testing.T) {
+	cfg := HTTPClientConfig{
+		ProxyURL: "http://proxy.example.com:8080",
+		Timeout:  30,
+	}
+
+	client := cfg.NewHTTPClient(0)
+	if client == nil {
+		t.Fatal("NewHTTPClient() returned nil")
+	}
+}
+
+func TestHTTPClientConfig_NewHTTPClient_TimeoutOverride(t *testing.T) {
+	cfg := HTTPClientConfig{
+		ProxyURL: "",
+		Timeout:  10,
+	}
+
+	client := cfg.NewHTTPClient(60 * time.Second)
+	if client == nil {
+		t.Fatal("NewHTTPClient() returned nil")
+	}
+	// Can't easily check internal timeout, but validates it doesn't panic
+}
+
+// =============================================================================
+// SetDefaults tests
+// =============================================================================
+
+func TestCORSConfig_SetDefaults(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+
+	if len(cfg.AllowedOrigins) == 0 {
+		t.Error("AllowedOrigins should have default value")
+	}
+	if cfg.AllowedOrigins[0] != "*" {
+		t.Errorf("AllowedOrigins[0] = %q, want '*'", cfg.AllowedOrigins[0])
+	}
+	if len(cfg.AllowedMethods) == 0 {
+		t.Error("AllowedMethods should have default value")
+	}
+	if len(cfg.AllowedHeaders) == 0 {
+		t.Error("AllowedHeaders should have default value")
 	}
 }
