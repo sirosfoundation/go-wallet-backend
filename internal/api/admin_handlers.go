@@ -619,8 +619,10 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 
 // VerifierRequest represents the request body for creating/updating a verifier
 type VerifierRequest struct {
-	Name string `json:"name" binding:"required"`
-	URL  string `json:"url" binding:"required"`
+	Name           string `json:"name" binding:"required"`
+	URL            string `json:"url" binding:"required"`
+	ClientID       string `json:"client_id,omitempty"`
+	ClientIDScheme string `json:"client_id_scheme,omitempty"`
 }
 
 // VerifierResponse represents a verifier in API responses
@@ -730,9 +732,11 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	}
 
 	verifier := &domain.Verifier{
-		TenantID: tenantID,
-		Name:     req.Name,
-		URL:      req.URL,
+		TenantID:       tenantID,
+		Name:           req.Name,
+		URL:            req.URL,
+		ClientID:       req.ClientID,
+		ClientIDScheme: req.ClientIDScheme,
 	}
 
 	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
@@ -784,6 +788,8 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 	// Update fields
 	verifier.Name = req.Name
 	verifier.URL = req.URL
+	verifier.ClientID = req.ClientID
+	verifier.ClientIDScheme = req.ClientIDScheme
 
 	if err := h.store.Verifiers().Update(c.Request.Context(), verifier); err != nil {
 		h.logger.Error("Failed to update verifier", zap.Error(err))

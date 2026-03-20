@@ -581,11 +581,11 @@ func TestTLSConfig_TLSMinVersion(t *testing.T) {
 		minVersion string
 		expected   uint16
 	}{
-		{"default empty returns TLS 1.2", "", 0x0303},  // tls.VersionTLS12
+		{"default empty returns TLS 1.2", "", 0x0303}, // tls.VersionTLS12
 		{"tls12 returns TLS 1.2", "tls12", 0x0303},
 		{"TLS12 uppercase returns TLS 1.2", "TLS12", 0x0303},
 		{"1.2 returns TLS 1.2", "1.2", 0x0303},
-		{"tls13 returns TLS 1.3", "tls13", 0x0304},  // tls.VersionTLS13
+		{"tls13 returns TLS 1.3", "tls13", 0x0304}, // tls.VersionTLS13
 		{"TLS13 uppercase returns TLS 1.3", "TLS13", 0x0304},
 		{"1.3 returns TLS 1.3", "1.3", 0x0304},
 		{"unknown falls back to TLS 1.2", "invalid", 0x0303},

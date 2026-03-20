@@ -44,8 +44,10 @@ type SyncIssuer struct {
 
 // SyncVerifier defines the desired state for a verifier within a tenant.
 type SyncVerifier struct {
-	Name string `yaml:"name"`
-	URL  string `yaml:"url"`
+	Name           string `yaml:"name"`
+	URL            string `yaml:"url"`
+	ClientID       string `yaml:"client_id,omitempty"`
+	ClientIDScheme string `yaml:"client_id_scheme,omitempty"`
 }
 
 // --- API response types for sync (extended to include trust_config) ---
@@ -625,13 +627,28 @@ func syncVerifiers(client *Client, tenantID string, desired []SyncVerifier) ([]s
 }
 
 func verifierNeedsUpdate(desired SyncVerifier, existing Verifier) bool {
-	return desired.URL != existing.URL
+	if desired.URL != existing.URL {
+		return true
+	}
+	if desired.ClientID != existing.ClientID {
+		return true
+	}
+	if desired.ClientIDScheme != existing.ClientIDScheme {
+		return true
+	}
+	return false
 }
 
 func createVerifierFromConfig(client *Client, tenantID string, v SyncVerifier) error {
 	body := map[string]interface{}{
 		"name": v.Name,
 		"url":  v.URL,
+	}
+	if v.ClientID != "" {
+		body["client_id"] = v.ClientID
+	}
+	if v.ClientIDScheme != "" {
+		body["client_id_scheme"] = v.ClientIDScheme
 	}
 	_, err := client.Request("POST", "/admin/tenants/"+tenantID+"/verifiers", body)
 	return err
@@ -641,6 +658,12 @@ func updateVerifierFromConfig(client *Client, tenantID string, verifierID int64,
 	body := map[string]interface{}{
 		"name": v.Name,
 		"url":  v.URL,
+	}
+	if v.ClientID != "" {
+		body["client_id"] = v.ClientID
+	}
+	if v.ClientIDScheme != "" {
+		body["client_id_scheme"] = v.ClientIDScheme
 	}
 	path := fmt.Sprintf("/admin/tenants/%s/verifiers/%s", tenantID, strconv.FormatInt(verifierID, 10))
 	_, err := client.Request("PUT", path, body)
