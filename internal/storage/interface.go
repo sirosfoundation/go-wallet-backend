@@ -170,6 +170,9 @@ type VerifierStore interface {
 	// GetByClientID retrieves a verifier by client_id within a tenant
 	GetByClientID(ctx context.Context, tenantID domain.TenantID, clientID string) (*domain.Verifier, error)
 
+	// GetByURL retrieves a verifier by its URL within a tenant
+	GetByURL(ctx context.Context, tenantID domain.TenantID, url string) (*domain.Verifier, error)
+
 	// GetAll retrieves all verifiers for a tenant
 	GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error)
 

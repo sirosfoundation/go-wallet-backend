@@ -725,14 +725,34 @@ func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.Tenan
 	return nil, storage.ErrNotFound
 }
 
+func (s *VerifierStore) GetByURL(ctx context.Context, tenantID domain.TenantID, url string) (*domain.Verifier, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, v := range s.data {
+		if v.TenantID == tenantID && v.URL == url {
+			return v, nil
+		}
+	}
+	return nil, storage.ErrNotFound
+}
+
 func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Find existing by (tenantID, clientID)
+	// Find existing by (tenantID, URL)
 	for id, existing := range s.data {
-		if existing.TenantID == verifier.TenantID && existing.ClientID == verifier.ClientID {
+		if existing.TenantID == verifier.TenantID && existing.URL == verifier.URL {
 			verifier.ID = id
+			// Preserve existing ClientID if verifier has none or empty
+			if verifier.ClientID == "" && existing.ClientID != "" {
+				verifier.ClientID = existing.ClientID
+			}
+			// Preserve existing ClientIDScheme if verifier has none or empty
+			if verifier.ClientIDScheme == "" && existing.ClientIDScheme != "" {
+				verifier.ClientIDScheme = existing.ClientIDScheme
+			}
 			s.data[id] = verifier
 			return nil
 		}

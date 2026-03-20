@@ -276,10 +276,22 @@ func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.Tenan
 	return &verifier, nil
 }
 
+func (s *VerifierStore) GetByURL(ctx context.Context, tenantID domain.TenantID, url string) (*domain.Verifier, error) {
+	var verifier domain.Verifier
+	err := s.collection.FindOne(ctx, bson.M{"tenant_id": string(tenantID), "url": url}).Decode(&verifier)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get verifier by URL: %w", err)
+	}
+	return &verifier, nil
+}
+
 func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) error {
 	filter := bson.M{
 		"tenant_id": string(verifier.TenantID),
-		"client_id": verifier.ClientID,
+		"url":       verifier.URL,
 	}
 
 	// Try to find existing
@@ -288,6 +300,14 @@ func (s *VerifierStore) Upsert(ctx context.Context, verifier *domain.Verifier) e
 	if err == nil {
 		// Update existing, preserve the ID
 		verifier.ID = existing.ID
+		// Preserve existing ClientID if verifier has none or empty
+		if verifier.ClientID == "" && existing.ClientID != "" {
+			verifier.ClientID = existing.ClientID
+		}
+		// Preserve existing ClientIDScheme if verifier has none or empty
+		if verifier.ClientIDScheme == "" && existing.ClientIDScheme != "" {
+			verifier.ClientIDScheme = existing.ClientIDScheme
+		}
 		_, err := s.collection.ReplaceOne(ctx, bson.M{"_id": existing.ID}, verifier)
 		if err != nil {
 			return fmt.Errorf("failed to update verifier: %w", err)
