@@ -209,6 +209,126 @@ The default tenant cannot be deleted.`,
 	},
 }
 
+// OIDC gate configuration flags
+var (
+	oidcGateMode             string
+	oidcGateRegistrationOP   string
+	oidcGateRegistrationClID string
+	oidcGateLoginOP          string
+	oidcGateLoginClID        string
+	oidcGateClear            bool
+)
+
+var tenantOIDCGateCmd = &cobra.Command{
+	Use:   "configure-oidc-gate [tenant-id]",
+	Short: "Configure OIDC gate for a tenant",
+	Long: `Configure OIDC authentication gate for tenant registration/login endpoints.
+
+The OIDC gate requires users to authenticate with an external OIDC provider
+(e.g., enterprise IdP) before accessing wallet registration or login.
+
+Modes:
+  none         - No OIDC gate (default)
+  registration - Gate on registration endpoint only
+  login        - Gate on login endpoint only
+  both         - Gate on both endpoints
+
+Examples:
+  # Enable registration gate with Keycloak
+  wallet-admin tenant configure-oidc-gate my-tenant \
+    --mode registration \
+    --registration-issuer https://idp.example.com/realms/corp \
+    --registration-client-id wallet-reg
+
+  # Enable both gates with same provider
+  wallet-admin tenant configure-oidc-gate my-tenant \
+    --mode both \
+    --registration-issuer https://idp.example.com/realms/corp \
+    --registration-client-id wallet-reg \
+    --login-issuer https://idp.example.com/realms/corp \
+    --login-client-id wallet-login
+
+  # Disable OIDC gate
+  wallet-admin tenant configure-oidc-gate my-tenant --clear`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		tenantID := args[0]
+		client := NewClient(adminURL, adminToken)
+
+		// If --clear, set mode to none and clear providers
+		if oidcGateClear {
+			reqBody := map[string]interface{}{
+				"oidc_gate": map[string]interface{}{
+					"mode": "none",
+				},
+			}
+
+			_, err := client.Request("PUT", "/admin/tenants/"+tenantID, reqBody)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("OIDC gate cleared for tenant '%s'.\n", tenantID)
+			return nil
+		}
+
+		// Validate mode
+		validModes := map[string]bool{"none": true, "registration": true, "login": true, "both": true}
+		if !validModes[oidcGateMode] {
+			return fmt.Errorf("invalid mode '%s': must be one of: none, registration, login, both", oidcGateMode)
+		}
+
+		// Build OIDC gate config
+		oidcGate := map[string]interface{}{
+			"mode": oidcGateMode,
+		}
+
+		// Registration provider config
+		if oidcGateMode == "registration" || oidcGateMode == "both" {
+			if oidcGateRegistrationOP == "" {
+				return fmt.Errorf("--registration-issuer is required for mode '%s'", oidcGateMode)
+			}
+			if oidcGateRegistrationClID == "" {
+				return fmt.Errorf("--registration-client-id is required for mode '%s'", oidcGateMode)
+			}
+			oidcGate["registration_op"] = map[string]interface{}{
+				"issuer":    oidcGateRegistrationOP,
+				"client_id": oidcGateRegistrationClID,
+			}
+		}
+
+		// Login provider config
+		if oidcGateMode == "login" || oidcGateMode == "both" {
+			if oidcGateLoginOP == "" {
+				return fmt.Errorf("--login-issuer is required for mode '%s'", oidcGateMode)
+			}
+			if oidcGateLoginClID == "" {
+				return fmt.Errorf("--login-client-id is required for mode '%s'", oidcGateMode)
+			}
+			oidcGate["login_op"] = map[string]interface{}{
+				"issuer":    oidcGateLoginOP,
+				"client_id": oidcGateLoginClID,
+			}
+		}
+
+		// Update tenant with OIDC gate config
+		reqBody := map[string]interface{}{
+			"oidc_gate": oidcGate,
+		}
+
+		data, err := client.Request("PUT", "/admin/tenants/"+tenantID, reqBody)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("OIDC gate configured for tenant '%s' with mode '%s'.\n", tenantID, oidcGateMode)
+		if output == "json" {
+			return printJSON(data)
+		}
+		return nil
+	},
+}
+
 func init() {
 	rootCmd.AddCommand(tenantCmd)
 	tenantCmd.AddCommand(tenantListCmd)
@@ -216,6 +336,7 @@ func init() {
 	tenantCmd.AddCommand(tenantCreateCmd)
 	tenantCmd.AddCommand(tenantUpdateCmd)
 	tenantCmd.AddCommand(tenantDeleteCmd)
+	tenantCmd.AddCommand(tenantOIDCGateCmd)
 
 	// Create flags
 	tenantCreateCmd.Flags().StringVar(&tenantCreateID, "id", "", "Tenant ID (required)")
@@ -228,4 +349,12 @@ func init() {
 	tenantUpdateCmd.Flags().StringVar(&tenantUpdateDisplayName, "display-name", "", "New display name")
 	tenantUpdateCmd.Flags().Bool("enabled", true, "Whether tenant is enabled")
 	tenantUpdateCmd.Flags().Bool("disabled", false, "Disable the tenant")
+
+	// OIDC gate flags
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateMode, "mode", "none", "OIDC gate mode: none, registration, login, both")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationOP, "registration-issuer", "", "OIDC issuer URL for registration gate")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationClID, "registration-client-id", "", "OIDC client ID for registration gate")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginOP, "login-issuer", "", "OIDC issuer URL for login gate")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginClID, "login-client-id", "", "OIDC client ID for login gate")
+	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateClear, "clear", false, "Clear OIDC gate configuration")
 }
