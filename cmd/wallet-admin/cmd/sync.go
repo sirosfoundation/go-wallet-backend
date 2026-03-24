@@ -25,6 +25,7 @@ type SyncTenant struct {
 	Enabled       *bool            `yaml:"enabled,omitempty"`
 	RequireInvite *bool            `yaml:"require_invite,omitempty"`
 	TrustConfig   *SyncTrustConfig `yaml:"trust_config,omitempty"`
+	OIDCGate      *SyncOIDCGate    `yaml:"oidc_gate,omitempty"`
 	Issuers       []SyncIssuer     `yaml:"issuers,omitempty"`
 	Verifiers     []SyncVerifier   `yaml:"verifiers,omitempty"`
 }
@@ -33,6 +34,25 @@ type SyncTenant struct {
 type SyncTrustConfig struct {
 	TrustEndpoint string `yaml:"trust_endpoint,omitempty"`
 	TrustTTL      *int   `yaml:"trust_ttl,omitempty"`
+}
+
+// SyncOIDCGate defines OIDC gate configuration for a tenant.
+type SyncOIDCGate struct {
+	Mode           string            `yaml:"mode"` // none, registration, login, both
+	RegistrationOP *SyncOIDCProvider `yaml:"registration_op,omitempty"`
+	LoginOP        *SyncOIDCProvider `yaml:"login_op,omitempty"`
+	RequiredClaims map[string]any    `yaml:"required_claims,omitempty"`
+	BindIdentity   *bool             `yaml:"bind_identity,omitempty"`
+}
+
+// SyncOIDCProvider defines an OIDC provider configuration for sync.
+type SyncOIDCProvider struct {
+	DisplayName string `yaml:"display_name,omitempty"`
+	Issuer      string `yaml:"issuer"`
+	ClientID    string `yaml:"client_id"`
+	JWKSURI     string `yaml:"jwks_uri,omitempty"`
+	Audience    string `yaml:"audience,omitempty"`
+	Scopes      string `yaml:"scopes,omitempty"`
 }
 
 // SyncIssuer defines the desired state for an issuer within a tenant.
@@ -48,7 +68,7 @@ type SyncVerifier struct {
 	URL  string `yaml:"url"`
 }
 
-// --- API response types for sync (extended to include trust_config) ---
+// --- API response types for sync (extended to include trust_config and oidc_gate) ---
 
 type syncTenantResp struct {
 	ID            string               `json:"id"`
@@ -57,11 +77,29 @@ type syncTenantResp struct {
 	Enabled       bool                 `json:"enabled"`
 	RequireInvite bool                 `json:"require_invite"`
 	TrustConfig   *syncTrustConfigResp `json:"trust_config,omitempty"`
+	OIDCGate      *syncOIDCGateResp    `json:"oidc_gate,omitempty"`
 }
 
 type syncTrustConfigResp struct {
 	TrustEndpoint string `json:"trust_endpoint,omitempty"`
 	TrustTTL      int    `json:"trust_ttl"`
+}
+
+type syncOIDCGateResp struct {
+	Mode           string                `json:"mode"`
+	RegistrationOP *syncOIDCProviderResp `json:"registration_op,omitempty"`
+	LoginOP        *syncOIDCProviderResp `json:"login_op,omitempty"`
+	RequiredClaims map[string]any        `json:"required_claims,omitempty"`
+	BindIdentity   bool                  `json:"bind_identity"`
+}
+
+type syncOIDCProviderResp struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer"`
+	ClientID    string `json:"client_id"`
+	JWKSURI     string `json:"jwks_uri,omitempty"`
+	Audience    string `json:"audience,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
 }
 
 type syncTenantsListResp struct {
@@ -379,6 +417,62 @@ func tenantNeedsUpdate(desired SyncTenant, existing syncTenantResp) bool {
 			return true
 		}
 	}
+	// Check OIDC gate config
+	if oidcGateNeedsUpdate(desired.OIDCGate, existing.OIDCGate) {
+		return true
+	}
+	return false
+}
+
+// oidcGateNeedsUpdate checks if the OIDC gate configuration needs to be updated
+func oidcGateNeedsUpdate(desired *SyncOIDCGate, existing *syncOIDCGateResp) bool {
+	if desired == nil {
+		return false // No desired config means no change
+	}
+	if existing == nil {
+		return desired.Mode != "" && desired.Mode != "none"
+	}
+	if desired.Mode != existing.Mode {
+		return true
+	}
+	if desired.BindIdentity != nil && *desired.BindIdentity != existing.BindIdentity {
+		return true
+	}
+	if oidcProviderNeedsUpdate(desired.RegistrationOP, existing.RegistrationOP) {
+		return true
+	}
+	if oidcProviderNeedsUpdate(desired.LoginOP, existing.LoginOP) {
+		return true
+	}
+	return false
+}
+
+// oidcProviderNeedsUpdate checks if an OIDC provider configuration needs to be updated
+func oidcProviderNeedsUpdate(desired *SyncOIDCProvider, existing *syncOIDCProviderResp) bool {
+	if desired == nil && existing == nil {
+		return false
+	}
+	if desired == nil || existing == nil {
+		return true
+	}
+	if desired.Issuer != existing.Issuer {
+		return true
+	}
+	if desired.ClientID != existing.ClientID {
+		return true
+	}
+	if desired.DisplayName != existing.DisplayName {
+		return true
+	}
+	if desired.Scopes != existing.Scopes {
+		return true
+	}
+	if desired.JWKSURI != existing.JWKSURI {
+		return true
+	}
+	if desired.Audience != existing.Audience {
+		return true
+	}
 	return false
 }
 
@@ -407,6 +501,50 @@ func buildTenantRequestBody(t SyncTenant) map[string]interface{} {
 			tc["trust_ttl"] = *t.TrustConfig.TrustTTL
 		}
 		body["trust_config"] = tc
+	}
+	if t.OIDCGate != nil {
+		body["oidc_gate"] = buildOIDCGateBody(t.OIDCGate)
+	}
+	return body
+}
+
+// buildOIDCGateBody builds the request body for OIDC gate configuration
+func buildOIDCGateBody(gate *SyncOIDCGate) map[string]interface{} {
+	body := map[string]interface{}{
+		"mode": gate.Mode,
+	}
+	if gate.BindIdentity != nil {
+		body["bind_identity"] = *gate.BindIdentity
+	}
+	if gate.RegistrationOP != nil {
+		body["registration_op"] = buildOIDCProviderBody(gate.RegistrationOP)
+	}
+	if gate.LoginOP != nil {
+		body["login_op"] = buildOIDCProviderBody(gate.LoginOP)
+	}
+	if len(gate.RequiredClaims) > 0 {
+		body["required_claims"] = gate.RequiredClaims
+	}
+	return body
+}
+
+// buildOIDCProviderBody builds the request body for an OIDC provider configuration
+func buildOIDCProviderBody(provider *SyncOIDCProvider) map[string]interface{} {
+	body := map[string]interface{}{
+		"issuer":    provider.Issuer,
+		"client_id": provider.ClientID,
+	}
+	if provider.DisplayName != "" {
+		body["display_name"] = provider.DisplayName
+	}
+	if provider.JWKSURI != "" {
+		body["jwks_uri"] = provider.JWKSURI
+	}
+	if provider.Audience != "" {
+		body["audience"] = provider.Audience
+	}
+	if provider.Scopes != "" {
+		body["scopes"] = provider.Scopes
 	}
 	return body
 }

@@ -220,6 +220,7 @@ var (
 	oidcGateLoginClID          string
 	oidcGateLoginName          string
 	oidcGateLoginScopes        string
+	oidcGateBindIdentity       bool
 	oidcGateClear              bool
 )
 
@@ -237,6 +238,11 @@ Modes:
   login        - Gate on login endpoint only
   both         - Gate on both endpoints
 
+Identity Binding:
+  When --bind-identity is enabled, the enterprise identity (issuer + subject)
+  is stored with the wallet user. On subsequent logins (if gated), the user
+  must authenticate with the same enterprise identity.
+
 Examples:
   # Enable registration gate with Keycloak
   wallet-admin tenant configure-oidc-gate my-tenant \
@@ -245,15 +251,14 @@ Examples:
     --registration-client-id wallet-reg \
     --registration-display-name "Corporate SSO"
 
-  # Enable both gates with same provider
+  # Enable both gates with identity binding
   wallet-admin tenant configure-oidc-gate my-tenant \
     --mode both \
+    --bind-identity \
     --registration-issuer https://idp.example.com/realms/corp \
     --registration-client-id wallet-reg \
-    --registration-display-name "Corporate Login" \
     --login-issuer https://idp.example.com/realms/corp \
-    --login-client-id wallet-login \
-    --login-display-name "Enterprise SSO"
+    --login-client-id wallet-login
 
   # Disable OIDC gate
   wallet-admin tenant configure-oidc-gate my-tenant --clear`,
@@ -287,7 +292,8 @@ Examples:
 
 		// Build OIDC gate config
 		oidcGate := map[string]interface{}{
-			"mode": oidcGateMode,
+			"mode":          oidcGateMode,
+			"bind_identity": oidcGateBindIdentity,
 		}
 
 		// Registration provider config
@@ -381,5 +387,6 @@ func init() {
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginClID, "login-client-id", "", "OIDC client ID for login gate")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginName, "login-display-name", "", "Display name for login IdP (e.g., 'Enterprise SSO')")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginScopes, "login-scopes", "", "OIDC scopes for login (default: 'openid profile email')")
+	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateBindIdentity, "bind-identity", false, "Bind enterprise identity to wallet user (verify on login)")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateClear, "clear", false, "Clear OIDC gate configuration")
 }

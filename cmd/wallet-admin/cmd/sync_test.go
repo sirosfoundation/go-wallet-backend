@@ -504,9 +504,156 @@ func TestBuildTenantRequestBody(t *testing.T) {
 			t.Error("require_invite should not be set when nil")
 		}
 	})
+
+	t.Run("oidc_gate with registration mode", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{
+			ID:   "t1",
+			Name: "T1",
+			OIDCGate: &SyncOIDCGate{
+				Mode:         "registration",
+				BindIdentity: boolPtr(true),
+				RegistrationOP: &SyncOIDCProvider{
+					Issuer:      "https://idp.example.com",
+					ClientID:    "wallet-reg",
+					DisplayName: "Corporate SSO",
+					Scopes:      "openid profile email groups",
+				},
+			},
+		})
+		gate, ok := body["oidc_gate"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected oidc_gate to be a map")
+		}
+		if gate["mode"] != "registration" {
+			t.Errorf("expected mode 'registration', got %v", gate["mode"])
+		}
+		if gate["bind_identity"] != true {
+			t.Errorf("expected bind_identity true, got %v", gate["bind_identity"])
+		}
+		regOP, ok := gate["registration_op"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected registration_op to be a map")
+		}
+		if regOP["issuer"] != "https://idp.example.com" {
+			t.Errorf("unexpected issuer: %v", regOP["issuer"])
+		}
+		if regOP["client_id"] != "wallet-reg" {
+			t.Errorf("unexpected client_id: %v", regOP["client_id"])
+		}
+		if regOP["display_name"] != "Corporate SSO" {
+			t.Errorf("unexpected display_name: %v", regOP["display_name"])
+		}
+	})
+
+	t.Run("oidc_gate with both mode", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{
+			ID:   "t1",
+			Name: "T1",
+			OIDCGate: &SyncOIDCGate{
+				Mode: "both",
+				RegistrationOP: &SyncOIDCProvider{
+					Issuer:   "https://idp.example.com/realms/reg",
+					ClientID: "wallet-reg",
+				},
+				LoginOP: &SyncOIDCProvider{
+					Issuer:   "https://idp.example.com/realms/login",
+					ClientID: "wallet-login",
+				},
+			},
+		})
+		gate, ok := body["oidc_gate"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected oidc_gate to be a map")
+		}
+		if gate["mode"] != "both" {
+			t.Errorf("expected mode 'both', got %v", gate["mode"])
+		}
+		if _, ok := gate["registration_op"]; !ok {
+			t.Error("expected registration_op to be set")
+		}
+		if _, ok := gate["login_op"]; !ok {
+			t.Error("expected login_op to be set")
+		}
+	})
+
+	t.Run("oidc_gate nil - omitted from body", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{ID: "t1", Name: "T1", OIDCGate: nil})
+		if _, ok := body["oidc_gate"]; ok {
+			t.Error("oidc_gate should not be set when nil")
+		}
+	})
 }
 
-// --- syncAction.String() tests ---
+// --- OIDC gate update detection tests ---
+
+func TestOIDCGateNeedsUpdate(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	t.Run("nil desired returns false", func(t *testing.T) {
+		if oidcGateNeedsUpdate(nil, nil) {
+			t.Error("nil desired should return false")
+		}
+		if oidcGateNeedsUpdate(nil, &syncOIDCGateResp{Mode: "registration"}) {
+			t.Error("nil desired with existing should return false")
+		}
+	})
+
+	t.Run("mode changed", func(t *testing.T) {
+		desired := &SyncOIDCGate{Mode: "both"}
+		existing := &syncOIDCGateResp{Mode: "registration"}
+		if !oidcGateNeedsUpdate(desired, existing) {
+			t.Error("mode change should trigger update")
+		}
+	})
+
+	t.Run("bind_identity changed", func(t *testing.T) {
+		desired := &SyncOIDCGate{Mode: "registration", BindIdentity: boolPtr(true)}
+		existing := &syncOIDCGateResp{Mode: "registration", BindIdentity: false}
+		if !oidcGateNeedsUpdate(desired, existing) {
+			t.Error("bind_identity change should trigger update")
+		}
+	})
+
+	t.Run("same values no update", func(t *testing.T) {
+		desired := &SyncOIDCGate{
+			Mode: "registration",
+			RegistrationOP: &SyncOIDCProvider{
+				Issuer:   "https://idp.example.com",
+				ClientID: "wallet-reg",
+			},
+		}
+		existing := &syncOIDCGateResp{
+			Mode: "registration",
+			RegistrationOP: &syncOIDCProviderResp{
+				Issuer:   "https://idp.example.com",
+				ClientID: "wallet-reg",
+			},
+		}
+		if oidcGateNeedsUpdate(desired, existing) {
+			t.Error("same values should not trigger update")
+		}
+	})
+
+	t.Run("provider issuer changed", func(t *testing.T) {
+		desired := &SyncOIDCGate{
+			Mode: "registration",
+			RegistrationOP: &SyncOIDCProvider{
+				Issuer:   "https://new-idp.example.com",
+				ClientID: "wallet-reg",
+			},
+		}
+		existing := &syncOIDCGateResp{
+			Mode: "registration",
+			RegistrationOP: &syncOIDCProviderResp{
+				Issuer:   "https://idp.example.com",
+				ClientID: "wallet-reg",
+			},
+		}
+		if !oidcGateNeedsUpdate(desired, existing) {
+			t.Error("issuer change should trigger update")
+		}
+	})
+}
 
 func TestSyncActionString(t *testing.T) {
 	tests := []struct {
