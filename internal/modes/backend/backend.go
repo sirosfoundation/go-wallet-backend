@@ -206,19 +206,31 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	// Tenant comes from X-Tenant-ID header (TenantHeaderMiddleware)
 	// =========================================================================
 	public := router.Group("/")
-	{
-		// User authentication routes (no auth required)
-		user := public.Group("/user")
-		user.Use(middleware.TenantHeaderMiddleware(store))
-		{
-			user.POST("/register", handlers.RegisterUser)
-			user.POST("/login", handlers.LoginUser)
 
-			// WebAuthn routes
-			user.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
-			user.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-			user.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-			user.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+	// Create OIDC validator cache for gate middleware
+	validatorCache := middleware.NewValidatorCache(logger)
+
+	{
+		// Base user group with tenant middleware
+		userBase := public.Group("/user")
+		userBase.Use(middleware.TenantHeaderMiddleware(store))
+
+		// Registration routes (with OIDC registration gate)
+		registration := userBase.Group("")
+		registration.Use(middleware.OIDCGateMiddleware(validatorCache, "registration", logger))
+		{
+			registration.POST("/register", handlers.RegisterUser)
+			registration.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
+			registration.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
+		}
+
+		// Login routes (with OIDC login gate)
+		login := userBase.Group("")
+		login.Use(middleware.OIDCGateMiddleware(validatorCache, "login", logger))
+		{
+			login.POST("/login", handlers.LoginUser)
+			login.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
+			login.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
 		}
 
 		// Helper routes (some public)

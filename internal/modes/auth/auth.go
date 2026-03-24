@@ -175,28 +175,47 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 	// Create rate limiter for auth endpoints
 	rateLimiter := middleware.NewAuthRateLimiter(cfg.Security.AuthRateLimit, logger)
 
+	// Create OIDC validator cache for gate middleware
+	validatorCache := middleware.NewValidatorCache(logger)
+
 	public := router.Group("/")
 	{
-		// User authentication routes
-		user := public.Group("/user")
-		user.Use(middleware.TenantHeaderMiddleware(store))
+		// Base user group with tenant middleware
+		userBase := public.Group("/user")
+		userBase.Use(middleware.TenantHeaderMiddleware(store))
+
+		// Registration routes (with OIDC registration gate)
+		registration := userBase.Group("")
+		registration.Use(middleware.OIDCGateMiddleware(validatorCache, "registration", logger))
 		{
-			user.POST("/register", handlers.RegisterUser)
-			user.POST("/login", handlers.LoginUser)
+			registration.POST("/register", handlers.RegisterUser)
 
-			// WebAuthn routes - protected by rate limiting
-			webauthn := user.Group("")
-			webauthn.Use(middleware.AuthRateLimitMiddleware(rateLimiter))
+			// WebAuthn registration routes - also protected by rate limiting
+			webauthnReg := registration.Group("")
+			webauthnReg.Use(middleware.AuthRateLimitMiddleware(rateLimiter))
 			{
-				webauthn.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
-				webauthn.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-				webauthn.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-				webauthn.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+				webauthnReg.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
+				webauthnReg.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
 			}
-
-			// Token refresh endpoint (rate limited)
-			user.POST("/token/refresh", middleware.AuthRateLimitMiddleware(rateLimiter), handlers.RefreshToken)
 		}
+
+		// Login routes (with OIDC login gate)
+		login := userBase.Group("")
+		login.Use(middleware.OIDCGateMiddleware(validatorCache, "login", logger))
+		{
+			login.POST("/login", handlers.LoginUser)
+
+			// WebAuthn login routes - also protected by rate limiting
+			webauthnLogin := login.Group("")
+			webauthnLogin.Use(middleware.AuthRateLimitMiddleware(rateLimiter))
+			{
+				webauthnLogin.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
+				webauthnLogin.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+			}
+		}
+
+		// Token refresh endpoint (rate limited, no OIDC gate needed)
+		userBase.POST("/token/refresh", middleware.AuthRateLimitMiddleware(rateLimiter), handlers.RefreshToken)
 
 		// Auth check helper
 		public.GET("/helper/auth-check", handlers.AuthCheck)
