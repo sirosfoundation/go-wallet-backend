@@ -100,7 +100,7 @@ func TestOIDCGateMiddleware_GateEnabled_NoToken(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "oidc_gate_required", resp["error"])
-	
+
 	oidcConfig, ok := resp["oidc_config"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Equal(t, "https://idp.example.com", oidcConfig["issuer"])
@@ -148,7 +148,7 @@ func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "oidc_gate_required", resp["error"])
-	
+
 	oidcConfig, ok := resp["oidc_config"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Equal(t, "https://login-idp.example.com", oidcConfig["issuer"])
@@ -197,7 +197,7 @@ func TestOIDCGateMiddleware_BothMode(t *testing.T) {
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
-		
+
 		var resp map[string]interface{}
 		json.Unmarshal(w.Body.Bytes(), &resp)
 		oidcConfig := resp["oidc_config"].(map[string]interface{})
@@ -221,7 +221,7 @@ func TestOIDCGateMiddleware_BothMode(t *testing.T) {
 		router.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
-		
+
 		var resp map[string]interface{}
 		json.Unmarshal(w.Body.Bytes(), &resp)
 		oidcConfig := resp["oidc_config"].(map[string]interface{})
@@ -318,7 +318,7 @@ func TestOIDCGateMiddleware_InvalidToken(t *testing.T) {
 
 	// Should return 401 with oidc_config since token is invalid
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	
+
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "oidc_gate_required", resp["error"])

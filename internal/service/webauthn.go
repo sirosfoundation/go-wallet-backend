@@ -24,16 +24,18 @@ import (
 )
 
 var (
-	ErrChallengeNotFound  = errors.New("challenge not found")
-	ErrChallengeExpired   = errors.New("challenge expired")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrCredentialNotFound = errors.New("credential not found")
-	ErrVerificationFailed = errors.New("verification failed")
-	ErrTenantMismatch     = errors.New("tenant mismatch")
-	ErrTenantAccessDenied = errors.New("tenant user must use tenant-scoped login endpoint")
-	ErrTenantNotFound     = errors.New("tenant not found")
-	ErrInviteRequired     = errors.New("invite code required")
-	ErrInvalidInvite      = errors.New("invalid or expired invite code")
+	ErrChallengeNotFound       = errors.New("challenge not found")
+	ErrChallengeExpired        = errors.New("challenge expired")
+	ErrUserNotFound            = errors.New("user not found")
+	ErrCredentialNotFound      = errors.New("credential not found")
+	ErrVerificationFailed      = errors.New("verification failed")
+	ErrTenantMismatch          = errors.New("tenant mismatch")
+	ErrTenantAccessDenied      = errors.New("tenant user must use tenant-scoped login endpoint")
+	ErrTenantNotFound          = errors.New("tenant not found")
+	ErrInviteRequired          = errors.New("invite code required")
+	ErrInvalidInvite           = errors.New("invalid or expired invite code")
+	ErrIdentityNotBound        = errors.New("no enterprise identity bound for this tenant")
+	ErrIdentityBindingMismatch = errors.New("enterprise identity does not match bound identity")
 )
 
 // WebAuthnService handles WebAuthn authentication
@@ -366,6 +368,18 @@ type FinishRegistrationRequest struct {
 	Nickname    string                   `json:"nickname,omitempty"`
 	Keys        taggedbinary.TaggedBytes `json:"keys,omitempty"`
 	PrivateData taggedbinary.TaggedBytes `json:"privateData,omitempty"`
+
+	// OIDCGateBinding contains optional OIDC identity binding info (set by handler)
+	// This is populated from the OIDC gate middleware result when bind_identity is true
+	OIDCGateBinding *OIDCGateBinding `json:"-"` // Do not bind from JSON
+}
+
+// OIDCGateBinding contains OIDC identity info for binding
+type OIDCGateBinding struct {
+	Issuer      string
+	Subject     string
+	Email       string
+	BindingType string // "registration" or "login"
 }
 
 // FinishRegistrationResponse contains the result of registration
@@ -547,6 +561,23 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
+	// Bind enterprise identity if OIDC gate binding was provided
+	if req.OIDCGateBinding != nil && tenantID != "" {
+		user.AddEnterpriseIdentity(domain.EnterpriseIdentity{
+			TenantID:    tenantID,
+			Issuer:      req.OIDCGateBinding.Issuer,
+			Subject:     req.OIDCGateBinding.Subject,
+			Email:       req.OIDCGateBinding.Email,
+			BindingType: req.OIDCGateBinding.BindingType,
+			BoundAt:     now,
+		})
+		s.logger.Info("Bound enterprise identity to user",
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("issuer", req.OIDCGateBinding.Issuer),
+			zap.String("subject", req.OIDCGateBinding.Subject))
+	}
+
 	// Store the user
 	if err := s.store.Users().Create(ctx, user); err != nil {
 		s.logger.Error("Failed to create user", zap.Error(err))
@@ -684,8 +715,9 @@ func (s *WebAuthnService) BeginLogin(ctx context.Context) (*BeginLoginResponse, 
 
 // FinishLoginRequest contains the authentication response from the client
 type FinishLoginRequest struct {
-	ChallengeID string          `json:"challengeId"`
-	Credential  json.RawMessage `json:"credential"`
+	ChallengeID     string           `json:"challengeId"`
+	Credential      json.RawMessage  `json:"credential"`
+	OIDCGateBinding *OIDCGateBinding // Set by handler when OIDC gate is active with bind_identity
 }
 
 // FinishLoginResponse contains the result of login
@@ -889,6 +921,45 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		s.logger.Error("Failed to update user", zap.Error(err))
 		// Don't fail login for this
+	}
+
+	// Verify enterprise identity binding if OIDC gate with bind_identity is active
+	if req.OIDCGateBinding != nil {
+		// Get tenant config to check if bind_identity is enabled
+		tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
+		if err != nil {
+			s.logger.Error("Failed to get tenant for identity verification", zap.Error(err))
+			return nil, fmt.Errorf("failed to verify identity binding: %w", err)
+		}
+
+		if tenant.OIDCGate.IsEnabled() && tenant.OIDCGate.BindIdentity {
+			// Verify that the user's enterprise identity matches the OIDC result
+			existingIdentity := user.GetEnterpriseIdentityForTenant(tenantID)
+			if existingIdentity == nil {
+				s.logger.Warn("User has no bound enterprise identity for tenant",
+					zap.String("user_id", userID.String()),
+					zap.String("tenant_id", string(tenantID)))
+				return nil, ErrIdentityNotBound
+			}
+
+			// Verify issuer and subject match
+			if existingIdentity.Issuer != req.OIDCGateBinding.Issuer ||
+				existingIdentity.Subject != req.OIDCGateBinding.Subject {
+				s.logger.Warn("Enterprise identity mismatch during login",
+					zap.String("user_id", userID.String()),
+					zap.String("tenant_id", string(tenantID)),
+					zap.String("expected_issuer", existingIdentity.Issuer),
+					zap.String("actual_issuer", req.OIDCGateBinding.Issuer),
+					zap.String("expected_subject", existingIdentity.Subject),
+					zap.String("actual_subject", req.OIDCGateBinding.Subject))
+				return nil, ErrIdentityBindingMismatch
+			}
+
+			s.logger.Info("Enterprise identity verified during login",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("issuer", req.OIDCGateBinding.Issuer))
+		}
 	}
 
 	// Generate JWT token with tenant_id included for security boundary

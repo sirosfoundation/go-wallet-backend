@@ -260,3 +260,128 @@ func TestLoginResponse_Fields(t *testing.T) {
 		t.Error("LoginResponse.DisplayName not set correctly")
 	}
 }
+
+func TestUser_EnterpriseIdentityMethods(t *testing.T) {
+	t.Run("GetEnterpriseIdentityForTenant returns nil when no identities", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: nil,
+		}
+		result := user.GetEnterpriseIdentityForTenant("tenant1")
+		if result != nil {
+			t.Error("Expected nil when no enterprise identities exist")
+		}
+	})
+
+	t.Run("GetEnterpriseIdentityForTenant returns correct identity", func(t *testing.T) {
+		now := time.Now()
+		user := &User{
+			EnterpriseIdentities: []EnterpriseIdentity{
+				{TenantID: "tenant1", Issuer: "https://idp1.example.com", Subject: "user1", BoundAt: now},
+				{TenantID: "tenant2", Issuer: "https://idp2.example.com", Subject: "user2", BoundAt: now},
+			},
+		}
+		result := user.GetEnterpriseIdentityForTenant("tenant2")
+		if result == nil {
+			t.Fatal("Expected to find identity for tenant2")
+		}
+		if result.Issuer != "https://idp2.example.com" {
+			t.Errorf("Expected issuer %q, got %q", "https://idp2.example.com", result.Issuer)
+		}
+		if result.Subject != "user2" {
+			t.Errorf("Expected subject %q, got %q", "user2", result.Subject)
+		}
+	})
+
+	t.Run("GetEnterpriseIdentityForTenant returns nil for non-existent tenant", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: []EnterpriseIdentity{
+				{TenantID: "tenant1", Issuer: "https://idp1.example.com", Subject: "user1"},
+			},
+		}
+		result := user.GetEnterpriseIdentityForTenant("tenant-nonexistent")
+		if result != nil {
+			t.Error("Expected nil for non-existent tenant")
+		}
+	})
+
+	t.Run("HasEnterpriseIdentityForTenant returns correct values", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: []EnterpriseIdentity{
+				{TenantID: "tenant1", Issuer: "https://idp1.example.com", Subject: "user1"},
+			},
+		}
+		if !user.HasEnterpriseIdentityForTenant("tenant1") {
+			t.Error("Expected HasEnterpriseIdentityForTenant to return true for existing tenant")
+		}
+		if user.HasEnterpriseIdentityForTenant("tenant2") {
+			t.Error("Expected HasEnterpriseIdentityForTenant to return false for non-existing tenant")
+		}
+	})
+
+	t.Run("AddEnterpriseIdentity adds new identity", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: nil,
+		}
+		identity := EnterpriseIdentity{
+			TenantID:    "tenant1",
+			Issuer:      "https://idp.example.com",
+			Subject:     "user123",
+			Email:       "user@example.com",
+			BindingType: "registration",
+			BoundAt:     time.Now(),
+		}
+		user.AddEnterpriseIdentity(identity)
+
+		if len(user.EnterpriseIdentities) != 1 {
+			t.Fatalf("Expected 1 identity, got %d", len(user.EnterpriseIdentities))
+		}
+		if user.EnterpriseIdentities[0].Issuer != "https://idp.example.com" {
+			t.Error("Identity not added correctly")
+		}
+	})
+
+	t.Run("AddEnterpriseIdentity replaces existing identity for same tenant", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: []EnterpriseIdentity{
+				{TenantID: "tenant1", Issuer: "https://old-idp.example.com", Subject: "old-user"},
+			},
+		}
+		newIdentity := EnterpriseIdentity{
+			TenantID: "tenant1",
+			Issuer:   "https://new-idp.example.com",
+			Subject:  "new-user",
+			BoundAt:  time.Now(),
+		}
+		user.AddEnterpriseIdentity(newIdentity)
+
+		if len(user.EnterpriseIdentities) != 1 {
+			t.Fatalf("Expected 1 identity after replacement, got %d", len(user.EnterpriseIdentities))
+		}
+		if user.EnterpriseIdentities[0].Issuer != "https://new-idp.example.com" {
+			t.Error("Identity was not replaced correctly")
+		}
+		if user.EnterpriseIdentities[0].Subject != "new-user" {
+			t.Error("Subject was not updated correctly")
+		}
+	})
+
+	t.Run("AddEnterpriseIdentity preserves other tenants", func(t *testing.T) {
+		user := &User{
+			EnterpriseIdentities: []EnterpriseIdentity{
+				{TenantID: "tenant1", Issuer: "https://idp1.example.com", Subject: "user1"},
+				{TenantID: "tenant2", Issuer: "https://idp2.example.com", Subject: "user2"},
+			},
+		}
+		newIdentity := EnterpriseIdentity{
+			TenantID: "tenant3",
+			Issuer:   "https://idp3.example.com",
+			Subject:  "user3",
+			BoundAt:  time.Now(),
+		}
+		user.AddEnterpriseIdentity(newIdentity)
+
+		if len(user.EnterpriseIdentities) != 3 {
+			t.Fatalf("Expected 3 identities, got %d", len(user.EnterpriseIdentities))
+		}
+	})
+}

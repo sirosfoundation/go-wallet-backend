@@ -46,6 +46,32 @@ func UserIDFromUserHandle(handle []byte) UserID {
 	return UserID{ID: string(handle)}
 }
 
+// EnterpriseIdentity stores a bound enterprise IdP identity
+type EnterpriseIdentity struct {
+	// TenantID is the tenant this binding belongs to
+	TenantID TenantID `json:"tenant_id" bson:"tenant_id"`
+
+	// Issuer is the OIDC issuer URL
+	Issuer string `json:"issuer" bson:"issuer"`
+
+	// Subject is the unique identifier from the IdP (sub claim)
+	Subject string `json:"subject" bson:"subject"`
+
+	// Email is the user's email from the IdP (optional)
+	Email string `json:"email,omitempty" bson:"email,omitempty"`
+
+	// BindingType indicates when this binding was created: "registration" or "login"
+	BindingType string `json:"binding_type" bson:"binding_type"`
+
+	// BoundAt is when this identity was bound to the user
+	BoundAt time.Time `json:"bound_at" bson:"bound_at"`
+}
+
+// MatchesOIDCResult checks if this identity matches an OIDC validation result
+func (e *EnterpriseIdentity) MatchesOIDCResult(issuer, subject string) bool {
+	return e.Issuer == issuer && e.Subject == subject
+}
+
 // User represents a wallet user
 type User struct {
 	UUID                UserID               `json:"uuid" bson:"_id"`
@@ -59,11 +85,43 @@ type User struct {
 	PrivateDataETag     string               `json:"private_data_etag,omitempty" bson:"private_data_etag,omitempty"`
 	WebauthnCredentials []WebauthnCredential `json:"webauthn_credentials,omitempty" bson:"webauthn_credentials,omitempty"`
 
+	// Enterprise identity bindings (from OIDC gates with bind_identity=true)
+	EnterpriseIdentities []EnterpriseIdentity `json:"enterprise_identities,omitempty" bson:"enterprise_identities,omitempty"`
+
 	// User settings
 	OpenIDRefreshTokenMaxAge int64 `json:"openid_refresh_token_max_age,omitempty" bson:"openid_refresh_token_max_age,omitempty"`
 
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
+}
+
+// GetEnterpriseIdentityForTenant returns the enterprise identity for the given tenant, if any
+func (u *User) GetEnterpriseIdentityForTenant(tenantID TenantID) *EnterpriseIdentity {
+	for i := range u.EnterpriseIdentities {
+		if u.EnterpriseIdentities[i].TenantID == tenantID {
+			return &u.EnterpriseIdentities[i]
+		}
+	}
+	return nil
+}
+
+// HasEnterpriseIdentityForTenant returns true if the user has a bound identity for the tenant
+func (u *User) HasEnterpriseIdentityForTenant(tenantID TenantID) bool {
+	return u.GetEnterpriseIdentityForTenant(tenantID) != nil
+}
+
+// AddEnterpriseIdentity adds or updates an enterprise identity for a tenant
+func (u *User) AddEnterpriseIdentity(identity EnterpriseIdentity) {
+	// Check if already exists for this tenant
+	for i := range u.EnterpriseIdentities {
+		if u.EnterpriseIdentities[i].TenantID == identity.TenantID {
+			// Update existing
+			u.EnterpriseIdentities[i] = identity
+			return
+		}
+	}
+	// Add new
+	u.EnterpriseIdentities = append(u.EnterpriseIdentities, identity)
 }
 
 // WebauthnCredential represents a WebAuthn credential

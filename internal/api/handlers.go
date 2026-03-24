@@ -13,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -143,6 +144,29 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 		return
 	}
 
+	// Check for OIDC gate identity binding
+	if oidcResult, ok := middleware.GetOIDCGateResultGin(c); ok {
+		// Get tenant to check if bind_identity is true
+		if tenantVal, exists := c.Get("tenant"); exists {
+			if tenant, ok := tenantVal.(*domain.Tenant); ok && tenant.OIDCGate.BindIdentity {
+				// Get email from claims if available
+				var email string
+				if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
+					email = emailClaim
+				}
+				req.OIDCGateBinding = &service.OIDCGateBinding{
+					Issuer:      oidcResult.Issuer,
+					Subject:     oidcResult.Subject,
+					Email:       email,
+					BindingType: "registration",
+				}
+				h.logger.Debug("OIDC identity binding prepared for registration",
+					zap.String("issuer", oidcResult.Issuer),
+					zap.String("subject", oidcResult.Subject))
+			}
+		}
+	}
+
 	resp, err := h.services.WebAuthn.FinishRegistration(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Error("Failed to finish WebAuthn registration", zap.Error(err))
@@ -199,6 +223,22 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 		return
 	}
 
+	// Check if OIDC gate authentication result is present
+	// Note: For login, we can't get tenant ID from request - it's determined from the credential
+	// The middleware sets the result in context, and the service will verify it matches the user's bound identity
+	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
+		// Extract email from claims if available
+		var email string
+		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
+			email = emailClaim
+		}
+		req.OIDCGateBinding = &service.OIDCGateBinding{
+			Issuer:  oidcResult.Issuer,
+			Subject: oidcResult.Subject,
+			Email:   email,
+		}
+	}
+
 	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Error("Failed to finish WebAuthn login", zap.Error(err))
@@ -216,6 +256,10 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(401, gin.H{"error": "Authentication failed"})
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
+		case errors.Is(err, service.ErrIdentityNotBound):
+			c.JSON(403, gin.H{"error": "No enterprise identity bound for this wallet"})
+		case errors.Is(err, service.ErrIdentityBindingMismatch):
+			c.JSON(403, gin.H{"error": "Enterprise identity does not match registered identity"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete login"})
 		}
