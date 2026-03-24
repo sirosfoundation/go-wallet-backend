@@ -211,12 +211,16 @@ The default tenant cannot be deleted.`,
 
 // OIDC gate configuration flags
 var (
-	oidcGateMode             string
-	oidcGateRegistrationOP   string
-	oidcGateRegistrationClID string
-	oidcGateLoginOP          string
-	oidcGateLoginClID        string
-	oidcGateClear            bool
+	oidcGateMode               string
+	oidcGateRegistrationOP     string
+	oidcGateRegistrationClID   string
+	oidcGateRegistrationName   string
+	oidcGateRegistrationScopes string
+	oidcGateLoginOP            string
+	oidcGateLoginClID          string
+	oidcGateLoginName          string
+	oidcGateLoginScopes        string
+	oidcGateClear              bool
 )
 
 var tenantOIDCGateCmd = &cobra.Command{
@@ -238,15 +242,18 @@ Examples:
   wallet-admin tenant configure-oidc-gate my-tenant \
     --mode registration \
     --registration-issuer https://idp.example.com/realms/corp \
-    --registration-client-id wallet-reg
+    --registration-client-id wallet-reg \
+    --registration-display-name "Corporate SSO"
 
   # Enable both gates with same provider
   wallet-admin tenant configure-oidc-gate my-tenant \
     --mode both \
     --registration-issuer https://idp.example.com/realms/corp \
     --registration-client-id wallet-reg \
+    --registration-display-name "Corporate Login" \
     --login-issuer https://idp.example.com/realms/corp \
-    --login-client-id wallet-login
+    --login-client-id wallet-login \
+    --login-display-name "Enterprise SSO"
 
   # Disable OIDC gate
   wallet-admin tenant configure-oidc-gate my-tenant --clear`,
@@ -291,10 +298,17 @@ Examples:
 			if oidcGateRegistrationClID == "" {
 				return fmt.Errorf("--registration-client-id is required for mode '%s'", oidcGateMode)
 			}
-			oidcGate["registration_op"] = map[string]interface{}{
+			regOP := map[string]interface{}{
 				"issuer":    oidcGateRegistrationOP,
 				"client_id": oidcGateRegistrationClID,
 			}
+			if oidcGateRegistrationName != "" {
+				regOP["display_name"] = oidcGateRegistrationName
+			}
+			if oidcGateRegistrationScopes != "" {
+				regOP["scopes"] = oidcGateRegistrationScopes
+			}
+			oidcGate["registration_op"] = regOP
 		}
 
 		// Login provider config
@@ -305,10 +319,17 @@ Examples:
 			if oidcGateLoginClID == "" {
 				return fmt.Errorf("--login-client-id is required for mode '%s'", oidcGateMode)
 			}
-			oidcGate["login_op"] = map[string]interface{}{
+			loginOP := map[string]interface{}{
 				"issuer":    oidcGateLoginOP,
 				"client_id": oidcGateLoginClID,
 			}
+			if oidcGateLoginName != "" {
+				loginOP["display_name"] = oidcGateLoginName
+			}
+			if oidcGateLoginScopes != "" {
+				loginOP["scopes"] = oidcGateLoginScopes
+			}
+			oidcGate["login_op"] = loginOP
 		}
 
 		// Update tenant with OIDC gate config
@@ -354,7 +375,11 @@ func init() {
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateMode, "mode", "none", "OIDC gate mode: none, registration, login, both")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationOP, "registration-issuer", "", "OIDC issuer URL for registration gate")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationClID, "registration-client-id", "", "OIDC client ID for registration gate")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationName, "registration-display-name", "", "Display name for registration IdP (e.g., 'Corporate SSO')")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRegistrationScopes, "registration-scopes", "", "OIDC scopes for registration (default: 'openid profile email')")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginOP, "login-issuer", "", "OIDC issuer URL for login gate")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginClID, "login-client-id", "", "OIDC client ID for login gate")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginName, "login-display-name", "", "Display name for login IdP (e.g., 'Enterprise SSO')")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginScopes, "login-scopes", "", "OIDC scopes for login (default: 'openid profile email')")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateClear, "clear", false, "Clear OIDC gate configuration")
 }

@@ -328,3 +328,127 @@ func TestUserIDFromHandle(t *testing.T) {
 		t.Error("UserIDFromHandle() expected error with empty handle")
 	}
 }
+
+func TestOIDCProviderConfig_EffectiveScopes(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *OIDCProviderConfig
+		want   string
+	}{
+		{
+			name:   "nil config",
+			config: nil,
+			want:   DefaultOIDCScopes,
+		},
+		{
+			name:   "empty scopes",
+			config: &OIDCProviderConfig{Scopes: ""},
+			want:   DefaultOIDCScopes,
+		},
+		{
+			name:   "custom scopes",
+			config: &OIDCProviderConfig{Scopes: "openid profile groups"},
+			want:   "openid profile groups",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.EffectiveScopes(); got != tt.want {
+				t.Errorf("EffectiveScopes() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOIDCProviderConfig_EffectiveDisplayName(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *OIDCProviderConfig
+		want   string
+	}{
+		{
+			name:   "nil config",
+			config: nil,
+			want:   "",
+		},
+		{
+			name:   "with display name",
+			config: &OIDCProviderConfig{DisplayName: "Corporate SSO", Issuer: "https://idp.example.com"},
+			want:   "Corporate SSO",
+		},
+		{
+			name:   "empty display name falls back to issuer",
+			config: &OIDCProviderConfig{DisplayName: "", Issuer: "https://idp.example.com"},
+			want:   "https://idp.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.EffectiveDisplayName(); got != tt.want {
+				t.Errorf("EffectiveDisplayName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOIDCGateConfig_Modes(t *testing.T) {
+	tests := []struct {
+		name            string
+		config          *OIDCGateConfig
+		wantEnabled     bool
+		wantRegRequired bool
+		wantLoginReq    bool
+	}{
+		{
+			name:            "nil config",
+			config:          nil,
+			wantEnabled:     false,
+			wantRegRequired: false,
+			wantLoginReq:    false,
+		},
+		{
+			name:            "mode none",
+			config:          &OIDCGateConfig{Mode: OIDCGateModeNone},
+			wantEnabled:     false,
+			wantRegRequired: false,
+			wantLoginReq:    false,
+		},
+		{
+			name:            "mode registration",
+			config:          &OIDCGateConfig{Mode: OIDCGateModeRegistration},
+			wantEnabled:     true,
+			wantRegRequired: true,
+			wantLoginReq:    false,
+		},
+		{
+			name:            "mode login",
+			config:          &OIDCGateConfig{Mode: OIDCGateModeLogin},
+			wantEnabled:     true,
+			wantRegRequired: false,
+			wantLoginReq:    true,
+		},
+		{
+			name:            "mode both",
+			config:          &OIDCGateConfig{Mode: OIDCGateModeBoth},
+			wantEnabled:     true,
+			wantRegRequired: true,
+			wantLoginReq:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.IsEnabled(); got != tt.wantEnabled {
+				t.Errorf("IsEnabled() = %v, want %v", got, tt.wantEnabled)
+			}
+			if got := tt.config.RequiresGateForRegistration(); got != tt.wantRegRequired {
+				t.Errorf("RequiresGateForRegistration() = %v, want %v", got, tt.wantRegRequired)
+			}
+			if got := tt.config.RequiresGateForLogin(); got != tt.wantLoginReq {
+				t.Errorf("RequiresGateForLogin() = %v, want %v", got, tt.wantLoginReq)
+			}
+		})
+	}
+}

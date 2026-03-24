@@ -91,6 +91,9 @@ type OIDCGateConfig struct {
 
 // OIDCProviderConfig defines an OIDC provider for validation
 type OIDCProviderConfig struct {
+    // User-friendly display name (e.g., "Corporate SSO", "University Login")
+    DisplayName string `json:"display_name,omitempty" bson:"display_name,omitempty"`
+    
     // Issuer URL (used for token validation and OIDC discovery)
     Issuer string `json:"issuer" bson:"issuer"`
     
@@ -102,6 +105,9 @@ type OIDCProviderConfig struct {
     
     // Optional: required audience (defaults to client_id)
     Audience string `json:"audience,omitempty" bson:"audience,omitempty"`
+    
+    // Optional: OIDC scopes to request (defaults to "openid profile email")
+    Scopes string `json:"scopes,omitempty" bson:"scopes,omitempty"`
 }
 ```
 
@@ -154,8 +160,10 @@ Response includes new field:
   "oidc_gate": {
     "mode": "registration",
     "registration_op": {
+      "display_name": "Corporate SSO",
       "issuer": "https://login.acme.com",
-      "client_id": "wallet-app"
+      "client_id": "wallet-app",
+      "scopes": "openid profile email groups"
     },
     "bind_identity": true
   }
@@ -174,8 +182,10 @@ Response on missing/invalid token: `401 Unauthorized`
   "error": "oidc_gate_required",
   "message": "OIDC authentication required",
   "oidc_config": {
+    "display_name": "Corporate SSO",
     "issuer": "https://login.acme.com",
-    "client_id": "wallet-app"
+    "client_id": "wallet-app",
+    "scopes": "openid profile email groups"
   }
 }
 ```

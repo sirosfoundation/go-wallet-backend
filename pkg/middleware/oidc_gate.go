@@ -214,8 +214,10 @@ func respondOIDCRequired(c *gin.Context, opConfig *domain.OIDCProviderConfig, me
 		"error":   "oidc_gate_required",
 		"message": message,
 		"oidc_config": gin.H{
-			"issuer":    opConfig.Issuer,
-			"client_id": opConfig.ClientID,
+			"display_name": opConfig.EffectiveDisplayName(),
+			"issuer":       opConfig.Issuer,
+			"client_id":    opConfig.ClientID,
+			"scopes":       opConfig.EffectiveScopes(),
 		},
 	})
 	c.Abort()

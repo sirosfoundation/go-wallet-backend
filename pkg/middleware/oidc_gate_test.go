@@ -71,8 +71,10 @@ func TestOIDCGateMiddleware_GateEnabled_NoToken(t *testing.T) {
 		OIDCGate: domain.OIDCGateConfig{
 			Mode: domain.OIDCGateModeRegistration,
 			RegistrationOP: &domain.OIDCProviderConfig{
-				Issuer:   "https://idp.example.com",
-				ClientID: "wallet-client",
+				DisplayName: "Corporate SSO",
+				Issuer:      "https://idp.example.com",
+				ClientID:    "wallet-client",
+				Scopes:      "openid profile email groups",
 			},
 		},
 	}
@@ -103,13 +105,15 @@ func TestOIDCGateMiddleware_GateEnabled_NoToken(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "https://idp.example.com", oidcConfig["issuer"])
 	assert.Equal(t, "wallet-client", oidcConfig["client_id"])
+	assert.Equal(t, "Corporate SSO", oidcConfig["display_name"])
+	assert.Equal(t, "openid profile email groups", oidcConfig["scopes"])
 }
 
 func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 	cache := NewValidatorCache(logger)
 
-	// Tenant with login gate enabled
+	// Tenant with login gate enabled - no display_name or scopes (tests defaults)
 	tenant := &domain.Tenant{
 		ID:   "test-tenant",
 		Name: "Test Tenant",
@@ -118,6 +122,7 @@ func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 			LoginOP: &domain.OIDCProviderConfig{
 				Issuer:   "https://login-idp.example.com",
 				ClientID: "wallet-login",
+				// No DisplayName or Scopes - should use defaults
 			},
 		},
 	}
@@ -148,6 +153,10 @@ func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "https://login-idp.example.com", oidcConfig["issuer"])
 	assert.Equal(t, "wallet-login", oidcConfig["client_id"])
+	// Default display_name falls back to issuer URL
+	assert.Equal(t, "https://login-idp.example.com", oidcConfig["display_name"])
+	// Default scopes
+	assert.Equal(t, "openid profile email", oidcConfig["scopes"])
 }
 
 func TestOIDCGateMiddleware_BothMode(t *testing.T) {

@@ -67,6 +67,9 @@ const (
 
 // OIDCProviderConfig defines an OIDC provider for token validation
 type OIDCProviderConfig struct {
+	// DisplayName is a user-friendly name for the IdP (e.g., "Corporate SSO", "University Login")
+	DisplayName string `json:"display_name,omitempty" bson:"display_name,omitempty" gorm:"column:display_name"`
+
 	// Issuer URL (used for token validation and OIDC discovery)
 	Issuer string `json:"issuer" bson:"issuer" gorm:"column:issuer"`
 
@@ -78,6 +81,31 @@ type OIDCProviderConfig struct {
 
 	// Audience is the required audience claim; defaults to ClientID if empty
 	Audience string `json:"audience,omitempty" bson:"audience,omitempty" gorm:"column:audience"`
+
+	// Scopes to request during OIDC flow; defaults to "openid profile email" if empty
+	Scopes string `json:"scopes,omitempty" bson:"scopes,omitempty" gorm:"column:scopes"`
+}
+
+// DefaultOIDCScopes is the default set of OIDC scopes to request
+const DefaultOIDCScopes = "openid profile email"
+
+// EffectiveScopes returns the scopes to request, defaulting to "openid profile email"
+func (c *OIDCProviderConfig) EffectiveScopes() string {
+	if c == nil || c.Scopes == "" {
+		return DefaultOIDCScopes
+	}
+	return c.Scopes
+}
+
+// EffectiveDisplayName returns the display name, falling back to issuer if not set
+func (c *OIDCProviderConfig) EffectiveDisplayName() string {
+	if c == nil {
+		return ""
+	}
+	if c.DisplayName != "" {
+		return c.DisplayName
+	}
+	return c.Issuer
 }
 
 // OIDCGateConfig configures OIDC pre-authentication gates for tenant endpoints

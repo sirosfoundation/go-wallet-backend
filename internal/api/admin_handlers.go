@@ -46,10 +46,12 @@ type TrustConfigRequest struct {
 
 // OIDCProviderConfigRequest represents an OIDC provider in API requests
 type OIDCProviderConfigRequest struct {
-	Issuer   string `json:"issuer" binding:"required"`
-	ClientID string `json:"client_id" binding:"required"`
-	JWKSURI  string `json:"jwks_uri,omitempty"`
-	Audience string `json:"audience,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer" binding:"required"`
+	ClientID    string `json:"client_id" binding:"required"`
+	JWKSURI     string `json:"jwks_uri,omitempty"`
+	Audience    string `json:"audience,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
 }
 
 // OIDCGateRequest represents the OIDC gate configuration in API requests
@@ -82,10 +84,12 @@ type TrustConfigResponse struct {
 
 // OIDCProviderConfigResponse represents an OIDC provider in API responses
 type OIDCProviderConfigResponse struct {
-	Issuer   string `json:"issuer"`
-	ClientID string `json:"client_id"`
-	JWKSURI  string `json:"jwks_uri,omitempty"`
-	Audience string `json:"audience,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer"`
+	ClientID    string `json:"client_id"`
+	JWKSURI     string `json:"jwks_uri,omitempty"`
+	Audience    string `json:"audience,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
 }
 
 // OIDCGateResponse represents the OIDC gate configuration in API responses
@@ -133,18 +137,22 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 	}
 	if g.RegistrationOP != nil {
 		resp.RegistrationOP = &OIDCProviderConfigResponse{
-			Issuer:   g.RegistrationOP.Issuer,
-			ClientID: g.RegistrationOP.ClientID,
-			JWKSURI:  g.RegistrationOP.JWKSURI,
-			Audience: g.RegistrationOP.Audience,
+			DisplayName: g.RegistrationOP.DisplayName,
+			Issuer:      g.RegistrationOP.Issuer,
+			ClientID:    g.RegistrationOP.ClientID,
+			JWKSURI:     g.RegistrationOP.JWKSURI,
+			Audience:    g.RegistrationOP.Audience,
+			Scopes:      g.RegistrationOP.Scopes,
 		}
 	}
 	if g.LoginOP != nil {
 		resp.LoginOP = &OIDCProviderConfigResponse{
-			Issuer:   g.LoginOP.Issuer,
-			ClientID: g.LoginOP.ClientID,
-			JWKSURI:  g.LoginOP.JWKSURI,
-			Audience: g.LoginOP.Audience,
+			DisplayName: g.LoginOP.DisplayName,
+			Issuer:      g.LoginOP.Issuer,
+			ClientID:    g.LoginOP.ClientID,
+			JWKSURI:     g.LoginOP.JWKSURI,
+			Audience:    g.LoginOP.Audience,
+			Scopes:      g.LoginOP.Scopes,
 		}
 	}
 	return resp
@@ -162,20 +170,24 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) {
 	// Apply registration OP
 	if req.RegistrationOP != nil {
 		gate.RegistrationOP = &domain.OIDCProviderConfig{
-			Issuer:   req.RegistrationOP.Issuer,
-			ClientID: req.RegistrationOP.ClientID,
-			JWKSURI:  req.RegistrationOP.JWKSURI,
-			Audience: req.RegistrationOP.Audience,
+			DisplayName: req.RegistrationOP.DisplayName,
+			Issuer:      req.RegistrationOP.Issuer,
+			ClientID:    req.RegistrationOP.ClientID,
+			JWKSURI:     req.RegistrationOP.JWKSURI,
+			Audience:    req.RegistrationOP.Audience,
+			Scopes:      req.RegistrationOP.Scopes,
 		}
 	}
 
 	// Apply login OP (separate from registration if provided)
 	if req.LoginOP != nil {
 		gate.LoginOP = &domain.OIDCProviderConfig{
-			Issuer:   req.LoginOP.Issuer,
-			ClientID: req.LoginOP.ClientID,
-			JWKSURI:  req.LoginOP.JWKSURI,
-			Audience: req.LoginOP.Audience,
+			DisplayName: req.LoginOP.DisplayName,
+			Issuer:      req.LoginOP.Issuer,
+			ClientID:    req.LoginOP.ClientID,
+			JWKSURI:     req.LoginOP.JWKSURI,
+			Audience:    req.LoginOP.Audience,
+			Scopes:      req.LoginOP.Scopes,
 		}
 	}
 
