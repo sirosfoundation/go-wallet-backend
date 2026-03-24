@@ -51,6 +51,87 @@ type TrustConfig struct {
 	TrustTTL int `json:"trust_ttl,omitempty" bson:"trust_ttl" gorm:"column:trust_ttl;default:86400"`
 }
 
+// OIDCGateMode defines which endpoints require OIDC pre-authentication
+type OIDCGateMode string
+
+const (
+	// OIDCGateModeNone disables OIDC gating (default behavior)
+	OIDCGateModeNone OIDCGateMode = "none"
+	// OIDCGateModeRegistration requires OIDC auth for registration only
+	OIDCGateModeRegistration OIDCGateMode = "registration"
+	// OIDCGateModeLogin requires OIDC auth for login only
+	OIDCGateModeLogin OIDCGateMode = "login"
+	// OIDCGateModeBoth requires OIDC auth for both registration and login
+	OIDCGateModeBoth OIDCGateMode = "both"
+)
+
+// OIDCProviderConfig defines an OIDC provider for token validation
+type OIDCProviderConfig struct {
+	// Issuer URL (used for token validation and OIDC discovery)
+	Issuer string `json:"issuer" bson:"issuer" gorm:"column:issuer"`
+
+	// ClientID is the public client ID for PKCE (no secret needed)
+	ClientID string `json:"client_id" bson:"client_id" gorm:"column:client_id"`
+
+	// JWKSURI is optional; if empty, discovered from issuer's .well-known/openid-configuration
+	JWKSURI string `json:"jwks_uri,omitempty" bson:"jwks_uri,omitempty" gorm:"column:jwks_uri"`
+
+	// Audience is the required audience claim; defaults to ClientID if empty
+	Audience string `json:"audience,omitempty" bson:"audience,omitempty" gorm:"column:audience"`
+}
+
+// OIDCGateConfig configures OIDC pre-authentication gates for tenant endpoints
+type OIDCGateConfig struct {
+	// Mode determines which endpoints require OIDC pre-authentication
+	Mode OIDCGateMode `json:"mode" bson:"mode" gorm:"column:oidc_gate_mode;default:none"`
+
+	// RegistrationOP is the OIDC provider for registration gate
+	RegistrationOP *OIDCProviderConfig `json:"registration_op,omitempty" bson:"registration_op,omitempty" gorm:"embedded;embeddedPrefix:reg_op_"`
+
+	// LoginOP is the OIDC provider for login gate; if nil, uses RegistrationOP
+	LoginOP *OIDCProviderConfig `json:"login_op,omitempty" bson:"login_op,omitempty" gorm:"embedded;embeddedPrefix:login_op_"`
+
+	// RequiredClaims specifies claims that must be present and match (e.g., {"email_verified": true})
+	RequiredClaims map[string]interface{} `json:"required_claims,omitempty" bson:"required_claims,omitempty" gorm:"-"`
+
+	// BindIdentity determines whether to persist the enterprise identity link with the wallet user
+	BindIdentity bool `json:"bind_identity" bson:"bind_identity" gorm:"column:oidc_bind_identity;default:false"`
+}
+
+// IsEnabled returns true if OIDC gating is enabled (mode != none)
+func (c *OIDCGateConfig) IsEnabled() bool {
+	return c != nil && c.Mode != "" && c.Mode != OIDCGateModeNone
+}
+
+// RequiresGateForRegistration returns true if registration requires OIDC pre-auth
+func (c *OIDCGateConfig) RequiresGateForRegistration() bool {
+	return c != nil && (c.Mode == OIDCGateModeRegistration || c.Mode == OIDCGateModeBoth)
+}
+
+// RequiresGateForLogin returns true if login requires OIDC pre-auth
+func (c *OIDCGateConfig) RequiresGateForLogin() bool {
+	return c != nil && (c.Mode == OIDCGateModeLogin || c.Mode == OIDCGateModeBoth)
+}
+
+// GetRegistrationOP returns the OIDC provider config for registration
+func (c *OIDCGateConfig) GetRegistrationOP() *OIDCProviderConfig {
+	if c == nil {
+		return nil
+	}
+	return c.RegistrationOP
+}
+
+// GetLoginOP returns the OIDC provider config for login (falls back to RegistrationOP)
+func (c *OIDCGateConfig) GetLoginOP() *OIDCProviderConfig {
+	if c == nil {
+		return nil
+	}
+	if c.LoginOP != nil {
+		return c.LoginOP
+	}
+	return c.RegistrationOP
+}
+
 // Tenant represents an organizational tenant
 type Tenant struct {
 	ID            TenantID  `json:"id" bson:"_id" gorm:"primaryKey"`
@@ -63,6 +144,9 @@ type Tenant struct {
 
 	// Trust configuration (embedded)
 	TrustConfig TrustConfig `json:"trust_config,omitempty" bson:"trust_config" gorm:"embedded;embeddedPrefix:trust_"`
+
+	// OIDC Gate configuration (embedded)
+	OIDCGate OIDCGateConfig `json:"oidc_gate,omitempty" bson:"oidc_gate" gorm:"embedded;embeddedPrefix:oidc_gate_"`
 }
 
 // TableName specifies the table name for GORM
