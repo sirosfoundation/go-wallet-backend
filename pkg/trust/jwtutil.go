@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/sirosfoundation/go-cryptoutil"
 )
 
 // ExtractKeyMaterialFromJWT extracts key material (x5c or jwk) from a JWT header.
@@ -70,7 +71,7 @@ func ExtractKeyMaterialFromJWT(jwtStr string) *KeyMaterial {
 //   - No key material is found in the header
 //   - The signature verification fails
 //   - The key format is unsupported
-func VerifyJWTWithEmbeddedKey(jwtStr string) (*KeyMaterial, error) {
+func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*KeyMaterial, error) {
 	parts := strings.Split(jwtStr, ".")
 	if len(parts) != 3 {
 		return nil, errors.New("invalid JWT format: expected 3 parts")
@@ -105,7 +106,7 @@ func VerifyJWTWithEmbeddedKey(jwtStr string) (*KeyMaterial, error) {
 				return nil, fmt.Errorf("failed to decode x5c leaf certificate: %w", err)
 			}
 		}
-		cert, err := x509.ParseCertificate(certDER)
+		cert, err := parseCertificateDER(certDER, ext...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse x5c leaf certificate: %w", err)
 		}
@@ -249,6 +250,13 @@ func okpJWKToPublicKey(jwk map[string]any) (ed25519.PublicKey, error) {
 	}
 
 	return ed25519.PublicKey(xBytes), nil
+}
+
+func parseCertificateDER(der []byte, ext ...*cryptoutil.Extensions) (*x509.Certificate, error) {
+	if len(ext) > 0 && ext[0] != nil {
+		return ext[0].ParseCertificate(der)
+	}
+	return x509.ParseCertificate(der)
 }
 
 // FetchJWKS fetches a JWKS from a URI using the given HTTP client.
