@@ -30,7 +30,6 @@ developer_tools/pki/*
 # Working documents (not tracked in git)
 PR_STRATEGY.md
 COMMIT_PLAN.md
-docs/
 
 # OIDC Conformance testing artifacts
 config.conformance.yaml
