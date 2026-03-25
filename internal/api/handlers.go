@@ -1240,3 +1240,104 @@ func (h *Handlers) KeystoreStatus(c *gin.Context) {
 		"connected": connected,
 	})
 }
+
+// =============================================================================
+// Public Tenant Config
+// =============================================================================
+
+// PublicTenantConfigResponse is the public-facing tenant configuration.
+// This excludes admin-only fields and exposes only what clients need.
+type PublicTenantConfigResponse struct {
+	ID            string                  `json:"id"`
+	Name          string                  `json:"name"`
+	DisplayName   string                  `json:"display_name,omitempty"`
+	RequireInvite bool                    `json:"require_invite"`
+	OIDCGate      *PublicOIDCGateResponse `json:"oidc_gate,omitempty"`
+}
+
+// PublicOIDCProviderResponse is the public-facing OIDC provider config.
+// Only includes fields needed by clients to initiate OIDC flows.
+type PublicOIDCProviderResponse struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer"`
+	ClientID    string `json:"client_id"`
+	Scopes      string `json:"scopes,omitempty"`
+}
+
+// PublicOIDCGateResponse is the public-facing OIDC gate configuration.
+type PublicOIDCGateResponse struct {
+	Mode           string                      `json:"mode"`
+	RegistrationOP *PublicOIDCProviderResponse `json:"registration_op,omitempty"`
+	LoginOP        *PublicOIDCProviderResponse `json:"login_op,omitempty"`
+}
+
+// GetTenantConfig returns the public configuration for a tenant.
+// GET /tenant/:id/config
+// This is a public endpoint that does not require authentication.
+func (h *Handlers) GetTenantConfig(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Validate tenant ID format
+	if err := domain.ValidateTenantID(tenantID); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid tenant ID"})
+		return
+	}
+
+	tenant, err := h.services.Tenant.GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(404, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		c.JSON(500, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	// Don't expose disabled tenants
+	if !tenant.Enabled {
+		c.JSON(404, gin.H{"error": "Tenant not found"})
+		return
+	}
+
+	response := &PublicTenantConfigResponse{
+		ID:            string(tenant.ID),
+		Name:          tenant.Name,
+		DisplayName:   tenant.DisplayName,
+		RequireInvite: tenant.RequireInvite,
+	}
+
+	// Include OIDC gate config if enabled
+	if tenant.OIDCGate.IsEnabled() {
+		response.OIDCGate = publicOIDCGateToResponse(&tenant.OIDCGate)
+	}
+
+	c.JSON(200, response)
+}
+
+// publicOIDCGateToResponse converts domain OIDCGateConfig to public response
+func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse {
+	if g == nil {
+		return nil
+	}
+	resp := &PublicOIDCGateResponse{
+		Mode: string(g.Mode),
+	}
+	if g.RegistrationOP != nil {
+		resp.RegistrationOP = &PublicOIDCProviderResponse{
+			DisplayName: g.RegistrationOP.DisplayName,
+			Issuer:      g.RegistrationOP.Issuer,
+			ClientID:    g.RegistrationOP.ClientID,
+			Scopes:      g.RegistrationOP.Scopes,
+		}
+	}
+	if g.LoginOP != nil {
+		resp.LoginOP = &PublicOIDCProviderResponse{
+			DisplayName: g.LoginOP.DisplayName,
+			Issuer:      g.LoginOP.Issuer,
+			ClientID:    g.LoginOP.ClientID,
+			Scopes:      g.LoginOP.Scopes,
+		}
+	}
+	return resp
+}

@@ -69,6 +69,12 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			user.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
 		}
 
+		// Public tenant configuration (for OIDC gate discovery)
+		tenant := public.Group("/tenant")
+		{
+			tenant.GET("/:id/config", p.handlers.GetTenantConfig)
+		}
+
 		// Auth check helper
 		public.GET("/helper/auth-check", p.handlers.AuthCheck)
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
