@@ -4,6 +4,12 @@
 
 Protect wallet registration and/or authentication endpoints with OpenID Connect authorization. Users must authenticate with an enterprise IdP (OP) before accessing the wallet.
 
+## Status: Implemented ✅
+
+This feature is implemented across:
+- **Backend**: `go-wallet-backend` branch `feature/oidc-gate`
+- **Frontend**: `wallet-frontend` branch `feature/oidc-gate`
+
 ## Use Cases
 
 | Mode | Registration | Login | Example |
@@ -13,26 +19,21 @@ Protect wallet registration and/or authentication endpoints with OpenID Connect 
 | `both` | Protected (OP-A) | Protected (OP-B) | Different OPs per operation, or same OP |
 | `none` | Open | Open | Default behavior (unchanged) |
 
-## Design Decisions (Open Questions)
+## Design Decisions
 
-### 1. Token Type
-- **Option A**: Validate ID tokens only (standard OIDC)
-- **Option B**: Support access token + introspection endpoint
-- **Recommendation**: Start with ID tokens; add access token support later if needed
+### Token Type
+- ID tokens only (standard OIDC)
+- Token validated via JWKS from OIDC discovery
 
-### 2. Identity Binding
-- **Option A**: One-time gate - validate token, proceed; no persistent link
-- **Option B**: Bind enterprise `sub` to wallet user (audit trail, recovery)
-- **Recommendation**: Support both via config flag `bind_identity`
+### Identity Binding
+- Configurable via `bind_identity` flag
+- When enabled, enterprise `sub` is bound to wallet user during registration
+- Login verifies the bound identity matches
 
-### 3. Claim Requirements
-- Validate issuer + audience (required)
-- Optional: require specific claims (e.g., `email_verified: true`, `groups` membership)
-
-### 4. Flow Orchestration
-- **Frontend-driven (SPA)**: Frontend handles PKCE flow, passes ID token to backend
-- **Backend-redirect**: Backend initiates authorization code flow
-- **Recommendation**: Frontend-driven for wallet-frontend; document backend approach for other clients
+### Flow Orchestration
+- **Frontend-driven PKCE**: Frontend handles the OIDC PKCE flow
+- **Token passing**: ID token sent in `Authorization: Bearer <token>` header
+- **Native support**: WebView apps can use NativeOIDCBridge interface
 
 ## Architecture
 
@@ -122,95 +123,129 @@ type EnterpriseIdentity struct {
 }
 ```
 
-## Implementation Plan
+## Backend Implementation
 
-### Phase 1: Backend Core (go-wallet-backend)
+### Components
 
-1. **Domain model** - Add `OIDCGateConfig` to Tenant struct
-2. **OIDC validation** - New `pkg/oidc` package for ID token validation
-   - JWKS fetching/caching
-   - Token signature verification
-   - Claims validation
-3. **Middleware** - `OIDCGateMiddleware` for conditional endpoint protection
-4. **Admin API** - Update tenant CRUD to support `oidc_gate` configuration
-5. **CLI** - Add `wallet-admin tenant configure-oidc-gate` command
+1. **Domain model** (`internal/domain/tenant.go`)
+   - `OIDCGateConfig` - Gate configuration
+   - `OIDCProviderConfig` - Per-OP settings
+   - `EnterpriseIdentity` - Bound identity (when `bind_identity` enabled)
 
-### Phase 2: Frontend Integration (wallet-frontend)
+2. **OIDC validation** (`pkg/oidc/`)
+   - `Validator` - JWT validation with JWKS
+   - OIDC discovery for JWKS URI
+   - Signature, expiry, issuer, audience validation
 
-1. **OIDC client** - Integrate `oidc-client-ts` library
-2. **Gate flow** - Intercept registration/login, redirect to OP if configured
-3. **Token passing** - Include ID token in Authorization header
-4. **Error handling** - Handle token validation failures gracefully
+3. **Middleware** (`pkg/middleware/oidc_gate.go`)
+   - `OIDCGateMiddleware` - Conditional endpoint protection
+   - `ValidatorCache` - Caches validators per OP
+   - Returns 401 with `oidc_config` for client retry
 
-### Phase 3: Testing & Documentation
+4. **Admin API** (`internal/api/admin_handlers.go`)
+   - CRUD for `oidc_gate` in tenant configuration
+   - Public config endpoint: `GET /api/v1/tenants/:id/config`
 
-1. **Unit tests** - Token validation, middleware behavior
-2. **Integration tests** - Full flow with mock IdP
-3. **Documentation** - Admin guide for configuring OIDC gates
+5. **CLI** (`cmd/wallet-admin/cmd/tenant.go`)
+   - `configure-oidc-gate` command
+   - Sync support in `sync.go`
 
-## API Changes
+## API
 
-### GET /api/v1/tenants/{id}
+### GET /api/v1/tenants/:id/config
 
-Response includes new field:
+Public endpoint returning tenant configuration including OIDC gate settings.
+
+Response:
 ```json
 {
   "id": "acme",
   "name": "ACME Corp",
+  "display_name": "ACME Corporation",
+  "require_invite": false,
   "oidc_gate": {
     "mode": "registration",
     "registration_op": {
       "display_name": "Corporate SSO",
       "issuer": "https://login.acme.com",
       "client_id": "wallet-app",
-      "scopes": "openid profile email groups"
-    },
-    "bind_identity": true
+      "scopes": "openid profile email"
+    }
   }
 }
 ```
 
-### Protected Endpoints (when gate is active)
+### Protected Endpoints
 
-Require `Authorization: Bearer <id_token>` header:
-- `POST /webauthn/register/start` (if mode = "registration" or "both")
-- `POST /webauthn/login/start` (if mode = "login" or "both")
+When OIDC gate is enabled, these endpoints require `Authorization: Bearer <id_token>`:
 
-Response on missing/invalid token: `401 Unauthorized`
+**Registration gate** (mode = `registration` or `both`):
+- `POST /user/register`
+- `POST /user/register-webauthn-begin`
+- `POST /user/register-webauthn-finish`
+
+**Login gate** (mode = `login` or `both`):
+- `POST /user/login`
+- `POST /user/login-webauthn-begin`
+- `POST /user/login-webauthn-finish`
+
+### Error Response (401)
+
+When token is missing or invalid:
 ```json
 {
   "error": "oidc_gate_required",
-  "message": "OIDC authentication required",
+  "message": "Authorization header required",
   "oidc_config": {
     "display_name": "Corporate SSO",
     "issuer": "https://login.acme.com",
     "client_id": "wallet-app",
-    "scopes": "openid profile email groups"
+    "scopes": "openid profile email"
   }
 }
 ```
 
 ## Security Considerations
 
-1. **Token replay** - Consider short-lived tokens + nonce binding
-2. **JWKS caching** - Implement cache with reasonable TTL (e.g., 1 hour)
-3. **Clock skew** - Allow configurable leeway for exp/iat/nbf validation
-4. **Error messages** - Avoid leaking sensitive info in validation errors
+1. **Token validation** - Full JWT validation (signature, exp, iss, aud)
+2. **JWKS caching** - Validators cached per issuer+audience combination
+3. **Clock skew** - Standard leeway applied for exp/iat/nbf
+4. **Error messages** - Generic errors avoid leaking sensitive info
+5. **Required claims** - Configurable claim validation (e.g., `email_verified: true`)
 
-## Open Questions
+## CLI Configuration
 
-1. Should we support OIDC discovery, or require explicit JWKS URI?
-2. Do we need to store the ID token for audit purposes?
-3. Should claim requirements be per-OP or shared?
-4. How to handle token refresh for long registration flows?
+Configure OIDC gate using `wallet-admin`:
+
+```bash
+# Enable registration gate with identity binding
+wallet-admin tenant configure-oidc-gate acme \
+  --mode registration \
+  --issuer https://login.acme.com \
+  --client-id wallet-app \
+  --display-name "Corporate SSO" \
+  --scopes "openid profile email" \
+  --bind-identity
+
+# Enable both gates (different OPs)
+wallet-admin tenant configure-oidc-gate acme \
+  --mode both \
+  --issuer https://login.acme.com \
+  --client-id wallet-app \
+  --login-issuer https://mfa.acme.com \
+  --login-client-id wallet-mfa
+
+# Disable gate
+wallet-admin tenant configure-oidc-gate acme --mode none
+```
 
 ---
 
-## Frontend Implementation Plan (wallet-frontend)
+## Frontend Implementation
 
 ### Overview
 
-The frontend needs to detect OIDC gate requirements and handle enterprise IdP authentication with explicit user action (button click). Registration and login gates are **independent** - a tenant may gate only registration, only login, both, or neither.
+The frontend detects OIDC gate requirements and handles enterprise IdP authentication with explicit user action (button click). Registration and login gates are **independent** - a tenant may gate only registration, only login, both, or neither.
 
 **Key design decisions:**
 1. **Button-based UX** - No auto-redirect; user clicks explicit IdP button
@@ -227,283 +262,46 @@ The frontend needs to detect OIDC gate requirements and handle enterprise IdP au
 | `login` | Open | Gated | Normal passkey buttons | IdP button → then passkey |
 | `both` | Gated | Gated | IdP button → then passkey | IdP button → then passkey |
 
-### Phase 1: API Types & Tenant Config (2-3 hours)
+### Components
 
-**Files to modify:**
-- `src/api/types.ts` - Add OIDC gate types
-- `src/context/TenantContext.tsx` - Extend with tenant config fetching
+| File | Description |
+|------|-------------|
+| `src/api/types.ts` | OIDC gate types (OIDCGateConfig, TenantConfig) |
+| `src/context/TenantContext.tsx` | Fetches tenant config, exposes gate helpers |
+| `src/lib/oidc.ts` | OIDC PKCE flow + native bridge support |
+| `src/hooks/useOIDCGate.ts` | React hook for gate state machine |
+| `src/pages/Login/Login.tsx` | Integrated gate detection, two-step flow |
+| `src/pages/OIDCCallback/OIDCCallback.tsx` | Handles IdP redirect callback |
+| `src/components/Auth/OIDCGateButton.tsx` | IdP authentication button |
+| `src/components/Auth/OIDCGateUI.tsx` | Gate flow UI container |
 
-**Types to add:**
-```typescript
-// src/api/types.ts
-export interface OIDCProviderConfig {
-  display_name?: string;
-  issuer: string;
-  client_id: string;
-  scopes?: string;
-}
+### Routes
 
-export interface OIDCGateConfig {
-  mode: 'none' | 'registration' | 'login' | 'both';
-  registration_op?: OIDCProviderConfig;
-  login_op?: OIDCProviderConfig;
-  bind_identity?: boolean;
-}
+- `/cb` - OIDC callback (default tenant)
+- `/id/:tenantId/cb` - OIDC callback (multi-tenant)
 
-export interface TenantConfig {
-  id: string;
-  name: string;
-  display_name?: string;
-  oidc_gate?: OIDCGateConfig;
-  // ... other fields
-}
-```
+### Native Bridge Interface
 
-**TenantContext changes:**
-- Add state for `tenantConfig: TenantConfig | null`
-- Fetch tenant config from `/api/v1/tenants/{id}` on mount
-- Expose helpers:
-  - `requiresOIDCGateForRegistration(): boolean`
-  - `requiresOIDCGateForLogin(): boolean`
-  - `getRegistrationOIDCProvider(): OIDCProviderConfig | null`
-  - `getLoginOIDCProvider(): OIDCProviderConfig | null`
-
-### Phase 2: OIDC Client Integration (4-6 hours)
-
-**New files:**
-- `src/lib/oidc.ts` - OIDC PKCE flow utilities
-- `src/hooks/useOIDCGate.ts` - React hook for OIDC gate flow
-
-**WebView/Native App Support:**
-
-Native apps running wallet-frontend in a WebView can inject a bridge object:
+For WebView apps using AppAuth-iOS/Android:
 
 ```typescript
-// Native bridge interface (injected by native app)
 interface NativeOIDCBridge {
-  // Check if native OIDC is available
   isAvailable(): boolean;
-  
-  // Start OIDC flow via native SDK (AppAuth-iOS/Android)
-  // Returns promise that resolves with ID token
   startFlow(config: {
     issuer: string;
     clientId: string;
     scopes: string;
-  }): Promise<{ idToken: string; }>;
-}
-
-declare global {
-  interface Window {
-    NativeOIDCBridge?: NativeOIDCBridge;
-  }
+  }): Promise<{ idToken: string }>;
 }
 ```
 
-**Flow mode detection:**
-```typescript
-// src/lib/oidc.ts
-export type OIDCFlowMode = 'browser-redirect' | 'native-bridge';
+Inject as `window.NativeOIDCBridge` before loading the WebView.
 
-export function getOIDCFlowMode(): OIDCFlowMode {
-  if (window.NativeOIDCBridge?.isAvailable?.()) {
-    return 'native-bridge';
-  }
-  return 'browser-redirect';
-}
-```
+---
 
-**Core functions in `src/lib/oidc.ts`:**
-```typescript
-interface OIDCConfig {
-  issuer: string;
-  clientId: string;
-  redirectUri: string;
-  scopes: string;
-}
+## Testing
 
-// Start OIDC flow - handles both browser and native modes
-async function startOIDCFlow(
-  config: OIDCConfig, 
-  purpose: 'registration' | 'login'
-): Promise<void>;
-
-// Handle callback (browser mode only)
-async function handleOIDCCallback(): Promise<{ idToken: string }>;
-
-// Get stored ID token
-function getStoredIdToken(purpose: 'registration' | 'login'): string | null;
-
-// Clear stored ID token
-function clearStoredIdToken(purpose: 'registration' | 'login'): void;
-```
-
-**Token storage:**
-- Use `sessionStorage` with keys like `oidc_gate_registration_token`, `oidc_gate_login_token`
-- Tokens are purpose-specific to avoid cross-contamination
-
-### Phase 3: Login Page Integration (4-6 hours)
-
-**Files to modify:**
-- `src/pages/Login/Login.tsx` - Add OIDC gate detection and flow
-- Add new component: `src/components/Auth/OIDCGateButton.tsx`
-
-**State machine for gated flows:**
-```typescript
-type GateState = 
-  | { status: 'idle' }                    // Initial state
-  | { status: 'awaiting-oidc' }           // User clicked IdP button, flow in progress
-  | { status: 'oidc-complete', token: string }  // IdP auth done, ready for passkey
-  | { status: 'error', message: string }; // Error occurred
-```
-
-**Registration flow (mode = 'registration' or 'both'):**
-```
-┌─────────────────────────────────────────────────────────┐
-│  Create your wallet                                      │
-│                                                          │
-│  Username: [___________________]                         │
-│                                                          │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ 🏢 Sign up with Corporate SSO                       ││ ← Primary button
-│  └─────────────────────────────────────────────────────┘│
-│                                                          │
-│  Your organization requires you to verify your identity  │
-│  before creating a wallet.                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-**After OIDC success (registration):**
-```
-┌─────────────────────────────────────────────────────────┐
-│  Choose your passkey type                                │
-│  ✓ Verified: alice@acme.com                              │
-│                                                          │
-│  [👆 Platform Passkey] ← primary                         │
-│  [🔑 Security Key]                                       │
-│  [📱 Hybrid Passkey]                                     │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Login flow (mode = 'login' or 'both'):**
-```
-┌─────────────────────────────────────────────────────────┐
-│  Welcome back                                            │
-│                                                          │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │ 🏢 Sign in with Corporate SSO                       ││
-│  └─────────────────────────────────────────────────────┘│
-│                                                          │
-│  After verifying your identity, you'll use your          │
-│  passkey to unlock your wallet.                          │
-└─────────────────────────────────────────────────────────┘
-```
-
-**After OIDC success (login):**
-```
-┌─────────────────────────────────────────────────────────┐
-│  Unlock your wallet                                      │
-│  ✓ Verified: alice@acme.com                              │
-│                                                          │
-│  [👆 Unlock with Passkey] ← primary                      │
-│  [🔑 Use Security Key]                                   │
-│  [📱 Use Another Device]                                 │
-└─────────────────────────────────────────────────────────┘
-```
-
-**Non-gated flows remain unchanged:**
-- If `mode = 'none'`: Normal passkey buttons for both registration and login
-- If `mode = 'registration'`: Login shows normal passkey buttons
-- If `mode = 'login'`: Registration shows normal passkey buttons
-
-**OIDCGateButton component:**
-```tsx
-interface OIDCGateButtonProps {
-  provider: OIDCProviderConfig;
-  purpose: 'registration' | 'login';
-  onClick: () => void;
-  disabled?: boolean;
-}
-
-// Renders: "🏢 Sign up with {display_name}" or "🏢 Sign in with {display_name}"
-```
-
-**Integration in WebauthnSignupLogin:**
-```tsx
-const { tenantConfig } = useTenant();
-const [registrationGateState, setRegistrationGateState] = useState<GateState>({ status: 'idle' });
-const [loginGateState, setLoginGateState] = useState<GateState>({ status: 'idle' });
-
-// Check if THIS specific action requires a gate
-const registrationRequiresGate = tenantConfig?.oidc_gate?.mode === 'registration' 
-  || tenantConfig?.oidc_gate?.mode === 'both';
-const loginRequiresGate = tenantConfig?.oidc_gate?.mode === 'login' 
-  || tenantConfig?.oidc_gate?.mode === 'both';
-
-// For registration tab
-if (!isLogin && registrationRequiresGate && registrationGateState.status !== 'oidc-complete') {
-  return <OIDCGateUI 
-    provider={tenantConfig.oidc_gate.registration_op}
-    purpose="registration"
-    state={registrationGateState}
-    onStart={handleStartRegistrationOIDC}
-  />;
-}
-
-// For login tab
-if (isLogin && loginRequiresGate && loginGateState.status !== 'oidc-complete') {
-  return <OIDCGateUI
-    provider={tenantConfig.oidc_gate.login_op}
-    purpose="login"
-    state={loginGateState}
-    onStart={handleStartLoginOIDC}
-  />;
-}
-
-// Otherwise, render normal passkey buttons
-// (includes: non-gated flows, or gated flows after OIDC success)
-```
-
-### Phase 4: Callback Page (2-3 hours)
-
-**New file:**
-- `src/pages/OIDCCallback/OIDCCallback.tsx`
-
-**Routes:**
-- Add `/cb` and `/id/:tenantId/cb` routes for browser-based OIDC
-
-**State preservation:**
-- Store `purpose` ('registration' | 'login') in `state` parameter
-- Store any form data (username) in sessionStorage before redirect
-- Restore after callback
-
-**Logic:**
-1. Parse authorization code from URL
-2. Exchange for tokens via OIDC client
-3. Extract `purpose` from state parameter
-4. Store ID token with purpose-specific key
-5. Redirect back to `/login` or `/id/:tenantId/login`
-6. Login page detects stored token, shows passkey step
-
-### Phase 5: Error Handling (2-3 hours)
-
-**Scenarios to handle:**
-
-| Error | HTTP Status | User Message | Action |
-|-------|-------------|--------------|--------|
-| IdP unreachable | - | "Unable to reach identity provider" | Retry button |
-| User cancelled at IdP | - | "Authentication cancelled" | Return to login |
-| Token validation failed | 401 | "Session expired, please verify again" | Clear token, restart |
-| Identity binding mismatch | 403 | "This wallet is registered to a different identity" | Explain, offer help |
-| Token expired mid-flow | 401 | "Your session expired" | Restart OIDC flow |
-
-**Files:**
-- Add error UI in `src/components/Auth/OIDCGateError.tsx`
-- Update Login.tsx to handle new error cases from backend
-
-### Phase 6: Testing (4-6 hours)
-
-**Manual test matrix:**
+### Test Matrix
 
 | Test Case | Mode | Action | Expected |
 |-----------|------|--------|----------|
@@ -517,51 +315,31 @@ if (isLogin && loginRequiresGate && loginGateState.status !== 'oidc-complete') {
 | 8 | both | Login | IdP button → passkey |
 | 9 | both + bind_identity | Login with different IdP user | 403 error |
 
-**Automated tests:**
-- Unit tests for `src/lib/oidc.ts` (mock fetch)
-- Unit tests for gate state machine
-- E2E test with mock IdP in wallet-e2e-tests
+### Testing Setup
 
-### Dependencies
+1. Configure a tenant with OIDC gate:
+   ```bash
+   wallet-admin tenant configure-oidc-gate test-tenant \
+     --mode registration \
+     --issuer https://your-idp.example.com \
+     --client-id your-client-id \
+     --display-name "Test IdP"
+   ```
 
-- `oidc-client-ts` - OIDC client library with PKCE support
+2. Configure your IdP (e.g., Keycloak, Azure AD):
+   - Create a public OIDC client with PKCE
+   - Set redirect URI: `http://localhost:5173/id/test-tenant/cb`
+   - Scopes: `openid profile email`
 
-### Files Summary
+3. Start services:
+   ```bash
+   # Backend
+   cd go-wallet-backend && go run ./cmd/wallet-backend
+   # Frontend
+   cd wallet-frontend && yarn dev
+   ```
 
-| File | Action | Description |
-|------|--------|-------------|
-| `src/api/types.ts` | Modify | Add OIDCGateConfig, TenantConfig types |
-| `src/context/TenantContext.tsx` | Modify | Fetch tenant config, expose gate helpers |
-| `src/lib/oidc.ts` | Create | OIDC PKCE flow + native bridge support |
-| `src/hooks/useOIDCGate.ts` | Create | React hook for gate state machine |
-| `src/pages/Login/Login.tsx` | Modify | Integrate gate detection, two-step flow |
-| `src/pages/OIDCCallback/OIDCCallback.tsx` | Create | Handle IdP redirect callback |
-| `src/components/Auth/OIDCGateButton.tsx` | Create | IdP authentication button |
-| `src/components/Auth/OIDCGateUI.tsx` | Create | Gate flow UI container |
-| `src/components/Auth/OIDCGateError.tsx` | Create | Error handling component |
-| `package.json` | Modify | Add oidc-client-ts dependency |
-
-### Native App Integration Guide
-
-For native apps using WebViews:
-
-1. **Inject the bridge before loading the WebView:**
-```swift
-// iOS example
-let script = """
-window.NativeOIDCBridge = {
-  isAvailable: function() { return true; },
-  startFlow: function(config) {
-    return new Promise(function(resolve, reject) {
-      window.webkit.messageHandlers.oidc.postMessage(config);
-      window._oidcResolve = resolve;
-      window._oidcReject = reject;
-    });
-  }
-};
-"""
-webView.configuration.userContentController.addUserScript(...)
-```
+4. Navigate to `http://localhost:5173/id/test-tenant/login` and test the flow.
 
 2. **Handle OIDC in native code:**
    - Use AppAuth-iOS or AppAuth-Android
