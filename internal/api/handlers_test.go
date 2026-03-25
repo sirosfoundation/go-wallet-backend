@@ -743,10 +743,10 @@ func TestHandlers_GetTenantConfig_Success(t *testing.T) {
 		RequireInvite: false,
 	}
 	handlers, router := setupTestHandlersWithTenant(t, tenant)
-	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/tenant/test-tenant/config", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/test-tenant/config", nil)
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
@@ -790,10 +790,10 @@ func TestHandlers_GetTenantConfig_WithOIDCGate(t *testing.T) {
 		},
 	}
 	handlers, router := setupTestHandlersWithTenant(t, tenant)
-	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/tenant/oidc-tenant/config", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/oidc-tenant/config", nil)
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {

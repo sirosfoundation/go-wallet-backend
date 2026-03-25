@@ -1272,7 +1272,7 @@ type PublicOIDCGateResponse struct {
 }
 
 // GetTenantConfig returns the public configuration for a tenant.
-// GET /tenant/:id/config
+// GET /api/v1/tenants/:id/config
 // This is a public endpoint that does not require authentication.
 func (h *Handlers) GetTenantConfig(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))

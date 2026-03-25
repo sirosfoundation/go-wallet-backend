@@ -202,6 +202,16 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	router.GET("/health", handlers.Status)
 
 	// =========================================================================
+	// PUBLIC API ROUTES (unauthenticated)
+	// These endpoints provide public configuration data
+	// =========================================================================
+	apiV1 := router.Group("/api/v1")
+	{
+		// Public tenant config - returns OIDC gate settings etc.
+		apiV1.GET("/tenants/:id/config", handlers.GetTenantConfig)
+	}
+
+	// =========================================================================
 	// PUBLIC ROUTES (unauthenticated)
 	// Tenant comes from X-Tenant-ID header (TenantHeaderMiddleware)
 	// =========================================================================
