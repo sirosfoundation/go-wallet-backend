@@ -121,6 +121,8 @@ github.com/sirosfoundation/go-trust v0.0.0-20260223112607-3f3b0788c175 h1:L1o+lS
 github.com/sirosfoundation/go-trust v0.0.0-20260223112607-3f3b0788c175/go.mod h1:Mwx3iDl0k05oP649gh+/6nmM1xeMlGaun5mleGTax70=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61 h1:1XMBGQ57pLEZRkazk8AN7mhNu63czErGg9+I3stWSS0=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61/go.mod h1:gAxbvM0HnnY4c3aNYo6Za97nPpGSbqLfjUtxJ8qNGjs=
+github.com/sirosfoundation/webauthn v0.16.2-siros1 h1:uZ8fk6Dbj89e2bKEXh2k6YR6MPXWFuXf5BckisxT+O0=
+github.com/sirosfoundation/webauthn v0.16.2-siros1/go.mod h1:dU9PhyI5vuvAoeXB0/tosoJKkWlDe84mT2/5i8DnMEA=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=
 github.com/sirupsen/logrus v1.9.3/go.mod h1:naHLuLoDiP4jHNo9R0sCBMtWGeIprob74mVsIT4qYEQ=
 github.com/spf13/cobra v1.10.2 h1:DMTTonx5m65Ic0GOoRY2c16WCbHxOOw6xxezuLaBpcU=
