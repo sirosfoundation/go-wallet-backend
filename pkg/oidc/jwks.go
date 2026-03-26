@@ -81,7 +81,7 @@ func (k *JWK) rsaPublicKey() (*rsa.PublicKey, error) {
 		return nil, errors.New("invalid RSA exponent: must be positive")
 	}
 	if !e.IsInt64() || e.Int64() > math.MaxInt32 {
-		return nil, errors.New("invalid RSA exponent: exceeds maximum int size")
+		return nil, errors.New("invalid RSA exponent: exceeds maximum allowed exponent")
 	}
 	eInt := int(e.Int64())
 	if eInt < 3 {
