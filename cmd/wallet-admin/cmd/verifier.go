@@ -10,10 +10,12 @@ import (
 
 // Verifier represents a verifier in a tenant (matching API response)
 type Verifier struct {
-	ID       int64  `json:"id"`
-	TenantID string `json:"tenant_id"`
-	Name     string `json:"name"`
-	URL      string `json:"url"`
+	ID             int64  `json:"id"`
+	TenantID       string `json:"tenant_id"`
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	ClientID       string `json:"client_id,omitempty"`
+	ClientIDScheme string `json:"client_id_scheme,omitempty"`
 }
 
 // VerifierListResponse represents the list verifiers response
@@ -95,9 +97,11 @@ var verifierGetCmd = &cobra.Command{
 }
 
 var (
-	verifierCreateTenantID string
-	verifierCreateName     string
-	verifierCreateURL      string
+	verifierCreateTenantID       string
+	verifierCreateName           string
+	verifierCreateURL            string
+	verifierCreateClientID       string
+	verifierCreateClientIDScheme string
 )
 
 var verifierCreateCmd = &cobra.Command{
@@ -123,6 +127,12 @@ credentials from wallet users.`,
 			"name": verifierCreateName,
 			"url":  verifierCreateURL,
 		}
+		if verifierCreateClientID != "" {
+			reqBody["client_id"] = verifierCreateClientID
+		}
+		if verifierCreateClientIDScheme != "" {
+			reqBody["client_id_scheme"] = verifierCreateClientIDScheme
+		}
 
 		data, err := client.Request("POST", "/admin/tenants/"+verifierCreateTenantID+"/verifiers", reqBody)
 		if err != nil {
@@ -138,9 +148,11 @@ credentials from wallet users.`,
 }
 
 var (
-	verifierUpdateTenantID string
-	verifierUpdateName     string
-	verifierUpdateURL      string
+	verifierUpdateTenantID       string
+	verifierUpdateName           string
+	verifierUpdateURL            string
+	verifierUpdateClientID       string
+	verifierUpdateClientIDScheme string
 )
 
 var verifierUpdateCmd = &cobra.Command{
@@ -171,12 +183,24 @@ var verifierUpdateCmd = &cobra.Command{
 			"name": existing.Name,
 			"url":  existing.URL,
 		}
+		if existing.ClientID != "" {
+			reqBody["client_id"] = existing.ClientID
+		}
+		if existing.ClientIDScheme != "" {
+			reqBody["client_id_scheme"] = existing.ClientIDScheme
+		}
 
 		if verifierUpdateName != "" {
 			reqBody["name"] = verifierUpdateName
 		}
 		if verifierUpdateURL != "" {
 			reqBody["url"] = verifierUpdateURL
+		}
+		if verifierUpdateClientID != "" {
+			reqBody["client_id"] = verifierUpdateClientID
+		}
+		if verifierUpdateClientIDScheme != "" {
+			reqBody["client_id_scheme"] = verifierUpdateClientIDScheme
 		}
 
 		data, err = client.Request("PUT", "/admin/tenants/"+verifierUpdateTenantID+"/verifiers/"+verifierID, reqBody)
@@ -238,6 +262,8 @@ func init() {
 	verifierCreateCmd.Flags().StringVar(&verifierCreateTenantID, "tenant", "", "Tenant ID (required)")
 	verifierCreateCmd.Flags().StringVar(&verifierCreateName, "name", "", "Verifier name (required)")
 	verifierCreateCmd.Flags().StringVar(&verifierCreateURL, "verifier-url", "", "Verifier URL (required)")
+	verifierCreateCmd.Flags().StringVar(&verifierCreateClientID, "client-id", "", "OAuth client ID for this verifier")
+	verifierCreateCmd.Flags().StringVar(&verifierCreateClientIDScheme, "client-id-scheme", "", "Client ID scheme (e.g., redirect_uri, pre-registered)")
 	_ = verifierCreateCmd.MarkFlagRequired("tenant")
 	_ = verifierCreateCmd.MarkFlagRequired("name")
 	_ = verifierCreateCmd.MarkFlagRequired("verifier-url")
@@ -246,6 +272,8 @@ func init() {
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateTenantID, "tenant", "", "Tenant ID (required)")
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateName, "name", "", "New verifier name")
 	verifierUpdateCmd.Flags().StringVar(&verifierUpdateURL, "verifier-url", "", "New verifier URL")
+	verifierUpdateCmd.Flags().StringVar(&verifierUpdateClientID, "client-id", "", "OAuth client ID for this verifier")
+	verifierUpdateCmd.Flags().StringVar(&verifierUpdateClientIDScheme, "client-id-scheme", "", "Client ID scheme (e.g., redirect_uri, pre-registered)")
 	_ = verifierUpdateCmd.MarkFlagRequired("tenant")
 
 	// Delete flags

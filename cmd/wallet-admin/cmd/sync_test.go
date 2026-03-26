@@ -428,6 +428,30 @@ func TestVerifierNeedsUpdate(t *testing.T) {
 			t.Error("expected update needed for URL change")
 		}
 	})
+
+	t.Run("client_id changed", func(t *testing.T) {
+		desired := SyncVerifier{Name: "V", URL: "https://v.example.com", ClientID: "new-client-id"}
+		existing := Verifier{Name: "V", URL: "https://v.example.com", ClientID: "old-client-id"}
+		if !verifierNeedsUpdate(desired, existing) {
+			t.Error("expected update needed for ClientID change")
+		}
+	})
+
+	t.Run("client_id_scheme changed", func(t *testing.T) {
+		desired := SyncVerifier{Name: "V", URL: "https://v.example.com", ClientIDScheme: "redirect_uri"}
+		existing := Verifier{Name: "V", URL: "https://v.example.com", ClientIDScheme: "did"}
+		if !verifierNeedsUpdate(desired, existing) {
+			t.Error("expected update needed for ClientIDScheme change")
+		}
+	})
+
+	t.Run("same values with client_id no update", func(t *testing.T) {
+		desired := SyncVerifier{Name: "V", URL: "https://v.example.com", ClientID: "my-client", ClientIDScheme: "redirect_uri"}
+		existing := Verifier{Name: "V", URL: "https://v.example.com", ClientID: "my-client", ClientIDScheme: "redirect_uri"}
+		if verifierNeedsUpdate(desired, existing) {
+			t.Error("expected no update needed when all fields match")
+		}
+	})
 }
 
 // --- buildTenantRequestBody tests ---

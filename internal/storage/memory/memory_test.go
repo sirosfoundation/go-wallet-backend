@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"time"
@@ -1716,5 +1717,128 @@ func TestUserTenantStore_RemoveMembership(t *testing.T) {
 	err := store.UserTenants().RemoveMembership(ctx, domain.NewUserID(), domain.DefaultTenantID)
 	if err != storage.ErrNotFound {
 		t.Errorf("RemoveMembership() non-existent error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestVerifierStore_GetByURL(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+
+	verifier := &domain.Verifier{
+		TenantID: domain.DefaultTenantID,
+		Name:     "Test Verifier",
+		URL:      "https://verifier.example.com/callback",
+		ClientID: "custom-client-id",
+	}
+
+	if err := store.Verifiers().Create(ctx, verifier); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Test successful lookup
+	found, err := store.Verifiers().GetByURL(ctx, domain.DefaultTenantID, "https://verifier.example.com/callback")
+	if err != nil {
+		t.Fatalf("GetByURL() error = %v", err)
+	}
+	if found.Name != "Test Verifier" {
+		t.Errorf("GetByURL() Name = %v, want Test Verifier", found.Name)
+	}
+	if found.ClientID != "custom-client-id" {
+		t.Errorf("GetByURL() ClientID = %v, want custom-client-id", found.ClientID)
+	}
+
+	// Test not found
+	_, err = store.Verifiers().GetByURL(ctx, domain.DefaultTenantID, "https://nonexistent.example.com")
+	if err != storage.ErrNotFound {
+		t.Errorf("GetByURL() non-existent error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestVerifierStore_Upsert_PreservesClientID(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+
+	// Create initial verifier with ClientID
+	initial := &domain.Verifier{
+		TenantID:       domain.DefaultTenantID,
+		Name:           "Test Verifier",
+		URL:            "https://verifier.example.com",
+		ClientID:       "original-client-id",
+		ClientIDScheme: "redirect_uri",
+	}
+
+	if err := store.Verifiers().Create(ctx, initial); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Upsert without ClientID - should preserve existing
+	update := &domain.Verifier{
+		TenantID:       domain.DefaultTenantID,
+		Name:           "Updated Verifier",
+		URL:            "https://verifier.example.com",
+		ClientID:       "", // Empty - should preserve original
+		ClientIDScheme: "", // Empty - should preserve original
+	}
+
+	if err := store.Verifiers().Upsert(ctx, update); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	// Retrieve and verify
+	found, err := store.Verifiers().GetByURL(ctx, domain.DefaultTenantID, "https://verifier.example.com")
+	if err != nil {
+		t.Fatalf("GetByURL() error = %v", err)
+	}
+	if found.Name != "Updated Verifier" {
+		t.Errorf("Upsert() Name = %v, want Updated Verifier", found.Name)
+	}
+	if found.ClientID != "original-client-id" {
+		t.Errorf("Upsert() ClientID = %v, want original-client-id (preserved)", found.ClientID)
+	}
+	if found.ClientIDScheme != "redirect_uri" {
+		t.Errorf("Upsert() ClientIDScheme = %v, want redirect_uri (preserved)", found.ClientIDScheme)
+	}
+}
+
+func TestVerifierStore_Upsert_OverwritesClientID(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+
+	// Create initial verifier with ClientID
+	initial := &domain.Verifier{
+		TenantID:       domain.DefaultTenantID,
+		Name:           "Test Verifier",
+		URL:            "https://verifier.example.com",
+		ClientID:       "original-client-id",
+		ClientIDScheme: "redirect_uri",
+	}
+
+	if err := store.Verifiers().Create(ctx, initial); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Upsert with new ClientID - should overwrite
+	update := &domain.Verifier{
+		TenantID:       domain.DefaultTenantID,
+		Name:           "Updated Verifier",
+		URL:            "https://verifier.example.com",
+		ClientID:       "new-client-id",
+		ClientIDScheme: "did",
+	}
+
+	if err := store.Verifiers().Upsert(ctx, update); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	// Retrieve and verify
+	found, err := store.Verifiers().GetByURL(ctx, domain.DefaultTenantID, "https://verifier.example.com")
+	if err != nil {
+		t.Fatalf("GetByURL() error = %v", err)
+	}
+	if found.ClientID != "new-client-id" {
+		t.Errorf("Upsert() ClientID = %v, want new-client-id", found.ClientID)
+	}
+	if found.ClientIDScheme != "did" {
+		t.Errorf("Upsert() ClientIDScheme = %v, want did", found.ClientIDScheme)
 	}
 }

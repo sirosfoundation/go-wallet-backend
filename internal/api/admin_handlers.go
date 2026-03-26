@@ -619,8 +619,10 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 
 // VerifierRequest represents the request body for creating/updating a verifier
 type VerifierRequest struct {
-	Name string `json:"name" binding:"required"`
-	URL  string `json:"url" binding:"required"`
+	Name           string `json:"name" binding:"required"`
+	URL            string `json:"url" binding:"required"`
+	ClientID       string `json:"client_id,omitempty"`
+	ClientIDScheme string `json:"client_id_scheme,omitempty"`
 }
 
 // VerifierResponse represents a verifier in API responses
@@ -729,10 +731,18 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 		return
 	}
 
+	// Validate client_id_scheme if provided
+	if err := domain.ValidateVerifierClientID(req.ClientID, req.ClientIDScheme); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	verifier := &domain.Verifier{
-		TenantID: tenantID,
-		Name:     req.Name,
-		URL:      req.URL,
+		TenantID:       tenantID,
+		Name:           req.Name,
+		URL:            req.URL,
+		ClientID:       req.ClientID,
+		ClientIDScheme: req.ClientIDScheme,
 	}
 
 	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
@@ -781,9 +791,29 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 		return
 	}
 
-	// Update fields
+	// Validate client_id_scheme if provided (considering preserved values)
+	effectiveClientID := req.ClientID
+	effectiveScheme := req.ClientIDScheme
+	if effectiveClientID == "" {
+		effectiveClientID = verifier.ClientID
+	}
+	if effectiveScheme == "" {
+		effectiveScheme = verifier.ClientIDScheme
+	}
+	if err := domain.ValidateVerifierClientID(effectiveClientID, effectiveScheme); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update fields - preserve existing client_id/client_id_scheme if not provided
 	verifier.Name = req.Name
 	verifier.URL = req.URL
+	if req.ClientID != "" {
+		verifier.ClientID = req.ClientID
+	}
+	if req.ClientIDScheme != "" {
+		verifier.ClientIDScheme = req.ClientIDScheme
+	}
 
 	if err := h.store.Verifiers().Update(c.Request.Context(), verifier); err != nil {
 		h.logger.Error("Failed to update verifier", zap.Error(err))

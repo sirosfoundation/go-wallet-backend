@@ -188,8 +188,8 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 6: Request VP signing from client
-	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials)
+	// Step 6: Request VP signing from client (use configured ClientID for audience if set)
+	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, err.Error())
 		return err
@@ -432,7 +432,8 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	// Check cached trust result (skip PDP call if fresh)
 	const trustCacheTTL = 5 * time.Minute
-	if cached := h.getCachedVerifierTrust(ctx, authReq.ClientID); cached != nil {
+	canonicalURL := getCanonicalVerifierURL(authReq)
+	if cached := h.getCachedVerifierTrust(ctx, canonicalURL); cached != nil {
 		if cached.TrustEvaluatedAt != nil && time.Since(*cached.TrustEvaluatedAt) < trustCacheTTL {
 			h.Logger.Debug("Using cached verifier trust",
 				zap.String("client_id", authReq.ClientID),
@@ -440,6 +441,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			verifier.Trusted = cached.TrustStatus == domain.TrustStatusTrusted
 			verifier.TrustedStatus = string(cached.TrustStatus)
 			verifier.Framework = cached.TrustFramework
+			// Use stored ClientID for VP audience if configured
+			if cached.ClientID != "" {
+				verifier.ClientID = cached.ClientID
+			}
 
 			// Still enforce trust even from cache
 			trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
@@ -470,6 +475,11 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	// Cache trust evaluation result (best-effort, don't block the flow)
 	h.cacheVerifierTrust(ctx, authReq, verifier)
+
+	// Look up stored verifier to get configured ClientID for VP audience
+	if stored := h.getCachedVerifierTrust(ctx, canonicalURL); stored != nil && stored.ClientID != "" {
+		verifier.ClientID = stored.ClientID
+	}
 
 	// Enforce trust decision: block untrusted verifiers when a PDP URL is configured.
 	trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
@@ -514,9 +524,22 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 	return km, nil
 }
 
-// getCachedVerifierTrust checks if a cached trust evaluation exists for the given client_id.
+// getCanonicalVerifierURL returns the canonical URL for a verifier from an authorization request.
+// This is used for consistent verifier lookup and caching.
+// Priority: response_uri > redirect_uri > client_id
+func getCanonicalVerifierURL(authReq *AuthorizationRequest) string {
+	if authReq.ResponseURI != "" {
+		return authReq.ResponseURI
+	}
+	if authReq.RedirectURI != "" {
+		return authReq.RedirectURI
+	}
+	return authReq.ClientID
+}
+
+// getCachedVerifierTrust checks if a cached trust evaluation exists for the given verifier URL.
 // Returns nil if no cache is available or lookup fails.
-func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, clientID string) *domain.Verifier {
+func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, verifierURL string) *domain.Verifier {
 	if h.Verifiers == nil {
 		return nil
 	}
@@ -526,7 +549,7 @@ func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, clientID str
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
 
-	cached, err := h.Verifiers.GetByClientID(ctx, tenantID, clientID)
+	cached, err := h.Verifiers.GetByURL(ctx, tenantID, verifierURL)
 	if err != nil {
 		return nil // Not found or error — proceed with fresh evaluation
 	}
@@ -556,13 +579,15 @@ func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *Authori
 	v := &domain.Verifier{
 		TenantID:         tenantID,
 		Name:             verifier.Name,
-		URL:              authReq.ClientID,
-		ClientID:         authReq.ClientID,
+		URL:              getCanonicalVerifierURL(authReq),
 		ClientIDScheme:   authReq.ClientIDScheme,
 		TrustStatus:      trustStatus,
 		TrustFramework:   verifier.Framework,
 		TrustEvaluatedAt: &now,
 	}
+	// Note: ClientID is intentionally NOT set here.
+	// If admin has configured a custom ClientID via the admin API,
+	// the Upsert will preserve it from the existing record.
 
 	if err := h.Verifiers.Upsert(ctx, v); err != nil {
 		h.Logger.Warn("Failed to cache verifier trust result",
@@ -773,15 +798,20 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 	return payload.SelectedCredentials, nil
 }
 
-func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection) (string, error) {
+func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
 	// Convert selections to credential refs
 	credRefs := make([]CredentialRef, len(selected))
 	for i, s := range selected {
 		credRefs[i] = CredentialRef(s)
 	}
 
+	// Use provided audience (configured client_id) or fall back to request client_id
+	if audience == "" {
+		audience = authReq.ClientID
+	}
+
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
-		Audience:             authReq.ClientID,
+		Audience:             audience,
 		Nonce:                authReq.Nonce,
 		CredentialsToInclude: credRefs,
 	})

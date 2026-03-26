@@ -842,6 +842,118 @@ func TestAdminHandlers_VerifierCRUD(t *testing.T) {
 	})
 }
 
+func TestAdminHandlers_VerifierClientID(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	router.POST("/admin/tenants", handlers.CreateTenant)
+	router.POST("/admin/tenants/:id/verifiers", handlers.CreateVerifier)
+	router.GET("/admin/tenants/:id/verifiers/:verifier_id", handlers.GetVerifier)
+	router.PUT("/admin/tenants/:id/verifiers/:verifier_id", handlers.UpdateVerifier)
+
+	// Create a tenant first
+	body := `{"id": "clientid-test", "name": "ClientID Test"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	t.Run("create verifier with client_id and scheme", func(t *testing.T) {
+		body := `{"name": "Pre-registered Verifier", "url": "https://verifier.example.com", "client_id": "custom-client-123", "client_id_scheme": "pre-registered"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/clientid-test/verifiers", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+		}
+
+		// Verify response includes client_id fields
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("Failed to parse response: %v", err)
+		}
+		if resp["client_id"] != "custom-client-123" {
+			t.Errorf("Expected client_id 'custom-client-123', got %v", resp["client_id"])
+		}
+		if resp["client_id_scheme"] != "pre-registered" {
+			t.Errorf("Expected client_id_scheme 'pre-registered', got %v", resp["client_id_scheme"])
+		}
+	})
+
+	t.Run("create verifier invalid scheme", func(t *testing.T) {
+		body := `{"name": "Invalid Scheme", "url": "https://invalid.example.com", "client_id": "test", "client_id_scheme": "invalid-scheme"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/clientid-test/verifiers", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("create verifier scheme without client_id", func(t *testing.T) {
+		body := `{"name": "Missing ClientID", "url": "https://missing-clientid.example.com", "client_id_scheme": "pre-registered"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/clientid-test/verifiers", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("update verifier preserves client_id when not provided", func(t *testing.T) {
+		// Update with only name/url, should preserve existing client_id
+		body := `{"name": "Updated Name", "url": "https://verifier.example.com"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/admin/tenants/clientid-test/verifiers/1", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		// Verify client_id fields are preserved
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("Failed to parse response: %v", err)
+		}
+		if resp["client_id"] != "custom-client-123" {
+			t.Errorf("Expected client_id 'custom-client-123' to be preserved, got %v", resp["client_id"])
+		}
+		if resp["client_id_scheme"] != "pre-registered" {
+			t.Errorf("Expected client_id_scheme 'pre-registered' to be preserved, got %v", resp["client_id_scheme"])
+		}
+	})
+
+	t.Run("update verifier with new client_id", func(t *testing.T) {
+		body := `{"name": "Updated Name", "url": "https://verifier.example.com", "client_id": "new-client-456", "client_id_scheme": "x509_san_dns"}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/admin/tenants/clientid-test/verifiers/1", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		// Verify client_id fields are updated
+		var resp map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("Failed to parse response: %v", err)
+		}
+		if resp["client_id"] != "new-client-456" {
+			t.Errorf("Expected client_id 'new-client-456', got %v", resp["client_id"])
+		}
+		if resp["client_id_scheme"] != "x509_san_dns" {
+			t.Errorf("Expected client_id_scheme 'x509_san_dns', got %v", resp["client_id_scheme"])
+		}
+	})
+}
+
 func TestTenantToResponse(t *testing.T) {
 	// Test the helper function directly
 	handlers, _ := setupAdminTestHandlers(t)

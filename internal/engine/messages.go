@@ -237,6 +237,7 @@ type VerifierInfo struct {
 	Domain         string    `json:"domain,omitempty"`
 	Framework      string    `json:"framework,omitempty"`
 	ClientIDScheme string    `json:"client_id_scheme,omitempty"`
+	ClientID       string    `json:"client_id,omitempty"` // Configured client_id for VP audience
 }
 
 // LogoInfo contains logo metadata
