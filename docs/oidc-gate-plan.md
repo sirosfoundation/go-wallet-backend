@@ -43,7 +43,7 @@ This feature is implemented across:
 │   (SPA)     │     │ IdP (OP)     │     │  Backend    │
 └─────┬───────┘     └──────────────┘     └──────┬──────┘
       │                                         │
-      │ 1. GET /api/v1/tenants/{id}             │
+      │ 1. GET /api/v1/tenants/{id}/config      │
       │────────────────────────────────────────►│
       │       {oidc_gate: {...config...}}       │
       │◄────────────────────────────────────────│
@@ -117,9 +117,12 @@ type OIDCProviderConfig struct {
 ```go
 // EnterpriseIdentity stores bound enterprise IdP identity
 type EnterpriseIdentity struct {
-    Issuer    string    `json:"issuer" bson:"issuer"`
-    Subject   string    `json:"subject" bson:"subject"`
-    BindingAt time.Time `json:"binding_at" bson:"binding_at"`
+    TenantID    TenantID  `json:"tenant_id" bson:"tenant_id"`
+    Issuer      string    `json:"issuer" bson:"issuer"`
+    Subject     string    `json:"subject" bson:"subject"`
+    Email       string    `json:"email,omitempty" bson:"email,omitempty"`
+    BindingType string    `json:"binding_type" bson:"binding_type"`
+    BoundAt     time.Time `json:"bound_at" bson:"bound_at"`
 }
 ```
 
