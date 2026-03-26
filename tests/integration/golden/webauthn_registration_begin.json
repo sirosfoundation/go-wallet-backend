@@ -2,7 +2,7 @@
   "challengeId": "\u003cCHALLENGE_ID\u003e",
   "createOptions": {
     "publicKey": {
-      "attestation": "direct",
+      "attestation": "none",
       "authenticatorSelection": {
         "requireResidentKey": true,
         "residentKey": "required",

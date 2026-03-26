@@ -124,3 +124,50 @@ func TestRunner_EngineEndpoints(t *testing.T) {
 	router.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+func TestModeRegistration(t *testing.T) {
+	// Verify that the engine mode is registered during init
+	cfg := &Config{
+		Config: testConfig(),
+		Logger: testLogger(),
+		Roles:  []string{"engine"},
+	}
+
+	// Try to create a runner through the registry
+	runner, err := modes.NewRunnerForRole(modes.RoleEngine, cfg)
+	require.NoError(t, err)
+	assert.NotNil(t, runner)
+	assert.Equal(t, modes.RoleEngine, runner.Role())
+}
+
+func TestRequestLogger(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := testLogger()
+
+	router := gin.New()
+	router.Use(requestLogger(logger))
+
+	router.GET("/test", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	// Test normal request logging
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/test", nil)
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// Test WebSocket upgrade request logging (different log path)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/test", nil)
+	req.Header.Set("Upgrade", "websocket")
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestConfigTypeValidation(t *testing.T) {
+	// Test that invalid config type returns error
+	_, err := modes.NewRunnerForRole(modes.RoleEngine, "invalid-config-type")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid config type")
+}
