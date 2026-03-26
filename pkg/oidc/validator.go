@@ -86,21 +86,25 @@ type Validator struct {
 	discoveryFetched time.Time
 }
 
-// NewValidator creates a new OIDC token validator
-func NewValidator(config ValidatorConfig, logger *zap.Logger) *Validator {
+// NewValidator creates a new OIDC token validator.
+// If httpClient is nil, a default client with 10s timeout is used.
+func NewValidator(config ValidatorConfig, httpClient *http.Client, logger *zap.Logger) *Validator {
 	if config.ClockSkew == 0 {
 		config.ClockSkew = time.Minute
 	}
 	if config.JWKSCacheTTL == 0 {
 		config.JWKSCacheTTL = time.Hour
 	}
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 10 * time.Second,
+		}
+	}
 
 	return &Validator{
-		config: config,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		logger: logger.Named("oidc"),
+		config:     config,
+		httpClient: httpClient,
+		logger:     logger.Named("oidc"),
 	}
 }
 

@@ -176,7 +176,9 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 	rateLimiter := middleware.NewAuthRateLimiter(cfg.Security.AuthRateLimit, logger)
 
 	// Create OIDC validator cache for gate middleware
-	validatorCache := middleware.NewValidatorCache(logger)
+	// Use configured HTTP client to respect proxy settings
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	public := router.Group("/")
 	{

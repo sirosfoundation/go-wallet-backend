@@ -32,7 +32,7 @@ func (m *mockTenantStore) GetTenant(id string) (*domain.Tenant, error) {
 
 func TestOIDCGateMiddleware_NoGate(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with no OIDC gate (mode = none)
 	tenant := &domain.Tenant{
@@ -62,7 +62,7 @@ func TestOIDCGateMiddleware_NoGate(t *testing.T) {
 
 func TestOIDCGateMiddleware_GateEnabled_NoToken(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with registration gate enabled
 	tenant := &domain.Tenant{
@@ -111,7 +111,7 @@ func TestOIDCGateMiddleware_GateEnabled_NoToken(t *testing.T) {
 
 func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with login gate enabled - no display_name or scopes (tests defaults)
 	tenant := &domain.Tenant{
@@ -161,7 +161,7 @@ func TestOIDCGateMiddleware_LoginGate_NoToken(t *testing.T) {
 
 func TestOIDCGateMiddleware_BothMode(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with both gates enabled
 	tenant := &domain.Tenant{
@@ -231,7 +231,7 @@ func TestOIDCGateMiddleware_BothMode(t *testing.T) {
 
 func TestOIDCGateMiddleware_WrongGateType(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with only registration gate (login gate not set)
 	tenant := &domain.Tenant{
@@ -267,7 +267,7 @@ func TestOIDCGateMiddleware_WrongGateType(t *testing.T) {
 
 func TestOIDCGateMiddleware_NoTenant(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	router := gin.New()
 	// No tenant in context
@@ -286,7 +286,7 @@ func TestOIDCGateMiddleware_NoTenant(t *testing.T) {
 
 func TestOIDCGateMiddleware_InvalidToken(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	// Tenant with gate enabled
 	tenant := &domain.Tenant{
@@ -326,7 +326,7 @@ func TestOIDCGateMiddleware_InvalidToken(t *testing.T) {
 
 func TestValidatorCache_GetOrCreate(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	config1 := &domain.OIDCProviderConfig{
 		Issuer:   "https://idp1.example.com",
@@ -352,7 +352,7 @@ func TestValidatorCache_GetOrCreate(t *testing.T) {
 
 func TestValidatorCache_CustomAudience(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	cache := NewValidatorCache(logger)
+	cache := NewValidatorCache(nil, logger)
 
 	config := &domain.OIDCProviderConfig{
 		Issuer:   "https://idp.example.com",

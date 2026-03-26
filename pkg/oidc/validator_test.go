@@ -92,7 +92,7 @@ func TestValidator_ValidateRSA(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create valid token
 	now := time.Now()
@@ -134,7 +134,7 @@ func TestValidator_ValidateECDSA(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create valid token
 	now := time.Now()
@@ -171,7 +171,7 @@ func TestValidator_ExpiredToken(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create expired token
 	now := time.Now()
@@ -203,7 +203,7 @@ func TestValidator_WrongIssuer(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create token with wrong issuer
 	now := time.Now()
@@ -235,7 +235,7 @@ func TestValidator_WrongAudience(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create token with wrong audience
 	now := time.Now()
@@ -267,7 +267,7 @@ func TestValidator_MissingSubject(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create token without subject
 	now := time.Now()
@@ -298,7 +298,7 @@ func TestValidator_InvalidToken(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	ctx := context.Background()
 
@@ -329,7 +329,7 @@ func TestValidator_MultipleAudiences(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create token with multiple audiences
 	now := time.Now()
@@ -365,7 +365,7 @@ func TestValidator_CustomClaims(t *testing.T) {
 		Issuer:   "https://test-issuer.example.com",
 		Audience: "test-client",
 		JWKSURI:  server.URL + "/jwks",
-	}, logger)
+	}, nil, logger)
 
 	// Create token with custom claims
 	now := time.Now()
@@ -420,7 +420,7 @@ func TestDiscoverProvider(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	discovery, err := DiscoverProvider(ctx, server.URL)
+	discovery, err := DiscoverProvider(ctx, server.URL, nil)
 	if err != nil {
 		t.Fatalf("failed to discover provider: %v", err)
 	}

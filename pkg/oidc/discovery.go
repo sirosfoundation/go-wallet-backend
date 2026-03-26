@@ -75,9 +75,10 @@ func (v *Validator) fetchDiscovery(ctx context.Context) (*DiscoveryDocument, err
 	return &doc, nil
 }
 
-// DiscoverProvider fetches the OIDC configuration for a given issuer
-// This is a standalone function for use outside the Validator
-func DiscoverProvider(ctx context.Context, issuer string) (*DiscoveryDocument, error) {
+// DiscoverProvider fetches the OIDC configuration for a given issuer.
+// If httpClient is nil, a default client with 10s timeout is used.
+// This is a standalone function for use outside the Validator.
+func DiscoverProvider(ctx context.Context, issuer string, httpClient *http.Client) (*DiscoveryDocument, error) {
 	issuer = strings.TrimSuffix(issuer, "/")
 	discoveryURL := issuer + "/.well-known/openid-configuration"
 
@@ -88,10 +89,12 @@ func DiscoverProvider(ctx context.Context, issuer string) (*DiscoveryDocument, e
 
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{
-		Timeout: 10 * time.Second, // Apply reasonable timeout to avoid indefinite hangs
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 10 * time.Second, // Apply reasonable timeout to avoid indefinite hangs
+		}
 	}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)
 	}

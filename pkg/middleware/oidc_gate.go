@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -21,13 +22,16 @@ const OIDCGateContextKey = "oidc_gate_result"
 type ValidatorCache struct {
 	mu         sync.RWMutex
 	validators map[string]*oidc.Validator
+	httpClient *http.Client
 	logger     *zap.Logger
 }
 
-// NewValidatorCache creates a new validator cache
-func NewValidatorCache(logger *zap.Logger) *ValidatorCache {
+// NewValidatorCache creates a new validator cache.
+// If httpClient is nil, validators will use a default HTTP client.
+func NewValidatorCache(httpClient *http.Client, logger *zap.Logger) *ValidatorCache {
 	return &ValidatorCache{
 		validators: make(map[string]*oidc.Validator),
+		httpClient: httpClient,
 		logger:     logger,
 	}
 }
@@ -62,7 +66,7 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 		Issuer:   config.Issuer,
 		Audience: audience,
 		JWKSURI:  config.JWKSURI,
-	}, c.logger)
+	}, c.httpClient, c.logger)
 
 	c.validators[key] = v
 	return v
