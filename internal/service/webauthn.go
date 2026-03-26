@@ -36,6 +36,7 @@ var (
 	ErrInvalidInvite           = errors.New("invalid or expired invite code")
 	ErrIdentityNotBound        = errors.New("no enterprise identity bound for this tenant")
 	ErrIdentityBindingMismatch = errors.New("enterprise identity does not match bound identity")
+	ErrOIDCGateRequired        = errors.New("OIDC authentication required for this tenant")
 )
 
 // WebAuthnService handles WebAuthn authentication
@@ -923,17 +924,26 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// Don't fail login for this
 	}
 
-	// Verify enterprise identity binding if OIDC gate with bind_identity is active
-	if req.OIDCGateBinding != nil {
-		// Get tenant config to check if bind_identity is enabled
-		tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
-		if err != nil {
-			s.logger.Error("Failed to get tenant for identity verification", zap.Error(err))
-			return nil, fmt.Errorf("failed to verify identity binding: %w", err)
+	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
+	// This prevents bypass via X-Tenant-ID header spoofing
+	tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
+	if err != nil {
+		s.logger.Error("Failed to get tenant for OIDC gate check", zap.Error(err))
+		return nil, fmt.Errorf("failed to verify tenant config: %w", err)
+	}
+
+	// Check if this tenant requires OIDC gate for login
+	if tenant.OIDCGate.RequiresGateForLogin() {
+		// Gate is required - verify OIDC binding was provided
+		if req.OIDCGateBinding == nil {
+			s.logger.Warn("Login gate required but no OIDC binding provided",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)))
+			return nil, ErrOIDCGateRequired
 		}
 
-		if tenant.OIDCGate.IsEnabled() && tenant.OIDCGate.BindIdentity {
-			// Verify that the user's enterprise identity matches the OIDC result
+		// If bind_identity is enabled, verify the enterprise identity matches
+		if tenant.OIDCGate.BindIdentity {
 			existingIdentity := user.GetEnterpriseIdentityForTenant(tenantID)
 			if existingIdentity == nil {
 				s.logger.Warn("User has no bound enterprise identity for tenant",

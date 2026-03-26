@@ -137,6 +137,7 @@ func (v *Validator) Validate(ctx context.Context, tokenString string) (*Validati
 		jwt.WithLeeway(v.config.ClockSkew),
 		jwt.WithIssuedAt(),
 		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}),
 	)
 
 	if err != nil {

@@ -7,8 +7,10 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 
@@ -74,9 +76,21 @@ func (k *JWK) rsaPublicKey() (*rsa.PublicKey, error) {
 	n := new(big.Int).SetBytes(nBytes)
 	e := new(big.Int).SetBytes(eBytes)
 
+	// Validate RSA exponent bounds (security: prevent overflow and invalid exponents)
+	if e.Sign() <= 0 {
+		return nil, errors.New("invalid RSA exponent: must be positive")
+	}
+	if !e.IsInt64() || e.Int64() > math.MaxInt32 {
+		return nil, errors.New("invalid RSA exponent: exceeds maximum int size")
+	}
+	eInt := int(e.Int64())
+	if eInt < 3 {
+		return nil, errors.New("invalid RSA exponent: must be at least 3")
+	}
+
 	return &rsa.PublicKey{
 		N: n,
-		E: int(e.Int64()),
+		E: eInt,
 	}, nil
 }
 
