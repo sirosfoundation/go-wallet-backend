@@ -1325,18 +1325,18 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 	}
 	if g.RegistrationOP != nil {
 		resp.RegistrationOP = &PublicOIDCProviderResponse{
-			DisplayName: g.RegistrationOP.DisplayName,
+			DisplayName: g.RegistrationOP.EffectiveDisplayName(),
 			Issuer:      g.RegistrationOP.Issuer,
 			ClientID:    g.RegistrationOP.ClientID,
-			Scopes:      g.RegistrationOP.Scopes,
+			Scopes:      g.RegistrationOP.EffectiveScopes(),
 		}
 	}
 	if g.LoginOP != nil {
 		resp.LoginOP = &PublicOIDCProviderResponse{
-			DisplayName: g.LoginOP.DisplayName,
+			DisplayName: g.LoginOP.EffectiveDisplayName(),
 			Issuer:      g.LoginOP.Issuer,
 			ClientID:    g.LoginOP.ClientID,
-			Scopes:      g.LoginOP.Scopes,
+			Scopes:      g.LoginOP.EffectiveScopes(),
 		}
 	}
 	return resp

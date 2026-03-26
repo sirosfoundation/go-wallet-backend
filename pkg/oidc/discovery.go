@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -87,7 +88,9 @@ func DiscoverProvider(ctx context.Context, issuer string) (*DiscoveryDocument, e
 
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 10 * time.Second, // Apply reasonable timeout to avoid indefinite hangs
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch discovery document: %w", err)

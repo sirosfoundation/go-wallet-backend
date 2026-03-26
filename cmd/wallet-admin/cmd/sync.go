@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -444,7 +445,24 @@ func oidcGateNeedsUpdate(desired *SyncOIDCGate, existing *syncOIDCGateResp) bool
 	if oidcProviderNeedsUpdate(desired.LoginOP, existing.LoginOP) {
 		return true
 	}
+	// Check required claims changes
+	if !requiredClaimsEqual(desired.RequiredClaims, existing.RequiredClaims) {
+		return true
+	}
 	return false
+}
+
+// requiredClaimsEqual compares two required claims maps for equality.
+// Treats nil and empty maps as equivalent.
+func requiredClaimsEqual(desired map[string]any, existing map[string]any) bool {
+	// Treat nil and empty as equivalent
+	if len(desired) == 0 && len(existing) == 0 {
+		return true
+	}
+	if len(desired) != len(existing) {
+		return false
+	}
+	return reflect.DeepEqual(desired, existing)
 }
 
 // oidcProviderNeedsUpdate checks if an OIDC provider configuration needs to be updated

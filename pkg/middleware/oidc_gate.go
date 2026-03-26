@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -33,7 +34,14 @@ func NewValidatorCache(logger *zap.Logger) *ValidatorCache {
 
 // GetOrCreate returns an existing validator or creates a new one
 func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Validator {
-	key := config.Issuer + "|" + config.ClientID
+	// Compute effective audience for cache key
+	audience := config.Audience
+	if audience == "" {
+		audience = config.ClientID
+	}
+
+	// Include all fields that affect validator behavior in the cache key
+	key := config.Issuer + "|" + audience + "|" + config.JWKSURI
 
 	c.mu.RLock()
 	if v, ok := c.validators[key]; ok {
@@ -48,11 +56,6 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 	// Double-check after acquiring write lock
 	if v, ok := c.validators[key]; ok {
 		return v
-	}
-
-	audience := config.Audience
-	if audience == "" {
-		audience = config.ClientID
 	}
 
 	v := oidc.NewValidator(oidc.ValidatorConfig{
@@ -239,8 +242,8 @@ func claimsMatch(expected, actual interface{}) bool {
 		a, ok := actual.(float64)
 		return ok && float64(e) == a
 	default:
-		// For complex types, try direct comparison
-		return expected == actual
+		// For complex types (slices, maps, etc.), use reflect.DeepEqual for safety
+		return reflect.DeepEqual(expected, actual)
 	}
 }
 

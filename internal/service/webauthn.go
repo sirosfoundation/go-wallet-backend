@@ -717,7 +717,7 @@ func (s *WebAuthnService) BeginLogin(ctx context.Context) (*BeginLoginResponse, 
 type FinishLoginRequest struct {
 	ChallengeID     string           `json:"challengeId"`
 	Credential      json.RawMessage  `json:"credential"`
-	OIDCGateBinding *OIDCGateBinding // Set by handler when OIDC gate is active with bind_identity
+	OIDCGateBinding *OIDCGateBinding `json:"-"` // Set by handler when OIDC gate is active with bind_identity
 }
 
 // FinishLoginResponse contains the result of login

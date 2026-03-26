@@ -159,13 +159,21 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 }
 
 // applyOIDCGateRequest applies API request to domain OIDCGateConfig
-func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) {
+// Returns an error if the mode is invalid
+func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) error {
 	if req == nil || gate == nil {
-		return
+		return nil
 	}
 
-	// Apply mode
-	gate.Mode = domain.OIDCGateMode(req.Mode)
+	// Apply mode (validate against supported values)
+	if req.Mode != "" {
+		switch req.Mode {
+		case "none", "registration", "login", "both":
+			gate.Mode = domain.OIDCGateMode(req.Mode)
+		default:
+			return fmt.Errorf("invalid oidc_gate mode: %q (must be one of: none, registration, login, both)", req.Mode)
+		}
+	}
 
 	// Apply registration OP
 	if req.RegistrationOP != nil {
@@ -200,6 +208,8 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) {
 	if req.BindIdentity != nil {
 		gate.BindIdentity = *req.BindIdentity
 	}
+
+	return nil
 }
 
 // ListTenants returns all tenants
@@ -297,7 +307,10 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 
 	// Apply OIDC gate config if provided
 	if req.OIDCGate != nil {
-		applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate)
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	if err := h.store.Tenants().Create(c.Request.Context(), tenant); err != nil {
@@ -351,7 +364,10 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 	// Update OIDC gate config if provided
 	if req.OIDCGate != nil {
-		applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate)
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	tenant.UpdatedAt = time.Now()
 

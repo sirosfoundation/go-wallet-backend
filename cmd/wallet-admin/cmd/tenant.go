@@ -271,7 +271,9 @@ Examples:
 		if oidcGateClear {
 			reqBody := map[string]interface{}{
 				"oidc_gate": map[string]interface{}{
-					"mode": "none",
+					"mode":            "none",
+					"registration_op": nil,
+					"login_op":        nil,
 				},
 			}
 
