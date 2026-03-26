@@ -149,3 +149,70 @@ func TestExtractDomain(t *testing.T) {
 		})
 	}
 }
+
+func TestGetCanonicalVerifierURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		authReq     *AuthorizationRequest
+		want        string
+		description string
+	}{
+		{
+			name: "response_uri takes priority",
+			authReq: &AuthorizationRequest{
+				ResponseURI: "https://verifier.example.com/response",
+				RedirectURI: "https://verifier.example.com/redirect",
+				ClientID:    "https://verifier.example.com",
+			},
+			want:        "https://verifier.example.com/response",
+			description: "When response_uri is set, it should be returned",
+		},
+		{
+			name: "redirect_uri when no response_uri",
+			authReq: &AuthorizationRequest{
+				ResponseURI: "",
+				RedirectURI: "https://verifier.example.com/redirect",
+				ClientID:    "https://verifier.example.com",
+			},
+			want:        "https://verifier.example.com/redirect",
+			description: "When response_uri is empty, redirect_uri should be used",
+		},
+		{
+			name: "client_id as fallback",
+			authReq: &AuthorizationRequest{
+				ResponseURI: "",
+				RedirectURI: "",
+				ClientID:    "https://verifier.example.com",
+			},
+			want:        "https://verifier.example.com",
+			description: "When both response_uri and redirect_uri are empty, client_id should be used",
+		},
+		{
+			name: "did client_id fallback",
+			authReq: &AuthorizationRequest{
+				ResponseURI: "",
+				RedirectURI: "",
+				ClientID:    "did:web:verifier.example.com",
+			},
+			want:        "did:web:verifier.example.com",
+			description: "DID client_id should be returned when no URIs are set",
+		},
+		{
+			name: "all empty returns empty string",
+			authReq: &AuthorizationRequest{
+				ResponseURI: "",
+				RedirectURI: "",
+				ClientID:    "",
+			},
+			want:        "",
+			description: "When all fields are empty, empty string is returned",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getCanonicalVerifierURL(tt.authReq)
+			assert.Equal(t, tt.want, got, tt.description)
+		})
+	}
+}
