@@ -145,3 +145,12 @@ func ValidateClientIDScheme(scheme string) error {
 	}
 	return nil
 }
+
+// ValidateVerifierClientID validates the client_id and client_id_scheme combination.
+// Returns an error if client_id_scheme is set but client_id is empty.
+func ValidateVerifierClientID(clientID, scheme string) error {
+	if scheme != "" && clientID == "" {
+		return fmt.Errorf("client_id is required when client_id_scheme is set")
+	}
+	return ValidateClientIDScheme(scheme)
+}

@@ -732,7 +732,7 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	}
 
 	// Validate client_id_scheme if provided
-	if err := domain.ValidateClientIDScheme(req.ClientIDScheme); err != nil {
+	if err := domain.ValidateVerifierClientID(req.ClientID, req.ClientIDScheme); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -791,17 +791,29 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 		return
 	}
 
-	// Validate client_id_scheme if provided
-	if err := domain.ValidateClientIDScheme(req.ClientIDScheme); err != nil {
+	// Validate client_id_scheme if provided (considering preserved values)
+	effectiveClientID := req.ClientID
+	effectiveScheme := req.ClientIDScheme
+	if effectiveClientID == "" {
+		effectiveClientID = verifier.ClientID
+	}
+	if effectiveScheme == "" {
+		effectiveScheme = verifier.ClientIDScheme
+	}
+	if err := domain.ValidateVerifierClientID(effectiveClientID, effectiveScheme); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Update fields
+	// Update fields - preserve existing client_id/client_id_scheme if not provided
 	verifier.Name = req.Name
 	verifier.URL = req.URL
-	verifier.ClientID = req.ClientID
-	verifier.ClientIDScheme = req.ClientIDScheme
+	if req.ClientID != "" {
+		verifier.ClientID = req.ClientID
+	}
+	if req.ClientIDScheme != "" {
+		verifier.ClientIDScheme = req.ClientIDScheme
+	}
 
 	if err := h.store.Verifiers().Update(c.Request.Context(), verifier); err != nil {
 		h.logger.Error("Failed to update verifier", zap.Error(err))

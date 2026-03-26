@@ -227,3 +227,55 @@ func TestVerifier_Fields(t *testing.T) {
 		t.Error("Verifier.URL not set correctly")
 	}
 }
+
+func TestValidateClientIDScheme(t *testing.T) {
+	tests := []struct {
+		scheme  string
+		wantErr bool
+	}{
+		{"", false},                   // empty is allowed
+		{"redirect_uri", false},       // valid scheme
+		{"pre-registered", false},     // valid scheme
+		{"x509_san_dns", false},       // valid scheme
+		{"x509_san_uri", false},       // valid scheme
+		{"verifier_attestation", false}, // valid scheme
+		{"did", false},                // valid scheme
+		{"invalid", true},             // invalid scheme
+		{"REDIRECT_URI", true},        // case sensitive
+		{"pre_registered", true},      // wrong format (underscore vs hyphen)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.scheme, func(t *testing.T) {
+			err := ValidateClientIDScheme(tt.scheme)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateClientIDScheme(%q) error = %v, wantErr %v", tt.scheme, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateVerifierClientID(t *testing.T) {
+	tests := []struct {
+		name     string
+		clientID string
+		scheme   string
+		wantErr  bool
+	}{
+		{"empty both", "", "", false},
+		{"client_id only", "my-client", "", false},
+		{"valid combo", "my-client", "pre-registered", false},
+		{"scheme without client_id", "", "pre-registered", true},
+		{"invalid scheme", "my-client", "invalid", true},
+		{"redirect_uri scheme empty client_id", "", "redirect_uri", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateVerifierClientID(tt.clientID, tt.scheme)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateVerifierClientID(%q, %q) error = %v, wantErr %v", tt.clientID, tt.scheme, err, tt.wantErr)
+			}
+		})
+	}
+}

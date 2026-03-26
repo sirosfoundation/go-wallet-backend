@@ -432,7 +432,8 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	// Check cached trust result (skip PDP call if fresh)
 	const trustCacheTTL = 5 * time.Minute
-	if cached := h.getCachedVerifierTrust(ctx, authReq.ClientID); cached != nil {
+	canonicalURL := getCanonicalVerifierURL(authReq)
+	if cached := h.getCachedVerifierTrust(ctx, canonicalURL); cached != nil {
 		if cached.TrustEvaluatedAt != nil && time.Since(*cached.TrustEvaluatedAt) < trustCacheTTL {
 			h.Logger.Debug("Using cached verifier trust",
 				zap.String("client_id", authReq.ClientID),
@@ -476,7 +477,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	h.cacheVerifierTrust(ctx, authReq, verifier)
 
 	// Look up stored verifier to get configured ClientID for VP audience
-	if stored := h.getCachedVerifierTrust(ctx, authReq.ClientID); stored != nil && stored.ClientID != "" {
+	if stored := h.getCachedVerifierTrust(ctx, canonicalURL); stored != nil && stored.ClientID != "" {
 		verifier.ClientID = stored.ClientID
 	}
 
@@ -523,6 +524,19 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 	return km, nil
 }
 
+// getCanonicalVerifierURL returns the canonical URL for a verifier from an authorization request.
+// This is used for consistent verifier lookup and caching.
+// Priority: response_uri > redirect_uri > client_id
+func getCanonicalVerifierURL(authReq *AuthorizationRequest) string {
+	if authReq.ResponseURI != "" {
+		return authReq.ResponseURI
+	}
+	if authReq.RedirectURI != "" {
+		return authReq.RedirectURI
+	}
+	return authReq.ClientID
+}
+
 // getCachedVerifierTrust checks if a cached trust evaluation exists for the given verifier URL.
 // Returns nil if no cache is available or lookup fails.
 func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, verifierURL string) *domain.Verifier {
@@ -565,7 +579,7 @@ func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *Authori
 	v := &domain.Verifier{
 		TenantID:         tenantID,
 		Name:             verifier.Name,
-		URL:              authReq.ClientID,
+		URL:              getCanonicalVerifierURL(authReq),
 		ClientIDScheme:   authReq.ClientIDScheme,
 		TrustStatus:      trustStatus,
 		TrustFramework:   verifier.Framework,
