@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -124,4 +125,23 @@ type Verifier struct {
 // TableName specifies the table name for GORM
 func (Verifier) TableName() string {
 	return "verifiers"
+}
+
+// ValidClientIDSchemes defines the valid values for client_id_scheme per OID4VP specification
+var ValidClientIDSchemes = map[string]bool{
+	"":                     true, // Empty is allowed (defaults to redirect_uri behavior)
+	"redirect_uri":         true,
+	"pre-registered":       true,
+	"x509_san_dns":         true,
+	"x509_san_uri":         true,
+	"verifier_attestation": true,
+	"did":                  true,
+}
+
+// ValidateClientIDScheme validates that a client_id_scheme value is supported
+func ValidateClientIDScheme(scheme string) error {
+	if !ValidClientIDSchemes[scheme] {
+		return fmt.Errorf("invalid client_id_scheme: %q (must be one of: redirect_uri, pre-registered, x509_san_dns, x509_san_uri, verifier_attestation, did)", scheme)
+	}
+	return nil
 }

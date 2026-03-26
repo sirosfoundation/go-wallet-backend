@@ -731,6 +731,12 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 		return
 	}
 
+	// Validate client_id_scheme if provided
+	if err := domain.ValidateClientIDScheme(req.ClientIDScheme); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	verifier := &domain.Verifier{
 		TenantID:       tenantID,
 		Name:           req.Name,
@@ -781,6 +787,12 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 
 	var req VerifierRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate client_id_scheme if provided
+	if err := domain.ValidateClientIDScheme(req.ClientIDScheme); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
