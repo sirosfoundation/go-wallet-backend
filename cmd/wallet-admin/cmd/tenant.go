@@ -267,13 +267,15 @@ Examples:
 		tenantID := args[0]
 		client := NewClient(adminURL, adminToken)
 
-		// If --clear, set mode to none and clear providers
+		// If --clear, set mode to none and clear all gate settings
 		if oidcGateClear {
 			reqBody := map[string]interface{}{
 				"oidc_gate": map[string]interface{}{
 					"mode":            "none",
 					"registration_op": nil,
 					"login_op":        nil,
+					"bind_identity":   false,
+					"required_claims": nil,
 				},
 			}
 
