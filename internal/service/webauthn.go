@@ -1379,9 +1379,10 @@ type credentialReader struct {
 
 // newCredentialReader creates a new credentialReader, decoding tagged binary if present.
 func newCredentialReader(data []byte) *credentialReader {
-	// Decode tagged binary format if present
-	decoded := taggedbinary.MustDecodeJSON(data)
-	return &credentialReader{data: decoded}
+	if taggedbinary.IsTaggedBinary(data) {
+		return &credentialReader{data: taggedbinary.MustDecodeJSON(data)}
+	}
+	return &credentialReader{data: data}
 }
 
 func (r *credentialReader) Read(p []byte) (n int, err error) {
