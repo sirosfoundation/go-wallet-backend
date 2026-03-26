@@ -15,9 +15,7 @@
 
 </div>
 
-**This is work in progress**
-
-This is a proof of concept re-implementation of wwWallet/wallet-backend-server in golang. The intention is to build a version of the wwWallet backend that is ready for large scale production deployment.
+A production-ready digital identity wallet backend implementing OpenID4VCI/VP standards. Originally a re-implementation of wwWallet/wallet-backend-server in Go, this backend now powers [id.siros.org](https://id.siros.org) and is designed for large-scale deployment.
 
 ## Features
 
