@@ -204,9 +204,16 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		gate.RequiredClaims = req.RequiredClaims
 	}
 
-	// Apply bind identity
+	// Apply bind identity with validation
 	if req.BindIdentity != nil {
 		gate.BindIdentity = *req.BindIdentity
+	}
+
+	// SECURITY: Validate bind_identity configuration
+	// bind_identity=true requires a registration gate (registration or both mode)
+	// because identity binding only happens during FinishRegistration
+	if gate.BindIdentity && gate.Mode == domain.OIDCGateModeLogin {
+		return fmt.Errorf("bind_identity cannot be enabled with mode 'login': identity binding requires registration gate")
 	}
 
 	return nil

@@ -67,7 +67,9 @@ func createTestJWKSServer(t *testing.T, jwkJSON string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
-			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, "https://test-issuer.example.com", r.Host)
+			// Use http:// scheme for the test server's jwks_uri
+			baseURL := "http://" + r.Host
+			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, "https://test-issuer.example.com", baseURL)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(config))
 		case "/jwks":

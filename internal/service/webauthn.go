@@ -942,6 +942,23 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			return nil, ErrOIDCGateRequired
 		}
 
+		// SECURITY: Always verify issuer matches tenant's configured LoginOP
+		// This prevents bypass via tokens from other tenants' OPs
+		loginOP := tenant.OIDCGate.GetLoginOP()
+		if loginOP == nil {
+			s.logger.Error("Login gate enabled but no LoginOP configured",
+				zap.String("tenant_id", string(tenantID)))
+			return nil, fmt.Errorf("login gate misconfigured: no LoginOP")
+		}
+		if req.OIDCGateBinding.Issuer != loginOP.Issuer {
+			s.logger.Warn("OIDC binding issuer mismatch",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("expected_issuer", loginOP.Issuer),
+				zap.String("actual_issuer", req.OIDCGateBinding.Issuer))
+			return nil, ErrOIDCGateRequired // Reject with gate required - token was for wrong OP
+		}
+
 		// If bind_identity is enabled, verify the enterprise identity matches
 		if tenant.OIDCGate.BindIdentity {
 			existingIdentity := user.GetEnterpriseIdentityForTenant(tenantID)
