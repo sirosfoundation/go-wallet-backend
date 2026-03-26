@@ -576,6 +576,35 @@ func TestBuildTenantRequestBody(t *testing.T) {
 		}
 	})
 
+	t.Run("oidc_gate with required_claims", func(t *testing.T) {
+		body := buildTenantRequestBody(SyncTenant{
+			ID:   "t1",
+			Name: "T1",
+			OIDCGate: &SyncOIDCGate{
+				Mode:           "registration",
+				RequiredClaims: map[string]any{"email_verified": true, "groups": "staff"},
+				RegistrationOP: &SyncOIDCProvider{
+					Issuer:   "https://idp.example.com",
+					ClientID: "wallet-reg",
+				},
+			},
+		})
+		gate, ok := body["oidc_gate"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected oidc_gate to be a map")
+		}
+		reqClaims, ok := gate["required_claims"].(map[string]any)
+		if !ok {
+			t.Fatal("expected required_claims to be a map")
+		}
+		if reqClaims["email_verified"] != true {
+			t.Errorf("expected email_verified true, got %v", reqClaims["email_verified"])
+		}
+		if reqClaims["groups"] != "staff" {
+			t.Errorf("expected groups 'staff', got %v", reqClaims["groups"])
+		}
+	})
+
 	t.Run("oidc_gate nil - omitted from body", func(t *testing.T) {
 		body := buildTenantRequestBody(SyncTenant{ID: "t1", Name: "T1", OIDCGate: nil})
 		if _, ok := body["oidc_gate"]; ok {
@@ -651,6 +680,47 @@ func TestOIDCGateNeedsUpdate(t *testing.T) {
 		}
 		if !oidcGateNeedsUpdate(desired, existing) {
 			t.Error("issuer change should trigger update")
+		}
+	})
+
+	t.Run("required_claims changed", func(t *testing.T) {
+		desired := &SyncOIDCGate{
+			Mode:           "registration",
+			RequiredClaims: map[string]any{"email_verified": true},
+		}
+		existing := &syncOIDCGateResp{
+			Mode:           "registration",
+			RequiredClaims: map[string]any{"email_verified": false},
+		}
+		if !oidcGateNeedsUpdate(desired, existing) {
+			t.Error("required_claims change should trigger update")
+		}
+	})
+
+	t.Run("required_claims added", func(t *testing.T) {
+		desired := &SyncOIDCGate{
+			Mode:           "registration",
+			RequiredClaims: map[string]any{"groups": "admins"},
+		}
+		existing := &syncOIDCGateResp{
+			Mode: "registration",
+		}
+		if !oidcGateNeedsUpdate(desired, existing) {
+			t.Error("adding required_claims should trigger update")
+		}
+	})
+
+	t.Run("same required_claims no update", func(t *testing.T) {
+		desired := &SyncOIDCGate{
+			Mode:           "registration",
+			RequiredClaims: map[string]any{"email_verified": true},
+		}
+		existing := &syncOIDCGateResp{
+			Mode:           "registration",
+			RequiredClaims: map[string]any{"email_verified": true},
+		}
+		if oidcGateNeedsUpdate(desired, existing) {
+			t.Error("same required_claims should not trigger update")
 		}
 	})
 }

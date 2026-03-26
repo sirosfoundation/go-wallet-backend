@@ -831,6 +831,57 @@ func TestHandlers_GetTenantConfig_WithOIDCGate(t *testing.T) {
 	}
 }
 
+func TestHandlers_GetTenantConfig_WithOIDCGate_RequiredClaims(t *testing.T) {
+	// Test that handlers work correctly when tenant has required_claims configured
+	// Note: required_claims is not exposed in the public config response (backend validation only)
+	tenant := &domain.Tenant{
+		ID:            "oidc-claims-tenant",
+		Name:          "OIDC Claims Tenant",
+		DisplayName:   "OIDC Claims Test Tenant",
+		Enabled:       true,
+		RequireInvite: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode:           domain.OIDCGateModeRegistration,
+			RequiredClaims: map[string]any{"email_verified": true, "groups": "staff"},
+			RegistrationOP: &domain.OIDCProviderConfig{
+				DisplayName: "Corp SSO",
+				Issuer:      "https://idp.example.com",
+				ClientID:    "wallet-client",
+				Scopes:      "openid email profile groups",
+			},
+		},
+	}
+	handlers, router := setupTestHandlersWithTenant(t, tenant)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/oidc-claims-tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response PublicTenantConfigResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	// Verify the handler processes the tenant correctly
+	if response.OIDCGate == nil {
+		t.Fatal("Expected OIDCGate to not be nil")
+	}
+	if response.OIDCGate.Mode != "registration" {
+		t.Errorf("Expected Mode 'registration', got %v", response.OIDCGate.Mode)
+	}
+	if response.OIDCGate.RegistrationOP == nil {
+		t.Fatal("Expected RegistrationOP to not be nil")
+	}
+	if response.OIDCGate.RegistrationOP.Issuer != "https://idp.example.com" {
+		t.Errorf("Expected Issuer 'https://idp.example.com', got %v", response.OIDCGate.RegistrationOP.Issuer)
+	}
+}
+
 func TestHandlers_GetTenantConfig_NotFound(t *testing.T) {
 	handlers, router := setupTestHandlers(t)
 	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
