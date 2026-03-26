@@ -408,6 +408,29 @@ type SecurityConfig struct {
 
 	// TokenBlacklist contains token blacklist/revocation configuration
 	TokenBlacklist TokenBlacklistConfig `yaml:"token_blacklist" envconfig:"TOKEN_BLACKLIST"`
+
+	// WebAuthn contains WebAuthn-specific security configuration
+	WebAuthn WebAuthnSecurityConfig `yaml:"webauthn" envconfig:"WEBAUTHN"`
+}
+
+// WebAuthnSecurityConfig contains WebAuthn-specific security configuration
+type WebAuthnSecurityConfig struct {
+	// AttestationConveyance controls how the RP requests attestation from authenticators.
+	// Valid values: "none", "indirect", "direct", "enterprise"
+	// Default: "none" (recommended for most deployments - avoids certificate validation issues)
+	// Use "direct" only if you need to verify authenticator makes/models.
+	AttestationConveyance string `yaml:"attestation_conveyance" envconfig:"ATTESTATION_CONVEYANCE"`
+}
+
+// GetAttestationConveyance returns the attestation conveyance preference
+// Defaults to "none" if not set or invalid
+func (c *WebAuthnSecurityConfig) GetAttestationConveyance() string {
+	switch c.AttestationConveyance {
+	case "none", "indirect", "direct", "enterprise":
+		return c.AttestationConveyance
+	default:
+		return "none"
+	}
 }
 
 // AuthRateLimitConfig contains rate limiting configuration for auth endpoints

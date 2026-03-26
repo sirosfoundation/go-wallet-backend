@@ -75,6 +75,21 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 	}, nil
 }
 
+// getAttestationPreference returns the configured attestation conveyance preference
+func (s *WebAuthnService) getAttestationPreference() protocol.ConveyancePreference {
+	pref := s.cfg.Security.WebAuthn.GetAttestationConveyance()
+	switch pref {
+	case "direct":
+		return protocol.PreferDirectAttestation
+	case "indirect":
+		return protocol.PreferIndirectAttestation
+	case "enterprise":
+		return protocol.PreferEnterpriseAttestation
+	default:
+		return protocol.PreferNoAttestation
+	}
+}
+
 // WebAuthnUser implements webauthn.User interface
 type WebAuthnUser struct {
 	user *domain.User
@@ -344,7 +359,7 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 				ResidentKey:        protocol.ResidentKeyRequirementRequired,
 				UserVerification:   protocol.VerificationRequired,
 			},
-			Attestation: protocol.PreferDirectAttestation,
+			Attestation: s.getAttestationPreference(),
 			Extensions: AuthenticationExtensions{
 				CredProps: true,
 				PRF:       &PRFExtension{},
@@ -1188,7 +1203,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 				ResidentKey:        protocol.ResidentKeyRequirementRequired,
 				UserVerification:   protocol.VerificationRequired,
 			},
-			Attestation: protocol.PreferDirectAttestation,
+			Attestation: s.getAttestationPreference(),
 			Extensions: AuthenticationExtensions{
 				CredProps: true,
 				PRF:       &PRFExtension{},
