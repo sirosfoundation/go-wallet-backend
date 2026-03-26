@@ -260,6 +260,11 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(403, gin.H{"error": "No enterprise identity bound for this wallet"})
 		case errors.Is(err, service.ErrIdentityBindingMismatch):
 			c.JSON(403, gin.H{"error": "Enterprise identity does not match registered identity"})
+		case errors.Is(err, service.ErrOIDCGateRequired):
+			c.JSON(401, gin.H{
+				"error": "OIDC gate authentication required",
+				"code":  "oidc_gate_required",
+			})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete login"})
 		}
