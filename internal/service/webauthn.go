@@ -992,10 +992,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	}
 
 	// Get tenant display name for the response
-	var tenantDisplayName string
-	if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
-		tenantDisplayName = tenant.DisplayName
-	}
+	// Note: tenant was already fetched above for OIDC gate check
+	tenantDisplayName := tenant.DisplayName
 
 	s.logger.Info("User logged in via WebAuthn",
 		zap.String("user_id", userID.String()),
