@@ -15,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -197,6 +198,49 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	// Initialize API handlers
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 
+	// Create HTTP client for outbound requests (AuthZEN proxy, etc.)
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+
+	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
+	var authzenHandler *api.AuthZENProxyHandler
+	if cfg.AuthZENProxy.Enabled {
+		// Set defaults
+		cfg.AuthZENProxy.SetDefaults()
+
+		// Create SPOCP authorizer
+		spocpCfg := &authz.SPOCPConfig{
+			RulesFile: cfg.AuthZENProxy.RulesFile,
+		}
+		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
+		if err != nil {
+			logger.Error("Failed to initialize SPOCP authorizer, using NoOp", zap.Error(err))
+			authorizer = nil
+		}
+
+		// Fall back to NoOp if SPOCP initialization failed
+		var authorizerInterface authz.Authorizer
+		if authorizer != nil {
+			authorizerInterface = authorizer
+		} else {
+			authorizerInterface = authz.NoOpAuthorizer{}
+		}
+
+		// Get effective PDP URL
+		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
+
+		authzenHandler = api.NewAuthZENProxyHandler(
+			&cfg.AuthZENProxy,
+			authorizerInterface,
+			httpClient,
+			logger,
+		)
+
+		logger.Info("AuthZEN proxy initialized",
+			zap.String("pdp_url", pdpURL),
+			zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
+		)
+	}
+
 	// Root-level health/status endpoints (no tenant required)
 	router.GET("/status", handlers.Status)
 	router.GET("/health", handlers.Status)
@@ -218,8 +262,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	public := router.Group("/")
 
 	// Create OIDC validator cache for gate middleware
-	// Use configured HTTP client to respect proxy settings
-	httpClient := cfg.HTTPClient.NewHTTPClient(0)
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	{
@@ -321,6 +363,19 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
+		}
+
+		// =========================================================================
+		// V1 API ROUTES (authenticated)
+		// These endpoints require JWT authentication
+		// =========================================================================
+		if authzenHandler != nil {
+			v1 := protected.Group("/v1")
+			{
+				// AuthZEN proxy endpoints for frontend trust evaluation
+				v1.POST("/evaluate", authzenHandler.Evaluate)
+				v1.POST("/resolve", authzenHandler.Resolve)
+			}
 		}
 	}
 
