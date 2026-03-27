@@ -18,6 +18,16 @@ import (
 // OIDCGateContextKey is the context key for OIDC gate validation result
 const OIDCGateContextKey = "oidc_gate_result"
 
+// GateType represents the type of OIDC gate (registration or login)
+type GateType string
+
+const (
+	// GateTypeRegistration is the gate for registration endpoints
+	GateTypeRegistration GateType = "registration"
+	// GateTypeLogin is the gate for login endpoints
+	GateTypeLogin GateType = "login"
+)
+
 // ValidatorCache caches OIDC validators per issuer
 type ValidatorCache struct {
 	mu         sync.RWMutex
@@ -77,13 +87,13 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 //
 // Parameters:
 //   - validatorCache: shared cache for OIDC validators
-//   - gateType: "registration" or "login" - determines which gate config to check
+//   - gateType: GateTypeRegistration or GateTypeLogin - determines which gate config to check
 //   - logger: zap logger
 //
 // The middleware expects TenantHeaderMiddleware to have run first to set the tenant in context.
 // If OIDC gating is not enabled for this gate type, the request proceeds normally.
 // If enabled, the Authorization header must contain a valid ID token.
-func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType string, logger *zap.Logger) gin.HandlerFunc {
+func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType GateType, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get tenant from context (set by TenantHeaderMiddleware)
 		tenantVal, exists := c.Get("tenant")
@@ -105,14 +115,14 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType string, logger 
 		var opConfig *domain.OIDCProviderConfig
 
 		switch gateType {
-		case "registration":
+		case GateTypeRegistration:
 			requiresGate = tenant.OIDCGate.RequiresGateForRegistration()
 			opConfig = tenant.OIDCGate.GetRegistrationOP()
-		case "login":
+		case GateTypeLogin:
 			requiresGate = tenant.OIDCGate.RequiresGateForLogin()
 			opConfig = tenant.OIDCGate.GetLoginOP()
 		default:
-			logger.Error("invalid gate type", zap.String("gate_type", gateType))
+			logger.Error("invalid gate type", zap.String("gate_type", string(gateType)))
 			c.JSON(500, gin.H{"error": "internal server error"})
 			c.Abort()
 			return
@@ -127,7 +137,7 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType string, logger 
 		if opConfig == nil {
 			logger.Error("OIDC gate enabled but no OP configured",
 				zap.String("tenant", string(tenant.ID)),
-				zap.String("gate_type", gateType))
+				zap.String("gate_type", string(gateType)))
 			c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
 			c.Abort()
 			return
@@ -160,7 +170,7 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType string, logger 
 		if err != nil {
 			logger.Debug("OIDC token validation failed",
 				zap.String("tenant", string(tenant.ID)),
-				zap.String("gate_type", gateType),
+				zap.String("gate_type", string(gateType)),
 				zap.Error(err))
 
 			switch {
@@ -204,7 +214,7 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType string, logger 
 
 		logger.Debug("OIDC gate passed",
 			zap.String("tenant", string(tenant.ID)),
-			zap.String("gate_type", gateType),
+			zap.String("gate_type", string(gateType)),
 			zap.String("subject", result.Subject),
 			zap.String("issuer", result.Issuer))
 
@@ -231,22 +241,58 @@ func respondOIDCRequired(c *gin.Context, opConfig *domain.OIDCProviderConfig, me
 }
 
 // claimsMatch compares expected and actual claim values
+// Supports subset matching for arrays (expected values must be present in actual)
 func claimsMatch(expected, actual interface{}) bool {
 	switch e := expected.(type) {
 	case bool:
 		a, ok := actual.(bool)
 		return ok && e == a
 	case string:
-		a, ok := actual.(string)
-		return ok && e == a
+		// String expected value can match either a string or be present in an array
+		if a, ok := actual.(string); ok {
+			return e == a
+		}
+		// Check if string is in array (e.g., expected: "admin", actual: ["admin", "user"])
+		if arr, ok := actual.([]interface{}); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok && s == e {
+					return true
+				}
+			}
+		}
+		return false
 	case float64:
 		a, ok := actual.(float64)
 		return ok && e == a
 	case int:
 		a, ok := actual.(float64)
 		return ok && float64(e) == a
+	case []interface{}:
+		// For array expected values, check if all expected values are present in actual
+		a, ok := actual.([]interface{})
+		if !ok {
+			// actual is not an array - check if single expected element matches
+			if len(e) == 1 {
+				return claimsMatch(e[0], actual)
+			}
+			return false
+		}
+		// All expected values must be present in actual (subset matching)
+		for _, ev := range e {
+			found := false
+			for _, av := range a {
+				if claimsMatch(ev, av) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
 	default:
-		// For complex types (slices, maps, etc.), use reflect.DeepEqual for safety
+		// For complex types, use reflect.DeepEqual as fallback
 		return reflect.DeepEqual(expected, actual)
 	}
 }

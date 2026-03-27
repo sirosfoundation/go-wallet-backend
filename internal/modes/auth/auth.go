@@ -188,7 +188,7 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 
 		// Registration routes (with OIDC registration gate)
 		registration := userBase.Group("")
-		registration.Use(middleware.OIDCGateMiddleware(validatorCache, "registration", logger))
+		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, logger))
 		{
 			registration.POST("/register", handlers.RegisterUser)
 
@@ -203,7 +203,7 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 
 		// Login routes (with OIDC login gate)
 		login := userBase.Group("")
-		login.Use(middleware.OIDCGateMiddleware(validatorCache, "login", logger))
+		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, logger))
 		{
 			login.POST("/login", handlers.LoginUser)
 
