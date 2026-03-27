@@ -35,12 +35,32 @@ type TenantRequest struct {
 	Enabled       *bool               `json:"enabled,omitempty"`
 	RequireInvite *bool               `json:"require_invite,omitempty"`
 	TrustConfig   *TrustConfigRequest `json:"trust_config,omitempty"`
+	OIDCGate      *OIDCGateRequest    `json:"oidc_gate,omitempty"`
 }
 
 // TrustConfigRequest represents the trust configuration in API requests
 type TrustConfigRequest struct {
 	TrustEndpoint string `json:"trust_endpoint,omitempty"`
 	TrustTTL      *int   `json:"trust_ttl,omitempty"` // seconds
+}
+
+// OIDCProviderConfigRequest represents an OIDC provider in API requests
+type OIDCProviderConfigRequest struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer" binding:"required"`
+	ClientID    string `json:"client_id" binding:"required"`
+	JWKSURI     string `json:"jwks_uri,omitempty"`
+	Audience    string `json:"audience,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
+}
+
+// OIDCGateRequest represents the OIDC gate configuration in API requests
+type OIDCGateRequest struct {
+	Mode           string                     `json:"mode"` // none, registration, login, both
+	RegistrationOP *OIDCProviderConfigRequest `json:"registration_op,omitempty"`
+	LoginOP        *OIDCProviderConfigRequest `json:"login_op,omitempty"`
+	RequiredClaims map[string]interface{}     `json:"required_claims,omitempty"`
+	BindIdentity   *bool                      `json:"bind_identity,omitempty"`
 }
 
 // TenantResponse represents a tenant in API responses
@@ -53,12 +73,32 @@ type TenantResponse struct {
 	CreatedAt     time.Time            `json:"created_at"`
 	UpdatedAt     time.Time            `json:"updated_at"`
 	TrustConfig   *TrustConfigResponse `json:"trust_config,omitempty"`
+	OIDCGate      *OIDCGateResponse    `json:"oidc_gate,omitempty"`
 }
 
 // TrustConfigResponse represents the trust configuration in API responses
 type TrustConfigResponse struct {
 	TrustEndpoint string `json:"trust_endpoint,omitempty"`
 	TrustTTL      int    `json:"trust_ttl"` // seconds
+}
+
+// OIDCProviderConfigResponse represents an OIDC provider in API responses
+type OIDCProviderConfigResponse struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer"`
+	ClientID    string `json:"client_id"`
+	JWKSURI     string `json:"jwks_uri,omitempty"`
+	Audience    string `json:"audience,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
+}
+
+// OIDCGateResponse represents the OIDC gate configuration in API responses
+type OIDCGateResponse struct {
+	Mode           string                      `json:"mode"`
+	RegistrationOP *OIDCProviderConfigResponse `json:"registration_op,omitempty"`
+	LoginOP        *OIDCProviderConfigResponse `json:"login_op,omitempty"`
+	RequiredClaims map[string]interface{}      `json:"required_claims,omitempty"`
+	BindIdentity   bool                        `json:"bind_identity"`
 }
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
@@ -78,7 +118,105 @@ func tenantToResponse(t *domain.Tenant) *TenantResponse {
 			TrustTTL:      t.TrustConfig.TrustTTL,
 		}
 	}
+	// Include OIDC gate config if enabled
+	if t.OIDCGate.IsEnabled() {
+		resp.OIDCGate = oidcGateToResponse(&t.OIDCGate)
+	}
 	return resp
+}
+
+// oidcGateToResponse converts domain OIDCGateConfig to API response
+func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
+	if g == nil {
+		return nil
+	}
+	resp := &OIDCGateResponse{
+		Mode:           string(g.Mode),
+		RequiredClaims: g.RequiredClaims,
+		BindIdentity:   g.BindIdentity,
+	}
+	if g.RegistrationOP != nil {
+		resp.RegistrationOP = &OIDCProviderConfigResponse{
+			DisplayName: g.RegistrationOP.DisplayName,
+			Issuer:      g.RegistrationOP.Issuer,
+			ClientID:    g.RegistrationOP.ClientID,
+			JWKSURI:     g.RegistrationOP.JWKSURI,
+			Audience:    g.RegistrationOP.Audience,
+			Scopes:      g.RegistrationOP.Scopes,
+		}
+	}
+	if g.LoginOP != nil {
+		resp.LoginOP = &OIDCProviderConfigResponse{
+			DisplayName: g.LoginOP.DisplayName,
+			Issuer:      g.LoginOP.Issuer,
+			ClientID:    g.LoginOP.ClientID,
+			JWKSURI:     g.LoginOP.JWKSURI,
+			Audience:    g.LoginOP.Audience,
+			Scopes:      g.LoginOP.Scopes,
+		}
+	}
+	return resp
+}
+
+// applyOIDCGateRequest applies API request to domain OIDCGateConfig
+// Returns an error if the mode is invalid
+func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) error {
+	if req == nil || gate == nil {
+		return nil
+	}
+
+	// Apply mode (validate against supported values)
+	if req.Mode != "" {
+		switch req.Mode {
+		case "none", "registration", "login", "both":
+			gate.Mode = domain.OIDCGateMode(req.Mode)
+		default:
+			return fmt.Errorf("invalid oidc_gate mode: %q (must be one of: none, registration, login, both)", req.Mode)
+		}
+	}
+
+	// Apply registration OP
+	if req.RegistrationOP != nil {
+		gate.RegistrationOP = &domain.OIDCProviderConfig{
+			DisplayName: req.RegistrationOP.DisplayName,
+			Issuer:      req.RegistrationOP.Issuer,
+			ClientID:    req.RegistrationOP.ClientID,
+			JWKSURI:     req.RegistrationOP.JWKSURI,
+			Audience:    req.RegistrationOP.Audience,
+			Scopes:      req.RegistrationOP.Scopes,
+		}
+	}
+
+	// Apply login OP (separate from registration if provided)
+	if req.LoginOP != nil {
+		gate.LoginOP = &domain.OIDCProviderConfig{
+			DisplayName: req.LoginOP.DisplayName,
+			Issuer:      req.LoginOP.Issuer,
+			ClientID:    req.LoginOP.ClientID,
+			JWKSURI:     req.LoginOP.JWKSURI,
+			Audience:    req.LoginOP.Audience,
+			Scopes:      req.LoginOP.Scopes,
+		}
+	}
+
+	// Apply required claims
+	if req.RequiredClaims != nil {
+		gate.RequiredClaims = req.RequiredClaims
+	}
+
+	// Apply bind identity with validation
+	if req.BindIdentity != nil {
+		gate.BindIdentity = *req.BindIdentity
+	}
+
+	// SECURITY: Validate bind_identity configuration
+	// bind_identity=true requires a registration gate (registration or both mode)
+	// because identity binding only happens during FinishRegistration
+	if gate.BindIdentity && gate.Mode == domain.OIDCGateModeLogin {
+		return fmt.Errorf("bind_identity cannot be enabled with mode 'login': identity binding requires registration gate")
+	}
+
+	return nil
 }
 
 // ListTenants returns all tenants
@@ -174,6 +312,14 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 		}
 	}
 
+	// Apply OIDC gate config if provided
+	if req.OIDCGate != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	if err := h.store.Tenants().Create(c.Request.Context(), tenant); err != nil {
 		h.logger.Error("Failed to create tenant", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
@@ -221,6 +367,13 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
 		if req.TrustConfig.TrustTTL != nil {
 			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
+		}
+	}
+	// Update OIDC gate config if provided
+	if req.OIDCGate != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
 	}
 	tenant.UpdatedAt = time.Now()

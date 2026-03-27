@@ -13,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -143,6 +144,61 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: Check if identity binding is required for this tenant
+	// This must be validated BEFORE checking oidcResult to prevent bypass
+	tenantVal, tenantExists := c.Get("tenant")
+	var tenant *domain.Tenant
+	if tenantExists {
+		tenant, _ = tenantVal.(*domain.Tenant)
+	}
+
+	// If bind_identity is configured, we MUST have both tenant and OIDC result
+	if tenant != nil && tenant.OIDCGate.BindIdentity {
+		// bind_identity requires registration mode - enforce binding
+		oidcResult, hasResult := middleware.GetOIDCGateResultGin(c)
+		if !hasResult {
+			h.logger.Error("bind_identity enabled but no OIDC result in context",
+				zap.String("tenant_id", string(tenant.ID)))
+			c.JSON(500, gin.H{"error": "OIDC gate state inconsistent"})
+			return
+		}
+
+		// SECURITY: Verify issuer matches tenant's configured RegistrationOP
+		regOP := tenant.OIDCGate.GetRegistrationOP()
+		if regOP == nil {
+			h.logger.Error("bind_identity enabled but no RegistrationOP configured",
+				zap.String("tenant_id", string(tenant.ID)))
+			c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
+			return
+		}
+		if oidcResult.Issuer != regOP.Issuer {
+			h.logger.Warn("OIDC issuer mismatch during registration binding",
+				zap.String("tenant_id", string(tenant.ID)),
+				zap.String("expected_issuer", regOP.Issuer),
+				zap.String("actual_issuer", oidcResult.Issuer))
+			c.JSON(401, gin.H{
+				"error": "OIDC issuer mismatch",
+				"code":  "oidc_issuer_mismatch",
+			})
+			return
+		}
+
+		// Get email from claims if available
+		var email string
+		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
+			email = emailClaim
+		}
+		req.OIDCGateBinding = &service.OIDCGateBinding{
+			Issuer:      oidcResult.Issuer,
+			Subject:     oidcResult.Subject,
+			Email:       email,
+			BindingType: "registration",
+		}
+		h.logger.Debug("OIDC identity binding prepared for registration",
+			zap.String("issuer", oidcResult.Issuer),
+			zap.String("subject", oidcResult.Subject))
+	}
+
 	resp, err := h.services.WebAuthn.FinishRegistration(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Error("Failed to finish WebAuthn registration", zap.Error(err))
@@ -199,6 +255,22 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 		return
 	}
 
+	// Check if OIDC gate authentication result is present
+	// Note: For login, we can't get tenant ID from request - it's determined from the credential
+	// The middleware sets the result in context, and the service will verify it matches the user's bound identity
+	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
+		// Extract email from claims if available
+		var email string
+		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
+			email = emailClaim
+		}
+		req.OIDCGateBinding = &service.OIDCGateBinding{
+			Issuer:  oidcResult.Issuer,
+			Subject: oidcResult.Subject,
+			Email:   email,
+		}
+	}
+
 	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Error("Failed to finish WebAuthn login", zap.Error(err))
@@ -216,6 +288,15 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(401, gin.H{"error": "Authentication failed"})
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
+		case errors.Is(err, service.ErrIdentityNotBound):
+			c.JSON(403, gin.H{"error": "No enterprise identity bound for this wallet"})
+		case errors.Is(err, service.ErrIdentityBindingMismatch):
+			c.JSON(403, gin.H{"error": "Enterprise identity does not match registered identity"})
+		case errors.Is(err, service.ErrOIDCGateRequired):
+			c.JSON(401, gin.H{
+				"error": "OIDC gate authentication required",
+				"code":  "oidc_gate_required",
+			})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete login"})
 		}
@@ -1195,4 +1276,105 @@ func (h *Handlers) KeystoreStatus(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"connected": connected,
 	})
+}
+
+// =============================================================================
+// Public Tenant Config
+// =============================================================================
+
+// PublicTenantConfigResponse is the public-facing tenant configuration.
+// This excludes admin-only fields and exposes only what clients need.
+type PublicTenantConfigResponse struct {
+	ID            string                  `json:"id"`
+	Name          string                  `json:"name"`
+	DisplayName   string                  `json:"display_name,omitempty"`
+	RequireInvite bool                    `json:"require_invite"`
+	OIDCGate      *PublicOIDCGateResponse `json:"oidc_gate,omitempty"`
+}
+
+// PublicOIDCProviderResponse is the public-facing OIDC provider config.
+// Only includes fields needed by clients to initiate OIDC flows.
+type PublicOIDCProviderResponse struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Issuer      string `json:"issuer"`
+	ClientID    string `json:"client_id"`
+	Scopes      string `json:"scopes,omitempty"`
+}
+
+// PublicOIDCGateResponse is the public-facing OIDC gate configuration.
+type PublicOIDCGateResponse struct {
+	Mode           string                      `json:"mode"`
+	RegistrationOP *PublicOIDCProviderResponse `json:"registration_op,omitempty"`
+	LoginOP        *PublicOIDCProviderResponse `json:"login_op,omitempty"`
+}
+
+// GetTenantConfig returns the public configuration for a tenant.
+// GET /api/v1/tenants/:id/config
+// This is a public endpoint that does not require authentication.
+func (h *Handlers) GetTenantConfig(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+
+	// Validate tenant ID format
+	if err := domain.ValidateTenantID(tenantID); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid tenant ID"})
+		return
+	}
+
+	tenant, err := h.services.Tenant.GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(404, gin.H{"error": "Tenant not found"})
+			return
+		}
+		h.logger.Error("Failed to get tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		c.JSON(500, gin.H{"error": "Failed to get tenant"})
+		return
+	}
+
+	// Don't expose disabled tenants
+	if !tenant.Enabled {
+		c.JSON(404, gin.H{"error": "Tenant not found"})
+		return
+	}
+
+	response := &PublicTenantConfigResponse{
+		ID:            string(tenant.ID),
+		Name:          tenant.Name,
+		DisplayName:   tenant.DisplayName,
+		RequireInvite: tenant.RequireInvite,
+	}
+
+	// Include OIDC gate config if enabled
+	if tenant.OIDCGate.IsEnabled() {
+		response.OIDCGate = publicOIDCGateToResponse(&tenant.OIDCGate)
+	}
+
+	c.JSON(200, response)
+}
+
+// publicOIDCGateToResponse converts domain OIDCGateConfig to public response
+func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse {
+	if g == nil {
+		return nil
+	}
+	resp := &PublicOIDCGateResponse{
+		Mode: string(g.Mode),
+	}
+	if g.RegistrationOP != nil {
+		resp.RegistrationOP = &PublicOIDCProviderResponse{
+			DisplayName: g.RegistrationOP.EffectiveDisplayName(),
+			Issuer:      g.RegistrationOP.Issuer,
+			ClientID:    g.RegistrationOP.ClientID,
+			Scopes:      g.RegistrationOP.EffectiveScopes(),
+		}
+	}
+	if g.LoginOP != nil {
+		resp.LoginOP = &PublicOIDCProviderResponse{
+			DisplayName: g.LoginOP.EffectiveDisplayName(),
+			Issuer:      g.LoginOP.Issuer,
+			ClientID:    g.LoginOP.ClientID,
+			Scopes:      g.LoginOP.EffectiveScopes(),
+		}
+	}
+	return resp
 }

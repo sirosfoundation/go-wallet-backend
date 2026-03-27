@@ -715,3 +715,215 @@ func TestHandlers_GenerateKeyAttestation_BadRequest(t *testing.T) {
 		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
 	}
 }
+
+// =============================================================================
+// Public Tenant Config Tests
+// =============================================================================
+
+func setupTestHandlersWithTenant(t *testing.T, tenant *domain.Tenant) (*Handlers, *gin.Engine) {
+	handlers, router := setupTestHandlers(t)
+
+	// Create tenant in store
+	if tenant != nil {
+		ctx := context.Background()
+		if err := handlers.services.Tenant.Create(ctx, tenant); err != nil {
+			t.Fatalf("Failed to create tenant: %v", err)
+		}
+	}
+
+	return handlers, router
+}
+
+func TestHandlers_GetTenantConfig_Success(t *testing.T) {
+	tenant := &domain.Tenant{
+		ID:            "test-tenant",
+		Name:          "Test Tenant",
+		DisplayName:   "Test Tenant Display",
+		Enabled:       true,
+		RequireInvite: false,
+	}
+	handlers, router := setupTestHandlersWithTenant(t, tenant)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/test-tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response PublicTenantConfigResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.ID != "test-tenant" {
+		t.Errorf("Expected ID 'test-tenant', got %v", response.ID)
+	}
+	if response.Name != "Test Tenant" {
+		t.Errorf("Expected Name 'Test Tenant', got %v", response.Name)
+	}
+	if response.DisplayName != "Test Tenant Display" {
+		t.Errorf("Expected DisplayName 'Test Tenant Display', got %v", response.DisplayName)
+	}
+	if response.OIDCGate != nil {
+		t.Error("Expected OIDCGate to be nil when not configured")
+	}
+}
+
+func TestHandlers_GetTenantConfig_WithOIDCGate(t *testing.T) {
+	tenant := &domain.Tenant{
+		ID:            "oidc-tenant",
+		Name:          "OIDC Tenant",
+		DisplayName:   "OIDC Test Tenant",
+		Enabled:       true,
+		RequireInvite: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeRegistration,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				DisplayName: "Enterprise SSO",
+				Issuer:      "https://idp.example.com",
+				ClientID:    "wallet-client",
+				Scopes:      "openid email profile",
+			},
+		},
+	}
+	handlers, router := setupTestHandlersWithTenant(t, tenant)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/oidc-tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response PublicTenantConfigResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	if response.ID != "oidc-tenant" {
+		t.Errorf("Expected ID 'oidc-tenant', got %v", response.ID)
+	}
+	if response.RequireInvite != true {
+		t.Errorf("Expected RequireInvite true, got %v", response.RequireInvite)
+	}
+	if response.OIDCGate == nil {
+		t.Fatal("Expected OIDCGate to not be nil")
+	}
+	if response.OIDCGate.Mode != "registration" {
+		t.Errorf("Expected Mode 'registration', got %v", response.OIDCGate.Mode)
+	}
+	if response.OIDCGate.RegistrationOP == nil {
+		t.Fatal("Expected RegistrationOP to not be nil")
+	}
+	if response.OIDCGate.RegistrationOP.DisplayName != "Enterprise SSO" {
+		t.Errorf("Expected DisplayName 'Enterprise SSO', got %v", response.OIDCGate.RegistrationOP.DisplayName)
+	}
+	if response.OIDCGate.RegistrationOP.Issuer != "https://idp.example.com" {
+		t.Errorf("Expected Issuer 'https://idp.example.com', got %v", response.OIDCGate.RegistrationOP.Issuer)
+	}
+	if response.OIDCGate.RegistrationOP.ClientID != "wallet-client" {
+		t.Errorf("Expected ClientID 'wallet-client', got %v", response.OIDCGate.RegistrationOP.ClientID)
+	}
+}
+
+func TestHandlers_GetTenantConfig_WithOIDCGate_RequiredClaims(t *testing.T) {
+	// Test that handlers work correctly when tenant has required_claims configured
+	// Note: required_claims is not exposed in the public config response (backend validation only)
+	tenant := &domain.Tenant{
+		ID:            "oidc-claims-tenant",
+		Name:          "OIDC Claims Tenant",
+		DisplayName:   "OIDC Claims Test Tenant",
+		Enabled:       true,
+		RequireInvite: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode:           domain.OIDCGateModeRegistration,
+			RequiredClaims: map[string]any{"email_verified": true, "groups": "staff"},
+			RegistrationOP: &domain.OIDCProviderConfig{
+				DisplayName: "Corp SSO",
+				Issuer:      "https://idp.example.com",
+				ClientID:    "wallet-client",
+				Scopes:      "openid email profile groups",
+			},
+		},
+	}
+	handlers, router := setupTestHandlersWithTenant(t, tenant)
+	router.GET("/api/v1/tenants/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/oidc-claims-tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response PublicTenantConfigResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+
+	// Verify the handler processes the tenant correctly
+	if response.OIDCGate == nil {
+		t.Fatal("Expected OIDCGate to not be nil")
+	}
+	if response.OIDCGate.Mode != "registration" {
+		t.Errorf("Expected Mode 'registration', got %v", response.OIDCGate.Mode)
+	}
+	if response.OIDCGate.RegistrationOP == nil {
+		t.Fatal("Expected RegistrationOP to not be nil")
+	}
+	if response.OIDCGate.RegistrationOP.Issuer != "https://idp.example.com" {
+		t.Errorf("Expected Issuer 'https://idp.example.com', got %v", response.OIDCGate.RegistrationOP.Issuer)
+	}
+}
+
+func TestHandlers_GetTenantConfig_NotFound(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/tenant/nonexistent/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d, got %d", http.StatusNotFound, w.Code)
+	}
+}
+
+func TestHandlers_GetTenantConfig_DisabledTenant(t *testing.T) {
+	tenant := &domain.Tenant{
+		ID:      "disabled-tenant",
+		Name:    "Disabled Tenant",
+		Enabled: false,
+	}
+	handlers, router := setupTestHandlersWithTenant(t, tenant)
+	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/tenant/disabled-tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	// Disabled tenants should return 404 (not exposed)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d, got %d", http.StatusNotFound, w.Code)
+	}
+}
+
+func TestHandlers_GetTenantConfig_InvalidID(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.GET("/tenant/:id/config", handlers.GetTenantConfig)
+
+	w := httptest.NewRecorder()
+	// Invalid tenant IDs (e.g., with special chars) should return 400
+	req := httptest.NewRequest(http.MethodGet, "/tenant/invalid@tenant/config", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}

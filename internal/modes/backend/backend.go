@@ -202,23 +202,47 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	router.GET("/health", handlers.Status)
 
 	// =========================================================================
+	// PUBLIC API ROUTES (unauthenticated)
+	// These endpoints provide public configuration data
+	// =========================================================================
+	apiV1 := router.Group("/api/v1")
+	{
+		// Public tenant config - returns OIDC gate settings etc.
+		apiV1.GET("/tenants/:id/config", handlers.GetTenantConfig)
+	}
+
+	// =========================================================================
 	// PUBLIC ROUTES (unauthenticated)
 	// Tenant comes from X-Tenant-ID header (TenantHeaderMiddleware)
 	// =========================================================================
 	public := router.Group("/")
-	{
-		// User authentication routes (no auth required)
-		user := public.Group("/user")
-		user.Use(middleware.TenantHeaderMiddleware(store))
-		{
-			user.POST("/register", handlers.RegisterUser)
-			user.POST("/login", handlers.LoginUser)
 
-			// WebAuthn routes
-			user.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
-			user.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
-			user.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
-			user.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
+	// Create OIDC validator cache for gate middleware
+	// Use configured HTTP client to respect proxy settings
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+	validatorCache := middleware.NewValidatorCache(httpClient, logger)
+
+	{
+		// Base user group with tenant middleware
+		userBase := public.Group("/user")
+		userBase.Use(middleware.TenantHeaderMiddleware(store))
+
+		// Registration routes (with OIDC registration gate)
+		registration := userBase.Group("")
+		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, logger))
+		{
+			registration.POST("/register", handlers.RegisterUser)
+			registration.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
+			registration.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
+		}
+
+		// Login routes (with OIDC login gate)
+		login := userBase.Group("")
+		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, logger))
+		{
+			login.POST("/login", handlers.LoginUser)
+			login.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
+			login.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
 		}
 
 		// Helper routes (some public)
