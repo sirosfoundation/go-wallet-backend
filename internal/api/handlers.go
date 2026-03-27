@@ -144,48 +144,59 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 		return
 	}
 
-	// Check for OIDC gate identity binding
-	if oidcResult, ok := middleware.GetOIDCGateResultGin(c); ok {
-		// Get tenant to check if bind_identity is true
-		if tenantVal, exists := c.Get("tenant"); exists {
-			if tenant, ok := tenantVal.(*domain.Tenant); ok && tenant.OIDCGate.BindIdentity {
-				// SECURITY: Verify issuer matches tenant's configured RegistrationOP
-				// This prevents binding identities from unexpected issuers
-				regOP := tenant.OIDCGate.GetRegistrationOP()
-				if regOP == nil {
-					h.logger.Error("bind_identity enabled but no RegistrationOP configured",
-						zap.String("tenant_id", string(tenant.ID)))
-					c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
-					return
-				}
-				if oidcResult.Issuer != regOP.Issuer {
-					h.logger.Warn("OIDC issuer mismatch during registration binding",
-						zap.String("tenant_id", string(tenant.ID)),
-						zap.String("expected_issuer", regOP.Issuer),
-						zap.String("actual_issuer", oidcResult.Issuer))
-					c.JSON(401, gin.H{
-						"error": "OIDC issuer mismatch",
-						"code":  "oidc_issuer_mismatch",
-					})
-					return
-				}
+	// SECURITY: Check if identity binding is required for this tenant
+	// This must be validated BEFORE checking oidcResult to prevent bypass
+	tenantVal, tenantExists := c.Get("tenant")
+	var tenant *domain.Tenant
+	if tenantExists {
+		tenant, _ = tenantVal.(*domain.Tenant)
+	}
 
-				// Get email from claims if available
-				var email string
-				if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-					email = emailClaim
-				}
-				req.OIDCGateBinding = &service.OIDCGateBinding{
-					Issuer:      oidcResult.Issuer,
-					Subject:     oidcResult.Subject,
-					Email:       email,
-					BindingType: "registration",
-				}
-				h.logger.Debug("OIDC identity binding prepared for registration",
-					zap.String("issuer", oidcResult.Issuer),
-					zap.String("subject", oidcResult.Subject))
-			}
+	// If bind_identity is configured, we MUST have both tenant and OIDC result
+	if tenant != nil && tenant.OIDCGate.BindIdentity {
+		// bind_identity requires registration mode - enforce binding
+		oidcResult, hasResult := middleware.GetOIDCGateResultGin(c)
+		if !hasResult {
+			h.logger.Error("bind_identity enabled but no OIDC result in context",
+				zap.String("tenant_id", string(tenant.ID)))
+			c.JSON(500, gin.H{"error": "OIDC gate state inconsistent"})
+			return
 		}
+
+		// SECURITY: Verify issuer matches tenant's configured RegistrationOP
+		regOP := tenant.OIDCGate.GetRegistrationOP()
+		if regOP == nil {
+			h.logger.Error("bind_identity enabled but no RegistrationOP configured",
+				zap.String("tenant_id", string(tenant.ID)))
+			c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
+			return
+		}
+		if oidcResult.Issuer != regOP.Issuer {
+			h.logger.Warn("OIDC issuer mismatch during registration binding",
+				zap.String("tenant_id", string(tenant.ID)),
+				zap.String("expected_issuer", regOP.Issuer),
+				zap.String("actual_issuer", oidcResult.Issuer))
+			c.JSON(401, gin.H{
+				"error": "OIDC issuer mismatch",
+				"code":  "oidc_issuer_mismatch",
+			})
+			return
+		}
+
+		// Get email from claims if available
+		var email string
+		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
+			email = emailClaim
+		}
+		req.OIDCGateBinding = &service.OIDCGateBinding{
+			Issuer:      oidcResult.Issuer,
+			Subject:     oidcResult.Subject,
+			Email:       email,
+			BindingType: "registration",
+		}
+		h.logger.Debug("OIDC identity binding prepared for registration",
+			zap.String("issuer", oidcResult.Issuer),
+			zap.String("subject", oidcResult.Subject))
 	}
 
 	resp, err := h.services.WebAuthn.FinishRegistration(c.Request.Context(), &req)

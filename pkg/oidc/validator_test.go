@@ -372,14 +372,14 @@ func TestValidator_CustomClaims(t *testing.T) {
 	// Create token with custom claims
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"iss":            "https://test-issuer.example.com",
-		"aud":            "test-client",
-		"sub":            "user123",
-		"exp":            now.Add(time.Hour).Unix(),
-		"iat":            now.Unix(),
-		"email":          "user@example.com",
-		"groups":         []string{"admin", "users"},
-		"custom_claim":   "custom_value",
+		"iss":          "https://test-issuer.example.com",
+		"aud":          "test-client",
+		"sub":          "user123",
+		"exp":          now.Add(time.Hour).Unix(),
+		"iat":          now.Unix(),
+		"email":        "user@example.com",
+		"groups":       []string{"admin", "users"},
+		"custom_claim": "custom_value",
 	}
 
 	tokenString := createTestToken(t, privateKey, claims, jwt.SigningMethodRS256, "test-key")
@@ -403,7 +403,7 @@ func TestValidator_CustomClaims(t *testing.T) {
 func TestDiscoverProvider(t *testing.T) {
 	// Test OIDC discovery
 	_, jwkJSON := createTestRSAKey(t)
-	
+
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/.well-known/openid-configuration" {
