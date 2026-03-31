@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +23,7 @@ type AuthZENProxyHandler struct {
 	cfg        *config.AuthZENProxyConfig
 	authorizer authz.Authorizer
 	clients    map[string]*authzenclient.Client
+	clientsMu  sync.RWMutex
 	httpClient *http.Client
 	logger     *zap.Logger
 }
@@ -38,7 +40,21 @@ func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Aut
 }
 
 // getClient returns a cached AuthZEN client for the given PDP URL, or creates one.
+// Thread-safe: uses RWMutex for concurrent access protection.
 func (h *AuthZENProxyHandler) getClient(pdpURL string) (*authzenclient.Client, error) {
+	// Fast path: read lock to check cache
+	h.clientsMu.RLock()
+	if client, ok := h.clients[pdpURL]; ok {
+		h.clientsMu.RUnlock()
+		return client, nil
+	}
+	h.clientsMu.RUnlock()
+
+	// Slow path: write lock to create client
+	h.clientsMu.Lock()
+	defer h.clientsMu.Unlock()
+
+	// Double-check after acquiring write lock
 	if client, ok := h.clients[pdpURL]; ok {
 		return client, nil
 	}
@@ -76,7 +92,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	var req gotrust.EvaluationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.logger.Debug("invalid evaluation request", zap.Error(err))
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "details": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
@@ -95,7 +111,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 			zap.String("action", getActionName(&req)),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusForbidden, gin.H{"error": "query not authorized", "details": err.Error()})
+		c.JSON(http.StatusForbidden, gin.H{"error": "query not authorized"})
 		return
 	}
 
@@ -123,7 +139,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "PDP evaluation failed", "details": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "trust evaluation service unavailable"})
 		return
 	}
 
@@ -162,7 +178,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		SubjectID string `json:"subject_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "details": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
@@ -184,7 +200,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		Request:  evalReq,
 	}
 	if err := h.authorizer.Authorize(ctx, authzReq); err != nil {
-		c.JSON(http.StatusForbidden, gin.H{"error": "query not authorized", "details": err.Error()})
+		c.JSON(http.StatusForbidden, gin.H{"error": "query not authorized"})
 		return
 	}
 
@@ -203,7 +219,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	resp, err := client.Evaluate(ctx, evalReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "resolution failed", "details": err.Error()})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "resolution service unavailable"})
 		return
 	}
 

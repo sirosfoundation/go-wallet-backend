@@ -276,8 +276,9 @@ func TestService_EvaluateIssuer_NoEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluateIssuer() error = %v", err)
 	}
-	if !result.Trusted {
-		t.Error("EvaluateIssuer() Trusted = false when no PDP configured")
+	// Fail-closed: no PDP configured should result in Trusted = false
+	if result.Trusted {
+		t.Error("EvaluateIssuer() Trusted = true when no PDP configured, expected fail-closed")
 	}
 	if result.Framework != "none" {
 		t.Errorf("EvaluateIssuer() Framework = %q, want none", result.Framework)
@@ -411,8 +412,9 @@ func TestService_EvaluateVerifier_NoEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluateVerifier() error = %v", err)
 	}
-	if !result.Trusted {
-		t.Error("EvaluateVerifier() Trusted = false when no PDP configured")
+	// Fail-closed: no PDP configured should result in Trusted = false
+	if result.Trusted {
+		t.Error("EvaluateVerifier() Trusted = true when no PDP configured, expected fail-closed")
 	}
 }
 

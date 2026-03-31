@@ -60,14 +60,15 @@ func (h *VCTMHandler) Execute(ctx context.Context, msg *FlowStartMessage) error 
 	defer cancel()
 
 	if msg.VCT == "" {
-		_ = h.Error("", ErrCodeInvalidMessage, "VCT parameter is required")
+		_ = h.Error("", ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
 		return fmt.Errorf("VCT parameter required")
 	}
 
 	// Lookup type metadata
 	metadata, err := h.lookupVCT(ctx, msg.VCT)
 	if err != nil {
-		_ = h.Error("", ErrCodeMetadataFetchErr, err.Error())
+		h.Logger.Debug("VCT lookup failed", zap.Error(err))
+		_ = h.Error("", ErrCodeMetadataFetchErr, ErrCodeMetadataFetchErr.UserFacingMessage())
 		return err
 	}
 
@@ -113,7 +114,7 @@ func (h *VCTMHandler) lookupVCT(ctx context.Context, vct string) (*TypeMetadata,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		return nil, fmt.Errorf("registry returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -140,7 +141,7 @@ func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) (*TypeMet
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		return nil, fmt.Errorf("VCT fetch returned status %d: %s", resp.StatusCode, string(body))
 	}
 

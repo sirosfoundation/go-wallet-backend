@@ -134,7 +134,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 1: Parse credential offer
 	offer, err := h.parseOffer(ctx, msg)
 	if err != nil {
-		_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, err.Error())
+		h.Logger.Debug("failed to parse offer", zap.Error(err))
+		_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
 		return err
 	}
 	h.SetData("offer", offer)
@@ -142,7 +143,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 2: Fetch issuer metadata
 	metadata, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
-		_ = h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, err.Error())
+		h.Logger.Debug("failed to fetch metadata", zap.Error(err))
+		_ = h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, ErrCodeMetadataFetchErr.UserFacingMessage())
 		return err
 	}
 	h.SetData("metadata", metadata)
@@ -150,7 +152,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 3: Evaluate trust
 	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata)
 	if err != nil {
-		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, err.Error())
+		h.Logger.Debug("issuer trust evaluation failed", zap.Error(err))
+		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
 		return err
 	}
 
@@ -172,7 +175,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	if h.needsProof(selectedConfig) {
 		proof, err := h.requestProof(ctx, metadata.CredentialIssuer, token.CNonce)
 		if err != nil {
-			_ = h.Error(StepRequestingCredential, ErrCodeSignError, err.Error())
+			h.Logger.Debug("failed to request proof", zap.Error(err))
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 			return err
 		}
 		proofJWT = proof
@@ -196,7 +200,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Poll for deferred credential
 		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID)
 		if err != nil {
-			_ = h.Error(StepDeferred, ErrCodeCredentialError, "Deferred credential polling failed: "+err.Error())
+			h.Logger.Debug("deferred polling failed", zap.Error(err))
+			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return err
 		}
 
@@ -296,7 +301,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		return nil, fmt.Errorf("metadata fetch returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -317,12 +322,6 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
-	// Get tenant trust endpoint from session (if configured)
-	trustEndpoint := ""
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TrustEndpoint != "" {
-		trustEndpoint = h.Flow.Session.TrustEndpoint
-	}
-
 	// Extract key material from issuer metadata for trust evaluation
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
 
@@ -331,22 +330,74 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
 	}
 
-	info, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, trustEndpoint, keyMaterial)
-	if err != nil {
-		h.Logger.Error("Trust evaluation failed", zap.String("issuer", issuer), zap.Error(err))
-		info = &TrustInfo{
-			Trusted:   false,
-			Framework: "error",
-			Reason:    "Trust evaluation error: " + err.Error(),
+	// Check if issuer is a DID - requires resolution via /v1/resolve
+	requiresResolution := strings.HasPrefix(issuer, "did:")
+
+	// Build trust evaluation request for frontend
+	trustReq := &TrustEvaluationRequest{
+		SubjectID:          issuer,
+		SubjectType:        SubjectTypeCredentialIssuer,
+		RequiresResolution: requiresResolution,
+		Context: map[string]interface{}{
+			"credential_types": h.collectCredentialTypes(metadata),
+		},
+	}
+
+	// Convert key material for frontend (nil for DID schemes - frontend resolves)
+	if keyMaterial != nil {
+		trustReq.KeyMaterial = &TrustKeyMaterial{
+			Type: keyMaterial.Type,
+			X5C:  keyMaterial.X5C,
+			JWK:  keyMaterial.JWK,
 		}
+	}
+
+	// Send trust evaluation request to frontend
+	// Skip validation for issuers - RequiresResolution doesn't require RequestJWT
+	if trustReq.SubjectID == "" {
+		return nil, errors.New("invalid trust evaluation request: SubjectID is required")
+	}
+	_ = h.Progress(StepEvaluatingTrust, map[string]interface{}{
+		"trust_evaluation_required": true,
+		"request":                   trustReq,
+	})
+
+	// Wait for frontend to evaluate trust via /v1/evaluate and respond
+	// Use shorter timeout for trust evaluation (frontend should respond quickly)
+	action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, TrustEvaluationTimeout, ActionTrustResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed waiting for trust evaluation: %w", err)
+	}
+
+	// Parse trust result from frontend
+	var trustResult TrustResultPayload
+	if err := json.Unmarshal(action.Payload, &trustResult); err != nil {
+		return nil, fmt.Errorf("failed to parse trust result: %w", err)
+	}
+
+	// Validate and mark as processed
+	if err := trustResult.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid trust result from frontend: %w", err)
+	}
+
+	// Audit log the trust result (for security audit trail)
+	h.Logger.Info("Trust evaluation result received",
+		zap.String("issuer", issuer),
+		zap.Bool("trusted", trustResult.Trusted),
+		zap.String("framework", trustResult.Framework),
+		zap.String("reason", trustResult.Reason))
+
+	info := &TrustInfo{
+		Trusted:   trustResult.Trusted,
+		Framework: trustResult.Framework,
+		Reason:    trustResult.Reason,
 	}
 
 	_ = h.Progress(StepTrustEvaluated, info)
 
-	// Enforce trust decision: block untrusted issuers when a PDP URL is configured.
-	// Trust is enforced iff a PDP endpoint is present (global config or session override).
-	trustEnforced := h.TrustSvc.IsIssuerTrustEnabled() || trustEndpoint != ""
-	if trustEnforced && !info.Trusted {
+	// Enforce trust decision: always block untrusted issuers
+	// (frontend has already evaluated trust via AuthZEN)
+	if !info.Trusted {
 		reason := info.Reason
 		if reason == "" {
 			reason = "issuer not trusted"
@@ -396,19 +447,16 @@ func (h *OID4VCIHandler) extractIssuerKeyMaterial(ctx context.Context, metadata 
 
 	// Verify and extract key material from signed_metadata JWT.
 	// Uses signature verification to prevent header injection attacks.
+	// Security: No fallback to unverified extraction - if verification fails, we reject.
 	if metadata.SignedMetadata != "" {
 		km, err := trust.VerifyJWTWithEmbeddedKey(metadata.SignedMetadata)
 		if err != nil {
-			h.Logger.Warn("signed_metadata JWT verification failed, trying header extraction as fallback",
+			h.Logger.Error("signed_metadata JWT verification failed - rejecting unsigned key material",
 				zap.Error(err))
-			// Fall back to unverified extraction if the issuer uses a non-standard algorithm.
-			// The PDP will still validate the key material against its trust registries.
-			if km := trust.ExtractKeyMaterialFromJWT(metadata.SignedMetadata); km != nil {
-				return km
-			}
-		} else {
-			return km
+			// Do NOT fall back to unverified extraction - this would allow header injection attacks
+			return nil
 		}
+		return km
 	}
 
 	// Inline JWKS in metadata
@@ -610,8 +658,9 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		_ = h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		h.Logger.Debug("token endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -727,8 +776,9 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		_ = h.Error(StepExchangingToken, ErrCodeTokenError, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		h.Logger.Debug("token endpoint error (auth code)", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -788,8 +838,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(resp.Body)
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 		return nil, fmt.Errorf("credential endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -845,7 +896,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 			continue // Retry on network errors
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
 		_ = resp.Body.Close()
 
 		switch resp.StatusCode {

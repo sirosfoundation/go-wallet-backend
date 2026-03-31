@@ -122,6 +122,9 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleClient(conn *websocket.Conn) {
 	defer func() { _ = conn.Close() }()
 
+	// Limit message size to 64KB to prevent memory exhaustion attacks
+	conn.SetReadLimit(64 * 1024)
+
 	var client *clientConnection
 
 	for {

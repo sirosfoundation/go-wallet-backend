@@ -93,7 +93,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	// Initialize public HTTP server
-	router := setupRouter(cfg, services, store, logger, roles)
+	router, err := setupRouter(cfg, services, store, logger, roles)
+	if err != nil {
+		return fmt.Errorf("failed to setup router: %w", err)
+	}
 
 	r.srv = &http.Server{
 		Addr:         cfg.Server.Address(),
@@ -170,7 +173,7 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger, roles []string) *gin.Engine {
+func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger, roles []string) (*gin.Engine, error) {
 	// Set Gin mode
 	if cfg.Logging.Level == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -213,15 +216,20 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		}
 		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
 		if err != nil {
-			logger.Error("Failed to initialize SPOCP authorizer, using NoOp", zap.Error(err))
+			logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
 			authorizer = nil
 		}
 
-		// Fall back to NoOp if SPOCP initialization failed
+		// Fail-closed: if SPOCP initialization failed in production, refuse to start
 		var authorizerInterface authz.Authorizer
 		if authorizer != nil {
 			authorizerInterface = authorizer
 		} else {
+			// Production guard: NoOpAuthorizer cannot be used in release mode
+			if gin.Mode() == gin.ReleaseMode {
+				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
+			}
+			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
 			authorizerInterface = authz.NoOpAuthorizer{}
 		}
 
@@ -273,7 +281,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		registration := userBase.Group("")
 		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, logger))
 		{
-			registration.POST("/register", handlers.RegisterUser)
 			registration.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
 			registration.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
 		}
@@ -282,7 +289,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		login := userBase.Group("")
 		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, logger))
 		{
-			login.POST("/login", handlers.LoginUser)
 			login.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
 			login.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
 		}
@@ -379,7 +385,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		}
 	}
 
-	return router
+	return router, nil
 }
 
 func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logger) *gin.Engine {

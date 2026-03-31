@@ -238,10 +238,12 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		return nil, err
 	}
 	if eval == nil {
+		// Fail-closed: if no PDP is configured, deny trust by default
+		// This prevents automatic trust bypass when trust evaluation is not properly set up
 		return &TrustInfo{
-			Trusted:   true,
+			Trusted:   false,
 			Framework: "none",
-			Reason:    "Trust evaluation not configured",
+			Reason:    "Trust evaluation not configured - no PDP endpoint available",
 		}, nil
 	}
 
