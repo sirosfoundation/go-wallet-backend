@@ -53,20 +53,35 @@ func (p *AuthProvider) Transport() Transport { return TransportHTTP }
 func (p *AuthProvider) Name() string         { return "auth" }
 
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
+	// Create HTTP client and OIDC validator cache for gate middleware
+	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
+	validatorCache := middleware.NewValidatorCache(httpClient, p.logger)
+
 	// Public auth routes (no authentication required)
 	public := router.Group("/")
 	{
-		user := public.Group("/user")
-		user.Use(middleware.TenantHeaderMiddleware(p.store))
-		{
-			user.POST("/register", p.handlers.RegisterUser)
-			user.POST("/login", p.handlers.LoginUser)
+		// Base user group with tenant middleware
+		userBase := public.Group("/user")
+		userBase.Use(middleware.TenantHeaderMiddleware(p.store))
 
-			// WebAuthn routes
-			user.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
-			user.POST("/register-webauthn-finish", p.handlers.FinishWebAuthnRegistration)
-			user.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
-			user.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
+		// Legacy password routes (no gate - deprecated)
+		userBase.POST("/register", p.handlers.RegisterUser)
+		userBase.POST("/login", p.handlers.LoginUser)
+
+		// Registration routes (with OIDC registration gate)
+		registration := userBase.Group("")
+		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger))
+		{
+			registration.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
+			registration.POST("/register-webauthn-finish", p.handlers.FinishWebAuthnRegistration)
+		}
+
+		// Login routes (with OIDC login gate)
+		login := userBase.Group("")
+		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger))
+		{
+			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
+			login.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)
