@@ -190,8 +190,6 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 		registration := userBase.Group("")
 		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, logger))
 		{
-			registration.POST("/register", handlers.RegisterUser)
-
 			// WebAuthn registration routes - also protected by rate limiting
 			webauthnReg := registration.Group("")
 			webauthnReg.Use(middleware.AuthRateLimitMiddleware(rateLimiter))
@@ -205,8 +203,6 @@ func setupAuthRouter(cfg *config.Config, services *service.Services, store backe
 		login := userBase.Group("")
 		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, logger))
 		{
-			login.POST("/login", handlers.LoginUser)
-
 			// WebAuthn login routes - also protected by rate limiting
 			webauthnLogin := login.Group("")
 			webauthnLogin.Use(middleware.AuthRateLimitMiddleware(rateLimiter))

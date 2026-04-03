@@ -145,10 +145,6 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 		c.JSON(http.StatusOK, status)
 	})
 
-	// User routes (deprecated password-based - public)
-	r.POST("/user/register", h.RegisterUser)
-	r.POST("/user/login", h.LoginUser)
-
 	// WebAuthn routes (public - for registration/login)
 	r.POST("/user/register-webauthn-begin", h.StartWebAuthnRegistration)
 	r.POST("/user/register-webauthn-finish", h.FinishWebAuthnRegistration)

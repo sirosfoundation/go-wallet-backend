@@ -64,10 +64,6 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		userBase := public.Group("/user")
 		userBase.Use(middleware.TenantHeaderMiddleware(p.store))
 
-		// Legacy password routes (no gate - deprecated)
-		userBase.POST("/register", p.handlers.RegisterUser)
-		userBase.POST("/login", p.handlers.LoginUser)
-
 		// Registration routes (with OIDC registration gate)
 		registration := userBase.Group("")
 		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger))

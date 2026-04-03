@@ -18,12 +18,17 @@ import (
 )
 
 var (
-	ErrSessionNotFound   = errors.New("session not found")
-	ErrFlowNotFound      = errors.New("flow not found")
-	ErrFlowTimeout       = errors.New("flow timeout")
-	ErrUnexpectedMessage = errors.New("unexpected message")
-	ErrSignTimeout       = errors.New("sign request timeout")
+	ErrSessionNotFound     = errors.New("session not found")
+	ErrFlowNotFound        = errors.New("flow not found")
+	ErrFlowTimeout         = errors.New("flow timeout")
+	ErrUnexpectedMessage   = errors.New("unexpected message")
+	ErrSignTimeout         = errors.New("sign request timeout")
+	ErrTooManyPendingFlows = errors.New("too many pending flows")
 )
+
+// MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
+// A session cannot start a new flow if it already has this many pending flows.
+const MaxPendingFlowsPerSession = 3
 
 // Session represents an authenticated WebSocket session
 type Session struct {
@@ -178,9 +183,9 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", userID[:8])),
-		actionCh:      make(chan *FlowActionMessage, 10),
-		signCh:        make(chan *SignResponseMessage, 10),
-		closeCh:       make(chan struct{}),
+		actionCh:      make(chan *FlowActionMessage, 50),
+		signCh:        make(chan *SignResponseMessage, 20),
+		closeCh:       make(chan struct{}, 1), // Buffered to prevent deadlock
 	}
 
 	// Register session
@@ -253,11 +258,25 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
 				continue
 			}
-			// Route to the flow
+			// Check if flow exists before routing - prevents action loss for unknown flows
+			session.flowsMu.RLock()
+			_, flowExists := session.flows[actionMsg.FlowID]
+			session.flowsMu.RUnlock()
+			if !flowExists {
+				session.logger.Warn("Action for unknown flow",
+					zap.String("flow_id", actionMsg.FlowID),
+					zap.String("action", actionMsg.Action))
+				_ = session.SendFlowError(actionMsg.FlowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
+				continue
+			}
+			// Route to the flow - send error if channel full instead of dropping
 			select {
 			case session.actionCh <- &actionMsg:
 			default:
-				session.logger.Warn("Action channel full, dropping message")
+				session.logger.Error("Action channel full, sending error to client",
+					zap.String("flow_id", actionMsg.FlowID),
+					zap.String("action", actionMsg.Action))
+				_ = session.SendFlowError(actionMsg.FlowID, "", ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
 
 		case TypeSignResponse:
@@ -266,11 +285,13 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid sign_response", zap.Error(err))
 				continue
 			}
-			// Route to waiting flow
+			// Route to waiting flow - send error if channel full instead of dropping
 			select {
 			case session.signCh <- &signMsg:
 			default:
-				session.logger.Warn("Sign channel full, dropping message")
+				session.logger.Error("Sign channel full, sending error to client",
+					zap.String("message_id", signMsg.MessageID))
+				_ = session.SendFlowError("", "", ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
 
 		default:
@@ -287,7 +308,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 
 	logger := session.logger.With(zap.String("flow_id", flowID[:8]), zap.String("protocol", string(msg.Protocol)))
 
-	// Get handler factory
+	// Ensure cleanup happens even on panic
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in flow handler", zap.Any("panic", r))
+			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
+		}
+	}()
+
+	// Get handler factory first (before acquiring flow lock)
 	m.handlersMu.RLock()
 	factory, ok := m.flowHandlers[msg.Protocol]
 	m.handlersMu.RUnlock()
@@ -297,7 +326,20 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
-	// Create flow
+	// Check concurrent flow limit and register atomically to prevent race condition.
+	// We hold the lock from check through registration to ensure atomic check-and-add.
+	session.flowsMu.Lock()
+	pendingFlows := len(session.flows)
+	if pendingFlows >= MaxPendingFlowsPerSession {
+		session.flowsMu.Unlock()
+		_ = session.SendFlowError(flowID, "", ErrCodeTooManyRequests, "Too many pending flows. Complete or cancel existing flows before starting new ones.")
+		logger.Warn("Rejected flow start - too many pending flows",
+			zap.Int("pending_flows", pendingFlows),
+			zap.Int("limit", MaxPendingFlowsPerSession))
+		return
+	}
+
+	// Create flow while still holding lock
 	flow := &Flow{
 		ID:        flowID,
 		Protocol:  msg.Protocol,
@@ -307,19 +349,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		Data:      make(map[string]interface{}),
 	}
 
-	// Create handler
+	// Register flow immediately to reserve slot
+	session.flows[flowID] = flow
+	session.flowsMu.Unlock()
+
+	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore)
 	if err != nil {
+		// Remove the reserved flow slot on error
+		session.flowsMu.Lock()
+		delete(session.flows, flowID)
+		session.flowsMu.Unlock()
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
 	flow.Handler = handler
-
-	// Register flow
-	session.flowsMu.Lock()
-	session.flows[flowID] = flow
-	session.flowsMu.Unlock()
 
 	defer func() {
 		session.flowsMu.Lock()
@@ -603,14 +648,28 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 }
 
+// TrustEvaluationTimeout is the timeout for trust evaluation (including DID resolution).
+// This is shorter than the full flow timeout to allow faster feedback on failures.
+const TrustEvaluationTimeout = 2 * time.Minute
+
+// UserInteractionTimeout is the default timeout for user interaction steps.
+const UserInteractionTimeout = 5 * time.Minute
+
 // WaitForAction waits for a flow action from the client
 func (s *Session) WaitForAction(ctx context.Context, flowID string, expectedActions ...string) (*FlowActionMessage, error) {
-	timeout := time.After(5 * time.Minute) // User interaction timeout
+	return s.WaitForActionWithTimeout(ctx, flowID, UserInteractionTimeout, expectedActions...)
+}
+
+// WaitForActionWithTimeout waits for a flow action with a custom timeout
+func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, timeout time.Duration, expectedActions ...string) (*FlowActionMessage, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-timeout:
+		case <-timer.C:
 			return nil, ErrFlowTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")

@@ -15,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -92,7 +93,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	// Initialize public HTTP server
-	router := setupRouter(cfg, services, store, logger, roles)
+	router, err := setupRouter(cfg, services, store, logger, roles)
+	if err != nil {
+		return fmt.Errorf("failed to setup router: %w", err)
+	}
 
 	r.srv = &http.Server{
 		Addr:         cfg.Server.Address(),
@@ -169,7 +173,7 @@ func (r *Runner) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger, roles []string) *gin.Engine {
+func setupRouter(cfg *config.Config, services *service.Services, store backend.Backend, logger *zap.Logger, roles []string) (*gin.Engine, error) {
 	// Set Gin mode
 	if cfg.Logging.Level == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -197,6 +201,55 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	// Initialize API handlers
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 
+	// Create HTTP client for outbound requests (AuthZEN proxy, etc.)
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+
+	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
+	var authzenHandler *api.AuthZENProxyHandler
+	if cfg.AuthZENProxy.Enabled {
+		// Set defaults
+		cfg.AuthZENProxy.SetDefaults()
+
+		// Create SPOCP authorizer
+		spocpCfg := &authz.SPOCPConfig{
+			RulesFile: cfg.AuthZENProxy.RulesFile,
+		}
+		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
+		if err != nil {
+			logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
+			authorizer = nil
+		}
+
+		// Fail-closed: if SPOCP initialization failed in production, refuse to start
+		var authorizerInterface authz.Authorizer
+		if authorizer != nil {
+			authorizerInterface = authorizer
+		} else {
+			// Production guard: NoOpAuthorizer cannot be used in release mode
+			if gin.Mode() == gin.ReleaseMode {
+				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
+			}
+			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
+			authorizerInterface = authz.NoOpAuthorizer{}
+		}
+
+		// Get effective PDP URL and set it on the config so the handler uses it
+		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
+		cfg.AuthZENProxy.PDPURL = pdpURL
+
+		authzenHandler = api.NewAuthZENProxyHandler(
+			&cfg.AuthZENProxy,
+			authorizerInterface,
+			httpClient,
+			logger,
+		)
+
+		logger.Info("AuthZEN proxy initialized",
+			zap.String("pdp_url", pdpURL),
+			zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
+		)
+	}
+
 	// Root-level health/status endpoints (no tenant required)
 	router.GET("/status", handlers.Status)
 	router.GET("/health", handlers.Status)
@@ -218,8 +271,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	public := router.Group("/")
 
 	// Create OIDC validator cache for gate middleware
-	// Use configured HTTP client to respect proxy settings
-	httpClient := cfg.HTTPClient.NewHTTPClient(0)
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	{
@@ -231,7 +282,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		registration := userBase.Group("")
 		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, logger))
 		{
-			registration.POST("/register", handlers.RegisterUser)
 			registration.POST("/register-webauthn-begin", handlers.StartWebAuthnRegistration)
 			registration.POST("/register-webauthn-finish", handlers.FinishWebAuthnRegistration)
 		}
@@ -240,7 +290,6 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		login := userBase.Group("")
 		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, logger))
 		{
-			login.POST("/login", handlers.LoginUser)
 			login.POST("/login-webauthn-begin", handlers.StartWebAuthnLogin)
 			login.POST("/login-webauthn-finish", handlers.FinishWebAuthnLogin)
 		}
@@ -322,9 +371,22 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		{
 			walletProvider.POST("/key-attestation/generate", handlers.GenerateKeyAttestation)
 		}
+
+		// =========================================================================
+		// V1 API ROUTES (authenticated)
+		// These endpoints require JWT authentication
+		// =========================================================================
+		if authzenHandler != nil {
+			v1 := protected.Group("/v1")
+			{
+				// AuthZEN proxy endpoints for frontend trust evaluation
+				v1.POST("/evaluate", authzenHandler.Evaluate)
+				v1.POST("/resolve", authzenHandler.Resolve)
+			}
+		}
 	}
 
-	return router
+	return router, nil
 }
 
 func setupAdminRouter(store backend.Backend, adminToken string, logger *zap.Logger) *gin.Engine {

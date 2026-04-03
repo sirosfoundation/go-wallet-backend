@@ -111,34 +111,6 @@ func TestSetupAuthRouter(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-func TestSetupAuthRouter_PublicRoutes(t *testing.T) {
-	cfg := testConfig()
-	logger := testLogger()
-
-	store, err := backend.New(nil, cfg)
-	require.NoError(t, err)
-	defer store.Close()
-
-	services := service.NewServices(store, cfg, logger)
-	roles := []string{"auth"}
-
-	gin.SetMode(gin.TestMode)
-	router := setupAuthRouter(cfg, services, store, logger, roles)
-
-	// Test deprecated password endpoints return 410
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/user/register", nil)
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusGone, w.Code)
-
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/user/login", nil)
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusGone, w.Code)
-}
-
 func TestSetupAuthRouter_WebAuthnRoutes(t *testing.T) {
 	cfg := testConfig()
 	logger := testLogger()

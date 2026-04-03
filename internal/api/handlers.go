@@ -69,26 +69,6 @@ func (h *Handlers) Status(c *gin.Context) {
 	})
 }
 
-// RegisterUser handles user registration
-// Deprecated: Use WebAuthn registration (/webauthn/register/start) instead.
-// This endpoint will be removed in a future version.
-func (h *Handlers) RegisterUser(c *gin.Context) {
-	c.JSON(410, gin.H{
-		"error":   "Password-based registration is deprecated",
-		"message": "Please use WebAuthn registration at /webauthn/register/start",
-	})
-}
-
-// LoginUser handles user login
-// Deprecated: Use WebAuthn login (/webauthn/login/start) instead.
-// This endpoint will be removed in a future version.
-func (h *Handlers) LoginUser(c *gin.Context) {
-	c.JSON(410, gin.H{
-		"error":   "Password-based login is deprecated",
-		"message": "Please use WebAuthn login at /webauthn/login/start",
-	})
-}
-
 // WebAuthn handlers
 
 // StartWebAuthnRegistration begins the WebAuthn registration process
