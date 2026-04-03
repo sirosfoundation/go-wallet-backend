@@ -233,8 +233,9 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 			authorizerInterface = authz.NoOpAuthorizer{}
 		}
 
-		// Get effective PDP URL
+		// Get effective PDP URL and set it on the config so the handler uses it
 		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
+		cfg.AuthZENProxy.PDPURL = pdpURL
 
 		authzenHandler = api.NewAuthZENProxyHandler(
 			&cfg.AuthZENProxy,

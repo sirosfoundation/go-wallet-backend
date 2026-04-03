@@ -403,7 +403,7 @@ type FeaturesConfig struct {
 // Query authorization is performed using SPOCP policies to restrict what queries are allowed.
 type AuthZENProxyConfig struct {
 	// Enabled controls whether the /v1/evaluate endpoint is available.
-	// Default: true
+	// Default: true (set in defaultConfig)
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
 	// PDPURL is the backend PDP URL to proxy requests to.
@@ -746,6 +746,11 @@ func defaultConfig() *Config {
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout: 30, // 30 seconds default
+		},
+		AuthZENProxy: AuthZENProxyConfig{
+			Enabled:         true, // Enabled by default - required for engine flows
+			AllowResolution: true, // Allow DID/metadata resolution by default
+			Timeout:         30,
 		},
 	}
 }

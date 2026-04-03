@@ -458,6 +458,9 @@ func (r *TrustResultPayload) Validate() error {
 
 // isValidLogoURL checks if the URL is safe for use as a logo.
 // Allows HTTPS URLs and data:image/ URIs for embedded images.
+// Note: SVG data URIs can contain embedded JavaScript. XSS prevention
+// is a frontend responsibility - render SVGs via <img> tags (which don't
+// execute scripts) or apply CSP/sanitization.
 func isValidLogoURL(url string) bool {
 	if len(url) < 8 {
 		return false

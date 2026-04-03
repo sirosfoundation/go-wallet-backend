@@ -316,8 +316,18 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		}
 	}()
 
-	// Check concurrent flow limit inside write lock to prevent race condition.
-	// This ensures atomic check-and-add for flow count enforcement.
+	// Get handler factory first (before acquiring flow lock)
+	m.handlersMu.RLock()
+	factory, ok := m.flowHandlers[msg.Protocol]
+	m.handlersMu.RUnlock()
+
+	if !ok {
+		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
+		return
+	}
+
+	// Check concurrent flow limit and register atomically to prevent race condition.
+	// We hold the lock from check through registration to ensure atomic check-and-add.
 	session.flowsMu.Lock()
 	pendingFlows := len(session.flows)
 	if pendingFlows >= MaxPendingFlowsPerSession {
@@ -328,19 +338,8 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 			zap.Int("limit", MaxPendingFlowsPerSession))
 		return
 	}
-	session.flowsMu.Unlock()
 
-	// Get handler factory
-	m.handlersMu.RLock()
-	factory, ok := m.flowHandlers[msg.Protocol]
-	m.handlersMu.RUnlock()
-
-	if !ok {
-		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
-		return
-	}
-
-	// Create flow
+	// Create flow while still holding lock
 	flow := &Flow{
 		ID:        flowID,
 		Protocol:  msg.Protocol,
@@ -350,19 +349,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		Data:      make(map[string]interface{}),
 	}
 
-	// Create handler
+	// Register flow immediately to reserve slot
+	session.flows[flowID] = flow
+	session.flowsMu.Unlock()
+
+	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore)
 	if err != nil {
+		// Remove the reserved flow slot on error
+		session.flowsMu.Lock()
+		delete(session.flows, flowID)
+		session.flowsMu.Unlock()
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
 	flow.Handler = handler
-
-	// Register flow
-	session.flowsMu.Lock()
-	session.flows[flowID] = flow
-	session.flowsMu.Unlock()
 
 	defer func() {
 		session.flowsMu.Lock()

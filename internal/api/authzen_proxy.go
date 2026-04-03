@@ -78,15 +78,23 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	defer cancel()
 
 	// Get tenant from context (set by AuthMiddleware from JWT)
-	tenantID, exists := c.Get("tenant_id")
+	// Use safe type assertion to avoid panic from misconfigured middleware
+	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
 		h.logger.Warn("tenant_id not found in context")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found"})
 		return
 	}
+	tenantID, ok := tenantIDVal.(string)
+	if !ok {
+		h.logger.Error("tenant_id is not a string", zap.Any("tenant_id", tenantIDVal))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
 
 	// Get user ID for audit logging
-	userID, _ := c.Get("user_id")
+	userIDVal, _ := c.Get("user_id")
+	userID := fmt.Sprintf("%v", userIDVal)
 
 	// Parse the evaluation request
 	var req gotrust.EvaluationRequest
@@ -98,15 +106,15 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 
 	// Authorize the query using spocp
 	authzReq := &authz.AuthorizationRequest{
-		TenantID: tenantID.(string),
-		UserID:   fmt.Sprintf("%v", userID),
+		TenantID: tenantID,
+		UserID:   userID,
 		Request:  &req,
 	}
 
 	if err := h.authorizer.Authorize(ctx, authzReq); err != nil {
 		h.logger.Info("query authorization denied",
-			zap.String("tenant_id", tenantID.(string)),
-			zap.Any("user_id", userID),
+			zap.String("tenant_id", tenantID),
+			zap.String("user_id", userID),
 			zap.String("subject_id", req.Subject.ID),
 			zap.String("action", getActionName(&req)),
 			zap.Error(err),
@@ -116,9 +124,9 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	}
 
 	// Get the PDP URL for this tenant
-	pdpURL := h.getPDPURL(tenantID.(string))
+	pdpURL := h.getPDPURL(tenantID)
 	if pdpURL == "" {
-		h.logger.Warn("no PDP configured for tenant", zap.String("tenant_id", tenantID.(string)))
+		h.logger.Warn("no PDP configured for tenant", zap.String("tenant_id", tenantID))
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
 		return
 	}
@@ -135,7 +143,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	resp, err := client.Evaluate(ctx, &req)
 	if err != nil {
 		h.logger.Error("PDP evaluation failed",
-			zap.String("tenant_id", tenantID.(string)),
+			zap.String("tenant_id", tenantID),
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
@@ -145,8 +153,8 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 
 	// Log the decision for audit
 	h.logger.Info("trust evaluation completed",
-		zap.String("tenant_id", tenantID.(string)),
-		zap.Any("user_id", userID),
+		zap.String("tenant_id", tenantID),
+		zap.String("user_id", userID),
 		zap.String("subject_id", req.Subject.ID),
 		zap.String("action", getActionName(&req)),
 		zap.Bool("decision", resp.Decision),
@@ -163,13 +171,25 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 // Request body: { "subject_id": "did:web:example.com" }
 // Response: gotrust.EvaluationResponse with trust_metadata
 func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
+	// Check if resolution is enabled
+	if !h.cfg.AllowResolution {
+		c.JSON(http.StatusForbidden, gin.H{"error": "resolution disabled"})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(h.cfg.Timeout)*time.Second)
 	defer cancel()
 
-	// Get tenant from context
-	tenantID, exists := c.Get("tenant_id")
+	// Get tenant from context (use safe type assertion)
+	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "tenant_id not found"})
+		return
+	}
+	tenantID, ok := tenantIDVal.(string)
+	if !ok {
+		h.logger.Error("tenant_id is not a string", zap.Any("tenant_id", tenantIDVal))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
@@ -196,7 +216,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Authorize the query
 	authzReq := &authz.AuthorizationRequest{
-		TenantID: tenantID.(string),
+		TenantID: tenantID,
 		Request:  evalReq,
 	}
 	if err := h.authorizer.Authorize(ctx, authzReq); err != nil {
@@ -205,7 +225,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	}
 
 	// Get PDP URL and forward
-	pdpURL := h.getPDPURL(tenantID.(string))
+	pdpURL := h.getPDPURL(tenantID)
 	if pdpURL == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
 		return
