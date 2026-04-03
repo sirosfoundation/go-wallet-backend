@@ -50,8 +50,11 @@ type SigningRequest struct {
 
 // ClientMessage represents a message received from client
 type ClientMessage struct {
+	Type      string           `json:"type,omitempty"` // Message type (e.g., "auth")
 	MessageID string           `json:"message_id"`
-	AppToken  string           `json:"appToken,omitempty"` // For handshake
+	AppToken  string           `json:"appToken,omitempty"` // Legacy: For handshake (deprecated)
+	Token     string           `json:"token,omitempty"`    // Auth token (preferred)
+	TenantID  string           `json:"tenantId,omitempty"` // Tenant ID for multi-tenant routing
 	Response  *SigningResponse `json:"response,omitempty"`
 }
 
@@ -74,6 +77,7 @@ type pendingRequest struct {
 type clientConnection struct {
 	conn           *websocket.Conn
 	userID         string
+	tenantID       string
 	pendingMu      sync.Mutex
 	pendingRequest *pendingRequest
 }
@@ -142,18 +146,31 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			continue
 		}
 
-		if msg.AppToken != "" {
-			userID, err := m.validateToken(msg.AppToken)
+		// Handle authentication: support both new format (Token) and legacy (AppToken)
+		authToken := msg.Token
+		if authToken == "" {
+			authToken = msg.AppToken // Legacy fallback
+		}
+
+		if authToken != "" {
+			userID, err := m.validateToken(authToken)
 			if err != nil {
 				m.logger.Error("Handshake failed - invalid token", zap.Error(err))
 				_ = conn.WriteJSON(ServerMessage{Type: "ERROR", MessageID: "auth_failed"})
 				continue
 			}
 
+			// Determine tenant ID (defaults to "default" if not provided)
+			tenantID := msg.TenantID
+			if tenantID == "" {
+				tenantID = "default"
+			}
+
 			// Register the client
 			client = &clientConnection{
-				conn:   conn,
-				userID: userID,
+				conn:     conn,
+				userID:   userID,
+				tenantID: tenantID,
 			}
 
 			m.clientsMu.Lock()
@@ -164,7 +181,7 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			m.clients[userID] = client
 			m.clientsMu.Unlock()
 
-			m.logger.Info("WebSocket handshake established", zap.String("user_id", userID))
+			m.logger.Info("WebSocket handshake established", zap.String("user_id", userID), zap.String("tenant_id", tenantID))
 			_ = conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})
 			continue
 		}
