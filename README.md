@@ -2,8 +2,6 @@
 
 <div align="center">
 
-<div align="center">
-
 [![CI](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wallet-backend.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wallet-backend)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sirosfoundation/go-wallet-backend)](https://goreportcard.com/report/github.com/sirosfoundation/go-wallet-backend)
