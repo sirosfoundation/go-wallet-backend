@@ -88,4 +88,4 @@ require (
 
 replace github.com/descope/virtualwebauthn => github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61
 
-replace github.com/go-webauthn/webauthn => github.com/sirosfoundation/webauthn v0.16.2-siros2
+#replace github.com/go-webauthn/webauthn => github.com/sirosfoundation/webauthn v0.16.2-siros2
