@@ -511,16 +511,16 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// Verify the registration using CreateCredential
 	credential, err := s.webauthn.CreateCredential(waUser, sessionData, parsedResponse)
 	if err != nil {
-		// DEBUG: Capture detailed attestation data for BER signature debugging
+		// Log failure at error level
 		s.logger.Error("Failed to verify registration",
 			zap.Error(err),
 			zap.String("error_type", fmt.Sprintf("%T", err)),
-			zap.String("error_details", err.Error()),
 		)
 
-		// Log attestation format and statement details
+		// Log detailed attestation data at debug level for troubleshooting
+		// Enable debug logging to capture this data for reproduction
 		attObj := parsedResponse.Response.AttestationObject
-		s.logger.Error("Attestation object details",
+		s.logger.Debug("Attestation object details",
 			zap.String("format", attObj.Format),
 			zap.Int("auth_data_len", len(attObj.RawAuthData)),
 			zap.ByteString("auth_data_hex", []byte(fmt.Sprintf("%x", attObj.RawAuthData))),
@@ -530,7 +530,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		for key, val := range attObj.AttStatement {
 			switch v := val.(type) {
 			case []byte:
-				s.logger.Error("AttStatement field (bytes)",
+				s.logger.Debug("AttStatement field (bytes)",
 					zap.String("key", key),
 					zap.Int("length", len(v)),
 					zap.String("base64", base64.StdEncoding.EncodeToString(v)),
@@ -541,7 +541,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 				if key == "x5c" {
 					for i, cert := range v {
 						if certBytes, ok := cert.([]byte); ok {
-							s.logger.Error("x5c certificate",
+							s.logger.Debug("x5c certificate",
 								zap.Int("index", i),
 								zap.Int("length", len(certBytes)),
 								zap.String("base64_der", base64.StdEncoding.EncodeToString(certBytes)),
@@ -549,18 +549,18 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 						}
 					}
 				} else {
-					s.logger.Error("AttStatement field (array)",
+					s.logger.Debug("AttStatement field (array)",
 						zap.String("key", key),
 						zap.Int("length", len(v)),
 					)
 				}
 			case int64:
-				s.logger.Error("AttStatement field (int64)",
+				s.logger.Debug("AttStatement field (int64)",
 					zap.String("key", key),
 					zap.Int64("value", v),
 				)
 			default:
-				s.logger.Error("AttStatement field (other)",
+				s.logger.Debug("AttStatement field (other)",
 					zap.String("key", key),
 					zap.String("type", fmt.Sprintf("%T", v)),
 				)
@@ -568,7 +568,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		}
 
 		// Log the raw credential JSON for complete reproduction data
-		s.logger.Error("Raw credential JSON for reproduction",
+		s.logger.Debug("Raw credential JSON for reproduction",
 			zap.ByteString("credential_json", req.Credential),
 		)
 
