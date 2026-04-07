@@ -423,13 +423,16 @@ type WebAuthnSecurityConfig struct {
 }
 
 // GetAttestationConveyance returns the attestation conveyance preference
-// Defaults to "none" if not set or invalid
+// Defaults to "direct" for BER attestation debugging (normally would be "none")
 func (c *WebAuthnSecurityConfig) GetAttestationConveyance() string {
 	switch c.AttestationConveyance {
 	case "none", "indirect", "direct", "enterprise":
 		return c.AttestationConveyance
 	default:
-		return "none"
+		// DEBUG: Force direct attestation to trigger x509.CheckSignature path
+		// This exercises certificate chain verification which may fail with
+		// BER-encoded ECDSA signatures from certain authenticators (e.g., YubiKey 5.8)
+		return "direct"
 	}
 }
 
