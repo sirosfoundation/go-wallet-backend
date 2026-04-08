@@ -42,10 +42,6 @@ func (t TenantID) String() string {
 
 // TrustConfig holds trust evaluation configuration for a tenant
 type TrustConfig struct {
-	// TrustEndpoint is the URL for the go-trust service.
-	// If empty, uses the default trust endpoint from server config.
-	TrustEndpoint string `json:"trust_endpoint,omitempty" bson:"trust_endpoint" gorm:"column:trust_endpoint"`
-
 	// PDPURL is the AuthZEN PDP URL for the /v1/evaluate proxy endpoint.
 	// If empty, uses the global authzen_proxy.pdp_url configuration.
 	// This allows different tenants to use different trust services.

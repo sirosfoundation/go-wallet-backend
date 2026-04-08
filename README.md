@@ -52,7 +52,9 @@ Tenants can override the default trust endpoint via their configuration:
 ```json
 {
   "id": "my-tenant",
-  "trust_endpoint": "https://custom-pdp.example.com"
+  "trust_config": {
+    "pdp_url": "https://custom-pdp.example.com"
+  }
 }
 ```
 

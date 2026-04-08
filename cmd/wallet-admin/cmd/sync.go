@@ -33,8 +33,8 @@ type SyncTenant struct {
 
 // SyncTrustConfig defines trust evaluation configuration for a tenant.
 type SyncTrustConfig struct {
-	TrustEndpoint string `yaml:"trust_endpoint,omitempty"`
-	TrustTTL      *int   `yaml:"trust_ttl,omitempty"`
+	PDPURL   string `yaml:"pdp_url,omitempty"`
+	TrustTTL *int   `yaml:"trust_ttl,omitempty"`
 }
 
 // SyncOIDCGate defines OIDC gate configuration for a tenant.
@@ -84,8 +84,8 @@ type syncTenantResp struct {
 }
 
 type syncTrustConfigResp struct {
-	TrustEndpoint string `json:"trust_endpoint,omitempty"`
-	TrustTTL      int    `json:"trust_ttl"`
+	PDPURL   string `json:"pdp_url,omitempty"`
+	TrustTTL int    `json:"trust_ttl"`
 }
 
 type syncOIDCGateResp struct {
@@ -413,7 +413,7 @@ func tenantNeedsUpdate(desired SyncTenant, existing syncTenantResp) bool {
 		if existing.TrustConfig == nil {
 			return true
 		}
-		if desired.TrustConfig.TrustEndpoint != existing.TrustConfig.TrustEndpoint {
+		if desired.TrustConfig.PDPURL != existing.TrustConfig.PDPURL {
 			return true
 		}
 		if desired.TrustConfig.TrustTTL != nil && *desired.TrustConfig.TrustTTL != existing.TrustConfig.TrustTTL {
@@ -514,8 +514,8 @@ func buildTenantRequestBody(t SyncTenant) map[string]interface{} {
 	}
 	if t.TrustConfig != nil {
 		tc := map[string]interface{}{}
-		if t.TrustConfig.TrustEndpoint != "" {
-			tc["trust_endpoint"] = t.TrustConfig.TrustEndpoint
+		if t.TrustConfig.PDPURL != "" {
+			tc["pdp_url"] = t.TrustConfig.PDPURL
 		}
 		if t.TrustConfig.TrustTTL != nil {
 			tc["trust_ttl"] = *t.TrustConfig.TrustTTL

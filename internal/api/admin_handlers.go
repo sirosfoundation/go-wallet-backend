@@ -40,9 +40,8 @@ type TenantRequest struct {
 
 // TrustConfigRequest represents the trust configuration in API requests
 type TrustConfigRequest struct {
-	TrustEndpoint string `json:"trust_endpoint,omitempty"`
-	TrustTTL      *int   `json:"trust_ttl,omitempty"` // seconds
-	PDPURL        string `json:"pdp_url,omitempty"`   // per-tenant AuthZEN PDP URL
+	TrustTTL *int   `json:"trust_ttl,omitempty"` // seconds
+	PDPURL   string `json:"pdp_url,omitempty"`   // per-tenant AuthZEN PDP URL
 }
 
 // OIDCProviderConfigRequest represents an OIDC provider in API requests
@@ -79,9 +78,8 @@ type TenantResponse struct {
 
 // TrustConfigResponse represents the trust configuration in API responses
 type TrustConfigResponse struct {
-	TrustEndpoint string `json:"trust_endpoint,omitempty"`
-	TrustTTL      int    `json:"trust_ttl"` // seconds
-	PDPURL        string `json:"pdp_url,omitempty"` // per-tenant AuthZEN PDP URL
+	TrustTTL int    `json:"trust_ttl"`         // seconds
+	PDPURL   string `json:"pdp_url,omitempty"` // per-tenant AuthZEN PDP URL
 }
 
 // OIDCProviderConfigResponse represents an OIDC provider in API responses
@@ -114,11 +112,10 @@ func tenantToResponse(t *domain.Tenant) *TenantResponse {
 		UpdatedAt:     t.UpdatedAt,
 	}
 	// Include trust config if any non-default values are set
-	if t.TrustConfig.TrustEndpoint != "" || t.TrustConfig.TrustTTL != 0 || t.TrustConfig.PDPURL != "" {
+	if t.TrustConfig.TrustTTL != 0 || t.TrustConfig.PDPURL != "" {
 		resp.TrustConfig = &TrustConfigResponse{
-			TrustEndpoint: t.TrustConfig.TrustEndpoint,
-			TrustTTL:      t.TrustConfig.TrustTTL,
-			PDPURL:        t.TrustConfig.PDPURL,
+			TrustTTL: t.TrustConfig.TrustTTL,
+			PDPURL:   t.TrustConfig.PDPURL,
 		}
 	}
 	// Include OIDC gate config if enabled
@@ -309,7 +306,6 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 
 	// Apply trust config if provided
 	if req.TrustConfig != nil {
-		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
 		if req.TrustConfig.TrustTTL != nil {
 			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
 		}
@@ -368,7 +364,6 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 	// Update trust config if provided
 	if req.TrustConfig != nil {
-		tenant.TrustConfig.TrustEndpoint = req.TrustConfig.TrustEndpoint
 		if req.TrustConfig.TrustTTL != nil {
 			tenant.TrustConfig.TrustTTL = *req.TrustConfig.TrustTTL
 		}

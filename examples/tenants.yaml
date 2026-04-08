@@ -16,7 +16,7 @@ tenants:
     display_name: Default
     enabled: true
     trust_config:
-      trust_endpoint: https://trust.example.com/authzen
+      pdp_url: https://trust.example.com/authzen
       trust_ttl: 86400  # seconds (24 hours)
     issuers:
       - credential_issuer_identifier: https://issuer.example.com

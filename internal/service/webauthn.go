@@ -1065,13 +1065,6 @@ func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.Tenan
 		"jti":       jti,               // JWT ID: unique identifier for revocation
 	}
 
-	// Add tenant trust endpoint if configured
-	if tenant, err := s.store.Tenants().GetByID(context.Background(), tenantID); err == nil && tenant != nil {
-		if tenant.TrustConfig.TrustEndpoint != "" {
-			claims["trust_endpoint"] = tenant.TrustConfig.TrustEndpoint
-		}
-	}
-
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.JWT.Secret))
 }

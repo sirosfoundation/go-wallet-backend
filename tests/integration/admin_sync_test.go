@@ -346,7 +346,7 @@ tenants:
   - id: trust-tenant
     name: Trust Tenant
     trust_config:
-      trust_endpoint: https://trust.example.com/authzen
+      pdp_url: https://trust.example.com/authzen
       trust_ttl: 3600
 `)
 
@@ -365,8 +365,8 @@ tenants:
 		if !ok {
 			t.Fatal("expected trust_config in response")
 		}
-		if tc["trust_endpoint"] != "https://trust.example.com/authzen" {
-			t.Errorf("unexpected trust_endpoint: %v", tc["trust_endpoint"])
+		if tc["pdp_url"] != "https://trust.example.com/authzen" {
+			t.Errorf("unexpected pdp_url: %v", tc["pdp_url"])
 		}
 		ttl, _ := tc["trust_ttl"].(json.Number)
 		if ttl.String() != "3600" {

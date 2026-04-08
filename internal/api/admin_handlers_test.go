@@ -216,7 +216,7 @@ func TestAdminHandlers_CreateTenant(t *testing.T) {
 	})
 
 	t.Run("create with trust_config pdp_url", func(t *testing.T) {
-		body := `{"id": "pdp-tenant", "name": "PDP Tenant", "trust_config": {"trust_endpoint": "https://trust.example.com", "pdp_url": "https://pdp.example.com"}}`
+		body := `{"id": "pdp-tenant", "name": "PDP Tenant", "trust_config": {"pdp_url": "https://pdp.example.com"}}`
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -351,7 +351,7 @@ func TestAdminHandlers_UpdateTenant(t *testing.T) {
 	})
 
 	t.Run("update trust_config with pdp_url", func(t *testing.T) {
-		body := `{"id": "update-test", "name": "Updated Name", "trust_config": {"trust_endpoint": "https://trust.example.com", "trust_ttl": 300, "pdp_url": "https://pdp.example.com"}}`
+		body := `{"id": "update-test", "name": "Updated Name", "trust_config": {"trust_ttl": 300, "pdp_url": "https://pdp.example.com"}}`
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPut, "/admin/tenants/update-test", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -368,9 +368,6 @@ func TestAdminHandlers_UpdateTenant(t *testing.T) {
 		}
 		if tenant.TrustConfig.PDPURL != "https://pdp.example.com" {
 			t.Errorf("Expected pdp_url 'https://pdp.example.com', got %q", tenant.TrustConfig.PDPURL)
-		}
-		if tenant.TrustConfig.TrustEndpoint != "https://trust.example.com" {
-			t.Errorf("Expected trust_endpoint 'https://trust.example.com', got %q", tenant.TrustConfig.TrustEndpoint)
 		}
 		if tenant.TrustConfig.TrustTTL != 300 {
 			t.Errorf("Expected trust_ttl 300, got %d", tenant.TrustConfig.TrustTTL)
