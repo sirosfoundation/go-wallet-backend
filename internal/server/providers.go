@@ -81,9 +81,14 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)
+		// Two routes for compatibility: legacy /tenant/:id/config and new /api/v1/tenants/:id/config
 		tenant := public.Group("/tenant")
 		{
 			tenant.GET("/:id/config", p.handlers.GetTenantConfig)
+		}
+		apiV1 := public.Group("/api/v1")
+		{
+			apiV1.GET("/tenants/:id/config", p.handlers.GetTenantConfig)
 		}
 
 		// Auth check helper
