@@ -423,7 +423,8 @@ type WebAuthnSecurityConfig struct {
 }
 
 // GetAttestationConveyance returns the attestation conveyance preference
-// Defaults to "none" if not set or invalid
+// Defaults to "none" (recommended for most deployments)
+// Use "direct" for testing authenticator attestation verification
 func (c *WebAuthnSecurityConfig) GetAttestationConveyance() string {
 	switch c.AttestationConveyance {
 	case "none", "indirect", "direct", "enterprise":
