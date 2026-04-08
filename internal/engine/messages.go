@@ -441,9 +441,9 @@ func (r *TrustResultPayload) Validate() error {
 		if len(r.Logo) > MaxLogoURLLength {
 			return fmt.Errorf("TrustResultPayload: Logo URL exceeds maximum length (%d > %d)", len(r.Logo), MaxLogoURLLength)
 		}
-		// Basic URL validation - must start with https:// or data:image/
+		// Basic URL validation - must start with http://, https://, or data:image/
 		if !isValidLogoURL(r.Logo) {
-			return errors.New("TrustResultPayload: Logo must be an HTTPS URL or data:image/ URI")
+			return errors.New("TrustResultPayload: Logo must be an HTTP(S) URL or data:image/ URI")
 		}
 	}
 
@@ -457,17 +457,21 @@ func (r *TrustResultPayload) Validate() error {
 }
 
 // isValidLogoURL checks if the URL is safe for use as a logo.
-// Allows HTTPS URLs and data:image/ URIs for embedded images.
+// Allows HTTPS/HTTP URLs and data:image/ URIs for embedded images.
+// HTTP URLs are allowed for dev/test setups; production PDPs should only
+// return HTTPS or data URLs.
 // Note: SVG data URIs can contain embedded JavaScript. XSS prevention
 // is a frontend responsibility - render SVGs via <img> tags (which don't
 // execute scripts) or apply CSP/sanitization.
 func isValidLogoURL(url string) bool {
-	if len(url) < 8 {
+	if len(url) < 7 {
 		return false
 	}
-	// Check for https:// prefix (case-insensitive first char for robustness)
-	if (url[0] == 'h' || url[0] == 'H') &&
-		(len(url) >= 8 && (url[:8] == "https://" || url[:8] == "HTTPS://")) {
+	// Check for http:// or https:// prefix (case-insensitive)
+	if len(url) >= 7 && (url[:7] == "http://" || url[:7] == "HTTP://") {
+		return true
+	}
+	if len(url) >= 8 && (url[:8] == "https://" || url[:8] == "HTTPS://") {
 		return true
 	}
 	// Check for data:image/ prefix for inline images

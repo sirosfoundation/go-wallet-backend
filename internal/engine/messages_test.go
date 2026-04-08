@@ -710,20 +710,12 @@ func TestTrustResultPayload_Validate_Invalid(t *testing.T) {
 			wantContain: "Logo URL exceeds maximum length",
 		},
 		{
-			name: "logo with http URL (not https)",
-			payload: TrustResultPayload{
-				Trusted: true,
-				Logo:    "http://example.com/logo.png",
-			},
-			wantContain: "Logo must be an HTTPS URL",
-		},
-		{
 			name: "logo with javascript URL (XSS attempt)",
 			payload: TrustResultPayload{
 				Trusted: true,
 				Logo:    "javascript:alert('xss')",
 			},
-			wantContain: "Logo must be an HTTPS URL",
+			wantContain: "Logo must be an HTTP(S) URL",
 		},
 		{
 			name: "reason too long",
@@ -797,7 +789,8 @@ func TestIsValidLogoURL(t *testing.T) {
 		{"HTTPS://EXAMPLE.COM/LOGO.PNG", true},
 		{"data:image/png;base64,abc123", true},
 		{"data:image/svg+xml;base64,abc123", true},
-		{"http://example.com/logo.png", false},
+		{"http://example.com/logo.png", true},
+		{"HTTP://EXAMPLE.COM/LOGO.PNG", true},
 		{"javascript:alert(1)", false},
 		{"ftp://example.com/logo.png", false},
 		{"", false},
