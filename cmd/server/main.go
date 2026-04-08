@@ -95,23 +95,34 @@ func main() {
 
 	if backendCfg != nil {
 		// Issue #70: Warn when trust evaluation is disabled (allows any issuer/verifier)
-		if !backendCfg.Trust.IsIssuerTrustEnabled() || !backendCfg.Trust.IsVerifierTrustEnabled() {
+		// Cache the results to avoid repeated calls
+		issuerEnabled := backendCfg.Trust.IsIssuerTrustEnabled()
+		verifierEnabled := backendCfg.Trust.IsVerifierTrustEnabled()
+
+		if !issuerEnabled || !verifierEnabled {
 			level := zap.WarnLevel
-			msg := "SECURITY: Trust evaluation is disabled - all issuers/verifiers will be accepted without verification"
 
-			if isProduction {
-				msg = "SECURITY WARNING: Trust evaluation is disabled in production environment"
-			}
-
-			if !backendCfg.Trust.IsIssuerTrustEnabled() && !backendCfg.Trust.IsVerifierTrustEnabled() {
+			if !issuerEnabled && !verifierEnabled {
+				msg := "SECURITY: Trust evaluation is disabled - all issuers and verifiers will be accepted without verification"
+				if isProduction {
+					msg = "SECURITY WARNING: Trust evaluation is disabled in production environment for issuers and verifiers"
+				}
 				logger.Log(level, msg,
 					zap.Bool("issuer_trust_enabled", false),
 					zap.Bool("verifier_trust_enabled", false))
-			} else if !backendCfg.Trust.IsIssuerTrustEnabled() {
-				logger.Log(level, msg+" for issuers",
+			} else if !issuerEnabled {
+				msg := "SECURITY: Issuer trust evaluation is disabled - all issuers will be accepted without verification"
+				if isProduction {
+					msg = "SECURITY WARNING: Issuer trust evaluation is disabled in production environment"
+				}
+				logger.Log(level, msg,
 					zap.Bool("issuer_trust_enabled", false))
 			} else {
-				logger.Log(level, msg+" for verifiers",
+				msg := "SECURITY: Verifier trust evaluation is disabled - all verifiers will be accepted without verification"
+				if isProduction {
+					msg = "SECURITY WARNING: Verifier trust evaluation is disabled in production environment"
+				}
+				logger.Log(level, msg,
 					zap.Bool("verifier_trust_enabled", false))
 			}
 		}
