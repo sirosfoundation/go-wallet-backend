@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -570,7 +571,10 @@ func TestGetPDPURL(t *testing.T) {
 
 	// Returns the global URL when no per-tenant config is available
 	ctx := context.Background()
-	url := handler.getPDPURL(ctx, "any-tenant")
+	url, err := handler.getPDPURL(ctx, "any-tenant")
+	if err != nil {
+		t.Fatalf("getPDPURL() unexpected error: %v", err)
+	}
 	if url != cfg.PDPURL {
 		t.Errorf("getPDPURL() = %q, want %q", url, cfg.PDPURL)
 	}
@@ -678,21 +682,30 @@ func TestGetPDPURL_PerTenantConfig(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("tenant with custom PDP uses tenant URL", func(t *testing.T) {
-		url := handler.getPDPURL(ctx, "tenant-with-pdp")
+		url, err := handler.getPDPURL(ctx, "tenant-with-pdp")
+		if err != nil {
+			t.Fatalf("getPDPURL() unexpected error: %v", err)
+		}
 		if url != tenantPDPURL {
 			t.Errorf("getPDPURL() = %q, want tenant PDP URL %q", url, tenantPDPURL)
 		}
 	})
 
 	t.Run("tenant without custom PDP uses global URL", func(t *testing.T) {
-		url := handler.getPDPURL(ctx, "tenant-without-pdp")
+		url, err := handler.getPDPURL(ctx, "tenant-without-pdp")
+		if err != nil {
+			t.Fatalf("getPDPURL() unexpected error: %v", err)
+		}
 		if url != globalPDPURL {
 			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
 		}
 	})
 
 	t.Run("unknown tenant uses global URL", func(t *testing.T) {
-		url := handler.getPDPURL(ctx, "unknown-tenant")
+		url, err := handler.getPDPURL(ctx, "unknown-tenant")
+		if err != nil {
+			t.Fatalf("getPDPURL() unexpected error: %v", err)
+		}
 		if url != globalPDPURL {
 			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
 		}
@@ -700,7 +713,56 @@ func TestGetPDPURL_PerTenantConfig(t *testing.T) {
 
 	t.Run("nil tenant lookup uses global URL", func(t *testing.T) {
 		handlerNoLookup := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
-		url := handlerNoLookup.getPDPURL(ctx, "any-tenant")
+		url, err := handlerNoLookup.getPDPURL(ctx, "any-tenant")
+		if err != nil {
+			t.Fatalf("getPDPURL() unexpected error: %v", err)
+		}
+		if url != globalPDPURL {
+			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
+		}
+	})
+}
+
+func TestGetPDPURL_FailClosedBehavior(t *testing.T) {
+	globalPDPURL := "https://global-pdp.example.com"
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:                     true,
+		PDPURL:                      globalPDPURL,
+		Timeout:                     30,
+		FailOpenOnTenantLookupError: false, // default fail-closed
+	}
+
+	// Create tenant lookup that returns an error
+	tenantLookup := &mockTenantLookup{
+		err: fmt.Errorf("database connection failed"),
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, http.DefaultClient, logger)
+
+	ctx := context.Background()
+
+	t.Run("fail-closed returns error on tenant lookup failure", func(t *testing.T) {
+		_, err := handler.getPDPURL(ctx, "any-tenant")
+		if err == nil {
+			t.Error("getPDPURL() expected error with fail-closed behavior, got nil")
+		}
+	})
+
+	t.Run("fail-open returns global URL on tenant lookup failure", func(t *testing.T) {
+		cfgFailOpen := &config.AuthZENProxyConfig{
+			Enabled:                     true,
+			PDPURL:                      globalPDPURL,
+			Timeout:                     30,
+			FailOpenOnTenantLookupError: true, // fail-open
+		}
+		handlerFailOpen := NewAuthZENProxyHandler(cfgFailOpen, &mockAuthorizer{allowAll: true}, tenantLookup, http.DefaultClient, logger)
+
+		url, err := handlerFailOpen.getPDPURL(ctx, "any-tenant")
+		if err != nil {
+			t.Fatalf("getPDPURL() with fail-open unexpected error: %v", err)
+		}
 		if url != globalPDPURL {
 			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
 		}

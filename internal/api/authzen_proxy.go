@@ -133,7 +133,15 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	}
 
 	// Get the PDP URL for this tenant
-	pdpURL := h.getPDPURL(ctx, tenantID)
+	pdpURL, err := h.getPDPURL(ctx, tenantID)
+	if err != nil {
+		h.logger.Error("tenant lookup failed",
+			zap.String("tenant_id", tenantID),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "tenant configuration unavailable"})
+		return
+	}
 	if pdpURL == "" {
 		h.logger.Warn("no PDP configured for tenant", zap.String("tenant_id", tenantID))
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
@@ -234,7 +242,15 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	}
 
 	// Get PDP URL and forward
-	pdpURL := h.getPDPURL(ctx, tenantID)
+	pdpURL, err := h.getPDPURL(ctx, tenantID)
+	if err != nil {
+		h.logger.Error("tenant lookup failed",
+			zap.String("tenant_id", tenantID),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "tenant configuration unavailable"})
+		return
+	}
 	if pdpURL == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
 		return
@@ -258,25 +274,31 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 // getPDPURL returns the PDP URL for the given tenant.
 // If the tenant has a per-tenant PDP configured (in TrustConfig.PDPURL),
 // that URL is used. Otherwise, falls back to the global configuration.
-func (h *AuthZENProxyHandler) getPDPURL(ctx context.Context, tenantID string) string {
+//
+// Returns an error if tenant lookup fails and FailOpenOnTenantLookupError is false.
+func (h *AuthZENProxyHandler) getPDPURL(ctx context.Context, tenantID string) (string, error) {
 	// Try to get per-tenant configuration if tenant lookup is available
 	if h.tenantLookup != nil && tenantID != "" {
 		tenant, err := h.tenantLookup.GetByID(ctx, domain.TenantID(tenantID))
 		if err != nil {
-			h.logger.Debug("failed to look up tenant for PDP URL",
+			h.logger.Warn("failed to look up tenant for PDP URL",
 				zap.String("tenant_id", tenantID),
 				zap.Error(err))
-			// Fall through to global config
+			// Fail closed by default - return error unless configured to fail open
+			if !h.cfg.FailOpenOnTenantLookupError {
+				return "", fmt.Errorf("tenant lookup failed: %w", err)
+			}
+			// Fall through to global config if fail-open is enabled
 		} else if tenant != nil && tenant.TrustConfig.PDPURL != "" {
 			h.logger.Debug("using per-tenant PDP URL",
 				zap.String("tenant_id", tenantID),
 				zap.String("pdp_url", tenant.TrustConfig.PDPURL))
-			return tenant.TrustConfig.PDPURL
+			return tenant.TrustConfig.PDPURL, nil
 		}
 	}
 
 	// Fall back to global PDP URL
-	return h.cfg.PDPURL
+	return h.cfg.PDPURL, nil
 }
 
 // getActionName safely extracts the action name from a request.

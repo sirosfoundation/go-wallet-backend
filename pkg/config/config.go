@@ -422,6 +422,12 @@ type AuthZENProxyConfig struct {
 	// Resolution requests fetch metadata (DID documents, entity configs) without key validation.
 	// Default: true
 	AllowResolution bool `yaml:"allow_resolution" envconfig:"ALLOW_RESOLUTION"`
+
+	// FailOpenOnTenantLookupError controls behavior when per-tenant PDP lookup fails.
+	// If false (default), tenant lookup errors return an error to the client.
+	// If true, falls back to the global PDP URL on lookup errors.
+	// Security note: fail-closed (false) prevents bypassing per-tenant security policies.
+	FailOpenOnTenantLookupError bool `yaml:"fail_open_on_tenant_lookup_error" envconfig:"FAIL_OPEN_ON_TENANT_LOOKUP_ERROR"`
 }
 
 // SetDefaults sets default values for AuthZEN proxy configuration.
