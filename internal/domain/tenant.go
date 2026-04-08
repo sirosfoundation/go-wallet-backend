@@ -46,6 +46,11 @@ type TrustConfig struct {
 	// If empty, uses the default trust endpoint from server config.
 	TrustEndpoint string `json:"trust_endpoint,omitempty" bson:"trust_endpoint" gorm:"column:trust_endpoint"`
 
+	// PDPURL is the AuthZEN PDP URL for the /v1/evaluate proxy endpoint.
+	// If empty, uses the global authzen_proxy.pdp_url configuration.
+	// This allows different tenants to use different trust services.
+	PDPURL string `json:"pdp_url,omitempty" bson:"pdp_url" gorm:"column:pdp_url"`
+
 	// TrustTTL is how long trust evaluations remain valid (in seconds).
 	// Default: 86400 (24 hours)
 	TrustTTL int `json:"trust_ttl,omitempty" bson:"trust_ttl" gorm:"column:trust_ttl;default:86400"`

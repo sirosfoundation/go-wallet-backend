@@ -240,6 +240,7 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		authzenHandler = api.NewAuthZENProxyHandler(
 			&cfg.AuthZENProxy,
 			authorizerInterface,
+			store.Tenants(), // Enable per-tenant PDP configuration lookup
 			httpClient,
 			logger,
 		)

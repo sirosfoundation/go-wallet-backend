@@ -17,25 +17,34 @@ import (
 	"go.uber.org/zap"
 )
 
+// TenantLookup is an interface for looking up tenant configuration.
+// This abstraction allows for easier testing.
+type TenantLookup interface {
+	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
+}
+
 // AuthZENProxyHandler handles AuthZEN evaluation requests by proxying to a PDP.
 // It provides an authenticated endpoint for the frontend to make trust decisions.
 type AuthZENProxyHandler struct {
-	cfg        *config.AuthZENProxyConfig
-	authorizer authz.Authorizer
-	clients    map[string]*authzenclient.Client
-	clientsMu  sync.RWMutex
-	httpClient *http.Client
-	logger     *zap.Logger
+	cfg          *config.AuthZENProxyConfig
+	authorizer   authz.Authorizer
+	tenantLookup TenantLookup
+	clients      map[string]*authzenclient.Client
+	clientsMu    sync.RWMutex
+	httpClient   *http.Client
+	logger       *zap.Logger
 }
 
 // NewAuthZENProxyHandler creates a new AuthZEN proxy handler.
-func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
+// The tenantLookup parameter is optional - if nil, per-tenant configuration is disabled.
+func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
-		cfg:        cfg,
-		authorizer: authorizer,
-		clients:    make(map[string]*authzenclient.Client),
-		httpClient: httpClient,
-		logger:     logger.Named("authzen-proxy"),
+		cfg:          cfg,
+		authorizer:   authorizer,
+		tenantLookup: tenantLookup,
+		clients:      make(map[string]*authzenclient.Client),
+		httpClient:   httpClient,
+		logger:       logger.Named("authzen-proxy"),
 	}
 }
 
@@ -124,7 +133,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	}
 
 	// Get the PDP URL for this tenant
-	pdpURL := h.getPDPURL(tenantID)
+	pdpURL := h.getPDPURL(ctx, tenantID)
 	if pdpURL == "" {
 		h.logger.Warn("no PDP configured for tenant", zap.String("tenant_id", tenantID))
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
@@ -225,7 +234,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	}
 
 	// Get PDP URL and forward
-	pdpURL := h.getPDPURL(tenantID)
+	pdpURL := h.getPDPURL(ctx, tenantID)
 	if pdpURL == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "trust evaluation not configured"})
 		return
@@ -247,11 +256,26 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 }
 
 // getPDPURL returns the PDP URL for the given tenant.
-// TODO: Support per-tenant PDP configuration.
-func (h *AuthZENProxyHandler) getPDPURL(tenantID string) string {
-	// For now, use the global PDP URL
-	// Future: look up per-tenant configuration
-	_ = tenantID
+// If the tenant has a per-tenant PDP configured (in TrustConfig.PDPURL),
+// that URL is used. Otherwise, falls back to the global configuration.
+func (h *AuthZENProxyHandler) getPDPURL(ctx context.Context, tenantID string) string {
+	// Try to get per-tenant configuration if tenant lookup is available
+	if h.tenantLookup != nil && tenantID != "" {
+		tenant, err := h.tenantLookup.GetByID(ctx, domain.TenantID(tenantID))
+		if err != nil {
+			h.logger.Debug("failed to look up tenant for PDP URL",
+				zap.String("tenant_id", tenantID),
+				zap.Error(err))
+			// Fall through to global config
+		} else if tenant != nil && tenant.TrustConfig.PDPURL != "" {
+			h.logger.Debug("using per-tenant PDP URL",
+				zap.String("tenant_id", tenantID),
+				zap.String("pdp_url", tenant.TrustConfig.PDPURL))
+			return tenant.TrustConfig.PDPURL
+		}
+	}
+
+	// Fall back to global PDP URL
 	return h.cfg.PDPURL
 }
 
@@ -261,20 +285,4 @@ func getActionName(req *gotrust.EvaluationRequest) string {
 		return req.Action.Name
 	}
 	return ""
-}
-
-// TenantPDPConfig holds per-tenant PDP configuration.
-// This will be stored in the tenant configuration.
-type TenantPDPConfig struct {
-	// PDPURL is the AuthZEN PDP URL for this tenant.
-	PDPURL string `json:"pdp_url" bson:"pdp_url"`
-	// Enabled indicates whether trust evaluation is enabled for this tenant.
-	Enabled bool `json:"enabled" bson:"enabled"`
-}
-
-// GetTenantPDPConfig retrieves the PDP configuration for a tenant.
-// This is a placeholder for future per-tenant configuration.
-func GetTenantPDPConfig(ctx context.Context, tenant *domain.Tenant) *TenantPDPConfig {
-	// Future: read from tenant.Config or a separate collection
-	return nil
 }

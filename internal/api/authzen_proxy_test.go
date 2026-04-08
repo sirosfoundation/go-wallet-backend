@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"go.uber.org/zap"
@@ -35,8 +36,29 @@ func (m *mockAuthorizer) Authorize(ctx context.Context, req *authz.Authorization
 	return nil
 }
 
+// mockTenantLookup implements TenantLookup for testing
+type mockTenantLookup struct {
+	tenants map[domain.TenantID]*domain.Tenant
+	err     error
+}
+
+func (m *mockTenantLookup) GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.tenants == nil {
+		return nil, nil
+	}
+	return m.tenants[id], nil
+}
+
 // setupAuthZENProxyHandler creates a test handler with a mock PDP
 func setupAuthZENProxyHandler(t *testing.T, authorizer authz.Authorizer, pdpHandler http.Handler) (*AuthZENProxyHandler, *gin.Engine, *httptest.Server) {
+	return setupAuthZENProxyHandlerWithTenants(t, authorizer, pdpHandler, nil)
+}
+
+// setupAuthZENProxyHandlerWithTenants creates a test handler with optional per-tenant config
+func setupAuthZENProxyHandlerWithTenants(t *testing.T, authorizer authz.Authorizer, pdpHandler http.Handler, tenantLookup TenantLookup) (*AuthZENProxyHandler, *gin.Engine, *httptest.Server) {
 	var pdpURL string
 	var pdpServer *httptest.Server
 
@@ -46,13 +68,14 @@ func setupAuthZENProxyHandler(t *testing.T, authorizer authz.Authorizer, pdpHand
 	}
 
 	cfg := &config.AuthZENProxyConfig{
-		Enabled: true,
-		PDPURL:  pdpURL,
-		Timeout: 30,
+		Enabled:         true,
+		PDPURL:          pdpURL,
+		Timeout:         30,
+		AllowResolution: true,
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, authorizer, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, authorizer, tenantLookup, http.DefaultClient, logger)
 
 	router := gin.New()
 
@@ -134,7 +157,7 @@ func TestEvaluate_Unauthorized_NoTenant(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	// No middleware to set tenant_id
@@ -206,7 +229,7 @@ func TestEvaluate_ServiceUnavailable_NoPDP(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -335,13 +358,14 @@ func TestResolve_Forbidden_AuthorizationDenied(t *testing.T) {
 
 func TestResolve_ServiceUnavailable_NoPDP(t *testing.T) {
 	cfg := &config.AuthZENProxyConfig{
-		Enabled: true,
-		PDPURL:  "", // No PDP configured
-		Timeout: 30,
+		Enabled:         true,
+		PDPURL:          "", // No PDP configured
+		Timeout:         30,
+		AllowResolution: true,
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -414,10 +438,11 @@ func TestGetPDPURL(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
-	// Currently returns the global URL for all tenants
-	url := handler.getPDPURL("any-tenant")
+	// Returns the global URL when no per-tenant config is available
+	ctx := context.Background()
+	url := handler.getPDPURL(ctx, "any-tenant")
 	if url != cfg.PDPURL {
 		t.Errorf("getPDPURL() = %q, want %q", url, cfg.PDPURL)
 	}
@@ -431,7 +456,7 @@ func TestNewAuthZENProxyHandler(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
 	if handler == nil {
 		t.Fatal("Expected handler to not be nil")
@@ -458,7 +483,7 @@ func TestGetClient_Caching(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
 
 	// First call creates client
 	client1, err := handler.getClient("https://pdp1.example.com")
@@ -485,4 +510,71 @@ func TestGetClient_Caching(t *testing.T) {
 	if client1 == client3 {
 		t.Error("Expected different client for different URL")
 	}
+}
+
+// ============================================================================
+// Per-Tenant PDP URL Tests
+// ============================================================================
+
+func TestGetPDPURL_PerTenantConfig(t *testing.T) {
+	globalPDPURL := "https://global-pdp.example.com"
+	tenantPDPURL := "https://tenant-pdp.example.com"
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled: true,
+		PDPURL:  globalPDPURL,
+		Timeout: 30,
+	}
+
+	// Create tenant with custom PDP URL
+	tenantLookup := &mockTenantLookup{
+		tenants: map[domain.TenantID]*domain.Tenant{
+			"tenant-with-pdp": {
+				ID:   "tenant-with-pdp",
+				Name: "Tenant With Custom PDP",
+				TrustConfig: domain.TrustConfig{
+					PDPURL: tenantPDPURL,
+				},
+			},
+			"tenant-without-pdp": {
+				ID:   "tenant-without-pdp",
+				Name: "Tenant Without Custom PDP",
+				// No PDPURL - should use global
+			},
+		},
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, http.DefaultClient, logger)
+
+	ctx := context.Background()
+
+	t.Run("tenant with custom PDP uses tenant URL", func(t *testing.T) {
+		url := handler.getPDPURL(ctx, "tenant-with-pdp")
+		if url != tenantPDPURL {
+			t.Errorf("getPDPURL() = %q, want tenant PDP URL %q", url, tenantPDPURL)
+		}
+	})
+
+	t.Run("tenant without custom PDP uses global URL", func(t *testing.T) {
+		url := handler.getPDPURL(ctx, "tenant-without-pdp")
+		if url != globalPDPURL {
+			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
+		}
+	})
+
+	t.Run("unknown tenant uses global URL", func(t *testing.T) {
+		url := handler.getPDPURL(ctx, "unknown-tenant")
+		if url != globalPDPURL {
+			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
+		}
+	})
+
+	t.Run("nil tenant lookup uses global URL", func(t *testing.T) {
+		handlerNoLookup := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
+		url := handlerNoLookup.getPDPURL(ctx, "any-tenant")
+		if url != globalPDPURL {
+			t.Errorf("getPDPURL() = %q, want global PDP URL %q", url, globalPDPURL)
+		}
+	})
 }
