@@ -446,10 +446,14 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 	}
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		// Support both "user_id" (go-wallet-backend native) and "uuid" (wallet-backend-server compat)
 		userID, _ = claims["user_id"].(string)
+		if userID == "" {
+			userID, _ = claims["uuid"].(string)
+		}
 		tenantID, _ = claims["tenant_id"].(string)
 		if userID == "" {
-			return "", "", errors.New("invalid token claims: missing user_id")
+			return "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
 		return userID, tenantID, nil
 	}
