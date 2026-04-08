@@ -214,6 +214,27 @@ func TestAdminHandlers_CreateTenant(t *testing.T) {
 			t.Error("Expected require_invite to default to false")
 		}
 	})
+
+	t.Run("create with trust_config pdp_url", func(t *testing.T) {
+		body := `{"id": "pdp-tenant", "name": "PDP Tenant", "trust_config": {"trust_endpoint": "https://trust.example.com", "pdp_url": "https://pdp.example.com"}}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusCreated {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusCreated, w.Code, w.Body.String())
+		}
+
+		var tenant TenantResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
+		if tenant.TrustConfig == nil {
+			t.Fatal("Expected trust_config to be set")
+		}
+		if tenant.TrustConfig.PDPURL != "https://pdp.example.com" {
+			t.Errorf("Expected pdp_url 'https://pdp.example.com', got %q", tenant.TrustConfig.PDPURL)
+		}
+	})
 }
 
 func TestAdminHandlers_GetTenant(t *testing.T) {
@@ -326,6 +347,33 @@ func TestAdminHandlers_UpdateTenant(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+
+	t.Run("update trust_config with pdp_url", func(t *testing.T) {
+		body := `{"id": "update-test", "name": "Updated Name", "trust_config": {"trust_endpoint": "https://trust.example.com", "trust_ttl": 300, "pdp_url": "https://pdp.example.com"}}`
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/admin/tenants/update-test", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var tenant TenantResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &tenant)
+		if tenant.TrustConfig == nil {
+			t.Fatal("Expected trust_config to be set")
+		}
+		if tenant.TrustConfig.PDPURL != "https://pdp.example.com" {
+			t.Errorf("Expected pdp_url 'https://pdp.example.com', got %q", tenant.TrustConfig.PDPURL)
+		}
+		if tenant.TrustConfig.TrustEndpoint != "https://trust.example.com" {
+			t.Errorf("Expected trust_endpoint 'https://trust.example.com', got %q", tenant.TrustConfig.TrustEndpoint)
+		}
+		if tenant.TrustConfig.TrustTTL != 300 {
+			t.Errorf("Expected trust_ttl 300, got %d", tenant.TrustConfig.TrustTTL)
 		}
 	})
 }

@@ -390,6 +390,134 @@ func TestResolve_ServiceUnavailable_NoPDP(t *testing.T) {
 	}
 }
 
+func TestResolve_Forbidden_ResolutionDisabled(t *testing.T) {
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          "http://pdp.example.com",
+		Timeout:         30,
+		AllowResolution: false, // Resolution disabled
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	reqBody := map[string]string{"subject_id": "did:web:example.com"}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("Expected status %d, got %d", http.StatusForbidden, w.Code)
+	}
+}
+
+func TestResolve_Unauthorized_NoTenantID(t *testing.T) {
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          "http://pdp.example.com",
+		Timeout:         30,
+		AllowResolution: true,
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	// No middleware setting tenant_id
+	router.POST("/v1/resolve", handler.Resolve)
+
+	reqBody := map[string]string{"subject_id": "did:web:example.com"}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestResolve_InternalError_BadTenantIDType(t *testing.T) {
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          "http://pdp.example.com",
+		Timeout:         30,
+		AllowResolution: true,
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", 12345) // Wrong type: int instead of string
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	reqBody := map[string]string{"subject_id": "did:web:example.com"}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Expected status %d, got %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+func TestResolve_BadGateway_PDPError(t *testing.T) {
+	// Create a mock PDP server that returns an error
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "internal error"}`))
+	}))
+	defer pdpServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	reqBody := map[string]string{"subject_id": "did:web:example.com"}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d", http.StatusBadGateway, w.Code)
+	}
+}
+
 // ============================================================================
 // Helper Function Tests
 // ============================================================================
