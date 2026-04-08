@@ -67,9 +67,10 @@ func createTestJWKSServer(t *testing.T, jwkJSON string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
-			// Build baseURL from the actual server URL (not r.Host which lacks scheme)
-			// The issuer field uses a fixed value for backward compatibility with
-			// existing tests that validate against https://test-issuer.example.com
+			// Build baseURL from r.Host and add the http scheme, since r.Host does
+			// not include a scheme. The issuer field uses a fixed value for backward
+			// compatibility with existing tests that validate against
+			// https://test-issuer.example.com.
 			baseURL := "http://" + r.Host
 			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, "https://test-issuer.example.com", baseURL)
 			w.Header().Set("Content-Type", "application/json")
@@ -84,21 +85,33 @@ func createTestJWKSServer(t *testing.T, jwkJSON string) *httptest.Server {
 	}))
 }
 
+// discoveryTestServer wraps an httptest.Server with request counters
+// for verifying that discovery and JWKS endpoints were actually called.
+type discoveryTestServer struct {
+	*httptest.Server
+	DiscoveryHits int
+	JWKSHits      int
+}
+
 // createTestJWKSServerWithDiscovery creates a test server that supports OIDC discovery.
 // Unlike createTestJWKSServer, this server returns its own URL as the issuer,
 // enabling tests that exercise the discovery-based JWKS path.
-func createTestJWKSServerWithDiscovery(t *testing.T, jwkJSON string) *httptest.Server {
+// Request counters are exposed via DiscoveryHits and JWKSHits for assertions.
+func createTestJWKSServerWithDiscovery(t *testing.T, jwkJSON string) *discoveryTestServer {
 	t.Helper()
+	ds := &discoveryTestServer{}
 	var serverURL string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ds.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
+			ds.DiscoveryHits++
 			// Use the actual server URL as issuer (self-referential)
 			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, serverURL, serverURL)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(config))
 		case "/jwks":
+			ds.JWKSHits++
 			jwks := fmt.Sprintf(`{"keys":[%s]}`, jwkJSON)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(jwks))
@@ -107,8 +120,8 @@ func createTestJWKSServerWithDiscovery(t *testing.T, jwkJSON string) *httptest.S
 		}
 	}))
 
-	serverURL = server.URL
-	return server
+	serverURL = ds.Server.URL
+	return ds
 }
 
 func TestValidator_ValidateRSA(t *testing.T) {
@@ -515,5 +528,13 @@ func TestValidator_ValidateWithDiscovery(t *testing.T) {
 
 	if result.Issuer != server.URL {
 		t.Errorf("expected issuer '%s', got '%s'", server.URL, result.Issuer)
+	}
+
+	// Verify the discovery and JWKS endpoints were actually called
+	if server.DiscoveryHits == 0 {
+		t.Error("expected at least one hit to /.well-known/openid-configuration, got 0")
+	}
+	if server.JWKSHits == 0 {
+		t.Error("expected at least one hit to /jwks, got 0")
 	}
 }
