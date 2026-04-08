@@ -124,7 +124,10 @@ func main() {
 					msg = "SECURITY WARNING: CORS wildcard (*) is configured in production - this allows any origin to make authenticated requests"
 				}
 				logger.Warn(msg,
-					zap.Strings("allowed_origins", backendCfg.Server.CORS.AllowedOrigins))
+					zap.Strings("allowed_origins", backendCfg.Server.CORS.AllowedOrigins),
+					zap.Bool("allow_credentials", backendCfg.Server.CORS.AllowCredentials),
+					zap.Strings("allowed_headers", backendCfg.Server.CORS.AllowedHeaders),
+					zap.Strings("allowed_methods", backendCfg.Server.CORS.AllowedMethods))
 				break
 			}
 		}
