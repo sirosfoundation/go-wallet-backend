@@ -67,7 +67,9 @@ func createTestJWKSServer(t *testing.T, jwkJSON string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
-			// Use http:// scheme for the test server's jwks_uri
+			// Build baseURL from the actual server URL (not r.Host which lacks scheme)
+			// The issuer field uses a fixed value for backward compatibility with
+			// existing tests that validate against https://test-issuer.example.com
 			baseURL := "http://" + r.Host
 			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, "https://test-issuer.example.com", baseURL)
 			w.Header().Set("Content-Type", "application/json")
@@ -80,6 +82,33 @@ func createTestJWKSServer(t *testing.T, jwkJSON string) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+// createTestJWKSServerWithDiscovery creates a test server that supports OIDC discovery.
+// Unlike createTestJWKSServer, this server returns its own URL as the issuer,
+// enabling tests that exercise the discovery-based JWKS path.
+func createTestJWKSServerWithDiscovery(t *testing.T, jwkJSON string) *httptest.Server {
+	t.Helper()
+	var serverURL string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			// Use the actual server URL as issuer (self-referential)
+			config := fmt.Sprintf(`{"issuer":"%s","jwks_uri":"%s/jwks"}`, serverURL, serverURL)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(config))
+		case "/jwks":
+			jwks := fmt.Sprintf(`{"keys":[%s]}`, jwkJSON)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(jwks))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	serverURL = server.URL
+	return server
 }
 
 func TestValidator_ValidateRSA(t *testing.T) {
@@ -433,5 +462,58 @@ func TestDiscoverProvider(t *testing.T) {
 
 	if discovery.JWKSURI != server.URL+"/jwks" {
 		t.Errorf("unexpected JWKS URI: %s", discovery.JWKSURI)
+	}
+}
+
+// TestValidator_ValidateWithDiscovery tests token validation using discovery-based JWKS.
+// This exercises the code path where JWKSURI is not configured and the validator
+// must discover it from the issuer's openid-configuration endpoint.
+// Covers issue #62: Add test for discovery-based JWKS path
+func TestValidator_ValidateWithDiscovery(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	privateKey, jwkJSON := createTestRSAKey(t)
+
+	// Use the discovery-aware test server
+	server := createTestJWKSServerWithDiscovery(t, jwkJSON)
+	defer server.Close()
+
+	// Create validator WITHOUT explicit JWKSURI - this forces discovery
+	v := NewValidator(ValidatorConfig{
+		Issuer:   server.URL, // Use the test server URL as issuer
+		Audience: "test-client",
+		// JWKSURI intentionally left empty to trigger discovery path
+	}, nil, logger)
+
+	// Create valid token with issuer matching the test server
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": server.URL, // Must match ValidatorConfig.Issuer
+		"aud": "test-client",
+		"sub": "discovery-user",
+		"exp": now.Add(time.Hour).Unix(),
+		"iat": now.Unix(),
+		"nbf": now.Unix(),
+	}
+
+	tokenString := createTestToken(t, privateKey, claims, jwt.SigningMethodRS256, "test-key")
+
+	// Validate - this should:
+	// 1. See JWKSURI is empty
+	// 2. Fetch /.well-known/openid-configuration from server.URL
+	// 3. Extract jwks_uri from discovery document
+	// 4. Fetch JWKS from that URI
+	// 5. Validate the token
+	ctx := context.Background()
+	result, err := v.Validate(ctx, tokenString)
+	if err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if result.Subject != "discovery-user" {
+		t.Errorf("expected subject 'discovery-user', got '%s'", result.Subject)
+	}
+
+	if result.Issuer != server.URL {
+		t.Errorf("expected issuer '%s', got '%s'", server.URL, result.Issuer)
 	}
 }
