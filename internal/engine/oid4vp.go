@@ -48,6 +48,7 @@ const (
 	ClientIDSchemeRedirectURI         = "redirect_uri"
 	ClientIDSchemeDID                 = "did"
 	ClientIDSchemeX509SANDNS          = "x509_san_dns"
+	ClientIDSchemeX509SANURI          = "x509_san_uri"
 	ClientIDSchemeVerifierAttestation = "verifier_attestation"
 )
 
@@ -145,7 +146,8 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 1: Parse authorization request
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
-		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
+		h.Logger.Debug("failed to parse request", zap.Error(err))
+		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
 		return err
 	}
 
@@ -159,7 +161,8 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 2: Evaluate verifier trust
 	verifier, err := h.evaluateVerifierTrust(ctx, authReq)
 	if err != nil {
-		_ = h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, err.Error())
+		h.Logger.Debug("verifier trust evaluation failed", zap.Error(err))
+		_ = h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, ErrCodeUntrustedVerifier.UserFacingMessage())
 		return err
 	}
 
@@ -191,14 +194,16 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 6: Request VP signing from client (use configured ClientID for audience if set)
 	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
-		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, err.Error())
+		h.Logger.Debug("VP signature failed", zap.Error(err))
+		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 		return err
 	}
 
 	// Step 7: Submit VP response to verifier
 	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
 	if err != nil {
-		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, err.Error())
+		h.Logger.Debug("VP submission failed", zap.Error(err))
+		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
 		return err
 	}
 
@@ -319,7 +324,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		return nil, fmt.Errorf("request fetch returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -381,18 +386,28 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	// Scheme-aware key material extraction and JWT verification
+	// For DID schemes, key resolution is delegated to frontend via /v1/resolve
 	var keyMaterial *KeyMaterial
-	var err error
+	var requiresResolution bool
+	var requestJWT string
+
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID:
-		// DID scheme: request MUST be JWT-secured; verify signature with embedded key
-		keyMaterial, err = h.verifyDIDRequest(authReq)
-		if err != nil {
-			return nil, fmt.Errorf("DID verifier request validation failed: %w", err)
+		// DID scheme: request MUST be JWT-secured
+		// Key resolution and JWT verification is delegated to frontend
+		if !strings.HasPrefix(authReq.ClientID, "did:") {
+			return nil, errors.New("client_id_scheme=did but client_id is not a DID")
 		}
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("client_id_scheme=did requires a signed request JWT")
+		}
+		// Don't verify JWT server-side - frontend will resolve DID and verify
+		requiresResolution = true
+		requestJWT = authReq.RequestJWT
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
+		// NOTE: client_id vs SAN DNS validation is performed by go-trust PDP via /v1/evaluate
 		if authReq.RequestJWT == "" {
 			return nil, errors.New("x509_san_dns scheme requires a signed request JWT")
 		}
@@ -424,69 +439,100 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
-	// Evaluate trust via TrustService
-	trustEndpoint := ""
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TrustEndpoint != "" {
-		trustEndpoint = h.Flow.Session.TrustEndpoint
+	// Build trust evaluation request for frontend
+	trustReq := &TrustEvaluationRequest{
+		SubjectID:          authReq.ClientID,
+		SubjectType:        SubjectTypeCredentialVerifier,
+		RequiresResolution: requiresResolution,
+		RequestJWT:         requestJWT,
+		Context: map[string]interface{}{
+			"client_id_scheme": authReq.ClientIDScheme,
+		},
 	}
 
-	// Check cached trust result (skip PDP call if fresh)
-	const trustCacheTTL = 5 * time.Minute
-	canonicalURL := getCanonicalVerifierURL(authReq)
-	if cached := h.getCachedVerifierTrust(ctx, canonicalURL); cached != nil {
-		if cached.TrustEvaluatedAt != nil && time.Since(*cached.TrustEvaluatedAt) < trustCacheTTL {
-			h.Logger.Debug("Using cached verifier trust",
-				zap.String("client_id", authReq.ClientID),
-				zap.String("status", string(cached.TrustStatus)))
-			verifier.Trusted = cached.TrustStatus == domain.TrustStatusTrusted
-			verifier.TrustedStatus = string(cached.TrustStatus)
-			verifier.Framework = cached.TrustFramework
-			// Use stored ClientID for VP audience if configured
-			if cached.ClientID != "" {
-				verifier.ClientID = cached.ClientID
-			}
+	// Add response/redirect URI to context
+	if authReq.ResponseURI != "" {
+		trustReq.Context["response_uri"] = authReq.ResponseURI
+	}
+	if authReq.RedirectURI != "" {
+		trustReq.Context["redirect_uri"] = authReq.RedirectURI
+	}
 
-			// Still enforce trust even from cache
-			trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
-			if trustEnforced && !verifier.Trusted {
-				return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
-			}
-			return verifier, nil
+	// Convert key material for frontend (nil for DID schemes - frontend resolves)
+	if keyMaterial != nil {
+		trustReq.KeyMaterial = &TrustKeyMaterial{
+			Type: keyMaterial.Type,
+			X5C:  keyMaterial.X5C,
+			JWK:  keyMaterial.JWK,
 		}
 	}
 
-	trustInfo, err := h.TrustSvc.EvaluateVerifier(ctx, authReq.ClientID, trustEndpoint, keyMaterial)
+	// Send trust evaluation request to frontend
+	if err := trustReq.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid trust evaluation request: %w", err)
+	}
+	_ = h.Progress(StepEvaluatingVerifierTrust, map[string]interface{}{
+		"trust_evaluation_required": true,
+		"request":                   trustReq,
+	})
+
+	// Wait for frontend to evaluate trust via /v1/evaluate and respond
+	// Use shorter timeout for trust evaluation (frontend should respond quickly)
+	action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, TrustEvaluationTimeout, ActionTrustResult)
 	if err != nil {
-		h.Logger.Warn("Verifier trust evaluation failed", zap.String("verifier", authReq.ClientID), zap.Error(err))
-		verifier.Trusted = false
-		verifier.TrustedStatus = string(domain.TrustStatusUnknown)
-		verifier.Framework = "error"
-		verifier.Reason = err.Error()
+		return nil, fmt.Errorf("failed waiting for trust evaluation: %w", err)
+	}
+
+	// Parse trust result from frontend
+	var trustResult TrustResultPayload
+	if err := json.Unmarshal(action.Payload, &trustResult); err != nil {
+		return nil, fmt.Errorf("failed to parse trust result: %w", err)
+	}
+
+	// Validate and mark as processed
+	if err := trustResult.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid trust result from frontend: %w", err)
+	}
+
+	// Audit log the trust result (for security audit trail)
+	h.Logger.Info("Trust evaluation result received",
+		zap.String("verifier", authReq.ClientID),
+		zap.Bool("trusted", trustResult.Trusted),
+		zap.String("framework", trustResult.Framework),
+		zap.String("reason", trustResult.Reason))
+
+	// Update verifier info from trust result
+	verifier.Trusted = trustResult.Trusted
+	verifier.Framework = trustResult.Framework
+	verifier.Reason = trustResult.Reason
+	if trustResult.Trusted {
+		verifier.TrustedStatus = string(domain.TrustStatusTrusted)
 	} else {
-		verifier.Trusted = trustInfo.Trusted
-		verifier.Framework = trustInfo.Framework
-		verifier.Reason = trustInfo.Reason
-		if trustInfo.Trusted {
-			verifier.TrustedStatus = string(domain.TrustStatusTrusted)
-		} else {
-			verifier.TrustedStatus = string(domain.TrustStatusUntrusted)
-		}
+		verifier.TrustedStatus = string(domain.TrustStatusUntrusted)
+	}
+
+	// Override name/logo from trust evaluation if provided
+	if trustResult.Name != "" {
+		verifier.Name = trustResult.Name
+	}
+	if trustResult.Logo != "" {
+		verifier.Logo = &LogoInfo{URI: trustResult.Logo}
 	}
 
 	// Cache trust evaluation result (best-effort, don't block the flow)
 	h.cacheVerifierTrust(ctx, authReq, verifier)
 
 	// Look up stored verifier to get configured ClientID for VP audience
+	canonicalURL := getCanonicalVerifierURL(authReq)
 	if stored := h.getCachedVerifierTrust(ctx, canonicalURL); stored != nil && stored.ClientID != "" {
 		verifier.ClientID = stored.ClientID
 	}
 
-	// Enforce trust decision: block untrusted verifiers when a PDP URL is configured.
-	trustEnforced := h.TrustSvc.IsVerifierTrustEnabled() || trustEndpoint != ""
-	if trustEnforced && !verifier.Trusted {
+	// Enforce trust decision: block untrusted verifiers
+	if !verifier.Trusted {
 		reason := "verifier not trusted"
-		if trustInfo != nil && trustInfo.Reason != "" {
-			reason = trustInfo.Reason
+		if trustResult.Reason != "" {
+			reason = trustResult.Reason
 		}
 		h.Logger.Warn("Blocking untrusted verifier",
 			zap.String("verifier", authReq.ClientID),
@@ -498,8 +544,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 }
 
 // verifyDIDRequest validates a DID-identified verifier's request.
-// Per OID4VP, when client_id_scheme=did, the request MUST be a signed JWT
-// and the JWT's key material must bind to the DID (verified by the PDP).
+// Deprecated: DID verification is now delegated to frontend via /v1/resolve.
+// The frontend resolves the DID document to get keys and verifies the JWT.
+// This function is kept for reference but should not be used.
 func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMaterial, error) {
 	// Validate client_id is a valid DID
 	if !strings.HasPrefix(authReq.ClientID, "did:") {
@@ -786,7 +833,8 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 			Reason string `json:"reason"`
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
-		_ = h.Error(StepAwaitingConsent, ErrCodePresentationError, "User declined: "+decline.Reason)
+		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
+		_ = h.Error(StepAwaitingConsent, ErrCodePresentationError, "User declined the request")
 		return nil, errors.New("user declined presentation")
 	}
 
@@ -891,7 +939,7 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 		return resp.Header.Get("Location"), nil
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	return "", fmt.Errorf("response submission failed with status %d: %s", resp.StatusCode, string(body))
 }
 
@@ -941,8 +989,20 @@ func (h *OID4VPHandler) buildPresentationSubmission(pd *PresentationDefinition) 
 // inferClientIDScheme infers the client_id_scheme from the client_id format
 // when the verifier does not provide it explicitly.
 func inferClientIDScheme(clientID string) string {
-	if strings.HasPrefix(clientID, "did:") {
+	switch {
+	case strings.HasPrefix(clientID, "did:"):
 		return ClientIDSchemeDID
+	case strings.HasPrefix(clientID, "x509_san_dns:"):
+		return ClientIDSchemeX509SANDNS
+	case strings.HasPrefix(clientID, "x509_san_uri:"):
+		return ClientIDSchemeX509SANURI
+	case strings.HasPrefix(clientID, "verifier_attestation:"):
+		return ClientIDSchemeVerifierAttestation
+	case strings.HasPrefix(clientID, "https://"), strings.HasPrefix(clientID, "http://"):
+		// HTTPS/HTTP URLs default to redirect_uri scheme
+		return ClientIDSchemeRedirectURI
+	default:
+		// Unknown format - use redirect_uri as default
+		return ClientIDSchemeRedirectURI
 	}
-	return ClientIDSchemeRedirectURI
 }

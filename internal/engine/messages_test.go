@@ -442,3 +442,367 @@ func TestFlowErrorJSON(t *testing.T) {
 		t.Errorf("Message = %q, want %q", parsed.Message, flowErr.Message)
 	}
 }
+
+// ============================================================================
+// TrustEvaluationRequest Validation Tests
+// ============================================================================
+
+func TestTrustEvaluationRequest_Validate_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		req  TrustEvaluationRequest
+	}{
+		{
+			name: "valid issuer with x5c key material",
+			req: TrustEvaluationRequest{
+				SubjectID:   "https://issuer.example.com",
+				SubjectType: SubjectTypeCredentialIssuer,
+				KeyMaterial: &TrustKeyMaterial{
+					Type: KeyMaterialTypeX5C,
+					X5C:  []string{"base64cert"},
+				},
+			},
+		},
+		{
+			name: "valid verifier with jwk key material",
+			req: TrustEvaluationRequest{
+				SubjectID:   "https://verifier.example.com",
+				SubjectType: SubjectTypeCredentialVerifier,
+				KeyMaterial: &TrustKeyMaterial{
+					Type: KeyMaterialTypeJWK,
+					JWK:  map[string]interface{}{"kty": "EC"},
+				},
+			},
+		},
+		{
+			name: "valid DID with requires_resolution",
+			req: TrustEvaluationRequest{
+				SubjectID:          "did:web:example.com",
+				SubjectType:        SubjectTypeCredentialVerifier,
+				RequiresResolution: true,
+				RequestJWT:         "eyJhbGciOiJFUzI1NiJ9...",
+			},
+		},
+		{
+			name: "valid issuer no key material",
+			req: TrustEvaluationRequest{
+				SubjectID:   "https://issuer.example.com",
+				SubjectType: SubjectTypeCredentialIssuer,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.req.Validate(); err != nil {
+				t.Errorf("Validate() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestTrustEvaluationRequest_Validate_Invalid(t *testing.T) {
+	tests := []struct {
+		name        string
+		req         TrustEvaluationRequest
+		wantContain string
+	}{
+		{
+			name:        "missing subject_id",
+			req:         TrustEvaluationRequest{SubjectType: SubjectTypeCredentialIssuer},
+			wantContain: "SubjectID is required",
+		},
+		{
+			name:        "empty subject_type",
+			req:         TrustEvaluationRequest{SubjectID: "https://example.com"},
+			wantContain: "SubjectType must be",
+		},
+		{
+			name:        "invalid subject_type",
+			req:         TrustEvaluationRequest{SubjectID: "https://example.com", SubjectType: "invalid"},
+			wantContain: "SubjectType must be",
+		},
+		{
+			name: "requires_resolution without request_jwt",
+			req: TrustEvaluationRequest{
+				SubjectID:          "did:web:example.com",
+				SubjectType:        SubjectTypeCredentialVerifier,
+				RequiresResolution: true,
+			},
+			wantContain: "RequestJWT is required when RequiresResolution is true",
+		},
+		{
+			name: "invalid key material type",
+			req: TrustEvaluationRequest{
+				SubjectID:   "https://example.com",
+				SubjectType: SubjectTypeCredentialIssuer,
+				KeyMaterial: &TrustKeyMaterial{Type: "invalid"},
+			},
+			wantContain: "Type must be",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if err == nil {
+				t.Errorf("Validate() error = nil, want error containing %q", tt.wantContain)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantContain) {
+				t.Errorf("Validate() error = %v, want error containing %q", err, tt.wantContain)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// TrustKeyMaterial Validation Tests
+// ============================================================================
+
+func TestTrustKeyMaterial_Validate_Valid(t *testing.T) {
+	tests := []struct {
+		name string
+		km   TrustKeyMaterial
+	}{
+		{
+			name: "valid x5c",
+			km: TrustKeyMaterial{
+				Type: KeyMaterialTypeX5C,
+				X5C:  []string{"base64cert1", "base64cert2"},
+			},
+		},
+		{
+			name: "valid jwk",
+			km: TrustKeyMaterial{
+				Type: KeyMaterialTypeJWK,
+				JWK:  map[string]interface{}{"kty": "EC", "crv": "P-256"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.km.Validate(); err != nil {
+				t.Errorf("Validate() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestTrustKeyMaterial_Validate_Invalid(t *testing.T) {
+	tests := []struct {
+		name        string
+		km          TrustKeyMaterial
+		wantContain string
+	}{
+		{
+			name:        "invalid type",
+			km:          TrustKeyMaterial{Type: "invalid"},
+			wantContain: "Type must be",
+		},
+		{
+			name:        "x5c type without x5c array",
+			km:          TrustKeyMaterial{Type: KeyMaterialTypeX5C},
+			wantContain: "X5C array is required",
+		},
+		{
+			name:        "x5c type with empty x5c array",
+			km:          TrustKeyMaterial{Type: KeyMaterialTypeX5C, X5C: []string{}},
+			wantContain: "X5C array is required",
+		},
+		{
+			name:        "jwk type without jwk",
+			km:          TrustKeyMaterial{Type: KeyMaterialTypeJWK},
+			wantContain: "JWK is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.km.Validate()
+			if err == nil {
+				t.Errorf("Validate() error = nil, want error containing %q", tt.wantContain)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantContain) {
+				t.Errorf("Validate() error = %v, want error containing %q", err, tt.wantContain)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// TrustResultPayload Validation Tests
+// ============================================================================
+
+func TestTrustResultPayload_Validate_Valid(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload TrustResultPayload
+	}{
+		{
+			name:    "empty payload (fail-closed default)",
+			payload: TrustResultPayload{},
+		},
+		{
+			name: "trusted with name and logo",
+			payload: TrustResultPayload{
+				Trusted:   true,
+				Name:      "Trusted Issuer",
+				Logo:      "https://example.com/logo.png",
+				Framework: "etsi_tsl",
+				Reason:    "Matched trust anchor",
+			},
+		},
+		{
+			name: "logo with data URI",
+			payload: TrustResultPayload{
+				Trusted: true,
+				Name:    "Issuer",
+				Logo:    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+			},
+		},
+		{
+			name: "untrusted with reason",
+			payload: TrustResultPayload{
+				Trusted: false,
+				Reason:  "Not in trust list",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.payload.Validate(); err != nil {
+				t.Errorf("Validate() error = %v, want nil", err)
+			}
+			if !tt.payload.IsValidated() {
+				t.Error("IsValidated() = false after successful Validate()")
+			}
+		})
+	}
+}
+
+func TestTrustResultPayload_Validate_Invalid(t *testing.T) {
+	longString := strings.Repeat("a", 300)
+	veryLongURL := "https://example.com/" + strings.Repeat("x", 3000)
+
+	tests := []struct {
+		name        string
+		payload     TrustResultPayload
+		wantContain string
+	}{
+		{
+			name: "name too long",
+			payload: TrustResultPayload{
+				Trusted: true,
+				Name:    longString,
+			},
+			wantContain: "Name exceeds maximum length",
+		},
+		{
+			name: "logo URL too long",
+			payload: TrustResultPayload{
+				Trusted: true,
+				Logo:    veryLongURL,
+			},
+			wantContain: "Logo URL exceeds maximum length",
+		},
+		{
+			name: "logo with javascript URL (XSS attempt)",
+			payload: TrustResultPayload{
+				Trusted: true,
+				Logo:    "javascript:alert('xss')",
+			},
+			wantContain: "Logo must be an HTTP(S) URL",
+		},
+		{
+			name: "reason too long",
+			payload: TrustResultPayload{
+				Trusted: false,
+				Reason:  strings.Repeat("r", 2000),
+			},
+			wantContain: "Reason exceeds maximum length",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.payload.Validate()
+			if err == nil {
+				t.Errorf("Validate() error = nil, want error containing %q", tt.wantContain)
+				return
+			}
+			if !strings.Contains(err.Error(), tt.wantContain) {
+				t.Errorf("Validate() error = %v, want error containing %q", err, tt.wantContain)
+			}
+			if tt.payload.IsValidated() {
+				t.Error("IsValidated() = true after failed Validate()")
+			}
+		})
+	}
+}
+
+func TestTrustResultPayload_IsValidated_BeforeValidate(t *testing.T) {
+	payload := TrustResultPayload{
+		Trusted: true,
+		Name:    "Test",
+	}
+	if payload.IsValidated() {
+		t.Error("IsValidated() = true before Validate() called")
+	}
+}
+
+// ============================================================================
+// Type Constants Tests
+// ============================================================================
+
+func TestSubjectTypeConstants(t *testing.T) {
+	if SubjectTypeCredentialIssuer != "credential_issuer" {
+		t.Errorf("SubjectTypeCredentialIssuer = %q, want 'credential_issuer'", SubjectTypeCredentialIssuer)
+	}
+	if SubjectTypeCredentialVerifier != "credential_verifier" {
+		t.Errorf("SubjectTypeCredentialVerifier = %q, want 'credential_verifier'", SubjectTypeCredentialVerifier)
+	}
+}
+
+func TestKeyMaterialTypeConstants(t *testing.T) {
+	if KeyMaterialTypeX5C != "x5c" {
+		t.Errorf("KeyMaterialTypeX5C = %q, want 'x5c'", KeyMaterialTypeX5C)
+	}
+	if KeyMaterialTypeJWK != "jwk" {
+		t.Errorf("KeyMaterialTypeJWK = %q, want 'jwk'", KeyMaterialTypeJWK)
+	}
+}
+
+// ============================================================================
+// isValidLogoURL Tests
+// ============================================================================
+
+func TestIsValidLogoURL(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://example.com/logo.png", true},
+		{"HTTPS://EXAMPLE.COM/LOGO.PNG", true},
+		{"data:image/png;base64,abc123", true},
+		{"data:image/svg+xml;base64,abc123", true},
+		{"http://example.com/logo.png", true},
+		{"HTTP://EXAMPLE.COM/LOGO.PNG", true},
+		{"javascript:alert(1)", false},
+		{"ftp://example.com/logo.png", false},
+		{"", false},
+		{"short", false},
+		{"file:///etc/passwd", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			if got := isValidLogoURL(tt.url); got != tt.want {
+				t.Errorf("isValidLogoURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
+	}
+}

@@ -54,7 +54,7 @@ tenants:
   - id: t1
     name: T1
     trust_config:
-      trust_endpoint: https://trust.example.com
+      pdp_url: https://trust.example.com
       trust_ttl: 3600
 `)
 		cfg, err := loadSyncConfig(path)
@@ -65,8 +65,8 @@ tenants:
 		if tc == nil {
 			t.Fatal("expected trust_config to be set")
 		}
-		if tc.TrustEndpoint != "https://trust.example.com" {
-			t.Errorf("unexpected trust_endpoint: %q", tc.TrustEndpoint)
+		if tc.PDPURL != "https://trust.example.com" {
+			t.Errorf("unexpected pdp_url: %q", tc.PDPURL)
 		}
 		if tc.TrustTTL == nil || *tc.TrustTTL != 3600 {
 			t.Errorf("expected trust_ttl 3600, got %v", tc.TrustTTL)
@@ -314,18 +314,18 @@ func TestTenantNeedsUpdate(t *testing.T) {
 	})
 
 	t.Run("trust_config added", func(t *testing.T) {
-		desired := SyncTenant{ID: "t1", Name: "T1", TrustConfig: &SyncTrustConfig{TrustEndpoint: "https://trust.example.com"}}
+		desired := SyncTenant{ID: "t1", Name: "T1", TrustConfig: &SyncTrustConfig{PDPURL: "https://trust.example.com"}}
 		existing := syncTenantResp{ID: "t1", Name: "T1"}
 		if !tenantNeedsUpdate(desired, existing) {
 			t.Error("expected update needed when trust_config added")
 		}
 	})
 
-	t.Run("trust_config endpoint changed", func(t *testing.T) {
-		desired := SyncTenant{ID: "t1", Name: "T1", TrustConfig: &SyncTrustConfig{TrustEndpoint: "https://new-trust.example.com"}}
-		existing := syncTenantResp{ID: "t1", Name: "T1", TrustConfig: &syncTrustConfigResp{TrustEndpoint: "https://old-trust.example.com"}}
+	t.Run("trust_config pdp_url changed", func(t *testing.T) {
+		desired := SyncTenant{ID: "t1", Name: "T1", TrustConfig: &SyncTrustConfig{PDPURL: "https://new-trust.example.com"}}
+		existing := syncTenantResp{ID: "t1", Name: "T1", TrustConfig: &syncTrustConfigResp{PDPURL: "https://old-trust.example.com"}}
 		if !tenantNeedsUpdate(desired, existing) {
-			t.Error("expected update needed for trust_endpoint change")
+			t.Error("expected update needed for pdp_url change")
 		}
 	})
 
@@ -486,8 +486,8 @@ func TestBuildTenantRequestBody(t *testing.T) {
 			DisplayName: "Full Tenant",
 			Enabled:     boolPtr(false),
 			TrustConfig: &SyncTrustConfig{
-				TrustEndpoint: "https://trust.example.com",
-				TrustTTL:      intPtr(7200),
+				PDPURL:   "https://trust.example.com",
+				TrustTTL: intPtr(7200),
 			},
 		})
 		if body["enabled"] != false {
@@ -500,8 +500,8 @@ func TestBuildTenantRequestBody(t *testing.T) {
 		if !ok {
 			t.Fatal("expected trust_config to be a map")
 		}
-		if tc["trust_endpoint"] != "https://trust.example.com" {
-			t.Errorf("unexpected trust_endpoint: %v", tc["trust_endpoint"])
+		if tc["pdp_url"] != "https://trust.example.com" {
+			t.Errorf("unexpected pdp_url: %v", tc["pdp_url"])
 		}
 		if tc["trust_ttl"] != 7200 {
 			t.Errorf("expected trust_ttl 7200, got %v", tc["trust_ttl"])

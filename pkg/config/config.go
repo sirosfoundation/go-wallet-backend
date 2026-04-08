@@ -25,6 +25,7 @@ type Config struct {
 	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
+	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -395,6 +396,55 @@ type FeaturesConfig struct {
 	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
 }
 
+// AuthZENProxyConfig configures the AuthZEN proxy endpoint for frontend trust evaluation.
+//
+// The proxy provides an authenticated endpoint for the frontend to make trust decisions
+// by forwarding AuthZEN evaluation requests to the configured PDP (Policy Decision Point).
+// Query authorization is performed using SPOCP policies to restrict what queries are allowed.
+type AuthZENProxyConfig struct {
+	// Enabled controls whether the /v1/evaluate endpoint is available.
+	// Default: true (set in defaultConfig)
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// PDPURL is the backend PDP URL to proxy requests to.
+	// If empty, uses the global trust.pdp_url configuration.
+	PDPURL string `yaml:"pdp_url" envconfig:"PDP_URL"`
+
+	// Timeout is the timeout for PDP requests in seconds.
+	// Default: 30
+	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
+
+	// RulesFile is the path to a SPOCP rules file for query authorization.
+	// If empty, default wallet rules are used.
+	RulesFile string `yaml:"rules_file" envconfig:"RULES_FILE"`
+
+	// AllowResolution controls whether resolution-only requests are allowed.
+	// Resolution requests fetch metadata (DID documents, entity configs) without key validation.
+	// Default: true
+	AllowResolution bool `yaml:"allow_resolution" envconfig:"ALLOW_RESOLUTION"`
+
+	// FailOpenOnTenantLookupError controls behavior when per-tenant PDP lookup fails.
+	// If false (default), tenant lookup errors return an error to the client.
+	// If true, falls back to the global PDP URL on lookup errors.
+	// Security note: fail-closed (false) prevents bypassing per-tenant security policies.
+	FailOpenOnTenantLookupError bool `yaml:"fail_open_on_tenant_lookup_error" envconfig:"FAIL_OPEN_ON_TENANT_LOOKUP_ERROR"`
+}
+
+// SetDefaults sets default values for AuthZEN proxy configuration.
+func (c *AuthZENProxyConfig) SetDefaults() {
+	if c.Timeout == 0 {
+		c.Timeout = 30
+	}
+}
+
+// GetPDPURL returns the effective PDP URL, falling back to the provided default.
+func (c *AuthZENProxyConfig) GetPDPURL(defaultURL string) string {
+	if c.PDPURL != "" {
+		return c.PDPURL
+	}
+	return defaultURL
+}
+
 // SecurityConfig contains security-related configuration
 type SecurityConfig struct {
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
@@ -703,6 +753,11 @@ func defaultConfig() *Config {
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout: 30, // 30 seconds default
+		},
+		AuthZENProxy: AuthZENProxyConfig{
+			Enabled:         true, // Enabled by default - required for engine flows
+			AllowResolution: true, // Allow DID/metadata resolution by default
+			Timeout:         30,
 		},
 	}
 }

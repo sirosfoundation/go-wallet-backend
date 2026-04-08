@@ -82,7 +82,7 @@ func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*V
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		rc.logger.Debug("Registry error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
 		return nil, nil
 	}

@@ -81,13 +81,14 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 		logger, _ := zap.NewDevelopment()
 		trustService := engine.NewTrustService(cfg, logger)
 
-		// Evaluate - should return default (trusted, no evaluation)
+		// Evaluate - should return fail-closed (not trusted, no evaluation possible)
 		ctx := context.Background()
 		info, err := trustService.EvaluateIssuer(ctx, "did:example:issuer", "", nil)
 
 		require.NoError(t, err)
 		require.NotNil(t, info)
-		assert.True(t, info.Trusted)
+		// Fail-closed: no PDP configured = not trusted
+		assert.False(t, info.Trusted)
 		assert.Equal(t, "none", info.Framework)
 		assert.Contains(t, info.Reason, "not configured")
 	})

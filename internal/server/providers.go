@@ -64,10 +64,6 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		userBase := public.Group("/user")
 		userBase.Use(middleware.TenantHeaderMiddleware(p.store))
 
-		// Legacy password routes (no gate - deprecated)
-		userBase.POST("/register", p.handlers.RegisterUser)
-		userBase.POST("/login", p.handlers.LoginUser)
-
 		// Registration routes (with OIDC registration gate)
 		registration := userBase.Group("")
 		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger))
@@ -85,9 +81,14 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)
+		// Two routes for compatibility: legacy /tenant/:id/config and new /api/v1/tenants/:id/config
 		tenant := public.Group("/tenant")
 		{
 			tenant.GET("/:id/config", p.handlers.GetTenantConfig)
+		}
+		apiV1 := public.Group("/api/v1")
+		{
+			apiV1.GET("/tenants/:id/config", p.handlers.GetTenantConfig)
 		}
 
 		// Auth check helper

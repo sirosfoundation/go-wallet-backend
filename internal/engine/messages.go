@@ -4,6 +4,8 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -85,7 +87,51 @@ const (
 	ErrCodeSignError         ErrorCode = "SIGN_ERROR"
 	ErrCodePresentationError ErrorCode = "PRESENTATION_ERROR"
 	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
 )
+
+// UserFacingMessage returns a generic user-facing message for an error code.
+// This is used to prevent leaking internal error details to clients.
+func (c ErrorCode) UserFacingMessage() string {
+	switch c {
+	case ErrCodeAuthFailed:
+		return "Authentication failed"
+	case ErrCodeInvalidMessage:
+		return "Invalid message format"
+	case ErrCodeUnknownFlow:
+		return "Unknown flow"
+	case ErrCodeFlowTimeout:
+		return "Flow timed out"
+	case ErrCodeOfferParseError:
+		return "Could not parse credential offer"
+	case ErrCodeOfferFetchError:
+		return "Could not fetch credential offer"
+	case ErrCodeMetadataFetchErr:
+		return "Could not fetch issuer metadata"
+	case ErrCodeUntrustedIssuer:
+		return "Issuer is not trusted"
+	case ErrCodeUntrustedVerifier:
+		return "Verifier is not trusted"
+	case ErrCodeAuthorizationFail:
+		return "Authorization failed"
+	case ErrCodeTokenError:
+		return "Token exchange failed"
+	case ErrCodeCredentialError:
+		return "Credential issuance failed"
+	case ErrCodeSignTimeout:
+		return "Signing request timed out"
+	case ErrCodeSignError:
+		return "Signing failed"
+	case ErrCodePresentationError:
+		return "Presentation failed"
+	case ErrCodeInternalError:
+		return "Internal server error"
+	case ErrCodeTooManyRequests:
+		return "Too many requests"
+	default:
+		return "An error occurred"
+	}
+}
 
 // SignAction identifies the type of signing operation
 type SignAction string
@@ -149,6 +195,7 @@ const (
 	ActionCredentialsMatched    = "credentials_matched"
 	ActionConsent               = "consent"
 	ActionDecline               = "decline"
+	ActionTrustResult           = "trust_result" // Frontend reports trust evaluation result
 )
 
 // FlowCompleteMessage indicates successful flow completion
@@ -267,6 +314,176 @@ type MatchedCredential struct {
 type ConsentSelection struct {
 	CredentialID    string   `json:"credential_id"`
 	DisclosedClaims []string `json:"disclosed_claims"`
+}
+
+// SubjectType constants for trust evaluation
+const (
+	SubjectTypeCredentialIssuer   = "credential_issuer"
+	SubjectTypeCredentialVerifier = "credential_verifier"
+)
+
+// KeyMaterialType constants
+const (
+	KeyMaterialTypeX5C = "x5c"
+	KeyMaterialTypeJWK = "jwk"
+)
+
+// TrustEvaluationRequest is the payload sent to frontend for trust evaluation.
+// The frontend should call POST /v1/evaluate with this data and return the result.
+// For DID schemes, the frontend should first call /v1/resolve to get the DID document.
+type TrustEvaluationRequest struct {
+	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer URL for issuers)
+	SubjectID string `json:"subject_id"`
+	// SubjectType is "credential_verifier" or "credential_issuer"
+	SubjectType string `json:"subject_type"`
+	// KeyMaterial contains the cryptographic key for binding validation.
+	// For DID schemes, this may be nil - frontend resolves keys via /v1/resolve.
+	KeyMaterial *TrustKeyMaterial `json:"key_material,omitempty"`
+	// RequiresResolution indicates the frontend should call /v1/resolve first.
+	// Set to true for DID schemes where key material must be resolved from DID document.
+	RequiresResolution bool `json:"requires_resolution,omitempty"`
+	// RequestJWT is the signed request JWT for DID schemes.
+	// Frontend should verify this JWT using keys obtained from /v1/resolve.
+	RequestJWT string `json:"request_jwt,omitempty"`
+	// Context contains additional evaluation context
+	Context map[string]interface{} `json:"context,omitempty"`
+}
+
+// Validate checks that required fields are present and valid.
+// Returns an error if the request is malformed.
+func (r *TrustEvaluationRequest) Validate() error {
+	if r.SubjectID == "" {
+		return errors.New("TrustEvaluationRequest: SubjectID is required")
+	}
+	if r.SubjectType != SubjectTypeCredentialIssuer && r.SubjectType != SubjectTypeCredentialVerifier {
+		return fmt.Errorf("TrustEvaluationRequest: SubjectType must be %q or %q, got %q",
+			SubjectTypeCredentialIssuer, SubjectTypeCredentialVerifier, r.SubjectType)
+	}
+	// RequiresResolution requires RequestJWT for DID schemes
+	if r.RequiresResolution && r.RequestJWT == "" {
+		return errors.New("TrustEvaluationRequest: RequestJWT is required when RequiresResolution is true")
+	}
+	// Validate key material if provided
+	if r.KeyMaterial != nil {
+		if err := r.KeyMaterial.Validate(); err != nil {
+			return fmt.Errorf("TrustEvaluationRequest: %w", err)
+		}
+	}
+	return nil
+}
+
+// TrustKeyMaterial contains key material for trust evaluation
+type TrustKeyMaterial struct {
+	// Type is "x5c" or "jwk"
+	Type string `json:"type"`
+	// X5C contains base64-encoded DER certificates (for x5c type)
+	X5C []string `json:"x5c,omitempty"`
+	// JWK contains the JWK key data (for jwk type)
+	JWK interface{} `json:"jwk,omitempty"`
+}
+
+// Validate checks that the key material is well-formed.
+func (km *TrustKeyMaterial) Validate() error {
+	if km.Type != KeyMaterialTypeX5C && km.Type != KeyMaterialTypeJWK {
+		return fmt.Errorf("KeyMaterial: Type must be %q or %q, got %q",
+			KeyMaterialTypeX5C, KeyMaterialTypeJWK, km.Type)
+	}
+	if km.Type == KeyMaterialTypeX5C && len(km.X5C) == 0 {
+		return errors.New("KeyMaterial: X5C array is required for x5c type")
+	}
+	if km.Type == KeyMaterialTypeJWK && km.JWK == nil {
+		return errors.New("KeyMaterial: JWK is required for jwk type")
+	}
+	return nil
+}
+
+// TrustResultPayload is sent by frontend after evaluating trust via /v1/evaluate
+type TrustResultPayload struct {
+	// Trusted indicates whether the subject is trusted
+	Trusted bool `json:"trusted"`
+	// Name is the display name from trust evaluation
+	Name string `json:"name,omitempty"`
+	// Logo is the logo URL from trust evaluation
+	Logo string `json:"logo,omitempty"`
+	// Framework identifies the trust framework (e.g., "etsi_tsl", "openid_federation", "did")
+	Framework string `json:"framework,omitempty"`
+	// Reason provides additional context for the decision
+	Reason string `json:"reason,omitempty"`
+	// Metadata contains additional trust-related data
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	// validated marks that this payload has passed validation
+	validated bool
+}
+
+// MaxNameLength is the maximum allowed length for display names.
+const MaxNameLength = 256
+
+// MaxLogoURLLength is the maximum allowed length for logo URLs.
+const MaxLogoURLLength = 2048
+
+// MaxReasonLength is the maximum allowed length for reason strings.
+const MaxReasonLength = 1024
+
+// Validate checks that the trust result is well-formed.
+// Call this after unmarshaling from JSON to detect malformed payloads.
+// This includes XSS protection by validating field lengths and URL formats.
+func (r *TrustResultPayload) Validate() error {
+	// Note: Trusted is a boolean, so JSON will default to false if missing.
+	// This is semantically correct (fail-closed).
+
+	// Validate Name length to prevent XSS/DoS via oversized strings
+	if len(r.Name) > MaxNameLength {
+		return fmt.Errorf("TrustResultPayload: Name exceeds maximum length (%d > %d)", len(r.Name), MaxNameLength)
+	}
+
+	// Validate Logo URL length and format
+	if r.Logo != "" {
+		if len(r.Logo) > MaxLogoURLLength {
+			return fmt.Errorf("TrustResultPayload: Logo URL exceeds maximum length (%d > %d)", len(r.Logo), MaxLogoURLLength)
+		}
+		// Basic URL validation - must start with http://, https://, or data:image/
+		if !isValidLogoURL(r.Logo) {
+			return errors.New("TrustResultPayload: Logo must be an HTTP(S) URL or data:image/ URI")
+		}
+	}
+
+	// Validate Reason length
+	if len(r.Reason) > MaxReasonLength {
+		return fmt.Errorf("TrustResultPayload: Reason exceeds maximum length (%d > %d)", len(r.Reason), MaxReasonLength)
+	}
+
+	r.validated = true
+	return nil
+}
+
+// isValidLogoURL checks if the URL is safe for use as a logo.
+// Allows HTTPS/HTTP URLs and data:image/ URIs for embedded images.
+// HTTP URLs are allowed for dev/test setups; production PDPs should only
+// return HTTPS or data URLs.
+// Note: SVG data URIs can contain embedded JavaScript. XSS prevention
+// is a frontend responsibility - render SVGs via <img> tags (which don't
+// execute scripts) or apply CSP/sanitization.
+func isValidLogoURL(url string) bool {
+	if len(url) < 7 {
+		return false
+	}
+	// Check for http:// or https:// prefix (case-insensitive)
+	if len(url) >= 7 && (url[:7] == "http://" || url[:7] == "HTTP://") {
+		return true
+	}
+	if len(url) >= 8 && (url[:8] == "https://" || url[:8] == "HTTPS://") {
+		return true
+	}
+	// Check for data:image/ prefix for inline images
+	if len(url) >= 11 && url[:11] == "data:image/" {
+		return true
+	}
+	return false
+}
+
+// IsValidated returns true if Validate() was called successfully.
+func (r *TrustResultPayload) IsValidated() bool {
+	return r.validated
 }
 
 // Now returns current ISO 8601 timestamp
