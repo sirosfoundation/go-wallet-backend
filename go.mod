@@ -66,7 +66,7 @@ require (
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sirosfoundation/g119612 v0.0.0-20260108094825-5b3123230280 // indirect
-	github.com/sirosfoundation/go-spocp v0.0.0-20260316113016-2a5043ce9fc1 // indirect
+	github.com/sirosfoundation/go-spocp v0.1.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/tinylib/msgp v1.6.3 // indirect

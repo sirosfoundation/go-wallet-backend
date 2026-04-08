@@ -2,6 +2,7 @@ package authz
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/sirosfoundation/go-spocp/pkg/sexp"
@@ -236,5 +237,82 @@ func TestSPOCPAuthorizer_NilRequest(t *testing.T) {
 	err = auth.Authorize(ctx, req)
 	if err != ErrInvalidQuery {
 		t.Errorf("expected ErrInvalidQuery for nil request, got: %v", err)
+	}
+}
+
+func TestSPOCPAuthorizer_LoadRulesFile(t *testing.T) {
+	logger := zap.NewNop()
+
+	// Create a temporary rules file with multi-line s-expressions
+	tmpDir := t.TempDir()
+	rulesFile := tmpDir + "/rules.txt"
+
+	// Rules file with:
+	// - Comment using # (hash)
+	// - Comment using ; (semicolon)
+	// - Multi-line S-expression
+	// - Single-line S-expression
+	rulesContent := `# Allow credential-issuer with JWK (comment with hash)
+; This is a multi-line rule (comment with semicolon)
+(7:authzen
+  (6:tenant)
+  (6:action17:credential-issuer)
+  (8:resource
+    (4:type3:jwk)
+    (2:id))
+  (7:subject
+    (4:type3:key)
+    (2:id)))
+# Allow resolution
+(7:authzen(6:tenant)(6:action)(8:resource(4:type10:resolution)(2:id))(7:subject(4:type3:key)(2:id)))
+`
+
+	if err := os.WriteFile(rulesFile, []byte(rulesContent), 0644); err != nil {
+		t.Fatalf("failed to write rules file: %v", err)
+	}
+
+	auth, err := NewSPOCPAuthorizer(&SPOCPConfig{RulesFile: rulesFile}, logger)
+	if err != nil {
+		t.Fatalf("failed to create authorizer: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// This should pass (credential-issuer with JWK from multi-line rule)
+	issuerReq := &AuthorizationRequest{
+		TenantID: "default",
+		Request: &gotrust.EvaluationRequest{
+			Subject:  gotrust.Subject{Type: "key", ID: "issuer"},
+			Resource: gotrust.Resource{Type: "jwk", ID: "issuer"},
+			Action:   &gotrust.Action{Name: "credential-issuer"},
+		},
+	}
+	if err := auth.Authorize(ctx, issuerReq); err != nil {
+		t.Errorf("expected credential-issuer to pass: %v", err)
+	}
+
+	// This should pass (resolution from single-line rule)
+	resolveReq := &AuthorizationRequest{
+		TenantID: "default",
+		Request: &gotrust.EvaluationRequest{
+			Subject:  gotrust.Subject{Type: "key", ID: "did:web:example.com"},
+			Resource: gotrust.Resource{Type: "resolution", ID: "did:web:example.com"},
+		},
+	}
+	if err := auth.Authorize(ctx, resolveReq); err != nil {
+		t.Errorf("expected resolution to pass: %v", err)
+	}
+
+	// This should fail (credential-verifier not in rules)
+	verifierReq := &AuthorizationRequest{
+		TenantID: "default",
+		Request: &gotrust.EvaluationRequest{
+			Subject:  gotrust.Subject{Type: "key", ID: "verifier"},
+			Resource: gotrust.Resource{Type: "jwk", ID: "verifier"},
+			Action:   &gotrust.Action{Name: "credential-verifier"},
+		},
+	}
+	if err := auth.Authorize(ctx, verifierReq); err == nil {
+		t.Errorf("expected credential-verifier to fail (not in custom rules)")
 	}
 }

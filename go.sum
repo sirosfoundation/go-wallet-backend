@@ -121,6 +121,10 @@ github.com/sirosfoundation/go-cryptoutil v0.2.0 h1:oR+YQPWAbxbf0i+/rmwmsFtk5tFEc
 github.com/sirosfoundation/go-cryptoutil v0.2.0/go.mod h1:OZi673Xmf5o2LzF/QMceptIpiB2GKYAYBfEa75ocBss=
 github.com/sirosfoundation/go-spocp v0.0.0-20260316113016-2a5043ce9fc1 h1:eSX9yfkaKNLg/6iBHe9xRprcV0fZ+xt/lq206EIEoq8=
 github.com/sirosfoundation/go-spocp v0.0.0-20260316113016-2a5043ce9fc1/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
+github.com/sirosfoundation/go-spocp v0.0.0-20260408131633-12ac86358c05 h1:lP5exJW1oeWb5zDD2SoFH3Fjk4pBBvw/ZWfC3mtHosM=
+github.com/sirosfoundation/go-spocp v0.0.0-20260408131633-12ac86358c05/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
+github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G1ihb9FCPs=
+github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
 github.com/sirosfoundation/go-trust v0.0.0-20260223112607-3f3b0788c175 h1:L1o+lSHdjpwdEg9ckWlUQS7opCJaW2FgYGWxWPh0QR8=
 github.com/sirosfoundation/go-trust v0.0.0-20260223112607-3f3b0788c175/go.mod h1:Mwx3iDl0k05oP649gh+/6nmM1xeMlGaun5mleGTax70=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61 h1:1XMBGQ57pLEZRkazk8AN7mhNu63czErGg9+I3stWSS0=

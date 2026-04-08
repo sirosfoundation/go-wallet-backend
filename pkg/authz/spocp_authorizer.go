@@ -3,9 +3,7 @@ package authz
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/sirosfoundation/go-spocp"
@@ -68,26 +66,20 @@ func NewSPOCPAuthorizer(cfg *SPOCPConfig, logger *zap.Logger) (*SPOCPAuthorizer,
 	return auth, nil
 }
 
-// LoadRulesFile loads SPOCP rules from a file in canonical format.
+// LoadRulesFile loads SPOCP rules from a file.
+// Rules are in canonical S-expression format and can span multiple lines.
+// Comments (lines starting with #, ;, or //) are ignored.
 func (a *SPOCPAuthorizer) LoadRulesFile(path string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	data, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		return fmt.Errorf("failed to read rules file: %w", err)
-	}
-
-	// Parse rules (one per line, # comments, canonical S-expression format)
-	lines := strings.Split(string(data), "\n")
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if err := a.engine.AddRule(line); err != nil {
-			return fmt.Errorf("line %d: %w", i+1, err)
-		}
+	// Use go-spocp's built-in file loading which supports:
+	// - Multi-line S-expressions
+	// - Comments (#, ;, //)
+	// - Whitespace handling
+	cleanPath := filepath.Clean(path)
+	if err := a.engine.LoadRulesFromFile(cleanPath); err != nil {
+		return fmt.Errorf("failed to load rules from %s: %w", cleanPath, err)
 	}
 
 	return nil
