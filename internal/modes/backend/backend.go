@@ -124,10 +124,11 @@ func (r *Runner) Run(ctx context.Context) error {
 				return fmt.Errorf("failed to generate admin token: %w", err)
 			}
 			// Log token at DEBUG level to avoid capture by production log aggregators
-			// For production deployments, set WALLET_SERVER_ADMIN_TOKEN or use admin_token_path
+			// For production deployments, set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH,
+			// or configure server.admin_token_path
 			logger.Debug("Generated admin API token",
 				zap.String("token", adminToken))
-			logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN or admin_token_path for production)")
+			logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token_path for production)")
 		}
 
 		adminRouter := setupAdminRouter(store, adminToken, logger)
