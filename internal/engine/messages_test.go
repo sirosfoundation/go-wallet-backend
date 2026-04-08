@@ -204,11 +204,13 @@ func TestMessageTypeConstants(t *testing.T) {
 		TypeFlowStart:         "flow_start",
 		TypeFlowAction:        "flow_action",
 		TypeSignResponse:      "sign_response",
+		TypeMatchResponse:     "match_response",
 		TypeHandshakeComplete: "handshake_complete",
 		TypeFlowProgress:      "flow_progress",
 		TypeFlowComplete:      "flow_complete",
 		TypeFlowError:         "flow_error",
 		TypeSignRequest:       "sign_request",
+		TypeMatchRequest:      "match_request",
 		TypePush:              "push",
 		TypeError:             "error",
 	}
@@ -267,6 +269,8 @@ func TestErrorCodeConstants(t *testing.T) {
 		ErrCodeCredentialError:   "CREDENTIAL_ERROR",
 		ErrCodeSignTimeout:       "SIGN_TIMEOUT",
 		ErrCodeSignError:         "SIGN_ERROR",
+		ErrCodeMatchTimeout:      "MATCH_TIMEOUT",
+		ErrCodeMatchError:        "MATCH_ERROR",
 		ErrCodePresentationError: "PRESENTATION_ERROR",
 		ErrCodeInternalError:     "INTERNAL_ERROR",
 	}
@@ -802,6 +806,189 @@ func TestIsValidLogoURL(t *testing.T) {
 		t.Run(tt.url, func(t *testing.T) {
 			if got := isValidLogoURL(tt.url); got != tt.want {
 				t.Errorf("isValidLogoURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Match Request/Response Message Tests
+// ============================================================================
+
+func TestMatchRequestMessageJSON(t *testing.T) {
+	msg := MatchRequestMessage{
+		Message: Message{
+			Type:      TypeMatchRequest,
+			FlowID:    "flow-123",
+			MessageID: "msg-456",
+			Timestamp: "2024-01-01T00:00:00Z",
+		},
+		PresentationDefinition: &PresentationDefinition{
+			ID:   "pd-1",
+			Name: "Test Presentation",
+			InputDescriptors: []InputDescriptor{
+				{
+					ID:      "id-1",
+					Name:    "Identity",
+					Purpose: "Verify identity",
+				},
+			},
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	// Verify key fields are present
+	if !strings.Contains(string(data), `"type":"match_request"`) {
+		t.Errorf("Missing type field in JSON: %s", data)
+	}
+	if !strings.Contains(string(data), `"flow_id":"flow-123"`) {
+		t.Errorf("Missing flow_id field in JSON: %s", data)
+	}
+	if !strings.Contains(string(data), `"message_id":"msg-456"`) {
+		t.Errorf("Missing message_id field in JSON: %s", data)
+	}
+	if !strings.Contains(string(data), `"presentation_definition"`) {
+		t.Errorf("Missing presentation_definition field in JSON: %s", data)
+	}
+}
+
+func TestMatchResponseMessageJSON(t *testing.T) {
+	msg := MatchResponseMessage{
+		Message: Message{
+			Type:      TypeMatchResponse,
+			FlowID:    "flow-123",
+			MessageID: "msg-456",
+			Timestamp: "2024-01-01T00:00:00Z",
+		},
+		Matches: []CredentialMatch{
+			{
+				InputDescriptorID: "id-1",
+				CredentialID:      "cred-abc",
+				Format:            "vc+sd-jwt",
+				VCT:               "urn:eu.europa.ec.eudi:pid:1",
+				AvailableClaims:   []string{"given_name", "family_name", "birth_date"},
+			},
+		},
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed MatchResponseMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if parsed.Type != TypeMatchResponse {
+		t.Errorf("Type = %q, want %q", parsed.Type, TypeMatchResponse)
+	}
+	if parsed.FlowID != "flow-123" {
+		t.Errorf("FlowID = %q, want 'flow-123'", parsed.FlowID)
+	}
+	if len(parsed.Matches) != 1 {
+		t.Fatalf("Matches len = %d, want 1", len(parsed.Matches))
+	}
+	if parsed.Matches[0].CredentialID != "cred-abc" {
+		t.Errorf("CredentialID = %q, want 'cred-abc'", parsed.Matches[0].CredentialID)
+	}
+	if parsed.Matches[0].VCT != "urn:eu.europa.ec.eudi:pid:1" {
+		t.Errorf("VCT = %q, want 'urn:eu.europa.ec.eudi:pid:1'", parsed.Matches[0].VCT)
+	}
+}
+
+func TestMatchResponseMessageNoMatch(t *testing.T) {
+	msg := MatchResponseMessage{
+		Message: Message{
+			Type:      TypeMatchResponse,
+			FlowID:    "flow-123",
+			MessageID: "msg-456",
+		},
+		Matches:       []CredentialMatch{},
+		NoMatchReason: "No credentials match descriptors: id-1, id-2",
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed MatchResponseMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if len(parsed.Matches) != 0 {
+		t.Errorf("Matches len = %d, want 0", len(parsed.Matches))
+	}
+	if parsed.NoMatchReason != "No credentials match descriptors: id-1, id-2" {
+		t.Errorf("NoMatchReason = %q, want 'No credentials match descriptors: id-1, id-2'", parsed.NoMatchReason)
+	}
+}
+
+func TestMatchResponseMessageError(t *testing.T) {
+	msg := MatchResponseMessage{
+		Message: Message{
+			Type:      TypeMatchResponse,
+			FlowID:    "flow-123",
+			MessageID: "msg-456",
+		},
+		Matches: nil,
+		Error:   "Credential matching failed: keystore unavailable",
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed MatchResponseMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if parsed.Error != "Credential matching failed: keystore unavailable" {
+		t.Errorf("Error = %q, want 'Credential matching failed: keystore unavailable'", parsed.Error)
+	}
+}
+
+func TestMatchMessageTypeConstants(t *testing.T) {
+	if TypeMatchRequest != "match_request" {
+		t.Errorf("TypeMatchRequest = %q, want 'match_request'", TypeMatchRequest)
+	}
+	if TypeMatchResponse != "match_response" {
+		t.Errorf("TypeMatchResponse = %q, want 'match_response'", TypeMatchResponse)
+	}
+}
+
+func TestMatchErrorCodeConstants(t *testing.T) {
+	if ErrCodeMatchTimeout != "MATCH_TIMEOUT" {
+		t.Errorf("ErrCodeMatchTimeout = %q, want 'MATCH_TIMEOUT'", ErrCodeMatchTimeout)
+	}
+	if ErrCodeMatchError != "MATCH_ERROR" {
+		t.Errorf("ErrCodeMatchError = %q, want 'MATCH_ERROR'", ErrCodeMatchError)
+	}
+}
+
+func TestMatchErrorCodeUserFacingMessage(t *testing.T) {
+	tests := []struct {
+		code ErrorCode
+		want string
+	}{
+		{ErrCodeMatchTimeout, "Credential matching timed out"},
+		{ErrCodeMatchError, "Credential matching failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			got := tt.code.UserFacingMessage()
+			if got != tt.want {
+				t.Errorf("UserFacingMessage() = %q, want %q", got, tt.want)
 			}
 		})
 	}

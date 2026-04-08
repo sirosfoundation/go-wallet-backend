@@ -778,27 +778,23 @@ func (h *OID4VPHandler) extractRequestedClaims(pd *PresentationDefinition) []Req
 }
 
 func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, pd *PresentationDefinition) ([]CredentialMatch, error) {
-	// Send presentation_definition to client for local matching
-	_ = h.Progress(StepMatchCredentials, map[string]interface{}{
-		"presentation_definition": pd,
-	})
-
-	// Wait for client response
-	action, err := h.WaitForAction(ctx, ActionCredentialsMatched)
+	// Send match_request to client for local matching (privacy-preserving)
+	// The client matches credentials locally and returns only the matching credential IDs/metadata
+	resp, err := h.RequestMatch(ctx, pd)
 	if err != nil {
+		if errors.Is(err, ErrMatchTimeout) {
+			h.Logger.Warn("Credential matching timed out")
+			return nil, err
+		}
+		h.Logger.Debug("Credential matching failed", zap.Error(err))
 		return nil, err
 	}
 
-	var payload CredentialsMatchedPayload
-	if err := json.Unmarshal(action.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("invalid credentials_matched payload: %w", err)
+	if resp.NoMatchReason != "" {
+		h.Logger.Info("No credentials matched", zap.String("reason", resp.NoMatchReason))
 	}
 
-	if payload.NoMatchReason != "" {
-		h.Logger.Info("No credentials matched", zap.String("reason", payload.NoMatchReason))
-	}
-
-	return payload.Matches, nil
+	return resp.Matches, nil
 }
 
 func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []CredentialMatch, verifier *VerifierInfo) ([]ConsentSelection, error) {

@@ -160,6 +160,8 @@ interface Message {
 | `flow_action` | C→S | Client action during flow |
 | `sign_request` | S→C | Server requests signature |
 | `sign_response` | C→S | Client provides signature |
+| `match_request` | S→C | Server requests credential matching |
+| `match_response` | C→S | Client provides matching credentials |
 | `push` | S→C | Server-initiated notification |
 | `error` | S→C | Protocol-level error |
 
@@ -552,14 +554,15 @@ Server → Client:
 Credential matching happens client-side to preserve privacy. The engine only
 sees credentials one-at-a-time during the signing step.
 
-Server sends the presentation_definition to client for local matching:
+Server sends a `match_request` to the client for local matching:
 
 ```
 Server → Client:
 {
-  "type": "flow_progress",
+  "type": "match_request",
   "flow_id": "<uuid>",
-  "step": "match_credentials",
+  "message_id": "<uuid>",
+  "timestamp": "2024-01-01T00:00:00Z",
   "presentation_definition": {
     "id": "example_presentation",
     "input_descriptors": [
@@ -584,9 +587,10 @@ responds with matched credentials (without revealing the full inventory):
 ```
 Client → Server:
 {
-  "type": "flow_action",
+  "type": "match_response",
   "flow_id": "<uuid>",
-  "action": "credentials_matched",
+  "message_id": "<uuid>",
+  "timestamp": "2024-01-01T00:00:00Z",
   "matches": [
     {
       "input_descriptor_id": "id_card",
@@ -604,13 +608,29 @@ If no credentials match:
 ```
 Client → Server:
 {
-  "type": "flow_action",
+  "type": "match_response",
   "flow_id": "<uuid>",
-  "action": "credentials_matched",
+  "message_id": "<uuid>",
   "matches": [],
-  "no_match_reason": "no_qualifying_credentials"
+  "no_match_reason": "No credentials match descriptors: id_card"
 }
 ```
+
+If matching fails due to an error:
+
+```
+Client → Server:
+{
+  "type": "match_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "matches": [],
+  "error": "Credential store unavailable"
+}
+```
+
+**Note**: The `match_request`/`match_response` pattern uses `message_id` for
+correlation (same as `sign_request`/`sign_response`), with a 30-second timeout.
 
 #### User Consent
 
