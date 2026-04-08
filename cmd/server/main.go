@@ -87,6 +87,49 @@ func main() {
 		zap.Strings("roles", roleStrings),
 	)
 
+	// Security configuration validation for production environments
+	// Checks for potentially dangerous configurations and logs warnings
+	isProduction := os.Getenv("ENVIRONMENT") == "production" ||
+		os.Getenv("GO_ENV") == "production" ||
+		os.Getenv("APP_ENV") == "production"
+
+	if backendCfg != nil {
+		// Issue #70: Warn when trust evaluation is disabled (allows any issuer/verifier)
+		if !backendCfg.Trust.IsIssuerTrustEnabled() || !backendCfg.Trust.IsVerifierTrustEnabled() {
+			level := zap.WarnLevel
+			msg := "SECURITY: Trust evaluation is disabled - all issuers/verifiers will be accepted without verification"
+
+			if isProduction {
+				msg = "SECURITY WARNING: Trust evaluation is disabled in production environment"
+			}
+
+			if !backendCfg.Trust.IsIssuerTrustEnabled() && !backendCfg.Trust.IsVerifierTrustEnabled() {
+				logger.Log(level, msg,
+					zap.Bool("issuer_trust_enabled", false),
+					zap.Bool("verifier_trust_enabled", false))
+			} else if !backendCfg.Trust.IsIssuerTrustEnabled() {
+				logger.Log(level, msg+" for issuers",
+					zap.Bool("issuer_trust_enabled", false))
+			} else {
+				logger.Log(level, msg+" for verifiers",
+					zap.Bool("verifier_trust_enabled", false))
+			}
+		}
+
+		// Issue #71: Warn when CORS allows wildcard origin
+		for _, origin := range backendCfg.Server.CORS.AllowedOrigins {
+			if origin == "*" {
+				msg := "SECURITY: CORS wildcard (*) configured - allows requests from any origin"
+				if isProduction {
+					msg = "SECURITY WARNING: CORS wildcard (*) is configured in production - this allows any origin to make authenticated requests"
+				}
+				logger.Warn(msg,
+					zap.Strings("allowed_origins", backendCfg.Server.CORS.AllowedOrigins))
+				break
+			}
+		}
+	}
+
 	// Build server configuration
 	serverCfg := server.DefaultServerConfig()
 	serverCfg.Roles = roleStrings
