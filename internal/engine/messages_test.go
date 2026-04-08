@@ -938,7 +938,7 @@ func TestMatchResponseMessageError(t *testing.T) {
 			FlowID:    "flow-123",
 			MessageID: "msg-456",
 		},
-		Matches: nil,
+		Matches: []CredentialMatch{}, // Use empty slice, not nil, to marshal as [] per protocol spec
 		Error:   "Credential matching failed: keystore unavailable",
 	}
 

@@ -784,6 +784,8 @@ func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, pd *Prese
 	if err != nil {
 		if errors.Is(err, ErrMatchTimeout) {
 			h.Logger.Warn("Credential matching timed out")
+			// Notify client that matching timed out so UI can show appropriate message
+			_ = h.Error(StepMatchCredentials, ErrCodeMatchTimeout, "Credential matching timed out")
 			return nil, err
 		}
 		h.Logger.Debug("Credential matching failed", zap.Error(err))

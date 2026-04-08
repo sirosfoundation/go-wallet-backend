@@ -305,8 +305,9 @@ func (m *Manager) handleSession(session *Session) {
 			case session.matchCh <- &matchMsg:
 			default:
 				session.logger.Error("Match channel full, sending error to client",
+					zap.String("flow_id", matchMsg.FlowID),
 					zap.String("message_id", matchMsg.MessageID))
-				_ = session.SendFlowError("", "", ErrCodeTooManyRequests, "Server overloaded, please retry")
+				_ = session.SendFlowError(matchMsg.FlowID, StepMatchCredentials, ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
 
 		default:
@@ -693,25 +694,28 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, pd *Presentat
 		return nil, err
 	}
 
-	// Wait for response
-	timeout := time.After(MatchTimeout)
+	// Wait for response with proper timer cleanup
+	timer := time.NewTimer(MatchTimeout)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-timeout:
+		case <-timer.C:
 			return nil, ErrMatchTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
 		case resp := <-s.matchCh:
-			if resp.MessageID == messageID {
+			// Verify both flow_id and message_id for proper correlation
+			if resp.FlowID == flowID && resp.MessageID == messageID {
 				// Check for error in response
 				if resp.Error != "" {
 					return nil, errors.New(resp.Error)
 				}
 				return resp, nil
 			}
-			// Wrong message ID, keep waiting
+			// Wrong flow_id or message_id, keep waiting
 		}
 	}
 }
