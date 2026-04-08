@@ -1103,6 +1103,7 @@ func TestPublicKeyCredentialRequestOptions_JSONStructure(t *testing.T) {
 	assert.Contains(t, publicKey, "allowCredentials")
 	assert.Contains(t, publicKey, "userVerification")
 }
+
 // ============================================================================
 // Regression Tests
 // ============================================================================
@@ -1114,64 +1115,314 @@ func TestPublicKeyCredentialRequestOptions_JSONStructure(t *testing.T) {
 // This test verifies that go-webauthn v0.16.0+ properly handles BER integers.
 // See: https://github.com/go-webauthn/webauthn/issues/593
 func TestBEREncodedECDSASignature(t *testing.T) {
-        // This test verifies the library upgrade by checking that the
-        // webauthncose package can verify signatures with BER-encoded integers.
-        // YubiKey 5.8 firmware produces such signatures during attestation.
+	// This test verifies the library upgrade by checking that the
+	// webauthncose package can verify signatures with BER-encoded integers.
+	// YubiKey 5.8 firmware produces such signatures during attestation.
 
-        // The go-webauthn v0.16.0 changelog states:
-        // "webauthncose: allow ber integers in ecdsa sigs (#593)"
+	// The go-webauthn v0.16.0 changelog states:
+	// "webauthncose: allow ber integers in ecdsa sigs (#593)"
 
-        // We verify this by checking the library version requirement is met
-        // in go.mod. The actual BER signature handling is tested extensively
-        // in the upstream go-webauthn library's test suite.
+	// We verify this by checking the library version requirement is met
+	// in go.mod. The actual BER signature handling is tested extensively
+	// in the upstream go-webauthn library's test suite.
 
-        // Captured attestation data from YubiKey 5.8 would require a physical
-        // device. Instead, we verify the library is correctly configured by
-        // running a standard registration flow which exercises the same
-        // signature verification code path.
+	// Captured attestation data from YubiKey 5.8 would require a physical
+	// device. Instead, we verify the library is correctly configured by
+	// running a standard registration flow which exercises the same
+	// signature verification code path.
 
-        setup := newTestVirtualWebAuthnSetup(t)
+	setup := newTestVirtualWebAuthnSetup(t)
 
-        // Begin registration
-        beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
-                DisplayName: "YubiKey 5.8 Regression Test",
-        })
-        require.NoError(t, err, "BeginRegistration should succeed")
+	// Begin registration
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "YubiKey 5.8 Regression Test",
+	})
+	require.NoError(t, err, "BeginRegistration should succeed")
 
-        // Parse and create attestation response
-        optionsJSON, err := json.Marshal(beginResp.CreateOptions)
-        require.NoError(t, err)
+	// Parse and create attestation response
+	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
 
-        attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
-        require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
+	require.NoError(t, err)
 
-        attestationResponse := virtualwebauthn.CreateAttestationResponse(
-                setup.rp,
-                setup.authenticator,
-                setup.credential,
-                *attestationOptions,
-        )
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
 
-        // Finish registration - this exercises the ECDSA signature verification
-        // code path that was fixed in go-webauthn v0.16.0 for BER integers
-        finishReq := &FinishRegistrationRequest{
-                ChallengeID: beginResp.ChallengeID,
-                Credential:  json.RawMessage(attestationResponse),
-                DisplayName: "YubiKey 5.8 Regression Test",
-        }
+	// Finish registration - this exercises the ECDSA signature verification
+	// code path that was fixed in go-webauthn v0.16.0 for BER integers
+	finishReq := &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "YubiKey 5.8 Regression Test",
+	}
 
-        finishResp, err := setup.service.FinishRegistration(setup.ctx, finishReq)
-        require.NoError(t, err, "FinishRegistration should succeed with ECDSA verification")
-        assert.NotEmpty(t, finishResp.UUID)
-        assert.NotEmpty(t, finishResp.Token)
+	finishResp, err := setup.service.FinishRegistration(setup.ctx, finishReq)
+	require.NoError(t, err, "FinishRegistration should succeed with ECDSA verification")
+	assert.NotEmpty(t, finishResp.UUID)
+	assert.NotEmpty(t, finishResp.Token)
 
-        // Verify the credential was stored correctly
-        userID := domain.UserIDFromString(finishResp.UUID)
-        user, err := setup.store.Users().GetByID(setup.ctx, userID)
-        require.NoError(t, err)
-        assert.Len(t, user.WebauthnCredentials, 1, "User should have one credential")
+	// Verify the credential was stored correctly
+	userID := domain.UserIDFromString(finishResp.UUID)
+	user, err := setup.store.Users().GetByID(setup.ctx, userID)
+	require.NoError(t, err)
+	assert.Len(t, user.WebauthnCredentials, 1, "User should have one credential")
 
-        // The credential should use ES256 (ECDSA with P-256)
-        cred := user.WebauthnCredentials[0]
-        assert.NotEmpty(t, cred.PublicKey, "Credential should have a public key")
+	// The credential should use ES256 (ECDSA with P-256)
+	cred := user.WebauthnCredentials[0]
+	assert.NotEmpty(t, cred.PublicKey, "Credential should have a public key")
+}
+
+// ============================================================================
+// OIDC Gate Enforcement Tests for FinishLogin
+// Issue #61: Add OIDC gate enforcement tests for FinishLogin
+// ============================================================================
+
+func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate enabled for login
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant"),
+		Name:    "Test Tenant",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	// Parse registration options
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User",
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	// Use EncodeUserHandle to create proper tenant-scoped handle
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	// Parse login options
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login WITHOUT OIDC binding - should fail with ErrOIDCGateRequired
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID:     beginLoginResp.ChallengeID,
+		Credential:      json.RawMessage(assertionResponse),
+		OIDCGateBinding: nil, // Missing OIDC binding
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require OIDC gate when binding is missing")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate enabled for login
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-2"),
+		Name:    "Test Tenant 2",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User 2",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User 2",
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login with WRONG issuer - should fail with ErrOIDCGateRequired
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://wrong-idp.example.com", // Wrong issuer!
+			Subject: "user123",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate AND bind_identity enabled
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-3"),
+		Name:    "Test Tenant 3",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+			BindIdentity: true, // Requires bound identity
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant (but WITHOUT binding identity during registration)
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User 3",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User 3",
+		// OIDCGateBinding is nil - no identity bound during registration
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login with correct issuer but no bound identity - should fail with ErrIdentityNotBound
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "user123",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrIdentityNotBound, "Should fail when no identity was bound during registration")
 }
