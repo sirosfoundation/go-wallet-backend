@@ -14,7 +14,6 @@ type Services struct {
 	UserTenant       *UserTenantService
 	WebAuthn         *WebAuthnService
 	Credential       *CredentialService
-	Presentation     *PresentationService
 	Issuer           *IssuerService
 	Verifier         *VerifierService
 	Keystore         *KeystoreService
@@ -43,7 +42,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		UserTenant:       NewUserTenantService(store, logger),
 		WebAuthn:         webauthnSvc,
 		Credential:       NewCredentialService(store, cfg, logger),
-		Presentation:     NewPresentationService(store, logger),
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
 		Keystore:         NewKeystoreService(store, cfg, logger),

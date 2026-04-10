@@ -2,6 +2,7 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -517,6 +518,73 @@ func TestUserService_DeleteUser(t *testing.T) {
 	_, err = service.GetUserByID(ctx, user.UUID)
 	if err == nil {
 		t.Error("GetUserByID() after deletion should return error")
+	}
+}
+
+func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Create a pending challenge for this user
+	challenge := &domain.WebauthnChallenge{
+		ID:        "test-challenge",
+		UserID:    user.UUID.String(),
+		TenantID:  string(domain.DefaultTenantID),
+		Challenge: "random-nonce",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := store.Challenges().Create(ctx, challenge); err != nil {
+		t.Fatalf("Create challenge error = %v", err)
+	}
+
+	// Create an invite consumed by this user
+	invite := &domain.Invite{
+		ID:       "test-invite",
+		TenantID: domain.DefaultTenantID,
+		Code:     "INVITE123",
+		Status:   domain.InviteStatusCompleted,
+		UsedBy:   &user.UUID,
+	}
+	if err := store.Invites().Create(ctx, invite); err != nil {
+		t.Fatalf("Create invite error = %v", err)
+	}
+
+	// Delete user
+	if err := service.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify challenge is deleted
+	_, err = store.Challenges().GetByID(ctx, "test-challenge")
+	if err == nil {
+		t.Error("Challenge should be deleted after DeleteUser")
+	}
+
+	// Verify invite used_by is cleared
+	got, err := store.Invites().GetByID(ctx, "test-invite")
+	if err != nil {
+		t.Fatalf("GetByID invite error = %v", err)
+	}
+	if got.UsedBy != nil {
+		t.Error("Invite used_by should be cleared after DeleteUser")
 	}
 }
 

@@ -178,12 +178,6 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 		storage.GET("/vc/:id", h.GetCredentialByIdentifier)
 		storage.PUT("/vc/:id", h.UpdateCredential)
 		storage.DELETE("/vc/:id", h.DeleteCredential)
-
-		// Presentations
-		storage.GET("/vp", h.GetAllPresentations)
-		storage.POST("/vp", h.StorePresentation)
-		storage.GET("/vp/:id", h.GetPresentationByIdentifier)
-		storage.DELETE("/vp/:id", h.DeletePresentation)
 	}
 
 	// Issuer routes (public)

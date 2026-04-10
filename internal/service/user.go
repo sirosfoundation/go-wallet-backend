@@ -233,9 +233,8 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
 
-	// Delete credentials and presentations from each tenant
+	// Delete credentials from each tenant (only relevant when credential storage is enabled)
 	for _, tenantID := range tenantIDs {
-		// Delete all credentials in this tenant
 		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
@@ -246,21 +245,20 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 			}
 		}
 
-		// Delete all presentations in this tenant
-		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, pres := range presentations {
-			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
-				s.logger.Warn("Failed to delete presentation", zap.Error(err))
-			}
-		}
-
 		// Remove tenant membership
 		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
 			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
 		}
+	}
+
+	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
+	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
+		s.logger.Warn("Failed to delete challenges for user", zap.Error(err))
+	}
+
+	// Clear user reference from consumed invites
+	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
+		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
 	}
 
 	// Delete the user

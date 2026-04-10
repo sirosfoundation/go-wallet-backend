@@ -107,62 +107,23 @@ func TestCredentialStorage(t *testing.T) {
 	})
 }
 
-// TestPresentationStorage tests VP storage endpoints
-func TestPresentationStorage(t *testing.T) {
+// TestPresentationStorageRemoved verifies VP endpoints are no longer registered
+func TestPresentationStorageRemoved(t *testing.T) {
 	h := NewTestHarness(t)
-	user := h.CreateTestUser("VP Storage User")
+	user := h.CreateTestUser("VP Removed User")
 
-	var storedVPID string
-
-	t.Run("POST stores a presentation", func(t *testing.T) {
-		vpJSON := `{"@context":["https://www.w3.org/2018/credentials/v1"],"type":["VerifiablePresentation"]}`
-		vpB64 := base64.RawURLEncoding.EncodeToString([]byte(vpJSON))
-
-		storeReq := map[string]interface{}{
-			"presentation":           map[string]string{"$b64u": vpB64},
-			"presentationIdentifier": "test-vp-001",
-		}
-
-		resp := h.AuthPOST(user, "/storage/vp", storeReq)
-
-		if resp.Response.StatusCode == http.StatusOK || resp.Response.StatusCode == http.StatusCreated {
-			var result map[string]interface{}
-			resp.JSON(&result)
-			if id, ok := result["presentationIdentifier"].(string); ok {
-				storedVPID = id
-			}
-		} else if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
+	t.Run("POST /storage/vp returns 404", func(t *testing.T) {
+		resp := h.AuthPOST(user, "/storage/vp", map[string]string{"test": "data"})
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for removed VP endpoint, got %d", resp.Response.StatusCode)
 		}
 	})
 
-	t.Run("GET returns all presentations", func(t *testing.T) {
+	t.Run("GET /storage/vp returns 404", func(t *testing.T) {
 		resp := h.AuthGET(user, "/storage/vp")
-		resp.Status(http.StatusOK)
-		t.Logf("All presentations response: %s", resp.Pretty())
-	})
-
-	t.Run("GET by ID returns specific presentation", func(t *testing.T) {
-		if storedVPID == "" {
-			storedVPID = "test-vp-001"
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for removed VP endpoint, got %d", resp.Response.StatusCode)
 		}
-
-		resp := h.AuthGET(user, "/storage/vp/"+storedVPID)
-		if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
-		}
-	})
-
-	t.Run("DELETE removes a presentation", func(t *testing.T) {
-		resp := h.AuthDELETE(user, "/storage/vp/test-vp-001")
-		if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
-		}
-	})
-
-	t.Run("returns 401 without auth", func(t *testing.T) {
-		resp := h.GET("/storage/vp")
-		resp.Status(http.StatusUnauthorized)
 	})
 }
 
