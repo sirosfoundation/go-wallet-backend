@@ -1842,3 +1842,81 @@ func TestVerifierStore_Upsert_OverwritesClientID(t *testing.T) {
 		t.Errorf("Upsert() ClientIDScheme = %v, want did", found.ClientIDScheme)
 	}
 }
+
+func TestChallengeStore_DeleteByUserID(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	// Create challenges for two different users
+	for _, c := range []*domain.WebauthnChallenge{
+		{ID: "c1", UserID: "user-A", Challenge: "ch1", Action: "register", ExpiresAt: time.Now().Add(5 * time.Minute)},
+		{ID: "c2", UserID: "user-A", Challenge: "ch2", Action: "login", ExpiresAt: time.Now().Add(5 * time.Minute)},
+		{ID: "c3", UserID: "user-B", Challenge: "ch3", Action: "register", ExpiresAt: time.Now().Add(5 * time.Minute)},
+	} {
+		if err := challenges.Create(ctx, c); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+	}
+
+	// Delete user-A's challenges
+	if err := challenges.DeleteByUserID(ctx, "user-A"); err != nil {
+		t.Fatalf("DeleteByUserID() error = %v", err)
+	}
+
+	// user-A's challenges should be gone
+	if _, err := challenges.GetByID(ctx, "c1"); err != storage.ErrNotFound {
+		t.Error("Challenge c1 should be deleted")
+	}
+	if _, err := challenges.GetByID(ctx, "c2"); err != storage.ErrNotFound {
+		t.Error("Challenge c2 should be deleted")
+	}
+
+	// user-B's challenge should remain
+	if _, err := challenges.GetByID(ctx, "c3"); err != nil {
+		t.Error("Challenge c3 should still exist")
+	}
+}
+
+func TestInviteStore_ClearUsedBy(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	invites := store.Invites()
+
+	userA := domain.UserIDFromString("user-A")
+	userB := domain.UserIDFromString("user-B")
+
+	// Create invites: one used by A, one by B, one unused
+	inv1 := &domain.Invite{ID: "inv1", TenantID: domain.DefaultTenantID, Code: "CODE1", Status: domain.InviteStatusCompleted, UsedBy: &userA}
+	inv2 := &domain.Invite{ID: "inv2", TenantID: domain.DefaultTenantID, Code: "CODE2", Status: domain.InviteStatusCompleted, UsedBy: &userB}
+	inv3 := &domain.Invite{ID: "inv3", TenantID: domain.DefaultTenantID, Code: "CODE3", Status: domain.InviteStatusActive}
+
+	for _, inv := range []*domain.Invite{inv1, inv2, inv3} {
+		if err := invites.Create(ctx, inv); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+	}
+
+	// Clear user-A references
+	if err := invites.ClearUsedBy(ctx, userA); err != nil {
+		t.Fatalf("ClearUsedBy() error = %v", err)
+	}
+
+	// inv1 should have UsedBy cleared
+	got1, _ := invites.GetByID(ctx, "inv1")
+	if got1.UsedBy != nil {
+		t.Error("inv1.UsedBy should be nil after ClearUsedBy")
+	}
+
+	// inv2 should be unchanged
+	got2, _ := invites.GetByID(ctx, "inv2")
+	if got2.UsedBy == nil || *got2.UsedBy != userB {
+		t.Error("inv2.UsedBy should still reference user-B")
+	}
+
+	// inv3 should be unchanged
+	got3, _ := invites.GetByID(ctx, "inv3")
+	if got3.UsedBy != nil {
+		t.Error("inv3.UsedBy should still be nil")
+	}
+}

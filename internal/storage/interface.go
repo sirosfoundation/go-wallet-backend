@@ -136,6 +136,9 @@ type ChallengeStore interface {
 
 	// DeleteExpired deletes all expired challenges
 	DeleteExpired(ctx context.Context) error
+
+	// DeleteByUserID deletes all challenges for a given user
+	DeleteByUserID(ctx context.Context, userID string) error
 }
 
 // IssuerStore defines the interface for credential issuer storage
@@ -227,4 +230,7 @@ type InviteStore interface {
 
 	// Delete hard-deletes an invite within a tenant
 	Delete(ctx context.Context, tenantID domain.TenantID, id string) error
+
+	// ClearUsedBy removes the user reference from any invites consumed by the given user
+	ClearUsedBy(ctx context.Context, userID domain.UserID) error
 }

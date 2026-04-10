@@ -183,17 +183,14 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected := router.Group("/storage")
 	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
 	{
-		// Credential storage
-		protected.GET("/vc", p.handlers.GetAllCredentials)
-		protected.POST("/vc", p.handlers.StoreCredential)
-		protected.POST("/vc/update", p.handlers.UpdateCredential)
-		protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
-		protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
-
-		// Presentation storage
-		protected.GET("/vp", p.handlers.GetAllPresentations)
-		protected.POST("/vp", p.handlers.StorePresentation)
-		protected.GET("/vp/:presentation_identifier", p.handlers.GetPresentationByIdentifier)
+		// Credential storage (gated)
+		if p.cfg.Features.CredentialStorageEnabled {
+			protected.GET("/vc", p.handlers.GetAllCredentials)
+			protected.POST("/vc", p.handlers.StoreCredential)
+			protected.POST("/vc/update", p.handlers.UpdateCredential)
+			protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
+			protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
+		}
 	}
 }
 

@@ -394,6 +394,14 @@ type FeaturesConfig struct {
 	// to use the WebSocket transport instead.
 	// Default: false
 	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
+
+	// CredentialStorageEnabled controls whether server-side credential storage
+	// endpoints (/storage/vc/*) are available. By default, credentials are stored
+	// exclusively in the encrypted client-side private_data blob and the server-side
+	// storage path is unused. Set to true only if you need backward-compatible
+	// server-side credential storage.
+	// Default: false (server-side credential storage disabled)
+	CredentialStorageEnabled bool `yaml:"credential_storage_enabled" envconfig:"CREDENTIAL_STORAGE_ENABLED"`
 }
 
 // AuthZENProxyConfig configures the AuthZEN proxy endpoint for frontend trust evaluation.
@@ -727,8 +735,9 @@ func defaultConfig() *Config {
 			},
 		},
 		Features: FeaturesConfig{
-			ProxyEnabled:      true,  // Default: proxy enabled for backward compatibility
-			WebSocketRequired: false, // Default: proxy still allowed
+			ProxyEnabled:             true,  // Default: proxy enabled for backward compatibility
+			WebSocketRequired:        false, // Default: proxy still allowed
+			CredentialStorageEnabled: false, // Default: server-side credential storage disabled
 		},
 		Security: SecurityConfig{
 			AuthRateLimit: AuthRateLimitConfig{
