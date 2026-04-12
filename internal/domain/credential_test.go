@@ -233,16 +233,16 @@ func TestValidateClientIDScheme(t *testing.T) {
 		scheme  string
 		wantErr bool
 	}{
-		{"", false},                   // empty is allowed
-		{"redirect_uri", false},       // valid scheme
-		{"pre-registered", false},     // valid scheme
-		{"x509_san_dns", false},       // valid scheme
-		{"x509_san_uri", false},       // valid scheme
+		{"", false},                     // empty is allowed
+		{"redirect_uri", false},         // valid scheme
+		{"pre-registered", false},       // valid scheme
+		{"x509_san_dns", false},         // valid scheme
+		{"x509_san_uri", false},         // valid scheme
 		{"verifier_attestation", false}, // valid scheme
-		{"did", false},                // valid scheme
-		{"invalid", true},             // invalid scheme
-		{"REDIRECT_URI", true},        // case sensitive
-		{"pre_registered", true},      // wrong format (underscore vs hyphen)
+		{"did", false},                  // valid scheme
+		{"invalid", true},               // invalid scheme
+		{"REDIRECT_URI", true},          // case sensitive
+		{"pre_registered", true},        // wrong format (underscore vs hyphen)
 	}
 
 	for _, tt := range tests {

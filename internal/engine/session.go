@@ -44,6 +44,7 @@ type Session struct {
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
 	signCh   chan *SignResponseMessage
+	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
 }
 
@@ -183,6 +184,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		logger:   m.logger.With(zap.String("session", userID[:8])),
 		actionCh: make(chan *FlowActionMessage, 50),
 		signCh:   make(chan *SignResponseMessage, 20),
+		matchCh:  make(chan *MatchResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1), // Buffered to prevent deadlock
 	}
 
@@ -290,6 +292,22 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Error("Sign channel full, sending error to client",
 					zap.String("message_id", signMsg.MessageID))
 				_ = session.SendFlowError("", "", ErrCodeTooManyRequests, "Server overloaded, please retry")
+			}
+
+		case TypeMatchResponse:
+			var matchMsg MatchResponseMessage
+			if err := json.Unmarshal(message, &matchMsg); err != nil {
+				session.logger.Warn("Invalid match_response", zap.Error(err))
+				continue
+			}
+			// Route to waiting flow - send error if channel full instead of dropping
+			select {
+			case session.matchCh <- &matchMsg:
+			default:
+				session.logger.Error("Match channel full, sending error to client",
+					zap.String("flow_id", matchMsg.FlowID),
+					zap.String("message_id", matchMsg.MessageID))
+				_ = session.SendFlowError(matchMsg.FlowID, StepMatchCredentials, ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
 
 		default:
@@ -645,6 +663,59 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 				return resp, nil
 			}
 			// Wrong message ID, keep waiting
+		}
+	}
+}
+
+// MatchTimeout is the timeout for credential matching requests.
+// This is generous to allow client-side matching across many credentials.
+const MatchTimeout = 30 * time.Second
+
+// ErrMatchTimeout is returned when credential matching times out
+var ErrMatchTimeout = errors.New("credential matching timed out")
+
+// RequestMatch sends a credential matching request and waits for response.
+// This is the privacy-preserving credential matching protocol where the client
+// matches credentials locally against the presentation definition.
+func (s *Session) RequestMatch(ctx context.Context, flowID string, pd *PresentationDefinition) (*MatchResponseMessage, error) {
+	messageID := uuid.New().String()
+
+	msg := MatchRequestMessage{
+		Message: Message{
+			Type:      TypeMatchRequest,
+			FlowID:    flowID,
+			MessageID: messageID,
+			Timestamp: Now(),
+		},
+		PresentationDefinition: pd,
+	}
+
+	if err := s.Send(&msg); err != nil {
+		return nil, err
+	}
+
+	// Wait for response with proper timer cleanup
+	timer := time.NewTimer(MatchTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return nil, ErrMatchTimeout
+		case <-s.closeCh:
+			return nil, errors.New("session closed")
+		case resp := <-s.matchCh:
+			// Verify both flow_id and message_id for proper correlation
+			if resp.FlowID == flowID && resp.MessageID == messageID {
+				// Check for error in response
+				if resp.Error != "" {
+					return nil, errors.New(resp.Error)
+				}
+				return resp, nil
+			}
+			// Wrong flow_id or message_id, keep waiting
 		}
 	}
 }
