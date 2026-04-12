@@ -100,45 +100,41 @@ func main() {
 		verifierEnabled := backendCfg.Trust.IsVerifierTrustEnabled()
 
 		if !issuerEnabled || !verifierEnabled {
+			// Use Error level in production to ensure visibility in alerting pipelines
 			level := zap.WarnLevel
+			if isProduction {
+				level = zap.ErrorLevel
+			}
 
 			if !issuerEnabled && !verifierEnabled {
-				msg := "SECURITY: Trust evaluation is disabled - all issuers and verifiers will be accepted without verification"
-				if isProduction {
-					msg = "SECURITY WARNING: Trust evaluation is disabled in production environment for issuers and verifiers"
-				}
-				logger.Log(level, msg,
+				logger.Log(level, "Trust evaluation is disabled - all issuers and verifiers will be accepted without verification",
 					zap.Bool("issuer_trust_enabled", false),
-					zap.Bool("verifier_trust_enabled", false))
+					zap.Bool("verifier_trust_enabled", false),
+					zap.Bool("production", isProduction))
 			} else if !issuerEnabled {
-				msg := "SECURITY: Issuer trust evaluation is disabled - all issuers will be accepted without verification"
-				if isProduction {
-					msg = "SECURITY WARNING: Issuer trust evaluation is disabled in production environment"
-				}
-				logger.Log(level, msg,
-					zap.Bool("issuer_trust_enabled", false))
+				logger.Log(level, "Issuer trust evaluation is disabled - all issuers will be accepted without verification",
+					zap.Bool("issuer_trust_enabled", false),
+					zap.Bool("production", isProduction))
 			} else {
-				msg := "SECURITY: Verifier trust evaluation is disabled - all verifiers will be accepted without verification"
-				if isProduction {
-					msg = "SECURITY WARNING: Verifier trust evaluation is disabled in production environment"
-				}
-				logger.Log(level, msg,
-					zap.Bool("verifier_trust_enabled", false))
+				logger.Log(level, "Verifier trust evaluation is disabled - all verifiers will be accepted without verification",
+					zap.Bool("verifier_trust_enabled", false),
+					zap.Bool("production", isProduction))
 			}
 		}
 
 		// Issue #71: Warn when CORS allows wildcard origin
 		for _, origin := range backendCfg.Server.CORS.AllowedOrigins {
 			if origin == "*" {
-				msg := "SECURITY: CORS wildcard (*) configured - allows requests from any origin"
+				level := zap.WarnLevel
 				if isProduction {
-					msg = "SECURITY WARNING: CORS wildcard (*) is configured in production - this allows any origin to make authenticated requests"
+					level = zap.ErrorLevel
 				}
-				logger.Warn(msg,
+				logger.Log(level, "CORS wildcard (*) configured - this allows any origin to make requests",
 					zap.Strings("allowed_origins", backendCfg.Server.CORS.AllowedOrigins),
 					zap.Bool("allow_credentials", backendCfg.Server.CORS.AllowCredentials),
 					zap.Strings("allowed_headers", backendCfg.Server.CORS.AllowedHeaders),
-					zap.Strings("allowed_methods", backendCfg.Server.CORS.AllowedMethods))
+					zap.Strings("allowed_methods", backendCfg.Server.CORS.AllowedMethods),
+					zap.Bool("production", isProduction))
 				break
 			}
 		}
