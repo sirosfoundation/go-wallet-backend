@@ -1,6 +1,6 @@
 module github.com/sirosfoundation/go-wallet-backend
 
-go 1.25.1
+go 1.26
 
 require (
 	github.com/descope/virtualwebauthn v1.0.3
@@ -13,6 +13,7 @@ require (
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/sirosfoundation/go-cryptoutil v0.2.0
+	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-trust v0.0.0-20260223112607-3f3b0788c175
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
@@ -66,7 +67,6 @@ require (
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/sirosfoundation/g119612 v0.0.0-20260108094825-5b3123230280 // indirect
-	github.com/sirosfoundation/go-spocp v0.1.0 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/tinylib/msgp v1.6.3 // indirect
