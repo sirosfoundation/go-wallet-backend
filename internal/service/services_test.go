@@ -49,9 +49,6 @@ func TestNewServices(t *testing.T) {
 	if services.Credential == nil {
 		t.Error("expected Credential service to be initialized")
 	}
-	if services.Presentation == nil {
-		t.Error("expected Presentation service to be initialized")
-	}
 	if services.Issuer == nil {
 		t.Error("expected Issuer service to be initialized")
 	}

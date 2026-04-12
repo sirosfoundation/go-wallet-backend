@@ -518,29 +518,6 @@ func TestHandlers_GetAllCredentials_Success(t *testing.T) {
 	}
 }
 
-func TestHandlers_GetAllPresentations_Success(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.GET("/vp", authMiddlewareForUser(user), handlers.GetAllPresentations)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/vp", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
-	}
-
-	// Verify response contains vp_list
-	var response map[string]interface{}
-	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
-		t.Fatalf("Failed to parse response: %v. Body: %s", err, w.Body.String())
-	}
-
-	if _, ok := response["vp_list"]; !ok {
-		t.Errorf("Expected vp_list in response, got: %v", response)
-	}
-}
-
 func TestHandlers_StoreAndGetCredential(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	router.POST("/vc", authMiddlewareForUser(user), handlers.StoreCredential)
@@ -613,29 +590,6 @@ func TestHandlers_DeleteCredential_Success(t *testing.T) {
 
 	if w2.Code != http.StatusOK {
 		t.Errorf("Delete failed with status %d: %s", w2.Code, w2.Body.String())
-	}
-}
-
-func TestHandlers_StorePresentation_Success(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.POST("/vp", authMiddlewareForUser(user), handlers.StorePresentation)
-
-	body, _ := json.Marshal(domain.StorePresentationRequest{
-		PresentationIdentifier:                  "pres-123",
-		Presentation:                            `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
-		PresentationSubmission:                  `{"id":"submission"}`,
-		IncludedVerifiableCredentialIdentifiers: []string{"cred-1"},
-		Audience:                                "verifier-1",
-		IssuanceDate:                            time.Now(),
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/vp", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 }
 
@@ -775,122 +729,6 @@ func TestHandlers_DeleteCredential_NotFound(t *testing.T) {
 }
 
 // ====================
-// Additional Presentation Tests
-// ====================
-
-func TestHandlers_GetPresentationByIdentifier_Success(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.POST("/vp", authMiddlewareForUser(user), handlers.StorePresentation)
-	router.GET("/vp/:presentation_identifier", authMiddlewareForUser(user), handlers.GetPresentationByIdentifier)
-
-	// First store a presentation
-	storeBody, _ := json.Marshal(domain.StorePresentationRequest{
-		PresentationIdentifier:                  "pres-get-test",
-		Presentation:                            `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
-		IncludedVerifiableCredentialIdentifiers: []string{"cred-1"},
-		Audience:                                "verifier-1",
-	})
-
-	w1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodPost, "/vp", bytes.NewBuffer(storeBody))
-	req1.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w1, req1)
-
-	// Get by identifier
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "/vp/pres-get-test", nil)
-	router.ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusOK {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w2.Code, w2.Body.String())
-	}
-
-	var pres domain.VerifiablePresentation
-	if err := json.Unmarshal(w2.Body.Bytes(), &pres); err != nil {
-		t.Fatalf("Failed to parse response: %v", err)
-	}
-
-	if pres.PresentationIdentifier != "pres-get-test" {
-		t.Errorf("Expected identifier 'pres-get-test', got '%s'", pres.PresentationIdentifier)
-	}
-}
-
-func TestHandlers_GetPresentationByIdentifier_NotFound(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.GET("/vp/:presentation_identifier", authMiddlewareForUser(user), handlers.GetPresentationByIdentifier)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/vp/nonexistent", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
-	}
-}
-
-func TestHandlers_DeletePresentation_Success(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.POST("/vp", authMiddlewareForUser(user), handlers.StorePresentation)
-	router.DELETE("/vp/:presentation_identifier", authMiddlewareForUser(user), handlers.DeletePresentation)
-
-	// First store a presentation
-	storeBody, _ := json.Marshal(domain.StorePresentationRequest{
-		PresentationIdentifier:                  "pres-delete-test",
-		Presentation:                            `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
-		IncludedVerifiableCredentialIdentifiers: []string{"cred-1"},
-	})
-
-	w1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodPost, "/vp", bytes.NewBuffer(storeBody))
-	req1.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w1, req1)
-
-	// Delete presentation
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodDelete, "/vp/pres-delete-test", nil)
-	router.ServeHTTP(w2, req2)
-
-	// Handler returns 204 No Content on success
-	if w2.Code != http.StatusNoContent {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusNoContent, w2.Code, w2.Body.String())
-	}
-}
-
-func TestHandlers_DeletePresentation_NotFound(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.DELETE("/vp/:presentation_identifier", authMiddlewareForUser(user), handlers.DeletePresentation)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/vp/nonexistent", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
-	}
-}
-
-func TestHandlers_StorePresentation_Invalid(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.POST("/vp", authMiddlewareForUser(user), handlers.StorePresentation)
-
-	// Missing required fields - service layer validation returns error, handler returns 500
-	body, _ := json.Marshal(map[string]interface{}{
-		"presentation": `{"test": true}`,
-		// Missing presentationIdentifier
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/vp", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	// Handler returns 500 for service-layer validation errors
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("Expected status %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
-	}
-}
-
-// ====================
 // Issuer and Verifier Tests
 // ====================
 
@@ -979,67 +817,5 @@ func TestHandlers_StoreCredential_MissingFormat(t *testing.T) {
 	// Handler accepts credentials without format (format validation is lenient)
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
-	}
-}
-
-func TestHandlers_DeleteCredential_CascadesPresentations(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	router.POST("/vc", authMiddlewareForUser(user), handlers.StoreCredential)
-	router.POST("/vp", authMiddlewareForUser(user), handlers.StorePresentation)
-	router.DELETE("/vc/:credential_identifier", authMiddlewareForUser(user), handlers.DeleteCredential)
-	router.GET("/vp", authMiddlewareForUser(user), handlers.GetAllPresentations)
-
-	// Store a credential
-	storeCredBody, _ := json.Marshal(map[string]interface{}{
-		"credentials": []map[string]interface{}{
-			{
-				"credentialIdentifier": "cascade-test-cred",
-				"credential":           `{"test": true}`,
-				"format":               "jwt_vc",
-			},
-		},
-	})
-
-	w1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodPost, "/vc", bytes.NewBuffer(storeCredBody))
-	req1.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w1, req1)
-
-	// Store a presentation that includes the credential
-	storePresBody, _ := json.Marshal(domain.StorePresentationRequest{
-		PresentationIdentifier:                  "cascade-test-pres",
-		Presentation:                            `{"test": true}`,
-		IncludedVerifiableCredentialIdentifiers: []string{"cascade-test-cred"},
-	})
-
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPost, "/vp", bytes.NewBuffer(storePresBody))
-	req2.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w2, req2)
-
-	// Delete the credential - should cascade to presentation
-	w3 := httptest.NewRecorder()
-	req3 := httptest.NewRequest(http.MethodDelete, "/vc/cascade-test-cred", nil)
-	router.ServeHTTP(w3, req3)
-
-	if w3.Code != http.StatusOK {
-		t.Errorf("Delete credential failed: %s", w3.Body.String())
-	}
-
-	// Check that presentation was also deleted
-	w4 := httptest.NewRecorder()
-	req4 := httptest.NewRequest(http.MethodGet, "/vp", nil)
-	router.ServeHTTP(w4, req4)
-
-	var vpResponse struct {
-		VPList []domain.VerifiablePresentation `json:"vp_list"`
-	}
-	if err := json.Unmarshal(w4.Body.Bytes(), &vpResponse); err != nil {
-		t.Fatalf("Failed to parse vp response: %v", err)
-	}
-
-	// Presentation should have been deleted (or vp_list should be empty/nil)
-	if len(vpResponse.VPList) != 0 {
-		t.Errorf("Expected 0 presentations after cascade delete, got %d", len(vpResponse.VPList))
 	}
 }

@@ -6,9 +6,11 @@ import (
 	"testing"
 )
 
-// TestCredentialStorage tests VC storage endpoints
+// TestCredentialStorage tests VC storage endpoints (with feature flag enabled)
 func TestCredentialStorage(t *testing.T) {
-	h := NewTestHarness(t)
+	cfg := defaultTestConfig()
+	cfg.Features.CredentialStorageEnabled = true
+	h := NewTestHarness(t, WithConfig(cfg))
 	user := h.CreateTestUser("Storage User")
 
 	// Sample credential for testing
@@ -107,62 +109,46 @@ func TestCredentialStorage(t *testing.T) {
 	})
 }
 
-// TestPresentationStorage tests VP storage endpoints
-func TestPresentationStorage(t *testing.T) {
-	h := NewTestHarness(t)
-	user := h.CreateTestUser("VP Storage User")
+// TestPresentationStorageRemoved verifies VP endpoints are no longer registered
+func TestPresentationStorageRemoved(t *testing.T) {
+	cfg := defaultTestConfig()
+	cfg.Features.CredentialStorageEnabled = true
+	h := NewTestHarness(t, WithConfig(cfg))
+	user := h.CreateTestUser("VP Removed User")
 
-	var storedVPID string
-
-	t.Run("POST stores a presentation", func(t *testing.T) {
-		vpJSON := `{"@context":["https://www.w3.org/2018/credentials/v1"],"type":["VerifiablePresentation"]}`
-		vpB64 := base64.RawURLEncoding.EncodeToString([]byte(vpJSON))
-
-		storeReq := map[string]interface{}{
-			"presentation":           map[string]string{"$b64u": vpB64},
-			"presentationIdentifier": "test-vp-001",
-		}
-
-		resp := h.AuthPOST(user, "/storage/vp", storeReq)
-
-		if resp.Response.StatusCode == http.StatusOK || resp.Response.StatusCode == http.StatusCreated {
-			var result map[string]interface{}
-			resp.JSON(&result)
-			if id, ok := result["presentationIdentifier"].(string); ok {
-				storedVPID = id
-			}
-		} else if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
+	t.Run("POST /storage/vp returns 404", func(t *testing.T) {
+		resp := h.AuthPOST(user, "/storage/vp", map[string]string{"test": "data"})
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for removed VP endpoint, got %d", resp.Response.StatusCode)
 		}
 	})
 
-	t.Run("GET returns all presentations", func(t *testing.T) {
+	t.Run("GET /storage/vp returns 404", func(t *testing.T) {
 		resp := h.AuthGET(user, "/storage/vp")
-		resp.Status(http.StatusOK)
-		t.Logf("All presentations response: %s", resp.Pretty())
-	})
-
-	t.Run("GET by ID returns specific presentation", func(t *testing.T) {
-		if storedVPID == "" {
-			storedVPID = "test-vp-001"
-		}
-
-		resp := h.AuthGET(user, "/storage/vp/"+storedVPID)
-		if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for removed VP endpoint, got %d", resp.Response.StatusCode)
 		}
 	})
+}
 
-	t.Run("DELETE removes a presentation", func(t *testing.T) {
-		resp := h.AuthDELETE(user, "/storage/vp/test-vp-001")
-		if resp.Response.StatusCode >= 500 {
-			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
+// TestCredentialStorageDisabled verifies VC endpoints return 404 when the feature flag is off (default)
+func TestCredentialStorageDisabled(t *testing.T) {
+	// Default config has CredentialStorageEnabled = false
+	h := NewTestHarness(t)
+	user := h.CreateTestUser("Disabled VC User")
+
+	t.Run("GET /storage/vc returns 404 when disabled", func(t *testing.T) {
+		resp := h.AuthGET(user, "/storage/vc")
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for disabled VC endpoint, got %d", resp.Response.StatusCode)
 		}
 	})
 
-	t.Run("returns 401 without auth", func(t *testing.T) {
-		resp := h.GET("/storage/vp")
-		resp.Status(http.StatusUnauthorized)
+	t.Run("POST /storage/vc returns 404 when disabled", func(t *testing.T) {
+		resp := h.AuthPOST(user, "/storage/vc", map[string]string{"test": "data"})
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for disabled VC endpoint, got %d", resp.Response.StatusCode)
+		}
 	})
 }
 

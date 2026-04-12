@@ -547,6 +547,18 @@ func (s *ChallengeStore) DeleteExpired(ctx context.Context) error {
 	return nil
 }
 
+func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, challenge := range s.data {
+		if challenge.UserID == userID {
+			delete(s.data, id)
+		}
+	}
+	return nil
+}
+
 // IssuerStore implements in-memory issuer storage
 type IssuerStore struct {
 	mu     sync.RWMutex

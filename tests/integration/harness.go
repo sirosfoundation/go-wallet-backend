@@ -55,6 +55,29 @@ func WithConfig(cfg *config.Config) TestHarnessOption {
 	}
 }
 
+// defaultTestConfig returns the default integration test config.
+// Callers can mutate the returned struct before passing it to WithConfig.
+func defaultTestConfig() *config.Config {
+	return &config.Config{
+		Server: config.ServerConfig{
+			Host:     "localhost",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			RPName:   "Test Wallet",
+		},
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+		JWT: config.JWTConfig{
+			Secret:      "test-secret-key-for-integration-tests",
+			ExpiryHours: 24,
+			RefreshDays: 7,
+			Issuer:      "test-wallet-backend",
+		},
+	}
+}
+
 // NewTestHarness creates a new test harness with a running test server
 func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	t.Helper()
@@ -76,24 +99,7 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 
 	// Default config if not provided
 	if h.Config == nil {
-		h.Config = &config.Config{
-			Server: config.ServerConfig{
-				Host:     "localhost",
-				Port:     8080,
-				RPID:     "localhost",
-				RPOrigin: "http://localhost:8080",
-				RPName:   "Test Wallet",
-			},
-			Storage: config.StorageConfig{
-				Type: "memory",
-			},
-			JWT: config.JWTConfig{
-				Secret:      "test-secret-key-for-integration-tests",
-				ExpiryHours: 24,
-				RefreshDays: 7,
-				Issuer:      "test-wallet-backend",
-			},
-		}
+		h.Config = defaultTestConfig()
 	}
 
 	// Create memory storage
@@ -168,22 +174,18 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 		session.POST("/webauthn-credential/:id/rename", h.RenameWebAuthnCredential)
 	}
 
-	// Storage routes (authenticated)
+	// Storage routes (authenticated) — gated like production
 	storage := r.Group("/storage")
 	storage.Use(auth)
 	{
-		// Credentials
-		storage.GET("/vc", h.GetAllCredentials)
-		storage.POST("/vc", h.StoreCredential)
-		storage.GET("/vc/:id", h.GetCredentialByIdentifier)
-		storage.PUT("/vc/:id", h.UpdateCredential)
-		storage.DELETE("/vc/:id", h.DeleteCredential)
-
-		// Presentations
-		storage.GET("/vp", h.GetAllPresentations)
-		storage.POST("/vp", h.StorePresentation)
-		storage.GET("/vp/:id", h.GetPresentationByIdentifier)
-		storage.DELETE("/vp/:id", h.DeletePresentation)
+		// Credentials (gated behind feature flag, matching providers.go)
+		if cfg.Features.CredentialStorageEnabled {
+			storage.GET("/vc", h.GetAllCredentials)
+			storage.POST("/vc", h.StoreCredential)
+			storage.GET("/vc/:id", h.GetCredentialByIdentifier)
+			storage.PUT("/vc/:id", h.UpdateCredential)
+			storage.DELETE("/vc/:id", h.DeleteCredential)
+		}
 	}
 
 	// Issuer routes (public)

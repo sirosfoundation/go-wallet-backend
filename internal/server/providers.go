@@ -52,6 +52,9 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 func (p *AuthProvider) Transport() Transport { return TransportHTTP }
 func (p *AuthProvider) Name() string         { return "auth" }
 
+// Services returns the auth provider's service aggregate.
+func (p *AuthProvider) Services() *service.Services { return p.services }
+
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
 	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
@@ -183,17 +186,14 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected := router.Group("/storage")
 	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
 	{
-		// Credential storage
-		protected.GET("/vc", p.handlers.GetAllCredentials)
-		protected.POST("/vc", p.handlers.StoreCredential)
-		protected.POST("/vc/update", p.handlers.UpdateCredential)
-		protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
-		protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
-
-		// Presentation storage
-		protected.GET("/vp", p.handlers.GetAllPresentations)
-		protected.POST("/vp", p.handlers.StorePresentation)
-		protected.GET("/vp/:presentation_identifier", p.handlers.GetPresentationByIdentifier)
+		// Credential storage (gated)
+		if p.cfg.Features.CredentialStorageEnabled {
+			protected.GET("/vc", p.handlers.GetAllCredentials)
+			protected.POST("/vc", p.handlers.StoreCredential)
+			protected.POST("/vc/update", p.handlers.UpdateCredential)
+			protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
+			protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
+		}
 	}
 }
 
@@ -250,6 +250,11 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 
 func (p *EngineProvider) Transport() Transport { return TransportWebSocket }
 func (p *EngineProvider) Name() string         { return "engine" }
+
+// SessionStore returns the engine's session store for cross-provider wiring.
+func (p *EngineProvider) SessionStore() wsengine.SessionStore {
+	return p.manager.SessionStore()
+}
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
@@ -319,6 +324,9 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 func (p *BackendProvider) Transport() Transport { return TransportHTTP }
 func (p *BackendProvider) Name() string         { return "backend" }
+
+// Services returns the backend's service aggregate (via the auth provider).
+func (p *BackendProvider) Services() *service.Services { return p.auth.Services() }
 
 func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register both auth and storage routes

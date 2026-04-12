@@ -24,11 +24,18 @@ var (
 	ErrLastWebAuthnCredential = errors.New("cannot delete last webauthn credential")
 )
 
+// SessionCleaner can remove sessions for a user.
+// Implemented by engine.SessionStore (memory or Redis).
+type SessionCleaner interface {
+	DeleteByUser(ctx context.Context, userID string) error
+}
+
 // UserService handles user-related operations
 type UserService struct {
-	store  storage.Store
-	cfg    *config.Config
-	logger *zap.Logger
+	store          storage.Store
+	cfg            *config.Config
+	logger         *zap.Logger
+	sessionCleaner SessionCleaner
 }
 
 // NewUserService creates a new UserService
@@ -38,6 +45,12 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 		cfg:    cfg,
 		logger: logger.Named("user-service"),
 	}
+}
+
+// SetSessionCleaner sets the session cleanup implementation.
+// When set, DeleteUser will purge active sessions for the deleted user.
+func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
+	s.sessionCleaner = sc
 }
 
 // Register registers a new user
@@ -85,7 +98,7 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
-	s.logger.Info("User registered", zap.String("user_id", user.UUID.String()))
+	s.logger.Info("User registered")
 	return user, nil
 }
 
@@ -116,7 +129,7 @@ func (s *UserService) Login(ctx context.Context, username, password string) (*do
 		return nil, "", fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	s.logger.Info("User logged in", zap.String("user_id", user.UUID.String()))
+	s.logger.Info("User logged in")
 	return user, token, nil
 }
 
@@ -233,9 +246,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
 
-	// Delete credentials and presentations from each tenant
+	// Delete any legacy server-side stored credentials from each tenant, regardless
+	// of whether credential/VC endpoints are currently enabled.
 	for _, tenantID := range tenantIDs {
-		// Delete all credentials in this tenant
 		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
@@ -246,20 +259,26 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 			}
 		}
 
-		// Delete all presentations in this tenant
-		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, pres := range presentations {
-			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
-				s.logger.Warn("Failed to delete presentation", zap.Error(err))
-			}
-		}
-
 		// Remove tenant membership
 		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
 			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+	}
+
+	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
+	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
+		s.logger.Warn("Failed to delete challenges for user", zap.Error(err))
+	}
+
+	// Clear user reference from consumed invites
+	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
+		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
+	}
+
+	// Purge active WebSocket sessions (Redis or memory)
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
 		}
 	}
 
@@ -268,7 +287,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
 
-	s.logger.Info("User deleted", zap.String("user_id", userID.String()))
+	s.logger.Info("User deleted")
 	return nil
 }
 

@@ -334,15 +334,15 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 		// Storage routes
 		storageGroup := protected.Group("/storage")
 		{
-			storageGroup.GET("/vc", handlers.GetAllCredentials)
-			storageGroup.POST("/vc", handlers.StoreCredential)
-			storageGroup.POST("/vc/update", handlers.UpdateCredential)
-			storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
-			storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
-
-			storageGroup.GET("/vp", handlers.GetAllPresentations)
-			storageGroup.POST("/vp", handlers.StorePresentation)
-			storageGroup.GET("/vp/:presentation_identifier", handlers.GetPresentationByIdentifier)
+			// Credential storage (gated — disabled by default since credentials
+			// are stored exclusively in encrypted client-side private_data)
+			if cfg.Features.CredentialStorageEnabled {
+				storageGroup.GET("/vc", handlers.GetAllCredentials)
+				storageGroup.POST("/vc", handlers.StoreCredential)
+				storageGroup.POST("/vc/update", handlers.UpdateCredential)
+				storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
+				storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
+			}
 		}
 
 		// Issuer routes
