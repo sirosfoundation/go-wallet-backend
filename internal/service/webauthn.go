@@ -296,7 +296,6 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 
 	// Debug: log the userHandle being sent to the browser
 	s.logger.Info("Registration: generated userHandle",
-		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int("handle_length", len(userHandle)),
 		zap.Binary("handle_bytes", userHandle),
@@ -329,7 +328,6 @@ func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegis
 	}
 
 	s.logger.Info("Started registration",
-		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)))
 
 	// Build response matching TypeScript wallet-backend-server format
@@ -650,10 +648,8 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 			BoundAt:     now,
 		})
 		s.logger.Info("Bound enterprise identity to user",
-			zap.String("user_id", userID.String()),
 			zap.String("tenant_id", string(tenantID)),
-			zap.String("issuer", req.OIDCGateBinding.Issuer),
-			zap.String("subject", req.OIDCGateBinding.Subject))
+			zap.String("issuer", req.OIDCGateBinding.Issuer))
 	}
 
 	// Store the user

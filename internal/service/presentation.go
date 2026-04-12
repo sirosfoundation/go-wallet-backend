@@ -53,7 +53,6 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 
 	s.logger.Info("Presentation stored",
 		zap.String("tenant_id", string(tenantID)),
-		zap.String("holder_did", presentation.HolderDID),
 		zap.String("presentation_id", presentation.PresentationIdentifier))
 
 	return nil
