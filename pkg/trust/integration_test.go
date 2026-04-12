@@ -2,6 +2,7 @@ package trust_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,26 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	authzenevaluator "github.com/sirosfoundation/go-wallet-backend/pkg/trust/authzen"
 )
+
+// safeCapture provides thread-safe capture of AuthZEN requests in test decision functions.
+// While net/http round-trips provide happens-before ordering in practice, explicit
+// synchronization makes the guarantee visible to readers and tools.
+type safeCapture struct {
+	mu  sync.Mutex
+	req *authzen.EvaluationRequest
+}
+
+func (c *safeCapture) set(req *authzen.EvaluationRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.req = req
+}
+
+func (c *safeCapture) get() *authzen.EvaluationRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.req
+}
 
 // newTestService creates a trust.Service wired to an embedded go-trust testserver.
 // Returns the service and a cleanup function.
@@ -124,11 +145,11 @@ func TestIntegration_EvaluateIssuer_WithJWK(t *testing.T) {
 }
 
 func TestIntegration_EvaluateIssuer_WithCredentialType(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	svc, cleanup := newTestService(t, testserver.WithDecisionFunc(
 		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+			capture.set(req)
 			return &authzen.EvaluationResponse{Decision: true}, nil
 		},
 	))
@@ -147,6 +168,7 @@ func TestIntegration_EvaluateIssuer_WithCredentialType(t *testing.T) {
 	}
 
 	// Verify the AuthZEN request was built correctly
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -162,6 +184,13 @@ func TestIntegration_EvaluateIssuer_WithCredentialType(t *testing.T) {
 	}
 	if capturedReq.Resource.Type != "x5c" {
 		t.Errorf("Resource.Type = %q, want x5c", capturedReq.Resource.Type)
+	}
+	// Verify credential_type is propagated in the AuthZEN context
+	if capturedReq.Context == nil {
+		t.Fatal("Context is nil, expected credential_type")
+	}
+	if ct, ok := capturedReq.Context["credential_type"]; !ok || ct != "eu.europa.ec.eudi.pid.1" {
+		t.Errorf("Context[credential_type] = %v, want eu.europa.ec.eudi.pid.1", ct)
 	}
 }
 
@@ -244,11 +273,11 @@ func TestIntegration_EvaluateVerifier_RejectAll(t *testing.T) {
 }
 
 func TestIntegration_EvaluateVerifier_ActionRouting(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	svc, cleanup := newTestService(t, testserver.WithDecisionFunc(
 		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+			capture.set(req)
 			// Only trust credential-verifier actions
 			if req.Action != nil && req.Action.Name == "credential-verifier" {
 				return &authzen.EvaluationResponse{Decision: true}, nil
@@ -269,6 +298,7 @@ func TestIntegration_EvaluateVerifier_ActionRouting(t *testing.T) {
 		t.Errorf("expected Trusted=true for credential-verifier action, got false (reason: %s)", result.Reason)
 	}
 
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -285,11 +315,11 @@ func TestIntegration_EvaluateVerifier_ActionRouting(t *testing.T) {
 }
 
 func TestIntegration_EvaluateVerifier_X5CChain(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	svc, cleanup := newTestService(t, testserver.WithDecisionFunc(
 		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+			capture.set(req)
 			return &authzen.EvaluationResponse{
 				Decision: true,
 				Context: &authzen.EvaluationResponseContext{
@@ -321,6 +351,7 @@ func TestIntegration_EvaluateVerifier_X5CChain(t *testing.T) {
 	}
 
 	// Verify the full chain was sent
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -451,11 +482,11 @@ func TestIntegration_PerFlowPDP_IssuerOnlyEnabled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestIntegration_WireProtocol_IssuerRequest(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	svc, cleanup := newTestService(t, testserver.WithDecisionFunc(
 		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+			capture.set(req)
 			return &authzen.EvaluationResponse{Decision: true}, nil
 		},
 	))
@@ -470,6 +501,7 @@ func TestIntegration_WireProtocol_IssuerRequest(t *testing.T) {
 		t.Fatalf("EvaluateIssuer() error = %v", err)
 	}
 
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("PDP did not receive request")
 	}
@@ -497,11 +529,11 @@ func TestIntegration_WireProtocol_IssuerRequest(t *testing.T) {
 }
 
 func TestIntegration_WireProtocol_VerifierRequest(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	svc, cleanup := newTestService(t, testserver.WithDecisionFunc(
 		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+			capture.set(req)
 			return &authzen.EvaluationResponse{Decision: true}, nil
 		},
 	))
@@ -515,6 +547,7 @@ func TestIntegration_WireProtocol_VerifierRequest(t *testing.T) {
 		t.Fatalf("EvaluateVerifier() error = %v", err)
 	}
 
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("PDP did not receive request")
 	}

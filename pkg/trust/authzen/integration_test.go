@@ -2,12 +2,31 @@ package authzen
 
 import (
 	"context"
+	"sync"
 	"testing"
 
-	"github.com/sirosfoundation/go-trust/pkg/authzen"
+	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/testserver"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
+
+// safeCapture provides thread-safe capture of AuthZEN requests in test decision functions.
+type safeCapture struct {
+	mu  sync.Mutex
+	req *gotrust.EvaluationRequest
+}
+
+func (c *safeCapture) set(req *gotrust.EvaluationRequest) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.req = req
+}
+
+func (c *safeCapture) get() *gotrust.EvaluationRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.req
+}
 
 // ---------------------------------------------------------------------------
 // Integration tests using embedded go-trust testserver
@@ -56,15 +75,15 @@ func TestIntegration_Evaluator_RejectAll(t *testing.T) {
 }
 
 func TestIntegration_Evaluator_DecisionFunc_CredentialIssuer(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	srv := testserver.New(testserver.WithDecisionFunc(
-		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+		func(req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error) {
+			capture.set(req)
 			if req.Action != nil && req.Action.Name == "credential-issuer" {
-				return &authzen.EvaluationResponse{
+				return &gotrust.EvaluationResponse{
 					Decision: true,
-					Context: &authzen.EvaluationResponseContext{
+					Context: &gotrust.EvaluationResponseContext{
 						Reason: map[string]interface{}{
 							"registry": "etsi-tsl",
 							"message":  "validated against TSL",
@@ -72,7 +91,7 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialIssuer(t *testing.T) {
 					},
 				}, nil
 			}
-			return &authzen.EvaluationResponse{Decision: false}, nil
+			return &gotrust.EvaluationResponse{Decision: false}, nil
 		},
 	))
 	defer srv.Close()
@@ -100,6 +119,7 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialIssuer(t *testing.T) {
 	}
 
 	// Verify wire format
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -115,15 +135,15 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialIssuer(t *testing.T) {
 }
 
 func TestIntegration_Evaluator_DecisionFunc_CredentialVerifier(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	srv := testserver.New(testserver.WithDecisionFunc(
-		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
+		func(req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error) {
+			capture.set(req)
 			if req.Action != nil && req.Action.Name == "credential-verifier" {
-				return &authzen.EvaluationResponse{
+				return &gotrust.EvaluationResponse{
 					Decision: true,
-					Context: &authzen.EvaluationResponseContext{
+					Context: &gotrust.EvaluationResponseContext{
 						Reason: map[string]interface{}{
 							"registry":     "etsi-tsl",
 							"service_type": "http://uri.etsi.org/TrstSvc/Svctype/QCertForESig",
@@ -132,7 +152,7 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialVerifier(t *testing.T) {
 					},
 				}, nil
 			}
-			return &authzen.EvaluationResponse{Decision: false}, nil
+			return &gotrust.EvaluationResponse{Decision: false}, nil
 		},
 	))
 	defer srv.Close()
@@ -160,6 +180,7 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialVerifier(t *testing.T) {
 	}
 
 	// Verify wire format
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -171,9 +192,9 @@ func TestIntegration_Evaluator_DecisionFunc_CredentialVerifier(t *testing.T) {
 func TestIntegration_Evaluator_HealthRecovery(t *testing.T) {
 	callCount := 0
 	srv := testserver.New(testserver.WithDecisionFunc(
-		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
+		func(req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error) {
 			callCount++
-			return &authzen.EvaluationResponse{Decision: true}, nil
+			return &gotrust.EvaluationResponse{Decision: true}, nil
 		},
 	))
 	defer srv.Close()
@@ -208,12 +229,12 @@ func TestIntegration_Evaluator_HealthRecovery(t *testing.T) {
 }
 
 func TestIntegration_EvaluateX5C_WithAction(t *testing.T) {
-	var capturedReq *authzen.EvaluationRequest
+	capture := &safeCapture{}
 
 	srv := testserver.New(testserver.WithDecisionFunc(
-		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			capturedReq = req
-			return &authzen.EvaluationResponse{Decision: true}, nil
+		func(req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error) {
+			capture.set(req)
+			return &gotrust.EvaluationResponse{Decision: true}, nil
 		},
 	))
 	defer srv.Close()
@@ -231,6 +252,7 @@ func TestIntegration_EvaluateX5C_WithAction(t *testing.T) {
 		t.Errorf("expected Decision=true, got false (reason: %s)", resp.Reason)
 	}
 
+	capturedReq := capture.get()
 	if capturedReq == nil {
 		t.Fatal("DecisionFunc was not called")
 	}
@@ -244,10 +266,10 @@ func TestIntegration_EvaluateX5C_WithAction(t *testing.T) {
 
 func TestIntegration_Resolve_DID(t *testing.T) {
 	srv := testserver.New(testserver.WithDecisionFunc(
-		func(req *authzen.EvaluationRequest) (*authzen.EvaluationResponse, error) {
-			return &authzen.EvaluationResponse{
+		func(req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error) {
+			return &gotrust.EvaluationResponse{
 				Decision: true,
-				Context: &authzen.EvaluationResponseContext{
+				Context: &gotrust.EvaluationResponseContext{
 					TrustMetadata: map[string]interface{}{
 						"id":                 req.Subject.ID,
 						"verificationMethod": []interface{}{},
