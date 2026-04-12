@@ -1,0 +1,11 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+    patch:
+      default:
+        informational: true # Report patch coverage but don't block PRs
+
+ignore:
+  - "cmd/**" # Server entrypoints — startup-only, not unit-testable

@@ -1176,3 +1176,431 @@ func TestBEREncodedECDSASignature(t *testing.T) {
 	cred := user.WebauthnCredentials[0]
 	assert.NotEmpty(t, cred.PublicKey, "Credential should have a public key")
 }
+
+// ============================================================================
+// OIDC Gate Enforcement Tests for FinishLogin
+// Issue #61: Add OIDC gate enforcement tests for FinishLogin
+// ============================================================================
+
+func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate enabled for login
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant"),
+		Name:    "Test Tenant",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	// Parse registration options
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User",
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	// Use EncodeUserHandle to create proper tenant-scoped handle
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	// Parse login options
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login WITHOUT OIDC binding - should fail with ErrOIDCGateRequired
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID:     beginLoginResp.ChallengeID,
+		Credential:      json.RawMessage(assertionResponse),
+		OIDCGateBinding: nil, // Missing OIDC binding
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require OIDC gate when binding is missing")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate enabled for login
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-2"),
+		Name:    "Test Tenant 2",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User 2",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User 2",
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login with WRONG issuer - should fail with ErrOIDCGateRequired
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://wrong-idp.example.com", // Wrong issuer!
+			Subject: "user123",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate AND bind_identity enabled
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-3"),
+		Name:    "Test Tenant 3",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+			BindIdentity: true, // Requires bound identity
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant (but WITHOUT binding identity during registration)
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User 3",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User 3",
+		// OIDCGateBinding is nil - no identity bound during registration
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login with correct issuer but no bound identity - should fail with ErrIdentityNotBound
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "user123",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrIdentityNotBound, "Should fail when no identity was bound during registration")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate AND bind_identity enabled
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-4"),
+		Name:    "Test Tenant 4",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+			BindIdentity: true,
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Test User 4",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Test User 4",
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "correct-user",
+		},
+	})
+	require.NoError(t, err)
+
+	// Verify the identity was bound
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	user, err := setup.store.Users().GetByID(setup.ctx, userID)
+	require.NoError(t, err)
+	require.NotNil(t, user.GetEnterpriseIdentityForTenant(tenant.ID), "Identity should be bound after registration")
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Attempt login with MISMATCHED subject - should fail with ErrIdentityBindingMismatch
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "wrong-user", // Doesn't match "correct-user"
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrIdentityBindingMismatch, "Should fail when binding doesn't match stored identity")
+}
+
+func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Create tenant with OIDC gate AND bind_identity enabled
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-5"),
+		Name:    "Test Tenant 5",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "test-client",
+			},
+			BindIdentity: true,
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	// Register a user with this tenant and bind identity
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Success User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Success User",
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "valid-user",
+		},
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with tenant-scoped user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Start login
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Login with MATCHING binding - should succeed
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:  "https://idp.example.com",
+			Subject: "valid-user", // Matches bound identity
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when OIDC binding matches stored identity")
+	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
+	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
+}
