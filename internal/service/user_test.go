@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -585,6 +586,57 @@ func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
 	}
 	if got.UsedBy != nil {
 		t.Error("Invite used_by should be cleared after DeleteUser")
+	}
+}
+
+// mockSessionCleaner records calls to DeleteByUser for test assertions.
+type mockSessionCleaner struct {
+	called bool
+	userID string
+}
+
+func (m *mockSessionCleaner) DeleteByUser(_ context.Context, userID string) error {
+	m.called = true
+	m.userID = userID
+	return nil
+}
+
+func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	// Wire mock session cleaner
+	mock := &mockSessionCleaner{}
+	svc.SetSessionCleaner(mock)
+
+	// Register user
+	username := "session-cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Session Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Delete user
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify session cleaner was called with correct user ID
+	if !mock.called {
+		t.Error("SessionCleaner.DeleteByUser should be called during DeleteUser")
+	}
+	if mock.userID != user.UUID.String() {
+		t.Errorf("SessionCleaner.DeleteByUser called with %q, want %q", mock.userID, user.UUID.String())
 	}
 }
 

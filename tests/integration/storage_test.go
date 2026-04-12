@@ -6,9 +6,11 @@ import (
 	"testing"
 )
 
-// TestCredentialStorage tests VC storage endpoints
+// TestCredentialStorage tests VC storage endpoints (with feature flag enabled)
 func TestCredentialStorage(t *testing.T) {
-	h := NewTestHarness(t)
+	cfg := defaultTestConfig()
+	cfg.Features.CredentialStorageEnabled = true
+	h := NewTestHarness(t, WithConfig(cfg))
 	user := h.CreateTestUser("Storage User")
 
 	// Sample credential for testing
@@ -109,7 +111,9 @@ func TestCredentialStorage(t *testing.T) {
 
 // TestPresentationStorageRemoved verifies VP endpoints are no longer registered
 func TestPresentationStorageRemoved(t *testing.T) {
-	h := NewTestHarness(t)
+	cfg := defaultTestConfig()
+	cfg.Features.CredentialStorageEnabled = true
+	h := NewTestHarness(t, WithConfig(cfg))
 	user := h.CreateTestUser("VP Removed User")
 
 	t.Run("POST /storage/vp returns 404", func(t *testing.T) {
@@ -123,6 +127,27 @@ func TestPresentationStorageRemoved(t *testing.T) {
 		resp := h.AuthGET(user, "/storage/vp")
 		if resp.Response.StatusCode != http.StatusNotFound {
 			t.Errorf("Expected 404 for removed VP endpoint, got %d", resp.Response.StatusCode)
+		}
+	})
+}
+
+// TestCredentialStorageDisabled verifies VC endpoints return 404 when the feature flag is off (default)
+func TestCredentialStorageDisabled(t *testing.T) {
+	// Default config has CredentialStorageEnabled = false
+	h := NewTestHarness(t)
+	user := h.CreateTestUser("Disabled VC User")
+
+	t.Run("GET /storage/vc returns 404 when disabled", func(t *testing.T) {
+		resp := h.AuthGET(user, "/storage/vc")
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for disabled VC endpoint, got %d", resp.Response.StatusCode)
+		}
+	})
+
+	t.Run("POST /storage/vc returns 404 when disabled", func(t *testing.T) {
+		resp := h.AuthPOST(user, "/storage/vc", map[string]string{"test": "data"})
+		if resp.Response.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected 404 for disabled VC endpoint, got %d", resp.Response.StatusCode)
 		}
 	})
 }

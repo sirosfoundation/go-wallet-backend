@@ -110,6 +110,11 @@ func (m *Manager) SetSessionStore(store SessionStore) {
 	m.sessionStore = store
 }
 
+// SessionStore returns the session store instance.
+func (m *Manager) SessionStore() SessionStore {
+	return m.sessionStore
+}
+
 // SetVerifierStore sets the verifier store for trust caching
 func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 	m.verifierStore = store

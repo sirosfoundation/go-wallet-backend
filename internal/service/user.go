@@ -24,11 +24,18 @@ var (
 	ErrLastWebAuthnCredential = errors.New("cannot delete last webauthn credential")
 )
 
+// SessionCleaner can remove sessions for a user.
+// Implemented by engine.SessionStore (memory or Redis).
+type SessionCleaner interface {
+	DeleteByUser(ctx context.Context, userID string) error
+}
+
 // UserService handles user-related operations
 type UserService struct {
-	store  storage.Store
-	cfg    *config.Config
-	logger *zap.Logger
+	store          storage.Store
+	cfg            *config.Config
+	logger         *zap.Logger
+	sessionCleaner SessionCleaner
 }
 
 // NewUserService creates a new UserService
@@ -38,6 +45,12 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 		cfg:    cfg,
 		logger: logger.Named("user-service"),
 	}
+}
+
+// SetSessionCleaner sets the session cleanup implementation.
+// When set, DeleteUser will purge active sessions for the deleted user.
+func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
+	s.sessionCleaner = sc
 }
 
 // Register registers a new user
@@ -233,7 +246,8 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
 
-	// Delete credentials from each tenant (only relevant when credential storage is enabled)
+	// Delete any legacy server-side stored credentials from each tenant, regardless
+	// of whether credential/VC endpoints are currently enabled.
 	for _, tenantID := range tenantIDs {
 		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -259,6 +273,13 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Clear user reference from consumed invites
 	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
+	}
+
+	// Purge active WebSocket sessions (Redis or memory)
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
+		}
 	}
 
 	// Delete the user
