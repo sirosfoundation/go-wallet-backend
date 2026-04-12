@@ -181,7 +181,7 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			m.clients[userID] = client
 			m.clientsMu.Unlock()
 
-			m.logger.Info("WebSocket handshake established", zap.String("user_id", userID), zap.String("tenant_id", tenantID))
+			m.logger.Info("WebSocket handshake established", zap.String("tenant_id", tenantID))
 			_ = conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})
 			continue
 		}
@@ -207,7 +207,7 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			delete(m.clients, client.userID)
 		}
 		m.clientsMu.Unlock()
-		m.logger.Info("WebSocket client disconnected", zap.String("user_id", client.userID))
+		m.logger.Info("WebSocket client disconnected")
 	}
 }
 

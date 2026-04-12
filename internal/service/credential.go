@@ -61,7 +61,6 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 
 	s.logger.Info("Stored credential",
 		zap.String("tenant_id", string(tenantID)),
-		zap.String("holder_did", req.HolderDID),
 		zap.String("credential_id", req.CredentialIdentifier))
 
 	return credential, nil
@@ -76,8 +75,7 @@ func (s *CredentialService) GetAll(ctx context.Context, tenantID domain.TenantID
 	credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 	if err != nil {
 		s.logger.Error("Failed to get credentials", zap.Error(err),
-			zap.String("tenant_id", string(tenantID)),
-			zap.String("holder_did", holderDID))
+			zap.String("tenant_id", string(tenantID)))
 		return nil, err
 	}
 

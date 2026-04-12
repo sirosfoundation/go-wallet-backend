@@ -376,8 +376,8 @@ func (m *Manager) startAdminServer() error {
 		if err != nil {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
-		m.logger.Debug("Generated admin API token (development mode)",
-			zap.String("token", token))
+		// Never log the token value — even at DEBUG level it may be captured
+		// by log aggregators.
 		m.logger.Warn("Auto-generated admin token — this is disabled in production")
 	}
 

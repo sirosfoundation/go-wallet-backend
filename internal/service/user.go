@@ -98,7 +98,7 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
-	s.logger.Info("User registered", zap.String("user_id", user.UUID.String()))
+	s.logger.Info("User registered")
 	return user, nil
 }
 
@@ -129,7 +129,7 @@ func (s *UserService) Login(ctx context.Context, username, password string) (*do
 		return nil, "", fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	s.logger.Info("User logged in", zap.String("user_id", user.UUID.String()))
+	s.logger.Info("User logged in")
 	return user, token, nil
 }
 
@@ -287,7 +287,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
 
-	s.logger.Info("User deleted", zap.String("user_id", userID.String()))
+	s.logger.Info("User deleted")
 	return nil
 }
 
