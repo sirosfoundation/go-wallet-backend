@@ -203,6 +203,11 @@ func main() {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
 		mgr.AddProvider(provider)
+
+		// Wire session store into UserService so DeleteUser purges active sessions
+		if backendProvider != nil {
+			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+		}
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.

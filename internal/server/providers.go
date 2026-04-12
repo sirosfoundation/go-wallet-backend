@@ -52,6 +52,9 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 func (p *AuthProvider) Transport() Transport { return TransportHTTP }
 func (p *AuthProvider) Name() string         { return "auth" }
 
+// Services returns the auth provider's service aggregate.
+func (p *AuthProvider) Services() *service.Services { return p.services }
+
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
 	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
@@ -248,6 +251,11 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 func (p *EngineProvider) Transport() Transport { return TransportWebSocket }
 func (p *EngineProvider) Name() string         { return "engine" }
 
+// SessionStore returns the engine's session store for cross-provider wiring.
+func (p *EngineProvider) SessionStore() wsengine.SessionStore {
+	return p.manager.SessionStore()
+}
+
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
@@ -330,6 +338,9 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 func (p *BackendProvider) Transport() Transport { return TransportHTTP }
 func (p *BackendProvider) Name() string         { return "backend" }
+
+// Services returns the backend's service aggregate (via the auth provider).
+func (p *BackendProvider) Services() *service.Services { return p.auth.Services() }
 
 func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register both auth and storage routes
