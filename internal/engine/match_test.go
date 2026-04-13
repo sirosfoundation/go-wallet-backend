@@ -433,3 +433,20 @@ func TestBaseHandler_RequestMatch(t *testing.T) {
 	require.NotNil(t, resp)
 	assert.Equal(t, "handler-cred", resp.Matches[0].CredentialID)
 }
+
+func TestSession_RequestMatch_SendError(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		srvConn.Close() // close immediately so the client Send fails
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+
+	// Close the client connection to trigger a Send error
+	conn.Close()
+
+	ctx := context.Background()
+	pd := &PresentationDefinition{ID: "send-error-pd"}
+	_, err := session.RequestMatch(ctx, "flow-send-err", pd)
+	require.Error(t, err)
+}

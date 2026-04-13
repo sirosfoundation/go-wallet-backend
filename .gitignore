@@ -42,3 +42,4 @@ playwright-screenshots/
 .vscode/mcp.json
 /wallet-admin
 registry_coverage.out
+server
