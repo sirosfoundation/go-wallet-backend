@@ -640,6 +640,78 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 }
 
+func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "vp-cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "VP Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Store a credential for this user
+	cred := &domain.VerifiableCredential{
+		TenantID:             domain.DefaultTenantID,
+		HolderDID:            user.DID,
+		CredentialIdentifier: "cred-001",
+		Credential:           `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
+		Format:               "jwt_vc_json",
+	}
+	if err := store.Credentials().Create(ctx, cred); err != nil {
+		t.Fatalf("Create credential error = %v", err)
+	}
+
+	// Store a presentation for this user
+	pres := &domain.VerifiablePresentation{
+		TenantID:               domain.DefaultTenantID,
+		HolderDID:              user.DID,
+		PresentationIdentifier: "pres-001",
+		Presentation:           `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
+	}
+	if err := store.Presentations().Create(ctx, pres); err != nil {
+		t.Fatalf("Create presentation error = %v", err)
+	}
+
+	// Verify they exist before deletion
+	creds, err := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if err != nil || len(creds) == 0 {
+		t.Fatal("Expected credential to exist before deletion")
+	}
+	preses, err := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if err != nil || len(preses) == 0 {
+		t.Fatal("Expected presentation to exist before deletion")
+	}
+
+	// Delete user
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify credential is deleted
+	creds, _ = store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if len(creds) != 0 {
+		t.Errorf("Expected 0 credentials after deletion, got %d", len(creds))
+	}
+
+	// Verify presentation is deleted
+	preses, _ = store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if len(preses) != 0 {
+		t.Errorf("Expected 0 presentations after deletion, got %d", len(preses))
+	}
+}
+
 func TestUserService_GenerateTokenForUser(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()

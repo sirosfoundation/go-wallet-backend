@@ -182,9 +182,9 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 		if cfg.Features.CredentialStorageEnabled {
 			storage.GET("/vc", h.GetAllCredentials)
 			storage.POST("/vc", h.StoreCredential)
-			storage.GET("/vc/:id", h.GetCredentialByIdentifier)
-			storage.PUT("/vc/:id", h.UpdateCredential)
-			storage.DELETE("/vc/:id", h.DeleteCredential)
+			storage.POST("/vc/update", h.UpdateCredential)
+			storage.GET("/vc/:credential_identifier", h.GetCredentialByIdentifier)
+			storage.DELETE("/vc/:credential_identifier", h.DeleteCredential)
 		}
 	}
 
