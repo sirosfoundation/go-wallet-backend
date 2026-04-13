@@ -397,7 +397,12 @@ func (m *Manager) startAdminServer() error {
 		})
 	})
 
-	// Prometheus metrics endpoint (no auth required — scraped by monitoring)
+	// Prometheus metrics endpoint — intentionally unauthenticated.
+	// The admin port MUST be bound to a private/loopback interface or
+	// firewalled so only the monitoring stack (e.g. Prometheus) can reach it.
+	// Adding Bearer-token auth here would require every Prometheus scrape
+	// config to carry the admin secret, which provides little benefit when
+	// the port is already network-isolated.
 	adminRouter.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Protected admin routes with token auth

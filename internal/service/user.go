@@ -245,9 +245,14 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		// Continue with user deletion even if we can't get tenants
 		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
+	if len(tenantIDs) == 0 {
+		// User may have been registered without an explicit tenant membership;
+		// always clean up the default tenant as a fallback.
+		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+	}
 
-	// Delete any legacy server-side stored credentials from each tenant, regardless
-	// of whether credential/VC endpoints are currently enabled.
+	// Delete any legacy server-side stored credentials and presentations from
+	// each tenant, regardless of whether credential/VC endpoints are currently enabled.
 	for _, tenantID := range tenantIDs {
 		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -256,6 +261,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, cred := range credentials {
 			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
 				s.logger.Warn("Failed to delete credential", zap.Error(err))
+			}
+		}
+
+		// Delete any server-side stored presentations (VPs) for GDPR compliance
+		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, pres := range presentations {
+			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
+				s.logger.Warn("Failed to delete presentation", zap.Error(err))
 			}
 		}
 

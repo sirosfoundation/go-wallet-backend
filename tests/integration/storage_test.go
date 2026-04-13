@@ -77,15 +77,16 @@ func TestCredentialStorage(t *testing.T) {
 		}
 	})
 
-	t.Run("PUT updates a credential", func(t *testing.T) {
-		credJSON := `{"@context":["https://www.w3.org/2018/credentials/v1"],"updated":true}`
-		credB64 := base64.RawURLEncoding.EncodeToString([]byte(credJSON))
-
+	t.Run("POST /vc/update updates a credential", func(t *testing.T) {
 		updateReq := map[string]interface{}{
-			"credential": map[string]string{"$b64u": credB64},
+			"credential": map[string]interface{}{
+				"credentialIdentifier": "test-vc-001",
+				"instanceId":           0,
+				"sigCount":             1,
+			},
 		}
 
-		resp := h.AuthPUT(user, "/storage/vc/test-vc-001", updateReq)
+		resp := h.AuthPOST(user, "/storage/vc/update", updateReq)
 		// 200 if updated, 404 if not found
 		if resp.Response.StatusCode >= 500 {
 			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
