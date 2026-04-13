@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
@@ -318,7 +319,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(m.logger, "/status", "/health", "/readyz"))
+	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))
+	router.Use(middleware.Logger(m.logger, "/status", "/health", "/healthz", "/readyz"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     m.cfg.CORS.AllowedOrigins,
 		AllowMethods:     m.cfg.CORS.AllowedMethods,
@@ -343,6 +345,7 @@ func (m *Manager) addStatusEndpoints(router *gin.Engine) {
 		})
 	}
 	router.GET("/health", statusHandler)
+	router.GET("/healthz", statusHandler)
 	router.GET("/status", statusHandler)
 
 	// /readyz - Kubernetes-style readiness probe
@@ -376,8 +379,8 @@ func (m *Manager) startAdminServer() error {
 		if err != nil {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
-		// Never log the token value — even at DEBUG level it may be captured
-		// by log aggregators.
+		m.logger.Debug("Generated admin API token (development mode)",
+			zap.String("token", token))
 		m.logger.Warn("Auto-generated admin token — this is disabled in production")
 	}
 
@@ -393,6 +396,9 @@ func (m *Manager) startAdminServer() error {
 			Roles:   m.cfg.Roles,
 		})
 	})
+
+	// Prometheus metrics endpoint (no auth required — scraped by monitoring)
+	adminRouter.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Protected admin routes with token auth
 	adminGroup := adminRouter.Group("/admin")
