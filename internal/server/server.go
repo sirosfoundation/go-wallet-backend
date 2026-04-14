@@ -86,6 +86,7 @@ type ServerConfig struct {
 	// Admin server settings
 	AdminPort  int
 	AdminToken string
+	AdminTLS   *config.TLSConfig // nil = inherit from TLS
 
 	// Common settings
 	CORS         config.CORSConfig
@@ -409,9 +410,15 @@ func (m *Manager) startAdminServer() error {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Use dedicated admin TLS config if provided, otherwise fall back to shared TLS
+	adminTLS := &m.cfg.TLS
+	if m.cfg.AdminTLS != nil {
+		adminTLS = m.cfg.AdminTLS
+	}
+
 	go func() {
-		m.logger.Info("Admin server listening", zap.String("address", adminAddr))
-		if err := m.cfg.TLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
+		m.logger.Info("Admin server listening", zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled))
+		if err := adminTLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
 			m.logger.Error("Admin server error", zap.Error(err))
 		}
 	}()

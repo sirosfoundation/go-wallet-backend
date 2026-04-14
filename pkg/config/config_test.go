@@ -666,6 +666,60 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_AdminTLS(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Server: ServerConfig{
+				Host:     "localhost",
+				Port:     8080,
+				RPID:     "localhost",
+				RPOrigin: "http://localhost:8080",
+			},
+			Storage: StorageConfig{Type: "memory"},
+			JWT:     JWTConfig{Secret: "test"},
+		}
+	}
+
+	t.Run("nil admin_tls is valid", func(t *testing.T) {
+		cfg := base()
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("admin_tls disabled is valid without cert/key", func(t *testing.T) {
+		cfg := base()
+		cfg.Server.AdminTLS = &TLSConfig{Enabled: false}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("admin_tls enabled requires cert_file", func(t *testing.T) {
+		cfg := base()
+		cfg.Server.AdminTLS = &TLSConfig{Enabled: true, KeyFile: "/key.pem"}
+		if err := cfg.Validate(); err == nil {
+			t.Error("expected error for missing cert_file")
+		}
+	})
+
+	t.Run("admin_tls enabled requires key_file", func(t *testing.T) {
+		cfg := base()
+		cfg.Server.AdminTLS = &TLSConfig{Enabled: true, CertFile: "/cert.pem"}
+		if err := cfg.Validate(); err == nil {
+			t.Error("expected error for missing key_file")
+		}
+	})
+
+	t.Run("admin_tls enabled with both files is valid", func(t *testing.T) {
+		cfg := base()
+		cfg.Server.AdminTLS = &TLSConfig{Enabled: true, CertFile: "/cert.pem", KeyFile: "/key.pem"}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
 // =============================================================================
 // ExternalURLsConfig tests
 // =============================================================================

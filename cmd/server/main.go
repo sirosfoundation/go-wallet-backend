@@ -154,6 +154,7 @@ func main() {
 		serverCfg.CORS = backendCfg.Server.CORS
 		serverCfg.LoggingLevel = backendCfg.Logging.Level
 		serverCfg.TLS = backendCfg.Server.TLS
+		serverCfg.AdminTLS = backendCfg.Server.AdminTLS
 	} else if registryCfg != nil {
 		// Registry-only mode - use registry server config
 		serverCfg.HTTPAddress = registryCfg.Server.Host

@@ -196,6 +196,34 @@ func TestServerConfig_Fields(t *testing.T) {
 	}
 }
 
+func TestServerConfig_AdminTLS_NilInherits(t *testing.T) {
+	cfg := &ServerConfig{
+		TLS: config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"},
+	}
+	// When AdminTLS is nil, the admin server should inherit the shared TLS config
+	if cfg.AdminTLS != nil {
+		t.Error("AdminTLS should be nil by default")
+	}
+}
+
+func TestServerConfig_AdminTLS_Override(t *testing.T) {
+	adminTLS := &config.TLSConfig{Enabled: true, CertFile: "/admin.pem", KeyFile: "/admin.key"}
+	cfg := &ServerConfig{
+		TLS:      config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"},
+		AdminTLS: adminTLS,
+	}
+
+	if cfg.AdminTLS == nil {
+		t.Fatal("AdminTLS should not be nil")
+	}
+	if cfg.AdminTLS.CertFile != "/admin.pem" {
+		t.Errorf("AdminTLS.CertFile = %q, want /admin.pem", cfg.AdminTLS.CertFile)
+	}
+	if cfg.AdminTLS.KeyFile != "/admin.key" {
+		t.Errorf("AdminTLS.KeyFile = %q, want /admin.key", cfg.AdminTLS.KeyFile)
+	}
+}
+
 // Test that status endpoints are added to routers
 func TestManager_StatusEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
