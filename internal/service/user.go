@@ -98,7 +98,7 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
-	s.logger.Info("User registered")
+	s.logger.Debug("User registered", zap.String("user_id", user.UUID.String()))
 	return user, nil
 }
 
