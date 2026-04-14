@@ -1123,3 +1123,70 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 		t.Error("AllowedHeaders should have default value")
 	}
 }
+
+func TestJWTConfig_AccessExpiry(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          JWTConfig
+		wantDuration time.Duration
+	}{
+		{
+			name:         "ExpiryMinutes takes precedence",
+			cfg:          JWTConfig{ExpiryMinutes: 15, ExpiryHours: 24},
+			wantDuration: 15 * time.Minute,
+		},
+		{
+			name:         "ExpiryMinutes only",
+			cfg:          JWTConfig{ExpiryMinutes: 30},
+			wantDuration: 30 * time.Minute,
+		},
+		{
+			name:         "Fallback to ExpiryHours",
+			cfg:          JWTConfig{ExpiryHours: 24},
+			wantDuration: 24 * time.Hour,
+		},
+		{
+			name:         "Both zero returns default 15m",
+			cfg:          JWTConfig{},
+			wantDuration: 15 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.AccessExpiry()
+			if got != tt.wantDuration {
+				t.Errorf("AccessExpiry() = %v, want %v", got, tt.wantDuration)
+			}
+		})
+	}
+}
+
+func TestDefaults_JWTExpiryMinutes(t *testing.T) {
+	// Test via Load with a minimal valid config file
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	// Provide only the mandatory fields; JWT defaults should be applied
+	content := `
+server:
+  port: 8080
+  rp_id: "localhost"
+  rp_origin: "http://localhost"
+jwt:
+  secret: "test-secret-at-least-32-chars-long"
+`
+	if err := os.WriteFile(cfgFile, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	// ExpiryMinutes should come from defaults since we didn't set it
+	if cfg.JWT.ExpiryMinutes != 15 {
+		t.Errorf("Default ExpiryMinutes = %d, want 15", cfg.JWT.ExpiryMinutes)
+	}
+	if cfg.JWT.RefreshDays != 7 {
+		t.Errorf("Default RefreshDays = %d, want 7", cfg.JWT.RefreshDays)
+	}
+}
