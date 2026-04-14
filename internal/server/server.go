@@ -370,10 +370,11 @@ func (m *Manager) startAdminServer() error {
 		if err != nil {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
-		// Never log the token value — even at DEBUG level it may be captured
-		// by log aggregators. For production deployments, set WALLET_SERVER_ADMIN_TOKEN
-		// or configure WALLET_SERVER_ADMIN_TOKEN_PATH / server.admin_token_path.
-		m.logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token_path for production)")
+		// Log the auto-generated token so it can be used during development.
+		// For production deployments, set WALLET_SERVER_ADMIN_TOKEN or
+		// configure WALLET_SERVER_ADMIN_TOKEN_PATH / server.admin_token_path.
+		m.logger.Info("Auto-generated admin token (set WALLET_SERVER_ADMIN_TOKEN for production)",
+			zap.String("token", token))
 	}
 
 	// Admin router
