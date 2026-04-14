@@ -196,32 +196,34 @@ func TestServerConfig_Fields(t *testing.T) {
 	}
 }
 
-func TestServerConfig_AdminTLS_NilInherits(t *testing.T) {
-	cfg := &ServerConfig{
-		TLS: config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"},
-	}
-	// When AdminTLS is nil, the admin server should inherit the shared TLS config
-	if cfg.AdminTLS != nil {
-		t.Error("AdminTLS should be nil by default")
-	}
-}
+func TestEffectiveAdminTLS(t *testing.T) {
+	shared := &config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"}
+	adminEnabled := &config.TLSConfig{Enabled: true, CertFile: "/admin.pem", KeyFile: "/admin.key"}
+	adminDisabled := &config.TLSConfig{Enabled: false}
 
-func TestServerConfig_AdminTLS_Override(t *testing.T) {
-	adminTLS := &config.TLSConfig{Enabled: true, CertFile: "/admin.pem", KeyFile: "/admin.key"}
-	cfg := &ServerConfig{
-		TLS:      config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"},
-		AdminTLS: adminTLS,
-	}
+	t.Run("nil AdminTLS inherits shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, nil)
+		if got != shared {
+			t.Error("expected shared TLS config when AdminTLS is nil")
+		}
+	})
 
-	if cfg.AdminTLS == nil {
-		t.Fatal("AdminTLS should not be nil")
-	}
-	if cfg.AdminTLS.CertFile != "/admin.pem" {
-		t.Errorf("AdminTLS.CertFile = %q, want /admin.pem", cfg.AdminTLS.CertFile)
-	}
-	if cfg.AdminTLS.KeyFile != "/admin.key" {
-		t.Errorf("AdminTLS.KeyFile = %q, want /admin.key", cfg.AdminTLS.KeyFile)
-	}
+	t.Run("disabled AdminTLS inherits shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, adminDisabled)
+		if got != shared {
+			t.Error("expected shared TLS config when AdminTLS.Enabled is false")
+		}
+	})
+
+	t.Run("enabled AdminTLS overrides shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, adminEnabled)
+		if got != adminEnabled {
+			t.Error("expected admin TLS config when AdminTLS.Enabled is true")
+		}
+		if got.CertFile != "/admin.pem" {
+			t.Errorf("CertFile = %q, want /admin.pem", got.CertFile)
+		}
+	})
 }
 
 // Test that status endpoints are added to routers

@@ -720,6 +720,90 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 	})
 }
 
+func TestLoad_AdminTLS_FromYAML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	configYAML := []byte(`
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+  admin_tls:
+    enabled: true
+    cert_file: /yaml/cert.pem
+    key_file: /yaml/key.pem
+storage:
+  type: memory
+jwt:
+  secret: test
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.AdminTLS == nil {
+		t.Fatal("Load() left Server.AdminTLS nil for YAML admin_tls configuration")
+	}
+	if !cfg.Server.AdminTLS.Enabled {
+		t.Errorf("Server.AdminTLS.Enabled = %v, want true", cfg.Server.AdminTLS.Enabled)
+	}
+	if cfg.Server.AdminTLS.CertFile != "/yaml/cert.pem" {
+		t.Errorf("Server.AdminTLS.CertFile = %q, want %q", cfg.Server.AdminTLS.CertFile, "/yaml/cert.pem")
+	}
+	if cfg.Server.AdminTLS.KeyFile != "/yaml/key.pem" {
+		t.Errorf("Server.AdminTLS.KeyFile = %q, want %q", cfg.Server.AdminTLS.KeyFile, "/yaml/key.pem")
+	}
+}
+
+func TestLoad_AdminTLS_FromEnv(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	configYAML := []byte(`
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	t.Setenv("WALLET_SERVER_ADMIN_TLS_ENABLED", "true")
+	t.Setenv("WALLET_SERVER_ADMIN_TLS_CERT_FILE", "/env/cert.pem")
+	t.Setenv("WALLET_SERVER_ADMIN_TLS_KEY_FILE", "/env/key.pem")
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Server.AdminTLS == nil {
+		t.Fatal("Load() left Server.AdminTLS nil when admin TLS env vars were set")
+	}
+	if !cfg.Server.AdminTLS.Enabled {
+		t.Errorf("Server.AdminTLS.Enabled = %v, want true", cfg.Server.AdminTLS.Enabled)
+	}
+	if cfg.Server.AdminTLS.CertFile != "/env/cert.pem" {
+		t.Errorf("Server.AdminTLS.CertFile = %q, want %q", cfg.Server.AdminTLS.CertFile, "/env/cert.pem")
+	}
+	if cfg.Server.AdminTLS.KeyFile != "/env/key.pem" {
+		t.Errorf("Server.AdminTLS.KeyFile = %q, want %q", cfg.Server.AdminTLS.KeyFile, "/env/key.pem")
+	}
+}
+
 // =============================================================================
 // ExternalURLsConfig tests
 // =============================================================================
