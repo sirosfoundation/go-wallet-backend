@@ -86,6 +86,7 @@ type ServerConfig struct {
 	// Admin server settings
 	AdminPort  int
 	AdminToken string
+	AdminTLS   *config.TLSConfig // nil = inherit from TLS
 
 	// Common settings
 	CORS         config.CORSConfig
@@ -409,9 +410,13 @@ func (m *Manager) startAdminServer() error {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Use dedicated admin TLS config only when it is explicitly enabled,
+	// otherwise fall back to the shared TLS configuration.
+	adminTLS := effectiveAdminTLS(&m.cfg.TLS, m.cfg.AdminTLS)
+
 	go func() {
-		m.logger.Info("Admin server listening", zap.String("address", adminAddr))
-		if err := m.cfg.TLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
+		m.logger.Info("Admin server listening", zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled))
+		if err := adminTLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
 			m.logger.Error("Admin server error", zap.Error(err))
 		}
 	}()
@@ -423,4 +428,14 @@ func (m *Manager) startAdminServer() error {
 // Useful for modes that need to add routes after construction.
 func (m *Manager) HTTPRouter() *gin.Engine {
 	return m.httpRouter
+}
+
+// effectiveAdminTLS returns the TLS config to use for the admin server.
+// It uses adminTLS only when it is non-nil and explicitly enabled;
+// otherwise it falls back to the shared TLS config.
+func effectiveAdminTLS(shared *config.TLSConfig, admin *config.TLSConfig) *config.TLSConfig {
+	if admin != nil && admin.Enabled {
+		return admin
+	}
+	return shared
 }

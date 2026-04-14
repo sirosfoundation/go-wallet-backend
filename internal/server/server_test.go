@@ -196,6 +196,36 @@ func TestServerConfig_Fields(t *testing.T) {
 	}
 }
 
+func TestEffectiveAdminTLS(t *testing.T) {
+	shared := &config.TLSConfig{Enabled: true, CertFile: "/main.pem", KeyFile: "/main.key"}
+	adminEnabled := &config.TLSConfig{Enabled: true, CertFile: "/admin.pem", KeyFile: "/admin.key"}
+	adminDisabled := &config.TLSConfig{Enabled: false}
+
+	t.Run("nil AdminTLS inherits shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, nil)
+		if got != shared {
+			t.Error("expected shared TLS config when AdminTLS is nil")
+		}
+	})
+
+	t.Run("disabled AdminTLS inherits shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, adminDisabled)
+		if got != shared {
+			t.Error("expected shared TLS config when AdminTLS.Enabled is false")
+		}
+	})
+
+	t.Run("enabled AdminTLS overrides shared", func(t *testing.T) {
+		got := effectiveAdminTLS(shared, adminEnabled)
+		if got != adminEnabled {
+			t.Error("expected admin TLS config when AdminTLS.Enabled is true")
+		}
+		if got.CertFile != "/admin.pem" {
+			t.Errorf("CertFile = %q, want /admin.pem", got.CertFile)
+		}
+	})
+}
+
 // Test that status endpoints are added to routers
 func TestManager_StatusEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)

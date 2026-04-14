@@ -100,6 +100,11 @@ type ServerConfig struct {
 
 	// TLS configuration for HTTPS listeners
 	TLS TLSConfig `yaml:"tls" envconfig:"TLS"`
+
+	// AdminTLS provides separate TLS configuration for the admin server.
+	// When set and enabled, the admin server uses its own certificate/key
+	// instead of inheriting the main TLS configuration.
+	AdminTLS *TLSConfig `yaml:"admin_tls,omitempty" envconfig:"ADMIN_TLS"`
 }
 
 // TLSConfig contains TLS configuration for HTTPS listeners
@@ -783,6 +788,16 @@ func (c *Config) Validate() error {
 		}
 		if c.Server.TLS.KeyFile == "" {
 			return fmt.Errorf("server.tls.key_file is required when TLS is enabled")
+		}
+	}
+
+	// Validate admin TLS configuration (if explicitly set)
+	if c.Server.AdminTLS != nil && c.Server.AdminTLS.Enabled {
+		if c.Server.AdminTLS.CertFile == "" {
+			return fmt.Errorf("server.admin_tls.cert_file is required when admin TLS is enabled")
+		}
+		if c.Server.AdminTLS.KeyFile == "" {
+			return fmt.Errorf("server.admin_tls.key_file is required when admin TLS is enabled")
 		}
 	}
 
