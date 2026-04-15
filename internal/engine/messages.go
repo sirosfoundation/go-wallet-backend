@@ -25,10 +25,11 @@ type MessageType string
 
 const (
 	// Client → Server
-	TypeHandshake    MessageType = "handshake"
-	TypeFlowStart    MessageType = "flow_start"
-	TypeFlowAction   MessageType = "flow_action"
-	TypeSignResponse MessageType = "sign_response"
+	TypeHandshake     MessageType = "handshake"
+	TypeFlowStart     MessageType = "flow_start"
+	TypeFlowAction    MessageType = "flow_action"
+	TypeSignResponse  MessageType = "sign_response"
+	TypeMatchResponse MessageType = "match_response"
 
 	// Server → Client
 	TypeHandshakeComplete MessageType = "handshake_complete"
@@ -36,6 +37,7 @@ const (
 	TypeFlowComplete      MessageType = "flow_complete"
 	TypeFlowError         MessageType = "flow_error"
 	TypeSignRequest       MessageType = "sign_request"
+	TypeMatchRequest      MessageType = "match_request"
 	TypePush              MessageType = "push"
 	TypeError             MessageType = "error"
 )
@@ -85,6 +87,8 @@ const (
 	ErrCodeCredentialError   ErrorCode = "CREDENTIAL_ERROR"
 	ErrCodeSignTimeout       ErrorCode = "SIGN_TIMEOUT"
 	ErrCodeSignError         ErrorCode = "SIGN_ERROR"
+	ErrCodeMatchTimeout      ErrorCode = "MATCH_TIMEOUT"
+	ErrCodeMatchError        ErrorCode = "MATCH_ERROR"
 	ErrCodePresentationError ErrorCode = "PRESENTATION_ERROR"
 	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
@@ -122,6 +126,10 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Signing request timed out"
 	case ErrCodeSignError:
 		return "Signing failed"
+	case ErrCodeMatchTimeout:
+		return "Credential matching timed out"
+	case ErrCodeMatchError:
+		return "Credential matching failed"
 	case ErrCodePresentationError:
 		return "Presentation failed"
 	case ErrCodeInternalError:
@@ -246,6 +254,22 @@ type SignResponseMessage struct {
 	Message
 	ProofJWT string `json:"proof_jwt,omitempty"`
 	VPToken  string `json:"vp_token,omitempty"`
+}
+
+// MatchRequestMessage requests client-side credential matching
+// This is the privacy-preserving protocol: credentials are matched locally
+// and only matching credential IDs/metadata are sent back to the server.
+type MatchRequestMessage struct {
+	Message
+	PresentationDefinition *PresentationDefinition `json:"presentation_definition"`
+}
+
+// MatchResponseMessage is the client's matching response
+type MatchResponseMessage struct {
+	Message
+	Matches       []CredentialMatch `json:"matches"`
+	NoMatchReason string            `json:"no_match_reason,omitempty"`
+	Error         string            `json:"error,omitempty"`
 }
 
 // PushMessage is a server-initiated notification
