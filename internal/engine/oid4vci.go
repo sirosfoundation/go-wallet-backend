@@ -30,6 +30,7 @@ type OID4VCIHandler struct {
 	BaseHandler
 	httpClient *http.Client
 	dpopKey    *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce  string            // server-provided DPoP nonce (RFC 9449 §8)
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
@@ -192,7 +193,8 @@ func ecPublicKeyJWK(pub *ecdsa.PublicKey) map[string]interface{} {
 
 // createDPoPProof creates a DPoP proof JWT per RFC 9449 §4.2.
 // accessToken should be empty for token endpoint requests, non-empty for resource requests.
-func createDPoPProof(key *ecdsa.PrivateKey, htm, htu, accessToken string) (string, error) {
+// nonce is the server-provided DPoP nonce (may be empty).
+func createDPoPProof(key *ecdsa.PrivateKey, htm, htu, accessToken, nonce string) (string, error) {
 	claims := jwt.MapClaims{
 		"jti": uuid.New().String(),
 		"htm": htm,
@@ -203,6 +205,9 @@ func createDPoPProof(key *ecdsa.PrivateKey, htm, htu, accessToken string) (strin
 		// ath: base64url(SHA-256(access_token)) per RFC 9449 §4.2
 		h := sha256.Sum256([]byte(accessToken))
 		claims["ath"] = base64.RawURLEncoding.EncodeToString(h[:])
+	}
+	if nonce != "" {
+		claims["nonce"] = nonce
 	}
 
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
@@ -218,12 +223,47 @@ func (h *OID4VCIHandler) setDPoPHeader(req *http.Request, htu, accessToken strin
 	if h.dpopKey == nil {
 		return nil
 	}
-	proof, err := createDPoPProof(h.dpopKey, req.Method, htu, accessToken)
+	proof, err := createDPoPProof(h.dpopKey, req.Method, htu, accessToken, h.dpopNonce)
 	if err != nil {
 		return fmt.Errorf("failed to create DPoP proof: %w", err)
 	}
 	req.Header.Set("DPoP", proof)
 	return nil
+}
+
+// updateDPoPNonce stores a server-provided DPoP nonce for subsequent requests (RFC 9449 §8).
+func (h *OID4VCIHandler) updateDPoPNonce(resp *http.Response) {
+	if nonce := resp.Header.Get("DPoP-Nonce"); nonce != "" {
+		h.dpopNonce = nonce
+	}
+}
+
+// isDPoPNonceError returns true if the response indicates a DPoP nonce is required.
+func isDPoPNonceError(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnauthorized {
+		return false
+	}
+	return resp.Header.Get("DPoP-Nonce") != ""
+}
+
+// OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
+type OAuthError struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+	ErrorURI         string `json:"error_uri,omitempty"`
+}
+
+// parseOAuthError attempts to parse a structured OAuth error from a response body.
+// Returns the parsed error or a generic error with the status code.
+func parseOAuthError(statusCode int, body []byte) error {
+	var oauthErr OAuthError
+	if err := json.Unmarshal(body, &oauthErr); err == nil && oauthErr.Error != "" {
+		if oauthErr.ErrorDescription != "" {
+			return fmt.Errorf("%s: %s", oauthErr.Error, oauthErr.ErrorDescription)
+		}
+		return fmt.Errorf("%s", oauthErr.Error)
+	}
+	return fmt.Errorf("endpoint returned status %d", statusCode)
 }
 
 // setAuthorizationHeader sets the Authorization header using DPoP scheme when the token
@@ -768,35 +808,50 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		data.Set("tx_code", txCode)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
-		return nil, err
+	// Token exchange with DPoP nonce retry (RFC 9449 §8)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
+			return nil, err
+		}
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("token request failed: %w", err)
+		}
+
+		// Check for DPoP nonce requirement — retry once with server-provided nonce
+		if attempt == 0 && isDPoPNonceError(resp) {
+			h.updateDPoPNonce(resp)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.updateDPoPNonce(resp)
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			_ = resp.Body.Close()
+			h.Logger.Debug("token endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
+			return nil, parseOAuthError(resp.StatusCode, body)
+		}
+
+		var token TokenResponse
+		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to parse token response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
+		return &token, nil
 	}
 
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("token request failed: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		h.Logger.Debug("token endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
-		_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
-		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
-	}
-
-	var token TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
-	}
-
-	_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
-	return &token, nil
+	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
 func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
@@ -847,6 +902,13 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 	codeChallenge := computeCodeChallenge(codeVerifier)
 
+	// Generate OAuth state parameter for CSRF protection (RFC 6749 §10.12)
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate state parameter: %w", err)
+	}
+	oauthState := base64.RawURLEncoding.EncodeToString(stateBytes)
+
 	// Parse and validate the authorization endpoint URL once
 	authEndpoint, err := url.Parse(oauthMeta.AuthorizationEndpoint)
 	if err != nil || authEndpoint.Scheme == "" {
@@ -860,11 +922,10 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	params.Set("response_type", "code")
 	params.Set("client_id", redirectURI) // OID4VCI: use redirect_uri as client_id for unregistered clients
 	params.Set("redirect_uri", redirectURI)
-	scope := "openid"
+	params.Set("state", oauthState)
 	if selectedConfig != nil && selectedConfig.Scope != "" {
-		scope = selectedConfig.Scope
+		params.Set("scope", selectedConfig.Scope)
 	}
-	params.Set("scope", scope)
 	if pkceEnabled {
 		params.Set("code_challenge", codeChallenge)
 		params.Set("code_challenge_method", "S256")
@@ -903,9 +964,13 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
 	}
 
+	// Send authorization URL and PKCE code_verifier to the client.
+	// The client stores code_verifier for flow resume after redirect (option A).
 	_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
 		"authorization_url":     authURL,
 		"expected_redirect_uri": redirectURI,
+		"code_verifier":         codeVerifier,
+		"state":                 oauthState,
 	})
 
 	// Wait for authorization complete
@@ -915,18 +980,30 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 
 	var authResult struct {
-		Code  string `json:"code"`
-		State string `json:"state"`
+		Code         string `json:"code"`
+		State        string `json:"state"`
+		CodeVerifier string `json:"code_verifier"`
 	}
 	if err := json.Unmarshal(action.Payload, &authResult); err != nil {
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "Invalid authorization response")
 		return nil, err
 	}
 
-	// Exchange code for token, including PKCE code_verifier when enabled
+	// Validate state parameter (CSRF protection)
+	if authResult.State != oauthState {
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "State parameter mismatch")
+		return nil, errors.New("state parameter mismatch (possible CSRF)")
+	}
+
+	// Use client-provided code_verifier if present (flow resume scenario);
+	// otherwise use the locally generated one.
 	verifier := ""
 	if pkceEnabled {
-		verifier = codeVerifier
+		if authResult.CodeVerifier != "" {
+			verifier = authResult.CodeVerifier
+		} else {
+			verifier = codeVerifier
+		}
 	}
 	return h.exchangeAuthCode(ctx, metadata, authResult.Code, redirectURI, verifier)
 }
@@ -992,35 +1069,50 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 		data.Set("code_verifier", codeVerifier)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
-		return nil, err
+	// Token exchange with DPoP nonce retry (RFC 9449 §8)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
+			return nil, err
+		}
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("token request failed: %w", err)
+		}
+
+		// Check for DPoP nonce requirement — retry once with server-provided nonce
+		if attempt == 0 && isDPoPNonceError(resp) {
+			h.updateDPoPNonce(resp)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.updateDPoPNonce(resp)
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			_ = resp.Body.Close()
+			h.Logger.Debug("token endpoint error (auth code)", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
+			return nil, parseOAuthError(resp.StatusCode, body)
+		}
+
+		var token TokenResponse
+		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to parse token response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
+		return &token, nil
 	}
 
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("token request failed: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		h.Logger.Debug("token endpoint error (auth code)", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
-		_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
-		return nil, fmt.Errorf("token endpoint returned status %d", resp.StatusCode)
-	}
-
-	var token TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
-	}
-
-	_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
-	return &token, nil
+	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
 func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
@@ -1056,35 +1148,51 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	}
 
 	bodyBytes, _ := json.Marshal(reqBody)
-	req, err := http.NewRequestWithContext(ctx, "POST", metadata.CredentialEndpoint, strings.NewReader(string(bodyBytes)))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	h.setAuthorizationHeader(req, token)
-	if err := h.setDPoPHeader(req, metadata.CredentialEndpoint, token.AccessToken); err != nil {
-		return nil, err
+
+	// Credential request with DPoP nonce retry (RFC 9449 §8)
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "POST", metadata.CredentialEndpoint, strings.NewReader(string(bodyBytes)))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		h.setAuthorizationHeader(req, token)
+		if err := h.setDPoPHeader(req, metadata.CredentialEndpoint, token.AccessToken); err != nil {
+			return nil, err
+		}
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("credential request failed: %w", err)
+		}
+
+		// Check for DPoP nonce requirement — retry once with server-provided nonce
+		if attempt == 0 && isDPoPNonceError(resp) {
+			h.updateDPoPNonce(resp)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.updateDPoPNonce(resp)
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			_ = resp.Body.Close()
+			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			return nil, parseOAuthError(resp.StatusCode, body)
+		}
+
+		var credResp CredentialResponse
+		if err := json.NewDecoder(resp.Body).Decode(&credResp); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to parse credential response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		return &credResp, nil
 	}
 
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("credential request failed: %w", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-		return nil, fmt.Errorf("credential endpoint returned status %d", resp.StatusCode)
-	}
-
-	var credResp CredentialResponse
-	if err := json.NewDecoder(resp.Body).Decode(&credResp); err != nil {
-		return nil, fmt.Errorf("failed to parse credential response: %w", err)
-	}
-
-	return &credResp, nil
+	return nil, errors.New("credential request failed after DPoP nonce retry")
 }
 
 // pollDeferredCredential polls the deferred credential endpoint until the credential is ready
@@ -1132,6 +1240,13 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		if err != nil {
 			h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
 			continue // Retry on network errors
+		}
+
+		// Handle DPoP nonce on deferred responses
+		h.updateDPoPNonce(resp)
+		if isDPoPNonceError(resp) {
+			_ = resp.Body.Close()
+			continue // Retry immediately with new nonce (counts as one attempt)
 		}
 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
