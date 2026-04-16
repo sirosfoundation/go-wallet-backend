@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -535,4 +537,316 @@ func TestPKCE_ChallengeIsBase64URL(t *testing.T) {
 	// No standard base64 characters
 	assert.False(t, strings.Contains(challenge, "+"))
 	assert.False(t, strings.Contains(challenge, "/"))
+}
+
+// --- DPoP (RFC 9449) tests ---
+
+func TestGenerateDPoPKey(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	assert.NotNil(t, key)
+	assert.Equal(t, elliptic.P256(), key.Curve)
+
+	key2, err := generateDPoPKey()
+	require.NoError(t, err)
+	assert.NotEqual(t, key.D, key2.D, "keys must be unique")
+}
+
+func TestEcPublicKeyJWK(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	jwk := ecPublicKeyJWK(&key.PublicKey)
+	assert.Equal(t, "EC", jwk["kty"])
+	assert.Equal(t, "P-256", jwk["crv"])
+
+	x, ok := jwk["x"].(string)
+	require.True(t, ok)
+	xBytes, err := base64.RawURLEncoding.DecodeString(x)
+	require.NoError(t, err)
+	assert.Len(t, xBytes, 32)
+
+	y, ok := jwk["y"].(string)
+	require.True(t, ok)
+	yBytes, err := base64.RawURLEncoding.DecodeString(y)
+	require.NoError(t, err)
+	assert.Len(t, yBytes, 32)
+}
+
+func TestCreateDPoPProof_TokenRequest(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	proof, err := createDPoPProof(key, "POST", "https://as.example.com/token", "")
+	require.NoError(t, err)
+
+	token, err := jwt.Parse(proof, func(tok *jwt.Token) (interface{}, error) {
+		assert.Equal(t, jwt.SigningMethodES256, tok.Method)
+		assert.Equal(t, "dpop+jwt", tok.Header["typ"])
+
+		jwkMap, ok := tok.Header["jwk"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "EC", jwkMap["kty"])
+		assert.Equal(t, "P-256", jwkMap["crv"])
+
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	assert.Equal(t, "POST", claims["htm"])
+	assert.Equal(t, "https://as.example.com/token", claims["htu"])
+	assert.NotEmpty(t, claims["jti"])
+	assert.NotNil(t, claims["iat"])
+	_, hasAth := claims["ath"]
+	assert.False(t, hasAth, "token request proof should not have ath claim")
+}
+
+func TestCreateDPoPProof_ResourceRequest(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	accessToken := "test-access-token-123"
+	proof, err := createDPoPProof(key, "POST", "https://issuer.example.com/credential", accessToken)
+	require.NoError(t, err)
+
+	token, err := jwt.Parse(proof, func(tok *jwt.Token) (interface{}, error) {
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	expectedHash := sha256.Sum256([]byte(accessToken))
+	expectedAth := base64.RawURLEncoding.EncodeToString(expectedHash[:])
+	assert.Equal(t, expectedAth, claims["ath"])
+}
+
+func TestCreateDPoPProof_UniqueJTI(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	proof1, err := createDPoPProof(key, "POST", "https://example.com/token", "")
+	require.NoError(t, err)
+	proof2, err := createDPoPProof(key, "POST", "https://example.com/token", "")
+	require.NoError(t, err)
+
+	parseJTI := func(proof string) string {
+		tok, err := jwt.Parse(proof, func(tok *jwt.Token) (interface{}, error) {
+			return &key.PublicKey, nil
+		})
+		require.NoError(t, err)
+		return tok.Claims.(jwt.MapClaims)["jti"].(string)
+	}
+	assert.NotEqual(t, parseJTI(proof1), parseJTI(proof2), "each proof must have a unique jti")
+}
+
+func TestSetDPoPHeader_WithKey(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	h := &OID4VCIHandler{dpopKey: key}
+	req, _ := http.NewRequest("POST", "https://example.com/token", nil)
+
+	err = h.setDPoPHeader(req, "https://example.com/token", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, req.Header.Get("DPoP"))
+}
+
+func TestSetDPoPHeader_WithoutKey(t *testing.T) {
+	h := &OID4VCIHandler{}
+	req, _ := http.NewRequest("POST", "https://example.com/token", nil)
+
+	err := h.setDPoPHeader(req, "https://example.com/token", "")
+	require.NoError(t, err)
+	assert.Empty(t, req.Header.Get("DPoP"), "should not set DPoP header without key")
+}
+
+func TestSetAuthorizationHeader_DPoP(t *testing.T) {
+	h := &OID4VCIHandler{}
+	req, _ := http.NewRequest("POST", "https://example.com/credential", nil)
+	token := &TokenResponse{AccessToken: "tok123", TokenType: "DPoP"}
+	h.setAuthorizationHeader(req, token)
+	assert.Equal(t, "DPoP tok123", req.Header.Get("Authorization"))
+}
+
+func TestSetAuthorizationHeader_Bearer(t *testing.T) {
+	h := &OID4VCIHandler{}
+	req, _ := http.NewRequest("POST", "https://example.com/credential", nil)
+	token := &TokenResponse{AccessToken: "tok456", TokenType: "Bearer"}
+	h.setAuthorizationHeader(req, token)
+	assert.Equal(t, "Bearer tok456", req.Header.Get("Authorization"))
+}
+
+func TestSetAuthorizationHeader_CaseInsensitive(t *testing.T) {
+	h := &OID4VCIHandler{}
+	req, _ := http.NewRequest("POST", "https://example.com/credential", nil)
+	token := &TokenResponse{AccessToken: "tok789", TokenType: "dpop"}
+	h.setAuthorizationHeader(req, token)
+	assert.Equal(t, "DPoP tok789", req.Header.Get("Authorization"))
+}
+
+func TestExchangePreAuthCode_SendsDPoP(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "test-token",
+			TokenType:   "DPoP",
+			CNonce:      "nonce123",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangePreAuthCode(context.Background(), metadata, "pre-auth-code", "")
+	require.NoError(t, err)
+	assert.Equal(t, "DPoP", token.TokenType)
+	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+
+	// Verify DPoP proof JWT
+	dpopProof := receivedHeaders.Get("DPoP")
+	tok, err := jwt.Parse(dpopProof, func(tok *jwt.Token) (interface{}, error) {
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+	claims := tok.Claims.(jwt.MapClaims)
+	assert.Equal(t, "POST", claims["htm"])
+}
+
+func TestExchangeAuthCode_SendsDPoP(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "auth-code-token",
+			TokenType:   "DPoP",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangeAuthCode(context.Background(), metadata, "code123", "https://wallet.example.com/callback", "verifier")
+	require.NoError(t, err)
+	assert.Equal(t, "DPoP", token.TokenType)
+	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+}
+
+func TestRequestCredential_DPoPBound(t *testing.T) {
+	var receivedHeaders http.Header
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CredentialResponse{
+			Credential: "test-credential-jwt",
+		})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer:   "https://issuer.example.com",
+		CredentialEndpoint: credServer.URL,
+	}
+	token := &TokenResponse{
+		AccessToken: "dpop-access-token",
+		TokenType:   "DPoP",
+	}
+	config := &CredentialConfig{Format: "vc+sd-jwt", VCT: "pid"}
+
+	_, err = h.requestCredential(context.Background(), metadata, token, config, "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "DPoP dpop-access-token", receivedHeaders.Get("Authorization"))
+	dpopHeader := receivedHeaders.Get("DPoP")
+	assert.NotEmpty(t, dpopHeader)
+
+	tok, err := jwt.Parse(dpopHeader, func(tok *jwt.Token) (interface{}, error) {
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+	claims := tok.Claims.(jwt.MapClaims)
+	assert.Equal(t, "POST", claims["htm"])
+	assert.NotEmpty(t, claims["ath"])
+
+	expectedHash := sha256.Sum256([]byte("dpop-access-token"))
+	expectedAth := base64.RawURLEncoding.EncodeToString(expectedHash[:])
+	assert.Equal(t, expectedAth, claims["ath"])
+}
+
+func TestRequestCredential_BearerFallback(t *testing.T) {
+	var receivedHeaders http.Header
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CredentialResponse{Credential: "test-credential"})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "bearer-token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	_, err = h.requestCredential(context.Background(), metadata, token, config, "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "Bearer bearer-token", receivedHeaders.Get("Authorization"))
+	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+}
+
+func TestExchangePreAuthCode_NoDPoPKey(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{AccessToken: "plain-token", TokenType: "Bearer"})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{TokenEndpoint: tokenServer.URL}
+	token, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer", token.TokenType)
+	assert.Empty(t, receivedHeaders.Get("DPoP"))
 }
