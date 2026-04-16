@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +42,29 @@ func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trust
 }
 
 // OID4VCI data structures
+
+// oauthServerMetadata contains the OAuth Authorization Server metadata fields
+// relevant for the OID4VCI authorization code flow.
+type oauthServerMetadata struct {
+	AuthorizationEndpoint              string `json:"authorization_endpoint"`
+	TokenEndpoint                      string `json:"token_endpoint"`
+	PushedAuthorizationRequestEndpoint string `json:"pushed_authorization_request_endpoint"`
+}
+
+// generateCodeVerifier creates a cryptographically random PKCE code_verifier (RFC 7636 §4.1).
+func generateCodeVerifier() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate code verifier: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// computeCodeChallenge computes the S256 PKCE code_challenge for a given verifier (RFC 7636 §4.2).
+func computeCodeChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
 
 // CredentialOffer represents an OpenID4VCI credential offer
 type CredentialOffer struct {
@@ -690,44 +716,81 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		// Fallback: construct auth URL directly
-		return h.startAuthorizationFlow(ctx, offer, metadata, authServer+"/authorize")
+		// Fallback: construct auth URL directly, no PAR
+		return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
+			AuthorizationEndpoint: authServer + "/authorize",
+		})
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusOK {
-		var oauthMeta struct {
-			AuthorizationEndpoint string `json:"authorization_endpoint"`
-			TokenEndpoint         string `json:"token_endpoint"`
-		}
+		var oauthMeta oauthServerMetadata
 		if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err == nil && oauthMeta.AuthorizationEndpoint != "" {
-			return h.startAuthorizationFlow(ctx, offer, metadata, oauthMeta.AuthorizationEndpoint)
+			return h.startAuthorizationFlow(ctx, offer, metadata, &oauthMeta)
 		}
 	}
 
-	return h.startAuthorizationFlow(ctx, offer, metadata, authServer+"/authorize")
+	return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
+		AuthorizationEndpoint: authServer + "/authorize",
+	})
 }
 
-func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, authEndpoint string) (*TokenResponse, error) {
-	// Build authorization URL with PKCE
-	// Note: In a real implementation, we'd use proper PKCE and state
+func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, oauthMeta *oauthServerMetadata) (*TokenResponse, error) {
 	redirectURI := h.Config.Server.BaseURL + "/callback"
 
-	authURL, _ := url.Parse(authEndpoint)
-	q := authURL.Query()
-	q.Set("response_type", "code")
-	q.Set("client_id", metadata.CredentialIssuer) // Use issuer as client_id
-	q.Set("redirect_uri", redirectURI)
-	q.Set("scope", "openid") // Basic scope
+	// Generate PKCE code verifier and challenge (RFC 7636)
+	codeVerifier, err := generateCodeVerifier()
+	if err != nil {
+		return nil, err
+	}
+	codeChallenge := computeCodeChallenge(codeVerifier)
+
+	// Build common authorization parameters
+	params := url.Values{}
+	params.Set("response_type", "code")
+	params.Set("client_id", metadata.CredentialIssuer)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("scope", "openid")
+	params.Set("code_challenge", codeChallenge)
+	params.Set("code_challenge_method", "S256")
 	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
 		if issuerState, ok := grant["issuer_state"].(string); ok {
-			q.Set("issuer_state", issuerState)
+			params.Set("issuer_state", issuerState)
 		}
 	}
-	authURL.RawQuery = q.Encode()
+
+	var authURL string
+
+	if oauthMeta.PushedAuthorizationRequestEndpoint != "" {
+		// Use Pushed Authorization Request (RFC 9126)
+		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, params)
+		if parErr != nil {
+			h.Logger.Debug("PAR request failed", zap.Error(parErr))
+			_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "Pushed authorization request failed")
+			return nil, parErr
+		}
+
+		// Build authorization URL with only client_id and request_uri
+		authEndpoint, _ := url.Parse(oauthMeta.AuthorizationEndpoint)
+		q := authEndpoint.Query()
+		q.Set("client_id", metadata.CredentialIssuer)
+		q.Set("request_uri", requestURI)
+		authEndpoint.RawQuery = q.Encode()
+		authURL = authEndpoint.String()
+	} else {
+		// Standard authorization URL with all parameters
+		authEndpoint, _ := url.Parse(oauthMeta.AuthorizationEndpoint)
+		authEndpoint.RawQuery = params.Encode()
+		authURL = authEndpoint.String()
+	}
+
+	// Use token endpoint from OAuth metadata if the issuer metadata doesn't have one
+	if metadata.TokenEndpoint == "" && oauthMeta.TokenEndpoint != "" {
+		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	}
 
 	_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
-		"authorization_url":     authURL.String(),
+		"authorization_url":     authURL,
 		"expected_redirect_uri": redirectURI,
 	})
 
@@ -746,11 +809,56 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		return nil, err
 	}
 
-	// Exchange code for token
-	return h.exchangeAuthCode(ctx, metadata, authResult.Code, redirectURI)
+	// Exchange code for token, including PKCE code_verifier
+	return h.exchangeAuthCode(ctx, metadata, authResult.Code, redirectURI, codeVerifier)
 }
 
-func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerMetadata, code, redirectURI string) (*TokenResponse, error) {
+// PARResponse represents the response from a Pushed Authorization Request endpoint (RFC 9126).
+type PARResponse struct {
+	RequestURI string `json:"request_uri"`
+	ExpiresIn  int    `json:"expires_in,omitempty"`
+	Error      string `json:"error,omitempty"`
+	ErrorDesc  string `json:"error_description,omitempty"`
+}
+
+// sendPushedAuthorizationRequest sends authorization parameters to the PAR endpoint
+// and returns the request_uri to use in the authorization redirect (RFC 9126).
+func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, parEndpoint string, params url.Values) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", parEndpoint, strings.NewReader(params.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("failed to create PAR request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("PAR request failed: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		h.Logger.Debug("PAR endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
+	}
+
+	var parResp PARResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parResp); err != nil {
+		return "", fmt.Errorf("failed to parse PAR response: %w", err)
+	}
+
+	if parResp.Error != "" {
+		return "", fmt.Errorf("PAR error: %s %s", parResp.Error, parResp.ErrorDesc)
+	}
+
+	if parResp.RequestURI == "" {
+		return "", errors.New("PAR response missing request_uri")
+	}
+
+	return parResp.RequestURI, nil
+}
+
+func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerMetadata, code, redirectURI, codeVerifier string) (*TokenResponse, error) {
 	_ = h.ProgressMessage(StepExchangingToken, "Exchanging authorization code for token")
 
 	tokenEndpoint := metadata.TokenEndpoint
@@ -762,6 +870,9 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
 	data.Set("redirect_uri", redirectURI)
+	if codeVerifier != "" {
+		data.Set("code_verifier", codeVerifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
 	if err != nil {
