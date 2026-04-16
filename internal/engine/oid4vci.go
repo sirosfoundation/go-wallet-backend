@@ -207,7 +207,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("selected_config", selectedConfig)
 
 	// Step 5: Handle authorization
-	token, err := h.handleAuthorization(ctx, offer, metadata)
+	token, err := h.handleAuthorization(ctx, offer, metadata, selectedConfig)
 	if err != nil {
 		return err
 	}
@@ -625,7 +625,7 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	return &config, nil
 }
 
-func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (*TokenResponse, error) {
+func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
 	// Check for pre-authorized code grant
 	if grants, ok := offer.Grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]; ok {
 		grantMap, ok := grants.(map[string]interface{})
@@ -636,7 +636,7 @@ func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *Credent
 
 	// Check for authorization_code grant
 	if _, ok := offer.Grants["authorization_code"]; ok {
-		return h.handleAuthorizationCode(ctx, offer, metadata)
+		return h.handleAuthorizationCode(ctx, offer, metadata, selectedConfig)
 	}
 
 	return nil, errors.New("no supported grant type in offer")
@@ -715,7 +715,7 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	return &token, nil
 }
 
-func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (*TokenResponse, error) {
+func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
 	// Build authorization URL
 	authServer := metadata.AuthorizationServer
 	if authServer == "" {
@@ -735,7 +735,7 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		// Fallback: construct auth URL directly, no PAR
-		return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
+		return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 			AuthorizationEndpoint: fallbackEndpoint,
 		})
 	}
@@ -744,16 +744,16 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 	if resp.StatusCode == http.StatusOK {
 		var oauthMeta oauthServerMetadata
 		if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err == nil && oauthMeta.AuthorizationEndpoint != "" {
-			return h.startAuthorizationFlow(ctx, offer, metadata, &oauthMeta)
+			return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthMeta)
 		}
 	}
 
-	return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
+	return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 		AuthorizationEndpoint: fallbackEndpoint,
 	})
 }
 
-func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, oauthMeta *oauthServerMetadata) (*TokenResponse, error) {
+func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig, oauthMeta *oauthServerMetadata) (*TokenResponse, error) {
 	redirectURI := h.Config.Server.BaseURL + "/callback"
 
 	// Generate PKCE code verifier and challenge (RFC 7636)
@@ -776,7 +776,11 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	params.Set("response_type", "code")
 	params.Set("client_id", redirectURI) // OID4VCI: use redirect_uri as client_id for unregistered clients
 	params.Set("redirect_uri", redirectURI)
-	params.Set("scope", "openid")
+	scope := "openid"
+	if selectedConfig != nil && selectedConfig.Scope != "" {
+		scope = selectedConfig.Scope
+	}
+	params.Set("scope", scope)
 	if pkceEnabled {
 		params.Set("code_challenge", codeChallenge)
 		params.Set("code_challenge_method", "S256")

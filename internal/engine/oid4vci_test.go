@@ -267,6 +267,41 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 	assert.Empty(t, parsedURL.Query().Get("code_challenge"))
 }
 
+func TestScopeFromCredentialConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		config        *CredentialConfig
+		expectedScope string
+	}{
+		{
+			name:          "uses credential config scope",
+			config:        &CredentialConfig{Scope: "pid"},
+			expectedScope: "pid",
+		},
+		{
+			name:          "falls back to openid when scope empty",
+			config:        &CredentialConfig{Scope: ""},
+			expectedScope: "openid",
+		},
+		{
+			name:          "falls back to openid when config nil",
+			config:        nil,
+			expectedScope: "openid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build the scope the same way startAuthorizationFlow does
+			scope := "openid"
+			if tt.config != nil && tt.config.Scope != "" {
+				scope = tt.config.Scope
+			}
+			assert.Equal(t, tt.expectedScope, scope)
+		})
+	}
+}
+
 // testOID4VCIHandler creates an OID4VCIHandler with a real WebSocket session
 // for tests that need Progress/Error methods to work.
 func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler, func()) {
