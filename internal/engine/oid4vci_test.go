@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -150,6 +151,30 @@ func TestSendPushedAuthorizationRequest_MissingRequestURI(t *testing.T) {
 	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing request_uri")
+}
+
+func TestSupportsPKCE(t *testing.T) {
+	tests := []struct {
+		name     string
+		methods  []string
+		expected bool
+	}{
+		{"nil methods (assume support)", nil, true},
+		{"empty methods (assume support)", []string{}, true},
+		{"S256 present", []string{"S256"}, true},
+		{"S256 among others", []string{"plain", "S256"}, true},
+		{"only plain", []string{"plain"}, false},
+		{"no S256", []string{"plain", "none"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta := &oauthServerMetadata{
+				CodeChallengeMethodsSupported: tt.methods,
+			}
+			assert.Equal(t, tt.expected, meta.supportsPKCE())
+		})
+	}
 }
 
 func TestHandleAuthorizationCode_OAuthMetadataWithPAR(t *testing.T) {
@@ -412,14 +437,20 @@ func TestOAuthServerMetadata_PAREndpointParsing(t *testing.T) {
 	assert.Equal(t, "https://as.example.com/par", meta.PushedAuthorizationRequestEndpoint)
 }
 
+// errRoundTripper always returns an error, used for deterministic network failure tests.
+type errRoundTripper struct{}
+
+func (e *errRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("simulated network error")
+}
+
 func TestSendPushedAuthorizationRequest_NetworkError(t *testing.T) {
 	h := &OID4VCIHandler{
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Transport: &errRoundTripper{}},
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	// Use an invalid URL to trigger a network error
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), "http://127.0.0.1:1/par", url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR request failed")
 }

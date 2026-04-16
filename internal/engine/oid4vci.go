@@ -46,9 +46,25 @@ func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trust
 // oauthServerMetadata contains the OAuth Authorization Server metadata fields
 // relevant for the OID4VCI authorization code flow.
 type oauthServerMetadata struct {
-	AuthorizationEndpoint              string `json:"authorization_endpoint"`
-	TokenEndpoint                      string `json:"token_endpoint"`
-	PushedAuthorizationRequestEndpoint string `json:"pushed_authorization_request_endpoint"`
+	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
+	TokenEndpoint                      string   `json:"token_endpoint"`
+	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
+	CodeChallengeMethodsSupported      []string `json:"code_challenge_methods_supported"`
+}
+
+// supportsPKCE returns true if the AS metadata indicates S256 PKCE support,
+// or if code_challenge_methods_supported is absent (assume support per OID4VCI spec).
+func (m *oauthServerMetadata) supportsPKCE() bool {
+	if len(m.CodeChallengeMethodsSupported) == 0 {
+		// Not declared — assume S256 is supported (OID4VCI spec default)
+		return true
+	}
+	for _, method := range m.CodeChallengeMethodsSupported {
+		if method == "S256" {
+			return true
+		}
+	}
+	return false
 }
 
 // generateCodeVerifier creates a cryptographically random PKCE code_verifier (RFC 7636 §4.1).
@@ -714,11 +730,13 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 		return nil, err
 	}
 
+	fallbackEndpoint := strings.TrimSuffix(authServer, "/") + "/authorize"
+
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		// Fallback: construct auth URL directly, no PAR
 		return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
-			AuthorizationEndpoint: authServer + "/authorize",
+			AuthorizationEndpoint: fallbackEndpoint,
 		})
 	}
 	defer resp.Body.Close() //nolint:errcheck
@@ -731,7 +749,7 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 	}
 
 	return h.startAuthorizationFlow(ctx, offer, metadata, &oauthServerMetadata{
-		AuthorizationEndpoint: authServer + "/authorize",
+		AuthorizationEndpoint: fallbackEndpoint,
 	})
 }
 
@@ -745,14 +763,24 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 	codeChallenge := computeCodeChallenge(codeVerifier)
 
+	// Parse and validate the authorization endpoint URL once
+	authEndpoint, err := url.Parse(oauthMeta.AuthorizationEndpoint)
+	if err != nil || authEndpoint.Scheme == "" {
+		return nil, fmt.Errorf("invalid authorization endpoint URL: %q", oauthMeta.AuthorizationEndpoint)
+	}
+
+	pkceEnabled := oauthMeta.supportsPKCE()
+
 	// Build common authorization parameters
 	params := url.Values{}
 	params.Set("response_type", "code")
 	params.Set("client_id", metadata.CredentialIssuer)
 	params.Set("redirect_uri", redirectURI)
 	params.Set("scope", "openid")
-	params.Set("code_challenge", codeChallenge)
-	params.Set("code_challenge_method", "S256")
+	if pkceEnabled {
+		params.Set("code_challenge", codeChallenge)
+		params.Set("code_challenge_method", "S256")
+	}
 	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
 		if issuerState, ok := grant["issuer_state"].(string); ok {
 			params.Set("issuer_state", issuerState)
@@ -771,7 +799,6 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		}
 
 		// Build authorization URL with only client_id and request_uri
-		authEndpoint, _ := url.Parse(oauthMeta.AuthorizationEndpoint)
 		q := authEndpoint.Query()
 		q.Set("client_id", metadata.CredentialIssuer)
 		q.Set("request_uri", requestURI)
@@ -779,7 +806,6 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		authURL = authEndpoint.String()
 	} else {
 		// Standard authorization URL with all parameters
-		authEndpoint, _ := url.Parse(oauthMeta.AuthorizationEndpoint)
 		authEndpoint.RawQuery = params.Encode()
 		authURL = authEndpoint.String()
 	}
@@ -809,8 +835,12 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		return nil, err
 	}
 
-	// Exchange code for token, including PKCE code_verifier
-	return h.exchangeAuthCode(ctx, metadata, authResult.Code, redirectURI, codeVerifier)
+	// Exchange code for token, including PKCE code_verifier when enabled
+	verifier := ""
+	if pkceEnabled {
+		verifier = codeVerifier
+	}
+	return h.exchangeAuthCode(ctx, metadata, authResult.Code, redirectURI, verifier)
 }
 
 // PARResponse represents the response from a Pushed Authorization Request endpoint (RFC 9126).
