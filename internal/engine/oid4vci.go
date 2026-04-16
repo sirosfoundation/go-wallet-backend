@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -103,6 +104,8 @@ type IssuerMetadata struct {
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	// Credential response encryption configuration
+	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
 	// mDOC IACA certificates URL
 	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
 	// Signed metadata JWT (contains x5c or jwk for trust evaluation)
@@ -166,6 +169,53 @@ type AvailableCredential struct {
 	Display *CredentialDisplay `json:"display,omitempty"`
 	Format  string             `json:"format"`
 	VCT     string             `json:"vct,omitempty"`
+}
+
+// CredentialResponseEncryptionConfig represents the issuer's credential_response_encryption metadata.
+type CredentialResponseEncryptionConfig struct {
+	AlgValuesSupported []string `json:"alg_values_supported"`
+	EncValuesSupported []string `json:"enc_values_supported"`
+	EncryptionRequired bool     `json:"encryption_required"`
+}
+
+// supportsAlg returns true if the encryption config supports the given algorithm.
+func (c *CredentialResponseEncryptionConfig) supportsAlg(alg string) bool {
+	for _, a := range c.AlgValuesSupported {
+		if a == alg {
+			return true
+		}
+	}
+	return false
+}
+
+// supportsEnc returns true if the encryption config supports the given content encryption.
+func (c *CredentialResponseEncryptionConfig) supportsEnc(enc string) bool {
+	for _, e := range c.EncValuesSupported {
+		if e == enc {
+			return true
+		}
+	}
+	return false
+}
+
+// decryptJWEResponse decrypts a JWE compact-serialized credential response using
+// the ephemeral ECDH-ES private key.
+func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*CredentialResponse, error) {
+	jwe, err := jose.ParseEncrypted(jweString, []jose.KeyAlgorithm{jose.ECDH_ES}, []jose.ContentEncryption{jose.A128CBC_HS256})
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JWE: %w", err)
+	}
+
+	plaintext, err := jwe.Decrypt(privKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt credential response: %w", err)
+	}
+
+	var credResp CredentialResponse
+	if err := json.Unmarshal(plaintext, &credResp); err != nil {
+		return nil, fmt.Errorf("failed to parse decrypted credential response: %w", err)
+	}
+	return &credResp, nil
 }
 
 // generateDPoPKey creates an ephemeral P-256 key pair for DPoP proofs (RFC 9449).
@@ -1147,6 +1197,24 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		}
 	}
 
+	// Credential response encryption (OID4VCI §7.3)
+	var encKey *ecdsa.PrivateKey
+	encCfg := metadata.CredentialResponseEncryption
+	if encCfg != nil && encCfg.supportsAlg("ECDH-ES") && encCfg.supportsEnc("A128CBC-HS256") {
+		var err error
+		encKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+		}
+		encJWK := ecPublicKeyJWK(&encKey.PublicKey)
+		encJWK["use"] = "enc"
+		reqBody["credential_response_encryption"] = map[string]interface{}{
+			"alg": "ECDH-ES",
+			"enc": "A128CBC-HS256",
+			"jwk": encJWK,
+		}
+	}
+
 	bodyBytes, _ := json.Marshal(reqBody)
 
 	// Credential request with DPoP nonce retry (RFC 9449 §8)
@@ -1182,12 +1250,26 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
 
+		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read credential response: %w", err)
+		}
+
+		// Detect encrypted response (JWE compact serialization)
+		contentType := resp.Header.Get("Content-Type")
+		if encKey != nil && (contentType == "application/jwt" || contentType == "application/jose") {
+			credResp, err := decryptJWEResponse(string(body), encKey)
+			if err != nil {
+				return nil, err
+			}
+			return credResp, nil
+		}
+
 		var credResp CredentialResponse
-		if err := json.NewDecoder(resp.Body).Decode(&credResp); err != nil {
-			_ = resp.Body.Close()
+		if err := json.Unmarshal(body, &credResp); err != nil {
 			return nil, fmt.Errorf("failed to parse credential response: %w", err)
 		}
-		_ = resp.Body.Close()
 
 		return &credResp, nil
 	}
