@@ -774,7 +774,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	// Build common authorization parameters
 	params := url.Values{}
 	params.Set("response_type", "code")
-	params.Set("client_id", metadata.CredentialIssuer)
+	params.Set("client_id", redirectURI) // OID4VCI: use redirect_uri as client_id for unregistered clients
 	params.Set("redirect_uri", redirectURI)
 	params.Set("scope", "openid")
 	if pkceEnabled {
@@ -800,7 +800,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 
 		// Build authorization URL with only client_id and request_uri
 		q := authEndpoint.Query()
-		q.Set("client_id", metadata.CredentialIssuer)
+		q.Set("client_id", redirectURI)
 		q.Set("request_uri", requestURI)
 		authEndpoint.RawQuery = q.Encode()
 		authURL = authEndpoint.String()
