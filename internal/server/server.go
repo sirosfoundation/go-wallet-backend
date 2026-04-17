@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
@@ -313,7 +314,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
-	router.Use(middleware.Logger(m.logger, "/status", "/health", "/readyz"))
+	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))
+	router.Use(middleware.Logger(m.logger, "/status", "/health", "/healthz", "/readyz"))
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     m.cfg.CORS.AllowedOrigins,
 		AllowMethods:     m.cfg.CORS.AllowedMethods,
@@ -338,6 +340,7 @@ func (m *Manager) addStatusEndpoints(router *gin.Engine) {
 		})
 	}
 	router.GET("/health", statusHandler)
+	router.GET("/healthz", statusHandler)
 	router.GET("/status", statusHandler)
 
 	// /readyz - Kubernetes-style readiness probe
@@ -368,12 +371,11 @@ func (m *Manager) startAdminServer() error {
 		if err != nil {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
-		// Log token at DEBUG level to avoid capture by production log aggregators
-		// For production deployments, set WALLET_SERVER_ADMIN_TOKEN or configure
-		// WALLET_SERVER_ADMIN_TOKEN_PATH / server.admin_token_path.
-		m.logger.Debug("Generated admin API token",
+		// Log the auto-generated token so it can be used during development.
+		// For production deployments, set WALLET_SERVER_ADMIN_TOKEN or
+		// configure WALLET_SERVER_ADMIN_TOKEN_PATH / server.admin_token_path.
+		m.logger.Info("Auto-generated admin token (set WALLET_SERVER_ADMIN_TOKEN for production)",
 			zap.String("token", token))
-		m.logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token_path for production)")
 	}
 
 	// Admin router
@@ -388,6 +390,14 @@ func (m *Manager) startAdminServer() error {
 			Roles:   m.cfg.Roles,
 		})
 	})
+
+	// Prometheus metrics endpoint — intentionally unauthenticated.
+	// The admin port MUST be bound to a private/loopback interface or
+	// firewalled so only the monitoring stack (e.g. Prometheus) can reach it.
+	// Adding Bearer-token auth here would require every Prometheus scrape
+	// config to carry the admin secret, which provides little benefit when
+	// the port is already network-isolated.
+	adminRouter.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Protected admin routes with token auth
 	adminGroup := adminRouter.Group("/admin")

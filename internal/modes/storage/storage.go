@@ -184,17 +184,14 @@ func setupStorageRouter(cfg *config.Config, services *service.Services, store ba
 		// Credential storage routes
 		storageGroup := protected.Group("/storage")
 		{
-			// Verifiable Credentials
-			storageGroup.GET("/vc", handlers.GetAllCredentials)
-			storageGroup.POST("/vc", handlers.StoreCredential)
-			storageGroup.POST("/vc/update", handlers.UpdateCredential)
-			storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
-			storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
-
-			// Verifiable Presentations
-			storageGroup.GET("/vp", handlers.GetAllPresentations)
-			storageGroup.POST("/vp", handlers.StorePresentation)
-			storageGroup.GET("/vp/:presentation_identifier", handlers.GetPresentationByIdentifier)
+			// Verifiable Credentials (gated)
+			if cfg.Features.CredentialStorageEnabled {
+				storageGroup.GET("/vc", handlers.GetAllCredentials)
+				storageGroup.POST("/vc", handlers.StoreCredential)
+				storageGroup.POST("/vc/update", handlers.UpdateCredential)
+				storageGroup.GET("/vc/:credential_identifier", handlers.GetCredentialByIdentifier)
+				storageGroup.DELETE("/vc/:credential_identifier", handlers.DeleteCredential)
+			}
 		}
 
 		// Keystore status

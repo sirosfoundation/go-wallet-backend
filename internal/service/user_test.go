@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -517,6 +519,196 @@ func TestUserService_DeleteUser(t *testing.T) {
 	_, err = service.GetUserByID(ctx, user.UUID)
 	if err == nil {
 		t.Error("GetUserByID() after deletion should return error")
+	}
+}
+
+func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	service := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := service.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Create a pending challenge for this user
+	challenge := &domain.WebauthnChallenge{
+		ID:        "test-challenge",
+		UserID:    user.UUID.String(),
+		TenantID:  string(domain.DefaultTenantID),
+		Challenge: "random-nonce",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := store.Challenges().Create(ctx, challenge); err != nil {
+		t.Fatalf("Create challenge error = %v", err)
+	}
+
+	// Create an invite consumed by this user
+	invite := &domain.Invite{
+		ID:       "test-invite",
+		TenantID: domain.DefaultTenantID,
+		Code:     "INVITE123",
+		Status:   domain.InviteStatusCompleted,
+		UsedBy:   &user.UUID,
+	}
+	if err := store.Invites().Create(ctx, invite); err != nil {
+		t.Fatalf("Create invite error = %v", err)
+	}
+
+	// Delete user
+	if err := service.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify challenge is deleted
+	_, err = store.Challenges().GetByID(ctx, "test-challenge")
+	if err == nil {
+		t.Error("Challenge should be deleted after DeleteUser")
+	}
+
+	// Verify invite used_by is cleared
+	got, err := store.Invites().GetByID(ctx, "test-invite")
+	if err != nil {
+		t.Fatalf("GetByID invite error = %v", err)
+	}
+	if got.UsedBy != nil {
+		t.Error("Invite used_by should be cleared after DeleteUser")
+	}
+}
+
+// mockSessionCleaner records calls to DeleteByUser for test assertions.
+type mockSessionCleaner struct {
+	called bool
+	userID string
+}
+
+func (m *mockSessionCleaner) DeleteByUser(_ context.Context, userID string) error {
+	m.called = true
+	m.userID = userID
+	return nil
+}
+
+func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	// Wire mock session cleaner
+	mock := &mockSessionCleaner{}
+	svc.SetSessionCleaner(mock)
+
+	// Register user
+	username := "session-cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Session Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Delete user
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify session cleaner was called with correct user ID
+	if !mock.called {
+		t.Error("SessionCleaner.DeleteByUser should be called during DeleteUser")
+	}
+	if mock.userID != user.UUID.String() {
+		t.Errorf("SessionCleaner.DeleteByUser called with %q, want %q", mock.userID, user.UUID.String())
+	}
+}
+
+func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	// Register user
+	username := "vp-cleanup-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "VP Cleanup User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Store a credential for this user
+	cred := &domain.VerifiableCredential{
+		TenantID:             domain.DefaultTenantID,
+		HolderDID:            user.DID,
+		CredentialIdentifier: "cred-001",
+		Credential:           `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
+		Format:               "jwt_vc_json",
+	}
+	if err := store.Credentials().Create(ctx, cred); err != nil {
+		t.Fatalf("Create credential error = %v", err)
+	}
+
+	// Store a presentation for this user
+	pres := &domain.VerifiablePresentation{
+		TenantID:               domain.DefaultTenantID,
+		HolderDID:              user.DID,
+		PresentationIdentifier: "pres-001",
+		Presentation:           `{"@context":["https://www.w3.org/2018/credentials/v1"]}`,
+	}
+	if err := store.Presentations().Create(ctx, pres); err != nil {
+		t.Fatalf("Create presentation error = %v", err)
+	}
+
+	// Verify they exist before deletion
+	creds, err := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if err != nil || len(creds) == 0 {
+		t.Fatal("Expected credential to exist before deletion")
+	}
+	preses, err := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if err != nil || len(preses) == 0 {
+		t.Fatal("Expected presentation to exist before deletion")
+	}
+
+	// Delete user
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	// Verify credential is deleted
+	creds, _ = store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if len(creds) != 0 {
+		t.Errorf("Expected 0 credentials after deletion, got %d", len(creds))
+	}
+
+	// Verify presentation is deleted
+	preses, _ = store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+	if len(preses) != 0 {
+		t.Errorf("Expected 0 presentations after deletion, got %d", len(preses))
 	}
 }
 

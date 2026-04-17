@@ -148,35 +148,7 @@ func TestHandlers_WebAuthn(t *testing.T) {
 	})
 }
 
-// Test Presentation handlers (now implemented)
-func TestHandlers_Presentation_Unauthorized(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.GET("/presentations", handlers.GetAllPresentations)
-	router.POST("/presentations", handlers.StorePresentation)
-	router.GET("/presentations/:presentation_identifier", handlers.GetPresentationByIdentifier)
-
-	tests := []struct {
-		method   string
-		endpoint string
-	}{
-		{http.MethodGet, "/presentations"},
-		{http.MethodPost, "/presentations"},
-		{http.MethodGet, "/presentations/123"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.method+" "+tt.endpoint, func(t *testing.T) {
-			w := httptest.NewRecorder()
-			req := httptest.NewRequest(tt.method, tt.endpoint, nil)
-			router.ServeHTTP(w, req)
-
-			// Requires authentication - should return 401
-			if w.Code != http.StatusUnauthorized {
-				t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
-			}
-		})
-	}
-}
+// Test Presentation handlers (removed — VP endpoints are no longer registered)
 
 // authMiddleware is a test helper that sets auth context
 func authMiddleware(userID, did string) gin.HandlerFunc {
@@ -422,63 +394,6 @@ func TestHandlers_DeleteCredential_BadRequest(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/credentials/test-id", nil)
-	router.ServeHTTP(w, req)
-
-	// Returns 400 due to missing user context
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
-	}
-}
-
-// Test presentation handlers
-func TestHandlers_GetAllPresentations_Unauthorized(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.GET("/presentations", handlers.GetAllPresentations)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/presentations", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
-	}
-}
-
-func TestHandlers_StorePresentation_Unauthorized(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.POST("/presentations", handlers.StorePresentation)
-
-	w := httptest.NewRecorder()
-	body := `{"vp": "test"}`
-	req := httptest.NewRequest(http.MethodPost, "/presentations", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
-	}
-}
-
-func TestHandlers_DeletePresentation_BadRequest(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.DELETE("/presentations/:id", handlers.DeletePresentation)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodDelete, "/presentations/test-id", nil)
-	router.ServeHTTP(w, req)
-
-	// Returns 400 due to missing user context
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
-	}
-}
-
-func TestHandlers_GetPresentationByIdentifier_BadRequest(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.GET("/presentations/:id", handlers.GetPresentationByIdentifier)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/presentations/test-id", nil)
 	router.ServeHTTP(w, req)
 
 	// Returns 400 due to missing user context

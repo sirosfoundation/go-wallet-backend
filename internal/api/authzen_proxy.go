@@ -123,8 +123,6 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	if err := h.authorizer.Authorize(ctx, authzReq); err != nil {
 		h.logger.Info("query authorization denied",
 			zap.String("tenant_id", tenantID),
-			zap.String("user_id", userID),
-			zap.String("subject_id", req.Subject.ID),
 			zap.String("action", getActionName(&req)),
 			zap.Error(err),
 		)
@@ -168,11 +166,9 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 		return
 	}
 
-	// Log the decision for audit
+	// Log the decision for audit (no user PII at INFO level)
 	h.logger.Info("trust evaluation completed",
 		zap.String("tenant_id", tenantID),
-		zap.String("user_id", userID),
-		zap.String("subject_id", req.Subject.ID),
 		zap.String("action", getActionName(&req)),
 		zap.Bool("decision", resp.Decision),
 	)
