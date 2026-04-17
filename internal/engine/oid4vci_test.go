@@ -799,7 +799,7 @@ func TestRequestCredential_DPoPBound(t *testing.T) {
 	}
 	config := &CredentialConfig{Format: "vc+sd-jwt", VCT: "pid"}
 
-	_, err = h.requestCredential(context.Background(), metadata, token, config, "")
+	_, err = h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 
 	assert.Equal(t, "DPoP dpop-access-token", receivedHeaders.Get("Authorization"))
@@ -839,7 +839,7 @@ func TestRequestCredential_BearerFallback(t *testing.T) {
 	token := &TokenResponse{AccessToken: "bearer-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	_, err = h.requestCredential(context.Background(), metadata, token, config, "")
+	_, err = h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 
 	assert.Equal(t, "Bearer bearer-token", receivedHeaders.Get("Authorization"))
@@ -1053,7 +1053,7 @@ func TestRequestCredential_DPoPNonceRetry(t *testing.T) {
 	token := &TokenResponse{AccessToken: "access-token", TokenType: "DPoP"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 	assert.Equal(t, "cred-after-nonce", resp.Credential)
 	assert.Equal(t, 2, attempt)
@@ -1267,7 +1267,7 @@ func TestRequestCredential_EncryptedResponse(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 	assert.Equal(t, "encrypted-credential-value", resp.Credential)
 }
@@ -1289,7 +1289,7 @@ func TestRequestCredential_NoEncryptionWhenUnsupported(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 	assert.Equal(t, "plain-credential", resp.Credential)
 	_, hasEncryption := receivedBody["credential_response_encryption"]
@@ -1319,7 +1319,7 @@ func TestRequestCredential_NoEncryptionWhenAlgUnsupported(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 	assert.Equal(t, "plain-credential", resp.Credential)
 	_, hasEncryption := receivedBody["credential_response_encryption"]
@@ -1355,7 +1355,7 @@ func TestRequestCredential_EncryptionRequiredNoMutualSupport(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	_, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no mutually supported alg/enc pair")
 }
@@ -1411,7 +1411,7 @@ func TestRequestCredential_EncryptedResponseWithParams(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "DPoP"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
 	require.NoError(t, err)
 	assert.Equal(t, "encrypted-with-params", resp.Credential)
 }
