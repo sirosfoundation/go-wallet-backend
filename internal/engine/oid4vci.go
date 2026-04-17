@@ -1168,6 +1168,7 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
 	data.Set("redirect_uri", redirectURI)
+	data.Set("client_id", redirectURI)
 	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
 	}
