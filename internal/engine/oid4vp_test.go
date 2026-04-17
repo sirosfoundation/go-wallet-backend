@@ -438,3 +438,36 @@ func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
 
 	assert.NotNil(t, parsed["dcql_query"])
 }
+
+func TestBuildDCAPIResponse(t *testing.T) {
+	h := &OID4VPHandler{}
+
+	t.Run("basic dc_api response with state", func(t *testing.T) {
+		authReq := &AuthorizationRequest{
+			ResponseMode: "dc_api",
+			State:        "test-state-123",
+		}
+
+		result, err := h.buildDCAPIResponse(authReq, "eyJ.vp_token.sig")
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Empty(t, result.redirectURI, "dc_api should not produce a redirect URI")
+		require.NotNil(t, result.vpResponse)
+
+		assert.Equal(t, "eyJ.vp_token.sig", result.vpResponse["vp_token"])
+		assert.Equal(t, "test-state-123", result.vpResponse["state"])
+	})
+
+	t.Run("dc_api without state", func(t *testing.T) {
+		authReq := &AuthorizationRequest{
+			ResponseMode: "dc_api",
+		}
+
+		result, err := h.buildDCAPIResponse(authReq, "vp-token-data")
+		require.NoError(t, err)
+		require.NotNil(t, result.vpResponse)
+		assert.Equal(t, "vp-token-data", result.vpResponse["vp_token"])
+		_, hasState := result.vpResponse["state"]
+		assert.False(t, hasState, "state should not be set when empty")
+	})
+}
