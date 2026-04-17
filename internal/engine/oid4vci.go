@@ -1471,6 +1471,13 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		switch v := resp.Credential.(type) {
 		case string:
 			credStr = v
+		case map[string]interface{}:
+			if innerCred, ok := v["credential"].(string); ok {
+				credStr = innerCred
+			} else {
+				bytes, _ := json.Marshal(v)
+				credStr = string(bytes)
+			}
 		default:
 			bytes, _ := json.Marshal(v)
 			credStr = string(bytes)
