@@ -210,9 +210,10 @@ const (
 // FlowCompleteMessage indicates successful flow completion
 type FlowCompleteMessage struct {
 	Message
-	Credentials  []CredentialResult `json:"credentials,omitempty"`
-	RedirectURI  string             `json:"redirect_uri,omitempty"`
-	TypeMetadata json.RawMessage    `json:"type_metadata,omitempty"`
+	Credentials  []CredentialResult     `json:"credentials,omitempty"`
+	RedirectURI  string                 `json:"redirect_uri,omitempty"`
+	ResponseData map[string]interface{} `json:"response_data,omitempty"` // DC API VP response payload
+	TypeMetadata json.RawMessage        `json:"type_metadata,omitempty"`
 }
 
 // FlowErrorMessage indicates a flow error
