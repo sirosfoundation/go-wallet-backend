@@ -67,7 +67,8 @@ func TestSendPushedAuthorizationRequest_Success(t *testing.T) {
 		err := r.ParseForm()
 		require.NoError(t, err)
 		assert.Equal(t, "code", r.FormValue("response_type"))
-		assert.Equal(t, "https://issuer.example.com", r.FormValue("client_id"))
+		// OID4VCI: redirect_uri is used as client_id for unregistered clients
+		assert.Equal(t, "https://wallet.example.com/callback", r.FormValue("client_id"))
 		assert.NotEmpty(t, r.FormValue("code_challenge"))
 		assert.Equal(t, "S256", r.FormValue("code_challenge_method"))
 
@@ -87,9 +88,9 @@ func TestSendPushedAuthorizationRequest_Success(t *testing.T) {
 
 	params := url.Values{}
 	params.Set("response_type", "code")
-	params.Set("client_id", "https://issuer.example.com")
+	params.Set("client_id", "https://wallet.example.com/callback")
 	params.Set("redirect_uri", "https://wallet.example.com/callback")
-	params.Set("scope", "openid")
+	params.Set("scope", "pid")
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
@@ -162,22 +163,22 @@ func TestSendPushedAuthorizationRequest_MissingRequestURI(t *testing.T) {
 func TestSupportsPKCE(t *testing.T) {
 	tests := []struct {
 		name     string
-		methods  []string
+		json     string
 		expected bool
 	}{
-		{"nil methods (assume support)", nil, true},
-		{"empty methods (assume support)", []string{}, true},
-		{"S256 present", []string{"S256"}, true},
-		{"S256 among others", []string{"plain", "S256"}, true},
-		{"only plain", []string{"plain"}, false},
-		{"no S256", []string{"plain", "none"}, false},
+		{"absent field (assume support)", `{"authorization_endpoint":"https://as.example.com/authorize"}`, true},
+		{"S256 present", `{"code_challenge_methods_supported":["S256"]}`, true},
+		{"S256 among others", `{"code_challenge_methods_supported":["plain","S256"]}`, true},
+		{"only plain", `{"code_challenge_methods_supported":["plain"]}`, false},
+		{"no S256", `{"code_challenge_methods_supported":["plain","none"]}`, false},
+		{"explicit empty list", `{"code_challenge_methods_supported":[]}`, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			meta := &oauthServerMetadata{
-				CodeChallengeMethodsSupported: tt.methods,
-			}
+			var meta oauthServerMetadata
+			err := json.Unmarshal([]byte(tt.json), &meta)
+			require.NoError(t, err)
 			assert.Equal(t, tt.expected, meta.supportsPKCE())
 		})
 	}
@@ -225,7 +226,8 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 		err := r.ParseForm()
 		require.NoError(t, err)
 		assert.Equal(t, "code", r.FormValue("response_type"))
-		assert.Equal(t, "https://issuer.example.com", r.FormValue("client_id"))
+		// OID4VCI: redirect_uri is used as client_id for unregistered clients
+		assert.Equal(t, "https://wallet.example.com/callback", r.FormValue("client_id"))
 		assert.Equal(t, "S256", r.FormValue("code_challenge_method"))
 		assert.NotEmpty(t, r.FormValue("code_challenge"))
 
@@ -247,9 +249,9 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 
 	params := url.Values{}
 	params.Set("response_type", "code")
-	params.Set("client_id", "https://issuer.example.com")
+	params.Set("client_id", "https://wallet.example.com/callback")
 	params.Set("redirect_uri", "https://wallet.example.com/callback")
-	params.Set("scope", "openid")
+	params.Set("scope", "pid")
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
@@ -259,13 +261,13 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 	// Verify the redirect URL would be built correctly
 	authEndpoint, _ := url.Parse("https://as.example.com/authorize")
 	q := authEndpoint.Query()
-	q.Set("client_id", "https://issuer.example.com")
+	q.Set("client_id", "https://wallet.example.com/callback")
 	q.Set("request_uri", requestURI)
 	authEndpoint.RawQuery = q.Encode()
 
 	parsedURL, err := url.Parse(authEndpoint.String())
 	require.NoError(t, err)
-	assert.Equal(t, "https://issuer.example.com", parsedURL.Query().Get("client_id"))
+	assert.Equal(t, "https://wallet.example.com/callback", parsedURL.Query().Get("client_id"))
 	assert.Equal(t, "urn:ietf:params:oauth:request_uri:xyz789", parsedURL.Query().Get("request_uri"))
 	// Should NOT contain the full params
 	assert.Empty(t, parsedURL.Query().Get("response_type"))
@@ -567,7 +569,8 @@ func TestEcPublicKeyJWK(t *testing.T) {
 	key, err := generateDPoPKey()
 	require.NoError(t, err)
 
-	jwk := ecPublicKeyJWK(&key.PublicKey)
+	jwk, err := ecPublicKeyJWK(&key.PublicKey)
+	require.NoError(t, err)
 	assert.Equal(t, "EC", jwk["kty"])
 	assert.Equal(t, "P-256", jwk["crv"])
 
@@ -840,7 +843,8 @@ func TestRequestCredential_BearerFallback(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "Bearer bearer-token", receivedHeaders.Get("Authorization"))
-	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+	// DPoP header should NOT be sent for Bearer tokens (RFC 9449 compliance)
+	assert.Empty(t, receivedHeaders.Get("DPoP"))
 }
 
 func TestExchangePreAuthCode_NoDPoPKey(t *testing.T) {
@@ -957,16 +961,16 @@ func TestExchangePreAuthCode_DPoPNonceRetry(t *testing.T) {
 		dpopHeader := r.Header.Get("DPoP")
 		assert.NotEmpty(t, dpopHeader)
 
-		// Parse DPoP proof and verify nonce
-		tok, err := jwt.Parse(dpopHeader, func(tok *jwt.Token) (interface{}, error) {
-			jwkMap := tok.Header["jwk"].(map[string]interface{})
-			assert.Equal(t, "EC", jwkMap["kty"])
-			// For test, we accept any key — just verify nonce claim
-			return nil, nil
-		})
-		// jwt.Parse will fail signature verification without the key, so parse manually
-		_ = tok
-		_ = err
+		// Parse DPoP proof without signature verification and verify nonce
+		var claims jwt.MapClaims
+		parser := jwt.Parser{}
+		tok, _, err := parser.ParseUnverified(dpopHeader, &claims)
+		require.NoError(t, err)
+
+		jwkMap, ok := tok.Header["jwk"].(map[string]interface{})
+		require.True(t, ok, "DPoP proof must include a JWK header")
+		assert.Equal(t, "EC", jwkMap["kty"])
+		assert.Equal(t, "required-nonce-abc", claims["nonce"])
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(TokenResponse{
@@ -1334,4 +1338,80 @@ func TestCredentialResponseEncryptionConfig_JSONParsing(t *testing.T) {
 	assert.Equal(t, []string{"RSA-OAEP-256", "ECDH-ES"}, cfg.AlgValuesSupported)
 	assert.Equal(t, []string{"A128CBC-HS256"}, cfg.EncValuesSupported)
 	assert.True(t, cfg.EncryptionRequired)
+}
+
+func TestRequestCredential_EncryptionRequiredNoMutualSupport(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialEndpoint: "https://issuer.example.com/credential",
+		CredentialResponseEncryption: &CredentialResponseEncryptionConfig{
+			AlgValuesSupported: []string{"RSA-OAEP-256"},
+			EncValuesSupported: []string{"A128CBC-HS256"},
+			EncryptionRequired: true,
+		},
+	}
+	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	_, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no mutually supported alg/enc pair")
+}
+
+func TestRequestCredential_EncryptedResponseWithParams(t *testing.T) {
+	// Verify Content-Type with parameters (e.g. charset) is handled correctly
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&reqBody)
+
+		enc := reqBody["credential_response_encryption"].(map[string]interface{})
+		jwkMap := enc["jwk"].(map[string]interface{})
+		xBytes, _ := base64.RawURLEncoding.DecodeString(jwkMap["x"].(string))
+		yBytes, _ := base64.RawURLEncoding.DecodeString(jwkMap["y"].(string))
+
+		pubKey := &ecdsa.PublicKey{
+			Curve: elliptic.P256(),
+			X:     new(big.Int).SetBytes(xBytes),
+			Y:     new(big.Int).SetBytes(yBytes),
+		}
+
+		credResp := CredentialResponse{Credential: "encrypted-with-params"}
+		plaintext, _ := json.Marshal(credResp)
+
+		encrypter, _ := jose.NewEncrypter(
+			jose.A128CBC_HS256,
+			jose.Recipient{Algorithm: jose.ECDH_ES, Key: pubKey},
+			nil,
+		)
+		jweObj, _ := encrypter.Encrypt(plaintext)
+		jweString, _ := jweObj.CompactSerialize()
+
+		// Content-Type with parameters
+		w.Header().Set("Content-Type", "application/jwt; charset=utf-8")
+		w.Write([]byte(jweString))
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialEndpoint: credServer.URL,
+		CredentialResponseEncryption: &CredentialResponseEncryptionConfig{
+			AlgValuesSupported: []string{"ECDH-ES"},
+			EncValuesSupported: []string{"A128CBC-HS256"},
+		},
+	}
+	token := &TokenResponse{AccessToken: "test-token", TokenType: "DPoP"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	resp, err := h.requestCredential(context.Background(), metadata, token, config, "")
+	require.NoError(t, err)
+	assert.Equal(t, "encrypted-with-params", resp.Credential)
 }
