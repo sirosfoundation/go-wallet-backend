@@ -46,6 +46,12 @@ type WebAuthnService struct {
 	logger          *zap.Logger
 	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
+	tokenBlacklist  *TokenBlacklist
+}
+
+// SetTokenBlacklist sets the token blacklist for refresh token rotation.
+func (s *WebAuthnService) SetTokenBlacklist(bl *TokenBlacklist) {
+	s.tokenBlacklist = bl
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -402,6 +408,8 @@ type OIDCGateBinding struct {
 type FinishRegistrationResponse struct {
 	UUID              string                   `json:"uuid"`
 	Token             string                   `json:"appToken"`
+	RefreshToken      string                   `json:"refreshToken,omitempty"` // Optional refresh token
+	ExpiresIn         int64                    `json:"expiresIn"`              // Access token lifetime in seconds
 	DisplayName       string                   `json:"displayName"`
 	Username          string                   `json:"username,omitempty"`
 	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
@@ -701,6 +709,9 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
+	// Generate refresh token (if enabled)
+	refreshToken, _ := s.generateRefreshToken(user, tenantID)
+
 	s.logger.Info("User registered via WebAuthn",
 		zap.String("user_id", userID.String()),
 		zap.String("tenant_id", string(tenantID)))
@@ -713,6 +724,8 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	return &FinishRegistrationResponse{
 		UUID:              userID.String(),
 		Token:             token,
+		RefreshToken:      refreshToken,
+		ExpiresIn:         int64(s.cfg.JWT.AccessExpiry().Seconds()),
 		DisplayName:       displayName,
 		Username:          username,
 		PrivateData:       user.PrivateData,
@@ -803,6 +816,7 @@ type FinishLoginResponse struct {
 	UUID              string                   `json:"uuid"`
 	Token             string                   `json:"appToken"`
 	RefreshToken      string                   `json:"refreshToken,omitempty"` // Optional refresh token
+	ExpiresIn         int64                    `json:"expiresIn"`              // Access token lifetime in seconds
 	DisplayName       string                   `json:"displayName"`
 	Username          string                   `json:"username,omitempty"`
 	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
@@ -1097,6 +1111,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		UUID:              userID.String(),
 		Token:             token,
 		RefreshToken:      refreshToken,
+		ExpiresIn:         int64(s.cfg.JWT.AccessExpiry().Seconds()),
 		DisplayName:       displayName,
 		Username:          username,
 		PrivateData:       user.PrivateData,
@@ -1120,8 +1135,8 @@ func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.Tenan
 		"did":       user.DID,
 		"tenant_id": string(tenantID),
 		"iat":       now.Unix(),
-		"nbf":       now.Unix(),                                                       // Not Before: token valid from now
-		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(), // Expiry
+		"nbf":       now.Unix(),                               // Not Before: token valid from now
+		"exp":       now.Add(s.cfg.JWT.AccessExpiry()).Unix(), // Expiry
 		"iss":       s.cfg.JWT.Issuer,
 		"aud":       s.cfg.Server.RPID, // Audience: the RP ID
 		"jti":       jti,               // JWT ID: unique identifier for revocation
@@ -1173,6 +1188,7 @@ type RefreshTokenRequest struct {
 type RefreshTokenResponse struct {
 	Token        string `json:"appToken"`
 	RefreshToken string `json:"refreshToken,omitempty"`
+	ExpiresIn    int64  `json:"expiresIn"` // Access token lifetime in seconds
 }
 
 // RefreshAccessToken exchanges a valid refresh token for a new access token
@@ -1214,6 +1230,16 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	tenantIDStr, _ := claims["tenant_id"].(string)
 	tenantID := domain.TenantID(tenantIDStr)
 
+	// Check if the old refresh token is already blacklisted (prevent reuse)
+	oldJTI, _ := claims["jti"].(string)
+	if oldJTI != "" && s.tokenBlacklist != nil && s.tokenBlacklist.IsBlacklisted(ctx, oldJTI) {
+		s.logger.Warn("Reuse of blacklisted refresh token detected",
+			zap.String("jti", oldJTI),
+			zap.String("user_id", userIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+
 	// Get the user (verify they still exist)
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
@@ -1232,6 +1258,15 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	// Generate new refresh token (rotation for security)
 	newRefreshToken, _ := s.generateRefreshToken(user, tenantID)
 
+	// Blacklist the old refresh token to prevent reuse (refresh token rotation)
+	if oldJTI != "" && s.tokenBlacklist != nil {
+		expFloat, _ := claims["exp"].(float64)
+		oldExpiry := time.Unix(int64(expFloat), 0)
+		if err := s.tokenBlacklist.Add(ctx, oldJTI, oldExpiry); err != nil {
+			s.logger.Warn("Failed to blacklist old refresh token", zap.Error(err))
+		}
+	}
+
 	s.logger.Info("Access token refreshed",
 		zap.String("user_id", userIDStr),
 		zap.String("tenant_id", tenantIDStr),
@@ -1240,6 +1275,7 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	return &RefreshTokenResponse{
 		Token:        accessToken,
 		RefreshToken: newRefreshToken,
+		ExpiresIn:    int64(s.cfg.JWT.AccessExpiry().Seconds()),
 	}, nil
 }
 

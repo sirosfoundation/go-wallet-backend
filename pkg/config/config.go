@@ -270,11 +270,25 @@ type LoggingConfig struct {
 
 // JWTConfig contains JWT configuration
 type JWTConfig struct {
-	Secret      string `yaml:"secret" envconfig:"SECRET"`
-	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
-	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
-	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
+	Secret        string `yaml:"secret" envconfig:"SECRET"`
+	SecretPath    string `yaml:"secret_path" envconfig:"SECRET_PATH"`       // Path to file containing JWT secret
+	ExpiryMinutes int    `yaml:"expiry_minutes" envconfig:"EXPIRY_MINUTES"` // Access token expiry in minutes (default: 15)
+	ExpiryHours   int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`     // Deprecated: use expiry_minutes. Kept for backward compat.
+	RefreshDays   int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
+	Issuer        string `yaml:"issuer" envconfig:"ISSUER"`
+}
+
+// AccessExpiry returns the access token expiry duration.
+// If ExpiryMinutes is set, it takes precedence.
+// Otherwise falls back to ExpiryHours for backward compatibility.
+func (c *JWTConfig) AccessExpiry() time.Duration {
+	if c.ExpiryMinutes > 0 {
+		return time.Duration(c.ExpiryMinutes) * time.Minute
+	}
+	if c.ExpiryHours > 0 {
+		return time.Duration(c.ExpiryHours) * time.Hour
+	}
+	return 15 * time.Minute // Default: 15 minutes
 }
 
 // WalletProviderConfig contains wallet provider key attestation configuration
@@ -716,9 +730,9 @@ func defaultConfig() *Config {
 			Format: "json",
 		},
 		JWT: JWTConfig{
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      "wallet-backend",
+			ExpiryMinutes: 15,
+			RefreshDays:   7,
+			Issuer:        "wallet-backend",
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds

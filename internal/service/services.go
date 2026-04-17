@@ -37,7 +37,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
-	return &Services{
+	s := &Services{
 		User:             NewUserService(store, cfg, logger),
 		Tenant:           NewTenantService(store, logger),
 		UserTenant:       NewUserTenantService(store, logger),
@@ -54,6 +54,13 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
+
+	// Wire token blacklist into WebAuthn service for refresh token rotation
+	if s.WebAuthn != nil && s.TokenBlacklist != nil {
+		s.WebAuthn.SetTokenBlacklist(s.TokenBlacklist)
+	}
+
+	return s
 }
 
 // Start starts background workers
