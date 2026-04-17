@@ -399,7 +399,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Step 4: User selects credential configuration
-	selectedConfig, err := h.awaitCredentialSelection(ctx, offer, metadata)
+	selectedConfigID, selectedConfig, err := h.awaitCredentialSelection(ctx, offer, metadata)
 	if err != nil {
 		return err
 	}
@@ -432,7 +432,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Step 7: Request credential
-	credential, err := h.requestCredential(ctx, metadata, token, selectedConfig, proofJWT)
+	credential, err := h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofJWT)
 	if err != nil {
 		return err
 	}
@@ -776,7 +776,7 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 	return certs, nil
 }
 
-func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (*CredentialConfig, error) {
+func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (string, *CredentialConfig, error) {
 	// Build available credentials list
 	available := make([]AvailableCredential, 0, len(offer.CredentialConfigurationIDs))
 	for _, configID := range offer.CredentialConfigurationIDs {
@@ -800,7 +800,7 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	if len(available) == 1 {
 		configID := available[0].ID
 		config := metadata.CredentialConfigurationsSupported[configID]
-		return &config, nil
+		return configID, &config, nil
 	}
 
 	// Send selection request
@@ -811,7 +811,7 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	// Wait for user selection
 	action, err := h.WaitForAction(ctx, ActionSelectCredential)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	// Parse selection
@@ -820,16 +820,16 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	}
 	if err := json.Unmarshal(action.Payload, &selection); err != nil {
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid selection payload")
-		return nil, err
+		return "", nil, err
 	}
 
 	config, ok := metadata.CredentialConfigurationsSupported[selection.CredentialConfigurationID]
 	if !ok {
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
-		return nil, errors.New("invalid credential configuration")
+		return "", nil, errors.New("invalid credential configuration")
 	}
 
-	return &config, nil
+	return selection.CredentialConfigurationID, &config, nil
 }
 
 func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
@@ -1234,11 +1234,12 @@ func (h *OID4VCIHandler) requestProof(ctx context.Context, audience, nonce strin
 	return resp.ProofJWT, nil
 }
 
-func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, config *CredentialConfig, proofJWT string) (*CredentialResponse, error) {
+func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofJWT string) (*CredentialResponse, error) {
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
-		"format": config.Format,
+		"format":                      config.Format,
+		"credential_configuration_id": configID,
 	}
 	if config.VCT != "" {
 		reqBody["vct"] = config.VCT
