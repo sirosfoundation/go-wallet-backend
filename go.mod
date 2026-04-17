@@ -25,6 +25,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+require github.com/go-jose/go-jose/v4 v4.1.4
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
