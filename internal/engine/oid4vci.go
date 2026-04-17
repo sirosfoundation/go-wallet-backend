@@ -30,9 +30,10 @@ import (
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
-	httpClient *http.Client
-	dpopKey    *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
-	dpopNonce  string            // server-provided DPoP nonce (RFC 9449 §8)
+	httpClient  *http.Client
+	dpopKey     *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce   string            // server-provided DPoP nonce (RFC 9449 §8)
+	redirectURI string
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
@@ -370,6 +371,10 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Add tenant context for X-Tenant-ID propagation
 	if h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		ctx = ContextWithTenant(ctx, h.Flow.Session.TenantID)
+	}
+
+	if msg.RedirectURI != "" {
+		h.redirectURI = msg.RedirectURI
 	}
 
 	// Step 1: Parse credential offer
@@ -979,7 +984,11 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 }
 
 func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig, oauthMeta *oauthServerMetadata) (*TokenResponse, error) {
-	redirectURI := h.Config.Server.BaseURL + "/callback"
+	if h.redirectURI == "" {
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "redirect_uri is required for authorization code flow")
+		return nil, errors.New("redirect_uri is required for authorization code flow")
+	}
+	redirectURI := h.redirectURI
 
 	// Generate PKCE code verifier and challenge (RFC 7636)
 	codeVerifier, err := generateCodeVerifier()

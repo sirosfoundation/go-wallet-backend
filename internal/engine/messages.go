@@ -179,6 +179,7 @@ type FlowStartMessage struct {
 	RequestURI         string   `json:"request_uri,omitempty"`          // OID4VP: openid4vp://...
 	RequestURIRef      string   `json:"request_uri_ref,omitempty"`      // OID4VP: https://...
 	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
+	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
 }
 
 // FlowProgressMessage reports flow progress to client
