@@ -216,3 +216,99 @@ func TestGetCanonicalVerifierURL(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDCAPIResponse(t *testing.T) {
+	h := &OID4VPHandler{}
+
+	t.Run("basic dc_api response", func(t *testing.T) {
+		authReq := &AuthorizationRequest{
+			ResponseMode: "dc_api",
+			State:        "test-state-123",
+			PresentationDefinition: &PresentationDefinition{
+				ID: "pd-1",
+				InputDescriptors: []InputDescriptor{
+					{ID: "id-card"},
+				},
+			},
+		}
+
+		result, err := h.buildDCAPIResponse(authReq, "eyJ.vp_token.sig")
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.Empty(t, result.redirectURI, "dc_api should not produce a redirect URI")
+		require.NotNil(t, result.vpResponse)
+
+		assert.Equal(t, "eyJ.vp_token.sig", result.vpResponse["vp_token"])
+		assert.Equal(t, "test-state-123", result.vpResponse["state"])
+
+		// Verify presentation_submission is valid JSON string
+		submissionStr, ok := result.vpResponse["presentation_submission"].(string)
+		require.True(t, ok, "presentation_submission should be a JSON string")
+		var submission map[string]interface{}
+		err = json.Unmarshal([]byte(submissionStr), &submission)
+		require.NoError(t, err)
+		assert.Equal(t, "pd-1_submission", submission["id"])
+		assert.Equal(t, "pd-1", submission["definition_id"])
+	})
+
+	t.Run("dc_api without state", func(t *testing.T) {
+		authReq := &AuthorizationRequest{
+			ResponseMode: "dc_api",
+			PresentationDefinition: &PresentationDefinition{
+				ID: "pd-2",
+				InputDescriptors: []InputDescriptor{
+					{ID: "diploma"},
+				},
+			},
+		}
+
+		result, err := h.buildDCAPIResponse(authReq, "vp-token-data")
+		require.NoError(t, err)
+		require.NotNil(t, result.vpResponse)
+		assert.Equal(t, "vp-token-data", result.vpResponse["vp_token"])
+		_, hasState := result.vpResponse["state"]
+		assert.False(t, hasState, "state should not be set when empty")
+	})
+
+	t.Run("dc_api without presentation_definition", func(t *testing.T) {
+		authReq := &AuthorizationRequest{
+			ResponseMode: "dc_api",
+			State:        "s1",
+		}
+
+		result, err := h.buildDCAPIResponse(authReq, "vp-token")
+		require.NoError(t, err)
+		require.NotNil(t, result.vpResponse)
+		assert.Equal(t, "vp-token", result.vpResponse["vp_token"])
+		_, hasSubmission := result.vpResponse["presentation_submission"]
+		assert.False(t, hasSubmission, "no presentation_submission without presentation_definition")
+	})
+}
+
+func TestBuildPresentationSubmission(t *testing.T) {
+	h := &OID4VPHandler{}
+
+	t.Run("multiple input descriptors", func(t *testing.T) {
+		pd := &PresentationDefinition{
+			ID: "multi-pd",
+			InputDescriptors: []InputDescriptor{
+				{ID: "id-card"},
+				{ID: "diploma"},
+				{ID: "employment"},
+			},
+		}
+		submission := h.buildPresentationSubmission(pd)
+		require.NotNil(t, submission)
+		assert.Equal(t, "multi-pd_submission", submission["id"])
+		assert.Equal(t, "multi-pd", submission["definition_id"])
+		descriptors := submission["descriptor_map"].([]map[string]interface{})
+		assert.Len(t, descriptors, 3)
+		assert.Equal(t, "id-card", descriptors[0]["id"])
+		assert.Equal(t, "diploma", descriptors[1]["id"])
+	})
+
+	t.Run("nil presentation definition", func(t *testing.T) {
+		submission := h.buildPresentationSubmission(nil)
+		assert.Nil(t, submission)
+	})
+}
