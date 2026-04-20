@@ -1299,8 +1299,8 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		return nil, err
 	}
 
-	if len(resp.Proofs) == 0 {
-		return nil, fmt.Errorf("frontend returned no proofs (expected %d)", count)
+	if len(resp.Proofs) != count {
+		return nil, fmt.Errorf("frontend returned %d proofs (expected %d)", len(resp.Proofs), count)
 	}
 
 	// Validate that every returned proof type is listed in proof_types_supported
