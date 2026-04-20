@@ -48,6 +48,64 @@ func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Aut
 	}
 }
 
+// NewAuthZENProxyHandlerFromConfig initializes an AuthZENProxyHandler from the global config.
+//
+// It handles the full initialization sequence: applying defaults, creating the SPOCP
+// authorizer (with a production fail-closed guard), resolving the PDP URL, and wiring
+// the handler. Returns (nil, nil) when AuthZEN proxy is disabled.
+//
+// The caller is responsible for closing any resources (e.g. storage) on error.
+func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLookup, httpClient *http.Client, logger *zap.Logger) (*AuthZENProxyHandler, error) {
+	if !cfg.AuthZENProxy.Enabled {
+		return nil, nil
+	}
+
+	// Apply config defaults
+	cfg.AuthZENProxy.SetDefaults()
+
+	// Create SPOCP authorizer
+	spocpCfg := &authz.SPOCPConfig{
+		RulesFile: cfg.AuthZENProxy.RulesFile,
+	}
+	authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
+	if err != nil {
+		logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
+		authorizer = nil
+	}
+
+	// Fail-closed: if SPOCP initialization failed in production, refuse to start
+	var authorizerInterface authz.Authorizer
+	if authorizer != nil {
+		authorizerInterface = authorizer
+	} else {
+		// Production guard: NoOpAuthorizer cannot be used in release mode
+		if gin.Mode() == gin.ReleaseMode {
+			return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
+		}
+		logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
+		authorizerInterface = authz.NoOpAuthorizer{}
+	}
+
+	// Get effective PDP URL and set it on the config so the handler uses it
+	pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
+	cfg.AuthZENProxy.PDPURL = pdpURL
+
+	handler := NewAuthZENProxyHandler(
+		&cfg.AuthZENProxy,
+		authorizerInterface,
+		tenantLookup,
+		httpClient,
+		logger,
+	)
+
+	logger.Info("AuthZEN proxy initialized",
+		zap.String("pdp_url", pdpURL),
+		zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
+	)
+
+	return handler, nil
+}
+
 // getClient returns a cached AuthZEN client for the given PDP URL, or creates one.
 // Thread-safe: uses RWMutex for concurrent access protection.
 func (h *AuthZENProxyHandler) getClient(pdpURL string) (*authzenclient.Client, error) {

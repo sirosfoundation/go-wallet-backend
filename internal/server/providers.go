@@ -17,7 +17,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -313,54 +312,13 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	logger.Info("Storage backend initialized", zap.String("type", cfg.Storage.Type))
 
 	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
-	var authzenHandler *api.AuthZENProxyHandler
-	if cfg.AuthZENProxy.Enabled {
-		// Set defaults
-		cfg.AuthZENProxy.SetDefaults()
-
-		// Create SPOCP authorizer
-		spocpCfg := &authz.SPOCPConfig{
-			RulesFile: cfg.AuthZENProxy.RulesFile,
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), httpClient, logger)
+	if err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Error("Failed to close store after AuthZEN proxy initialization failure", zap.Error(closeErr))
 		}
-		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
-		if err != nil {
-			logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
-			authorizer = nil
-		}
-
-		// Fail-closed: if SPOCP initialization failed in production, refuse to start
-		var authorizerInterface authz.Authorizer
-		if authorizer != nil {
-			authorizerInterface = authorizer
-		} else {
-			// Production guard: NoOpAuthorizer cannot be used in release mode
-			if gin.Mode() == gin.ReleaseMode {
-				if closeErr := store.Close(); closeErr != nil {
-					logger.Error("Failed to close store after SPOCP authorizer initialization failure", zap.Error(closeErr))
-				}
-				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
-			}
-			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
-			authorizerInterface = authz.NoOpAuthorizer{}
-		}
-
-		// Get effective PDP URL and set it on the config so the handler uses it
-		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
-		cfg.AuthZENProxy.PDPURL = pdpURL
-
-		httpClient := cfg.HTTPClient.NewHTTPClient(0)
-		authzenHandler = api.NewAuthZENProxyHandler(
-			&cfg.AuthZENProxy,
-			authorizerInterface,
-			store.Tenants(),
-			httpClient,
-			logger,
-		)
-
-		logger.Info("AuthZEN proxy initialized",
-			zap.String("pdp_url", pdpURL),
-			zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
-		)
+		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
 	return &BackendProvider{

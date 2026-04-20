@@ -15,7 +15,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -209,50 +208,9 @@ func setupRouter(cfg *config.Config, services *service.Services, store backend.B
 	httpClient := cfg.HTTPClient.NewHTTPClient(0)
 
 	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
-	var authzenHandler *api.AuthZENProxyHandler
-	if cfg.AuthZENProxy.Enabled {
-		// Set defaults
-		cfg.AuthZENProxy.SetDefaults()
-
-		// Create SPOCP authorizer
-		spocpCfg := &authz.SPOCPConfig{
-			RulesFile: cfg.AuthZENProxy.RulesFile,
-		}
-		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
-		if err != nil {
-			logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
-			authorizer = nil
-		}
-
-		// Fail-closed: if SPOCP initialization failed in production, refuse to start
-		var authorizerInterface authz.Authorizer
-		if authorizer != nil {
-			authorizerInterface = authorizer
-		} else {
-			// Production guard: NoOpAuthorizer cannot be used in release mode
-			if gin.Mode() == gin.ReleaseMode {
-				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
-			}
-			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
-			authorizerInterface = authz.NoOpAuthorizer{}
-		}
-
-		// Get effective PDP URL and set it on the config so the handler uses it
-		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
-		cfg.AuthZENProxy.PDPURL = pdpURL
-
-		authzenHandler = api.NewAuthZENProxyHandler(
-			&cfg.AuthZENProxy,
-			authorizerInterface,
-			store.Tenants(), // Enable per-tenant PDP configuration lookup
-			httpClient,
-			logger,
-		)
-
-		logger.Info("AuthZEN proxy initialized",
-			zap.String("pdp_url", pdpURL),
-			zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
-		)
+	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), httpClient, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
 	// Root-level health/status endpoints (no tenant required)
