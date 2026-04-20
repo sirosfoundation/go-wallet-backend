@@ -1611,7 +1611,7 @@ func TestRequestCredential_RegularErrorNotWrapped(t *testing.T) {
 // passes proof_types_supported and count to the frontend via the sign request,
 // and validates that the returned proof types are supported.
 func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
-	var receivedParams SignRequestParams
+	paramsCh := make(chan SignRequestParams, 1)
 
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
@@ -1623,7 +1623,7 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 		if err := json.Unmarshal(data, &req); err != nil {
 			return
 		}
-		receivedParams = req.Params
+		paramsCh <- req.Params
 
 		resp := SignResponseMessage{
 			Message: Message{
@@ -1672,7 +1672,8 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 	assert.Equal(t, "jwt", proofs[0].ProofType)
 	assert.Equal(t, "proof-1", proofs[0].JWT)
 
-	// Verify params sent to frontend
+	// Verify params sent to frontend (received via channel - no data race)
+	receivedParams := <-paramsCh
 	assert.Equal(t, "https://issuer.example.com", receivedParams.Audience)
 	assert.Equal(t, "test-nonce", receivedParams.Nonce)
 	assert.Equal(t, 1, receivedParams.Count)
@@ -1682,7 +1683,7 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 }
 
 func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
-	var receivedParams SignRequestParams
+	paramsCh := make(chan SignRequestParams, 1)
 
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
@@ -1694,7 +1695,7 @@ func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 		if err := json.Unmarshal(data, &req); err != nil {
 			return
 		}
-		receivedParams = req.Params
+		paramsCh <- req.Params
 
 		resp := SignResponseMessage{
 			Message: Message{
@@ -1740,6 +1741,9 @@ func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce")
 	require.NoError(t, err)
 	assert.Len(t, proofs, 3)
+
+	// Verify count was passed correctly (received via channel - no data race)
+	receivedParams := <-paramsCh
 	assert.Equal(t, 3, receivedParams.Count, "count should match batch_size")
 }
 
@@ -1844,7 +1848,7 @@ func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
 
 	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no proofs")
+	assert.Contains(t, err.Error(), "frontend returned 0 proofs")
 }
 
 func TestCNonceRequiredError_ErrorAndUnwrap(t *testing.T) {
