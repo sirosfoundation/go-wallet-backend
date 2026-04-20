@@ -459,7 +459,11 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 				nonce = cNonceErr.NewNonce
 				continue
 			}
-			// On the second attempt or for non-c_nonce errors, surface the error
+			// On the second attempt or for non-c_nonce errors, surface the error.
+			// For CNonceRequiredError on the final retry, unwrap and return the
+			// underlying credential error so the caller receives a meaningful error
+			// message (e.g. "invalid_nonce: ..."). The flow error has already been
+			// sent to the frontend via h.Error above in requestCredential.
 			if errors.As(credErr, &cNonceErr) {
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return cNonceErr.Err
@@ -1273,7 +1277,7 @@ func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
 
 // credentialBatchSize returns the number of proofs the engine should request
 // for a credential. It is 1 when batch_credential_issuance is absent or has a
-// batch_size ≤ 1.
+// batch_size ≤ 1. A batch_size of 0 is treated as absent (defaults to 1).
 func credentialBatchSize(metadata *IssuerMetadata) int {
 	if metadata.BatchCredentialIssuance == nil || metadata.BatchCredentialIssuance.BatchSize <= 1 {
 		return 1
