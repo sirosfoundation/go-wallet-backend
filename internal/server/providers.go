@@ -17,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -284,10 +285,12 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 
 // BackendProvider provides the full backend API (auth + storage combined)
 type BackendProvider struct {
-	auth    *AuthProvider
-	storage *StorageProvider
-	store   backend.Backend
-	logger  *zap.Logger
+	auth           *AuthProvider
+	storage        *StorageProvider
+	store          backend.Backend
+	cfg            *config.Config
+	authzenHandler *api.AuthZENProxyHandler
+	logger         *zap.Logger
 }
 
 // NewBackendProvider creates a combined auth+storage provider
@@ -309,11 +312,61 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 	logger.Info("Storage backend initialized", zap.String("type", cfg.Storage.Type))
 
+	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
+	var authzenHandler *api.AuthZENProxyHandler
+	if cfg.AuthZENProxy.Enabled {
+		// Set defaults
+		cfg.AuthZENProxy.SetDefaults()
+
+		// Create SPOCP authorizer
+		spocpCfg := &authz.SPOCPConfig{
+			RulesFile: cfg.AuthZENProxy.RulesFile,
+		}
+		authorizer, err := authz.NewSPOCPAuthorizer(spocpCfg, logger)
+		if err != nil {
+			logger.Error("Failed to initialize SPOCP authorizer", zap.Error(err))
+			authorizer = nil
+		}
+
+		// Fail-closed: if SPOCP initialization failed in production, refuse to start
+		var authorizerInterface authz.Authorizer
+		if authorizer != nil {
+			authorizerInterface = authorizer
+		} else {
+			// Production guard: NoOpAuthorizer cannot be used in release mode
+			if gin.Mode() == gin.ReleaseMode {
+				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
+			}
+			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
+			authorizerInterface = authz.NoOpAuthorizer{}
+		}
+
+		// Get effective PDP URL and set it on the config so the handler uses it
+		pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
+		cfg.AuthZENProxy.PDPURL = pdpURL
+
+		httpClient := cfg.HTTPClient.NewHTTPClient(0)
+		authzenHandler = api.NewAuthZENProxyHandler(
+			&cfg.AuthZENProxy,
+			authorizerInterface,
+			store.Tenants(),
+			httpClient,
+			logger,
+		)
+
+		logger.Info("AuthZEN proxy initialized",
+			zap.String("pdp_url", pdpURL),
+			zap.String("rules_file", cfg.AuthZENProxy.RulesFile),
+		)
+	}
+
 	return &BackendProvider{
-		auth:    NewAuthProvider(cfg, store, logger, roles),
-		storage: NewStorageProvider(cfg, store, logger, roles),
-		store:   store,
-		logger:  logger,
+		auth:           NewAuthProvider(cfg, store, logger, roles),
+		storage:        NewStorageProvider(cfg, store, logger, roles),
+		store:          store,
+		cfg:            cfg,
+		authzenHandler: authzenHandler,
+		logger:         logger,
 	}, nil
 }
 
@@ -324,6 +377,17 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register both auth and storage routes
 	p.auth.RegisterRoutes(router)
 	p.storage.RegisterRoutes(router)
+
+	// Register AuthZEN proxy routes if enabled
+	if p.authzenHandler != nil {
+		protected := router.Group("/")
+		protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+		v1 := protected.Group("/v1")
+		{
+			v1.POST("/evaluate", p.authzenHandler.Evaluate)
+			v1.POST("/resolve", p.authzenHandler.Resolve)
+		}
+	}
 }
 
 // Close shuts down the backend provider
