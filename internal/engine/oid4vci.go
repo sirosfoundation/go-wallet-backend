@@ -1323,9 +1323,27 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	if config.VCT != "" {
 		reqBody["vct"] = config.VCT
 	}
-	// Always use the "proofs" array (OID4VCI §7.2), even for a single proof
+	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
 	if len(proofs) > 0 {
-		reqBody["proofs"] = proofs
+		// Validate all proofs are the same type (OID4VCI spec requirement)
+		proofType := proofs[0].ProofType
+		for _, p := range proofs[1:] {
+			if p.ProofType != proofType {
+				return nil, fmt.Errorf("mixed proof types not allowed: got %q and %q", proofType, p.ProofType)
+			}
+		}
+
+		// Transform to OID4VCI spec format: {"<proof_type>": ["...", "..."]}
+		var proofValues []string
+		for _, p := range proofs {
+			switch p.ProofType {
+			case "jwt":
+				proofValues = append(proofValues, p.JWT)
+			case "attestation":
+				proofValues = append(proofValues, p.Attestation)
+			}
+		}
+		reqBody["proofs"] = map[string][]string{proofType: proofValues}
 	}
 
 	// Credential response encryption (OID4VCI §7.3)

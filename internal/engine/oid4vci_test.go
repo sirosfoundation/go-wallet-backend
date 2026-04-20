@@ -1459,7 +1459,7 @@ func TestCredentialBatchSize_Multiple(t *testing.T) {
 	assert.Equal(t, 3, credentialBatchSize(meta))
 }
 
-func TestRequestCredential_UsesProofsArray(t *testing.T) {
+func TestRequestCredential_UsesProofsObject(t *testing.T) {
 	var receivedBody map[string]interface{}
 	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&receivedBody)
@@ -1480,21 +1480,24 @@ func TestRequestCredential_UsesProofsArray(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "test-cred", resp.Credential)
 
-	// Verify "proofs" array is used, not legacy "proof"
+	// Verify "proofs" is an object (OID4VCI §7.2), not legacy "proof" or array
 	_, hasProof := receivedBody["proof"]
 	assert.False(t, hasProof, "should NOT include legacy 'proof' key")
 
 	proofsRaw, hasProofs := receivedBody["proofs"]
-	assert.True(t, hasProofs, "must include 'proofs' array")
+	assert.True(t, hasProofs, "must include 'proofs' object")
 
-	proofsSlice, ok := proofsRaw.([]interface{})
-	require.True(t, ok, "'proofs' must be an array")
-	require.Len(t, proofsSlice, 1)
+	// OID4VCI spec: proofs is an object like {"jwt": ["...", "..."]}
+	proofsObj, ok := proofsRaw.(map[string]interface{})
+	require.True(t, ok, "'proofs' must be an object, not array")
 
-	proofObj, ok := proofsSlice[0].(map[string]interface{})
-	require.True(t, ok)
-	assert.Equal(t, "jwt", proofObj["proof_type"])
-	assert.Equal(t, "test-jwt-value", proofObj["jwt"])
+	jwtProofs, hasJwt := proofsObj["jwt"]
+	require.True(t, hasJwt, "proofs object must have 'jwt' key")
+
+	jwtSlice, ok := jwtProofs.([]interface{})
+	require.True(t, ok, "jwt proofs must be an array")
+	require.Len(t, jwtSlice, 1)
+	assert.Equal(t, "test-jwt-value", jwtSlice[0])
 }
 
 func TestRequestCredential_NoProofSendsNoProofsKey(t *testing.T) {
@@ -1523,7 +1526,7 @@ func TestRequestCredential_NoProofSendsNoProofsKey(t *testing.T) {
 	assert.False(t, hasProofs)
 }
 
-func TestRequestCredential_MultipleProofsInArray(t *testing.T) {
+func TestRequestCredential_MultipleProofsInObject(t *testing.T) {
 	var receivedBody map[string]interface{}
 	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&receivedBody)
@@ -1548,11 +1551,43 @@ func TestRequestCredential_MultipleProofsInArray(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "batch-cred", resp.Credential)
 
+	// OID4VCI spec: proofs is an object like {"jwt": ["...", "...", "..."]}
 	proofsRaw, hasProofs := receivedBody["proofs"]
 	require.True(t, hasProofs)
-	proofsSlice, ok := proofsRaw.([]interface{})
+	proofsObj, ok := proofsRaw.(map[string]interface{})
+	require.True(t, ok, "'proofs' must be an object")
+
+	jwtProofs, hasJwt := proofsObj["jwt"]
+	require.True(t, hasJwt)
+	jwtSlice, ok := jwtProofs.([]interface{})
 	require.True(t, ok)
-	assert.Len(t, proofsSlice, 3)
+	assert.Len(t, jwtSlice, 3)
+	assert.Equal(t, "jwt-one", jwtSlice[0])
+	assert.Equal(t, "jwt-two", jwtSlice[1])
+	assert.Equal(t, "jwt-three", jwtSlice[2])
+}
+
+func TestRequestCredential_MixedProofTypesReturnsError(t *testing.T) {
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach credential endpoint with mixed proof types")
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+	proofs := []ProofObject{
+		{ProofType: "jwt", JWT: "jwt-proof-1"},
+		{ProofType: "attestation", Attestation: "attestation-proof-1"},
+		{ProofType: "jwt", JWT: "jwt-proof-2"},
+	}
+
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, proofs)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mixed proof types not allowed")
 }
 
 func TestRequestCredential_CNonceRefreshReturnsError(t *testing.T) {
