@@ -1299,12 +1299,26 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		return nil, err
 	}
 
-	if len(resp.Proofs) != count {
-		return nil, fmt.Errorf("frontend returned %d proofs (expected %d)", len(resp.Proofs), count)
+	if len(resp.Proofs) == 0 {
+		return nil, errors.New("frontend returned no proofs")
+	}
+
+	// Determine proof type from first proof
+	proofType := resp.Proofs[0].ProofType
+
+	// Validate proof count based on proof type:
+	// - 'attestation': one proof can cover multiple credentials (batch attestation)
+	// - 'jwt' or other: need one proof per credential in the batch
+	if proofType != "attestation" && len(resp.Proofs) != count {
+		return nil, fmt.Errorf("frontend returned %d %s proofs (expected %d)", len(resp.Proofs), proofType, count)
 	}
 
 	// Validate that every returned proof type is listed in proof_types_supported
+	// and that all proofs are the same type
 	for _, proof := range resp.Proofs {
+		if proof.ProofType != proofType {
+			return nil, fmt.Errorf("mixed proof types not allowed: got %q and %q", proofType, proof.ProofType)
+		}
 		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
 			return nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
 		}
