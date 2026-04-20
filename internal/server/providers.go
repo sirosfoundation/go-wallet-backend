@@ -284,10 +284,12 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 
 // BackendProvider provides the full backend API (auth + storage combined)
 type BackendProvider struct {
-	auth    *AuthProvider
-	storage *StorageProvider
-	store   backend.Backend
-	logger  *zap.Logger
+	auth           *AuthProvider
+	storage        *StorageProvider
+	store          backend.Backend
+	cfg            *config.Config
+	authzenHandler *api.AuthZENProxyHandler
+	logger         *zap.Logger
 }
 
 // NewBackendProvider creates a combined auth+storage provider
@@ -309,11 +311,23 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 	logger.Info("Storage backend initialized", zap.String("type", cfg.Storage.Type))
 
+	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), httpClient, logger)
+	if err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Error("Failed to close store after AuthZEN proxy initialization failure", zap.Error(closeErr))
+		}
+		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
+	}
+
 	return &BackendProvider{
-		auth:    NewAuthProvider(cfg, store, logger, roles),
-		storage: NewStorageProvider(cfg, store, logger, roles),
-		store:   store,
-		logger:  logger,
+		auth:           NewAuthProvider(cfg, store, logger, roles),
+		storage:        NewStorageProvider(cfg, store, logger, roles),
+		store:          store,
+		cfg:            cfg,
+		authzenHandler: authzenHandler,
+		logger:         logger,
 	}, nil
 }
 
@@ -324,6 +338,17 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register both auth and storage routes
 	p.auth.RegisterRoutes(router)
 	p.storage.RegisterRoutes(router)
+
+	// Register AuthZEN proxy routes if enabled
+	if p.authzenHandler != nil {
+		protected := router.Group("/")
+		protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+		v1 := protected.Group("/v1")
+		{
+			v1.POST("/evaluate", p.authzenHandler.Evaluate)
+			v1.POST("/resolve", p.authzenHandler.Resolve)
+		}
+	}
 }
 
 // Close shuts down the backend provider
