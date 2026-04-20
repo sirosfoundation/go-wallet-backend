@@ -460,10 +460,9 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 				continue
 			}
 			// On the second attempt or for non-c_nonce errors, surface the error.
-			// For CNonceRequiredError on the final retry, unwrap and return the
-			// underlying credential error so the caller receives a meaningful error
-			// message (e.g. "invalid_nonce: ..."). The flow error has already been
-			// sent to the frontend via h.Error above in requestCredential.
+			// For CNonceRequiredError on the final retry, send the flow error here
+			// and unwrap the underlying credential error so the caller receives a
+			// meaningful issuer error message (e.g. "invalid_nonce: ...").
 			if errors.As(credErr, &cNonceErr) {
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return cNonceErr.Err
