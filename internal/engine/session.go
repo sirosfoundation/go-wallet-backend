@@ -612,6 +612,20 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 	return s.Send(&msg)
 }
 
+// SendFlowCompleteWithData sends a flow completion message with dc_api response data
+func (s *Session) SendFlowCompleteWithData(flowID string, credentials []CredentialResult, responseData map[string]interface{}) error {
+	msg := FlowCompleteMessage{
+		Message: Message{
+			Type:      TypeFlowComplete,
+			FlowID:    flowID,
+			Timestamp: Now(),
+		},
+		Credentials:  credentials,
+		ResponseData: responseData,
+	}
+	return s.Send(&msg)
+}
+
 // SendFlowError sends a flow error message
 func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, message string) error {
 	msg := FlowErrorMessage{

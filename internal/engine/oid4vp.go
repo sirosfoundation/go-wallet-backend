@@ -200,7 +200,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 7: Submit VP response to verifier
-	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
+	result, err := h.submitResponse(ctx, authReq, vpToken)
 	if err != nil {
 		h.Logger.Debug("VP submission failed", zap.Error(err))
 		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
@@ -208,7 +208,11 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 8: Complete
-	return h.Complete(nil, redirectURI)
+	if result.vpResponse != nil {
+		// dc_api mode: return VP response data to frontend for postMessage delivery
+		return h.CompleteWithResponseData(nil, result.vpResponse)
+	}
+	return h.Complete(nil, result.redirectURI)
 }
 
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
@@ -868,17 +872,16 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	return resp.VPToken, nil
 }
 
-func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) (string, error) {
-	_ = h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
+// vpSubmitResult holds the outcome of VP response submission.
+// For server-side modes (direct_post, fragment, query) redirectURI is populated.
+// For dc_api mode vpResponse is populated and must be returned to the frontend.
+type vpSubmitResult struct {
+	redirectURI string
+	vpResponse  map[string]interface{}
+}
 
-	// Determine response endpoint
-	responseEndpoint := authReq.ResponseURI
-	if responseEndpoint == "" {
-		responseEndpoint = authReq.RedirectURI
-	}
-	if responseEndpoint == "" {
-		return "", errors.New("no response endpoint in request")
-	}
+func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) (*vpSubmitResult, error) {
+	_ = h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
 
 	// Determine response mode
 	responseMode := authReq.ResponseMode
@@ -886,16 +889,54 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 		responseMode = "direct_post"
 	}
 
+	// dc_api mode: build response payload for frontend delivery, no verifier POST required
+	if responseMode == "dc_api" {
+		return h.buildDCAPIResponse(authReq, vpToken)
+	}
+
+	// Determine response endpoint for server-side modes
+	responseEndpoint := authReq.ResponseURI
+	if responseEndpoint == "" {
+		responseEndpoint = authReq.RedirectURI
+	}
+	if responseEndpoint == "" {
+		return nil, errors.New("no response endpoint in request")
+	}
+
 	switch responseMode {
 	case "direct_post":
-		return h.submitDirectPost(ctx, responseEndpoint, authReq, vpToken)
+		redirectURI, err := h.submitDirectPost(ctx, responseEndpoint, authReq, vpToken)
+		if err != nil {
+			return nil, err
+		}
+		return &vpSubmitResult{redirectURI: redirectURI}, nil
 	case "fragment":
-		return h.buildFragmentRedirect(responseEndpoint, authReq, vpToken), nil
+		return &vpSubmitResult{redirectURI: h.buildFragmentRedirect(responseEndpoint, authReq, vpToken)}, nil
 	case "query":
-		return h.buildQueryRedirect(responseEndpoint, authReq, vpToken), nil
+		return &vpSubmitResult{redirectURI: h.buildQueryRedirect(responseEndpoint, authReq, vpToken)}, nil
 	default:
-		return "", fmt.Errorf("unsupported response_mode: %s", responseMode)
+		return nil, fmt.Errorf("unsupported response_mode: %s", responseMode)
 	}
+}
+
+// buildDCAPIResponse assembles the VP response payload for dc_api mode.
+// The response is returned to the frontend over WebSocket so it can be
+// delivered via window.opener.postMessage() back to the browser extension.
+func (h *OID4VPHandler) buildDCAPIResponse(authReq *AuthorizationRequest, vpToken string) (*vpSubmitResult, error) {
+	vpResponse := map[string]interface{}{
+		"vp_token": vpToken,
+	}
+
+	submission := h.buildPresentationSubmission(authReq.PresentationDefinition)
+	if submission != nil {
+		vpResponse["presentation_submission"] = submission
+	}
+
+	if authReq.State != "" {
+		vpResponse["state"] = authReq.State
+	}
+
+	return &vpSubmitResult{vpResponse: vpResponse}, nil
 }
 
 func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {

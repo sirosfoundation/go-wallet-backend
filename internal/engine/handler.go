@@ -63,6 +63,11 @@ func (h *BaseHandler) Complete(credentials []CredentialResult, redirectURI strin
 	return h.Flow.Session.SendFlowComplete(h.Flow.ID, credentials, redirectURI)
 }
 
+// CompleteWithResponseData sends a flow completion message with dc_api response data
+func (h *BaseHandler) CompleteWithResponseData(credentials []CredentialResult, responseData map[string]interface{}) error {
+	return h.Flow.Session.SendFlowCompleteWithData(h.Flow.ID, credentials, responseData)
+}
+
 // RequestSign requests a client-side signature
 func (h *BaseHandler) RequestSign(ctx context.Context, action SignAction, params SignRequestParams) (*SignResponseMessage, error) {
 	return h.Flow.Session.RequestSign(ctx, h.Flow.ID, action, params)
