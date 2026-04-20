@@ -1883,7 +1883,7 @@ func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
 
 	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "frontend returned 0 proofs")
+	assert.Contains(t, err.Error(), "frontend returned no proofs")
 }
 
 func TestCNonceRequiredError_ErrorAndUnwrap(t *testing.T) {
