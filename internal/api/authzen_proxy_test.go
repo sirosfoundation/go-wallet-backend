@@ -768,3 +768,210 @@ func TestGetPDPURL_FailClosedBehavior(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// NewAuthZENProxyHandlerFromConfig Tests
+// ============================================================================
+
+func TestNewAuthZENProxyHandlerFromConfig_Disabled(t *testing.T) {
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: false,
+		},
+	}
+	logger := zap.NewNop()
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error when disabled, got: %v", err)
+	}
+	if handler != nil {
+		t.Error("expected nil handler when AuthZEN proxy is disabled")
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_EnabledNoRulesFile(t *testing.T) {
+	// No rules file → SPOCP uses built-in default wallet rules (not an error)
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: true,
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 30,
+		},
+	}
+	logger := zap.NewNop()
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error with no rules file, got: %v", err)
+	}
+	if handler == nil {
+		t.Error("expected non-nil handler")
+	}
+	// PDP URL should remain set on the config
+	if cfg.AuthZENProxy.PDPURL != "https://pdp.example.com" {
+		t.Errorf("expected PDPURL to be preserved, got: %s", cfg.AuthZENProxy.PDPURL)
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_EnabledBadRulesFile_DebugMode(t *testing.T) {
+	// Bad rules file in test mode → uses NoOpAuthorizer (warns but continues)
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled:   true,
+			PDPURL:    "https://pdp.example.com",
+			Timeout:   30,
+			RulesFile: "/nonexistent/path/rules.spocp",
+		},
+	}
+	logger := zap.NewNop()
+	// gin.TestMode is set in init(), so the release-mode fail-closed guard won't trigger
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error in test mode with bad rules file, got: %v", err)
+	}
+	if handler == nil {
+		t.Error("expected non-nil handler (should fall back to NoOpAuthorizer)")
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_EnabledBadRulesFile_ReleaseMode(t *testing.T) {
+	// Bad rules file in release mode → fail-closed, must return an error
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled:   true,
+			PDPURL:    "https://pdp.example.com",
+			Timeout:   30,
+			RulesFile: "/nonexistent/path/rules.spocp",
+		},
+	}
+	logger := zap.NewNop()
+
+	gin.SetMode(gin.ReleaseMode)
+	defer gin.SetMode(gin.TestMode)
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err == nil {
+		t.Error("expected error in release mode when SPOCP authorizer cannot be initialized")
+	}
+	if handler != nil {
+		t.Error("expected nil handler when initialization fails")
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_PDPURLFromAuthZENConfig(t *testing.T) {
+	// AuthZENProxy.PDPURL takes precedence over Trust.PDPURL fallback
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: true,
+			PDPURL:  "https://authzen-pdp.example.com",
+			Timeout: 30,
+		},
+		Trust: config.TrustConfig{
+			PDPURL: "https://trust-pdp.example.com",
+		},
+	}
+	logger := zap.NewNop()
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+	// The config's PDPURL should remain the authzen-specific one
+	if cfg.AuthZENProxy.PDPURL != "https://authzen-pdp.example.com" {
+		t.Errorf("expected PDPURL from AuthZENProxy config, got: %s", cfg.AuthZENProxy.PDPURL)
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_PDPURLFallbackFromTrust(t *testing.T) {
+	// When AuthZENProxy.PDPURL is empty, PDPURL should be resolved from Trust.PDPURL
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: true,
+			PDPURL:  "", // empty – should fall back to Trust
+			Timeout: 30,
+		},
+		Trust: config.TrustConfig{
+			PDPURL: "https://trust-pdp.example.com",
+		},
+	}
+	logger := zap.NewNop()
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+	// After init, the config's PDPURL should be updated to the Trust fallback
+	if cfg.AuthZENProxy.PDPURL != "https://trust-pdp.example.com" {
+		t.Errorf("expected PDPURL to fall back to Trust.PDPURL, got: %s", cfg.AuthZENProxy.PDPURL)
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_SetsDefaultTimeout(t *testing.T) {
+	// Verify SetDefaults is called: a zero timeout should be set to 30
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: true,
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 0, // should be set to 30 by SetDefaults
+		},
+	}
+	logger := zap.NewNop()
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+	if cfg.AuthZENProxy.Timeout != 30 {
+		t.Errorf("expected Timeout to be set to 30 by SetDefaults, got: %d", cfg.AuthZENProxy.Timeout)
+	}
+}
+
+func TestNewAuthZENProxyHandlerFromConfig_WithTenantLookup(t *testing.T) {
+	// Verify the tenant lookup is wired through to the handler
+	tenantLookup := &mockTenantLookup{
+		tenants: map[domain.TenantID]*domain.Tenant{
+			"custom-tenant": {
+				ID:   "custom-tenant",
+				Name: "Custom Tenant",
+				TrustConfig: domain.TrustConfig{
+					PDPURL: "https://tenant-pdp.example.com",
+				},
+			},
+		},
+	}
+	cfg := &config.Config{
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled: true,
+			PDPURL:  "https://global-pdp.example.com",
+			Timeout: 30,
+		},
+	}
+	logger := zap.NewNop()
+
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, tenantLookup, http.DefaultClient, logger)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("expected non-nil handler")
+	}
+
+	// The handler should use the per-tenant PDP URL for "custom-tenant"
+	pdpURL, err := handler.getPDPURL(context.Background(), "custom-tenant")
+	if err != nil {
+		t.Fatalf("getPDPURL() unexpected error: %v", err)
+	}
+	if pdpURL != "https://tenant-pdp.example.com" {
+		t.Errorf("expected per-tenant PDP URL, got: %s", pdpURL)
+	}
+}

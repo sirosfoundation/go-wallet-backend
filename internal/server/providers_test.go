@@ -3,17 +3,69 @@ package server
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
+
+// minimalTestConfig returns a config with the minimum fields needed for
+// creating AuthProvider/StorageProvider in tests without network calls.
+func minimalTestConfig() *config.Config {
+	return &config.Config{
+		Server: config.ServerConfig{
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+		},
+		JWT: config.JWTConfig{
+			Secret:      "test-secret-key",
+			ExpiryHours: 24,
+			RefreshDays: 7,
+			Issuer:      "test",
+		},
+		HTTPClient: config.HTTPClientConfig{
+			Timeout: 5,
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{
+				Enabled: false,
+			},
+			ChallengeCleanup: config.ChallengeCleanupConfig{
+				Enabled: false,
+			},
+		},
+		AuthZENProxy: config.AuthZENProxyConfig{
+			Enabled:         true,
+			PDPURL:          "https://pdp.example.com",
+			Timeout:         30,
+			AllowResolution: true,
+		},
+	}
+}
+
+// hasRoute checks whether the given method+path is registered in the router.
+func hasRoute(routes gin.RoutesInfo, method, path string) bool {
+	for _, r := range routes {
+		if r.Method == method && r.Path == path {
+			return true
+		}
+	}
+	return false
+}
 
 // =============================================================================
 // BackendProvider CheckReady tests
@@ -249,3 +301,77 @@ func (m *mockBackend) Invites() storage.InviteStore       { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
+
+// =============================================================================
+// BackendProvider RegisterRoutes tests
+// =============================================================================
+
+// newTestAuthZENHandler creates a minimal AuthZENProxyHandler for route tests.
+func newTestAuthZENHandler(cfg *config.Config, logger *zap.Logger) *api.AuthZENProxyHandler {
+	return api.NewAuthZENProxyHandler(
+		&cfg.AuthZENProxy,
+		authz.NoOpAuthorizer{},
+		nil,
+		http.DefaultClient,
+		logger,
+	)
+}
+
+func TestBackendProvider_RegisterRoutes_WithAuthZENHandler(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	cfg := minimalTestConfig()
+	store := &mockBackend{healthy: true}
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+	authzenHandler := newTestAuthZENHandler(cfg, logger)
+
+	provider := &BackendProvider{
+		auth:           authProvider,
+		storage:        storageProvider,
+		store:          store,
+		cfg:            cfg,
+		authzenHandler: authzenHandler,
+		logger:         logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	routes := router.Routes()
+	if !hasRoute(routes, http.MethodPost, "/v1/evaluate") {
+		t.Error("expected POST /v1/evaluate to be registered when authzenHandler is set")
+	}
+	if !hasRoute(routes, http.MethodPost, "/v1/resolve") {
+		t.Error("expected POST /v1/resolve to be registered when authzenHandler is set")
+	}
+}
+
+func TestBackendProvider_RegisterRoutes_WithoutAuthZENHandler(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	cfg := minimalTestConfig()
+	store := &mockBackend{healthy: true}
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+
+	provider := &BackendProvider{
+		auth:           authProvider,
+		storage:        storageProvider,
+		store:          store,
+		cfg:            cfg,
+		authzenHandler: nil, // no handler → routes must NOT be registered
+		logger:         logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	routes := router.Routes()
+	if hasRoute(routes, http.MethodPost, "/v1/evaluate") {
+		t.Error("expected POST /v1/evaluate NOT to be registered when authzenHandler is nil")
+	}
+	if hasRoute(routes, http.MethodPost, "/v1/resolve") {
+		t.Error("expected POST /v1/resolve NOT to be registered when authzenHandler is nil")
+	}
+}
