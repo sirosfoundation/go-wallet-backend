@@ -133,6 +133,8 @@ type IssuerMetadata struct {
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
 	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
+	// Batch credential issuance configuration (OID4VCI §E.1)
+	BatchCredentialIssuance *BatchCredentialIssuance `json:"batch_credential_issuance,omitempty"`
 	// mDOC IACA certificates URL
 	MdocIacasURI string `json:"mdoc_iacas_uri,omitempty"`
 	// Signed metadata JWT (contains x5c or jwk for trust evaluation)
@@ -141,6 +143,11 @@ type IssuerMetadata struct {
 	JWKS json.RawMessage `json:"jwks,omitempty"`
 	// JWKS URI for issuer keys
 	JWKsURI string `json:"jwks_uri,omitempty"`
+}
+
+// BatchCredentialIssuance contains batch credential issuance configuration from issuer metadata.
+type BatchCredentialIssuance struct {
+	BatchSize int `json:"batch_size"`
 }
 
 // IssuerDisplay represents issuer display information
@@ -424,22 +431,45 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 
-	// Step 6: Generate proof (if required)
-	var proofJWT string
-	if h.needsProof(selectedConfig) {
-		proof, err := h.requestProof(ctx, metadata.CredentialIssuer, token.CNonce)
-		if err != nil {
-			h.Logger.Debug("failed to request proof", zap.Error(err))
-			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-			return err
+	// Step 6 + 7: Request proofs and credential, with full retry on c_nonce refresh.
+	// OID4VCI spec: when the issuer returns a fresh c_nonce in an error response,
+	// the engine re-requests ALL proofs from the frontend with the new nonce and
+	// retries the credential request once.
+	nonce := token.CNonce
+	var credential *CredentialResponse
+	for retries := 0; retries <= 1; retries++ {
+		var proofs []ProofObject
+		if h.needsProof(selectedConfig) {
+			var proofErr error
+			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce)
+			if proofErr != nil {
+				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
+				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+				return proofErr
+			}
 		}
-		proofJWT = proof
-	}
 
-	// Step 7: Request credential
-	credential, err := h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofJWT)
-	if err != nil {
-		return err
+		var credErr error
+		credential, credErr = h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofs)
+		if credErr != nil {
+			var cNonceErr *CNonceRequiredError
+			if retries == 0 && errors.As(credErr, &cNonceErr) {
+				// Issuer returned a refreshed c_nonce — re-request all proofs and retry
+				h.Logger.Debug("c_nonce refreshed by issuer, re-requesting proofs")
+				nonce = cNonceErr.NewNonce
+				continue
+			}
+			// On the second attempt or for non-c_nonce errors, surface the error.
+			// For CNonceRequiredError on the final retry, send the flow error here
+			// and unwrap the underlying credential error so the caller receives a
+			// meaningful issuer error message (e.g. "invalid_nonce: ...").
+			if errors.As(credErr, &cNonceErr) {
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				return cNonceErr.Err
+			}
+			return credErr
+		}
+		break
 	}
 
 	// Step 8: Handle deferred or immediate issuance
@@ -1228,23 +1258,62 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
+// CNonceRequiredError is returned by requestCredential when the credential
+// endpoint responds with an error that includes a refreshed c_nonce. The
+// engine should re-request all proofs from the frontend using the new nonce
+// and retry the credential request.
+type CNonceRequiredError struct {
+	NewNonce string
+	Err      error
+}
+
+func (e *CNonceRequiredError) Error() string { return e.Err.Error() }
+func (e *CNonceRequiredError) Unwrap() error { return e.Err }
+
 func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
 	return len(config.ProofTypesSupported) > 0
 }
 
-func (h *OID4VCIHandler) requestProof(ctx context.Context, audience, nonce string) (string, error) {
-	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
-		Audience:  audience,
-		Nonce:     nonce,
-		ProofType: "jwt",
-	})
-	if err != nil {
-		return "", err
+// credentialBatchSize returns the number of proofs the engine should request
+// for a credential. It is 1 when batch_credential_issuance is absent or has a
+// batch_size ≤ 1. A batch_size of 0 is treated as absent (defaults to 1).
+func credentialBatchSize(metadata *IssuerMetadata) int {
+	if metadata.BatchCredentialIssuance == nil || metadata.BatchCredentialIssuance.BatchSize <= 1 {
+		return 1
 	}
-	return resp.ProofJWT, nil
+	return metadata.BatchCredentialIssuance.BatchSize
 }
 
-func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofJWT string) (*CredentialResponse, error) {
+// requestProofs asks the frontend to generate the required OID4VCI proofs and
+// validates that each returned proof type is listed in proof_types_supported.
+func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string) ([]ProofObject, error) {
+	count := credentialBatchSize(metadata)
+
+	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
+		Audience:            metadata.CredentialIssuer,
+		Nonce:               nonce,
+		ProofTypesSupported: config.ProofTypesSupported,
+		Count:               count,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(resp.Proofs) != count {
+		return nil, fmt.Errorf("frontend returned %d proofs (expected %d)", len(resp.Proofs), count)
+	}
+
+	// Validate that every returned proof type is listed in proof_types_supported
+	for _, proof := range resp.Proofs {
+		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
+			return nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
+		}
+	}
+
+	return resp.Proofs, nil
+}
+
+func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofs []ProofObject) (*CredentialResponse, error) {
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
@@ -1254,11 +1323,27 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	if config.VCT != "" {
 		reqBody["vct"] = config.VCT
 	}
-	if proofJWT != "" {
-		reqBody["proof"] = map[string]interface{}{
-			"proof_type": "jwt",
-			"jwt":        proofJWT,
+	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
+	if len(proofs) > 0 {
+		// Validate all proofs are the same type (OID4VCI spec requirement)
+		proofType := proofs[0].ProofType
+		for _, p := range proofs[1:] {
+			if p.ProofType != proofType {
+				return nil, fmt.Errorf("mixed proof types not allowed: got %q and %q", proofType, p.ProofType)
+			}
 		}
+
+		// Transform to OID4VCI spec format: {"<proof_type>": ["...", "..."]}
+		var proofValues []string
+		for _, p := range proofs {
+			switch p.ProofType {
+			case "jwt":
+				proofValues = append(proofValues, p.JWT)
+			case "attestation":
+				proofValues = append(proofValues, p.Attestation)
+			}
+		}
+		reqBody["proofs"] = map[string][]string{proofType: proofValues}
 	}
 
 	// Credential response encryption (OID4VCI §7.3)
@@ -1337,6 +1422,20 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+
+			// Check whether the error response contains a refreshed c_nonce so the
+			// caller can re-request proofs and retry. Do NOT send a flow error here —
+			// that is the caller's responsibility when no retry is possible.
+			var errResp struct {
+				CNonce string `json:"c_nonce"`
+			}
+			if json.Unmarshal(body, &errResp) == nil && errResp.CNonce != "" {
+				return nil, &CNonceRequiredError{
+					NewNonce: errResp.CNonce,
+					Err:      parseOAuthError(resp.StatusCode, body),
+				}
+			}
+
 			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}

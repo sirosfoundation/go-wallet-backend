@@ -799,7 +799,7 @@ func TestRequestCredential_DPoPBound(t *testing.T) {
 	}
 	config := &CredentialConfig{Format: "vc+sd-jwt", VCT: "pid"}
 
-	_, err = h.requestCredential(context.Background(), metadata, token, "", config, "")
+	_, err = h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, "DPoP dpop-access-token", receivedHeaders.Get("Authorization"))
@@ -839,7 +839,7 @@ func TestRequestCredential_BearerFallback(t *testing.T) {
 	token := &TokenResponse{AccessToken: "bearer-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	_, err = h.requestCredential(context.Background(), metadata, token, "", config, "")
+	_, err = h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, "Bearer bearer-token", receivedHeaders.Get("Authorization"))
@@ -1053,7 +1053,7 @@ func TestRequestCredential_DPoPNonceRetry(t *testing.T) {
 	token := &TokenResponse{AccessToken: "access-token", TokenType: "DPoP"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "cred-after-nonce", resp.Credential)
 	assert.Equal(t, 2, attempt)
@@ -1267,7 +1267,7 @@ func TestRequestCredential_EncryptedResponse(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "encrypted-credential-value", resp.Credential)
 }
@@ -1289,7 +1289,7 @@ func TestRequestCredential_NoEncryptionWhenUnsupported(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "plain-credential", resp.Credential)
 	_, hasEncryption := receivedBody["credential_response_encryption"]
@@ -1319,7 +1319,7 @@ func TestRequestCredential_NoEncryptionWhenAlgUnsupported(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "plain-credential", resp.Credential)
 	_, hasEncryption := receivedBody["credential_response_encryption"]
@@ -1355,7 +1355,7 @@ func TestRequestCredential_EncryptionRequiredNoMutualSupport(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "Bearer"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	_, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no mutually supported alg/enc pair")
 }
@@ -1411,7 +1411,537 @@ func TestRequestCredential_EncryptedResponseWithParams(t *testing.T) {
 	token := &TokenResponse{AccessToken: "test-token", TokenType: "DPoP"}
 	config := &CredentialConfig{Format: "vc+sd-jwt"}
 
-	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, "")
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "encrypted-with-params", resp.Credential)
+}
+
+// --- Batch credential issuance and multi-proof tests ---
+
+func TestBatchCredentialIssuance_JSONParsing(t *testing.T) {
+	body := `{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"batch_credential_issuance": {
+			"batch_size": 3
+		}
+	}`
+	var meta IssuerMetadata
+	err := json.Unmarshal([]byte(body), &meta)
+	require.NoError(t, err)
+	require.NotNil(t, meta.BatchCredentialIssuance)
+	assert.Equal(t, 3, meta.BatchCredentialIssuance.BatchSize)
+}
+
+func TestBatchCredentialIssuance_Absent(t *testing.T) {
+	body := `{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential"
+	}`
+	var meta IssuerMetadata
+	err := json.Unmarshal([]byte(body), &meta)
+	require.NoError(t, err)
+	assert.Nil(t, meta.BatchCredentialIssuance)
+}
+
+func TestCredentialBatchSize_Absent(t *testing.T) {
+	meta := &IssuerMetadata{}
+	assert.Equal(t, 1, credentialBatchSize(meta))
+}
+
+func TestCredentialBatchSize_One(t *testing.T) {
+	meta := &IssuerMetadata{BatchCredentialIssuance: &BatchCredentialIssuance{BatchSize: 1}}
+	assert.Equal(t, 1, credentialBatchSize(meta))
+}
+
+func TestCredentialBatchSize_Multiple(t *testing.T) {
+	meta := &IssuerMetadata{BatchCredentialIssuance: &BatchCredentialIssuance{BatchSize: 3}}
+	assert.Equal(t, 3, credentialBatchSize(meta))
+}
+
+func TestRequestCredential_UsesProofsObject(t *testing.T) {
+	var receivedBody map[string]interface{}
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CredentialResponse{Credential: "test-cred"})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+	proofs := []ProofObject{{ProofType: "jwt", JWT: "test-jwt-value"}}
+
+	resp, err := h.requestCredential(context.Background(), metadata, token, "my-config", config, proofs)
+	require.NoError(t, err)
+	assert.Equal(t, "test-cred", resp.Credential)
+
+	// Verify "proofs" is an object (OID4VCI §7.2), not legacy "proof" or array
+	_, hasProof := receivedBody["proof"]
+	assert.False(t, hasProof, "should NOT include legacy 'proof' key")
+
+	proofsRaw, hasProofs := receivedBody["proofs"]
+	assert.True(t, hasProofs, "must include 'proofs' object")
+
+	// OID4VCI spec: proofs is an object like {"jwt": ["...", "..."]}
+	proofsObj, ok := proofsRaw.(map[string]interface{})
+	require.True(t, ok, "'proofs' must be an object, not array")
+
+	jwtProofs, hasJwt := proofsObj["jwt"]
+	require.True(t, hasJwt, "proofs object must have 'jwt' key")
+
+	jwtSlice, ok := jwtProofs.([]interface{})
+	require.True(t, ok, "jwt proofs must be an array")
+	require.Len(t, jwtSlice, 1)
+	assert.Equal(t, "test-jwt-value", jwtSlice[0])
+}
+
+func TestRequestCredential_NoProofSendsNoProofsKey(t *testing.T) {
+	var receivedBody map[string]interface{}
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CredentialResponse{Credential: "no-proof-cred"})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "no-proof-cred", resp.Credential)
+
+	_, hasProof := receivedBody["proof"]
+	assert.False(t, hasProof)
+	_, hasProofs := receivedBody["proofs"]
+	assert.False(t, hasProofs)
+}
+
+func TestRequestCredential_MultipleProofsInObject(t *testing.T) {
+	var receivedBody map[string]interface{}
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(CredentialResponse{Credential: "batch-cred"})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+	proofs := []ProofObject{
+		{ProofType: "jwt", JWT: "jwt-one"},
+		{ProofType: "jwt", JWT: "jwt-two"},
+		{ProofType: "jwt", JWT: "jwt-three"},
+	}
+
+	resp, err := h.requestCredential(context.Background(), metadata, token, "", config, proofs)
+	require.NoError(t, err)
+	assert.Equal(t, "batch-cred", resp.Credential)
+
+	// OID4VCI spec: proofs is an object like {"jwt": ["...", "...", "..."]}
+	proofsRaw, hasProofs := receivedBody["proofs"]
+	require.True(t, hasProofs)
+	proofsObj, ok := proofsRaw.(map[string]interface{})
+	require.True(t, ok, "'proofs' must be an object")
+
+	jwtProofs, hasJwt := proofsObj["jwt"]
+	require.True(t, hasJwt)
+	jwtSlice, ok := jwtProofs.([]interface{})
+	require.True(t, ok)
+	assert.Len(t, jwtSlice, 3)
+	assert.Equal(t, "jwt-one", jwtSlice[0])
+	assert.Equal(t, "jwt-two", jwtSlice[1])
+	assert.Equal(t, "jwt-three", jwtSlice[2])
+}
+
+func TestRequestCredential_MixedProofTypesReturnsError(t *testing.T) {
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("should not reach credential endpoint with mixed proof types")
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+	proofs := []ProofObject{
+		{ProofType: "jwt", JWT: "jwt-proof-1"},
+		{ProofType: "attestation", Attestation: "attestation-proof-1"},
+		{ProofType: "jwt", JWT: "jwt-proof-2"},
+	}
+
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, proofs)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mixed proof types not allowed")
+}
+
+func TestRequestCredential_CNonceRefreshReturnsError(t *testing.T) {
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "invalid_nonce",
+			"c_nonce": "fresh-nonce-abc",
+		})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
+	require.Error(t, err)
+
+	var cNonceErr *CNonceRequiredError
+	require.True(t, errors.As(err, &cNonceErr), "should return CNonceRequiredError")
+	assert.Equal(t, "fresh-nonce-abc", cNonceErr.NewNonce)
+}
+
+func TestRequestCredential_RegularErrorNotWrapped(t *testing.T) {
+	credServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":             "invalid_request",
+			"error_description": "bad format",
+		})
+	}))
+	defer credServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, credServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialEndpoint: credServer.URL}
+	token := &TokenResponse{AccessToken: "token", TokenType: "Bearer"}
+	config := &CredentialConfig{Format: "vc+sd-jwt"}
+
+	_, err := h.requestCredential(context.Background(), metadata, token, "", config, nil)
+	require.Error(t, err)
+
+	var cNonceErr *CNonceRequiredError
+	assert.False(t, errors.As(err, &cNonceErr), "regular errors should NOT be wrapped in CNonceRequiredError")
+	assert.Contains(t, err.Error(), "invalid_request")
+}
+
+// TestRequestProofs_PassesProofTypesAndCount tests that requestProofs correctly
+// passes proof_types_supported and count to the frontend via the sign request,
+// and validates that the returned proof types are supported.
+func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "jwt", JWT: "proof-1"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	// Route the sign_response from the WebSocket client side to signCh
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+	}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{
+			"jwt": map[string]interface{}{"alg_values_supported": []string{"ES256"}},
+		},
+	}
+
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	require.NoError(t, err)
+	require.Len(t, proofs, 1)
+	assert.Equal(t, "jwt", proofs[0].ProofType)
+	assert.Equal(t, "proof-1", proofs[0].JWT)
+
+	// Verify params sent to frontend (received via channel - no data race)
+	receivedParams := <-paramsCh
+	assert.Equal(t, "https://issuer.example.com", receivedParams.Audience)
+	assert.Equal(t, "test-nonce", receivedParams.Nonce)
+	assert.Equal(t, 1, receivedParams.Count)
+	require.NotNil(t, receivedParams.ProofTypesSupported)
+	_, ok := receivedParams.ProofTypesSupported["jwt"]
+	assert.True(t, ok, "jwt should be in proof_types_supported sent to frontend")
+}
+
+func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "jwt", JWT: "p1"},
+				{ProofType: "jwt", JWT: "p2"},
+				{ProofType: "jwt", JWT: "p3"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer:        "https://issuer.example.com",
+		BatchCredentialIssuance: &BatchCredentialIssuance{BatchSize: 3},
+	}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{"jwt": nil},
+	}
+
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	require.NoError(t, err)
+	assert.Len(t, proofs, 3)
+
+	// Verify count was passed correctly (received via channel - no data race)
+	receivedParams := <-paramsCh
+	assert.Equal(t, 3, receivedParams.Count, "count should match batch_size")
+}
+
+func TestRequestProofs_RejectsUnsupportedProofType(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		// Frontend returns an "unsupported" proof type
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "unknown_type", JWT: "something"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{"jwt": nil},
+	}
+
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported proof type")
+	assert.Contains(t, err.Error(), "unknown_type")
+}
+
+func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		// Frontend returns empty proofs array
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{"jwt": nil},
+	}
+
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "frontend returned 0 proofs")
+}
+
+func TestCNonceRequiredError_ErrorAndUnwrap(t *testing.T) {
+	inner := errors.New("invalid_nonce")
+	e := &CNonceRequiredError{NewNonce: "fresh", Err: inner}
+	assert.Equal(t, "invalid_nonce", e.Error())
+	assert.Equal(t, inner, errors.Unwrap(e))
+}
+
+func TestSignRequestParams_ProofTypesAndCount_JSONRoundtrip(t *testing.T) {
+	params := SignRequestParams{
+		Audience: "https://issuer.example.com",
+		Nonce:    "abc",
+		Count:    3,
+		ProofTypesSupported: map[string]interface{}{
+			"jwt":         map[string]interface{}{"alg_values_supported": []string{"ES256"}},
+			"attestation": map[string]interface{}{},
+		},
+	}
+	data, err := json.Marshal(params)
+	require.NoError(t, err)
+
+	var decoded SignRequestParams
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	assert.Equal(t, 3, decoded.Count)
+	assert.Equal(t, "https://issuer.example.com", decoded.Audience)
+	assert.Contains(t, decoded.ProofTypesSupported, "jwt")
+	assert.Contains(t, decoded.ProofTypesSupported, "attestation")
+}
+
+func TestProofObject_AttestationType(t *testing.T) {
+	proof := ProofObject{ProofType: "attestation", Attestation: "attest-value"}
+	data, err := json.Marshal(proof)
+	require.NoError(t, err)
+
+	var decoded ProofObject
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.Equal(t, "attestation", decoded.ProofType)
+	assert.Equal(t, "attest-value", decoded.Attestation)
+	assert.Empty(t, decoded.JWT)
+}
+
+func TestSignResponseMessage_ProofsField(t *testing.T) {
+	resp := SignResponseMessage{
+		Proofs: []ProofObject{
+			{ProofType: "jwt", JWT: "token-abc"},
+			{ProofType: "attestation", Attestation: "attest-xyz"},
+		},
+	}
+	data, err := json.Marshal(resp)
+	require.NoError(t, err)
+
+	var decoded SignResponseMessage
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Len(t, decoded.Proofs, 2)
+	assert.Equal(t, "jwt", decoded.Proofs[0].ProofType)
+	assert.Equal(t, "token-abc", decoded.Proofs[0].JWT)
+	assert.Equal(t, "attestation", decoded.Proofs[1].ProofType)
+	assert.Equal(t, "attest-xyz", decoded.Proofs[1].Attestation)
 }
