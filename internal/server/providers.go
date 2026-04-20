@@ -335,6 +335,9 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		} else {
 			// Production guard: NoOpAuthorizer cannot be used in release mode
 			if gin.Mode() == gin.ReleaseMode {
+				if closeErr := store.Close(); closeErr != nil {
+					logger.Error("Failed to close store after SPOCP authorizer initialization failure", zap.Error(closeErr))
+				}
 				return nil, fmt.Errorf("SPOCP authorizer failed to initialize and NoOpAuthorizer cannot be used in production (GIN_MODE=release). Configure a valid rules file or set GIN_MODE=debug for development")
 			}
 			logger.Warn("Using NoOpAuthorizer - ALL requests will be authorized. This is only safe for development!")
