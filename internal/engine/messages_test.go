@@ -993,3 +993,146 @@ func TestMatchErrorCodeUserFacingMessage(t *testing.T) {
 		})
 	}
 }
+
+// ===== FlowCompleteMessage serialization tests =====
+
+func TestFlowCompleteMessage_IncludesIssuerFields(t *testing.T) {
+	msg := FlowCompleteMessage{
+		Message: Message{
+			Type:      TypeFlowComplete,
+			FlowID:    "flow-123",
+			Timestamp: "2024-01-01T00:00:00Z",
+		},
+		Credentials: []CredentialResult{
+			{Format: "dc+sd-jwt", Credential: "eyJ..."},
+		},
+		CredentialIssuer:                  "https://issuer.example.com",
+		SelectedCredentialConfigurationID: "UniversityDegree",
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if parsed["credential_issuer"] != "https://issuer.example.com" {
+		t.Errorf("credential_issuer = %v, want https://issuer.example.com", parsed["credential_issuer"])
+	}
+	if parsed["selected_credential_configuration_id"] != "UniversityDegree" {
+		t.Errorf("selected_credential_configuration_id = %v, want UniversityDegree", parsed["selected_credential_configuration_id"])
+	}
+}
+
+func TestFlowCompleteMessage_OmitsEmptyIssuerFields(t *testing.T) {
+	msg := FlowCompleteMessage{
+		Message: Message{
+			Type:      TypeFlowComplete,
+			FlowID:    "flow-456",
+			Timestamp: "2024-01-01T00:00:00Z",
+		},
+		// CredentialIssuer and SelectedCredentialConfigurationID left empty
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	if strings.Contains(string(data), "credential_issuer") {
+		t.Error("empty credential_issuer should be omitted (omitempty)")
+	}
+	if strings.Contains(string(data), "selected_credential_configuration_id") {
+		t.Error("empty selected_credential_configuration_id should be omitted (omitempty)")
+	}
+}
+
+func TestFlowCompleteMessage_Roundtrip(t *testing.T) {
+	original := FlowCompleteMessage{
+		Message: Message{
+			Type:      TypeFlowComplete,
+			FlowID:    "flow-rt",
+			Timestamp: Now(),
+		},
+		Credentials: []CredentialResult{
+			{Format: "dc+sd-jwt", Credential: "eyJ...abc"},
+		},
+		CredentialIssuer:                  "https://issuer.example.com",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	var decoded FlowCompleteMessage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if decoded.CredentialIssuer != original.CredentialIssuer {
+		t.Errorf("CredentialIssuer = %q, want %q", decoded.CredentialIssuer, original.CredentialIssuer)
+	}
+	if decoded.SelectedCredentialConfigurationID != original.SelectedCredentialConfigurationID {
+		t.Errorf("SelectedCredentialConfigurationID = %q, want %q", decoded.SelectedCredentialConfigurationID, original.SelectedCredentialConfigurationID)
+	}
+	if len(decoded.Credentials) != 1 {
+		t.Fatalf("Credentials length = %d, want 1", len(decoded.Credentials))
+	}
+}
+
+// ===== FlowStartMessage new fields tests =====
+
+func TestFlowStartMessage_AuthCodeFields(t *testing.T) {
+	raw := `{
+		"type": "flow_start",
+		"flow_id": "resume-flow",
+		"protocol": "oid4vci",
+		"auth_code": "SplxlOBeZQQYbYS6WxSbIA",
+		"code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+		"redirect_uri": "https://wallet.example.com/cb"
+	}`
+
+	var msg FlowStartMessage
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+
+	if msg.AuthCode != "SplxlOBeZQQYbYS6WxSbIA" {
+		t.Errorf("AuthCode = %q, want SplxlOBeZQQYbYS6WxSbIA", msg.AuthCode)
+	}
+	if msg.CodeVerifier != "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" {
+		t.Errorf("CodeVerifier = %q, want dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", msg.CodeVerifier)
+	}
+	if msg.RedirectURI != "https://wallet.example.com/cb" {
+		t.Errorf("RedirectURI = %q, want https://wallet.example.com/cb", msg.RedirectURI)
+	}
+}
+
+func TestFlowStartMessage_AuthCodeFieldsOmitEmpty(t *testing.T) {
+	msg := FlowStartMessage{
+		Message: Message{
+			Type:   TypeFlowStart,
+			FlowID: "normal-flow",
+		},
+		Protocol: "oid4vci",
+		// AuthCode and CodeVerifier left empty
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+
+	if strings.Contains(string(data), "auth_code") {
+		t.Error("empty auth_code should be omitted (omitempty)")
+	}
+	if strings.Contains(string(data), "code_verifier") {
+		t.Error("empty code_verifier should be omitted (omitempty)")
+	}
+}
