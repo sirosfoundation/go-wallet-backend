@@ -35,6 +35,10 @@ type VCTMEntry struct {
 	// IsDynamic indicates if this entry was fetched on-demand (not from registry)
 	IsDynamic bool `json:"is_dynamic,omitempty"`
 
+	// IsLocal indicates if this entry was loaded from a local file override.
+	// Local entries take priority over remote entries and survive polling cycles.
+	IsLocal bool `json:"is_local,omitempty"`
+
 	// ExpiresAt is when this entry should be considered stale
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 
@@ -208,15 +212,21 @@ func (s *Store) Delete(vctID string) {
 }
 
 // Update atomically replaces all registry-sourced entries and updates metadata.
-// Dynamically-fetched entries (IsDynamic == true) that are not present in the
-// new set are preserved so that on-demand fetches survive polling cycles.
+// Dynamically-fetched entries (IsDynamic == true) and local file overrides
+// (IsLocal == true) that are not present in the new set are preserved so that
+// on-demand fetches and local overrides survive polling cycles.
+// When a local override exists for the same VCT as a remote entry, the local
+// entry takes priority.
 func (s *Store) Update(entries map[string]*VCTMEntry, sourceURL string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Carry over dynamic entries that are not in the new registry set
+	// Carry over dynamic and local entries.
+	// Local entries always win over remote entries with the same VCT.
 	for id, existing := range s.entries {
-		if existing.IsDynamic {
+		if existing.IsLocal {
+			entries[id] = existing // local overrides remote
+		} else if existing.IsDynamic {
 			if _, overwritten := entries[id]; !overwritten {
 				entries[id] = existing
 			}

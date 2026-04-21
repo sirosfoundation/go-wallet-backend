@@ -75,6 +75,11 @@ type SourceConfig struct {
 	// URL of the upstream registry index (e.g., https://registry.siros.org/.well-known/vctm-registry.json)
 	URL string `yaml:"url"`
 
+	// LocalOverrides is a list of local file or directory paths containing VCTM JSON files.
+	// These are loaded at startup and take priority over entries fetched from the remote registry.
+	// Directories are scanned for *.json files. Entries are keyed by their "vct" field.
+	LocalOverrides []string `yaml:"local_overrides" envconfig:"LOCAL_OVERRIDES"`
+
 	// PollInterval is how often to poll the upstream registry for updates
 	PollInterval time.Duration `yaml:"poll_interval" envconfig:"POLL_INTERVAL"`
 

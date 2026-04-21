@@ -481,6 +481,13 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 			zap.Time("last_updated", store.LastUpdated()))
 	}
 
+	// Load local VCTM overrides (before remote fetching so they take priority)
+	if len(cfg.Source.LocalOverrides) > 0 {
+		if err := registry.LoadLocalOverrides(store, cfg.Source.LocalOverrides, logger); err != nil {
+			return nil, fmt.Errorf("failed to load local VCTM overrides: %w", err)
+		}
+	}
+
 	// Create centralized HTTP client using config
 	httpClient := cfg.HTTPClient.NewHTTPClient(cfg.Source.Timeout)
 
