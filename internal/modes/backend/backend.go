@@ -31,9 +31,10 @@ func init() {
 
 // Config holds configuration for the backend mode
 type Config struct {
-	Config *config.Config
-	Logger *zap.Logger
-	Roles  []string // Active roles (for status endpoint)
+	Config       *config.Config
+	Logger       *zap.Logger
+	Roles        []string // Active roles (for status endpoint)
+	IsProduction bool     // When true, refuse to start without a configured admin token
 }
 
 // Runner implements the backend mode
@@ -117,17 +118,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	if cfg.Server.AdminPort > 0 {
 		adminToken := cfg.Server.AdminToken
 		if adminToken == "" {
+			if r.cfg.IsProduction {
+				return fmt.Errorf("admin token is required in production: set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token / server.admin_token_path")
+			}
 			var err error
 			adminToken, err = middleware.GenerateAdminToken()
 			if err != nil {
 				return fmt.Errorf("failed to generate admin token: %w", err)
 			}
-			// Log token at DEBUG level to avoid capture by production log aggregators
-			// For production deployments, set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH,
-			// or configure server.admin_token_path
-			logger.Debug("Generated admin API token",
+			logger.Debug("Generated admin API token (development mode)",
 				zap.String("token", adminToken))
-			logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token_path for production)")
+			logger.Warn("Auto-generated admin token \u2014 this is disabled in production")
 		}
 
 		adminRouter := setupAdminRouter(store, adminToken, logger)
