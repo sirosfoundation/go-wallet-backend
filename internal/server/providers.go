@@ -124,6 +124,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		issuerGroup := protected.Group("/issuer")
 		{
 			issuerGroup.GET("/all", p.handlers.GetAllIssuers)
+			issuerGroup.GET("/:id/metadata", p.handlers.GetIssuerMetadata)
 		}
 
 		// Verifier routes
