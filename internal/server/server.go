@@ -369,7 +369,7 @@ func (m *Manager) startAdminServer() error {
 	token := m.cfg.AdminToken
 	if token == "" {
 		if m.cfg.IsProduction {
-			return fmt.Errorf("admin token is required in production: set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token / server.admin_token_path")
+			return fmt.Errorf("admin token is required in production: set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token or server.admin_token_path")
 		}
 		var err error
 		token, err = middleware.GenerateAdminToken()
