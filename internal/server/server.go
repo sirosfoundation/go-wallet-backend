@@ -97,6 +97,11 @@ type ServerConfig struct {
 
 	// Active roles for status endpoint
 	Roles []string
+
+	// IsProduction is true when the server runs in a production environment.
+	// In production, admin token auto-generation is disabled and the server
+	// refuses to start without a pre-configured admin token.
+	IsProduction bool
 }
 
 // DefaultServerConfig returns default server configuration
@@ -363,17 +368,17 @@ func (m *Manager) addStatusEndpoints(router *gin.Engine) {
 func (m *Manager) startAdminServer() error {
 	token := m.cfg.AdminToken
 	if token == "" {
+		if m.cfg.IsProduction {
+			return fmt.Errorf("admin token is required in production: set WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token or server.admin_token_path")
+		}
 		var err error
 		token, err = middleware.GenerateAdminToken()
 		if err != nil {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
-		// Log token at DEBUG level to avoid capture by production log aggregators
-		// For production deployments, set WALLET_SERVER_ADMIN_TOKEN or configure
-		// WALLET_SERVER_ADMIN_TOKEN_PATH / server.admin_token_path.
-		m.logger.Debug("Generated admin API token",
+		m.logger.Debug("Generated admin API token (development mode)",
 			zap.String("token", token))
-		m.logger.Warn("Auto-generated admin token (use WALLET_SERVER_ADMIN_TOKEN, WALLET_SERVER_ADMIN_TOKEN_PATH, or server.admin_token_path for production)")
+		m.logger.Warn("Auto-generated admin token — this is disabled in production")
 	}
 
 	// Admin router

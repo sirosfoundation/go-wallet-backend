@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -335,6 +336,58 @@ func TestManager_ServersNotStarted(t *testing.T) {
 	}
 	if manager.adminServer != nil {
 		t.Error("adminServer should be nil before Start")
+	}
+}
+
+func TestStartAdminServer_ProductionRequiresToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+
+	cfg := DefaultServerConfig()
+	cfg.AdminPort = 0 // won't actually listen
+	cfg.IsProduction = true
+	cfg.AdminToken = ""
+
+	mgr := NewManager(cfg, logger)
+	err := mgr.startAdminServer()
+	if err == nil {
+		t.Fatal("expected error when production mode has no admin token")
+	}
+	if !strings.Contains(err.Error(), "admin token is required in production") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestStartAdminServer_ProductionWithToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+
+	cfg := DefaultServerConfig()
+	cfg.AdminPort = 0
+	cfg.IsProduction = true
+	cfg.AdminToken = "test-token-value"
+
+	mgr := NewManager(cfg, logger)
+	err := mgr.startAdminServer()
+	// Should succeed (won't actually listen on port 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStartAdminServer_DevAutoGeneratesToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+
+	cfg := DefaultServerConfig()
+	cfg.AdminPort = 0
+	cfg.IsProduction = false
+	cfg.AdminToken = ""
+
+	mgr := NewManager(cfg, logger)
+	err := mgr.startAdminServer()
+	if err != nil {
+		t.Fatalf("dev mode without token should auto-generate, got error: %v", err)
 	}
 }
 

@@ -162,6 +162,8 @@ func main() {
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
 	}
 
+	serverCfg.IsProduction = isProduction
+
 	// Create unified server manager
 	mgr := server.NewManager(serverCfg, logger)
 
