@@ -76,11 +76,12 @@ func loadFile(store *Store, path string, logger *zap.Logger) error {
 		return fmt.Errorf("invalid JSON")
 	}
 
-	// Extract the top-level "vct" and optional "name" / "description" fields.
+	// Extract the top-level "vct" and optional display fields.
 	var header struct {
-		VCT         string `json:"vct"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		VCT          string `json:"vct"`
+		Name         string `json:"name"`
+		Description  string `json:"description"`
+		Organization string `json:"organization"`
 	}
 	if err := json.Unmarshal(data, &header); err != nil {
 		return fmt.Errorf("unmarshal header: %w", err)
@@ -90,12 +91,13 @@ func loadFile(store *Store, path string, logger *zap.Logger) error {
 	}
 
 	entry := &VCTMEntry{
-		VCT:         header.VCT,
-		Name:        header.Name,
-		Description: header.Description,
-		Metadata:    json.RawMessage(data),
-		FetchedAt:   time.Now(),
-		IsLocal:     true,
+		VCT:          header.VCT,
+		Name:         header.Name,
+		Description:  header.Description,
+		Organization: header.Organization,
+		Metadata:     json.RawMessage(data),
+		FetchedAt:    time.Now(),
+		IsLocal:      true,
 	}
 
 	store.Put(entry)

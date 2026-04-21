@@ -481,8 +481,11 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 			zap.Time("last_updated", store.LastUpdated()))
 	}
 
-	// Load local VCTM overrides (before remote fetching so they take priority)
+	// Load local VCTM overrides (before remote fetching so they take priority).
+	// Clear any stale cached local entries first so removed override files
+	// don't persist through the cache.
 	if len(cfg.Source.LocalOverrides) > 0 {
+		store.ClearLocal()
 		if err := registry.LoadLocalOverrides(store, cfg.Source.LocalOverrides, logger); err != nil {
 			return nil, fmt.Errorf("failed to load local VCTM overrides: %w", err)
 		}

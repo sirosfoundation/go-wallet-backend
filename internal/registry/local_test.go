@@ -51,9 +51,15 @@ func TestLoadLocalOverrides_SingleFile(t *testing.T) {
 
 func TestLoadLocalOverrides_Directory(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "a.json"), testVCTMJSON("urn:test:a", "A"), 0644)
-	os.WriteFile(filepath.Join(dir, "b.json"), testVCTMJSON("urn:test:b", "B"), 0644)
-	os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not json"), 0644) // should be skipped
+	if err := os.WriteFile(filepath.Join(dir, "a.json"), testVCTMJSON("urn:test:a", "A"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.json"), testVCTMJSON("urn:test:b", "B"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not json"), 0644); err != nil { // should be skipped
+		t.Fatal(err)
+	}
 
 	store := NewStore(filepath.Join(dir, "cache.json"))
 	logger := zap.NewNop()
@@ -75,8 +81,12 @@ func TestLoadLocalOverrides_Directory(t *testing.T) {
 
 func TestLoadLocalOverrides_SkipsInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "good.json"), testVCTMJSON("urn:test:good", "Good"), 0644)
-	os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not valid json"), 0644)
+	if err := os.WriteFile(filepath.Join(dir, "good.json"), testVCTMJSON("urn:test:good", "Good"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	store := NewStore(filepath.Join(dir, "cache.json"))
 	logger := zap.NewNop()
@@ -94,7 +104,9 @@ func TestLoadLocalOverrides_SkipsInvalidJSON(t *testing.T) {
 func TestLoadLocalOverrides_MissingVCT(t *testing.T) {
 	dir := t.TempDir()
 	noVCT := []byte(`{"name": "no vct field"}`)
-	os.WriteFile(filepath.Join(dir, "novct.json"), noVCT, 0644)
+	if err := os.WriteFile(filepath.Join(dir, "novct.json"), noVCT, 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	store := NewStore(filepath.Join(dir, "cache.json"))
 	logger := zap.NewNop()
@@ -121,7 +133,9 @@ func TestLoadLocalOverrides_FileError(t *testing.T) {
 func TestLocalOverrides_SurvivePolling(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "local.json")
-	os.WriteFile(fp, testVCTMJSON("urn:test:local", "Local"), 0644)
+	if err := os.WriteFile(fp, testVCTMJSON("urn:test:local", "Local"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	store := NewStore(filepath.Join(dir, "cache.json"))
 	logger := zap.NewNop()
@@ -170,5 +184,58 @@ func TestLoadLocalOverrides_EmptyPaths(t *testing.T) {
 	}
 	if store.Count() != 0 {
 		t.Errorf("Count = %d, want 0", store.Count())
+	}
+}
+
+func TestClearLocal_RemovesOnlyLocalEntries(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "cache.json"))
+
+	// Add a local entry and a remote entry
+	store.Put(&VCTMEntry{VCT: "urn:test:local", Name: "Local", IsLocal: true})
+	store.Put(&VCTMEntry{VCT: "urn:test:remote", Name: "Remote"})
+	store.Put(&VCTMEntry{VCT: "urn:test:dynamic", Name: "Dynamic", IsDynamic: true})
+
+	if store.Count() != 3 {
+		t.Fatalf("Count = %d, want 3", store.Count())
+	}
+
+	store.ClearLocal()
+
+	if store.Count() != 2 {
+		t.Errorf("Count = %d, want 2 after ClearLocal", store.Count())
+	}
+	if _, ok := store.Get("urn:test:local"); ok {
+		t.Error("local entry should have been removed")
+	}
+	if _, ok := store.Get("urn:test:remote"); !ok {
+		t.Error("remote entry should still be present")
+	}
+	if _, ok := store.Get("urn:test:dynamic"); !ok {
+		t.Error("dynamic entry should still be present")
+	}
+}
+
+func TestLoadLocalOverrides_ExtractsOrganization(t *testing.T) {
+	dir := t.TempDir()
+
+	data := []byte(`{"vct": "urn:test:org", "name": "Org Test", "description": "desc", "organization": "ACME Corp"}`)
+	fp := filepath.Join(dir, "org.json")
+	if err := os.WriteFile(fp, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(filepath.Join(dir, "cache.json"))
+	logger := zap.NewNop()
+
+	if err := LoadLocalOverrides(store, []string{fp}, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, ok := store.Get("urn:test:org")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Organization != "ACME Corp" {
+		t.Errorf("Organization = %q, want %q", entry.Organization, "ACME Corp")
 	}
 }

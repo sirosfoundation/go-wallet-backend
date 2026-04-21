@@ -211,6 +211,20 @@ func (s *Store) Delete(vctID string) {
 	delete(s.entries, vctID)
 }
 
+// ClearLocal removes all entries with IsLocal=true from the store.
+// This should be called before reloading local overrides so that removed
+// override files don't persist via the cache.
+func (s *Store) ClearLocal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, entry := range s.entries {
+		if entry.IsLocal {
+			delete(s.entries, id)
+		}
+	}
+}
+
 // Update atomically replaces all registry-sourced entries and updates metadata.
 // Dynamically-fetched entries (IsDynamic == true) and local file overrides
 // (IsLocal == true) that are not present in the new set are preserved so that
