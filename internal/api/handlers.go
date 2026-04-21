@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,7 @@ type Handlers struct {
 	logger        *zap.Logger
 	roles         []string
 	metadataCache *issuerMetadataCache
+	httpClient    *http.Client
 }
 
 // NewHandlers creates a new Handlers instance
@@ -35,6 +37,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		logger:        logger.Named("handlers"),
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
+		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 	}
 }
 
@@ -47,6 +50,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		logger:        logger.Named("handlers"),
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
+		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 	}
 }
 

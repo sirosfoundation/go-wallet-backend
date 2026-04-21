@@ -128,13 +128,9 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 		t.Fatalf("Failed to parse response: %v", err)
 	}
 
-	// The result should contain metadata with credential_issuer
-	meta, ok := result["Metadata"].(map[string]interface{})
-	if !ok {
-		t.Fatal("Expected Metadata field in response")
-	}
-	if meta["credential_issuer"] != "https://issuer.example.com" {
-		t.Errorf("Expected credential_issuer, got %v", meta["credential_issuer"])
+	// The response should be the IssuerMetadata directly with proper JSON keys
+	if result["credential_issuer"] != "https://issuer.example.com" {
+		t.Errorf("Expected credential_issuer, got %v", result["credential_issuer"])
 	}
 }
 
@@ -259,18 +255,16 @@ func TestIssuerMetadataCache(t *testing.T) {
 	}
 
 	// Put and hit
-	result := &metadata.IssuerDiscoveryResult{
-		Metadata: &metadata.IssuerMetadata{
-			CredentialIssuer: "https://example.com",
-		},
+	m := &metadata.IssuerMetadata{
+		CredentialIssuer: "https://example.com",
 	}
-	cache.put("https://example.com", result)
+	cache.put("https://example.com", m)
 
 	cached, ok := cache.get("https://example.com")
 	if !ok {
 		t.Fatal("Expected cache hit")
 	}
-	if cached != result {
+	if cached != m {
 		t.Error("Cached result does not match")
 	}
 }

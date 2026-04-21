@@ -2,8 +2,8 @@ package api
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,13 +18,13 @@ import (
 // credential_issuer_identifier. This avoids hammering upstream well-known
 // endpoints on every frontend page load.
 type issuerMetadataCache struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	entries map[string]*metadataCacheEntry
 	ttl     time.Duration
 }
 
 type metadataCacheEntry struct {
-	result    *metadata.IssuerDiscoveryResult
+	metadata  *metadata.IssuerMetadata
 	fetchedAt time.Time
 }
 
@@ -37,24 +37,36 @@ func newIssuerMetadataCache() *issuerMetadataCache {
 	}
 }
 
-func (c *issuerMetadataCache) get(issuerURL string) (*metadata.IssuerDiscoveryResult, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	entry, ok := c.entries[issuerURL]
-	if !ok || time.Since(entry.fetchedAt) > c.ttl {
-		return nil, false
-	}
-	return entry.result, true
-}
-
-func (c *issuerMetadataCache) put(issuerURL string, result *metadata.IssuerDiscoveryResult) {
+func (c *issuerMetadataCache) get(issuerURL string) (*metadata.IssuerMetadata, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	entry, ok := c.entries[issuerURL]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(entry.fetchedAt) > c.ttl {
+		delete(c.entries, issuerURL)
+		return nil, false
+	}
+	return entry.metadata, true
+}
+
+func (c *issuerMetadataCache) put(issuerURL string, m *metadata.IssuerMetadata) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Evict expired entries on write to keep the map bounded
+	now := time.Now()
+	for url, entry := range c.entries {
+		if now.Sub(entry.fetchedAt) > c.ttl {
+			delete(c.entries, url)
+		}
+	}
+
 	c.entries[issuerURL] = &metadataCacheEntry{
-		result:    result,
-		fetchedAt: time.Now(),
+		metadata:  m,
+		fetchedAt: now,
 	}
 }
 
@@ -69,8 +81,8 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 		return
 	}
 
-	var id int64
-	if _, err := fmt.Sscanf(issuerID, "%d", &id); err != nil {
+	id, err := strconv.ParseInt(issuerID, 10, 64)
+	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid issuer ID"})
 		return
 	}
@@ -102,8 +114,7 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 	}
 
 	// Fetch metadata server-side
-	httpClient := h.cfg.HTTPClient.NewHTTPClient(0)
-	result := metadata.DiscoverIssuer(c.Request.Context(), issuerURL, httpClient)
+	result := metadata.DiscoverIssuer(c.Request.Context(), issuerURL, h.httpClient)
 	if result.Error != nil && result.Metadata == nil {
 		h.logger.Error("Failed to fetch issuer metadata",
 			zap.String("issuer_url", issuerURL),
@@ -112,8 +123,7 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 		return
 	}
 
-	// Cache even partial results (metadata OK, IACA failed)
-	h.metadataCache.put(issuerURL, result)
+	h.metadataCache.put(issuerURL, result.Metadata)
 
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, result.Metadata)
 }
