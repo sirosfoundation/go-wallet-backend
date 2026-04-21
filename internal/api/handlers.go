@@ -498,14 +498,6 @@ func (h *Handlers) DeleteCredential(c *gin.Context) {
 
 	tenantID, _ := h.getTenantID(c)
 
-	// Delete associated presentations first (like the reference implementation)
-	if err := h.services.Presentation.DeleteByCredentialID(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
-		// Log but continue - presentations may not exist
-		h.logger.Warn("Error deleting presentations for credential",
-			zap.String("credential_id", credentialID),
-			zap.Error(err))
-	}
-
 	if err := h.services.Credential.Delete(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
@@ -517,114 +509,6 @@ func (h *Handlers) DeleteCredential(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{"message": "Verifiable Credential deleted successfully."})
-}
-
-// Presentation handlers
-
-// GetAllPresentations returns all presentations for the authenticated user
-func (h *Handlers) GetAllPresentations(c *gin.Context) {
-	holderDID, ok := h.getHolderDID(c)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	tenantID, _ := h.getTenantID(c)
-	presentations, err := h.services.Presentation.GetAll(c.Request.Context(), tenantID, holderDID)
-	if err != nil {
-		h.logger.Error("Failed to get presentations", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to get presentations"})
-		return
-	}
-
-	c.JSON(200, gin.H{"vp_list": presentations})
-}
-
-// StorePresentation stores a new presentation
-func (h *Handlers) StorePresentation(c *gin.Context) {
-	holderDID, ok := h.getHolderDID(c)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var presentation domain.VerifiablePresentation
-	if err := c.ShouldBindJSON(&presentation); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	tenantID, _ := h.getTenantID(c)
-	presentation.HolderDID = holderDID
-
-	if err := h.services.Presentation.Store(c.Request.Context(), tenantID, &presentation); err != nil {
-		if errors.Is(err, storage.ErrAlreadyExists) {
-			c.JSON(409, gin.H{"error": "Presentation already exists"})
-			return
-		}
-		h.logger.Error("Failed to store presentation", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to store presentation"})
-		return
-	}
-
-	c.JSON(200, gin.H{})
-}
-
-// GetPresentationByIdentifier retrieves a presentation by identifier
-func (h *Handlers) GetPresentationByIdentifier(c *gin.Context) {
-	presentationID := c.Param("presentation_identifier")
-	if presentationID == "" {
-		c.JSON(400, gin.H{"error": "Presentation ID required"})
-		return
-	}
-
-	holderDID, ok := h.getHolderDID(c)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	tenantID, _ := h.getTenantID(c)
-	presentation, err := h.services.Presentation.Get(c.Request.Context(), tenantID, holderDID, presentationID)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "Presentation not found"})
-			return
-		}
-		h.logger.Error("Failed to get presentation", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to get presentation"})
-		return
-	}
-
-	c.JSON(200, presentation)
-}
-
-// DeletePresentation deletes a presentation
-func (h *Handlers) DeletePresentation(c *gin.Context) {
-	presentationID := c.Param("presentation_identifier")
-	if presentationID == "" {
-		c.JSON(400, gin.H{"error": "Presentation ID required"})
-		return
-	}
-
-	holderDID, ok := h.getHolderDID(c)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	tenantID, _ := h.getTenantID(c)
-	if err := h.services.Presentation.Delete(c.Request.Context(), tenantID, holderDID, presentationID); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "Presentation not found"})
-			return
-		}
-		h.logger.Error("Failed to delete presentation", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to delete presentation"})
-		return
-	}
-
-	c.JSON(204, nil)
 }
 
 // Issuer handlers

@@ -118,3 +118,14 @@ func (s *InviteStore) Delete(ctx context.Context, tenantID domain.TenantID, id s
 	}
 	return nil
 }
+
+func (s *InviteStore) ClearUsedBy(ctx context.Context, userID domain.UserID) error {
+	_, err := s.collection.UpdateMany(ctx,
+		bson.M{"used_by": userID},
+		bson.M{"$unset": bson.M{"used_by": ""}},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to clear used_by for user: %w", err)
+	}
+	return nil
+}

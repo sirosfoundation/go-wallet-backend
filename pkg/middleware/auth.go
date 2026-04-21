@@ -160,7 +160,6 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			if err == storage.ErrNotFound {
 				logger.Warn("JWT contains invalid tenant_id",
 					zap.String("tenant_id", tenantID),
-					zap.String("user_id", userID),
 				)
 				c.JSON(401, gin.H{"error": "Invalid tenant in token"})
 			} else {
@@ -177,7 +176,6 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		if !tenant.Enabled {
 			logger.Warn("JWT tenant is disabled",
 				zap.String("tenant_id", tenantID),
-				zap.String("user_id", userID),
 			)
 			c.JSON(403, gin.H{"error": "Tenant is disabled"})
 			c.Abort()
@@ -190,7 +188,6 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			logger.Warn("X-Tenant-ID header mismatches JWT tenant_id - using JWT (authoritative)",
 				zap.String("header_tenant_id", headerTenantID),
 				zap.String("jwt_tenant_id", tenantID),
-				zap.String("user_id", userID),
 			)
 		}
 
