@@ -1,17 +1,13 @@
-// Package modes provides the mode dispatcher for the hybrid binary.
-// The wallet-backend binary can run in different modes (roles):
-// - backend: runs the wallet backend API server
-// - registry: runs the VCTM registry server
-// - engine: runs the WebSocket v2 engine
+// Package modes defines operating roles for the hybrid wallet-backend binary.
 //
 // Roles can be combined via comma-separated list:
-// - --mode=backend (just backend)
-// - --mode=backend,engine (backend + websocket)
-// - --mode=backend,registry,engine (all roles)
+//
+//	--mode=backend              (just backend)
+//	--mode=backend,engine       (backend + websocket)
+//	--mode=all                  (all roles)
 package modes
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -41,20 +37,6 @@ func (r Role) IsValid() bool {
 	}
 	return false
 }
-
-// Mode is a deprecated alias for Role, kept for backward compatibility
-type Mode = Role
-
-// Deprecated mode constants - use Role constants instead
-const (
-	ModeAll      Mode = "all" // Special: expands to all roles
-	ModeBackend  Mode = RoleBackend
-	ModeRegistry Mode = RoleRegistry
-	ModeEngine   Mode = RoleEngine
-)
-
-// ValidModes is deprecated, use ValidRoles instead
-var ValidModes = []Mode{ModeAll, ModeBackend, ModeRegistry, ModeEngine}
 
 // RoleSet represents a set of active roles
 type RoleSet struct {
@@ -146,66 +128,4 @@ func ParseRoles(s string) (*RoleSet, error) {
 	}
 
 	return NewRoleSet(roles), nil
-}
-
-// ParseMode parses a mode string into a Mode (single role), returning an error if invalid
-// Deprecated: Use ParseRoles for multi-role support
-func ParseMode(s string) (Mode, error) {
-	mode := Mode(s)
-	for _, valid := range ValidModes {
-		if mode == valid {
-			return mode, nil
-		}
-	}
-	return "", fmt.Errorf("invalid mode %q, valid modes: %v", s, ValidModes)
-}
-
-// Runner is the interface for role-specific runners
-type Runner interface {
-	// Role returns the role this runner implements
-	Role() Role
-
-	// Name returns the mode name (deprecated, use Role())
-	Name() Mode
-
-	// Run starts the role's services and blocks until shutdown
-	Run(ctx context.Context) error
-
-	// Shutdown gracefully shuts down the role's services
-	Shutdown(ctx context.Context) error
-}
-
-// RunnerFactory creates a Runner for the given role
-type RunnerFactory func(cfg interface{}) (Runner, error)
-
-// registry of runner factories by role
-var runners = make(map[Role]RunnerFactory)
-
-// Register registers a runner factory for a role
-func Register(role Role, factory RunnerFactory) {
-	runners[role] = factory
-}
-
-// NewRunner creates a runner for the given role
-// Deprecated: Use NewRunnerForRole instead
-func NewRunner(mode Mode, cfg interface{}) (Runner, error) {
-	return NewRunnerForRole(mode, cfg)
-}
-
-// NewRunnerForRole creates a runner for the given role
-func NewRunnerForRole(role Role, cfg interface{}) (Runner, error) {
-	factory, ok := runners[role]
-	if !ok {
-		return nil, fmt.Errorf("no runner registered for role %q", role)
-	}
-	return factory(cfg)
-}
-
-// ListRegistered returns the list of registered roles
-func ListRegistered() []Role {
-	var roles []Role
-	for r := range runners {
-		roles = append(roles, r)
-	}
-	return roles
 }
