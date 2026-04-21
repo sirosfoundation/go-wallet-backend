@@ -600,6 +600,10 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
+	s.flowsMu.RLock()
+	flow := s.flows[flowID]
+	s.flowsMu.RUnlock()
+
 	msg := FlowCompleteMessage{
 		Message: Message{
 			Type:      TypeFlowComplete,
@@ -608,6 +612,16 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 		},
 		Credentials: credentials,
 		RedirectURI: redirectURI,
+	}
+	if flow != nil {
+		flow.mu.RLock()
+		if v, ok := flow.Data["credential_issuer"]; ok {
+			msg.CredentialIssuer, _ = v.(string)
+		}
+		if v, ok := flow.Data["selected_credential_configuration_id"]; ok {
+			msg.SelectedCredentialConfigurationID, _ = v.(string)
+		}
+		flow.mu.RUnlock()
 	}
 	return s.Send(&msg)
 }

@@ -392,6 +392,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 	h.SetData("offer", offer)
+	h.SetData("credential_issuer", offer.CredentialIssuer)
 
 	// Step 2: Fetch issuer metadata
 	metadata, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
@@ -416,6 +417,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 	h.SetData("selected_config", selectedConfig)
+	h.SetData("selected_credential_configuration_id", selectedConfigID)
 
 	// Generate ephemeral DPoP key pair (RFC 9449)
 	h.dpopKey, err = generateDPoPKey()
@@ -425,8 +427,15 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 
-	// Step 5: Handle authorization
-	token, err := h.handleAuthorization(ctx, offer, metadata, selectedConfig)
+	// Step 5: Handle authorization (or resume with provided auth code)
+	var token *TokenResponse
+	if msg.AuthCode != "" {
+		// Resumption: client already completed OAuth and returned with auth code
+		token, err = h.resumeWithAuthCode(ctx, msg, metadata)
+	} else {
+		// Normal flow: handle authorization (pre-auth or auth code grant)
+		token, err = h.handleAuthorization(ctx, offer, metadata, selectedConfig)
+	}
 	if err != nil {
 		return err
 	}
@@ -887,12 +896,22 @@ func (h *OID4VCIHandler) handleAuthorization(ctx context.Context, offer *Credent
 func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *IssuerMetadata, grant map[string]interface{}) (*TokenResponse, error) {
 	preAuthCode, _ := grant["pre-authorized_code"].(string)
 
+	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
+	if metadata.TokenEndpoint == "" {
+		if oauthMeta := h.fetchOAuthMetadata(ctx, metadata); oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
+			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		}
+	}
+
 	// Check if TX code required
 	if txCodeRequired, ok := grant["tx_code"]; ok && txCodeRequired != nil {
 		// Request TX code from user
 		_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
-			"type":    "tx_code",
-			"message": "Please enter the transaction code",
+			"type":                "tx_code",
+			"pre_authorized_code": preAuthCode,
+			"tx_code":             txCodeRequired,
+			"credential_issuer":   metadata.CredentialIssuer,
+			"message":             "Please enter the transaction code",
 		})
 
 		action, err := h.WaitForAction(ctx, ActionProvidePin)
@@ -975,42 +994,52 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
-func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
-	// Build authorization URL
+// fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
+// Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
+func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
 	authServer := metadata.AuthorizationServer
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
 
-	// Fetch OAuth metadata
 	oauthMetadataURL := strings.TrimSuffix(authServer, "/") + "/.well-known/oauth-authorization-server"
-
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
-		return nil, err
+		return nil
 	}
-
-	fallbackEndpoint := strings.TrimSuffix(authServer, "/") + "/authorize"
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var oauthMeta oauthServerMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err != nil {
+		return nil
+	}
+	return &oauthMeta
+}
+
+func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
+	authServer := metadata.AuthorizationServer
+	if authServer == "" {
+		authServer = metadata.CredentialIssuer
+	}
+	fallbackEndpoint := strings.TrimSuffix(authServer, "/") + "/authorize"
+
+	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
+	if oauthMeta == nil || oauthMeta.AuthorizationEndpoint == "" {
 		// Fallback: construct auth URL directly, no PAR
 		return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 			AuthorizationEndpoint: fallbackEndpoint,
 		})
 	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode == http.StatusOK {
-		var oauthMeta oauthServerMetadata
-		if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err == nil && oauthMeta.AuthorizationEndpoint != "" {
-			return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthMeta)
-		}
-	}
-
-	return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
-		AuthorizationEndpoint: fallbackEndpoint,
-	})
+	return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, oauthMeta)
 }
 
 func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig, oauthMeta *oauthServerMetadata) (*TokenResponse, error) {
@@ -1105,10 +1134,12 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 
 	// Send authorization URL and PKCE code_verifier to the client.
 	// The client stores code_verifier for flow resume after redirect (option A).
+	// Include the parsed credential offer so client can resume with a stateless backend.
 	progressData := map[string]interface{}{
 		"authorization_url":     authURL,
 		"expected_redirect_uri": redirectURI,
 		"state":                 oauthState,
+		"credential_offer":      offer,
 	}
 	if pkceEnabled {
 		progressData["code_verifier"] = codeVerifier
@@ -1258,6 +1289,32 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
+// resumeWithAuthCode handles flow resumption after same-tab redirect.
+// The client has saved the credential offer and code_verifier, redirected to the AS,
+// and returned with an authorization code. This function skips authorization URL
+// generation and directly exchanges the auth code for a token.
+func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartMessage, metadata *IssuerMetadata) (*TokenResponse, error) {
+	h.Logger.Info("Resuming OID4VCI flow with authorization code")
+	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
+
+	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
+	if metadata.TokenEndpoint == "" {
+		if oauthMeta := h.fetchOAuthMetadata(ctx, metadata); oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
+			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		}
+	}
+
+	// Use redirect URI from message
+	redirectURI := msg.RedirectURI
+	if redirectURI == "" {
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "redirect_uri is required for flow resumption")
+		return nil, errors.New("redirect_uri is required for flow resumption")
+	}
+
+	// Exchange authorization code using provided code_verifier
+	return h.exchangeAuthCode(ctx, metadata, msg.AuthCode, redirectURI, msg.CodeVerifier)
+}
+
 // CNonceRequiredError is returned by requestCredential when the credential
 // endpoint responds with an error that includes a refreshed c_nonce. The
 // engine should re-request all proofs from the frontend using the new nonce
@@ -1395,6 +1452,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				return nil, fmt.Errorf("failed to build encryption JWK: %w", err)
 			}
 			encJWK["use"] = "enc"
+			encJWK["alg"] = selectedAlg
 			reqBody["credential_response_encryption"] = map[string]interface{}{
 				"alg": selectedAlg,
 				"enc": selectedEnc,

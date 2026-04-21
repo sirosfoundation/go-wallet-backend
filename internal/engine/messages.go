@@ -180,6 +180,10 @@ type FlowStartMessage struct {
 	RequestURIRef      string   `json:"request_uri_ref,omitempty"`      // OID4VP: https://...
 	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
 	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
+
+	// Resumption fields (same-tab redirect flow)
+	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
+	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -210,9 +214,11 @@ const (
 // FlowCompleteMessage indicates successful flow completion
 type FlowCompleteMessage struct {
 	Message
-	Credentials  []CredentialResult `json:"credentials,omitempty"`
-	RedirectURI  string             `json:"redirect_uri,omitempty"`
-	TypeMetadata json.RawMessage    `json:"type_metadata,omitempty"`
+	Credentials                       []CredentialResult `json:"credentials,omitempty"`
+	RedirectURI                       string             `json:"redirect_uri,omitempty"`
+	TypeMetadata                      json.RawMessage    `json:"type_metadata,omitempty"`
+	CredentialIssuer                  string             `json:"credential_issuer,omitempty"`
+	SelectedCredentialConfigurationID string             `json:"selected_credential_configuration_id,omitempty"`
 }
 
 // FlowErrorMessage indicates a flow error
