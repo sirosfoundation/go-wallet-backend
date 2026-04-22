@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 
 	"go.uber.org/zap"
 
@@ -68,9 +69,10 @@ func (h *BaseHandler) RequestSign(ctx context.Context, action SignAction, params
 	return h.Flow.Session.RequestSign(ctx, h.Flow.ID, action, params)
 }
 
-// RequestMatch requests client-side credential matching (privacy-preserving)
-func (h *BaseHandler) RequestMatch(ctx context.Context, pd *PresentationDefinition) (*MatchResponseMessage, error) {
-	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, pd)
+// RequestMatch requests client-side credential matching (privacy-preserving).
+// Accepts either a PresentationDefinition or a DCQL query.
+func (h *BaseHandler) RequestMatch(ctx context.Context, pd *PresentationDefinition, dcql json.RawMessage) (*MatchResponseMessage, error) {
+	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, pd, dcql)
 }
 
 // WaitForAction waits for a client action

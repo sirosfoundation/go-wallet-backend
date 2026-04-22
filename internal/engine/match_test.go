@@ -104,7 +104,7 @@ func TestSession_RequestMatch_Success(t *testing.T) {
 		},
 	}
 
-	resp, err := session.RequestMatch(ctx, "flow-1", pd)
+	resp, err := session.RequestMatch(ctx, "flow-1", pd, nil)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Len(t, resp.Matches, 1)
@@ -130,7 +130,7 @@ func TestSession_RequestMatch_Timeout(t *testing.T) {
 	defer cancel()
 
 	pd := &PresentationDefinition{ID: "timeout-pd"}
-	_, err := session.RequestMatch(ctx, "flow-timeout", pd)
+	_, err := session.RequestMatch(ctx, "flow-timeout", pd, nil)
 	require.Error(t, err)
 	// Either context deadline or match timeout, both are acceptable
 	assert.True(t, err == context.DeadlineExceeded || err == ErrMatchTimeout,
@@ -178,7 +178,7 @@ func TestSession_RequestMatch_ErrorInResponse(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "error-pd"}
-	_, err := session.RequestMatch(ctx, "flow-error", pd)
+	_, err := session.RequestMatch(ctx, "flow-error", pd, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "client-side matching failed")
 }
@@ -224,7 +224,7 @@ func TestSession_RequestMatch_NoMatchReason(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "nomatch-pd"}
-	resp, err := session.RequestMatch(ctx, "flow-nomatch", pd)
+	resp, err := session.RequestMatch(ctx, "flow-nomatch", pd, nil)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Empty(t, resp.Matches)
@@ -249,7 +249,7 @@ func TestSession_RequestMatch_SessionClosed(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "close-pd"}
-	_, err := session.RequestMatch(ctx, "flow-close", pd)
+	_, err := session.RequestMatch(ctx, "flow-close", pd, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session closed")
 }
@@ -309,7 +309,7 @@ func TestSession_RequestMatch_WrongFlowID_Ignored(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "filter-pd"}
-	resp, err := session.RequestMatch(ctx, "flow-filter", pd)
+	resp, err := session.RequestMatch(ctx, "flow-filter", pd, nil)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "correct-cred", resp.Matches[0].CredentialID)
@@ -428,7 +428,7 @@ func TestBaseHandler_RequestMatch(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "handler-pd"}
-	resp, err := handler.RequestMatch(ctx, pd)
+	resp, err := handler.RequestMatch(ctx, pd, nil)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "handler-cred", resp.Matches[0].CredentialID)
@@ -447,6 +447,6 @@ func TestSession_RequestMatch_SendError(t *testing.T) {
 
 	ctx := context.Background()
 	pd := &PresentationDefinition{ID: "send-error-pd"}
-	_, err := session.RequestMatch(ctx, "flow-send-err", pd)
+	_, err := session.RequestMatch(ctx, "flow-send-err", pd, nil)
 	require.Error(t, err)
 }

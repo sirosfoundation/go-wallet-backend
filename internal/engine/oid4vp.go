@@ -65,11 +65,17 @@ type AuthorizationRequest struct {
 	Scope                     string                  `json:"scope,omitempty"`
 	PresentationDefinition    *PresentationDefinition `json:"presentation_definition,omitempty"`
 	PresentationDefinitionURI string                  `json:"presentation_definition_uri,omitempty"`
+	DCQLQuery                 json.RawMessage         `json:"dcql_query,omitempty"`
 	ClientMetadata            *ClientMetadata         `json:"client_metadata,omitempty"`
 	ClientMetadataURI         string                  `json:"client_metadata_uri,omitempty"`
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
+}
+
+// IsDCQL returns true if this request uses a DCQL query instead of a Presentation Definition.
+func (r *AuthorizationRequest) IsDCQL() bool {
+	return len(r.DCQLQuery) > 0
 }
 
 // PresentationDefinition represents a DIF Presentation Definition
@@ -167,15 +173,20 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 3: Send parsed request info to client
-	requestedClaims := h.extractRequestedClaims(authReq.PresentationDefinition)
-	_ = h.Progress(StepRequestParsed, map[string]interface{}{
-		"verifier":                verifier,
-		"presentation_definition": authReq.PresentationDefinition,
-		"requested_claims":        requestedClaims,
-	})
+	progressPayload := map[string]interface{}{
+		"verifier": verifier,
+	}
+	if authReq.IsDCQL() {
+		progressPayload["dcql_query"] = authReq.DCQLQuery
+	} else {
+		requestedClaims := h.extractRequestedClaims(authReq.PresentationDefinition)
+		progressPayload["presentation_definition"] = authReq.PresentationDefinition
+		progressPayload["requested_claims"] = requestedClaims
+	}
+	_ = h.Progress(StepRequestParsed, progressPayload)
 
 	// Step 4: Request client-side credential matching (privacy-preserving)
-	matches, err := h.requestCredentialMatching(ctx, authReq.PresentationDefinition)
+	matches, err := h.requestCredentialMatching(ctx, authReq)
 	if err != nil {
 		return err
 	}
@@ -265,6 +276,14 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 		authReq.PresentationDefinition = &pd
 	}
 	authReq.PresentationDefinitionURI = q.Get("presentation_definition_uri")
+
+	// Parse dcql_query if inline (DCQL takes precedence over presentation_definition)
+	if dcqlStr := q.Get("dcql_query"); dcqlStr != "" {
+		if !json.Valid([]byte(dcqlStr)) {
+			return nil, fmt.Errorf("invalid dcql_query: not valid JSON")
+		}
+		authReq.DCQLQuery = json.RawMessage(dcqlStr)
+	}
 
 	// Parse client_metadata if inline
 	if cmStr := q.Get("client_metadata"); cmStr != "" {
@@ -360,8 +379,8 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
-	// Fetch presentation_definition if needed
-	if authReq.PresentationDefinition == nil && authReq.PresentationDefinitionURI != "" {
+	// Fetch presentation_definition if needed (not applicable for DCQL)
+	if !authReq.IsDCQL() && authReq.PresentationDefinition == nil && authReq.PresentationDefinitionURI != "" {
 		pd, err := h.fetchPresentationDefinition(ctx, authReq.PresentationDefinitionURI)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch presentation definition: %w", err)
@@ -777,10 +796,10 @@ func (h *OID4VPHandler) extractRequestedClaims(pd *PresentationDefinition) []Req
 	return claims
 }
 
-func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, pd *PresentationDefinition) ([]CredentialMatch, error) {
+func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, authReq *AuthorizationRequest) ([]CredentialMatch, error) {
 	// Send match_request to client for local matching (privacy-preserving)
 	// The client matches credentials locally and returns only the matching credential IDs/metadata
-	resp, err := h.RequestMatch(ctx, pd)
+	resp, err := h.RequestMatch(ctx, authReq.PresentationDefinition, authReq.DCQLQuery)
 	if err != nil {
 		if errors.Is(err, ErrMatchTimeout) {
 			h.Logger.Warn("Credential matching timed out")
@@ -805,6 +824,7 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 	for i, m := range matches {
 		matchedCredentials[i] = MatchedCredential{
 			InputDescriptorID: m.InputDescriptorID,
+			CredentialQueryID: m.CredentialQueryID,
 			CredentialID:      m.CredentialID,
 			DisclosableClaims: m.AvailableClaims,
 		}
@@ -905,10 +925,12 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 		data.Set("state", authReq.State)
 	}
 
-	// Build presentation_submission
-	submission := h.buildPresentationSubmission(authReq.PresentationDefinition)
-	submissionJSON, _ := json.Marshal(submission)
-	data.Set("presentation_submission", string(submissionJSON))
+	// DCQL responses omit presentation_submission (OID4VP §7.3)
+	if !authReq.IsDCQL() {
+		submission := h.buildPresentationSubmission(authReq.PresentationDefinition)
+		submissionJSON, _ := json.Marshal(submission)
+		data.Set("presentation_submission", string(submissionJSON))
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
 	if err != nil {
