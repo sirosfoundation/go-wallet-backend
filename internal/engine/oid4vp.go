@@ -346,7 +346,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	}
 
 	var authReq AuthorizationRequest
-	if err := json.Unmarshal(body, &authReq); err != nil {
+	if err := json.Unmarshal([]byte(bodyStr), &authReq); err != nil {
 		return nil, fmt.Errorf("failed to parse request: %w", err)
 	}
 

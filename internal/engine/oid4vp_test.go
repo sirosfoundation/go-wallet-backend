@@ -1,11 +1,15 @@
 package engine
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -213,6 +217,93 @@ func TestGetCanonicalVerifierURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := getCanonicalVerifierURL(tt.authReq)
 			assert.Equal(t, tt.want, got, tt.description)
+		})
+	}
+}
+
+func TestFetchRequestFromURI(t *testing.T) {
+	// Build a minimal, unsigned JWT whose payload is a valid AuthorizationRequest.
+	// parseRequestJWT does not verify the signature, so any three-part dot-separated
+	// string with a valid base64url-encoded JSON payload works here.
+	claims := map[string]any{
+		"client_id":     "did:web:verifier",
+		"response_type": "vp_token",
+		"nonce":         "test-nonce",
+	}
+	payloadBytes, err := json.Marshal(claims)
+	require.NoError(t, err)
+	jwtPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	// Use a fixed header and a dummy signature to form a three-part JWT.
+	fakeHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	fakeJWT := fakeHeader + "." + jwtPayload + ".fakesig"
+
+	// A plain JSON object whose client_id contains no dots so that the naive
+	// dot-count heuristic in fetchRequestFromURI does not misclassify it as a JWT.
+	plainJSON := `{"client_id":"verifier","response_type":"vp_token","nonce":"test-nonce"}`
+	// The same JSON object encoded as a JSON string (as some verifiers return it).
+	quotedJSON := `"{\"client_id\":\"verifier\",\"response_type\":\"vp_token\",\"nonce\":\"test-nonce\"}"`
+
+	tests := []struct {
+		name         string
+		responseBody string
+		statusCode   int
+		wantClientID string
+		wantErr      bool
+		wantErrMsg   string
+	}{
+		{
+			name:         "plain JWT response",
+			responseBody: fakeJWT,
+			statusCode:   http.StatusOK,
+			wantClientID: "did:web:verifier",
+		},
+		{
+			name:         "quoted JWT string response",
+			responseBody: `"` + fakeJWT + `"`,
+			statusCode:   http.StatusOK,
+			wantClientID: "did:web:verifier",
+		},
+		{
+			name:         "plain JSON object response",
+			responseBody: plainJSON,
+			statusCode:   http.StatusOK,
+			wantClientID: "verifier",
+		},
+		{
+			name:         "quoted JSON object string response",
+			responseBody: quotedJSON,
+			statusCode:   http.StatusOK,
+			wantClientID: "verifier",
+		},
+		{
+			name:         "HTTP error status",
+			responseBody: "not found",
+			statusCode:   http.StatusNotFound,
+			wantErr:      true,
+			wantErrMsg:   "404",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = fmt.Fprint(w, tt.responseBody)
+			}))
+			defer srv.Close()
+
+			h := &OID4VPHandler{httpClient: srv.Client()}
+
+			authReq, err := h.fetchRequestFromURI(context.Background(), srv.URL)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.wantErrMsg != "" {
+					assert.Contains(t, err.Error(), tt.wantErrMsg)
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantClientID, authReq.ClientID)
 		})
 	}
 }
