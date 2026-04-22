@@ -288,14 +288,23 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	}
 
 	// Check if response is JWT or JSON
-	bodyStr := string(body)
+	bodyStr := strings.TrimSpace(string(body))
+
+	// If the response is a JSON-encoded string unquote it
+	if strings.HasPrefix(bodyStr, "\"") {
+		var unquoted string
+		if err := json.Unmarshal([]byte(bodyStr), &unquoted); err == nil {
+			bodyStr = unquoted
+		}
+	}
+
 	if strings.Count(bodyStr, ".") == 2 {
 		// Likely a JWT
 		return h.parseRequestJWT(bodyStr)
 	}
 
 	var authReq AuthorizationRequest
-	if err := json.Unmarshal(body, &authReq); err != nil {
+	if err := json.Unmarshal([]byte(bodyStr), &authReq); err != nil {
 		return nil, fmt.Errorf("failed to parse request: %w", err)
 	}
 
