@@ -73,9 +73,11 @@ type AuthorizationRequest struct {
 	RequestJWT string `json:"-"`
 }
 
-// IsDCQL returns true if this request uses a DCQL query instead of a Presentation Definition.
+// IsDCQL returns true if this request uses a non-null DCQL query
+// instead of a Presentation Definition.
 func (r *AuthorizationRequest) IsDCQL() bool {
-	return len(r.DCQLQuery) > 0
+	trimmed := strings.TrimSpace(string(r.DCQLQuery))
+	return trimmed != "" && trimmed != "null"
 }
 
 // PresentationDefinition represents a DIF Presentation Definition
@@ -283,6 +285,9 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 			return nil, fmt.Errorf("invalid dcql_query: not valid JSON")
 		}
 		authReq.DCQLQuery = json.RawMessage(dcqlStr)
+		// DCQL and PD are mutually exclusive; clear PD fields
+		authReq.PresentationDefinition = nil
+		authReq.PresentationDefinitionURI = ""
 	}
 
 	// Parse client_metadata if inline
@@ -798,8 +803,16 @@ func (h *OID4VPHandler) extractRequestedClaims(pd *PresentationDefinition) []Req
 
 func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, authReq *AuthorizationRequest) ([]CredentialMatch, error) {
 	// Send match_request to client for local matching (privacy-preserving)
-	// The client matches credentials locally and returns only the matching credential IDs/metadata
-	resp, err := h.RequestMatch(ctx, authReq.PresentationDefinition, authReq.DCQLQuery)
+	// The client matches credentials locally and returns only the matching credential IDs/metadata.
+	// Enforce mutual exclusivity: send only one query format.
+	var pd *PresentationDefinition
+	var dcql json.RawMessage
+	if authReq.IsDCQL() {
+		dcql = authReq.DCQLQuery
+	} else {
+		pd = authReq.PresentationDefinition
+	}
+	resp, err := h.RequestMatch(ctx, pd, dcql)
 	if err != nil {
 		if errors.Is(err, ErrMatchTimeout) {
 			h.Logger.Warn("Credential matching timed out")

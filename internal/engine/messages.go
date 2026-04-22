@@ -279,10 +279,11 @@ type SignResponseMessage struct {
 	Proofs []ProofObject `json:"proofs,omitempty"`
 }
 
-// MatchRequestMessage requests client-side credential matching
+// MatchRequestMessage requests client-side credential matching.
 // This is the privacy-preserving protocol: credentials are matched locally
 // and only matching credential IDs/metadata are sent back to the server.
-// Exactly one of PresentationDefinition or DCQLQuery will be set.
+// At most one of PresentationDefinition or DCQLQuery should be set;
+// the sender enforces this before constructing the message.
 type MatchRequestMessage struct {
 	Message
 	PresentationDefinition *PresentationDefinition `json:"presentation_definition,omitempty"`

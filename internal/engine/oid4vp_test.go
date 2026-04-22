@@ -249,9 +249,9 @@ func TestAuthorizationRequest_IsDCQL(t *testing.T) {
 		{
 			name: "dcql_query is null JSON",
 			req:  AuthorizationRequest{DCQLQuery: json.RawMessage(`null`)},
-			// json.RawMessage("null") has length > 0, but that's the Go convention;
-			// callers provide non-null queries. This tests the raw length check.
-			want: true,
+			// A null JSON value is not a valid DCQL query and should not cause
+			// the request to be classified as DCQL.
+			want: false,
 		},
 	}
 	for _, tt := range tests {

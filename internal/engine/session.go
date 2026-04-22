@@ -695,7 +695,7 @@ var ErrMatchTimeout = errors.New("credential matching timed out")
 
 // RequestMatch sends a credential matching request and waits for response.
 // This is the privacy-preserving credential matching protocol where the client
-// matches credentials locally against the presentation definition.
+// matches credentials locally against a presentation definition or DCQL query.
 func (s *Session) RequestMatch(ctx context.Context, flowID string, pd *PresentationDefinition, dcql json.RawMessage) (*MatchResponseMessage, error) {
 	messageID := uuid.New().String()
 
