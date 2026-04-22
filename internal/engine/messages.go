@@ -279,12 +279,12 @@ type SignResponseMessage struct {
 	Proofs []ProofObject `json:"proofs,omitempty"`
 }
 
-// MatchRequestMessage requests client-side credential matching
+// MatchRequestMessage requests client-side credential matching.
 // This is the privacy-preserving protocol: credentials are matched locally
 // and only matching credential IDs/metadata are sent back to the server.
 type MatchRequestMessage struct {
 	Message
-	PresentationDefinition *PresentationDefinition `json:"presentation_definition"`
+	DCQLQuery json.RawMessage `json:"dcql_query,omitempty"`
 }
 
 // MatchResponseMessage is the client's matching response
@@ -339,18 +339,23 @@ type LogoInfo struct {
 	URI string `json:"uri"`
 }
 
-// CredentialMatch represents a credential that matches a presentation request
+// CredentialMatch represents a credential that matches a DCQL query.
 type CredentialMatch struct {
-	InputDescriptorID string   `json:"input_descriptor_id"`
+	CredentialQueryID string   `json:"credential_query_id,omitempty"`
 	CredentialID      string   `json:"credential_id"`
 	Format            string   `json:"format"`
 	VCT               string   `json:"vct,omitempty"`
 	AvailableClaims   []string `json:"available_claims,omitempty"`
 }
 
+// QueryID returns the credential query identifier.
+func (m CredentialMatch) QueryID() string {
+	return m.CredentialQueryID
+}
+
 // MatchedCredential represents a credential with consent info
 type MatchedCredential struct {
-	InputDescriptorID string          `json:"input_descriptor_id"`
+	CredentialQueryID string          `json:"credential_query_id,omitempty"`
 	CredentialID      string          `json:"credential_id"`
 	CredentialDisplay json.RawMessage `json:"credential_display,omitempty"`
 	DisclosableClaims []string        `json:"disclosable_claims,omitempty"`

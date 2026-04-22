@@ -823,17 +823,7 @@ func TestMatchRequestMessageJSON(t *testing.T) {
 			MessageID: "msg-456",
 			Timestamp: "2024-01-01T00:00:00Z",
 		},
-		PresentationDefinition: &PresentationDefinition{
-			ID:   "pd-1",
-			Name: "Test Presentation",
-			InputDescriptors: []InputDescriptor{
-				{
-					ID:      "id-1",
-					Name:    "Identity",
-					Purpose: "Verify identity",
-				},
-			},
-		},
+		DCQLQuery: json.RawMessage(`{"credentials":[{"id":"id-1"}]}`),
 	}
 
 	data, err := json.Marshal(msg)
@@ -851,8 +841,8 @@ func TestMatchRequestMessageJSON(t *testing.T) {
 	if !strings.Contains(string(data), `"message_id":"msg-456"`) {
 		t.Errorf("Missing message_id field in JSON: %s", data)
 	}
-	if !strings.Contains(string(data), `"presentation_definition"`) {
-		t.Errorf("Missing presentation_definition field in JSON: %s", data)
+	if !strings.Contains(string(data), `"dcql_query"`) {
+		t.Errorf("Missing dcql_query field in JSON: %s", data)
 	}
 }
 
@@ -866,7 +856,7 @@ func TestMatchResponseMessageJSON(t *testing.T) {
 		},
 		Matches: []CredentialMatch{
 			{
-				InputDescriptorID: "id-1",
+				CredentialQueryID: "id-1",
 				CredentialID:      "cred-abc",
 				Format:            "vc+sd-jwt",
 				VCT:               "urn:eu.europa.ec.eudi:pid:1",

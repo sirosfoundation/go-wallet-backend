@@ -73,7 +73,7 @@ func TestSession_RequestMatch_Success(t *testing.T) {
 				Timestamp: Now(),
 			},
 			Matches: []CredentialMatch{
-				{InputDescriptorID: "id-1", CredentialID: "cred-abc"},
+				{CredentialQueryID: "id-1", CredentialID: "cred-abc"},
 			},
 		}
 		_ = srvConn.WriteJSON(resp)
@@ -97,14 +97,9 @@ func TestSession_RequestMatch_Success(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{
-		ID: "test-pd",
-		InputDescriptors: []InputDescriptor{
-			{ID: "id-1"},
-		},
-	}
+	dcql := json.RawMessage(`{"credentials":[{"id":"id-1"}]}`)
 
-	resp, err := session.RequestMatch(ctx, "flow-1", pd)
+	resp, err := session.RequestMatch(ctx, "flow-1", dcql)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Len(t, resp.Matches, 1)
@@ -129,7 +124,7 @@ func TestSession_RequestMatch_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	pd := &PresentationDefinition{ID: "timeout-pd"}
+	pd := json.RawMessage(`{"credentials":[{"id":"timeout"}]}`)
 	_, err := session.RequestMatch(ctx, "flow-timeout", pd)
 	require.Error(t, err)
 	// Either context deadline or match timeout, both are acceptable
@@ -177,8 +172,8 @@ func TestSession_RequestMatch_ErrorInResponse(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "error-pd"}
-	_, err := session.RequestMatch(ctx, "flow-error", pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"error"}]}`)
+	_, err := session.RequestMatch(ctx, "flow-error", dcql)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "client-side matching failed")
 }
@@ -223,8 +218,8 @@ func TestSession_RequestMatch_NoMatchReason(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "nomatch-pd"}
-	resp, err := session.RequestMatch(ctx, "flow-nomatch", pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"nomatch"}]}`)
+	resp, err := session.RequestMatch(ctx, "flow-nomatch", dcql)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Empty(t, resp.Matches)
@@ -248,8 +243,8 @@ func TestSession_RequestMatch_SessionClosed(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "close-pd"}
-	_, err := session.RequestMatch(ctx, "flow-close", pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"close"}]}`)
+	_, err := session.RequestMatch(ctx, "flow-close", dcql)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session closed")
 }
@@ -308,8 +303,8 @@ func TestSession_RequestMatch_WrongFlowID_Ignored(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "filter-pd"}
-	resp, err := session.RequestMatch(ctx, "flow-filter", pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"filter"}]}`)
+	resp, err := session.RequestMatch(ctx, "flow-filter", dcql)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "correct-cred", resp.Matches[0].CredentialID)
@@ -332,7 +327,7 @@ func TestMatchResponseChannelRouting(t *testing.T) {
 			MessageID: "msg-1",
 		},
 		Matches: []CredentialMatch{
-			{InputDescriptorID: "id-1", CredentialID: "cred-1"},
+			{CredentialQueryID: "id-1", CredentialID: "cred-1"},
 		},
 	}
 
@@ -427,8 +422,8 @@ func TestBaseHandler_RequestMatch(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "handler-pd"}
-	resp, err := handler.RequestMatch(ctx, pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"handler"}]}`)
+	resp, err := handler.RequestMatch(ctx, dcql)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "handler-cred", resp.Matches[0].CredentialID)
@@ -446,7 +441,7 @@ func TestSession_RequestMatch_SendError(t *testing.T) {
 	conn.Close()
 
 	ctx := context.Background()
-	pd := &PresentationDefinition{ID: "send-error-pd"}
-	_, err := session.RequestMatch(ctx, "flow-send-err", pd)
+	dcql := json.RawMessage(`{"credentials":[{"id":"send-error"}]}`)
+	_, err := session.RequestMatch(ctx, "flow-send-err", dcql)
 	require.Error(t, err)
 }
