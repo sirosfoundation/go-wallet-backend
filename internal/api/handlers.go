@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,31 +20,37 @@ import (
 
 // Handlers aggregates all HTTP handlers
 type Handlers struct {
-	services *service.Services
-	store    storage.Store
-	cfg      *config.Config
-	logger   *zap.Logger
-	roles    []string
+	services      *service.Services
+	store         storage.Store
+	cfg           *config.Config
+	logger        *zap.Logger
+	roles         []string
+	metadataCache *issuerMetadataCache
+	httpClient    *http.Client
 }
 
 // NewHandlers creates a new Handlers instance
 func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
 	return &Handlers{
-		services: services,
-		cfg:      cfg,
-		logger:   logger.Named("handlers"),
-		roles:    roles,
+		services:      services,
+		cfg:           cfg,
+		logger:        logger.Named("handlers"),
+		roles:         roles,
+		metadataCache: newIssuerMetadataCache(),
+		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 	}
 }
 
 // NewHandlersWithStore creates a new Handlers instance with store for health checks
 func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *config.Config, logger *zap.Logger, roles []string) *Handlers {
 	return &Handlers{
-		services: services,
-		store:    store,
-		cfg:      cfg,
-		logger:   logger.Named("handlers"),
-		roles:    roles,
+		services:      services,
+		store:         store,
+		cfg:           cfg,
+		logger:        logger.Named("handlers"),
+		roles:         roles,
+		metadataCache: newIssuerMetadataCache(),
+		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 	}
 }
 
