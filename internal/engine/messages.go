@@ -282,12 +282,9 @@ type SignResponseMessage struct {
 // MatchRequestMessage requests client-side credential matching.
 // This is the privacy-preserving protocol: credentials are matched locally
 // and only matching credential IDs/metadata are sent back to the server.
-// At most one of PresentationDefinition or DCQLQuery should be set;
-// the sender enforces this before constructing the message.
 type MatchRequestMessage struct {
 	Message
-	PresentationDefinition *PresentationDefinition `json:"presentation_definition,omitempty"`
-	DCQLQuery              json.RawMessage         `json:"dcql_query,omitempty"`
+	DCQLQuery json.RawMessage `json:"dcql_query,omitempty"`
 }
 
 // MatchResponseMessage is the client's matching response
@@ -342,11 +339,8 @@ type LogoInfo struct {
 	URI string `json:"uri"`
 }
 
-// CredentialMatch represents a credential that matches a presentation request.
-// For Presentation Definition requests, InputDescriptorID is set.
-// For DCQL requests, CredentialQueryID is set.
+// CredentialMatch represents a credential that matches a DCQL query.
 type CredentialMatch struct {
-	InputDescriptorID string   `json:"input_descriptor_id,omitempty"`
 	CredentialQueryID string   `json:"credential_query_id,omitempty"`
 	CredentialID      string   `json:"credential_id"`
 	Format            string   `json:"format"`
@@ -354,17 +348,13 @@ type CredentialMatch struct {
 	AvailableClaims   []string `json:"available_claims,omitempty"`
 }
 
-// QueryID returns the appropriate query identifier (InputDescriptorID or CredentialQueryID).
+// QueryID returns the credential query identifier.
 func (m CredentialMatch) QueryID() string {
-	if m.CredentialQueryID != "" {
-		return m.CredentialQueryID
-	}
-	return m.InputDescriptorID
+	return m.CredentialQueryID
 }
 
 // MatchedCredential represents a credential with consent info
 type MatchedCredential struct {
-	InputDescriptorID string          `json:"input_descriptor_id,omitempty"`
 	CredentialQueryID string          `json:"credential_query_id,omitempty"`
 	CredentialID      string          `json:"credential_id"`
 	CredentialDisplay json.RawMessage `json:"credential_display,omitempty"`

@@ -70,9 +70,8 @@ func (h *BaseHandler) RequestSign(ctx context.Context, action SignAction, params
 }
 
 // RequestMatch requests client-side credential matching (privacy-preserving).
-// Accepts either a PresentationDefinition or a DCQL query.
-func (h *BaseHandler) RequestMatch(ctx context.Context, pd *PresentationDefinition, dcql json.RawMessage) (*MatchResponseMessage, error) {
-	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, pd, dcql)
+func (h *BaseHandler) RequestMatch(ctx context.Context, dcql json.RawMessage) (*MatchResponseMessage, error) {
+	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, dcql)
 }
 
 // WaitForAction waits for a client action

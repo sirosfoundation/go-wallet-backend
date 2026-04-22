@@ -221,50 +221,7 @@ func TestGetCanonicalVerifierURL(t *testing.T) {
 	}
 }
 
-// ===== DCQL support tests =====
-
-func TestAuthorizationRequest_IsDCQL(t *testing.T) {
-	tests := []struct {
-		name string
-		req  AuthorizationRequest
-		want bool
-	}{
-		{
-			name: "dcql_query set",
-			req:  AuthorizationRequest{DCQLQuery: json.RawMessage(`{"credentials":[]}`)},
-			want: true,
-		},
-		{
-			name: "presentation_definition set",
-			req: AuthorizationRequest{PresentationDefinition: &PresentationDefinition{
-				ID: "test", InputDescriptors: []InputDescriptor{{ID: "id_card"}},
-			}},
-			want: false,
-		},
-		{
-			name: "neither set",
-			req:  AuthorizationRequest{},
-			want: false,
-		},
-		{
-			name: "dcql_query is null JSON",
-			req:  AuthorizationRequest{DCQLQuery: json.RawMessage(`null`)},
-			// A null JSON value is not a valid DCQL query and should not cause
-			// the request to be classified as DCQL.
-			want: false,
-		},
-		{
-			name: "dcql_query is whitespace only",
-			req:  AuthorizationRequest{DCQLQuery: json.RawMessage("  \t\n ")},
-			want: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.req.IsDCQL())
-		})
-	}
-}
+// ===== DCQL query tests =====
 
 func TestCredentialMatch_QueryID(t *testing.T) {
 	tests := []struct {
@@ -273,23 +230,13 @@ func TestCredentialMatch_QueryID(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "DCQL credential_query_id",
+			name:  "credential_query_id set",
 			match: CredentialMatch{CredentialQueryID: "my_credential", CredentialID: "cred-1"},
 			want:  "my_credential",
 		},
 		{
-			name:  "PD input_descriptor_id",
-			match: CredentialMatch{InputDescriptorID: "id_card_desc", CredentialID: "cred-2"},
-			want:  "id_card_desc",
-		},
-		{
-			name:  "DCQL takes precedence",
-			match: CredentialMatch{CredentialQueryID: "dcql_id", InputDescriptorID: "pd_id", CredentialID: "cred-3"},
-			want:  "dcql_id",
-		},
-		{
-			name:  "neither set",
-			match: CredentialMatch{CredentialID: "cred-4"},
+			name:  "not set",
+			match: CredentialMatch{CredentialID: "cred-2"},
 			want:  "",
 		},
 	}
@@ -309,29 +256,7 @@ func TestParseRequestFromURL_DCQLQuery(t *testing.T) {
 	authReq, err := h.parseRequestFromURL(u)
 	require.NoError(t, err)
 
-	assert.True(t, authReq.IsDCQL())
-	assert.Nil(t, authReq.PresentationDefinition)
-	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
-}
-
-func TestParseRequestFromURL_DCQLClearsPD(t *testing.T) {
-	// When both dcql_query and presentation_definition are present in the URL,
-	// DCQL takes precedence and PD fields must be cleared.
-	pdJSON := `{"id":"test-pd","input_descriptors":[{"id":"id_card"}]}`
-	dcqlJSON := `{"credentials":[{"id":"my_credential","format":"vc+sd-jwt"}]}`
-	u, err := url.Parse("openid4vp://?response_type=vp_token&client_id=https://verifier.example.com" +
-		"&presentation_definition=" + url.QueryEscape(pdJSON) +
-		"&presentation_definition_uri=" + url.QueryEscape("https://example.com/pd") +
-		"&dcql_query=" + url.QueryEscape(dcqlJSON))
-	require.NoError(t, err)
-
-	h := &OID4VPHandler{}
-	authReq, err := h.parseRequestFromURL(u)
-	require.NoError(t, err)
-
-	assert.True(t, authReq.IsDCQL())
-	assert.Nil(t, authReq.PresentationDefinition, "PD should be cleared when DCQL is present")
-	assert.Empty(t, authReq.PresentationDefinitionURI, "PD URI should be cleared when DCQL is present")
+	assert.NotNil(t, authReq.DCQLQuery)
 	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
 }
 
@@ -373,12 +298,12 @@ func TestParseRequestJWT_DCQLQuery(t *testing.T) {
 	authReq, err := h.parseRequestJWT(jwtStr)
 	require.NoError(t, err)
 
-	assert.True(t, authReq.IsDCQL())
+	assert.True(t, len(authReq.DCQLQuery) > 0)
 	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
 	assert.Equal(t, "test-nonce", authReq.Nonce)
 }
 
-func TestSubmitDirectPost_DCQL_NoPresentationSubmission(t *testing.T) {
+func TestSubmitDirectPost_NoPresentationSubmission(t *testing.T) {
 	// Verify that DCQL requests don't send presentation_submission
 	var receivedForm url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -404,37 +329,7 @@ func TestSubmitDirectPost_DCQL_NoPresentationSubmission(t *testing.T) {
 
 	assert.Equal(t, "test-vp-token", receivedForm.Get("vp_token"))
 	assert.Equal(t, "test-state", receivedForm.Get("state"))
-	assert.Empty(t, receivedForm.Get("presentation_submission"), "DCQL should not send presentation_submission")
-}
-
-func TestSubmitDirectPost_PD_IncludesPresentationSubmission(t *testing.T) {
-	// Verify that PD requests still send presentation_submission
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseForm()
-		require.NoError(t, err)
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{})
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{
-		httpClient: server.Client(),
-	}
-
-	authReq := &AuthorizationRequest{
-		PresentationDefinition: &PresentationDefinition{
-			ID:               "test-pd",
-			InputDescriptors: []InputDescriptor{{ID: "id_card"}},
-		},
-		State: "test-state",
-	}
-
-	_, err := h.submitDirectPost(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err)
-
-	assert.NotEmpty(t, receivedForm.Get("presentation_submission"), "PD should include presentation_submission")
+	assert.Empty(t, receivedForm.Get("presentation_submission"), "should not send presentation_submission")
 }
 
 func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
@@ -453,32 +348,5 @@ func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
 	var parsed map[string]interface{}
 	require.NoError(t, json.Unmarshal(data, &parsed))
 
-	// dcql_query should be present
 	assert.NotNil(t, parsed["dcql_query"])
-	// presentation_definition should be absent (omitempty)
-	_, hasPD := parsed["presentation_definition"]
-	assert.False(t, hasPD, "presentation_definition should be omitted for DCQL")
-}
-
-func TestMatchRequestMessage_PD_JSON(t *testing.T) {
-	msg := MatchRequestMessage{
-		Message: Message{
-			Type:   TypeMatchRequest,
-			FlowID: "test-flow",
-		},
-		PresentationDefinition: &PresentationDefinition{
-			ID:               "test-pd",
-			InputDescriptors: []InputDescriptor{{ID: "id_card"}},
-		},
-	}
-
-	data, err := json.Marshal(msg)
-	require.NoError(t, err)
-
-	var parsed map[string]interface{}
-	require.NoError(t, json.Unmarshal(data, &parsed))
-
-	assert.NotNil(t, parsed["presentation_definition"])
-	_, hasDCQL := parsed["dcql_query"]
-	assert.False(t, hasDCQL, "dcql_query should be omitted for PD")
 }
