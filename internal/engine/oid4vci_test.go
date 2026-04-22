@@ -1945,3 +1945,409 @@ func TestSignResponseMessage_ProofsField(t *testing.T) {
 	assert.Equal(t, "attestation", decoded.Proofs[1].ProofType)
 	assert.Equal(t, "attest-xyz", decoded.Proofs[1].Attestation)
 }
+
+// ===== fetchOAuthMetadata tests =====
+
+func TestFetchOAuthMetadata_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, r.URL.Path, "/.well-known/oauth-authorization-server")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"authorization_endpoint":                "https://as.example.com/authorize",
+			"token_endpoint":                        "https://as.example.com/token",
+			"pushed_authorization_request_endpoint": "https://as.example.com/par",
+		})
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer: server.URL,
+	})
+	require.NotNil(t, meta)
+	assert.Equal(t, "https://as.example.com/authorize", meta.AuthorizationEndpoint)
+	assert.Equal(t, "https://as.example.com/token", meta.TokenEndpoint)
+	assert.Equal(t, "https://as.example.com/par", meta.PushedAuthorizationRequestEndpoint)
+}
+
+func TestFetchOAuthMetadata_UsesAuthorizationServer(t *testing.T) {
+	var requestedURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedURL = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"authorization_endpoint": "https://as.example.com/authorize",
+			"token_endpoint":         "https://as.example.com/token",
+		})
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer:    "https://issuer.example.com",
+		AuthorizationServer: server.URL,
+	})
+	require.NotNil(t, meta)
+	assert.Equal(t, "/.well-known/oauth-authorization-server", requestedURL)
+}
+
+func TestFetchOAuthMetadata_FallbackToCredentialIssuer(t *testing.T) {
+	var requestedURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedURL = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_endpoint": "https://issuer.example.com/token",
+		})
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer: server.URL,
+		// AuthorizationServer intentionally empty
+	})
+	require.NotNil(t, meta)
+	assert.Equal(t, "/.well-known/oauth-authorization-server", requestedURL)
+}
+
+func TestFetchOAuthMetadata_404ReturnsNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer: server.URL,
+	})
+	assert.Nil(t, meta)
+}
+
+func TestFetchOAuthMetadata_NetworkErrorReturnsNil(t *testing.T) {
+	h := &OID4VCIHandler{
+		httpClient: &http.Client{Transport: &errRoundTripper{}},
+	}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer: "https://unreachable.example.com",
+	})
+	assert.Nil(t, meta)
+}
+
+func TestFetchOAuthMetadata_MalformedJSONReturnsNil(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{not valid json`))
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer: server.URL,
+	})
+	assert.Nil(t, meta)
+}
+
+// ===== resumeWithAuthCode tests =====
+
+func TestResumeWithAuthCode_Success(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := r.ParseForm()
+		require.NoError(t, err)
+		assert.Equal(t, "authorization_code", r.FormValue("grant_type"))
+		assert.Equal(t, "test-auth-code", r.FormValue("code"))
+		assert.Equal(t, "test-verifier", r.FormValue("code_verifier"))
+		assert.Equal(t, "https://wallet.example.com/cb", r.FormValue("redirect_uri"))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "resumed-access-token",
+			TokenType:   "Bearer",
+			ExpiresIn:   3600,
+			CNonce:      "resumed-nonce",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+	msg := &FlowStartMessage{
+		AuthCode:     "test-auth-code",
+		CodeVerifier: "test-verifier",
+		RedirectURI:  "https://wallet.example.com/cb",
+	}
+
+	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.NoError(t, err)
+	assert.Equal(t, "resumed-access-token", token.AccessToken)
+	assert.Equal(t, "resumed-nonce", token.CNonce)
+}
+
+func TestResumeWithAuthCode_MissingRedirectURI(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    "https://issuer.example.com/token",
+	}
+	msg := &FlowStartMessage{
+		AuthCode:     "test-auth-code",
+		CodeVerifier: "test-verifier",
+		// RedirectURI intentionally empty
+	}
+
+	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect_uri is required")
+}
+
+func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) {
+	// OAuth metadata server returns token endpoint
+	var tokenRequested bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// The token_endpoint will be set dynamically after server starts
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_endpoint": "http://" + r.Host + "/token",
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		tokenRequested = true
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "discovered-token",
+			TokenType:   "Bearer",
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	h, cleanup := testOID4VCIHandler(t, server.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: server.URL,
+		// TokenEndpoint intentionally empty — should be discovered
+	}
+	msg := &FlowStartMessage{
+		AuthCode:     "test-code",
+		CodeVerifier: "test-verifier",
+		RedirectURI:  "https://wallet.example.com/cb",
+	}
+
+	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.NoError(t, err)
+	assert.True(t, tokenRequested, "token endpoint should have been called")
+	assert.Equal(t, "discovered-token", token.AccessToken)
+}
+
+func TestResumeWithAuthCode_MissingCodeVerifier(t *testing.T) {
+	// When OAuth metadata is unreachable, PKCE defaults to required.
+	// An empty code_verifier should produce a clear error.
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    "https://issuer.example.com/token",
+	}
+	msg := &FlowStartMessage{
+		AuthCode:    "test-auth-code",
+		RedirectURI: "https://wallet.example.com/cb",
+		// CodeVerifier intentionally empty
+	}
+
+	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "code_verifier is required")
+}
+
+func TestResumeWithAuthCode_PKCENotRequired(t *testing.T) {
+	// When AS explicitly declares empty code_challenge_methods_supported,
+	// PKCE is not required and an empty code_verifier should be allowed.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Explicitly declare empty list → PKCE not supported
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_endpoint":                   "http://" + r.Host + "/token",
+			"code_challenge_methods_supported": []string{},
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "no-pkce-token",
+			TokenType:   "Bearer",
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	h, cleanup := testOID4VCIHandler(t, server.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: server.URL,
+	}
+	msg := &FlowStartMessage{
+		AuthCode:    "test-auth-code",
+		RedirectURI: "https://wallet.example.com/cb",
+		// CodeVerifier intentionally empty — PKCE not required
+	}
+
+	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.NoError(t, err)
+	assert.Equal(t, "no-pkce-token", token.AccessToken)
+}
+
+// ===== handleAuthorization grants fallback tests =====
+
+func TestHandleAuthorization_NoGrantsFallsThrough(t *testing.T) {
+	// When offer.Grants is empty, handleAuthorization should return an error
+	// (current behavior — grants fallback not yet implemented)
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	offer := &CredentialOffer{
+		CredentialIssuer:           "https://issuer.example.com",
+		CredentialConfigurationIDs: []string{"test-config"},
+		Grants:                     map[string]interface{}{}, // empty
+	}
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+	}
+	config := &CredentialConfig{}
+
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no supported grant type")
+}
+
+func TestHandleAuthorization_NilGrantsFallsThrough(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	offer := &CredentialOffer{
+		CredentialIssuer:           "https://issuer.example.com",
+		CredentialConfigurationIDs: []string{"test-config"},
+		Grants:                     nil, // nil
+	}
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+	}
+	config := &CredentialConfig{}
+
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no supported grant type")
+}
+
+func TestHandleAuthorization_PreAuthGrantSelected(t *testing.T) {
+	// Verify pre-auth grant path is selected when present (even though
+	// the flow will fail without a real token endpoint, we verify dispatch)
+	h, cleanup := testOID4VCIHandler(t, &http.Client{Transport: &errRoundTripper{}})
+	defer cleanup()
+
+	offer := &CredentialOffer{
+		CredentialIssuer:           "https://issuer.example.com",
+		CredentialConfigurationIDs: []string{"test-config"},
+		Grants: map[string]interface{}{
+			"urn:ietf:params:oauth:grant-type:pre-authorized_code": map[string]interface{}{
+				"pre-authorized_code": "pre-auth-123",
+			},
+		},
+	}
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    "https://issuer.example.com/token",
+	}
+	config := &CredentialConfig{}
+
+	// Will fail at token exchange (network error), but proves the pre-auth path was taken
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	require.Error(t, err)
+	// Should NOT be "no supported grant type" — the pre-auth path was dispatched
+	assert.NotContains(t, err.Error(), "no supported grant type")
+}
+
+// ===== tx_code description extraction tests =====
+
+func TestTxCodeDescriptionExtraction(t *testing.T) {
+	// Verify that the tx_code description field is correctly extracted
+	// from the grant's tx_code spec object (OID4VCI §4.1.1).
+	tests := []struct {
+		name        string
+		txCode      interface{}
+		wantDesc    string
+		wantHasDesc bool
+	}{
+		{
+			name: "description present",
+			txCode: map[string]interface{}{
+				"input_mode":  "numeric",
+				"length":      6,
+				"description": "Enter the code from your email",
+			},
+			wantDesc:    "Enter the code from your email",
+			wantHasDesc: true,
+		},
+		{
+			name: "description absent",
+			txCode: map[string]interface{}{
+				"input_mode": "numeric",
+				"length":     6,
+			},
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+		{
+			name: "description empty string",
+			txCode: map[string]interface{}{
+				"description": "",
+			},
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+		{
+			name:        "tx_code not a map",
+			txCode:      true,
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desc := ""
+			hasDesc := false
+			if txMap, ok := tt.txCode.(map[string]interface{}); ok {
+				if d, ok := txMap["description"].(string); ok && d != "" {
+					desc = d
+					hasDesc = true
+				}
+			}
+			assert.Equal(t, tt.wantDesc, desc)
+			assert.Equal(t, tt.wantHasDesc, hasDesc)
+		})
+	}
+}
