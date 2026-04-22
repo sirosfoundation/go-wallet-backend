@@ -1,11 +1,15 @@
 package engine
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -215,4 +219,134 @@ func TestGetCanonicalVerifierURL(t *testing.T) {
 			assert.Equal(t, tt.want, got, tt.description)
 		})
 	}
+}
+
+// ===== DCQL query tests =====
+
+func TestCredentialMatch_QueryID(t *testing.T) {
+	tests := []struct {
+		name  string
+		match CredentialMatch
+		want  string
+	}{
+		{
+			name:  "credential_query_id set",
+			match: CredentialMatch{CredentialQueryID: "my_credential", CredentialID: "cred-1"},
+			want:  "my_credential",
+		},
+		{
+			name:  "not set",
+			match: CredentialMatch{CredentialID: "cred-2"},
+			want:  "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.match.QueryID())
+		})
+	}
+}
+
+func TestParseRequestFromURL_DCQLQuery(t *testing.T) {
+	dcqlJSON := `{"credentials":[{"id":"my_credential","format":"vc+sd-jwt","meta":{"vct_values":["https://credentials.example.com/identity_credential"]},"claims":[{"path":["$.first_name"]},{"path":["$.last_name"]}]}]}`
+	u, err := url.Parse("openid4vp://?response_type=vp_token&client_id=https://verifier.example.com&dcql_query=" + url.QueryEscape(dcqlJSON))
+	require.NoError(t, err)
+
+	h := &OID4VPHandler{}
+	authReq, err := h.parseRequestFromURL(u)
+	require.NoError(t, err)
+
+	assert.NotNil(t, authReq.DCQLQuery)
+	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
+}
+
+func TestParseRequestFromURL_InvalidDCQLQuery(t *testing.T) {
+	u, err := url.Parse("openid4vp://?dcql_query=not-valid-json")
+	require.NoError(t, err)
+
+	h := &OID4VPHandler{}
+	_, err = h.parseRequestFromURL(u)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid dcql_query")
+}
+
+func TestParseRequestJWT_DCQLQuery(t *testing.T) {
+	dcqlJSON := `{"credentials":[{"id":"my_credential","format":"vc+sd-jwt"}]}`
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	headerMap := map[string]any{"alg": "ES256"}
+	headerBytes, _ := json.Marshal(headerMap)
+	header := base64.RawURLEncoding.EncodeToString(headerBytes)
+
+	claims := map[string]any{
+		"client_id":  "https://verifier.example.com",
+		"dcql_query": json.RawMessage(dcqlJSON),
+		"nonce":      "test-nonce",
+	}
+	payloadBytes, _ := json.Marshal(claims)
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+
+	signingInput := header + "." + payload
+	sigBytes, err := jwt.SigningMethodES256.Sign(signingInput, privKey)
+	require.NoError(t, err)
+
+	jwtStr := signingInput + "." + base64.RawURLEncoding.EncodeToString(sigBytes)
+
+	h := &OID4VPHandler{}
+	authReq, err := h.parseRequestJWT(jwtStr)
+	require.NoError(t, err)
+
+	assert.True(t, len(authReq.DCQLQuery) > 0)
+	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
+	assert.Equal(t, "test-nonce", authReq.Nonce)
+}
+
+func TestSubmitDirectPost_NoPresentationSubmission(t *testing.T) {
+	// Verify that DCQL requests don't send presentation_submission
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := r.ParseForm()
+		require.NoError(t, err)
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{})
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{
+		httpClient: server.Client(),
+	}
+
+	authReq := &AuthorizationRequest{
+		DCQLQuery: json.RawMessage(`{"credentials":[{"id":"my_credential"}]}`),
+		State:     "test-state",
+	}
+
+	_, err := h.submitDirectPost(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err)
+
+	assert.Equal(t, "test-vp-token", receivedForm.Get("vp_token"))
+	assert.Equal(t, "test-state", receivedForm.Get("state"))
+	assert.Empty(t, receivedForm.Get("presentation_submission"), "should not send presentation_submission")
+}
+
+func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
+	dcqlJSON := json.RawMessage(`{"credentials":[{"id":"my_credential","format":"vc+sd-jwt"}]}`)
+	msg := MatchRequestMessage{
+		Message: Message{
+			Type:   TypeMatchRequest,
+			FlowID: "test-flow",
+		},
+		DCQLQuery: dcqlJSON,
+	}
+
+	data, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	assert.NotNil(t, parsed["dcql_query"])
 }
