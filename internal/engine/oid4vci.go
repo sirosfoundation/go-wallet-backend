@@ -430,7 +430,12 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Step 5: Handle authorization (or resume with provided auth code)
 	var token *TokenResponse
 	if msg.AuthCode != "" {
-		// Resumption: client already completed OAuth and returned with auth code
+		// Resumption: client already completed OAuth and returned with auth code.
+		// Verify the offer actually supports the authorization_code grant.
+		if _, ok := offer.Grants["authorization_code"]; !ok {
+			_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "credential offer does not support authorization_code grant")
+			return errors.New("cannot resume with auth code: credential offer does not support authorization_code grant")
+		}
 		token, err = h.resumeWithAuthCode(ctx, msg, metadata)
 	} else {
 		// Normal flow: handle authorization (pre-auth or auth code grant)
@@ -905,14 +910,19 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 
 	// Check if TX code required
 	if txCodeRequired, ok := grant["tx_code"]; ok && txCodeRequired != nil {
-		// Request TX code from user
-		_ = h.Progress(StepAuthorizationReq, map[string]interface{}{
+		// Use issuer-provided description from tx_code spec (OID4VCI §4.1.1)
+		progressPayload := map[string]interface{}{
 			"type":                "tx_code",
 			"pre_authorized_code": preAuthCode,
 			"tx_code":             txCodeRequired,
 			"credential_issuer":   metadata.CredentialIssuer,
-			"message":             "Please enter the transaction code",
-		})
+		}
+		if txMap, ok := txCodeRequired.(map[string]interface{}); ok {
+			if desc, ok := txMap["description"].(string); ok && desc != "" {
+				progressPayload["message"] = desc
+			}
+		}
+		_ = h.Progress(StepAuthorizationReq, progressPayload)
 
 		action, err := h.WaitForAction(ctx, ActionProvidePin)
 		if err != nil {
@@ -1297,11 +1307,20 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	h.Logger.Info("Resuming OID4VCI flow with authorization code")
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
-	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
-	if metadata.TokenEndpoint == "" {
-		if oauthMeta := h.fetchOAuthMetadata(ctx, metadata); oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
-			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
-		}
+	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
+	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
+	if oauthMeta != nil && oauthMeta.TokenEndpoint != "" && metadata.TokenEndpoint == "" {
+		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	}
+
+	// Validate code_verifier: PKCE defaults to enabled (OID4VCI spec), so if the
+	// AS requires it the token exchange will fail without a verifier. Catch this
+	// early with a clear error rather than an opaque OAuth error from the AS.
+	pkceRequired := oauthMeta == nil || oauthMeta.supportsPKCE()
+	codeVerifier := strings.TrimSpace(msg.CodeVerifier)
+	if pkceRequired && codeVerifier == "" {
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "code_verifier is required for flow resumption")
+		return nil, errors.New("code_verifier is required for flow resumption")
 	}
 
 	// Use redirect URI from message
@@ -1312,7 +1331,7 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	}
 
 	// Exchange authorization code using provided code_verifier
-	return h.exchangeAuthCode(ctx, metadata, msg.AuthCode, redirectURI, msg.CodeVerifier)
+	return h.exchangeAuthCode(ctx, metadata, msg.AuthCode, redirectURI, codeVerifier)
 }
 
 // CNonceRequiredError is returned by requestCredential when the credential

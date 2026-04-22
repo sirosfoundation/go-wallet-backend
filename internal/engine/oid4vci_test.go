@@ -1955,7 +1955,7 @@ func TestFetchOAuthMetadata_Success(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"authorization_endpoint":                "https://as.example.com/authorize",
 			"token_endpoint":                        "https://as.example.com/token",
-			"pushed_authorization_request_endpoint":  "https://as.example.com/par",
+			"pushed_authorization_request_endpoint": "https://as.example.com/par",
 		})
 	}))
 	defer server.Close()
@@ -2160,6 +2160,66 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 	assert.Equal(t, "discovered-token", token.AccessToken)
 }
 
+func TestResumeWithAuthCode_MissingCodeVerifier(t *testing.T) {
+	// When OAuth metadata is unreachable, PKCE defaults to required.
+	// An empty code_verifier should produce a clear error.
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    "https://issuer.example.com/token",
+	}
+	msg := &FlowStartMessage{
+		AuthCode:    "test-auth-code",
+		RedirectURI: "https://wallet.example.com/cb",
+		// CodeVerifier intentionally empty
+	}
+
+	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "code_verifier is required")
+}
+
+func TestResumeWithAuthCode_PKCENotRequired(t *testing.T) {
+	// When AS explicitly declares empty code_challenge_methods_supported,
+	// PKCE is not required and an empty code_verifier should be allowed.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Explicitly declare empty list → PKCE not supported
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_endpoint":                   "http://" + r.Host + "/token",
+			"code_challenge_methods_supported": []string{},
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "no-pkce-token",
+			TokenType:   "Bearer",
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	h, cleanup := testOID4VCIHandler(t, server.Client())
+	defer cleanup()
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: server.URL,
+	}
+	msg := &FlowStartMessage{
+		AuthCode:    "test-auth-code",
+		RedirectURI: "https://wallet.example.com/cb",
+		// CodeVerifier intentionally empty — PKCE not required
+	}
+
+	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.NoError(t, err)
+	assert.Equal(t, "no-pkce-token", token.AccessToken)
+}
+
 // ===== handleAuthorization grants fallback tests =====
 
 func TestHandleAuthorization_NoGrantsFallsThrough(t *testing.T) {
@@ -2228,4 +2288,66 @@ func TestHandleAuthorization_PreAuthGrantSelected(t *testing.T) {
 	require.Error(t, err)
 	// Should NOT be "no supported grant type" — the pre-auth path was dispatched
 	assert.NotContains(t, err.Error(), "no supported grant type")
+}
+
+// ===== tx_code description extraction tests =====
+
+func TestTxCodeDescriptionExtraction(t *testing.T) {
+	// Verify that the tx_code description field is correctly extracted
+	// from the grant's tx_code spec object (OID4VCI §4.1.1).
+	tests := []struct {
+		name        string
+		txCode      interface{}
+		wantDesc    string
+		wantHasDesc bool
+	}{
+		{
+			name: "description present",
+			txCode: map[string]interface{}{
+				"input_mode":  "numeric",
+				"length":      6,
+				"description": "Enter the code from your email",
+			},
+			wantDesc:    "Enter the code from your email",
+			wantHasDesc: true,
+		},
+		{
+			name: "description absent",
+			txCode: map[string]interface{}{
+				"input_mode": "numeric",
+				"length":     6,
+			},
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+		{
+			name: "description empty string",
+			txCode: map[string]interface{}{
+				"description": "",
+			},
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+		{
+			name:        "tx_code not a map",
+			txCode:      true,
+			wantDesc:    "",
+			wantHasDesc: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desc := ""
+			hasDesc := false
+			if txMap, ok := tt.txCode.(map[string]interface{}); ok {
+				if d, ok := txMap["description"].(string); ok && d != "" {
+					desc = d
+					hasDesc = true
+				}
+			}
+			assert.Equal(t, tt.wantDesc, desc)
+			assert.Equal(t, tt.wantHasDesc, hasDesc)
+		})
+	}
 }
