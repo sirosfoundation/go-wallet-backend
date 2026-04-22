@@ -23,7 +23,7 @@ type VCTMHandler struct {
 }
 
 // NewVCTMHandler creates a new VCTM flow handler
-func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
+func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 	// Get registry URL from config, or use default
 	registryURL := cfg.Trust.RegistryURL
 	if registryURL == "" {
