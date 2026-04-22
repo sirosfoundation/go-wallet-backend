@@ -253,6 +253,11 @@ func TestAuthorizationRequest_IsDCQL(t *testing.T) {
 			// the request to be classified as DCQL.
 			want: false,
 		},
+		{
+			name: "dcql_query is whitespace only",
+			req:  AuthorizationRequest{DCQLQuery: json.RawMessage("  \t\n ")},
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -306,6 +311,27 @@ func TestParseRequestFromURL_DCQLQuery(t *testing.T) {
 
 	assert.True(t, authReq.IsDCQL())
 	assert.Nil(t, authReq.PresentationDefinition)
+	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
+}
+
+func TestParseRequestFromURL_DCQLClearsPD(t *testing.T) {
+	// When both dcql_query and presentation_definition are present in the URL,
+	// DCQL takes precedence and PD fields must be cleared.
+	pdJSON := `{"id":"test-pd","input_descriptors":[{"id":"id_card"}]}`
+	dcqlJSON := `{"credentials":[{"id":"my_credential","format":"vc+sd-jwt"}]}`
+	u, err := url.Parse("openid4vp://?response_type=vp_token&client_id=https://verifier.example.com" +
+		"&presentation_definition=" + url.QueryEscape(pdJSON) +
+		"&presentation_definition_uri=" + url.QueryEscape("https://example.com/pd") +
+		"&dcql_query=" + url.QueryEscape(dcqlJSON))
+	require.NoError(t, err)
+
+	h := &OID4VPHandler{}
+	authReq, err := h.parseRequestFromURL(u)
+	require.NoError(t, err)
+
+	assert.True(t, authReq.IsDCQL())
+	assert.Nil(t, authReq.PresentationDefinition, "PD should be cleared when DCQL is present")
+	assert.Empty(t, authReq.PresentationDefinitionURI, "PD URI should be cleared when DCQL is present")
 	assert.JSONEq(t, dcqlJSON, string(authReq.DCQLQuery))
 }
 
