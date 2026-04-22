@@ -72,8 +72,12 @@ func TestTrustCache_TenantIsolation(t *testing.T) {
 }
 
 func TestTrustCache_Expiry(t *testing.T) {
-	cache := NewTrustCache(1 * time.Millisecond) // Very short TTL
+	cache := NewTrustCache(1 * time.Hour)
 	tenant := domain.TenantID("test")
+
+	// Use injectable clock to avoid flaky time.Sleep-based tests
+	fakeNow := time.Now()
+	cache.now = func() time.Time { return fakeNow }
 
 	cache.Set(tenant, "https://verifier.example.com", &TrustCacheRecord{
 		Name:    "Expiring",
@@ -85,8 +89,8 @@ func TestTrustCache_Expiry(t *testing.T) {
 		t.Fatal("expected record immediately after set")
 	}
 
-	// Wait for expiry
-	time.Sleep(5 * time.Millisecond)
+	// Advance clock past TTL
+	fakeNow = fakeNow.Add(2 * time.Hour)
 
 	got := cache.Get(tenant, "https://verifier.example.com")
 	if got != nil {
@@ -140,5 +144,35 @@ func TestTrustCache_Len(t *testing.T) {
 
 	if cache.Len() != 3 {
 		t.Errorf("Len() = %d, want 3", cache.Len())
+	}
+}
+
+func TestTrustCache_SweepOnSet(t *testing.T) {
+	cache := NewTrustCache(1 * time.Hour)
+
+	fakeNow := time.Now()
+	cache.now = func() time.Time { return fakeNow }
+
+	// Add some entries
+	cache.Set("t1", "url1", &TrustCacheRecord{Name: "a"})
+	cache.Set("t1", "url2", &TrustCacheRecord{Name: "b"})
+	cache.Set("t2", "url1", &TrustCacheRecord{Name: "c"})
+
+	if cache.Len() != 3 {
+		t.Fatalf("Len() = %d, want 3 before sweep", cache.Len())
+	}
+
+	// Advance clock past TTL so all existing entries are expired
+	fakeNow = fakeNow.Add(2 * time.Hour)
+
+	// Set a new entry — this should sweep the 3 expired entries
+	cache.Set("t3", "url3", &TrustCacheRecord{Name: "d"})
+
+	// Only the new entry should remain
+	if cache.Len() != 1 {
+		t.Errorf("Len() = %d, want 1 after sweep-on-set", cache.Len())
+	}
+	if got := cache.Get("t3", "url3"); got == nil || got.Name != "d" {
+		t.Errorf("new entry missing after sweep, got %+v", got)
 	}
 }

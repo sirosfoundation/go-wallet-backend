@@ -29,6 +29,7 @@ type TrustCache struct {
 	mu      sync.RWMutex
 	entries map[string]*TrustCacheEntry // key: tenantID + "|" + verifierURL
 	ttl     time.Duration
+	now     func() time.Time // injectable clock for testing
 }
 
 // NewTrustCache creates a new in-memory trust cache with the given TTL.
@@ -36,6 +37,7 @@ func NewTrustCache(ttl time.Duration) *TrustCache {
 	return &TrustCache{
 		entries: make(map[string]*TrustCacheEntry),
 		ttl:     ttl,
+		now:     time.Now,
 	}
 }
 
@@ -55,7 +57,7 @@ func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCac
 	if !ok {
 		return nil
 	}
-	if time.Now().After(entry.ExpiresAt) {
+	if c.now().After(entry.ExpiresAt) {
 		// Expired — remove lazily
 		c.mu.Lock()
 		delete(c.entries, key)
@@ -66,13 +68,21 @@ func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCac
 }
 
 // Set stores a trust evaluation result in the cache.
+// Also sweeps expired entries to prevent unbounded growth.
 func (c *TrustCache) Set(tenantID domain.TenantID, verifierURL string, record *TrustCacheRecord) {
 	key := trustCacheKey(tenantID, verifierURL)
+	now := c.now()
 
 	c.mu.Lock()
 	c.entries[key] = &TrustCacheEntry{
 		Verifier:  record,
-		ExpiresAt: time.Now().Add(c.ttl),
+		ExpiresAt: now.Add(c.ttl),
+	}
+	// Sweep expired entries opportunistically on each Set to prevent unbounded growth
+	for k, e := range c.entries {
+		if now.After(e.ExpiresAt) {
+			delete(c.entries, k)
+		}
 	}
 	c.mu.Unlock()
 }

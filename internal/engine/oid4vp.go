@@ -347,6 +347,30 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingVerifierTrust, "Evaluating verifier trust")
 
+	// Check in-memory trust cache before triggering frontend evaluation
+	canonicalURL := getCanonicalVerifierURL(authReq)
+	if cached := h.getCachedVerifierTrust(canonicalURL); cached != nil {
+		verifier := &VerifierInfo{
+			Name:           cached.Name,
+			ClientIDScheme: cached.ClientIDScheme,
+			Trusted:        cached.Trusted,
+			Framework:      cached.TrustFramework,
+			TrustedStatus:  string(cached.TrustStatus),
+			Domain:         extractDomain(authReq.ClientID),
+		}
+		// Look up admin-configured ClientID (read-only)
+		if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+			verifier.ClientID = clientID
+		}
+		if !verifier.Trusted {
+			return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
+		}
+		h.Logger.Debug("Using cached trust result",
+			zap.String("verifier", authReq.ClientID),
+			zap.Bool("trusted", cached.Trusted))
+		return verifier, nil
+	}
+
 	// Fetch client metadata if needed
 	var clientMeta *ClientMetadata
 	if authReq.ClientMetadata != nil {
@@ -523,7 +547,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	h.cacheVerifierTrust(authReq, verifier)
 
 	// Look up admin-configured ClientID for VP audience (read-only)
-	canonicalURL := getCanonicalVerifierURL(authReq)
 	if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
 		verifier.ClientID = clientID
 	}
@@ -591,7 +614,7 @@ func (h *OID4VPHandler) getCachedVerifierTrust(verifierURL string) *TrustCacheRe
 		return nil
 	}
 
-	tenantID := domain.TenantID("default")
+	tenantID := domain.DefaultTenantID
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
@@ -606,7 +629,7 @@ func (h *OID4VPHandler) getAdminClientID(ctx context.Context, verifierURL string
 		return ""
 	}
 
-	tenantID := domain.TenantID("default")
+	tenantID := domain.DefaultTenantID
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
@@ -625,7 +648,7 @@ func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifi
 		return
 	}
 
-	tenantID := domain.TenantID("default")
+	tenantID := domain.DefaultTenantID
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
