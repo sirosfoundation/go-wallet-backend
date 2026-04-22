@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -266,17 +267,33 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Parse the resolve request
 	var req struct {
-		SubjectID string `json:"subject_id" binding:"required"`
+		SubjectID   string `json:"subject_id" binding:"required"`
+		SubjectType string `json:"subject_type"` // "key" (default) or "url"
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
+	// Determine subject type: explicit field takes precedence,
+	// otherwise auto-detect from the subject_id format.
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		if strings.HasPrefix(req.SubjectID, "https://") {
+			subjectType = "url"
+		} else {
+			subjectType = "key"
+		}
+	}
+	if subjectType != "key" && subjectType != "url" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "subject_type must be 'key' or 'url'"})
+		return
+	}
+
 	// Build an evaluation request for resolution-only
 	evalReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
-			Type: "key",
+			Type: subjectType,
 			ID:   req.SubjectID,
 		},
 		Resource: gotrust.Resource{

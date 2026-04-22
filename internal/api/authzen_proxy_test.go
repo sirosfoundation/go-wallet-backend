@@ -519,6 +519,131 @@ func TestResolve_BadGateway_PDPError(t *testing.T) {
 	}
 }
 
+func TestResolve_URLSubject_AutoDetect(t *testing.T) {
+	// Mock PDP that verifies the subject type is "url"
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var evalReq gotrust.EvaluationRequest
+		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
+			t.Fatalf("Failed to decode request: %v", err)
+		}
+		if evalReq.Subject.Type != "url" {
+			t.Errorf("Expected subject.type 'url', got %q", evalReq.Subject.Type)
+		}
+		if evalReq.Subject.ID != "https://issuer.example.com" {
+			t.Errorf("Expected subject.id 'https://issuer.example.com', got %q", evalReq.Subject.ID)
+		}
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, pdpHandler)
+	defer pdpServer.Close()
+
+	reqBody := map[string]string{
+		"subject_id": "https://issuer.example.com",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_URLSubject_ExplicitType(t *testing.T) {
+	// Mock PDP that verifies the subject type is "url"
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var evalReq gotrust.EvaluationRequest
+		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
+			t.Fatalf("Failed to decode request: %v", err)
+		}
+		if evalReq.Subject.Type != "url" {
+			t.Errorf("Expected subject.type 'url', got %q", evalReq.Subject.Type)
+		}
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, pdpHandler)
+	defer pdpServer.Close()
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "https://issuer.example.com",
+		"subject_type": "url",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_DIDSubject_StillWorks(t *testing.T) {
+	// Verify backward compatibility: DID subjects still get type "key"
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var evalReq gotrust.EvaluationRequest
+		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
+			t.Fatalf("Failed to decode request: %v", err)
+		}
+		if evalReq.Subject.Type != "key" {
+			t.Errorf("Expected subject.type 'key', got %q", evalReq.Subject.Type)
+		}
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, pdpHandler)
+	defer pdpServer.Close()
+
+	reqBody := map[string]string{
+		"subject_id": "did:web:example.com",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_InvalidSubjectType(t *testing.T) {
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, nil)
+	if pdpServer != nil {
+		defer pdpServer.Close()
+	}
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "did:web:example.com",
+		"subject_type": "invalid",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
 // ============================================================================
 // Helper Function Tests
 // ============================================================================
