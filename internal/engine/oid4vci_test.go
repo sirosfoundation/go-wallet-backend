@@ -1717,6 +1717,74 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 	assert.True(t, ok, "jwt should be in proof_types_supported sent to frontend")
 }
 
+func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "jwt", JWT: "proof-1"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{
+		redirectURI: "https://wallet.example.com/callback",
+	}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+	}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{
+			"jwt": map[string]interface{}{"alg_values_supported": []string{"ES256"}},
+		},
+	}
+
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	require.NoError(t, err)
+	require.Len(t, proofs, 1)
+
+	receivedParams := <-paramsCh
+	assert.Equal(t, "https://wallet.example.com/callback", receivedParams.Issuer,
+		"Issuer param should equal redirectURI (used as OAuth client_id)")
+	assert.Equal(t, "https://issuer.example.com", receivedParams.Audience)
+	assert.Equal(t, "test-nonce", receivedParams.Nonce)
+}
+
 func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 	paramsCh := make(chan SignRequestParams, 1)
 
