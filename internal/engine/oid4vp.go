@@ -153,7 +153,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Step 6: Complete
 	if result.vpResponse != nil {
 		// DC API mode: send VP response data to frontend for postMessage delivery
-		msg := FlowCompleteMessage{
+		completeMsg := FlowCompleteMessage{
 			Message: Message{
 				Type:      TypeFlowComplete,
 				FlowID:    h.Flow.ID,
@@ -161,7 +161,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 			},
 			ResponseData: result.vpResponse,
 		}
-		return h.Flow.Session.Send(&msg)
+		return h.Flow.Session.Send(&completeMsg)
 	}
 	return h.Complete(nil, result.redirectURI)
 }
