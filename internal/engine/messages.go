@@ -244,8 +244,10 @@ type SignRequestMessage struct {
 
 // SignRequestParams contains signing parameters
 type SignRequestParams struct {
-	Audience  string `json:"audience,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
+	Audience string `json:"audience,omitempty"`
+	Nonce    string `json:"nonce,omitempty"`
+	// Issuer is the JWT `iss` value to use when generating proof JWTs.
+	// This is typically the OAuth client identifier / client_id.
 	Issuer    string `json:"issuer,omitempty"`
 	ProofType string `json:"proof_type,omitempty"`
 	// ProofTypesSupported contains the issuer's proof_types_supported map so the
