@@ -134,7 +134,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 6: Request VP signing from client (use configured ClientID for audience if set)
+	// Step 4: Request VP signing from client (use configured ClientID for audience if set)
 	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
@@ -142,7 +142,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 7: Submit VP response to verifier
+	// Step 5: Submit VP response to verifier
 	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
 	if err != nil {
 		h.Logger.Debug("VP submission failed", zap.Error(err))
@@ -150,7 +150,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 8: Complete
+	// Step 6: Complete
 	return h.Complete(nil, redirectURI)
 }
 
@@ -716,6 +716,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 
 	var payload ConsentPayload
 	if err := json.Unmarshal(action.Payload, &payload); err != nil {
+		_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid consent payload")
 		return nil, fmt.Errorf("invalid consent payload: %w", err)
 	}
 
