@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -30,14 +31,19 @@ import (
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
-	httpClient  *http.Client
-	dpopKey     *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
-	dpopNonce   string            // server-provided DPoP nonce (RFC 9449 §8)
-	redirectURI string
+	httpClient       *http.Client
+	metadataResolver *issuermetadata.Resolver
+	dpopKey          *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce        string            // server-provided DPoP nonce (RFC 9449 §8)
+	redirectURI      string
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
 func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+	resolver, err := issuermetadata.New(issuermetadata.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
+	}
 	return &OID4VCIHandler{
 		BaseHandler: BaseHandler{
 			Flow:     flow,
@@ -46,7 +52,8 @@ func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trust
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient: cfg.HTTPClient.NewHTTPClient(0),
+		httpClient:       cfg.HTTPClient.NewHTTPClient(0),
+		metadataResolver: resolver,
 	}, nil
 }
 
@@ -584,27 +591,18 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*IssuerMetadata, error) {
 	_ = h.ProgressMessage(StepFetchingMetadata, "Fetching issuer metadata")
 
-	// Fetch from well-known endpoint
-	metadataURL := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-credential-issuer"
-
-	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h.httpClient.Do(req)
+	raw, err := h.metadataResolver.Resolve(ctx, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		return nil, fmt.Errorf("metadata fetch returned status %d: %s", resp.StatusCode, string(body))
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling issuer metadata: %w", err)
 	}
 
 	var metadata IssuerMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
