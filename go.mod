@@ -15,7 +15,7 @@ require (
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/sirosfoundation/go-cryptoutil v0.5.0
 	github.com/sirosfoundation/go-spocp v0.1.0
-	github.com/sirosfoundation/go-trust v0.3.1-0.20260410084810-00ffd4f98fe9 // pre-release: needs testserver + action.parameters (pending v0.4.0 tag)
+	github.com/sirosfoundation/go-trust v0.3.1-0.20260423102119-0ad8807f68bd // pre-release: pending go-trust#37 merge + v0.4.0 tag
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver v1.17.9
@@ -69,8 +69,8 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	github.com/sirosfoundation/g119612 v0.0.0-20260324144233-345907d5f149 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/sirosfoundation/g119612 v0.1.0 // indirect
+	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
