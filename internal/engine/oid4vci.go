@@ -1368,6 +1368,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
 		Audience:            metadata.CredentialIssuer,
 		Nonce:               nonce,
+		Issuer:              h.redirectURI,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
 	})

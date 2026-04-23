@@ -246,6 +246,7 @@ type SignRequestMessage struct {
 type SignRequestParams struct {
 	Audience  string `json:"audience,omitempty"`
 	Nonce     string `json:"nonce,omitempty"`
+	Issuer    string `json:"issuer,omitempty"`
 	ProofType string `json:"proof_type,omitempty"`
 	// ProofTypesSupported contains the issuer's proof_types_supported map so the
 	// frontend has full context to decide which proof type(s) to generate.
