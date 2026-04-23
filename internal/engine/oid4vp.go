@@ -128,25 +128,8 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 3: Send parsed request info to client
-	_ = h.Progress(StepRequestParsed, map[string]interface{}{
-		"verifier":   verifier,
-		"dcql_query": authReq.DCQLQuery,
-	})
-
-	// Step 4: Request client-side credential matching (privacy-preserving)
-	matches, err := h.requestCredentialMatching(ctx, authReq)
-	if err != nil {
-		return err
-	}
-
-	if len(matches) == 0 {
-		_ = h.Error(StepMatchCredentials, ErrCodePresentationError, "No matching credentials found")
-		return errors.New("no matching credentials")
-	}
-
-	// Step 5: Request user consent
-	selectedCredentials, err := h.requestConsent(ctx, matches, verifier)
+	// Step 3: Send credential_selection with dcql_query + verifier; wait for consent or decline
+	selectedCredentials, err := h.requestCredentialSelection(ctx, authReq, verifier)
 	if err != nil {
 		return err
 	}
@@ -707,50 +690,15 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 	return &cm, nil
 }
 
-func (h *OID4VPHandler) requestCredentialMatching(ctx context.Context, authReq *AuthorizationRequest) ([]CredentialMatch, error) {
-	// Send match_request to client for local matching (privacy-preserving)
-	// The client matches credentials locally and returns only the matching credential IDs/metadata.
-	resp, err := h.RequestMatch(ctx, authReq.DCQLQuery)
-	if err != nil {
-		if errors.Is(err, ErrMatchTimeout) {
-			h.Logger.Warn("Credential matching timed out")
-			// Notify client that matching timed out so UI can show appropriate message
-			_ = h.Error(StepMatchCredentials, ErrCodeMatchTimeout, "Credential matching timed out")
-			return nil, err
-		}
-		h.Logger.Debug("Credential matching failed", zap.Error(err))
-		return nil, err
-	}
-
-	if resp.NoMatchReason != "" {
-		h.Logger.Info("No credentials matched", zap.String("reason", resp.NoMatchReason))
-	}
-
-	return resp.Matches, nil
-}
-
-func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []CredentialMatch, verifier *VerifierInfo) ([]ConsentSelection, error) {
-	// Build matched credentials display
-	matchedCredentials := make([]MatchedCredential, len(matches))
-	for i, m := range matches {
-		matchedCredentials[i] = MatchedCredential{
-			CredentialQueryID: m.CredentialQueryID,
-			CredentialID:      m.CredentialID,
-			DisclosableClaims: m.AvailableClaims,
-		}
-
-		// Fetch credential display from VCTM if available
-		if m.VCT != "" && h.Registry != nil {
-			matchedCredentials[i].CredentialDisplay = h.Registry.FetchTypeMetadataJSON(ctx, m.VCT)
-		}
-	}
-
-	_ = h.Progress(StepAwaitingConsent, map[string]interface{}{
-		"matched_credentials": matchedCredentials,
-		"verifier":            verifier,
+// requestCredentialSelection sends dcql_query + verifier to the client in a single
+// credential_selection progress message and waits for the user to consent or decline.
+// The frontend is responsible for local credential matching and the consent UI.
+func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
+	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
+		"dcql_query": authReq.DCQLQuery,
+		"verifier":   verifier,
 	})
 
-	// Wait for consent or decline
 	action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline)
 	if err != nil {
 		return nil, err
@@ -762,13 +710,18 @@ func (h *OID4VPHandler) requestConsent(ctx context.Context, matches []Credential
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		_ = h.Error(StepAwaitingConsent, ErrCodePresentationError, "User declined the request")
+		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
 		return nil, errors.New("user declined presentation")
 	}
 
 	var payload ConsentPayload
 	if err := json.Unmarshal(action.Payload, &payload); err != nil {
 		return nil, fmt.Errorf("invalid consent payload: %w", err)
+	}
+
+	if len(payload.SelectedCredentials) == 0 {
+		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "No credentials selected")
+		return nil, errors.New("no credentials selected")
 	}
 
 	return payload.SelectedCredentials, nil

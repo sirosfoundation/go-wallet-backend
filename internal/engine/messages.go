@@ -66,6 +66,7 @@ const (
 	StepEvaluatingVerifierTrust FlowStep = "evaluating_verifier_trust"
 	StepMatchCredentials        FlowStep = "match_credentials"
 	StepAwaitingConsent         FlowStep = "awaiting_consent"
+	StepCredentialSelection     FlowStep = "credential_selection"
 	StepSubmittingResponse      FlowStep = "submitting_response"
 )
 
