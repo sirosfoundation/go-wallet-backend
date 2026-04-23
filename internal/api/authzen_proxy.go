@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 
@@ -275,19 +275,26 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// Determine subject type: explicit field takes precedence,
-	// otherwise auto-detect from the subject_id format.
+	// Determine subject type: explicit field takes precedence, default is "key".
+	// Callers that want issuer metadata resolution must explicitly pass subject_type="url".
+	// This preserves backward compatibility: existing callers using HTTPS URLs for OIDF
+	// entity resolution continue to work with subject_type="key" (the default).
 	subjectType := req.SubjectType
 	if subjectType == "" {
-		if strings.HasPrefix(req.SubjectID, "https://") {
-			subjectType = "url"
-		} else {
-			subjectType = "key"
-		}
+		subjectType = "key"
 	}
 	if subjectType != "key" && subjectType != "url" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "subject_type must be 'key' or 'url'"})
 		return
+	}
+
+	// When subject_type is "url", validate that subject_id is a well-formed HTTPS URL.
+	if subjectType == "url" {
+		u, err := url.Parse(req.SubjectID)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_id must be a valid HTTPS URL when subject_type is 'url'"})
+			return
+		}
 	}
 
 	// Build an evaluation request for resolution-only

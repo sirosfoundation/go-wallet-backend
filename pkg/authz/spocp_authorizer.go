@@ -248,6 +248,21 @@ func DefaultWalletRules() []sexp.Element {
 				sexp.NewList("id", &starform.Prefix{Value: "http://"}),
 			),
 		),
+
+		// Rule 5: Allow issuer metadata resolution (subject.type="url", HTTPS URLs)
+		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata.
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("resolution")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
+			),
+		),
 	}
 }
 
@@ -295,6 +310,20 @@ func ProductionWalletRules() []sexp.Element {
 			),
 			sexp.NewList("subject",
 				sexp.NewList("type", sexp.NewAtom("key")),
+				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
+			),
+		),
+
+		// Allow issuer metadata resolution (subject.type="url", HTTPS only in production)
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("resolution")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
 				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
 			),
 		),

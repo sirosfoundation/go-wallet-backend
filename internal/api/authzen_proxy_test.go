@@ -519,15 +519,16 @@ func TestResolve_BadGateway_PDPError(t *testing.T) {
 	}
 }
 
-func TestResolve_URLSubject_AutoDetect(t *testing.T) {
-	// Mock PDP that verifies the subject type is "url"
+func TestResolve_URLSubject_DefaultsToKey(t *testing.T) {
+	// HTTPS URLs without an explicit subject_type must default to "key" for backward
+	// compatibility (e.g. OIDF entity resolution over HTTPS uses subject.type="key").
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var evalReq gotrust.EvaluationRequest
 		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
 			t.Fatalf("Failed to decode request: %v", err)
 		}
-		if evalReq.Subject.Type != "url" {
-			t.Errorf("Expected subject.type 'url', got %q", evalReq.Subject.Type)
+		if evalReq.Subject.Type != "key" {
+			t.Errorf("Expected subject.type 'key' (default), got %q", evalReq.Subject.Type)
 		}
 		if evalReq.Subject.ID != "https://issuer.example.com" {
 			t.Errorf("Expected subject.id 'https://issuer.example.com', got %q", evalReq.Subject.ID)
@@ -641,6 +642,79 @@ func TestResolve_InvalidSubjectType(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestResolve_URLSubject_NonHTTPS_Rejected(t *testing.T) {
+	// When subject_type="url" is explicitly set, subject_id must be a valid HTTPS URL.
+	// HTTP URLs should be rejected with 400.
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, nil)
+	if pdpServer != nil {
+		defer pdpServer.Close()
+	}
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "http://issuer.example.com",
+		"subject_type": "url",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
+	// Integration test: subject.type="url" with an HTTPS URL must be authorized by
+	// the default SPOCP rules (Rule 5 added alongside the issuer-url registry).
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp) //nolint:errcheck
+	})
+	pdpServer := httptest.NewServer(pdpHandler)
+	defer pdpServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+
+	logger := zap.NewNop()
+	spocpAuth, err := authz.NewSPOCPAuthorizer(nil, logger)
+	if err != nil {
+		t.Fatalf("failed to create SPOCP authorizer: %v", err)
+	}
+	handler := NewAuthZENProxyHandler(cfg, spocpAuth, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "https://issuer.example.com",
+		"subject_type": "url",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d (url-type subject authorized by default SPOCP rules), got %d: %s",
+			http.StatusOK, w.Code, w.Body.String())
 	}
 }
 

@@ -91,6 +91,21 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 			shouldPass: true,
 		},
 		{
+			name:     "issuer metadata resolution (url type)",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "url",
+					ID:   "https://issuer.example.com",
+				},
+				Resource: gotrust.Resource{
+					Type: "resolution",
+					ID:   "https://issuer.example.com",
+				},
+			},
+			shouldPass: true,
+		},
+		{
 			name:     "unsupported action",
 			tenantID: "default",
 			request: &gotrust.EvaluationRequest{
