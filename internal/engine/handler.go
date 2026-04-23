@@ -20,17 +20,18 @@ type FlowHandler interface {
 }
 
 // FlowHandlerFactory creates a flow handler for a flow
-type FlowHandlerFactory func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error)
+type FlowHandlerFactory func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error)
 
 // BaseHandler provides common functionality for flow handlers
 type BaseHandler struct {
-	Flow      *Flow
-	Config    *config.Config
-	Logger    *zap.Logger
-	TrustSvc  *TrustService
-	Registry  *RegistryClient
-	Verifiers storage.VerifierStore
-	cancel    context.CancelFunc
+	Flow       *Flow
+	Config     *config.Config
+	Logger     *zap.Logger
+	TrustSvc   *TrustService
+	Registry   *RegistryClient
+	Verifiers  storage.VerifierStore
+	TrustCache *TrustCache
+	cancel     context.CancelFunc
 }
 
 // Cancel cancels the flow

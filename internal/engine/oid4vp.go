@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -27,15 +26,16 @@ type OID4VPHandler struct {
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
-func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
+func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
-			Flow:      flow,
-			Config:    cfg,
-			Logger:    logger,
-			TrustSvc:  trustSvc,
-			Registry:  registry,
-			Verifiers: verifiers,
+			Flow:       flow,
+			Config:     cfg,
+			Logger:     logger,
+			TrustSvc:   trustSvc,
+			Registry:   registry,
+			Verifiers:  verifiers,
+			TrustCache: trustCache,
 		},
 		httpClient: cfg.HTTPClient.NewHTTPClient(0),
 	}, nil
@@ -314,6 +314,30 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingVerifierTrust, "Evaluating verifier trust")
 
+	// Check in-memory trust cache before triggering frontend evaluation
+	canonicalURL := getCanonicalVerifierURL(authReq)
+	if cached := h.getCachedVerifierTrust(canonicalURL); cached != nil {
+		verifier := &VerifierInfo{
+			Name:           cached.Name,
+			ClientIDScheme: cached.ClientIDScheme,
+			Trusted:        cached.Trusted,
+			Framework:      cached.TrustFramework,
+			TrustedStatus:  string(cached.TrustStatus),
+			Domain:         extractDomain(authReq.ClientID),
+		}
+		// Look up admin-configured ClientID (read-only)
+		if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+			verifier.ClientID = clientID
+		}
+		if !verifier.Trusted {
+			return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
+		}
+		h.Logger.Debug("Using cached trust result",
+			zap.String("verifier", authReq.ClientID),
+			zap.Bool("trusted", cached.Trusted))
+		return verifier, nil
+	}
+
 	// Fetch client metadata if needed
 	var clientMeta *ClientMetadata
 	if authReq.ClientMetadata != nil {
@@ -477,13 +501,12 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		verifier.Logo = &LogoInfo{URI: trustResult.Logo}
 	}
 
-	// Cache trust evaluation result (best-effort, don't block the flow)
-	h.cacheVerifierTrust(ctx, authReq, verifier)
+	// Cache trust evaluation result in memory (does not write to VerifierStore)
+	h.cacheVerifierTrust(authReq, verifier)
 
-	// Look up stored verifier to get configured ClientID for VP audience
-	canonicalURL := getCanonicalVerifierURL(authReq)
-	if stored := h.getCachedVerifierTrust(ctx, canonicalURL); stored != nil && stored.ClientID != "" {
-		verifier.ClientID = stored.ClientID
+	// Look up admin-configured ClientID for VP audience (read-only)
+	if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+		verifier.ClientID = clientID
 	}
 
 	// Enforce trust decision: block untrusted verifiers
@@ -543,32 +566,47 @@ func getCanonicalVerifierURL(authReq *AuthorizationRequest) string {
 }
 
 // getCachedVerifierTrust checks if a cached trust evaluation exists for the given verifier URL.
-// Returns nil if no cache is available or lookup fails.
-func (h *OID4VPHandler) getCachedVerifierTrust(ctx context.Context, verifierURL string) *domain.Verifier {
-	if h.Verifiers == nil {
+// Returns nil if no cache is available or the entry has expired.
+func (h *OID4VPHandler) getCachedVerifierTrust(verifierURL string) *TrustCacheRecord {
+	if h.TrustCache == nil {
 		return nil
 	}
 
-	tenantID := domain.TenantID("default")
+	tenantID := domain.DefaultTenantID
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
 
-	cached, err := h.Verifiers.GetByURL(ctx, tenantID, verifierURL)
-	if err != nil {
-		return nil // Not found or error — proceed with fresh evaluation
-	}
-	return cached
+	return h.TrustCache.Get(tenantID, verifierURL)
 }
 
-// cacheVerifierTrust persists verifier trust evaluation results for future lookups.
-// This is best-effort — failures are logged but don't affect the flow.
-func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) {
+// getAdminClientID looks up the admin-configured ClientID for a verifier URL.
+// This is a read-only lookup against the admin VerifierStore.
+func (h *OID4VPHandler) getAdminClientID(ctx context.Context, verifierURL string) string {
 	if h.Verifiers == nil {
-		return // No store available (standalone engine mode)
+		return ""
 	}
 
-	tenantID := domain.TenantID("default")
+	tenantID := domain.DefaultTenantID
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		tenantID = domain.TenantID(h.Flow.Session.TenantID)
+	}
+
+	stored, err := h.Verifiers.GetByURL(ctx, tenantID, verifierURL)
+	if err != nil || stored == nil {
+		return ""
+	}
+	return stored.ClientID
+}
+
+// cacheVerifierTrust stores verifier trust evaluation results in the in-memory cache.
+// This avoids writing to VerifierStore, which would pollute the admin registry.
+func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifier *VerifierInfo) {
+	if h.TrustCache == nil {
+		return
+	}
+
+	tenantID := domain.DefaultTenantID
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
@@ -580,25 +618,14 @@ func (h *OID4VPHandler) cacheVerifierTrust(ctx context.Context, authReq *Authori
 		trustStatus = domain.TrustStatusUntrusted
 	}
 
-	now := time.Now()
-	v := &domain.Verifier{
-		TenantID:         tenantID,
-		Name:             verifier.Name,
-		URL:              getCanonicalVerifierURL(authReq),
-		ClientIDScheme:   authReq.ClientIDScheme,
-		TrustStatus:      trustStatus,
-		TrustFramework:   verifier.Framework,
-		TrustEvaluatedAt: &now,
-	}
-	// Note: ClientID is intentionally NOT set here.
-	// If admin has configured a custom ClientID via the admin API,
-	// the Upsert will preserve it from the existing record.
-
-	if err := h.Verifiers.Upsert(ctx, v); err != nil {
-		h.Logger.Warn("Failed to cache verifier trust result",
-			zap.String("client_id", authReq.ClientID),
-			zap.Error(err))
-	}
+	h.TrustCache.Set(tenantID, getCanonicalVerifierURL(authReq), &TrustCacheRecord{
+		Name:           verifier.Name,
+		URL:            getCanonicalVerifierURL(authReq),
+		ClientIDScheme: authReq.ClientIDScheme,
+		TrustStatus:    trustStatus,
+		TrustFramework: verifier.Framework,
+		Trusted:        verifier.Trusted,
+	})
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).

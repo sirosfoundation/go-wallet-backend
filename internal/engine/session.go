@@ -78,6 +78,7 @@ type Manager struct {
 	trustService   *TrustService
 	registryClient *RegistryClient
 	verifierStore  storage.VerifierStore
+	trustCache     *TrustCache
 
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
@@ -101,6 +102,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		flowHandlers:   make(map[Protocol]FlowHandlerFactory),
 		trustService:   NewTrustService(cfg, logger),
 		registryClient: NewRegistryClient(cfg, logger),
+		trustCache:     NewTrustCache(1 * time.Hour),
 		sessionStore:   NewMemorySessionStore(logger), // Default to memory
 	}
 	return m
@@ -375,7 +377,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	session.flowsMu.Unlock()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
-	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore)
+	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
 	if err != nil {
 		// Remove the reserved flow slot on error
 		session.flowsMu.Lock()

@@ -37,7 +37,7 @@ type OID4VCIHandler struct {
 }
 
 // NewOID4VCIHandler creates a new OID4VCI flow handler
-func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore) (FlowHandler, error) {
+func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 	return &OID4VCIHandler{
 		BaseHandler: BaseHandler{
 			Flow:     flow,
