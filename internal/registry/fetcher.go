@@ -153,12 +153,13 @@ func (f *Fetcher) pollLoop(ctx context.Context) {
 
 // Fetch fetches all configured sources and merges the results into the store.
 // Sources are fetched in order; entries from later sources overwrite earlier ones.
+// If all sources fail, the store is left unchanged and an error is returned.
 func (f *Fetcher) Fetch(ctx context.Context) error {
 	// Use the normalized sources list (populated by Validate); fall back to the
 	// legacy single Source field when Validate has not been called (e.g., in tests).
 	sources := f.config.Sources
 	if len(sources) == 0 && f.config.Source.URL != "" {
-		sources = []SourceConfig{f.config.Source}
+		sources = []RemoteSourceConfig{{URL: f.config.Source.URL, Timeout: f.config.Source.Timeout}}
 	}
 	if len(sources) == 0 {
 		return fmt.Errorf("no registry sources configured")
@@ -166,6 +167,7 @@ func (f *Fetcher) Fetch(ctx context.Context) error {
 
 	// Accumulate entries across all sources; later sources overwrite earlier ones.
 	entries := make(map[string]*VCTMEntry)
+	var successCount int
 
 	for _, src := range sources {
 		srcEntries, err := f.fetchFromSource(ctx, src)
@@ -178,6 +180,11 @@ func (f *Fetcher) Fetch(ctx context.Context) error {
 		for k, v := range srcEntries {
 			entries[k] = v
 		}
+		successCount++
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("all %d registry source(s) failed; store not updated", len(sources))
 	}
 
 	// Build a combined source URL for the store metadata.
@@ -199,7 +206,15 @@ func (f *Fetcher) Fetch(ctx context.Context) error {
 
 // fetchFromSource fetches entries from a single source URL, auto-detecting whether
 // the endpoint returns the legacy vctm-registry.json format or the TS11 schemas.json format.
-func (f *Fetcher) fetchFromSource(ctx context.Context, source SourceConfig) (map[string]*VCTMEntry, error) {
+// If source.Timeout is non-zero it is applied as a context deadline for the entire
+// source fetch (index + all VCTM documents).
+func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig) (map[string]*VCTMEntry, error) {
+	if source.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, source.Timeout)
+		defer cancel()
+	}
+
 	f.logger.Info("fetching registry source", zap.String("url", source.URL))
 
 	body, err := f.fetchRaw(ctx, source.URL)
@@ -230,7 +245,7 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source SourceConfig) (map
 
 // processTS11Response processes a TS11-format /api/v1/schemas.json response,
 // including following pagination via the "next" field.
-func (f *Fetcher) processTS11Response(ctx context.Context, source SourceConfig, body []byte) (map[string]*VCTMEntry, error) {
+func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount, errorCount int
 
@@ -344,7 +359,7 @@ func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vct,
 }
 
 // processLegacyResponse processes a legacy vctm-registry.json response.
-func (f *Fetcher) processLegacyResponse(ctx context.Context, source SourceConfig, body []byte) (map[string]*VCTMEntry, error) {
+func (f *Fetcher) processLegacyResponse(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	var index RegistryIndex
 	if err := json.Unmarshal(body, &index); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal legacy registry index: %w", err)

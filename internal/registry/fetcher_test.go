@@ -314,7 +314,7 @@ func TestFetcher_FetchFromSource_TS11Format(t *testing.T) {
 	logger := testLogger()
 	fetcher := NewFetcher(config, store, logger, nil)
 
-	src := SourceConfig{URL: indexServer.URL, Timeout: 5 * time.Second}
+	src := RemoteSourceConfig{URL: indexServer.URL, Timeout: 5 * time.Second}
 	entries, err := fetcher.fetchFromSource(context.Background(), src)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
@@ -365,7 +365,7 @@ func TestFetcher_FetchFromSource_TS11_FallbackToFirstSchemaURI(t *testing.T) {
 	config := DefaultConfig()
 	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
 
-	src := SourceConfig{URL: indexServer.URL}
+	src := RemoteSourceConfig{URL: indexServer.URL}
 	entries, err := fetcher.fetchFromSource(context.Background(), src)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
@@ -387,7 +387,7 @@ func TestFetcher_FetchFromSource_TS11_SkipsSchemaWithNoURIs(t *testing.T) {
 	config := DefaultConfig()
 	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
 
-	src := SourceConfig{URL: indexServer.URL}
+	src := RemoteSourceConfig{URL: indexServer.URL}
 	entries, err := fetcher.fetchFromSource(context.Background(), src)
 	require.NoError(t, err)
 	assert.Empty(t, entries)
@@ -440,7 +440,7 @@ func TestFetcher_FetchFromSource_TS11_Pagination(t *testing.T) {
 	config := DefaultConfig()
 	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
 
-	src := SourceConfig{URL: indexServer.URL}
+	src := RemoteSourceConfig{URL: indexServer.URL}
 	entries, err := fetcher.fetchFromSource(context.Background(), src)
 	require.NoError(t, err)
 	// Both pages should be collected
@@ -478,7 +478,7 @@ func TestFetcher_FetchFromSource_LegacyFormat(t *testing.T) {
 	config := DefaultConfig()
 	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
 
-	src := SourceConfig{URL: indexServer.URL}
+	src := RemoteSourceConfig{URL: indexServer.URL}
 	entries, err := fetcher.fetchFromSource(context.Background(), src)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
@@ -558,7 +558,7 @@ func TestFetcher_Fetch_MultipleSources_LaterOverwritesEarlier(t *testing.T) {
 	}))
 	defer srv2.Close()
 
-	config.Sources = []SourceConfig{
+	config.Sources = []RemoteSourceConfig{
 		{URL: srv1.URL, Timeout: 5 * time.Second},
 		{URL: srv2.URL, Timeout: 5 * time.Second},
 	}
@@ -597,7 +597,7 @@ func TestFetcher_Fetch_MultipleSources_PartialFailure(t *testing.T) {
 	defer okServer.Close()
 
 	config := DefaultConfig()
-	config.Sources = []SourceConfig{
+	config.Sources = []RemoteSourceConfig{
 		{URL: errorServer.URL, Timeout: 5 * time.Second},
 		{URL: okServer.URL, Timeout: 5 * time.Second},
 	}
@@ -614,6 +614,38 @@ func TestFetcher_Fetch_MultipleSources_PartialFailure(t *testing.T) {
 	assert.Equal(t, 1, store.Count())
 }
 
+func TestFetcher_Fetch_AllSourcesFail_ReturnsError(t *testing.T) {
+	// Both sources will return 500 errors
+	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer errorServer.Close()
+
+	config := DefaultConfig()
+	config.Sources = []RemoteSourceConfig{
+		{URL: errorServer.URL, Timeout: 5 * time.Second},
+		{URL: errorServer.URL + "/other", Timeout: 5 * time.Second},
+	}
+	require.NoError(t, config.Validate())
+
+	store := NewStore("")
+	// Pre-populate the store with an entry to verify it is preserved on failure
+	store.Put(&VCTMEntry{VCT: "https://example.com/existing", Name: "Existing"})
+
+	fetcher := NewFetcher(config, store, testLogger(), nil)
+
+	err := fetcher.Fetch(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "all")
+	assert.Contains(t, err.Error(), "failed")
+
+	// Existing store contents must be preserved
+	assert.Equal(t, 1, store.Count())
+	entry, ok := store.Get("https://example.com/existing")
+	require.True(t, ok)
+	assert.Equal(t, "Existing", entry.Name)
+}
+
 func TestConfig_Validate_NormalizesSourcesToSingleSource(t *testing.T) {
 	config := DefaultConfig()
 	// Sources is empty; Validate should populate it from Source
@@ -625,12 +657,23 @@ func TestConfig_Validate_NormalizesSourcesToSingleSource(t *testing.T) {
 
 func TestConfig_Validate_MultiSources(t *testing.T) {
 	config := DefaultConfig()
-	config.Sources = []SourceConfig{
+	config.Sources = []RemoteSourceConfig{
 		{URL: "https://registry1.example.org/api/v1/schemas.json"},
 		{URL: "https://registry2.example.org/api/v1/schemas.json"},
 	}
 	require.NoError(t, config.Validate())
 	assert.Len(t, config.Sources, 2)
+}
+
+func TestConfig_Validate_SourcesEmptyURLIsRejected(t *testing.T) {
+	config := DefaultConfig()
+	config.Sources = []RemoteSourceConfig{
+		{URL: "https://registry.example.org/api/v1/schemas.json"},
+		{URL: ""}, // empty URL should fail
+	}
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sources[1].url is required")
 }
 
 func TestConfig_Validate_BothSourceEmptyAndSourcesEmpty(t *testing.T) {

@@ -21,12 +21,12 @@ type Config struct {
 	// Use Sources for multi-registry support. If Sources is empty, Source is used.
 	Source SourceConfig `yaml:"source"`
 
-	// Sources is a list of registry sources to fetch from.
+	// Sources is an ordered list of remote registry URLs to fetch from.
 	// Schemas fetched from later sources in the list overwrite earlier ones,
 	// allowing a registry to extend or override another.
-	// When non-empty, the Source field is ignored for URL fetching (but
-	// Source.PollInterval and Source.LocalOverrides are still used).
-	Sources []SourceConfig `yaml:"sources"`
+	// When non-empty, the Source.URL field is ignored for remote fetching
+	// (Source.PollInterval and Source.LocalOverrides remain global settings).
+	Sources []RemoteSourceConfig `yaml:"sources"`
 
 	// Cache configuration
 	Cache CacheConfig `yaml:"cache"`
@@ -76,6 +76,21 @@ func (c ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// RemoteSourceConfig contains the minimal configuration needed to fetch schemas
+// from a single remote registry URL. It is used by Config.Sources to specify
+// multiple registries. Unlike SourceConfig it intentionally omits the global
+// settings (LocalOverrides, PollInterval) that are not meaningful per source.
+type RemoteSourceConfig struct {
+	// URL of the upstream registry index.
+	// Supports both the legacy vctm-registry.json format and the TS11-compliant
+	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
+	URL string `yaml:"url"`
+
+	// Timeout for HTTP requests to this source. Zero means no per-source timeout
+	// (the shared http.Client timeout applies).
+	Timeout time.Duration `yaml:"timeout"`
 }
 
 // SourceConfig contains upstream registry source configuration
@@ -325,7 +340,14 @@ func (c *Config) Validate() error {
 
 	// Normalize: if Sources is empty, populate from the legacy Source field
 	if len(c.Sources) == 0 {
-		c.Sources = []SourceConfig{c.Source}
+		c.Sources = []RemoteSourceConfig{{URL: c.Source.URL, Timeout: c.Source.Timeout}}
+	}
+
+	// Validate each Sources entry
+	for i, src := range c.Sources {
+		if src.URL == "" {
+			return fmt.Errorf("sources[%d].url is required", i)
+		}
 	}
 
 	for i, source := range c.Sources {
