@@ -13,7 +13,7 @@ func TestDefaultConfig(t *testing.T) {
 
 	assert.Equal(t, "0.0.0.0", config.Server.Host)
 	assert.Equal(t, 8097, config.Server.Port)
-	assert.Equal(t, "https://registry.siros.org/.well-known/vctm-registry.json", config.Source.URL)
+	assert.Equal(t, "https://registry.siros.org/api/v1/schemas.json", config.Source.URL)
 	assert.Equal(t, 5*time.Minute, config.Source.PollInterval)
 	assert.Equal(t, 30*time.Second, config.Source.Timeout)
 	assert.Equal(t, "data/vctm-cache.json", config.Cache.Path)

@@ -17,8 +17,16 @@ type Config struct {
 	// Server configuration
 	Server ServerConfig `yaml:"server"`
 
-	// Registry source configuration
+	// Source is the legacy single-registry source configuration.
+	// Use Sources for multi-registry support. If Sources is empty, Source is used.
 	Source SourceConfig `yaml:"source"`
+
+	// Sources is a list of registry sources to fetch from.
+	// Schemas fetched from later sources in the list overwrite earlier ones,
+	// allowing a registry to extend or override another.
+	// When non-empty, the Source field is ignored for URL fetching (but
+	// Source.PollInterval and Source.LocalOverrides are still used).
+	Sources []SourceConfig `yaml:"sources"`
 
 	// Cache configuration
 	Cache CacheConfig `yaml:"cache"`
@@ -72,7 +80,9 @@ func (c ServerConfig) ResolvedServedBy() string {
 
 // SourceConfig contains upstream registry source configuration
 type SourceConfig struct {
-	// URL of the upstream registry index (e.g., https://registry.siros.org/.well-known/vctm-registry.json)
+	// URL of the upstream registry index.
+	// Supports both the legacy vctm-registry.json format and the TS11-compliant
+	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
 	URL string `yaml:"url"`
 
 	// LocalOverrides is a list of local file or directory paths containing VCTM JSON files.
@@ -256,7 +266,7 @@ func DefaultConfig() *Config {
 			Port: 8097,
 		},
 		Source: SourceConfig{
-			URL:          "https://registry.siros.org/.well-known/vctm-registry.json",
+			URL:          "https://registry.siros.org/api/v1/schemas.json",
 			PollInterval: 5 * time.Minute,
 			Timeout:      30 * time.Second,
 		},
@@ -309,8 +319,13 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.Source.URL == "" {
+	if c.Source.URL == "" && len(c.Sources) == 0 {
 		return fmt.Errorf("source URL is required")
+	}
+
+	// Normalize: if Sources is empty, populate from the legacy Source field
+	if len(c.Sources) == 0 {
+		c.Sources = []SourceConfig{c.Source}
 	}
 
 	if c.Source.PollInterval < time.Second {

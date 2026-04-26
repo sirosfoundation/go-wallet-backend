@@ -8,14 +8,25 @@ server:
 
 # Source configuration - where to fetch VCTMs from
 source:
-  # URL of the upstream VCTM registry index
-  url: "https://registry.siros.org/.well-known/vctm-registry.json"
+  # URL of the upstream registry index.
+  # Supports the legacy vctm-registry.json format and the TS11-compliant
+  # /api/v1/schemas.json endpoint; the format is auto-detected.
+  url: "https://registry.siros.org/api/v1/schemas.json"
   
   # How often to poll for updates (e.g., 5m, 1h)
   poll_interval: 5m
   
   # HTTP timeout for fetching from upstream
   timeout: 30s
+
+# Multiple registry sources (optional).
+# When configured, schemas from later sources overwrite schemas from earlier
+# sources. The single "source.url" above is used when this list is empty.
+# sources:
+#   - url: "https://registry.siros.org/api/v1/schemas.json"
+#     timeout: 30s
+#   - url: "https://other-registry.example.org/api/v1/schemas.json"
+#     timeout: 30s
 
 # Cache configuration
 cache:
