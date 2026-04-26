@@ -328,6 +328,11 @@ func (c *Config) Validate() error {
 		c.Sources = []SourceConfig{c.Source}
 	}
 
+	for i, source := range c.Sources {
+		if source.URL == "" {
+			return fmt.Errorf("sources[%d].url is required", i)
+		}
+	}
 	if c.Source.PollInterval < time.Second {
 		return fmt.Errorf("poll interval must be at least 1 second")
 	}
