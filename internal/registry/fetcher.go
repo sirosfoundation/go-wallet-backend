@@ -214,7 +214,13 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source SourceConfig) (map
 		Schemas     json.RawMessage `json:"schemas"`
 		Credentials json.RawMessage `json:"credentials"`
 	}
-	_ = json.Unmarshal(body, &detector)
+	if err := json.Unmarshal(body, &detector); err != nil {
+		// Not valid JSON at the top level – fall through to legacy processing
+		// which will surface the parse error with a clear message.
+		f.logger.Debug("format auto-detection failed, falling back to legacy parser",
+			zap.String("url", source.URL), zap.Error(err))
+		return f.processLegacyResponse(ctx, source, body)
+	}
 
 	if detector.Schemas != nil {
 		return f.processTS11Response(ctx, source, body)
@@ -319,7 +325,10 @@ func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vct,
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
 	}
-	_ = json.Unmarshal(body, &vctmDoc)
+	if err := json.Unmarshal(body, &vctmDoc); err != nil {
+		f.logger.Debug("could not extract name/description from VCTM document",
+			zap.String("vct", vct), zap.Error(err))
+	}
 
 	return &VCTMEntry{
 		VCT:              vct,
