@@ -17,8 +17,16 @@ type Config struct {
 	// Server configuration
 	Server ServerConfig `yaml:"server"`
 
-	// Registry source configuration
+	// Source is the legacy single-registry source configuration.
+	// Use Sources for multi-registry support. If Sources is empty, Source is used.
 	Source SourceConfig `yaml:"source"`
+
+	// Sources is an ordered list of remote registry URLs to fetch from.
+	// Schemas fetched from later sources in the list overwrite earlier ones,
+	// allowing a registry to extend or override another.
+	// When non-empty, the Source.URL field is ignored for remote fetching
+	// (Source.PollInterval and Source.LocalOverrides remain global settings).
+	Sources []RemoteSourceConfig `yaml:"sources"`
 
 	// Cache configuration
 	Cache CacheConfig `yaml:"cache"`
@@ -70,9 +78,26 @@ func (c ServerConfig) ResolvedServedBy() string {
 	return *c.ServedByHeader
 }
 
+// RemoteSourceConfig contains the minimal configuration needed to fetch schemas
+// from a single remote registry URL. It is used by Config.Sources to specify
+// multiple registries. Unlike SourceConfig it intentionally omits the global
+// settings (LocalOverrides, PollInterval) that are not meaningful per source.
+type RemoteSourceConfig struct {
+	// URL of the upstream registry index.
+	// Supports both the legacy vctm-registry.json format and the TS11-compliant
+	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
+	URL string `yaml:"url"`
+
+	// Timeout for HTTP requests to this source. Zero means no per-source timeout
+	// (the shared http.Client timeout applies).
+	Timeout time.Duration `yaml:"timeout"`
+}
+
 // SourceConfig contains upstream registry source configuration
 type SourceConfig struct {
-	// URL of the upstream registry index (e.g., https://registry.siros.org/.well-known/vctm-registry.json)
+	// URL of the upstream registry index.
+	// Supports both the legacy vctm-registry.json format and the TS11-compliant
+	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
 	URL string `yaml:"url"`
 
 	// LocalOverrides is a list of local file or directory paths containing VCTM JSON files.
@@ -256,7 +281,7 @@ func DefaultConfig() *Config {
 			Port: 8097,
 		},
 		Source: SourceConfig{
-			URL:          "https://registry.siros.org/.well-known/vctm-registry.json",
+			URL:          "https://registry.siros.org/api/v1/schemas.json",
 			PollInterval: 5 * time.Minute,
 			Timeout:      30 * time.Second,
 		},
@@ -309,10 +334,27 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.Source.URL == "" {
+	if c.Source.URL == "" && len(c.Sources) == 0 {
 		return fmt.Errorf("source URL is required")
 	}
 
+	// Normalize: if Sources is empty, populate from the legacy Source field
+	if len(c.Sources) == 0 {
+		c.Sources = []RemoteSourceConfig{{URL: c.Source.URL, Timeout: c.Source.Timeout}}
+	}
+
+	// Validate each Sources entry
+	for i, src := range c.Sources {
+		if src.URL == "" {
+			return fmt.Errorf("sources[%d].url is required", i)
+		}
+	}
+
+	for i, source := range c.Sources {
+		if source.URL == "" {
+			return fmt.Errorf("sources[%d].url is required", i)
+		}
+	}
 	if c.Source.PollInterval < time.Second {
 		return fmt.Errorf("poll interval must be at least 1 second")
 	}
