@@ -809,7 +809,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rp_id is required")
 	}
 
-	if c.Server.RPOrigin == "" && len(c.Server.RPOrigins) == 0 {
+	if len(c.Server.GetRPOrigins()) == 0 {
 		return fmt.Errorf("rp_origin or rp_origins is required")
 	}
 

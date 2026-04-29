@@ -148,11 +148,22 @@ func TestServerConfig_GetRPOrigins(t *testing.T) {
 			cfg:       ServerConfig{},
 			wantOrder: nil,
 		},
+		{
+			name:      "list of only empty strings is treated as empty",
+			cfg:       ServerConfig{RPOrigins: []string{"", ""}},
+			wantOrder: nil,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.cfg.GetRPOrigins()
+			if tt.wantOrder == nil {
+				if got != nil {
+					t.Fatalf("GetRPOrigins() = %v, want nil", got)
+				}
+				return
+			}
 			if len(got) != len(tt.wantOrder) {
 				t.Fatalf("GetRPOrigins() = %v, want %v", got, tt.wantOrder)
 			}
