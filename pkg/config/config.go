@@ -82,9 +82,12 @@ type ServerConfig struct {
 	RegistryPort   int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
 	AdminToken     string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
 	AdminTokenPath string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
-	RPID           string `yaml:"rp_id" envconfig:"RP_ID"`
-	RPOrigin       string `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
-	RPName         string `yaml:"rp_name" envconfig:"RP_NAME"`
+	RPID      string `yaml:"rp_id" envconfig:"RP_ID"`
+	// RPOrigin is the legacy single-origin setting. Kept for backward compatibility.
+	// New deployments should use RPOrigins. When both are set, RPOrigin is prepended.
+	RPOrigin  string   `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
+	RPOrigins []string `yaml:"rp_origins" envconfig:"RP_ORIGINS"`
+	RPName    string   `yaml:"rp_name" envconfig:"RP_NAME"`
 	BaseURL        string `yaml:"base_url" envconfig:"BASE_URL"`
 
 	// CORS configuration
@@ -163,6 +166,25 @@ type CORSConfig struct {
 
 	// MaxAge indicates how long (in seconds) the results of a preflight request can be cached.
 	MaxAge int `yaml:"max_age" envconfig:"MAX_AGE"`
+}
+
+// GetRPOrigins returns the deduplicated list of WebAuthn RP origins.
+// RPOrigin (legacy single-value field) is prepended when non-empty,
+// so existing deployments continue to work without any config change.
+func (c *ServerConfig) GetRPOrigins() []string {
+	seen := make(map[string]struct{})
+	var result []string
+	for _, o := range append([]string{c.RPOrigin}, c.RPOrigins...) {
+		if o == "" {
+			continue
+		}
+		if _, dup := seen[o]; dup {
+			continue
+		}
+		seen[o] = struct{}{}
+		result = append(result, o)
+	}
+	return result
 }
 
 // SetDefaults sets default values for CORS configuration
@@ -705,6 +727,7 @@ func defaultConfig() *Config {
 			RegistryPort: 8097, // VCTM registry port
 			RPID:         "localhost",
 			RPOrigin:     "http://localhost:8080",
+			RPOrigins:    nil,
 			RPName:       "Wallet Backend",
 			CORS:         corsConfig,
 		},
@@ -786,8 +809,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rp_id is required")
 	}
 
-	if c.Server.RPOrigin == "" {
-		return fmt.Errorf("rp_origin is required")
+	if c.Server.RPOrigin == "" && len(c.Server.RPOrigins) == 0 {
+		return fmt.Errorf("rp_origin or rp_origins is required")
 	}
 
 	// Validate TLS configuration

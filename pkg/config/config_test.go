@@ -81,6 +81,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			Port:     8080,
 			RPID:     "localhost",
 			RPOrigin: "",
+			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
 		JWT:     JWTConfig{Secret: "test"},
@@ -88,7 +89,79 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Error("Expected validation error for missing RPOrigin")
+		t.Error("Expected validation error when both rp_origin and rp_origins are empty")
+	}
+}
+
+func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
+	cfg := &Config{
+		Server: ServerConfig{
+			Host:      "localhost",
+			Port:      8080,
+			RPID:      "localhost",
+			RPOrigin:  "",
+			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
+		},
+		Storage: StorageConfig{Type: "memory"},
+		JWT:     JWTConfig{Secret: "test"},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Expected no validation error with rp_origins set, got: %v", err)
+	}
+}
+
+func TestServerConfig_GetRPOrigins(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       ServerConfig
+		wantOrder []string
+	}{
+		{
+			name:      "legacy single origin only",
+			cfg:       ServerConfig{RPOrigin: "https://id.example.com"},
+			wantOrder: []string{"https://id.example.com"},
+		},
+		{
+			name:      "new list only",
+			cfg:       ServerConfig{RPOrigins: []string{"https://a.example.com", "https://b.example.com"}},
+			wantOrder: []string{"https://a.example.com", "https://b.example.com"},
+		},
+		{
+			name: "legacy prepended to list",
+			cfg: ServerConfig{
+				RPOrigin:  "https://id.example.com",
+				RPOrigins: []string{"android:apk-key-hash:abc123"},
+			},
+			wantOrder: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
+		},
+		{
+			name: "duplicate between legacy and list is deduplicated",
+			cfg: ServerConfig{
+				RPOrigin:  "https://id.example.com",
+				RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
+			},
+			wantOrder: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
+		},
+		{
+			name:      "both empty returns nil",
+			cfg:       ServerConfig{},
+			wantOrder: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.cfg.GetRPOrigins()
+			if len(got) != len(tt.wantOrder) {
+				t.Fatalf("GetRPOrigins() = %v, want %v", got, tt.wantOrder)
+			}
+			for i, o := range got {
+				if o != tt.wantOrder[i] {
+					t.Errorf("GetRPOrigins()[%d] = %q, want %q", i, o, tt.wantOrder[i])
+				}
+			}
+		})
 	}
 }
 
