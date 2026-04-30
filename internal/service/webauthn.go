@@ -465,6 +465,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		zap.Int("original_len", len(req.Credential)),
 		zap.Int("decoded_len", len(credData)),
 		zap.ByteString("decoded_preview", credData[:min(500, len(credData))]),
+		zap.ByteString("decoded", credData),
 	)
 
 	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(
