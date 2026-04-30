@@ -58,7 +58,7 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 	wconfig := &webauthn.Config{
 		RPDisplayName: cfg.Server.RPName,
 		RPID:          cfg.Server.RPID,
-		RPOrigins:     []string{cfg.Server.RPOrigin},
+		RPOrigins:     cfg.Server.GetRPOrigins(),
 	}
 
 	wa, err := webauthn.New(wconfig)
