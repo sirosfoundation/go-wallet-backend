@@ -337,6 +337,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			h.Logger.Warn("Failed to fetch client metadata", zap.Error(err))
 		} else {
 			clientMeta = cm
+			// Store fetched metadata on the request so downstream steps
+			// (e.g. submitDirectPostJWT) can access JARM parameters.
+			authReq.ClientMetadata = cm
 		}
 	}
 
@@ -791,6 +794,12 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 }
 
 func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
+	// Validate endpoint URL scheme to prevent SSRF
+	epURL, err := url.Parse(endpoint)
+	if err != nil || (epURL.Scheme != "https" && epURL.Scheme != "http") {
+		return "", fmt.Errorf("invalid response endpoint URL: %s", endpoint)
+	}
+
 	data := url.Values{}
 	data.Set("vp_token", vpToken)
 	if authReq.State != "" {
@@ -872,6 +881,12 @@ func inferClientIDScheme(clientID string) string {
 }
 
 func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
+	// Validate endpoint URL scheme to prevent SSRF (CodeQL: uncontrolled data in network request)
+	epURL, err := url.Parse(endpoint)
+	if err != nil || (epURL.Scheme != "https" && epURL.Scheme != "http") {
+		return "", fmt.Errorf("invalid response endpoint URL: %s", endpoint)
+	}
+
 	now := time.Now()
 
 	var vpTokenValue interface{} = vpToken
@@ -934,7 +949,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	encrypter, err := jose.NewEncrypter(
 		contentEnc,
 		jose.Recipient{Algorithm: keyAlg, Key: verifierKey, KeyID: kid},
-		(&jose.EncrypterOptions{}).WithContentType("jwt"),
+		(&jose.EncrypterOptions{}).WithContentType("JWT"),
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to create JWE encrypter: %w", err)
@@ -964,7 +979,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	if err != nil {
 		return "", fmt.Errorf("failed to submit JARM response: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		var result struct {
@@ -995,9 +1010,24 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 			Keys []json.RawMessage `json:"keys"`
 		}
 		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
-			var jwk jose.JSONWebKey
-			if err := jwk.UnmarshalJSON(jwks.Keys[0]); err == nil {
-				return jwk.Key, jwk.KeyID, nil
+			// Select the best key for encryption: prefer use="enc", then
+			// matching alg, then fall back to first parseable key.
+			var fallbackKey *jose.JSONWebKey
+			for _, raw := range jwks.Keys {
+				var jwk jose.JSONWebKey
+				if err := jwk.UnmarshalJSON(raw); err != nil {
+					continue
+				}
+				if jwk.Use == "enc" {
+					return jwk.Key, jwk.KeyID, nil
+				}
+				if fallbackKey == nil {
+					k := jwk // copy
+					fallbackKey = &k
+				}
+			}
+			if fallbackKey != nil {
+				return fallbackKey.Key, fallbackKey.KeyID, nil
 			}
 		}
 	}

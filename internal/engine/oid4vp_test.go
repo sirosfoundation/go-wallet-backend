@@ -438,3 +438,166 @@ func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
 
 	assert.NotNil(t, parsed["dcql_query"])
 }
+
+// ===== submitDirectPostJWT tests =====
+
+func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
+	// Generate an ephemeral EC key for ECDH-ES encryption
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	encJWK := map[string]any{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
+		"use": "enc",
+		"kid": "enc-key-1",
+	}
+	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := r.ParseForm()
+		require.NoError(t, err)
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		State:    "test-state",
+		ClientMetadata: &ClientMetadata{
+			JWKS:                              jwksBytes,
+			AuthorizationEncryptedResponseAlg: "ECDH-ES",
+			AuthorizationEncryptedResponseEnc: "A128CBC-HS256",
+		},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err)
+
+	// Should have posted a JWE in the "response" field
+	response := receivedForm.Get("response")
+	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
+	// A JWE compact serialization has 5 dot-separated parts
+	parts := len(splitDots(response))
+	assert.Equal(t, 5, parts, "JWE should have 5 parts, got %d", parts)
+}
+
+func TestSubmitDirectPostJWT_MissingEncAlg(t *testing.T) {
+	h := &OID4VPHandler{httpClient: http.DefaultClient}
+	authReq := &AuthorizationRequest{
+		ClientID:       "https://verifier.example.com",
+		ClientMetadata: &ClientMetadata{},
+	}
+
+	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
+}
+
+func TestSubmitDirectPostJWT_NilClientMetadata(t *testing.T) {
+	h := &OID4VPHandler{httpClient: http.DefaultClient}
+	authReq := &AuthorizationRequest{
+		ClientID:       "https://verifier.example.com",
+		ClientMetadata: nil,
+	}
+
+	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
+}
+
+func TestSubmitDirectPostJWT_InvalidEndpoint(t *testing.T) {
+	h := &OID4VPHandler{httpClient: http.DefaultClient}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		ClientMetadata: &ClientMetadata{
+			AuthorizationEncryptedResponseAlg: "ECDH-ES",
+		},
+	}
+
+	_, err := h.submitDirectPostJWT(context.Background(), "ftp://evil.com", authReq, "vp-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid response endpoint URL")
+}
+
+// ===== extractVerifierEncryptionKey tests =====
+
+func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
+	sigKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	sigJWK := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(sigKey.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(sigKey.PublicKey.Y.Bytes(), 32)),
+		"use": "sig", "kid": "sig-key-1",
+	}
+	encJWK := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
+		"use": "enc", "kid": "enc-key-1",
+	}
+	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{sigJWK, encJWK}})
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "enc-key-1", kid, "should select the key with use=enc")
+}
+
+func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	jwk := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.Y.Bytes(), 32)),
+		"kid": "only-key",
+	}
+	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "only-key", kid)
+}
+
+func TestExtractVerifierEncryptionKey_NoKeysReturnsError(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{},
+	}
+
+	_, _, err := h.extractVerifierEncryptionKey(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no verifier encryption key found")
+}
+
+// splitDots splits a string by "." — a minimal helper for counting JWE parts.
+func splitDots(s string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
