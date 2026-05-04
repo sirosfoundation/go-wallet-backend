@@ -799,6 +799,7 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	if err != nil || (epURL.Scheme != "https" && epURL.Scheme != "http") {
 		return "", fmt.Errorf("invalid response endpoint URL: %s", endpoint)
 	}
+	validatedEndpoint := epURL.String()
 
 	data := url.Values{}
 	data.Set("vp_token", vpToken)
@@ -806,7 +807,7 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 		data.Set("state", authReq.State)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", validatedEndpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -881,11 +882,12 @@ func inferClientIDScheme(clientID string) string {
 }
 
 func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
-	// Validate endpoint URL scheme to prevent SSRF (CodeQL: uncontrolled data in network request)
+	// Validate endpoint URL scheme to prevent SSRF (CodeQL: go/request-forgery)
 	epURL, err := url.Parse(endpoint)
 	if err != nil || (epURL.Scheme != "https" && epURL.Scheme != "http") {
 		return "", fmt.Errorf("invalid response endpoint URL: %s", endpoint)
 	}
+	validatedEndpoint := epURL.String()
 
 	now := time.Now()
 
@@ -969,7 +971,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	data := url.Values{}
 	data.Set("response", jweString)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", validatedEndpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
