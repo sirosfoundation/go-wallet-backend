@@ -10,6 +10,12 @@ server:
   registry_port: 8097
   rp_id: "localhost"
   rp_origin: "http://localhost:8080"
+  # rp_origins allows multiple WebAuthn RP origins (e.g. for native app wrappers).
+  # When set, these are combined with rp_origin (if present) and deduplicated.
+  # Use rp_origins alone or together with rp_origin; at least one must be set.
+  # rp_origins:
+  #   - "http://localhost:8080"
+  #   - "android:apk-key-hash:abc123def456"
   rp_name: "Wallet Backend"
   base_url: "http://localhost:8080"
 
