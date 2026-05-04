@@ -557,7 +557,7 @@ func TestResolve_URLSubject_DefaultsToKey(t *testing.T) {
 }
 
 func TestResolve_URLSubject_ExplicitType(t *testing.T) {
-	// Mock PDP that verifies the subject type is "url"
+	// Mock PDP that verifies the subject type is "url" and resource type is "credential_issuer"
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var evalReq gotrust.EvaluationRequest
 		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
@@ -565,6 +565,9 @@ func TestResolve_URLSubject_ExplicitType(t *testing.T) {
 		}
 		if evalReq.Subject.Type != "url" {
 			t.Errorf("Expected subject.type 'url', got %q", evalReq.Subject.Type)
+		}
+		if evalReq.Resource.Type != "credential_issuer" {
+			t.Errorf("Expected resource.type 'credential_issuer', got %q", evalReq.Resource.Type)
 		}
 		resp := gotrust.EvaluationResponse{Decision: true}
 		w.Header().Set("Content-Type", "application/json")
@@ -591,7 +594,7 @@ func TestResolve_URLSubject_ExplicitType(t *testing.T) {
 }
 
 func TestResolve_DIDSubject_StillWorks(t *testing.T) {
-	// Verify backward compatibility: DID subjects still get type "key"
+	// Verify backward compatibility: DID subjects still get type "key" and resource.type "resolution"
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var evalReq gotrust.EvaluationRequest
 		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
@@ -599,6 +602,9 @@ func TestResolve_DIDSubject_StillWorks(t *testing.T) {
 		}
 		if evalReq.Subject.Type != "key" {
 			t.Errorf("Expected subject.type 'key', got %q", evalReq.Subject.Type)
+		}
+		if evalReq.Resource.Type != "resolution" {
+			t.Errorf("Expected resource.type 'resolution', got %q", evalReq.Resource.Type)
 		}
 		resp := gotrust.EvaluationResponse{Decision: true}
 		w.Header().Set("Content-Type", "application/json")

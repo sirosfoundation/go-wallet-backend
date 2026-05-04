@@ -99,7 +99,7 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 					ID:   "https://issuer.example.com",
 				},
 				Resource: gotrust.Resource{
-					Type: "resolution",
+					Type: "credential_issuer",
 					ID:   "https://issuer.example.com",
 				},
 			},

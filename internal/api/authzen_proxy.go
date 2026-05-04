@@ -267,8 +267,9 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Parse the resolve request
 	var req struct {
-		SubjectID   string `json:"subject_id" binding:"required"`
-		SubjectType string `json:"subject_type"` // "key" (default) or "url"
+		SubjectID    string `json:"subject_id" binding:"required"`
+		SubjectType  string `json:"subject_type"`  // "key" (default) or "url"
+		ResourceType string `json:"resource_type"` // e.g. "credential_issuer" (default for url subjects)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -297,14 +298,26 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		}
 	}
 
-	// Build an evaluation request for resolution-only
+	// Determine resource type based on subject type and optional override.
+	// For URL subjects, default to "credential_issuer" (OpenID4VCI issuer metadata).
+	// For key subjects, default to "resolution" (DID/OIDF entity resolution).
+	resourceType := req.ResourceType
+	if resourceType == "" {
+		if subjectType == "url" {
+			resourceType = "credential_issuer"
+		} else {
+			resourceType = "resolution"
+		}
+	}
+
+	// Build an evaluation request
 	evalReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
 			Type: subjectType,
 			ID:   req.SubjectID,
 		},
 		Resource: gotrust.Resource{
-			Type: "resolution",
+			Type: resourceType,
 			ID:   req.SubjectID,
 		},
 	}
