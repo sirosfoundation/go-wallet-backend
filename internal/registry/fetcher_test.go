@@ -319,7 +319,9 @@ func TestFetcher_FetchFromSource_TS11Format(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
-	vct := vctmServer.URL + "/cred.vctm.json"
+	// The entry must be keyed on the "vct" field from the VCTM document,
+	// not on the schemaURI (which is only the fetch URL).
+	vct := "https://registry.example.org/cred.vctm.json"
 	entry, ok := entries[vct]
 	require.True(t, ok)
 
@@ -394,11 +396,16 @@ func TestFetcher_FetchFromSource_TS11_SkipsSchemaWithNoURIs(t *testing.T) {
 }
 
 func TestFetcher_FetchFromSource_TS11_Pagination(t *testing.T) {
-	vctmContent := `{"vct":"https://example.org/cred.json","name":"Cred"}`
-
+	// The VCTM server serves distinct documents (with different "vct" values) per path
+	// so that page 1 and page 2 produce two distinct store entries.
 	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(vctmContent))
+		switch r.URL.Path {
+		case "/cred2.json":
+			_, _ = w.Write([]byte(`{"vct":"https://example.org/cred2","name":"Cred2"}`))
+		default:
+			_, _ = w.Write([]byte(`{"vct":"https://example.org/cred1","name":"Cred1"}`))
+		}
 	}))
 	defer vctmServer.Close()
 
@@ -445,6 +452,101 @@ func TestFetcher_FetchFromSource_TS11_Pagination(t *testing.T) {
 	require.NoError(t, err)
 	// Both pages should be collected
 	assert.Len(t, entries, 2)
+}
+
+// TestFetcher_FetchFromSource_TS11_VCTFromDocument verifies that the VCT identifier is
+// read from the "vct" field in the VCTM document itself rather than derived from the
+// schemaURI.  This matters because the VCT may be a URN (e.g. "urn:eudi:diploma:1").
+func TestFetcher_FetchFromSource_TS11_VCTFromDocument(t *testing.T) {
+	// The VCTM document carries a URN-based vct, not the HTTP URL of the document.
+	vctmContent := `{"vct":"urn:eudi:diploma:1","name":"EUDI Diploma","description":"A diploma credential"}`
+
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer vctmServer.Close()
+
+	schemas := TS11SchemasResponse{
+		Schemas: []TS11SchemaMeta{
+			{
+				ID:               "diploma-id",
+				Version:          "1.0.0",
+				AttestationLoS:   "iso_18045_basic",
+				BindingType:      "key",
+				SupportedFormats: []string{"dc+sd-jwt"},
+				SchemaURIs: []TS11SchemaURI{
+					{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/diploma.vctm.json"},
+				},
+			},
+		},
+	}
+
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(schemas)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// Must be keyed on the URN from the document, not on the HTTP schemaURI.
+	entry, ok := entries["urn:eudi:diploma:1"]
+	require.True(t, ok, "entry must be keyed on the 'vct' field from the VCTM document")
+	assert.Equal(t, "urn:eudi:diploma:1", entry.VCT)
+	assert.Equal(t, "EUDI Diploma", entry.Name)
+	assert.Equal(t, "A diploma credential", entry.Description)
+}
+
+// TestFetcher_FetchFromSource_TS11_VCTFallbackToSchemaURI verifies that when the VCTM
+// document does not carry a "vct" field, the schemaURI is used as the fallback VCT.
+func TestFetcher_FetchFromSource_TS11_VCTFallbackToSchemaURI(t *testing.T) {
+	// VCTM document with no "vct" field.
+	vctmContent := `{"name":"No VCT Field Credential"}`
+
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer vctmServer.Close()
+
+	schemaURI := vctmServer.URL + "/cred.vctm.json"
+	schemas := TS11SchemasResponse{
+		Schemas: []TS11SchemaMeta{
+			{
+				ID:      "fallback-id",
+				Version: "1.0.0",
+				SchemaURIs: []TS11SchemaURI{
+					{FormatIdentifier: "dc+sd-jwt", URI: schemaURI},
+				},
+			},
+		},
+	}
+
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(schemas)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// When the document has no "vct" field, fall back to the schemaURI.
+	entry, ok := entries[schemaURI]
+	require.True(t, ok, "entry should be keyed on schemaURI when document has no 'vct' field")
+	assert.Equal(t, schemaURI, entry.VCT)
 }
 
 func TestFetcher_FetchFromSource_LegacyFormat(t *testing.T) {

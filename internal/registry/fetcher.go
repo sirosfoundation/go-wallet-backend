@@ -257,7 +257,8 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 		}
 
 		for _, schema := range page.Schemas {
-			// Derive the VCT from the dc+sd-jwt schemaURI (the VCTM URL is the VCT).
+			// Determine which schemaURI to use as the VCTM fetch URL.
+			// Prefer the dc+sd-jwt entry; fall back to the first URI.
 			var vctmURI string
 			for _, su := range schema.SchemaURIs {
 				if su.FormatIdentifier == "dc+sd-jwt" {
@@ -265,7 +266,6 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 					break
 				}
 			}
-			// Fall back to the first schemaURI if no dc+sd-jwt entry is present.
 			if vctmURI == "" && len(schema.SchemaURIs) > 0 {
 				vctmURI = schema.SchemaURIs[0].URI
 			}
@@ -275,25 +275,28 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 				continue
 			}
 
-			// The VCT identifier is the VCTM document URI itself.
-			vct := vctmURI
-
-			if !f.config.Filter.Matches(vct) {
-				filteredCount++
-				f.logger.Debug("filtered out credential", zap.String("vct", vct))
-				continue
-			}
-
-			entry, err := f.fetchTS11VCTM(ctx, schema, vct, vctmURI)
+			// NOTE: we do not pre-derive the VCT from the schemaURI.
+			// The authoritative VCT identifier lives inside the fetched VCTM
+			// document itself ("vct" field) and may be a URN (e.g.
+			// "urn:eudi:diploma:1") rather than the HTTP URL of the document.
+			// We must fetch first, then apply the filter on the real VCT.
+			entry, err := f.fetchTS11VCTM(ctx, schema, vctmURI)
 			if err != nil {
 				errorCount++
 				f.logger.Warn("failed to fetch TS11 VCTM",
-					zap.String("vct", vct),
+					zap.String("schema_id", schema.ID),
+					zap.String("url", vctmURI),
 					zap.Error(err))
 				continue
 			}
 
-			entries[vct] = entry
+			if !f.config.Filter.Matches(entry.VCT) {
+				filteredCount++
+				f.logger.Debug("filtered out credential", zap.String("vct", entry.VCT))
+				continue
+			}
+
+			entries[entry.VCT] = entry
 			fetchedCount++
 		}
 
@@ -321,10 +324,13 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 }
 
 // fetchTS11VCTM fetches the VCTM document for a TS11 schema and constructs a VCTMEntry.
-// The name and description are extracted from the fetched VCTM document because the
-// TS11 SchemaMeta does not carry a human-readable name.
-func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vct, vctmURI string) (*VCTMEntry, error) {
-	f.logger.Debug("fetching TS11 VCTM", zap.String("vct", vct), zap.String("url", vctmURI))
+// The authoritative VCT identifier, name, and description are all extracted from the
+// fetched VCTM document.  The VCT field in the document takes precedence over the
+// schemaURI used to fetch it, because the VCT may be a URN (e.g. "urn:eudi:diploma:1")
+// rather than an HTTP URL.  If the document does not contain a "vct" field, vctmURI is
+// used as the fallback identifier.
+func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vctmURI string) (*VCTMEntry, error) {
+	f.logger.Debug("fetching TS11 VCTM", zap.String("url", vctmURI))
 
 	body, err := f.fetchRaw(ctx, vctmURI)
 	if err != nil {
@@ -335,14 +341,24 @@ func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vct,
 		return nil, fmt.Errorf("invalid JSON in VCTM response")
 	}
 
-	// Extract the human-readable name and description from the VCTM document itself.
+	// Extract the authoritative VCT identifier, name, and description from the
+	// VCTM document itself.
 	var vctmDoc struct {
+		VCT         string `json:"vct"`
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
 	}
 	if err := json.Unmarshal(body, &vctmDoc); err != nil {
-		f.logger.Debug("could not extract name/description from VCTM document",
-			zap.String("vct", vct), zap.Error(err))
+		f.logger.Debug("could not extract fields from VCTM document",
+			zap.String("url", vctmURI), zap.Error(err))
+	}
+
+	// Fall back to the schemaURI when the document does not carry a "vct" field.
+	vct := vctmDoc.VCT
+	if vct == "" {
+		f.logger.Debug("VCTM document has no 'vct' field, falling back to schemaURI",
+			zap.String("url", vctmURI))
+		vct = vctmURI
 	}
 
 	return &VCTMEntry{
