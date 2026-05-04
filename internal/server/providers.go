@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
@@ -237,8 +238,19 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 		}
 	}
 
+	// Create a shared issuer metadata resolver so the TTL cache is effective
+	// across flows, and honour the service's HTTP client settings.
+	metadataResolver, err := issuermetadata.New(issuermetadata.Config{
+		HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
+		AllowHTTP:       cfg.HTTPClient.InsecureSkipVerify,
+		AllowPrivateIPs: cfg.HTTPClient.InsecureSkipVerify,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
+	}
+
 	// Register flow handlers
-	manager.RegisterFlowHandler(wsengine.ProtocolOID4VCI, wsengine.NewOID4VCIHandler)
+	manager.RegisterFlowHandler(wsengine.ProtocolOID4VCI, wsengine.NewOID4VCIHandlerFactory(metadataResolver))
 	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 

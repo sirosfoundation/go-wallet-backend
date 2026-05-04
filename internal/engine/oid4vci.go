@@ -22,39 +22,43 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
+// MetadataResolver resolves OpenID4VCI issuer metadata.
+type MetadataResolver interface {
+	Resolve(ctx context.Context, issuerURL string) (map[string]interface{}, error)
+}
+
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
 	httpClient       *http.Client
-	metadataResolver *issuermetadata.Resolver
+	metadataResolver MetadataResolver
 	dpopKey          *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
 	dpopNonce        string            // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
 }
 
-// NewOID4VCIHandler creates a new OID4VCI flow handler
-func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
-	resolver, err := issuermetadata.New(issuermetadata.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
+// NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
+// MetadataResolver across all handler instances, so the resolver's TTL cache
+// deduplicates metadata fetches across flows.
+func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
+	return func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return &OID4VCIHandler{
+			BaseHandler: BaseHandler{
+				Flow:     flow,
+				Config:   cfg,
+				Logger:   logger,
+				TrustSvc: trustSvc,
+				Registry: registry,
+			},
+			httpClient:       cfg.HTTPClient.NewHTTPClient(0),
+			metadataResolver: resolver,
+		}, nil
 	}
-	return &OID4VCIHandler{
-		BaseHandler: BaseHandler{
-			Flow:     flow,
-			Config:   cfg,
-			Logger:   logger,
-			TrustSvc: trustSvc,
-			Registry: registry,
-		},
-		httpClient:       cfg.HTTPClient.NewHTTPClient(0),
-		metadataResolver: resolver,
-	}, nil
 }
 
 // OID4VCI data structures
