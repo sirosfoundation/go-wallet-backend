@@ -12,6 +12,12 @@ server:
   registry_port: 8097
   rp_id: "wallet.example.com"
   rp_origin: "https://wallet.example.com"
+  # rp_origins allows multiple WebAuthn RP origins (e.g. for Android/iOS native app wrappers).
+  # When set, these are combined with rp_origin (if present) and deduplicated.
+  # Use rp_origins alone or alongside rp_origin for a gradual migration; at least one must be set.
+  # rp_origins:
+  #   - "https://wallet.example.com"
+  #   - "android:apk-key-hash:YOUR_APK_KEY_HASH_HERE"
   rp_name: "Example Wallet"
   base_url: "https://wallet.example.com"
 
