@@ -512,18 +512,22 @@ func TestSubmitDirectPostJWT_NilClientMetadata(t *testing.T) {
 	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
 }
 
-func TestSubmitDirectPostJWT_InvalidEndpoint(t *testing.T) {
-	h := &OID4VPHandler{httpClient: http.DefaultClient}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{
-			AuthorizationEncryptedResponseAlg: "ECDH-ES",
-		},
-	}
-
-	_, err := h.submitDirectPostJWT(context.Background(), "ftp://evil.com", authReq, "vp-token")
+func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {
+	_, err := sanitizeEndpointURL("ftp://evil.com")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid response endpoint URL")
+	assert.Contains(t, err.Error(), "invalid response endpoint URL scheme")
+}
+
+func TestSanitizeEndpointURL_ValidHTTPS(t *testing.T) {
+	result, err := sanitizeEndpointURL("https://verifier.example.com/response")
+	require.NoError(t, err)
+	assert.Equal(t, "https://verifier.example.com/response", result)
+}
+
+func TestSanitizeEndpointURL_ValidHTTP(t *testing.T) {
+	result, err := sanitizeEndpointURL("http://localhost:8080/callback")
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:8080/callback", result)
 }
 
 // ===== extractVerifierEncryptionKey tests =====
