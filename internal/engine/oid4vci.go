@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -29,7 +30,7 @@ import (
 
 // MetadataResolver resolves OpenID4VCI issuer metadata.
 type MetadataResolver interface {
-	Resolve(ctx context.Context, issuerURL string) (map[string]interface{}, error)
+	ResolveWithInfo(ctx context.Context, issuerURL string) (*issuermetadata.ResolveResult, error)
 }
 
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
@@ -406,16 +407,17 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("credential_issuer", offer.CredentialIssuer)
 
 	// Step 2: Fetch issuer metadata
-	metadata, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
+	metaResult, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
 		h.Logger.Debug("failed to fetch metadata", zap.Error(err))
 		_ = h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, ErrCodeMetadataFetchErr.UserFacingMessage())
 		return err
 	}
+	metadata := metaResult.Metadata
 	h.SetData("metadata", metadata)
 
 	// Step 3: Evaluate trust
-	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata)
+	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata, metaResult.Validated)
 	if err != nil {
 		h.Logger.Debug("issuer trust evaluation failed", zap.Error(err))
 		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
@@ -592,15 +594,21 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 	return &offer, nil
 }
 
-func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*IssuerMetadata, error) {
+// metadataResult bundles parsed issuer metadata with the resolver's trust signal.
+type metadataResult struct {
+	Metadata  *IssuerMetadata
+	Validated bool // true when the resolver verified a signed metadata JWT
+}
+
+func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*metadataResult, error) {
 	_ = h.ProgressMessage(StepFetchingMetadata, "Fetching issuer metadata")
 
-	raw, err := h.metadataResolver.Resolve(ctx, issuer)
+	result, err := h.metadataResolver.ResolveWithInfo(ctx, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %w", err)
 	}
 
-	b, err := json.Marshal(raw)
+	b, err := json.Marshal(result.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("marshalling issuer metadata: %w", err)
 	}
@@ -614,12 +622,13 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 		"credential_issuer":   metadata.CredentialIssuer,
 		"credential_endpoint": metadata.CredentialEndpoint,
 		"display":             metadata.Display,
+		"validated":           result.Validated,
 	})
 
-	return &metadata, nil
+	return &metadataResult{Metadata: &metadata, Validated: result.Validated}, nil
 }
 
-func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
+func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
 	// Extract key material from issuer metadata for trust evaluation
@@ -639,7 +648,8 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		SubjectType:        SubjectTypeCredentialIssuer,
 		RequiresResolution: requiresResolution,
 		Context: map[string]interface{}{
-			"credential_types": h.collectCredentialTypes(metadata),
+			"credential_types":   h.collectCredentialTypes(metadata),
+			"metadata_validated": metadataValidated,
 		},
 	}
 
