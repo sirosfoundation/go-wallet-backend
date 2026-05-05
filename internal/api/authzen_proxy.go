@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -266,21 +267,57 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Parse the resolve request
 	var req struct {
-		SubjectID string `json:"subject_id" binding:"required"`
+		SubjectID    string `json:"subject_id" binding:"required"`
+		SubjectType  string `json:"subject_type"`  // "key" (default) or "url"
+		ResourceType string `json:"resource_type"` // e.g. "credential_issuer" (default for url subjects)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
-	// Build an evaluation request for resolution-only
+	// Determine subject type: explicit field takes precedence, default is "key".
+	// Callers that want issuer metadata resolution must explicitly pass subject_type="url".
+	// This preserves backward compatibility: existing callers using HTTPS URLs for OIDF
+	// entity resolution continue to work with subject_type="key" (the default).
+	subjectType := req.SubjectType
+	if subjectType == "" {
+		subjectType = "key"
+	}
+	if subjectType != "key" && subjectType != "url" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "subject_type must be 'key' or 'url'"})
+		return
+	}
+
+	// When subject_type is "url", validate that subject_id is a well-formed HTTPS URL.
+	if subjectType == "url" {
+		u, err := url.Parse(req.SubjectID)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_id must be a valid HTTPS URL when subject_type is 'url'"})
+			return
+		}
+	}
+
+	// Determine resource type based on subject type and optional override.
+	// For URL subjects, default to "credential_issuer" (OpenID4VCI issuer metadata).
+	// For key subjects, default to "resolution" (DID/OIDF entity resolution).
+	resourceType := req.ResourceType
+	if resourceType == "" {
+		if subjectType == "url" {
+			resourceType = "credential_issuer"
+		} else {
+			resourceType = "resolution"
+		}
+	}
+
+	// Build an evaluation request
 	evalReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
-			Type: "key",
+			Type: subjectType,
 			ID:   req.SubjectID,
 		},
 		Resource: gotrust.Resource{
-			Type: "resolution",
+			Type: resourceType,
 			ID:   req.SubjectID,
 		},
 	}
