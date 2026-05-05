@@ -15,7 +15,7 @@ require (
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/sirosfoundation/go-cryptoutil v0.5.0
 	github.com/sirosfoundation/go-spocp v0.1.0
-	github.com/sirosfoundation/go-trust v0.3.1-0.20260504153707-11e4e9a51cb9 // pre-release: pending go-trust#37 merge + v0.4.0 tag
+	github.com/sirosfoundation/go-trust v0.3.1-0.20260504153707-11e4e9a51cb9 // pre-release: pending go-trust#43 merge + v0.4.0 tag
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver v1.17.9
