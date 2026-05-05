@@ -19,6 +19,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -2418,4 +2419,160 @@ func TestTxCodeDescriptionExtraction(t *testing.T) {
 			assert.Equal(t, tt.wantHasDesc, hasDesc)
 		})
 	}
+}
+
+// mockMetadataResolver is a test stub for the MetadataResolver interface.
+type mockMetadataResolver struct {
+	result    map[string]interface{}
+	validated bool
+	err       error
+}
+
+func (m *mockMetadataResolver) ResolveWithInfo(_ context.Context, _ string) (*issuermetadata.ResolveResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &issuermetadata.ResolveResult{
+		Metadata:  m.result,
+		Validated: m.validated,
+	}, nil
+}
+
+func TestFetchMetadata_Success(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		// consume progress messages; don't need to respond
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"token_endpoint":      "https://issuer.example.com/token",
+			"signed_metadata":     "eyJ...",
+		},
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
+	assert.Equal(t, "https://issuer.example.com/credential", meta.Metadata.CredentialEndpoint)
+	assert.Equal(t, "https://issuer.example.com/token", meta.Metadata.TokenEndpoint)
+	assert.Equal(t, "eyJ...", meta.Metadata.SignedMetadata)
+	assert.False(t, meta.Validated, "unsigned metadata should not be validated")
+}
+
+func TestFetchMetadata_ResolverError(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		err: errors.New("connection refused"),
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	_, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to fetch metadata")
+	assert.Contains(t, err.Error(), "connection refused")
+}
+
+func TestFetchMetadata_MapConversion(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{
+					"format": "vc+sd-jwt",
+					"vct":    "urn:credential:pid",
+				},
+			},
+			"display": []interface{}{
+				map[string]interface{}{
+					"name":   "Example Issuer",
+					"locale": "en",
+				},
+			},
+		},
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	require.Len(t, meta.Metadata.Display, 1)
+	assert.Equal(t, "Example Issuer", meta.Metadata.Display[0].Name)
+	require.Contains(t, meta.Metadata.CredentialConfigurationsSupported, "pid")
+	assert.Equal(t, "vc+sd-jwt", meta.Metadata.CredentialConfigurationsSupported["pid"].Format)
+	assert.Equal(t, "urn:credential:pid", meta.Metadata.CredentialConfigurationsSupported["pid"].VCT)
+}
+
+func TestFetchMetadata_ValidatedFlag(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+		},
+		validated: true,
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.True(t, meta.Validated, "signed metadata should have Validated=true")
+	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
 }

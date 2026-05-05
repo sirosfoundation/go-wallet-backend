@@ -22,32 +22,44 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
+// MetadataResolver resolves OpenID4VCI issuer metadata.
+type MetadataResolver interface {
+	ResolveWithInfo(ctx context.Context, issuerURL string) (*issuermetadata.ResolveResult, error)
+}
+
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
-	httpClient  *http.Client
-	dpopKey     *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
-	dpopNonce   string            // server-provided DPoP nonce (RFC 9449 §8)
-	redirectURI string
+	httpClient       *http.Client
+	metadataResolver MetadataResolver
+	dpopKey          *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce        string            // server-provided DPoP nonce (RFC 9449 §8)
+	redirectURI      string
 }
 
-// NewOID4VCIHandler creates a new OID4VCI flow handler
-func NewOID4VCIHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
-	return &OID4VCIHandler{
-		BaseHandler: BaseHandler{
-			Flow:     flow,
-			Config:   cfg,
-			Logger:   logger,
-			TrustSvc: trustSvc,
-			Registry: registry,
-		},
-		httpClient: cfg.HTTPClient.NewHTTPClient(0),
-	}, nil
+// NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
+// MetadataResolver across all handler instances, so the resolver's TTL cache
+// deduplicates metadata fetches across flows.
+func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
+	return func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return &OID4VCIHandler{
+			BaseHandler: BaseHandler{
+				Flow:     flow,
+				Config:   cfg,
+				Logger:   logger,
+				TrustSvc: trustSvc,
+				Registry: registry,
+			},
+			httpClient:       cfg.HTTPClient.NewHTTPClient(0),
+			metadataResolver: resolver,
+		}, nil
+	}
 }
 
 // OID4VCI data structures
@@ -395,16 +407,17 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("credential_issuer", offer.CredentialIssuer)
 
 	// Step 2: Fetch issuer metadata
-	metadata, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
+	metaResult, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
 		h.Logger.Debug("failed to fetch metadata", zap.Error(err))
 		_ = h.Error(StepFetchingMetadata, ErrCodeMetadataFetchErr, ErrCodeMetadataFetchErr.UserFacingMessage())
 		return err
 	}
+	metadata := metaResult.Metadata
 	h.SetData("metadata", metadata)
 
 	// Step 3: Evaluate trust
-	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata)
+	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata, metaResult.Validated)
 	if err != nil {
 		h.Logger.Debug("issuer trust evaluation failed", zap.Error(err))
 		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
@@ -581,30 +594,27 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 	return &offer, nil
 }
 
-func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*IssuerMetadata, error) {
+// metadataResult bundles parsed issuer metadata with the resolver's trust signal.
+type metadataResult struct {
+	Metadata  *IssuerMetadata
+	Validated bool // true when the resolver verified a signed metadata JWT
+}
+
+func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*metadataResult, error) {
 	_ = h.ProgressMessage(StepFetchingMetadata, "Fetching issuer metadata")
 
-	// Fetch from well-known endpoint
-	metadataURL := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-credential-issuer"
-
-	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := h.httpClient.Do(req)
+	result, err := h.metadataResolver.ResolveWithInfo(ctx, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %w", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		return nil, fmt.Errorf("metadata fetch returned status %d: %s", resp.StatusCode, string(body))
+	b, err := json.Marshal(result.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling issuer metadata: %w", err)
 	}
 
 	var metadata IssuerMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
@@ -612,12 +622,13 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*Iss
 		"credential_issuer":   metadata.CredentialIssuer,
 		"credential_endpoint": metadata.CredentialEndpoint,
 		"display":             metadata.Display,
+		"validated":           result.Validated,
 	})
 
-	return &metadata, nil
+	return &metadataResult{Metadata: &metadata, Validated: result.Validated}, nil
 }
 
-func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata) (*TrustInfo, error) {
+func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
 	// Extract key material from issuer metadata for trust evaluation
@@ -637,7 +648,8 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		SubjectType:        SubjectTypeCredentialIssuer,
 		RequiresResolution: requiresResolution,
 		Context: map[string]interface{}{
-			"credential_types": h.collectCredentialTypes(metadata),
+			"credential_types":   h.collectCredentialTypes(metadata),
+			"metadata_validated": metadataValidated,
 		},
 	}
 
