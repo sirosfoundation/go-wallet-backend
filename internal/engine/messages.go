@@ -262,8 +262,9 @@ type SignRequestParams struct {
 
 // CredentialRef references a credential for signing
 type CredentialRef struct {
-	CredentialID    string   `json:"credential_id"`
-	DisclosedClaims []string `json:"disclosed_claims,omitempty"`
+	CredentialQueryID string   `json:"credential_query_id,omitempty"`
+	CredentialID      string   `json:"credential_id"`
+	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
 }
 
 // ProofObject represents a single OID4VCI credential proof.
@@ -368,8 +369,9 @@ type MatchedCredential struct {
 
 // ConsentSelection represents user's disclosure selection
 type ConsentSelection struct {
-	CredentialID    string   `json:"credential_id"`
-	DisclosedClaims []string `json:"disclosed_claims"`
+	CredentialQueryID string   `json:"credential_query_id,omitempty"`
+	CredentialID      string   `json:"credential_id"`
+	DisclosedClaims   []string `json:"disclosed_claims"`
 }
 
 // SubjectType constants for trust evaluation
