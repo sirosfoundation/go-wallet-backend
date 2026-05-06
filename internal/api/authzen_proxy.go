@@ -382,10 +382,13 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects, resolve locally via the metadata resolver when available.
-	// Fall back to proxying to the PDP when no resolver is configured so that
-	// deployments without AllowResolution retain backward-compatible behaviour.
+	// For URL subjects, dispatch based on resource type
 	if subjectType == "url" {
+		if resourceType == "credential_offer_uri" {
+			h.resolveCredentialOfferURI(c, ctx, req.SubjectID)
+			return
+		}
+		// Default: resolve as credential issuer (fetches /.well-known/openid-credential-issuer)
 		if h.metadataResolver == nil {
 			h.logger.Debug("no metadata resolver configured for URL subject — proxying to PDP")
 			h.proxyToPDP(c, ctx, tenantID, evalReq)
@@ -397,6 +400,89 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// For key subjects, proxy to PDP
 	h.proxyToPDP(c, ctx, tenantID, evalReq)
+}
+
+// resolveCredentialOfferURI fetches a credential_offer_uri and returns the parsed
+// credential offer document. The offer URI is fetched server-side using the
+// configured httpClient, which applies SSRF protections via transport-level
+// restrictions. The URL must already be validated as HTTPS before this call.
+//
+// Response: { "decision": true, "context": { "credential_offer": <offer doc> } }
+func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx context.Context, offerURI string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, offerURI, nil)
+	if err != nil {
+		h.logger.Error("failed to build credential offer request",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch credential offer"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.Error("credential offer fetch failed",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch credential offer"})
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Warn("credential offer endpoint returned non-200",
+			zap.String("offer_uri", offerURI),
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("credential offer endpoint returned status %d", resp.StatusCode)})
+		return
+	}
+
+	// Limit response body to 1MB to prevent abuse
+	const maxOfferSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOfferSize))
+	if err != nil {
+		h.logger.Error("failed to read credential offer response",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read credential offer response"})
+		return
+	}
+
+	var offer map[string]interface{}
+	if err := json.Unmarshal(body, &offer); err != nil {
+		h.logger.Warn("credential offer response is not valid JSON",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer response is not valid JSON"})
+		return
+	}
+
+	// Validate the document contains the required OID4VCI credential offer fields.
+	if _, ok := offer["credential_issuer"].(string); !ok {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_issuer"})
+		return
+	}
+	if _, ok := offer["credential_configuration_ids"].([]interface{}); !ok {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_configuration_ids"})
+		return
+	}
+
+	h.logger.Info("credential offer URI resolved",
+		zap.String("offer_uri", offerURI),
+		zap.String("credential_issuer", offer["credential_issuer"].(string)),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"decision": true,
+		"context": gin.H{
+			"credential_offer": offer,
+		},
+	})
 }
 
 // resolveURLSubject handles the local resolution path for URL subjects.

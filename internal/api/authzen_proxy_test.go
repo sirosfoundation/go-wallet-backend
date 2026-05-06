@@ -742,6 +742,281 @@ func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 }
 
 // ============================================================================
+// credential_offer_uri Resource Type Tests
+// ============================================================================
+
+func TestResolve_CredentialOfferURI_Success(t *testing.T) {
+	// A well-formed credential offer document served at the offer URI is returned
+	// in context.credential_offer, with decision=true and no PDP call.
+	offer := map[string]interface{}{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_configuration_ids": []interface{}{
+			"UniversityDegreeCredential",
+		},
+		"grants": map[string]interface{}{
+			"urn:ietf:params:oauth:grant-type:pre-authorized_code": map[string]interface{}{
+				"pre-authorized_code": "abc123",
+			},
+		},
+	}
+
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(offer) //nolint:errcheck
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, offerServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp["decision"] != true {
+		t.Errorf("Expected decision=true, got %v", resp["decision"])
+	}
+	ctx, ok := resp["context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context object, got %T", resp["context"])
+	}
+	credOffer, ok := ctx["credential_offer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context.credential_offer object, got %T", ctx["credential_offer"])
+	}
+	if credOffer["credential_issuer"] != "https://issuer.example.com" {
+		t.Errorf("Expected credential_issuer='https://issuer.example.com', got %v", credOffer["credential_issuer"])
+	}
+}
+
+func TestResolve_CredentialOfferURI_NonHTTPS_Rejected(t *testing.T) {
+	// HTTP (non-HTTPS) subject_id must be rejected before any fetch is attempted.
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, nil)
+	if pdpServer != nil {
+		defer pdpServer.Close()
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "http://issuer.example.com/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_FetchFailure(t *testing.T) {
+	// If the offer URI cannot be fetched, return 502.
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	// Use a port that is not listening so the fetch will fail
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "https://127.0.0.1:1/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_InvalidJSON(t *testing.T) {
+	// If the offer endpoint returns invalid JSON, return 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not valid json")) //nolint:errcheck
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, offerServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_MissingCredentialIssuer(t *testing.T) {
+	// A JSON document without credential_issuer must be rejected with 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_configuration_ids": []string{"MyCredential"},
+		})
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, offerServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_NonOKStatus(t *testing.T) {
+	// If the offer endpoint returns a non-200 status, return 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, offerServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+// ============================================================================
 // Helper Function Tests
 // ============================================================================
 
