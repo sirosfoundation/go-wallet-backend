@@ -351,7 +351,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		metadataResolver = r
 	}
 
-	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), metadataResolver, httpClient, logger)
+	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), store.Issuers(), metadataResolver, httpClient, logger)
 	if err != nil {
 		if closeErr := store.Close(); closeErr != nil {
 			logger.Error("Failed to close store after AuthZEN proxy initialization failure", zap.Error(closeErr))

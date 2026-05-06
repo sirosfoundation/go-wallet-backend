@@ -86,7 +86,7 @@ func setupAuthZENProxyHandlerWithTenants(t *testing.T, authorizer authz.Authoriz
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, authorizer, tenantLookup, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, authorizer, tenantLookup, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 
@@ -168,7 +168,7 @@ func TestEvaluate_Unauthorized_NoTenant(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	// No middleware to set tenant_id
@@ -240,7 +240,7 @@ func TestEvaluate_ServiceUnavailable_NoPDP(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -376,7 +376,7 @@ func TestResolve_ServiceUnavailable_NoPDP(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -410,7 +410,7 @@ func TestResolve_Forbidden_ResolutionDisabled(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -441,7 +441,7 @@ func TestResolve_Unauthorized_NoTenantID(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	// No middleware setting tenant_id
@@ -469,7 +469,7 @@ func TestResolve_InternalError_BadTenantIDType(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -507,7 +507,7 @@ func TestResolve_BadGateway_PDPError(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -714,7 +714,7 @@ func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 			},
 		},
 	}
-	handler := NewAuthZENProxyHandler(cfg, spocpAuth, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, spocpAuth, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -788,7 +788,7 @@ func TestGetPDPURL(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	// Returns the global URL when no per-tenant config is available
 	ctx := context.Background()
@@ -809,7 +809,7 @@ func TestNewAuthZENProxyHandler(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	if handler == nil {
 		t.Fatal("Expected handler to not be nil")
@@ -836,7 +836,7 @@ func TestGetClient_Caching(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 
 	// First call creates client
 	client1, err := handler.getClient("https://pdp1.example.com")
@@ -898,7 +898,7 @@ func TestGetPDPURL_PerTenantConfig(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, nil, nil, http.DefaultClient, logger)
 
 	ctx := context.Background()
 
@@ -933,7 +933,7 @@ func TestGetPDPURL_PerTenantConfig(t *testing.T) {
 	})
 
 	t.Run("nil tenant lookup uses global URL", func(t *testing.T) {
-		handlerNoLookup := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+		handlerNoLookup := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, nil, http.DefaultClient, logger)
 		url, err := handlerNoLookup.getPDPURL(ctx, "any-tenant")
 		if err != nil {
 			t.Fatalf("getPDPURL() unexpected error: %v", err)
@@ -960,7 +960,7 @@ func TestGetPDPURL_FailClosedBehavior(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, tenantLookup, nil, nil, http.DefaultClient, logger)
 
 	ctx := context.Background()
 
@@ -978,7 +978,7 @@ func TestGetPDPURL_FailClosedBehavior(t *testing.T) {
 			Timeout:                     30,
 			FailOpenOnTenantLookupError: true, // fail-open
 		}
-		handlerFailOpen := NewAuthZENProxyHandler(cfgFailOpen, &mockAuthorizer{allowAll: true}, tenantLookup, nil, http.DefaultClient, logger)
+		handlerFailOpen := NewAuthZENProxyHandler(cfgFailOpen, &mockAuthorizer{allowAll: true}, tenantLookup, nil, nil, http.DefaultClient, logger)
 
 		url, err := handlerFailOpen.getPDPURL(ctx, "any-tenant")
 		if err != nil {
@@ -1001,7 +1001,7 @@ func TestNewAuthZENProxyHandlerFromConfig_Disabled(t *testing.T) {
 		},
 	}
 	logger := zap.NewNop()
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error when disabled, got: %v", err)
 	}
@@ -1021,7 +1021,7 @@ func TestNewAuthZENProxyHandlerFromConfig_EnabledNoRulesFile(t *testing.T) {
 	}
 	logger := zap.NewNop()
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error with no rules file, got: %v", err)
 	}
@@ -1047,7 +1047,7 @@ func TestNewAuthZENProxyHandlerFromConfig_EnabledBadRulesFile_DebugMode(t *testi
 	logger := zap.NewNop()
 	// gin.TestMode is set in init(), so the release-mode fail-closed guard won't trigger
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error in test mode with bad rules file, got: %v", err)
 	}
@@ -1071,7 +1071,7 @@ func TestNewAuthZENProxyHandlerFromConfig_EnabledBadRulesFile_ReleaseMode(t *tes
 	gin.SetMode(gin.ReleaseMode)
 	defer gin.SetMode(gin.TestMode)
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err == nil {
 		t.Error("expected error in release mode when SPOCP authorizer cannot be initialized")
 	}
@@ -1094,7 +1094,7 @@ func TestNewAuthZENProxyHandlerFromConfig_PDPURLFromAuthZENConfig(t *testing.T) 
 	}
 	logger := zap.NewNop()
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
 	}
@@ -1121,7 +1121,7 @@ func TestNewAuthZENProxyHandlerFromConfig_PDPURLFallbackFromTrust(t *testing.T) 
 	}
 	logger := zap.NewNop()
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
 	}
@@ -1145,7 +1145,7 @@ func TestNewAuthZENProxyHandlerFromConfig_SetsDefaultTimeout(t *testing.T) {
 	}
 	logger := zap.NewNop()
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, nil, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
 	}
@@ -1179,7 +1179,7 @@ func TestNewAuthZENProxyHandlerFromConfig_WithTenantLookup(t *testing.T) {
 	}
 	logger := zap.NewNop()
 
-	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, tenantLookup, nil, http.DefaultClient, logger)
+	handler, err := NewAuthZENProxyHandlerFromConfig(cfg, tenantLookup, nil, nil, http.DefaultClient, logger)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
 	}
@@ -1275,7 +1275,7 @@ func TestResolve_URLSubject_LocalResolution(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1351,7 +1351,7 @@ func TestResolve_URLSubject_Untrusted(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1398,7 +1398,7 @@ func TestResolve_URLSubject_MetadataResolutionFailure(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1479,7 +1479,7 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	}
 	logger := zap.NewNop()
 	// Use the TLS server's client so the handler can fetch HTTPS logo URLs.
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, logoServer.Client(), logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, logoServer.Client(), logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1567,7 +1567,7 @@ func TestResolve_KeySubject_ProxiesToPDP(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1627,7 +1627,7 @@ func TestResolve_URLSubject_SignedUntrusted_Error(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1648,5 +1648,151 @@ func TestResolve_URLSubject_SignedUntrusted_Error(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected status %d for signed+untrusted, got %d: %s", http.StatusForbidden, w.Code, w.Body.String())
+	}
+}
+
+// mockIssuerLookup implements IssuerLookup for testing.
+type mockIssuerLookup struct {
+	issuer *domain.CredentialIssuer
+	err    error
+}
+
+func (m *mockIssuerLookup) GetByIdentifier(_ context.Context, _ domain.TenantID, _ string) (*domain.CredentialIssuer, error) {
+	return m.issuer, m.err
+}
+
+func TestResolve_URLSubject_RegisteredIssuerInfo_IncludedWhenFound(t *testing.T) {
+	// When an issuer is registered in the backend storage, /v1/resolve should
+	// include its registration info (e.g. client_id) in the response as
+	// registered_issuer — separate from trust_metadata.
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer": "https://issuer.example.com",
+	}
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{Metadata: metadata}}
+
+	registeredIssuer := &domain.CredentialIssuer{
+		CredentialIssuerIdentifier: "https://issuer.example.com",
+		ClientID:                   "my-client-id",
+		Visible:                    true,
+		TrustStatus:                domain.TrustStatus("trusted"),
+		TrustFramework:             "EUCS",
+	}
+	issuerLookup := &mockIssuerLookup{issuer: registeredIssuer}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, issuerLookup, resolver, http.DefaultClient, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":   "https://issuer.example.com",
+		"subject_type": "url",
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	reg, ok := resp["registered_issuer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected registered_issuer in response, got: %v", resp["registered_issuer"])
+	}
+	if reg["client_id"] != "my-client-id" {
+		t.Errorf("expected client_id=my-client-id, got: %v", reg["client_id"])
+	}
+	if reg["trust_framework"] != "EUCS" {
+		t.Errorf("expected trust_framework=EUCS, got: %v", reg["trust_framework"])
+	}
+	if reg["visible"] != true {
+		t.Errorf("expected visible=true, got: %v", reg["visible"])
+	}
+
+	// trust_metadata should still be present and unchanged
+	ctx, ok := resp["context"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected context in response")
+	}
+	if ctx["trust_metadata"] == nil {
+		t.Error("expected trust_metadata in context")
+	}
+}
+
+func TestResolve_URLSubject_RegisteredIssuerInfo_OmittedWhenNotFound(t *testing.T) {
+	// When the issuer is not registered in backend storage, registered_issuer
+	// should be absent from the response.
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer": "https://unknown-issuer.example.com",
+	}
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{Metadata: metadata}}
+	issuerLookup := &mockIssuerLookup{issuer: nil, err: nil}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, issuerLookup, resolver, http.DefaultClient, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":   "https://unknown-issuer.example.com",
+		"subject_type": "url",
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if _, exists := resp["registered_issuer"]; exists {
+		t.Errorf("expected registered_issuer to be absent, got: %v", resp["registered_issuer"])
 	}
 }

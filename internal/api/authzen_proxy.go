@@ -35,12 +35,35 @@ type TenantLookup interface {
 	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
 }
 
+// IssuerLookup is an interface for looking up registered credential issuers.
+// This abstraction allows for easier testing.
+type IssuerLookup interface {
+	GetByIdentifier(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error)
+}
+
+// RegisteredIssuerInfo contains issuer registration data from the backend storage.
+// It is included in the /v1/resolve response context when the issuer is found in storage.
+type RegisteredIssuerInfo struct {
+	ClientID       string             `json:"client_id,omitempty"`
+	Visible        bool               `json:"visible"`
+	TrustStatus    domain.TrustStatus `json:"trust_status,omitempty"`
+	TrustFramework string             `json:"trust_framework,omitempty"`
+}
+
+// resolveURLResponse is the response type for /v1/resolve URL subject requests.
+// It extends gotrust.EvaluationResponse with optional registered issuer info.
+type resolveURLResponse struct {
+	gotrust.EvaluationResponse
+	RegisteredIssuer *RegisteredIssuerInfo `json:"registered_issuer,omitempty"`
+}
+
 // AuthZENProxyHandler handles AuthZEN evaluation requests by proxying to a PDP.
 // It provides an authenticated endpoint for the frontend to make trust decisions.
 type AuthZENProxyHandler struct {
 	cfg              *config.AuthZENProxyConfig
 	authorizer       authz.Authorizer
 	tenantLookup     TenantLookup
+	issuerLookup     IssuerLookup
 	metadataResolver IssuerMetadataResolver
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
@@ -49,13 +72,15 @@ type AuthZENProxyHandler struct {
 }
 
 // NewAuthZENProxyHandler creates a new AuthZEN proxy handler.
-// The tenantLookup parameter is optional - if nil, per-tenant configuration is disabled.
+// The tenantLookup and issuerLookup parameters are optional - if nil, the respective
+// per-tenant features are disabled.
 // The metadataResolver is required for URL subject resolution on /v1/resolve.
-func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
+func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
 		authorizer:       authorizer,
 		tenantLookup:     tenantLookup,
+		issuerLookup:     issuerLookup,
 		metadataResolver: metadataResolver,
 		clients:          make(map[string]*authzenclient.Client),
 		httpClient:       httpClient,
@@ -70,7 +95,7 @@ func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Aut
 // the handler. Returns (nil, nil) when AuthZEN proxy is disabled.
 //
 // The caller is responsible for closing any resources (e.g. storage) on error.
-func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) (*AuthZENProxyHandler, error) {
+func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) (*AuthZENProxyHandler, error) {
 	if !cfg.AuthZENProxy.Enabled {
 		return nil, nil
 	}
@@ -109,6 +134,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		&cfg.AuthZENProxy,
 		authorizerInterface,
 		tenantLookup,
+		issuerLookup,
 		metadataResolver,
 		httpClient,
 		logger,
@@ -470,14 +496,30 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	}
 
 	// Step 6: Return composite response with trust decision and metadata
-	resp := &gotrust.EvaluationResponse{
-		Decision: trustResp.Decision,
-		Context: &gotrust.EvaluationResponseContext{
-			TrustMetadata: result.Metadata,
+	resp := &resolveURLResponse{
+		EvaluationResponse: gotrust.EvaluationResponse{
+			Decision: trustResp.Decision,
+			Context: &gotrust.EvaluationResponseContext{
+				TrustMetadata: result.Metadata,
+			},
 		},
 	}
 	if trustResp.Context != nil && trustResp.Context.Reason != nil {
 		resp.Context.Reason = trustResp.Context.Reason
+	}
+
+	// Step 7: Enrich response with registered issuer info from backend storage.
+	// This is looked up by the issuer URL (CredentialIssuerIdentifier) within the tenant.
+	// If not found or issuer lookup is unavailable, the field is omitted.
+	if h.issuerLookup != nil && tenantID != "" {
+		if reg, err := h.issuerLookup.GetByIdentifier(ctx, domain.TenantID(tenantID), issuerURL); err == nil && reg != nil {
+			resp.RegisteredIssuer = &RegisteredIssuerInfo{
+				ClientID:       reg.ClientID,
+				Visible:        reg.Visible,
+				TrustStatus:    reg.TrustStatus,
+				TrustFramework: reg.TrustFramework,
+			}
+		}
 	}
 
 	h.logger.Info("URL subject resolution completed",

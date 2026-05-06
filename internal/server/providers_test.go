@@ -313,6 +313,7 @@ func newTestAuthZENHandler(cfg *config.Config, logger *zap.Logger) *api.AuthZENP
 		authz.NoOpAuthorizer{},
 		nil,
 		nil,
+		nil,
 		http.DefaultClient,
 		logger,
 	)
