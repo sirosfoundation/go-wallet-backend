@@ -407,37 +407,37 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		return
 	}
 
-// Build trust evaluation request with key material.
-        // Action is set to "credential-issuer" so PDP policy can distinguish
-        // issuer trust evaluation from verifier or general resolution requests.
-        trustReq := &gotrust.EvaluationRequest{
-                Subject: gotrust.Subject{
-                        Type: "key",
-                        ID:   issuerURL,
-                },
-                Resource: gotrust.Resource{
-                        ID: issuerURL,
-                },
-                Action: &gotrust.Action{Name: "credential-issuer"},
-        }
+	// Build trust evaluation request with key material.
+	// Action is set to "credential-issuer" so PDP policy can distinguish
+	// issuer trust evaluation from verifier or general resolution requests.
+	trustReq := &gotrust.EvaluationRequest{
+		Subject: gotrust.Subject{
+			Type: "key",
+			ID:   issuerURL,
+		},
+		Resource: gotrust.Resource{
+			ID: issuerURL,
+		},
+		Action: &gotrust.Action{Name: "credential-issuer"},
+	}
 
-        if keyMaterial != nil {
-                trustReq.Resource.Type = keyMaterial.Type
-                switch keyMaterial.Type {
-                case "x5c":
-                        keys := make([]interface{}, len(keyMaterial.X5C))
-                        for i, cert := range keyMaterial.X5C {
-                                keys[i] = cert
-                        }
-                        trustReq.Resource.Key = keys
-                case "jwk":
-                        trustReq.Resource.Key = trust.NormalizeJWKS(keyMaterial.JWK)
-                }
-        } else {
-                // No key material could be extracted. Set resource type to "resolution"
-                // so the PDP receives a well-formed request and can apply a
-                // resolution-only policy rather than a trust-evaluation policy.
-                trustReq.Resource.Type = "resolution"
+	if keyMaterial != nil {
+		trustReq.Resource.Type = keyMaterial.Type
+		switch keyMaterial.Type {
+		case "x5c":
+			keys := make([]interface{}, len(keyMaterial.X5C))
+			for i, cert := range keyMaterial.X5C {
+				keys[i] = cert
+			}
+			trustReq.Resource.Key = keys
+		case "jwk":
+			trustReq.Resource.Key = trust.NormalizeJWKS(keyMaterial.JWK)
+		}
+	} else {
+		// No key material could be extracted. Set resource type to "resolution"
+		// so the PDP receives a well-formed request and can apply a
+		// resolution-only policy rather than a trust-evaluation policy.
+		trustReq.Resource.Type = "resolution"
 	}
 
 	trustResp, err := client.Evaluate(ctx, trustReq)
@@ -549,21 +549,21 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 		}
 	}
 
-// Check jwks_uri — HTTPS only to avoid SSRF via issuer-controlled URIs.
-        if jwksURI, ok := metadata["jwks_uri"].(string); ok && jwksURI != "" {
-                parsed, err := url.Parse(jwksURI)
-                if err != nil || parsed.Scheme != "https" {
-                        h.logger.Warn("Skipping jwks_uri with non-HTTPS scheme (SSRF protection)",
-                                zap.String("uri", jwksURI))
-                } else {
-                        jwks, err := trust.FetchJWKS(ctx, jwksURI, h.httpClient)
-                        if err != nil {
-                                h.logger.Warn("Failed to fetch JWKS",
-                                        zap.String("uri", jwksURI),
-                                        zap.Error(err))
-                        } else {
-                                return &trust.KeyMaterial{Type: "jwk", JWK: jwks}
-                        }
+	// Check jwks_uri — HTTPS only to avoid SSRF via issuer-controlled URIs.
+	if jwksURI, ok := metadata["jwks_uri"].(string); ok && jwksURI != "" {
+		parsed, err := url.Parse(jwksURI)
+		if err != nil || parsed.Scheme != "https" {
+			h.logger.Warn("Skipping jwks_uri with non-HTTPS scheme (SSRF protection)",
+				zap.String("uri", jwksURI))
+		} else {
+			jwks, err := trust.FetchJWKS(ctx, jwksURI, h.httpClient)
+			if err != nil {
+				h.logger.Warn("Failed to fetch JWKS",
+					zap.String("uri", jwksURI),
+					zap.Error(err))
+			} else {
+				return &trust.KeyMaterial{Type: "jwk", JWK: jwks}
+			}
 		}
 	}
 
@@ -622,9 +622,9 @@ func (h *AuthZENProxyHandler) inlineLogoField(ctx context.Context, displayEntry 
 		return
 	}
 
-// Only fetch HTTPS URLs (enforce to prevent SSRF via issuer-controlled logo URIs).
-        parsed, err := url.Parse(uri)
-        if err != nil || parsed.Scheme != "https" {
+	// Only fetch HTTPS URLs (enforce to prevent SSRF via issuer-controlled logo URIs).
+	parsed, err := url.Parse(uri)
+	if err != nil || parsed.Scheme != "https" {
 		return
 	}
 
@@ -655,16 +655,16 @@ func (h *AuthZENProxyHandler) fetchAsDataURI(ctx context.Context, imageURL strin
 		return "", fmt.Errorf("logo fetch returned status %d", resp.StatusCode)
 	}
 
-// Limit read to 1MB to prevent abuse. Read one extra byte to detect
-        // truncation — if the body exceeds the limit, reject it rather than
-        // returning a partial/corrupt data: URI.
-        const maxLogoSize = 1 << 20
-        body, err := io.ReadAll(io.LimitReader(resp.Body, maxLogoSize+1))
-        if err != nil {
-                return "", err
-        }
-        if len(body) > maxLogoSize {
-                return "", fmt.Errorf("logo response exceeds %d byte limit", maxLogoSize)
+	// Limit read to 1MB to prevent abuse. Read one extra byte to detect
+	// truncation — if the body exceeds the limit, reject it rather than
+	// returning a partial/corrupt data: URI.
+	const maxLogoSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLogoSize+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > maxLogoSize {
+		return "", fmt.Errorf("logo response exceeds %d byte limit", maxLogoSize)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
