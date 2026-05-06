@@ -1,8 +1,10 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,6 +54,8 @@ type HTTPClientConfig struct {
 // timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
 // configured timeout. A zero-value HTTPClientConfig produces a sensible default
 // (30 s timeout, system proxy, TLS verification enabled).
+// When AllowPrivateIPs is false, a custom dialer blocks connections to private,
+// loopback, and link-local IP ranges to prevent SSRF.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -71,6 +75,35 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		proxyURL, err := url.Parse(c.ProxyURL)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	if !c.AllowPrivateIPs {
+		// Block connections to private/loopback/link-local IPs to prevent SSRF.
+		// DNS resolution happens inside the dialer so post-DNS rebinding is also blocked.
+		baseDialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+			}
+			for _, ip := range ips {
+				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+					return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+				}
+				// Block cloud metadata endpoints (169.254.169.254, [fd00::1])
+				if ip.Equal(net.ParseIP("169.254.169.254")) {
+					return nil, fmt.Errorf("connection to cloud metadata endpoint %s is not allowed", host)
+				}
+			}
+			return baseDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 		}
 	}
 

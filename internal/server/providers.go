@@ -212,7 +212,10 @@ type EngineProvider struct {
 
 // NewEngineProvider creates a new WebSocket engine route provider.
 // If store is non-nil, the engine will cache verifier trust evaluations.
-func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore) (*EngineProvider, error) {
+// If sharedResolver is non-nil, it is used for issuer metadata resolution so
+// the TTL cache is shared with the HTTP /v1/resolve handler; otherwise a new
+// resolver is created from the config.
+func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore, sharedResolver *issuermetadata.Resolver) (*EngineProvider, error) {
 	// Create WebSocket manager
 	manager := wsengine.NewManager(cfg, logger)
 
@@ -238,15 +241,20 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 		}
 	}
 
-	// Create a shared issuer metadata resolver so the TTL cache is effective
-	// across flows, and honour the service's HTTP client settings.
-	metadataResolver, err := issuermetadata.New(issuermetadata.Config{
-		HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
-		AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
-		AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
+	// Use the shared resolver when available so the TTL cache is not duplicated.
+	// Fall back to creating a local resolver (e.g. when the engine runs without
+	// the backend provider, or when resolution is disabled on the backend).
+	metadataResolver := sharedResolver
+	if metadataResolver == nil {
+		r, err := issuermetadata.New(issuermetadata.Config{
+			HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
+			AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
+			AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
+		}
+		metadataResolver = r
 	}
 
 	// Register flow handlers
@@ -302,12 +310,13 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 
 // BackendProvider provides the full backend API (auth + storage combined)
 type BackendProvider struct {
-	auth           *AuthProvider
-	storage        *StorageProvider
-	store          backend.Backend
-	cfg            *config.Config
-	authzenHandler *api.AuthZENProxyHandler
-	logger         *zap.Logger
+	auth             *AuthProvider
+	storage          *StorageProvider
+	store            backend.Backend
+	cfg              *config.Config
+	authzenHandler   *api.AuthZENProxyHandler
+	metadataResolver *issuermetadata.Resolver
+	logger           *zap.Logger
 }
 
 // NewBackendProvider creates a combined auth+storage provider
@@ -335,7 +344,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	// Create issuer metadata resolver for local URL subject resolution.
 	// Only instantiated when AuthZEN proxy is enabled and resolution is allowed,
 	// so that a startup failure here does not affect deployments that don't use it.
-	var metadataResolver api.IssuerMetadataResolver
+	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
 			HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
@@ -360,12 +369,13 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	}
 
 	return &BackendProvider{
-		auth:           NewAuthProvider(cfg, store, logger, roles),
-		storage:        NewStorageProvider(cfg, store, logger, roles),
-		store:          store,
-		cfg:            cfg,
-		authzenHandler: authzenHandler,
-		logger:         logger,
+		auth:             NewAuthProvider(cfg, store, logger, roles),
+		storage:          NewStorageProvider(cfg, store, logger, roles),
+		store:            store,
+		cfg:              cfg,
+		authzenHandler:   authzenHandler,
+		metadataResolver: metadataResolver,
+		logger:           logger,
 	}, nil
 }
 
@@ -415,6 +425,13 @@ func (p *BackendProvider) CheckReady(ctx context.Context) error {
 // Store returns the underlying storage backend
 func (p *BackendProvider) Store() backend.Backend {
 	return p.store
+}
+
+// MetadataResolver returns the shared issuer metadata resolver, or nil if
+// resolution is not enabled. The engine provider can accept this resolver to
+// share the TTL cache with the HTTP /v1/resolve handler.
+func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
+	return p.metadataResolver
 }
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.

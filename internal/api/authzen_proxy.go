@@ -369,15 +369,15 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects, resolve locally and evaluate trust
+	// For URL subjects, resolve locally when a metadata resolver is configured.
+	// If no resolver is configured, fall back to proxying to the PDP for
+	// backward compatibility.
 	if subjectType == "url" {
-		if h.metadataResolver == nil {
-			h.logger.Error("metadata resolver not configured for URL subject resolution")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "issuer metadata resolution not configured"})
+		if h.metadataResolver != nil {
+			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
 			return
 		}
-		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
-		return
+		// No local resolver configured — fall through to PDP proxy
 	}
 
 	// For key subjects, proxy to PDP
@@ -410,7 +410,16 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	}
 
 	// Step 2: Extract key material from metadata
-	keyMaterial := h.extractKeyMaterial(ctx, result.Metadata)
+	keyMaterial, signedButFailed := h.extractKeyMaterial(ctx, result.Metadata)
+
+	// If signed_metadata was present but JWT verification failed, reject immediately.
+	// Returning metadata with a claimed-but-unverifiable signature would be misleading.
+	if metadataIsSigned && signedButFailed {
+		h.logger.Error("signed_metadata JWT verification failed, rejecting request",
+			zap.String("issuer_url", issuerURL))
+		c.JSON(http.StatusBadGateway, gin.H{"error": "signed issuer metadata could not be verified"})
+		return
+	}
 
 	// Step 3: Evaluate trust via PDP using extracted key material
 	pdpURL, err := h.getPDPURL(ctx, tenantID)
@@ -566,16 +575,19 @@ func (h *AuthZENProxyHandler) proxyToPDP(c *gin.Context, ctx context.Context, te
 
 // extractKeyMaterial extracts cryptographic key material from issuer metadata.
 // It checks (in order): signed_metadata JWT, inline JWKS, jwks_uri.
-func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata map[string]interface{}) *trust.KeyMaterial {
+// Returns (keyMaterial, signedButFailed) where signedButFailed is true only
+// when a signed_metadata JWT was present but its embedded-key verification failed.
+// Callers should treat signedButFailed=true as a hard error.
+func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata map[string]interface{}) (*trust.KeyMaterial, bool) {
 	// Check signed_metadata JWT
 	if signedMetadata, ok := metadata["signed_metadata"].(string); ok && signedMetadata != "" {
 		km, err := trust.VerifyJWTWithEmbeddedKey(signedMetadata)
 		if err != nil {
 			h.logger.Error("signed_metadata JWT verification failed",
 				zap.Error(err))
-			return nil
+			return nil, true // signal to caller: signing was attempted but failed
 		}
-		return km
+		return km, false
 	}
 
 	// Check inline JWKS
@@ -583,11 +595,11 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 		// jwks may be a map or raw JSON depending on how it was resolved
 		switch v := jwksRaw.(type) {
 		case map[string]interface{}:
-			return &trust.KeyMaterial{Type: "jwk", JWK: v}
+			return &trust.KeyMaterial{Type: "jwk", JWK: v}, false
 		case string:
 			var jwks interface{}
 			if err := json.Unmarshal([]byte(v), &jwks); err == nil {
-				return &trust.KeyMaterial{Type: "jwk", JWK: jwks}
+				return &trust.KeyMaterial{Type: "jwk", JWK: jwks}, false
 			}
 		}
 	}
@@ -605,13 +617,13 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 					zap.String("uri", jwksURI),
 					zap.Error(err))
 			} else {
-				return &trust.KeyMaterial{Type: "jwk", JWK: jwks}
+				return &trust.KeyMaterial{Type: "jwk", JWK: jwks}, false
 			}
 		}
 	}
 
 	// No key material available
-	return nil
+	return nil, false
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

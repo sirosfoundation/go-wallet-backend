@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
+	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
@@ -198,7 +199,12 @@ func main() {
 		if backendProvider != nil {
 			verifierStore = backendProvider.Store().Verifiers()
 		}
-		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore)
+		// Share the metadata resolver from the backend so the TTL cache is not duplicated.
+		var sharedResolver *issuermetadata.Resolver
+		if backendProvider != nil {
+			sharedResolver = backendProvider.MetadataResolver()
+		}
+		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, sharedResolver)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
