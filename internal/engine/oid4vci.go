@@ -353,7 +353,7 @@ func (h *OID4VCIHandler) lookupIssuerCredentials(ctx context.Context, credential
 	}
 	tenantID := h.Flow.Session.TenantID
 	if tenantID == "" {
-		return "", ""
+		tenantID = string(domain.DefaultTenantID)
 	}
 	issuer, err := h.Issuers.GetByIdentifier(ctx, domain.TenantID(tenantID), credentialIssuer)
 	if err != nil || issuer == nil {
@@ -369,9 +369,23 @@ func createClientAssertion(clientID, clientJWKJSON, audience string) (string, er
 	if err := jwk.UnmarshalJSON([]byte(clientJWKJSON)); err != nil {
 		return "", fmt.Errorf("failed to parse client JWK: %w", err)
 	}
-	key, ok := jwk.Key.(*ecdsa.PrivateKey)
-	if !ok {
-		return "", fmt.Errorf("client JWK is not an ECDSA private key")
+
+	// Derive signing method from JWK key type and curve.
+	var signingMethod jwt.SigningMethod
+	switch k := jwk.Key.(type) {
+	case *ecdsa.PrivateKey:
+		switch k.Curve {
+		case elliptic.P256():
+			signingMethod = jwt.SigningMethodES256
+		case elliptic.P384():
+			signingMethod = jwt.SigningMethodES384
+		case elliptic.P521():
+			signingMethod = jwt.SigningMethodES512
+		default:
+			return "", fmt.Errorf("unsupported EC curve: %v", k.Curve.Params().Name)
+		}
+	default:
+		return "", fmt.Errorf("unsupported key type %T; only ECDSA keys are supported", jwk.Key)
 	}
 
 	now := time.Now()
@@ -384,11 +398,11 @@ func createClientAssertion(clientID, clientJWKJSON, audience string) (string, er
 		"exp": now.Add(60 * time.Second).Unix(),
 	}
 
-	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok := jwt.NewWithClaims(signingMethod, claims)
 	if jwk.KeyID != "" {
 		tok.Header["kid"] = jwk.KeyID
 	}
-	return tok.SignedString(key)
+	return tok.SignedString(jwk.Key)
 }
 
 // isDPoPNonceError returns true if the response indicates a DPoP nonce is required.

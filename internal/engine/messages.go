@@ -200,9 +200,8 @@ type FlowProgressMessage struct {
 // user input (e.g., TX code) before it can complete.
 type FlowResponseMessage struct {
 	Message
-	Step    FlowStep               `json:"step,omitempty"`
-	Data    map[string]interface{} `json:"data,omitempty"`
-	Payload json.RawMessage        `json:"payload,omitempty"`
+	Step FlowStep               `json:"step,omitempty"`
+	Data map[string]interface{} `json:"data,omitempty"`
 }
 
 // FlowActionMessage is sent by client to provide input during a flow

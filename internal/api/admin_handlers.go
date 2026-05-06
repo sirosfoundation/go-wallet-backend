@@ -551,7 +551,6 @@ type IssuerResponse struct {
 	TenantID                   string  `json:"tenant_id"`
 	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier"`
 	ClientID                   string  `json:"client_id,omitempty"`
-	ClientJWK                  string  `json:"client_jwk,omitempty"`
 	Visible                    bool    `json:"visible"`
 	TrustStatus                string  `json:"trust_status,omitempty"`
 	TrustFramework             string  `json:"trust_framework,omitempty"`
@@ -564,7 +563,6 @@ func issuerToResponse(i *domain.CredentialIssuer) *IssuerResponse {
 		TenantID:                   string(i.TenantID),
 		CredentialIssuerIdentifier: i.CredentialIssuerIdentifier,
 		ClientID:                   i.ClientID,
-		ClientJWK:                  i.ClientJWK,
 		Visible:                    i.Visible,
 		TrustStatus:                string(i.TrustStatus),
 		TrustFramework:             i.TrustFramework,
