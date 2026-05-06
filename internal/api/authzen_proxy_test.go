@@ -1423,8 +1423,8 @@ func TestResolve_URLSubject_MetadataResolutionFailure(t *testing.T) {
 }
 
 func TestResolve_URLSubject_LogoInlining(t *testing.T) {
-	// Serve a test logo image
-	logoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Serve a test logo image over TLS — logo inlining requires HTTPS.
+	logoServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte("fake-png-data"))
 	}))
@@ -1478,7 +1478,8 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+	// Use the TLS server's client so the handler can fetch HTTPS logo URLs.
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, logoServer.Client(), logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {

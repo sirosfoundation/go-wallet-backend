@@ -332,17 +332,23 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
 	httpClient := cfg.HTTPClient.NewHTTPClient(0)
 
-	// Create issuer metadata resolver for local URL subject resolution
-	metadataResolver, err := issuermetadata.New(issuermetadata.Config{
-		HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
-		AllowHTTP:       cfg.HTTPClient.InsecureSkipVerify,
-		AllowPrivateIPs: cfg.HTTPClient.InsecureSkipVerify,
-	})
-	if err != nil {
-		if closeErr := store.Close(); closeErr != nil {
-			logger.Error("Failed to close store after metadata resolver creation failure", zap.Error(closeErr))
+	// Create issuer metadata resolver for local URL subject resolution.
+	// Only instantiated when AuthZEN proxy is enabled and resolution is allowed,
+	// so that a startup failure here does not affect deployments that don't use it.
+	var metadataResolver api.IssuerMetadataResolver
+	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
+		r, err := issuermetadata.New(issuermetadata.Config{
+			HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
+			AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
+			AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
+		})
+		if err != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				logger.Error("Failed to close store after metadata resolver creation failure", zap.Error(closeErr))
+			}
+			return nil, fmt.Errorf("failed to create issuer metadata resolver: %w", err)
 		}
-		return nil, fmt.Errorf("failed to create issuer metadata resolver: %w", err)
+		metadataResolver = r
 	}
 
 	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), metadataResolver, httpClient, logger)
