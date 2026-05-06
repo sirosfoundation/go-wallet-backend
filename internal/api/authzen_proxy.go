@@ -509,9 +509,10 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	}
 
 	// Step 7: Enrich response with registered issuer info from backend storage.
-	// This is looked up by the issuer URL (CredentialIssuerIdentifier) within the tenant.
-	// If not found or issuer lookup is unavailable, the field is omitted.
-	if h.issuerLookup != nil && tenantID != "" {
+	// Scoped strictly to the authenticated tenant — tenantID is enforced non-empty
+	// by Resolve() before this function is called, preventing cross-tenant access.
+	// If the issuer is not registered in this tenant's storage, the field is omitted.
+	if h.issuerLookup != nil {
 		if reg, err := h.issuerLookup.GetByIdentifier(ctx, domain.TenantID(tenantID), issuerURL); err == nil && reg != nil {
 			resp.RegisteredIssuer = &RegisteredIssuerInfo{
 				ClientID:       reg.ClientID,
