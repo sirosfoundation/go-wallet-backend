@@ -742,6 +742,273 @@ func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 }
 
 // ============================================================================
+// vctm_url Resource Type Tests
+// ============================================================================
+
+func TestResolve_VCTMURL_Success(t *testing.T) {
+	vctm := map[string]interface{}{
+		"vct":         "https://credentials.example.com/identity_credential",
+		"name":        "Identity Credential",
+		"description": "An identity credential",
+		"display": []interface{}{
+			map[string]interface{}{
+				"lang": "en-US",
+				"name": "Identity Credential",
+			},
+		},
+	}
+
+	vctmServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(vctm) //nolint:errcheck
+	}))
+	defer vctmServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, vctmServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    vctmServer.URL + "/identity_credential",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp["decision"] != true {
+		t.Errorf("Expected decision=true, got %v", resp["decision"])
+	}
+	ctx, ok := resp["context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context object, got %T", resp["context"])
+	}
+	tm, ok := ctx["trust_metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context.trust_metadata object, got %T", ctx["trust_metadata"])
+	}
+	if tm["vct"] != "https://credentials.example.com/identity_credential" {
+		t.Errorf("Unexpected vct value: %v", tm["vct"])
+	}
+}
+
+func TestResolve_VCTMURL_NonHTTPS_Rejected(t *testing.T) {
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, nil)
+	if pdpServer != nil {
+		defer pdpServer.Close()
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "http://credentials.example.com/identity_credential",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_VCTMURL_FetchFailure(t *testing.T) {
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "https://127.0.0.1:1/vctm",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_VCTMURL_InvalidJSON(t *testing.T) {
+	vctmServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not valid json")) //nolint:errcheck
+	}))
+	defer vctmServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, vctmServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    vctmServer.URL + "/vctm",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_VCTMURL_MissingVCTField(t *testing.T) {
+	vctmServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"name": "No VCT field here",
+		})
+	}))
+	defer vctmServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, vctmServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    vctmServer.URL + "/vctm",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_VCTMURL_NonOKStatus(t *testing.T) {
+	vctmServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer vctmServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, vctmServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    vctmServer.URL + "/vctm",
+		"subject_type":  "url",
+		"resource_type": "vctm_url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+// ============================================================================
 // credential_offer_uri Resource Type Tests
 // ============================================================================
 

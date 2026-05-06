@@ -388,6 +388,10 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 			h.resolveCredentialOfferURI(c, ctx, req.SubjectID)
 			return
 		}
+		if resourceType == "vctm_url" {
+			h.resolveVCTMURL(c, ctx, req.SubjectID)
+			return
+		}
 		// Default: resolve as credential issuer (fetches /.well-known/openid-credential-issuer)
 		if h.metadataResolver == nil {
 			h.logger.Debug("no metadata resolver configured for URL subject — proxying to PDP")
@@ -400,6 +404,83 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// For key subjects, proxy to PDP
 	h.proxyToPDP(c, ctx, tenantID, evalReq)
+}
+
+// resolveVCTMURL fetches an SD-JWT VC Type Metadata document from the given URL
+// and returns it as trust_metadata. The URL must already be validated as HTTPS.
+// The document must contain a "vct" field per the SD-JWT VC Type Metadata spec.
+//
+// Response: { "decision": true, "context": { "trust_metadata": <vctm doc> } }
+func (h *AuthZENProxyHandler) resolveVCTMURL(c *gin.Context, ctx context.Context, vctURL string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, vctURL, nil)
+	if err != nil {
+		h.logger.Error("failed to build VCTM request",
+			zap.String("vct_url", vctURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch VCTM"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.Error("VCTM fetch failed",
+			zap.String("vct_url", vctURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch VCTM"})
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Warn("VCTM endpoint returned non-200",
+			zap.String("vct_url", vctURL),
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("VCTM endpoint returned status %d", resp.StatusCode)})
+		return
+	}
+
+	const maxVCTMSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxVCTMSize))
+	if err != nil {
+		h.logger.Error("failed to read VCTM response",
+			zap.String("vct_url", vctURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read VCTM response"})
+		return
+	}
+
+	var vctm map[string]interface{}
+	if err := json.Unmarshal(body, &vctm); err != nil {
+		h.logger.Warn("VCTM response is not valid JSON",
+			zap.String("vct_url", vctURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "VCTM response is not valid JSON"})
+		return
+	}
+
+	// Validate required field per SD-JWT VC Type Metadata spec
+	if _, ok := vctm["vct"].(string); !ok {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "VCTM missing required field: vct"})
+		return
+	}
+
+	h.logger.Info("VCTM URL resolved",
+		zap.String("vct_url", vctURL),
+		zap.String("vct", vctm["vct"].(string)),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"decision": true,
+		"context": gin.H{
+			"trust_metadata": vctm,
+		},
+	})
 }
 
 // resolveCredentialOfferURI fetches a credential_offer_uri and returns the parsed
