@@ -50,7 +50,7 @@ type AuthZENProxyHandler struct {
 
 // NewAuthZENProxyHandler creates a new AuthZEN proxy handler.
 // The tenantLookup parameter is optional - if nil, per-tenant configuration is disabled.
-// The metadataResolver parameter is optional - if nil, URL subject resolution is proxied to the PDP.
+// The metadataResolver is required for URL subject resolution on /v1/resolve.
 func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
@@ -343,19 +343,28 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects with a metadata resolver, resolve locally and evaluate trust
-	if subjectType == "url" && h.metadataResolver != nil {
+	// For URL subjects, resolve locally and evaluate trust
+	if subjectType == "url" {
+		if h.metadataResolver == nil {
+			h.logger.Error("metadata resolver not configured for URL subject resolution")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "issuer metadata resolution not configured"})
+			return
+		}
 		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
 		return
 	}
 
-	// For key subjects (or URL without local resolver), proxy to PDP
+	// For key subjects, proxy to PDP
 	h.proxyToPDP(c, ctx, tenantID, evalReq)
 }
 
 // resolveURLSubject handles the local resolution path for URL subjects.
 // It resolves metadata, extracts key material, evaluates trust via PDP,
-// inlines logos as data: URIs, and returns a composite response.
+// and returns a composite response. Logo inlining is performed when:
+//   - metadata is unsigned (no signed_metadata field), OR
+//   - metadata is signed AND the PDP returns trusted
+//
+// If metadata is signed but untrusted, an error is returned.
 func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Context, tenantID, issuerURL string) {
 	// Step 1: Resolve issuer metadata locally
 	result, err := h.metadataResolver.ResolveWithInfo(ctx, issuerURL)
@@ -366,6 +375,12 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "issuer metadata resolution failed"})
 		return
+	}
+
+	// Determine if metadata is signed (has signed_metadata field)
+	_, metadataIsSigned := result.Metadata["signed_metadata"].(string)
+	if sm, ok := result.Metadata["signed_metadata"].(string); ok && sm == "" {
+		metadataIsSigned = false
 	}
 
 	// Step 2: Extract key material from metadata
@@ -428,12 +443,25 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		return
 	}
 
-	// Step 4: If trusted, inline logo images as data: URIs in metadata
-	if trustResp.Decision {
+	// Step 4: Enforce trust policy for signed metadata
+	// Signed but untrusted metadata is rejected — the issuer claims a binding
+	// that the trust registry does not recognize, so we must not return it.
+	if metadataIsSigned && !trustResp.Decision {
+		h.logger.Warn("signed metadata from untrusted issuer rejected",
+			zap.String("issuer_url", issuerURL),
+		)
+		c.JSON(http.StatusForbidden, gin.H{"error": "issuer metadata is signed but issuer is not trusted"})
+		return
+	}
+
+	// Step 5: Inline logo images as data: URIs.
+	// Inlining is safe when metadata is unsigned (display-only, no trust claim)
+	// or when signed metadata has been verified as trusted.
+	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
 
-	// Step 5: Return composite response with trust decision and metadata
+	// Step 6: Return composite response with trust decision and metadata
 	resp := &gotrust.EvaluationResponse{
 		Decision: trustResp.Decision,
 		Context: &gotrust.EvaluationResponseContext{
@@ -448,6 +476,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		zap.String("tenant_id", tenantID),
 		zap.String("issuer_url", issuerURL),
 		zap.Bool("decision", trustResp.Decision),
+		zap.Bool("signed", metadataIsSigned),
 	)
 
 	c.JSON(http.StatusOK, resp)

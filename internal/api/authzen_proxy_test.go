@@ -76,8 +76,17 @@ func setupAuthZENProxyHandlerWithTenants(t *testing.T, authorizer authz.Authoriz
 		AllowResolution: true,
 	}
 
+	// Default mock resolver that returns basic unsigned metadata
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{
+				"credential_issuer": "https://issuer.example.com",
+			},
+		},
+	}
+
 	logger := zap.NewNop()
-	handler := NewAuthZENProxyHandler(cfg, authorizer, tenantLookup, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, authorizer, tenantLookup, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 
@@ -558,17 +567,16 @@ func TestResolve_URLSubject_DefaultsToKey(t *testing.T) {
 }
 
 func TestResolve_URLSubject_ExplicitType(t *testing.T) {
-	// Mock PDP that verifies the subject type is "url" and resource type is "credential_issuer"
+	// With explicit subject_type "url", the subject is resolved locally.
+	// The PDP receives a key-based trust evaluation request.
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var evalReq gotrust.EvaluationRequest
 		if err := json.NewDecoder(r.Body).Decode(&evalReq); err != nil {
 			t.Fatalf("Failed to decode request: %v", err)
 		}
-		if evalReq.Subject.Type != "url" {
-			t.Errorf("Expected subject.type 'url', got %q", evalReq.Subject.Type)
-		}
-		if evalReq.Resource.Type != "credential_issuer" {
-			t.Errorf("Expected resource.type 'credential_issuer', got %q", evalReq.Resource.Type)
+		// Local resolution sends subject.type "key" to the PDP
+		if evalReq.Subject.Type != "key" {
+			t.Errorf("Expected subject.type 'key', got %q", evalReq.Subject.Type)
 		}
 		resp := gotrust.EvaluationResponse{Decision: true}
 		w.Header().Set("Content-Type", "application/json")
@@ -699,7 +707,14 @@ func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create SPOCP authorizer: %v", err)
 	}
-	handler := NewAuthZENProxyHandler(cfg, spocpAuth, nil, nil, http.DefaultClient, logger)
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{
+				"credential_issuer": "https://issuer.example.com",
+			},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, spocpAuth, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1307,7 +1322,8 @@ func TestResolve_URLSubject_LocalResolution(t *testing.T) {
 }
 
 func TestResolve_URLSubject_Untrusted(t *testing.T) {
-	// Mock PDP that returns untrusted
+	// Unsigned metadata that is untrusted: should still return metadata with decision=false.
+	// Logos are inlined because metadata is unsigned (display-only, no trust claim).
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := gotrust.EvaluationResponse{Decision: false}
 		w.Header().Set("Content-Type", "application/json")
@@ -1580,16 +1596,28 @@ func TestResolve_KeySubject_ProxiesToPDP(t *testing.T) {
 	}
 }
 
-func TestResolve_URLSubject_NoResolver_ProxiesToPDP(t *testing.T) {
-	// When no metadata resolver is configured, URL subjects should fall back to PDP proxy
+func TestResolve_URLSubject_SignedUntrusted_Error(t *testing.T) {
+	// When metadata contains signed_metadata but is untrusted, must return an error
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp := gotrust.EvaluationResponse{Decision: true}
+		resp := gotrust.EvaluationResponse{Decision: false}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
 
 	pdpServer := httptest.NewServer(pdpHandler)
 	defer pdpServer.Close()
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{
+				"credential_issuer": "https://signed-untrusted.example.com",
+				"signed_metadata":   "eyJhbGciOiJFUzI1NiJ9.fake.signature",
+				"jwks": map[string]interface{}{
+					"keys": []interface{}{map[string]interface{}{"kty": "EC"}},
+				},
+			},
+		},
+	}
 
 	cfg := &config.AuthZENProxyConfig{
 		Enabled:         true,
@@ -1598,8 +1626,7 @@ func TestResolve_URLSubject_NoResolver_ProxiesToPDP(t *testing.T) {
 		AllowResolution: true,
 	}
 	logger := zap.NewNop()
-	// No metadata resolver - should fall back to PDP proxy
-	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, http.DefaultClient, logger)
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, resolver, http.DefaultClient, logger)
 
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
@@ -1609,7 +1636,7 @@ func TestResolve_URLSubject_NoResolver_ProxiesToPDP(t *testing.T) {
 	router.POST("/v1/resolve", handler.Resolve)
 
 	body, _ := json.Marshal(map[string]string{
-		"subject_id":   "https://issuer.example.com",
+		"subject_id":   "https://signed-untrusted.example.com",
 		"subject_type": "url",
 	})
 
@@ -1618,7 +1645,7 @@ func TestResolve_URLSubject_NoResolver_ProxiesToPDP(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected status %d for signed+untrusted, got %d: %s", http.StatusForbidden, w.Code, w.Body.String())
 	}
 }
