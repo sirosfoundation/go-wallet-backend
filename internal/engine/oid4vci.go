@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -47,7 +48,7 @@ type OID4VCIHandler struct {
 // MetadataResolver across all handler instances, so the resolver's TTL cache
 // deduplicates metadata fetches across flows.
 func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
-	return func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+	return func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, issuers storage.IssuerStore, trustCache *TrustCache) (FlowHandler, error) {
 		return &OID4VCIHandler{
 			BaseHandler: BaseHandler{
 				Flow:     flow,
@@ -55,6 +56,7 @@ func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
 				Logger:   logger,
 				TrustSvc: trustSvc,
 				Registry: registry,
+				Issuers:  issuers,
 			},
 			httpClient:       cfg.HTTPClient.NewHTTPClient(0),
 			metadataResolver: resolver,
@@ -341,6 +343,52 @@ func (h *OID4VCIHandler) updateDPoPNonce(resp *http.Response) {
 	if nonce := resp.Header.Get("DPoP-Nonce"); nonce != "" {
 		h.dpopNonce = nonce
 	}
+}
+
+// lookupIssuerCredentials retrieves the client_id and client_jwk for a credential issuer.
+// Returns empty strings if the issuer store is unavailable or the issuer is not registered.
+func (h *OID4VCIHandler) lookupIssuerCredentials(ctx context.Context, credentialIssuer string) (clientID, clientJWK string) {
+	if h.Issuers == nil {
+		return "", ""
+	}
+	tenantID := h.Flow.Session.TenantID
+	if tenantID == "" {
+		return "", ""
+	}
+	issuer, err := h.Issuers.GetByIdentifier(ctx, domain.TenantID(tenantID), credentialIssuer)
+	if err != nil || issuer == nil {
+		return "", ""
+	}
+	return issuer.ClientID, issuer.ClientJWK
+}
+
+// createClientAssertion creates a private_key_jwt client assertion (RFC 7523 §2.2).
+// The assertion is a JWT signed with the client's private key.
+func createClientAssertion(clientID, clientJWKJSON, audience string) (string, error) {
+	var jwk jose.JSONWebKey
+	if err := jwk.UnmarshalJSON([]byte(clientJWKJSON)); err != nil {
+		return "", fmt.Errorf("failed to parse client JWK: %w", err)
+	}
+	key, ok := jwk.Key.(*ecdsa.PrivateKey)
+	if !ok {
+		return "", fmt.Errorf("client JWK is not an ECDSA private key")
+	}
+
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": clientID,
+		"sub": clientID,
+		"aud": audience,
+		"jti": uuid.New().String(),
+		"iat": now.Unix(),
+		"exp": now.Add(60 * time.Second).Unix(),
+	}
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	if jwk.KeyID != "" {
+		tok.Header["kid"] = jwk.KeyID
+	}
+	return tok.SignedString(key)
 }
 
 // isDPoPNonceError returns true if the response indicates a DPoP nonce is required.
@@ -922,19 +970,16 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 
 	// Check if TX code required
 	if txCodeRequired, ok := grant["tx_code"]; ok && txCodeRequired != nil {
-		// Use issuer-provided description from tx_code spec (OID4VCI §4.1.1)
-		progressPayload := map[string]interface{}{
-			"type":                "tx_code",
+		// Send an intermediate flow_response (not progress) so the client's
+		// pending promise resolves with the pre-auth code and tx_code spec.
+		// The client then shows the TX code popup and sends flow_action
+		// with action=provide_pin to continue.
+		responseData := map[string]interface{}{
 			"pre_authorized_code": preAuthCode,
 			"tx_code":             txCodeRequired,
 			"credential_issuer":   metadata.CredentialIssuer,
 		}
-		if txMap, ok := txCodeRequired.(map[string]interface{}); ok {
-			if desc, ok := txMap["description"].(string); ok && desc != "" {
-				progressPayload["message"] = desc
-			}
-		}
-		_ = h.Progress(StepAuthorizationReq, progressPayload)
+		_ = h.Respond(StepAuthorizationReq, responseData)
 
 		action, err := h.WaitForAction(ctx, ActionProvidePin)
 		if err != nil {
@@ -968,6 +1013,23 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	data.Set("pre-authorized_code", code)
 	if txCode != "" {
 		data.Set("tx_code", txCode)
+	}
+
+	// Look up registered client credentials for this issuer
+	clientID, clientJWK := h.lookupIssuerCredentials(ctx, metadata.CredentialIssuer)
+	if clientID != "" {
+		data.Set("client_id", clientID)
+
+		// Generate private_key_jwt client assertion if a client JWK is configured
+		if clientJWK != "" {
+			assertion, err := createClientAssertion(clientID, clientJWK, tokenEndpoint)
+			if err != nil {
+				h.Logger.Warn("Failed to create client assertion, proceeding without", zap.Error(err))
+			} else {
+				data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+				data.Set("client_assertion", assertion)
+			}
+		}
 	}
 
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)

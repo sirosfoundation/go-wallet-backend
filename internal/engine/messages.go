@@ -34,6 +34,7 @@ const (
 	// Server → Client
 	TypeHandshakeComplete MessageType = "handshake_complete"
 	TypeFlowProgress      MessageType = "flow_progress"
+	TypeFlowResponse      MessageType = "flow_response"
 	TypeFlowComplete      MessageType = "flow_complete"
 	TypeFlowError         MessageType = "flow_error"
 	TypeSignRequest       MessageType = "sign_request"
@@ -192,6 +193,16 @@ type FlowProgressMessage struct {
 	Message
 	Step    FlowStep        `json:"step"`
 	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// FlowResponseMessage is an intermediate response that resolves the client's
+// pending request without ending the flow. Used when the engine needs further
+// user input (e.g., TX code) before it can complete.
+type FlowResponseMessage struct {
+	Message
+	Step    FlowStep               `json:"step,omitempty"`
+	Data    map[string]interface{} `json:"data,omitempty"`
+	Payload json.RawMessage        `json:"payload,omitempty"`
 }
 
 // FlowActionMessage is sent by client to provide input during a flow

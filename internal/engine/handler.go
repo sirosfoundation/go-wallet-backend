@@ -20,7 +20,7 @@ type FlowHandler interface {
 }
 
 // FlowHandlerFactory creates a flow handler for a flow
-type FlowHandlerFactory func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error)
+type FlowHandlerFactory func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, issuers storage.IssuerStore, trustCache *TrustCache) (FlowHandler, error)
 
 // BaseHandler provides common functionality for flow handlers
 type BaseHandler struct {
@@ -30,6 +30,7 @@ type BaseHandler struct {
 	TrustSvc   *TrustService
 	Registry   *RegistryClient
 	Verifiers  storage.VerifierStore
+	Issuers    storage.IssuerStore
 	TrustCache *TrustCache
 	cancel     context.CancelFunc
 }
@@ -48,6 +49,17 @@ func (h *BaseHandler) Progress(step FlowStep, payload interface{}) error {
 	h.Flow.mu.Unlock()
 
 	return h.Flow.Session.SendProgress(h.Flow.ID, step, payload)
+}
+
+// Respond sends an intermediate response that resolves the client's pending
+// request (unlike Progress which is a side-channel notification). The flow
+// continues after this; the client is expected to send a flow_action to proceed.
+func (h *BaseHandler) Respond(step FlowStep, data map[string]interface{}) error {
+	h.Flow.mu.Lock()
+	h.Flow.State = step
+	h.Flow.mu.Unlock()
+
+	return h.Flow.Session.SendFlowResponse(h.Flow.ID, step, data)
 }
 
 // ProgressMessage sends a progress update with just a message

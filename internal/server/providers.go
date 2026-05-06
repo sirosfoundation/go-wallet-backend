@@ -212,13 +212,18 @@ type EngineProvider struct {
 
 // NewEngineProvider creates a new WebSocket engine route provider.
 // If store is non-nil, the engine will cache verifier trust evaluations.
-func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore) (*EngineProvider, error) {
+func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore, issuerStore storage.IssuerStore) (*EngineProvider, error) {
 	// Create WebSocket manager
 	manager := wsengine.NewManager(cfg, logger)
 
 	// Wire verifier store for trust caching
 	if store != nil {
 		manager.SetVerifierStore(store)
+	}
+
+	// Wire issuer store for client authentication in VCI flows
+	if issuerStore != nil {
+		manager.SetIssuerStore(issuerStore)
 	}
 
 	// Configure session store based on config

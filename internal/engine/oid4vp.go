@@ -29,7 +29,7 @@ type OID4VPHandler struct {
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
-func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, issuers storage.IssuerStore, trustCache *TrustCache) (FlowHandler, error) {
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
 			Flow:       flow,
