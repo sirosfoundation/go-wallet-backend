@@ -39,9 +39,11 @@ type HTTPClientConfig struct {
 	// AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges.
 	// Required when credential issuers run on Docker, k8s internal networks, or localhost.
 	// Default: false (non-public IP ranges are blocked by SSRF protection).
+	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
 	// Default: false (HTTPS required). Use only for local development.
+	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
 
