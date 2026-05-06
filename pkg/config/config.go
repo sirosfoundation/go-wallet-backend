@@ -36,6 +36,13 @@ type HTTPClientConfig struct {
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 	// InsecureSkipVerify disables TLS certificate verification (not recommended for production)
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+	// AllowPrivateIPs permits outbound requests to private/internal networks (RFC 1918).
+	// Required when credential issuers run on Docker, k8s internal networks, or localhost.
+	// Default: false (private IPs are blocked by SSRF protection).
+	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
+	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
+	// Default: false (HTTPS required). Use only for local development.
+	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
 
 // NewHTTPClient creates an *http.Client from the configuration, applying proxy,

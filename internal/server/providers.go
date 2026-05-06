@@ -242,8 +242,8 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	// across flows, and honour the service's HTTP client settings.
 	metadataResolver, err := issuermetadata.New(issuermetadata.Config{
 		HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
-		AllowHTTP:       cfg.HTTPClient.InsecureSkipVerify,
-		AllowPrivateIPs: cfg.HTTPClient.InsecureSkipVerify,
+		AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
+		AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
