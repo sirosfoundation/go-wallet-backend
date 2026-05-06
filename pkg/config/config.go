@@ -38,7 +38,8 @@ type HTTPClientConfig struct {
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
 	// AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges.
 	// Required when credential issuers run on Docker, k8s internal networks, or localhost.
-	// Default: false (non-public IP ranges are blocked by SSRF protection).
+	// Default: true (most deployments run issuers on internal networks).
+	// Set to false in high-security environments where all issuers are on public IPs.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
@@ -798,7 +799,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout: 30, // 30 seconds default
+			Timeout:         30,   // 30 seconds default
+			AllowPrivateIPs: true, // most deployments run issuers on Docker/k8s internal networks
 		},
 		AuthZENProxy: AuthZENProxyConfig{
 			Enabled:         true, // Enabled by default - required for engine flows
