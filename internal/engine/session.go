@@ -78,7 +78,6 @@ type Manager struct {
 	trustService   *TrustService
 	registryClient *RegistryClient
 	verifierStore  storage.VerifierStore
-	issuerStore    storage.IssuerStore
 	trustCache     *TrustCache
 
 	// Persistent session store (optional, for horizontal scaling)
@@ -122,11 +121,6 @@ func (m *Manager) SessionStore() SessionStore {
 // SetVerifierStore sets the verifier store for trust caching
 func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 	m.verifierStore = store
-}
-
-// SetIssuerStore sets the issuer store for client authentication in VCI flows
-func (m *Manager) SetIssuerStore(store storage.IssuerStore) {
-	m.issuerStore = store
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -383,7 +377,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	session.flowsMu.Unlock()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
-	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.issuerStore, m.trustCache)
+	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
 	if err != nil {
 		// Remove the reserved flow slot on error
 		session.flowsMu.Lock()

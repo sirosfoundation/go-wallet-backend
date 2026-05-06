@@ -195,12 +195,10 @@ func main() {
 	if roles.Has(modes.RoleEngine) {
 		// Wire verifier store from backend if available (for trust caching)
 		var verifierStore storage.VerifierStore
-		var issuerStore storage.IssuerStore
 		if backendProvider != nil {
 			verifierStore = backendProvider.Store().Verifiers()
-			issuerStore = backendProvider.Store().Issuers()
 		}
-		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, issuerStore)
+		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}

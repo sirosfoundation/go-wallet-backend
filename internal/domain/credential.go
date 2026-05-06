@@ -98,7 +98,6 @@ type CredentialIssuer struct {
 	TenantID                   TenantID    `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
 	CredentialIssuerIdentifier string      `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
 	ClientID                   string      `json:"clientId,omitempty" bson:"client_id"`
-	ClientJWK                  string      `json:"clientJwk,omitempty" bson:"client_jwk"`
 	Visible                    bool        `json:"visible" bson:"visible"`
 	TrustStatus                TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
 	TrustFramework             string      `json:"trustFramework,omitempty" bson:"trust_framework"`

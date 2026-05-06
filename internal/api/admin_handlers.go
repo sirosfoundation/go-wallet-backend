@@ -541,7 +541,6 @@ func (h *AdminHandlers) AdminStatus(c *gin.Context) {
 type IssuerRequest struct {
 	CredentialIssuerIdentifier string `json:"credential_issuer_identifier" binding:"required"`
 	ClientID                   string `json:"client_id,omitempty"`
-	ClientJWK                  string `json:"client_jwk,omitempty"`
 	Visible                    *bool  `json:"visible,omitempty"`
 }
 
@@ -671,7 +670,6 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 		TenantID:                   tenantID,
 		CredentialIssuerIdentifier: req.CredentialIssuerIdentifier,
 		ClientID:                   req.ClientID,
-		ClientJWK:                  req.ClientJWK,
 		Visible:                    visible,
 	}
 
@@ -720,7 +718,6 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 	// Update fields
 	issuer.CredentialIssuerIdentifier = req.CredentialIssuerIdentifier
 	issuer.ClientID = req.ClientID
-	issuer.ClientJWK = req.ClientJWK
 	if req.Visible != nil {
 		issuer.Visible = *req.Visible
 	}
