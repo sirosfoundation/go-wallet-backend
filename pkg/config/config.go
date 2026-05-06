@@ -36,6 +36,15 @@ type HTTPClientConfig struct {
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 	// InsecureSkipVerify disables TLS certificate verification (not recommended for production)
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+	// AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges.
+	// Required when credential issuers run on Docker, k8s internal networks, or localhost.
+	// Default: false (non-public IP ranges are blocked by SSRF protection).
+	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
+	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
+	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
+	// Default: false (HTTPS required). Use only for local development.
+	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
+	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
 
 // NewHTTPClient creates an *http.Client from the configuration, applying proxy,
