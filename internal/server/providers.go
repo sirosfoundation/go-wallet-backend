@@ -331,7 +331,21 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
 	httpClient := cfg.HTTPClient.NewHTTPClient(0)
-	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), httpClient, logger)
+
+	// Create issuer metadata resolver for local URL subject resolution
+	metadataResolver, err := issuermetadata.New(issuermetadata.Config{
+		HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
+		AllowHTTP:       cfg.HTTPClient.InsecureSkipVerify,
+		AllowPrivateIPs: cfg.HTTPClient.InsecureSkipVerify,
+	})
+	if err != nil {
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Error("Failed to close store after metadata resolver creation failure", zap.Error(closeErr))
+		}
+		return nil, fmt.Errorf("failed to create issuer metadata resolver: %w", err)
+	}
+
+	authzenHandler, err := api.NewAuthZENProxyHandlerFromConfig(cfg, store.Tenants(), metadataResolver, httpClient, logger)
 	if err != nil {
 		if closeErr := store.Close(); closeErr != nil {
 			logger.Error("Failed to close store after AuthZEN proxy initialization failure", zap.Error(closeErr))
