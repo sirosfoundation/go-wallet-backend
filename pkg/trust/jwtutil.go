@@ -63,6 +63,10 @@ func ExtractKeyMaterialFromJWT(jwtStr string) *KeyMaterial {
 	return nil
 }
 
+// ErrNoEmbeddedKey is returned by VerifyJWTWithEmbeddedKey when the JWT header
+// contains neither an x5c certificate chain nor an embedded JWK.
+var ErrNoEmbeddedKey = errors.New("JWT header contains neither x5c nor jwk")
+
 // VerifyJWTWithEmbeddedKey verifies a JWT's signature using the key material
 // embedded in its own header (x5c or jwk). This ensures the JWT was actually
 // signed by the claimed key, preventing header injection attacks.
@@ -121,7 +125,7 @@ func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*Ke
 		pubKey = key
 		km = &KeyMaterial{Type: "jwk", JWK: header.JWK}
 	} else {
-		return nil, errors.New("JWT header contains neither x5c nor jwk")
+		return nil, ErrNoEmbeddedKey
 	}
 
 	// Verify the JWT signature using the extracted public key

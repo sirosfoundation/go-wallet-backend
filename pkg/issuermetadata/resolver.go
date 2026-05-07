@@ -92,10 +92,11 @@ type Config struct {
 }
 
 type cachedEntry struct {
-	parsed    map[string]interface{}
-	fetchedAt time.Time
-	validated bool
-	signed    bool
+	parsed           map[string]interface{}
+	fetchedAt        time.Time
+	validated        bool
+	signed           bool
+	signerKeyMaterial *SignerKeyMaterial
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
@@ -143,12 +144,23 @@ func New(cfg Config) (*Resolver, error) {
 	}, nil
 }
 
+// SignerKeyMaterial carries the cryptographic key material extracted from a
+// signed metadata JWT (application/jwt response or signed_metadata field).
+// Callers such as the AuthZEN proxy can use this to build key-based trust
+// evaluation requests without re-parsing the JWT.
+type SignerKeyMaterial struct {
+	Type string      // "x5c" or "jwk"
+	X5C  []string    // base64-encoded DER certificates when Type=="x5c"
+	JWK  interface{} // JWK map when Type=="jwk"
+}
+
 // ResolveResult contains the resolved metadata and cache-hit information.
 type ResolveResult struct {
-	Metadata  map[string]interface{}
-	Cached    bool
-	Validated bool
-	Signed    bool // true when response was application/jwt or contained signed_metadata
+	Metadata         map[string]interface{}
+	Cached           bool
+	Validated        bool
+	Signed           bool              // true when response was application/jwt or contained signed_metadata
+	SignerKeyMaterial *SignerKeyMaterial // non-nil for application/jwt responses with x5c header
 }
 
 // Resolve returns the authoritative issuer metadata for the given issuer URL,
@@ -173,9 +185,10 @@ func (r *Resolver) Resolve(ctx context.Context, issuerURL string) (map[string]in
 
 // fetchResult is the internal result of a fetch operation.
 type fetchResult struct {
-	metadata  map[string]interface{}
-	validated bool
-	signed    bool
+	metadata         map[string]interface{}
+	validated        bool
+	signed           bool
+	signerKeyMaterial *SignerKeyMaterial
 }
 
 // ResolveWithInfo is like Resolve but additionally reports whether the result
@@ -189,7 +202,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	}
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
-		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed}, nil
+		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
 
 	metadataURL := issuerURL + "/.well-known/openid-credential-issuer"
@@ -199,7 +212,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	}
 
 	r.setCache(issuerURL, result)
-	return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed}, nil
+	return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed, SignerKeyMaterial: result.signerKeyMaterial}, nil
 }
 
 func (r *Resolver) validateURL(issuerURL string) error {
@@ -280,7 +293,8 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 // Per OpenID4VCI §12.2.3:
 // - JOSE header: typ=openidvci-issuer-metadata+jwt, alg must be asymmetric
 // - Payload: sub must match issuer URL, iat required
-// - Key resolved from JOSE header (x5c, kid, trust_chain)
+// - Key resolved from JOSE header (currently only x5c is supported; kid and
+//   trust_chain resolution are not yet implemented)
 func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString string) (*fetchResult, error) {
 	jws, err := jose.ParseSigned(jwtString, supportedSignatureAlgorithms)
 	if err != nil {
@@ -310,10 +324,23 @@ func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString s
 		return nil, err
 	}
 
+	// Extract signer key material so callers (e.g. AuthZEN proxy) can build
+	// key-based trust evaluation requests. For application/jwt responses the
+	// JWT payload claims don't contain signed_metadata/jwks fields, so the
+	// signer key is only available here.
+	var km *SignerKeyMaterial
+	if certs, certsErr := r.extractX5CCerts(jws); certsErr == nil && len(certs) > 0 {
+		x5c := make([]string, len(certs))
+		for i, c := range certs {
+			x5c[i] = base64.StdEncoding.EncodeToString(c.Raw)
+		}
+		km = &SignerKeyMaterial{Type: "x5c", X5C: x5c}
+	}
+
 	// Validated is true only when a TrustEvaluator is configured and approved
 	// the signer. Without a TrustEvaluator, the signature is verified but no
 	// trust decision is made.
-	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
+	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true, signerKeyMaterial: km}, nil
 }
 
 // handleJSONResponse processes an application/json response.
@@ -443,7 +470,7 @@ func (r *Resolver) verifyJWSFromHeader(ctx context.Context, issuerURL string, jw
 	}
 
 	// If x5c was present but malformed, surface the real error.
-	if x5cErr != nil && x5cErr.Error() != "no x5c header" {
+	if x5cErr != nil && !errors.Is(x5cErr, errNoX5C) {
 		return nil, fmt.Errorf("parsing x5c certificate chain: %w", x5cErr)
 	}
 
@@ -485,7 +512,7 @@ func (r *Resolver) extractX5CCerts(jws *jose.JSONWebSignature) ([]*x509.Certific
 		return nil, fmt.Errorf("parsing protected header: %w", err)
 	}
 	if len(headerMap.X5C) == 0 {
-		return nil, fmt.Errorf("no x5c header")
+		return nil, errNoX5C
 	}
 
 	certs := make([]*x509.Certificate, len(headerMap.X5C))
@@ -536,8 +563,8 @@ func (r *Resolver) evaluateSignerTrust(ctx context.Context, issuerURL string, jw
 	if x5cErr == nil && len(certs) > 0 {
 		return r.evaluateX5CTrust(ctx, issuerURL, certs)
 	}
-	// Surface malformed x5c errors (but not "no x5c header").
-	if x5cErr != nil && x5cErr.Error() != "no x5c header" {
+	// Surface malformed x5c errors (but not errNoX5C — absence of x5c is expected).
+	if x5cErr != nil && !errors.Is(x5cErr, errNoX5C) {
 		return fmt.Errorf("parsing x5c certificate chain: %w", x5cErr)
 	}
 
@@ -631,6 +658,10 @@ func (r *Resolver) evaluateJWKTrust(ctx context.Context, issuerURL string, jwk *
 
 // errNoJWKS is returned by resolveJWKS when metadata contains neither jwks nor jwks_uri.
 var errNoJWKS = errors.New("no JWKS found in metadata (jwks or jwks_uri required)")
+
+// errNoX5C is returned by extractX5CCerts when the JWS protected header does
+// not contain an x5c certificate chain.
+var errNoX5C = errors.New("no x5c header")
 
 // resolveJWKS returns the JWKS for validating the signed_metadata JWT.
 // Inline jwks is preferred over jwks_uri.
@@ -726,9 +757,10 @@ func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{
-		parsed:    result.metadata,
-		fetchedAt: time.Now(),
-		validated: result.validated,
-		signed:    result.signed,
+		parsed:           result.metadata,
+		fetchedAt:        time.Now(),
+		validated:        result.validated,
+		signed:           result.signed,
+		signerKeyMaterial: result.signerKeyMaterial,
 	}
 }

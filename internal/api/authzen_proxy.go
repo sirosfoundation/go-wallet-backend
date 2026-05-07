@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -420,6 +421,13 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// Step 2: Extract key material from metadata
 	keyMaterial, signedButFailed := h.extractKeyMaterial(ctx, result.Metadata)
 
+	// For application/jwt responses the JWT payload claims don't carry
+	// signed_metadata/jwks fields, so key material is surfaced via the resolver result.
+	if keyMaterial == nil && !signedButFailed && result.SignerKeyMaterial != nil {
+		km := result.SignerKeyMaterial
+		keyMaterial = &trust.KeyMaterial{Type: km.Type, X5C: km.X5C, JWK: km.JWK}
+	}
+
 	// If signed_metadata was present but JWT verification failed, reject immediately.
 	// Returning metadata with a claimed-but-unverifiable signature would be misleading.
 	if metadataIsSigned && signedButFailed {
@@ -593,7 +601,7 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 		if err != nil {
 			// If the JWT has no embedded key (x5c/jwk), fall through to
 			// check jwks/jwks_uri for kid-based verification.
-			if strings.Contains(err.Error(), "neither x5c nor jwk") {
+			if errors.Is(err, trust.ErrNoEmbeddedKey) {
 				h.logger.Debug("signed_metadata JWT has no embedded key, falling through to jwks/jwks_uri",
 					zap.Error(err))
 			} else {
