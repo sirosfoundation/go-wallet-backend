@@ -637,7 +637,7 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 	// the httpClient's DialContext additionally blocks private/loopback IPs when AllowPrivateIPs=false.
 	if jwksURI, ok := metadata["jwks_uri"].(string); ok && jwksURI != "" {
 		parsed, err := url.Parse(jwksURI)
-		if err != nil || (parsed.Scheme != "https" && !(h.allowHTTP && parsed.Scheme == "http")) {
+		if err != nil || (parsed.Scheme != "https" && (!h.allowHTTP || parsed.Scheme != "http")) {
 			h.logger.Warn("Skipping jwks_uri with non-HTTPS scheme (SSRF protection)",
 				zap.String("uri", jwksURI))
 		} else {
@@ -710,7 +710,7 @@ func (h *AuthZENProxyHandler) inlineLogoField(ctx context.Context, displayEntry 
 	// Only fetch HTTPS URLs (enforce to prevent SSRF via issuer-controlled logo URIs).
 	// Plain HTTP is permitted when allowHTTP is set (test/dev environments).
 	parsed, err := url.Parse(uri)
-	if err != nil || (parsed.Scheme != "https" && !(h.allowHTTP && parsed.Scheme == "http")) {
+	if err != nil || (parsed.Scheme != "https" && (!h.allowHTTP || parsed.Scheme != "http")) {
 		return
 	}
 
@@ -738,7 +738,7 @@ func (h *AuthZENProxyHandler) fetchAsDataURI(ctx context.Context, imageURL strin
 	// other concurrent users of h.httpClient (Transport is shared/safe).
 	client := *h.httpClient
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if req.URL.Scheme != "https" && !(h.allowHTTP && req.URL.Scheme == "http") {
+		if req.URL.Scheme != "https" && (!h.allowHTTP || req.URL.Scheme != "http") {
 			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL)
 		}
 		if len(via) >= 10 {
