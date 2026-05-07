@@ -7,20 +7,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
-// These tests verify that the OR-logic mapping in NewEngineProvider (and
-// NewBackendProvider) correctly wires HTTPClientConfig fields to the
-// issuermetadata resolver's SSRF policy.
-//
-// The resolver uses go-trust's SafeHTTPClient, which enforces:
-//   - HTTPS unless AllowHTTP is set
-//   - Non-private-IP destinations unless AllowPrivateIPs is set
+// These tests verify that the issuermetadata resolver correctly enforces
+// AllowHTTP, and that providers.go wires the caller-provided HTTP client
+// (which handles SSRF protection) through to the resolver.
 
 // wellKnownHandler returns a minimal OpenID4VCI metadata document so that
 // the resolver can parse a valid response once the request is allowed through.
@@ -38,8 +35,7 @@ func TestMetadataResolverConfig_HTTPRejectedByDefault(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP:       false, // default — HTTPS required
-		AllowPrivateIPs: true,  // allow loopback so we isolate the HTTP-only check
+		AllowHTTP: false, // default — HTTPS required
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -55,7 +51,7 @@ func TestMetadataResolverConfig_HTTPRejectedByDefault(t *testing.T) {
 }
 
 // TestMetadataResolverConfig_HTTPAllowedWhenSet verifies that an HTTP issuer
-// URL resolves successfully when AllowHTTP=true and AllowPrivateIPs=true.
+// URL resolves successfully when AllowHTTP=true.
 func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,8 +60,7 @@ func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP:       true,
-		AllowPrivateIPs: true,
+		AllowHTTP: true,
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -73,22 +68,31 @@ func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 
 	_, err = resolver.Resolve(context.Background(), srv.URL)
 	if err != nil {
-		t.Fatalf("expected success when AllowHTTP=true and AllowPrivateIPs=true, got: %v", err)
+		t.Fatalf("expected success when AllowHTTP=true, got: %v", err)
 	}
 }
 
-// TestMetadataResolverConfig_PrivateIPRejectedByDefault verifies that loopback
-// (127.0.0.1) is blocked when AllowPrivateIPs is false (the default).
-func TestMetadataResolverConfig_PrivateIPRejectedByDefault(t *testing.T) {
+// TestMetadataResolverConfig_SSRFViaHTTPClient verifies that SSRF protection
+// is enforced by the caller-provided HTTP client (from config.HTTPClientConfig),
+// not by the resolver itself. When AllowPrivateIPs=false on the HTTP client,
+// loopback requests are blocked.
+func TestMetadataResolverConfig_SSRFViaHTTPClient(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wellKnownHandler(srv.URL).ServeHTTP(w, r)
 	}))
 	defer srv.Close()
 
+	// Create an HTTP client that blocks private IPs (SSRF protection).
+	httpCfg := config.HTTPClientConfig{
+		AllowHTTP:       true,  // allow HTTP to bypass scheme check
+		AllowPrivateIPs: false, // block loopback
+	}
+	client := httpCfg.NewHTTPClient(10 * time.Second)
+
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP:       true,  // allow HTTP to bypass scheme check; isolates IP check
-		AllowPrivateIPs: false, // default — private/loopback IPs blocked
+		AllowHTTP:  true,
+		HTTPClient: client,
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -96,33 +100,31 @@ func TestMetadataResolverConfig_PrivateIPRejectedByDefault(t *testing.T) {
 
 	_, err = resolver.Resolve(context.Background(), srv.URL)
 	if err == nil {
-		t.Fatal("expected error: private/loopback IP should be rejected when AllowPrivateIPs=false")
-	}
-	if !strings.Contains(err.Error(), "SSRF") {
-		t.Errorf("expected SSRF protection error, got: %v", err)
+		t.Fatal("expected error: private/loopback IP should be rejected by the HTTP client")
 	}
 }
 
-// TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTPAndPrivateIPs
-// verifies that the backward-compatibility OR-logic in providers.go means that
-// InsecureSkipVerify=true grants both AllowHTTP and AllowPrivateIPs, preserving
-// the pre-fix behavior for operators who used InsecureSkipVerify in development.
-func TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTPAndPrivateIPs(t *testing.T) {
+// TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTP verifies that
+// the OR-logic in providers.go means InsecureSkipVerify=true enables AllowHTTP,
+// and that the HTTP client with AllowPrivateIPs=true allows loopback.
+func TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTP(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wellKnownHandler(srv.URL).ServeHTTP(w, r)
 	}))
 	defer srv.Close()
 
-	// Reproduce the mapping from NewEngineProvider / NewBackendProvider.
 	httpCfg := config.HTTPClientConfig{
 		InsecureSkipVerify: true,
-		// AllowHTTP and AllowPrivateIPs are deliberately left false to confirm
-		// that InsecureSkipVerify=true alone enables both via the OR logic.
+		AllowPrivateIPs:    true, // needed for loopback test server
+		// AllowHTTP is deliberately left false to confirm that
+		// InsecureSkipVerify=true alone enables it via the OR logic.
 	}
+	client := httpCfg.NewHTTPClient(10 * time.Second)
+
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP:       httpCfg.AllowHTTP || httpCfg.InsecureSkipVerify,
-		AllowPrivateIPs: httpCfg.AllowPrivateIPs || httpCfg.InsecureSkipVerify,
+		AllowHTTP:  httpCfg.AllowHTTP || httpCfg.InsecureSkipVerify,
+		HTTPClient: client,
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -130,19 +132,16 @@ func TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTPAndPrivateIPs(
 
 	_, err = resolver.Resolve(context.Background(), srv.URL)
 	if err != nil {
-		t.Fatalf("expected success when InsecureSkipVerify=true (legacy: implies AllowHTTP+AllowPrivateIPs), got: %v", err)
+		t.Fatalf("expected success when InsecureSkipVerify=true, got: %v", err)
 	}
 }
 
 // =============================================================================
 // NewEngineProvider wiring tests
 //
-// These cover the 2 changed lines in providers.go:
-//   AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
-//   AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
-//
-// We exercise NewEngineProvider with various HTTPClientConfig combinations and
-// then probe the resulting resolver through a loopback httptest.Server.
+// These verify that NewEngineProvider correctly wires:
+//   AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify
+//   HTTPClient: cfg.HTTPClient.NewHTTPClient(timeout)
 // =============================================================================
 
 // minimalEngineConfig returns a *config.Config that satisfies NewEngineProvider
@@ -162,9 +161,7 @@ func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
 }
 
 // TestNewEngineProvider_AllowHTTPWiring verifies that NewEngineProvider wires
-// AllowHTTP (and therefore the OR-logic) to the metadata resolver correctly.
-// We confirm by resolving an HTTP loopback URL: if AllowHTTP is effective the
-// resolver succeeds; if not, it returns an HTTPS-required error.
+// AllowHTTP to the metadata resolver correctly.
 func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -185,18 +182,13 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			wantAllow: true,
 		},
 		{
-			name:      "InsecureSkipVerify=true implies both",
+			name:      "InsecureSkipVerify=true implies AllowHTTP but not AllowPrivateIPs",
 			httpCfg:   config.HTTPClientConfig{InsecureSkipVerify: true},
-			wantAllow: true,
+			wantAllow: false, // loopback blocked because AllowPrivateIPs is not set
 		},
 		{
 			name:      "AllowHTTP=false blocks HTTP (default)",
 			httpCfg:   config.HTTPClientConfig{AllowPrivateIPs: true},
-			wantAllow: false,
-		},
-		{
-			name:      "AllowPrivateIPs=false blocks loopback",
-			httpCfg:   config.HTTPClientConfig{AllowHTTP: true},
 			wantAllow: false,
 		},
 	}
@@ -208,17 +200,15 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}
 
-			// Access the resolver via the engine manager's OID4VCI handler,
-			// or create an equivalent resolver with the same config to probe behavior.
-			// Since the resolver is internal we reproduce the wiring to verify it.
+			// Reproduce the wiring to verify behavior.
+			client := tc.httpCfg.NewHTTPClient(10 * time.Second)
 			resolver, err := issuermetadata.New(issuermetadata.Config{
-				AllowHTTP:       tc.httpCfg.AllowHTTP || tc.httpCfg.InsecureSkipVerify,
-				AllowPrivateIPs: tc.httpCfg.AllowPrivateIPs || tc.httpCfg.InsecureSkipVerify,
+				AllowHTTP:  tc.httpCfg.AllowHTTP || tc.httpCfg.InsecureSkipVerify,
+				HTTPClient: client,
 			})
 			if err != nil {
 				t.Fatalf("failed to create equivalent resolver: %v", err)
 			}
-			// Ensure provider was constructed (the lines are covered)
 			_ = provider
 
 			_, resolveErr := resolver.Resolve(context.Background(), srv.URL)

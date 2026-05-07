@@ -11,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
@@ -19,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
@@ -247,9 +247,8 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	metadataResolver := sharedResolver
 	if metadataResolver == nil {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
-			AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
-			AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
+			HTTPClient: cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -347,9 +346,8 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPTimeout:     time.Duration(cfg.HTTPClient.Timeout) * time.Second,
-			AllowHTTP:       cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
-			AllowPrivateIPs: cfg.HTTPClient.AllowPrivateIPs || cfg.HTTPClient.InsecureSkipVerify,
+			HTTPClient: cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {
