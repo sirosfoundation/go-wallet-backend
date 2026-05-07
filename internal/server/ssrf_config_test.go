@@ -195,7 +195,7 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			provider, err := NewEngineProvider(minimalEngineConfig(tc.httpCfg), logger, nil, nil)
+			provider, err := NewEngineProvider(minimalEngineConfig(tc.httpCfg), logger, nil, nil, nil)
 			if err != nil {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}

@@ -1763,6 +1763,7 @@ func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
 	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
 	h := &OID4VCIHandler{
 		redirectURI: "https://wallet.example.com/callback",
+		clientID:    "https://wallet.example.com/callback",
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
