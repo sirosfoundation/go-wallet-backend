@@ -69,6 +69,7 @@ type AuthZENProxyHandler struct {
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
 	httpClient       *http.Client
+	allowHTTP        bool // when true, plain HTTP URLs are permitted for logos and jwks_uri (test/dev envs)
 	logger           *zap.Logger
 }
 
@@ -148,6 +149,9 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		httpClient,
 		logger,
 	)
+	// Propagate the HTTP client's allow_http setting so that logo and
+	// jwks_uri fetches respect the same policy as metadata resolution.
+	handler.allowHTTP = cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify
 
 	logger.Info("AuthZEN proxy initialized",
 		zap.String("pdp_url", pdpURL),
@@ -378,13 +382,13 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects, resolve locally via the metadata resolver.
-	// A nil resolver at this point is a startup misconfiguration (caught by
-	// NewAuthZENProxyHandlerFromConfig); return 503 as defense-in-depth.
+	// For URL subjects, resolve locally via the metadata resolver when available.
+	// Fall back to proxying to the PDP when no resolver is configured so that
+	// deployments without AllowResolution retain backward-compatible behaviour.
 	if subjectType == "url" {
 		if h.metadataResolver == nil {
-			h.logger.Error("metadata resolver is nil for URL subject — this is a startup misconfiguration")
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "issuer metadata resolution not configured"})
+			h.logger.Debug("no metadata resolver configured for URL subject — proxying to PDP")
+			h.proxyToPDP(c, ctx, tenantID, evalReq)
 			return
 		}
 		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
@@ -628,10 +632,12 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 		}
 	}
 
-	// Check jwks_uri — HTTPS only to avoid SSRF via issuer-controlled URIs.
+	// Check jwks_uri — HTTPS is required unless allowHTTP is set (test/dev environments).
+	// This prevents SSRF via issuer-controlled jwks_uri pointing to internal services;
+	// the httpClient's DialContext additionally blocks private/loopback IPs when AllowPrivateIPs=false.
 	if jwksURI, ok := metadata["jwks_uri"].(string); ok && jwksURI != "" {
 		parsed, err := url.Parse(jwksURI)
-		if err != nil || parsed.Scheme != "https" {
+		if err != nil || (parsed.Scheme != "https" && !(h.allowHTTP && parsed.Scheme == "http")) {
 			h.logger.Warn("Skipping jwks_uri with non-HTTPS scheme (SSRF protection)",
 				zap.String("uri", jwksURI))
 		} else {
@@ -702,8 +708,9 @@ func (h *AuthZENProxyHandler) inlineLogoField(ctx context.Context, displayEntry 
 	}
 
 	// Only fetch HTTPS URLs (enforce to prevent SSRF via issuer-controlled logo URIs).
+	// Plain HTTP is permitted when allowHTTP is set (test/dev environments).
 	parsed, err := url.Parse(uri)
-	if err != nil || parsed.Scheme != "https" {
+	if err != nil || (parsed.Scheme != "https" && !(h.allowHTTP && parsed.Scheme == "http")) {
 		return
 	}
 
@@ -731,7 +738,7 @@ func (h *AuthZENProxyHandler) fetchAsDataURI(ctx context.Context, imageURL strin
 	// other concurrent users of h.httpClient (Transport is shared/safe).
 	client := *h.httpClient
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if req.URL.Scheme != "https" {
+		if req.URL.Scheme != "https" && !(h.allowHTTP && req.URL.Scheme == "http") {
 			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL)
 		}
 		if len(via) >= 10 {

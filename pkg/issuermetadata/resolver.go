@@ -92,10 +92,10 @@ type Config struct {
 }
 
 type cachedEntry struct {
-	parsed           map[string]interface{}
-	fetchedAt        time.Time
-	validated        bool
-	signed           bool
+	parsed            map[string]interface{}
+	fetchedAt         time.Time
+	validated         bool
+	signed            bool
 	signerKeyMaterial *SignerKeyMaterial
 }
 
@@ -156,10 +156,10 @@ type SignerKeyMaterial struct {
 
 // ResolveResult contains the resolved metadata and cache-hit information.
 type ResolveResult struct {
-	Metadata         map[string]interface{}
-	Cached           bool
-	Validated        bool
-	Signed           bool              // true when response was application/jwt or contained signed_metadata
+	Metadata          map[string]interface{}
+	Cached            bool
+	Validated         bool
+	Signed            bool               // true when response was application/jwt or contained signed_metadata
 	SignerKeyMaterial *SignerKeyMaterial // non-nil for application/jwt responses with x5c header
 }
 
@@ -185,9 +185,9 @@ func (r *Resolver) Resolve(ctx context.Context, issuerURL string) (map[string]in
 
 // fetchResult is the internal result of a fetch operation.
 type fetchResult struct {
-	metadata         map[string]interface{}
-	validated        bool
-	signed           bool
+	metadata          map[string]interface{}
+	validated         bool
+	signed            bool
 	signerKeyMaterial *SignerKeyMaterial
 }
 
@@ -291,10 +291,10 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 
 // handleJWTResponse processes an application/jwt response (entire body is a JWS).
 // Per OpenID4VCI §12.2.3:
-// - JOSE header: typ=openidvci-issuer-metadata+jwt, alg must be asymmetric
-// - Payload: sub must match issuer URL, iat required
-// - Key resolved from JOSE header (currently only x5c is supported; kid and
-//   trust_chain resolution are not yet implemented)
+//   - JOSE header: typ=openidvci-issuer-metadata+jwt, alg must be asymmetric
+//   - Payload: sub must match issuer URL, iat required
+//   - Key resolved from JOSE header (currently only x5c is supported; kid and
+//     trust_chain resolution are not yet implemented)
 func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString string) (*fetchResult, error) {
 	jws, err := jose.ParseSigned(jwtString, supportedSignatureAlgorithms)
 	if err != nil {
@@ -757,10 +757,10 @@ func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{
-		parsed:           result.metadata,
-		fetchedAt:        time.Now(),
-		validated:        result.validated,
-		signed:           result.signed,
+		parsed:            result.metadata,
+		fetchedAt:         time.Now(),
+		validated:         result.validated,
+		signed:            result.signed,
 		signerKeyMaterial: result.signerKeyMaterial,
 	}
 }
