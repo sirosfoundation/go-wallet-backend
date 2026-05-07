@@ -710,13 +710,29 @@ func (h *AuthZENProxyHandler) inlineLogoField(ctx context.Context, displayEntry 
 }
 
 // fetchAsDataURI fetches a URL and returns its content as a data: URI.
+// A copy of the shared HTTP client is used with CheckRedirect set to refuse
+// any redirect that leaves HTTPS — this prevents a server from issuing a
+// 3xx to a plain HTTP URL and bypassing the upstream scheme check.
 func (h *AuthZENProxyHandler) fetchAsDataURI(ctx context.Context, imageURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := h.httpClient.Do(req)
+	// Shallow-copy the client so we can set CheckRedirect without affecting
+	// other concurrent users of h.httpClient (Transport is shared/safe).
+	client := *h.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
