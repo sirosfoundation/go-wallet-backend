@@ -13,7 +13,7 @@ import (
 )
 
 func TestNewProxyService(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 
 	svc := NewProxyService(cfg, logger)
@@ -56,7 +56,7 @@ func TestIsBinaryRequest(t *testing.T) {
 }
 
 func TestProxyService_Execute_EmptyURL(t *testing.T) {
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -76,7 +76,7 @@ func TestProxyService_Execute_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -104,7 +104,7 @@ func TestProxyService_Execute_WithHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -135,7 +135,7 @@ func TestProxyService_StripsFingerprintingHeaders(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -197,7 +197,7 @@ func TestProxyService_Execute_POST_WithData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -225,7 +225,7 @@ func TestProxyService_Execute_DefaultMethod(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -252,7 +252,7 @@ func TestProxyService_Execute_StringData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()
@@ -280,7 +280,7 @@ func TestProxyService_Execute_ByteData(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{}
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}
 	logger := zap.NewNop()
 	svc := NewProxyService(cfg, logger)
 	ctx := context.Background()

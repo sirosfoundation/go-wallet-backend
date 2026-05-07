@@ -25,6 +25,9 @@ func testConfig() *config.Config {
 			Issuer:      "test-issuer",
 			ExpiryHours: 24,
 		},
+		HTTPClient: config.HTTPClientConfig{
+			AllowPrivateIPs: true,
+		},
 	}
 }
 

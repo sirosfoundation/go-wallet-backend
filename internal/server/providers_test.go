@@ -38,7 +38,8 @@ func minimalTestConfig() *config.Config {
 			Issuer:      "test",
 		},
 		HTTPClient: config.HTTPClientConfig{
-			Timeout: 5,
+			Timeout:         5,
+			AllowPrivateIPs: true,
 		},
 		Security: config.SecurityConfig{
 			TokenBlacklist: config.TokenBlacklistConfig{
