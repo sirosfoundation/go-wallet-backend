@@ -38,7 +38,8 @@ func minimalTestConfig() *config.Config {
 			Issuer:      "test",
 		},
 		HTTPClient: config.HTTPClientConfig{
-			Timeout: 5,
+			Timeout:         5,
+			AllowPrivateIPs: true,
 		},
 		Security: config.SecurityConfig{
 			TokenBlacklist: config.TokenBlacklistConfig{
@@ -311,6 +312,8 @@ func newTestAuthZENHandler(cfg *config.Config, logger *zap.Logger) *api.AuthZENP
 	return api.NewAuthZENProxyHandler(
 		&cfg.AuthZENProxy,
 		authz.NoOpAuthorizer{},
+		nil,
+		nil,
 		nil,
 		http.DefaultClient,
 		logger,

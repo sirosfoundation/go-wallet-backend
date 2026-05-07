@@ -14,11 +14,13 @@ import (
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
+	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
 )
 
@@ -198,7 +200,18 @@ func main() {
 		if backendProvider != nil {
 			verifierStore = backendProvider.Store().Verifiers()
 		}
-		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore)
+		// Share the metadata resolver from the backend so the TTL cache is not duplicated.
+		var sharedResolver *issuermetadata.Resolver
+		if backendProvider != nil {
+			sharedResolver = backendProvider.MetadataResolver()
+		}
+		// Share the issuer lookup so the engine gets the same registered-issuer
+		// enrichment as the /v1/resolve HTTP endpoint.
+		var issuerLookup wsengine.CredentialIssuerLookup
+		if backendProvider != nil {
+			issuerLookup = backendProvider.Store().Issuers()
+		}
+		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, sharedResolver, issuerLookup)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}

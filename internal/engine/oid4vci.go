@@ -22,9 +22,10 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -33,20 +34,31 @@ type MetadataResolver interface {
 	ResolveWithInfo(ctx context.Context, issuerURL string) (*issuermetadata.ResolveResult, error)
 }
 
+// CredentialIssuerLookup looks up registered credential issuers by identifier within a tenant.
+// This interface is satisfied by storage.IssuerStore.
+type CredentialIssuerLookup interface {
+	GetByIdentifier(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error)
+}
+
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
 	httpClient       *http.Client
 	metadataResolver MetadataResolver
-	dpopKey          *ecdsa.PrivateKey // ephemeral DPoP key pair (RFC 9449)
-	dpopNonce        string            // server-provided DPoP nonce (RFC 9449 §8)
+	issuerLookup     CredentialIssuerLookup // optional; nil-safe
+	dpopKey          *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce        string                 // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
+	clientID         string // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
 // MetadataResolver across all handler instances, so the resolver's TTL cache
 // deduplicates metadata fetches across flows.
-func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
+// issuerLookup is optional (nil-safe); when provided, fetchMetadata also returns
+// the registered-issuer record from backend storage so callers have the same
+// enriched view as the /v1/resolve HTTP endpoint.
+func NewOID4VCIHandlerFactory(resolver MetadataResolver, issuerLookup CredentialIssuerLookup) FlowHandlerFactory {
 	return func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 		return &OID4VCIHandler{
 			BaseHandler: BaseHandler{
@@ -58,6 +70,7 @@ func NewOID4VCIHandlerFactory(resolver MetadataResolver) FlowHandlerFactory {
 			},
 			httpClient:       cfg.HTTPClient.NewHTTPClient(0),
 			metadataResolver: resolver,
+			issuerLookup:     issuerLookup,
 		}, nil
 	}
 }
@@ -416,6 +429,18 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	metadata := metaResult.Metadata
 	h.SetData("metadata", metadata)
 
+	// Resolve effective client_id for all subsequent OAuth steps.
+	// Default to redirect_uri (OID4VCI §7.1 unregistered-client convention).
+	// When the issuer is registered and carries a known client_id, use that instead.
+	h.clientID = h.redirectURI
+	if r := metaResult.RegisteredIssuer; r != nil && r.ClientID != "" {
+		h.clientID = r.ClientID
+		h.Logger.Debug("using registered client_id for issuer",
+			zap.String("client_id", h.clientID),
+			zap.String("issuer", offer.CredentialIssuer),
+		)
+	}
+
 	// Step 3: Evaluate trust
 	trust, err := h.evaluateTrust(ctx, offer.CredentialIssuer, metadata, metaResult.Validated)
 	if err != nil {
@@ -594,10 +619,12 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 	return &offer, nil
 }
 
-// metadataResult bundles parsed issuer metadata with the resolver's trust signal.
+// metadataResult bundles parsed issuer metadata with the resolver's trust signal
+// and any registered-issuer data from backend storage.
 type metadataResult struct {
-	Metadata  *IssuerMetadata
-	Validated bool // true when the resolver verified a signed metadata JWT
+	Metadata         *IssuerMetadata
+	Validated        bool                     // true when the resolver verified a signed metadata JWT
+	RegisteredIssuer *domain.CredentialIssuer // non-nil when the issuer is registered in this tenant
 }
 
 func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*metadataResult, error) {
@@ -618,6 +645,18 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
+	// Look up registered issuer record from backend storage when a lookup is wired.
+	// Errors are non-fatal: the issuer may simply not be registered in this tenant.
+	var registeredIssuer *domain.CredentialIssuer
+	if h.issuerLookup != nil {
+		tenantID := TenantFromContext(ctx)
+		if tenantID != "" {
+			if reg, lookupErr := h.issuerLookup.GetByIdentifier(ctx, domain.TenantID(tenantID), issuer); lookupErr == nil {
+				registeredIssuer = reg
+			}
+		}
+	}
+
 	_ = h.Progress(StepMetadataFetched, map[string]interface{}{
 		"credential_issuer":   metadata.CredentialIssuer,
 		"credential_endpoint": metadata.CredentialEndpoint,
@@ -625,7 +664,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		"validated":           result.Validated,
 	})
 
-	return &metadataResult{Metadata: &metadata, Validated: result.Validated}, nil
+	return &metadataResult{Metadata: &metadata, Validated: result.Validated, RegisteredIssuer: registeredIssuer}, nil
 }
 
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
@@ -1096,7 +1135,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	// Build common authorization parameters
 	params := url.Values{}
 	params.Set("response_type", "code")
-	params.Set("client_id", redirectURI) // OID4VCI: use redirect_uri as client_id for unregistered clients
+	params.Set("client_id", h.clientID) // registered client_id or redirect_uri for unregistered clients
 	params.Set("redirect_uri", redirectURI)
 	params.Set("state", oauthState)
 	if selectedConfig != nil && selectedConfig.Scope != "" {
@@ -1131,7 +1170,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		} else {
 			// Build authorization URL with only client_id and request_uri
 			q := authEndpoint.Query()
-			q.Set("client_id", redirectURI)
+			q.Set("client_id", h.clientID)
 			q.Set("request_uri", requestURI)
 			authEndpoint.RawQuery = q.Encode()
 			authURL = authEndpoint.String()
@@ -1260,7 +1299,7 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
 	data.Set("redirect_uri", redirectURI)
-	data.Set("client_id", redirectURI)
+	data.Set("client_id", h.clientID)
 	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
 	}
@@ -1380,7 +1419,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
 		Audience:            metadata.CredentialIssuer,
 		Nonce:               nonce,
-		Issuer:              h.redirectURI,
+		Issuer:              h.clientID,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
 	})

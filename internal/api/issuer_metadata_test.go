@@ -34,6 +34,8 @@ func setupIssuerMetadataTest(t *testing.T) (*Handlers, *gin.Engine, *memory.Stor
 			ExpiryHours: 24,
 			Issuer:      "test-wallet",
 		},
+		// Allow loopback so tests using httptest.NewServer can reach mock servers.
+		HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 	}
 
 	store := memory.NewStore()

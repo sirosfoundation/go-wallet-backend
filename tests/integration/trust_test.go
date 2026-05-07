@@ -26,7 +26,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 		defer srv.Close()
 
 		// Create trust service pointing to testserver
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -52,7 +52,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 		defer srv.Close()
 
 		// Create trust service pointing to testserver
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -73,7 +73,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 
 	t.Run("No trust endpoint configured", func(t *testing.T) {
 		// Create trust service without endpoint
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: "", // No endpoint
 			},
@@ -102,7 +102,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -128,7 +128,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -158,7 +158,7 @@ func TestTrustService_EndpointOverride(t *testing.T) {
 	defer deniedSrv.Close()
 
 	// Default endpoint allows everything
-	cfg := &config.Config{
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 		Trust: config.TrustConfig{
 			DefaultEndpoint: trustedSrv.URL(),
 			Timeout:         10,
@@ -186,7 +186,7 @@ func TestTrustService_EvaluatorCaching(t *testing.T) {
 	srv := testserver.New(testserver.WithRegistry(reg))
 	defer srv.Close()
 
-	cfg := &config.Config{
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 		Trust: config.TrustConfig{
 			DefaultEndpoint: srv.URL(),
 			Timeout:         10,
@@ -215,7 +215,7 @@ func TestTrustService_Timeout(t *testing.T) {
 	srv := testserver.New(testserver.WithRegistry(reg))
 	defer srv.Close()
 
-	cfg := &config.Config{
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 		Trust: config.TrustConfig{
 			DefaultEndpoint: srv.URL(),
 			Timeout:         1, // 1 second timeout
@@ -239,7 +239,7 @@ func TestTrustService_ConcurrentRequests(t *testing.T) {
 	srv := testserver.New(testserver.WithRegistry(reg))
 	defer srv.Close()
 
-	cfg := &config.Config{
+	cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 		Trust: config.TrustConfig{
 			DefaultEndpoint: srv.URL(),
 			Timeout:         10,
@@ -286,7 +286,7 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -319,7 +319,7 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -356,7 +356,7 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -387,7 +387,7 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,
@@ -419,7 +419,7 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 		srv := testserver.New(testserver.WithRegistry(reg))
 		defer srv.Close()
 
-		cfg := &config.Config{
+		cfg := &config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 			Trust: config.TrustConfig{
 				DefaultEndpoint: srv.URL(),
 				Timeout:         10,

@@ -19,7 +19,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-	"github.com/sirosfoundation/go-trust/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -1763,6 +1763,7 @@ func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
 	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
 	h := &OID4VCIHandler{
 		redirectURI: "https://wallet.example.com/callback",
+		clientID:    "https://wallet.example.com/callback",
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 

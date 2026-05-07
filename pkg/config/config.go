@@ -1,8 +1,10 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,7 +40,8 @@ type HTTPClientConfig struct {
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
 	// AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges.
 	// Required when credential issuers run on Docker, k8s internal networks, or localhost.
-	// Default: false (non-public IP ranges are blocked by SSRF protection).
+	// Default: false (private/loopback/cloud-metadata IPs are blocked by the SSRF DialContext).
+	// Set to true when issuers are hosted on internal networks (dev/staging environments).
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
@@ -51,6 +54,8 @@ type HTTPClientConfig struct {
 // timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
 // configured timeout. A zero-value HTTPClientConfig produces a sensible default
 // (30 s timeout, system proxy, TLS verification enabled).
+// When AllowPrivateIPs is false, a custom dialer blocks connections to private,
+// loopback, and link-local IP ranges to prevent SSRF.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -70,6 +75,36 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		proxyURL, err := url.Parse(c.ProxyURL)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	if !c.AllowPrivateIPs {
+		// Block connections to private/loopback/link-local IPs to prevent SSRF.
+		// DNS resolution happens inside the dialer so post-DNS rebinding is also blocked.
+		baseDialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+			}
+			for _, ip := range ips {
+				// Block cloud metadata endpoints (169.254.169.254, fd00::1)
+				// before the generic private/link-local check for a clearer message.
+				if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+					return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
+				}
+				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+					return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+				}
+			}
+			return baseDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 		}
 	}
 
@@ -799,6 +834,8 @@ func defaultConfig() *Config {
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout: 30, // 30 seconds default
+			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
+			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
 		AuthZENProxy: AuthZENProxyConfig{
 			Enabled:         true, // Enabled by default - required for engine flows

@@ -23,6 +23,9 @@ func testConfig() *config.Config {
 		Server: config.ServerConfig{
 			RegistryPort: 8097,
 		},
+		HTTPClient: config.HTTPClientConfig{
+			AllowPrivateIPs: true,
+		},
 	}
 }
 
