@@ -95,6 +95,7 @@ type cachedEntry struct {
 	parsed    map[string]interface{}
 	fetchedAt time.Time
 	validated bool
+	signed    bool
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
@@ -147,6 +148,7 @@ type ResolveResult struct {
 	Metadata  map[string]interface{}
 	Cached    bool
 	Validated bool
+	Signed    bool // true when response was application/jwt or contained signed_metadata
 }
 
 // Resolve returns the authoritative issuer metadata for the given issuer URL,
@@ -173,6 +175,7 @@ func (r *Resolver) Resolve(ctx context.Context, issuerURL string) (map[string]in
 type fetchResult struct {
 	metadata  map[string]interface{}
 	validated bool
+	signed    bool
 }
 
 // ResolveWithInfo is like Resolve but additionally reports whether the result
@@ -186,7 +189,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	}
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
-		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated}, nil
+		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed}, nil
 	}
 
 	metadataURL := issuerURL + "/.well-known/openid-credential-issuer"
@@ -195,8 +198,8 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
-	r.setCache(issuerURL, result.metadata, result.validated)
-	return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated}, nil
+	r.setCache(issuerURL, result)
+	return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed}, nil
 }
 
 func (r *Resolver) validateURL(issuerURL string) error {
@@ -310,7 +313,7 @@ func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString s
 	// Validated is true only when a TrustEvaluator is configured and approved
 	// the signer. Without a TrustEvaluator, the signature is verified but no
 	// trust decision is made.
-	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil}, nil
+	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 }
 
 // handleJSONResponse processes an application/json response.
@@ -334,11 +337,11 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 				return nil, err
 			}
 			// Validated only when a TrustEvaluator is configured and approved.
-			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil}, nil
+			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 		}
 	}
 
-	return &fetchResult{metadata: raw, validated: false}, nil
+	return &fetchResult{metadata: raw, validated: false, signed: false}, nil
 }
 
 // validateSignedMetadata verifies the signed_metadata JWT against the issuer's
@@ -687,11 +690,23 @@ func (r *Resolver) fetchJWKSFromURI(ctx context.Context, uri string) (jose.JSONW
 
 func (r *Resolver) getCachedEntry(issuerURL string) *cachedEntry {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	entry, ok := r.cache[issuerURL]
-	if !ok || time.Since(entry.fetchedAt) > r.cfg.CacheTTL {
+	if !ok {
+		r.mu.RUnlock()
 		return nil
 	}
+	if time.Since(entry.fetchedAt) > r.cfg.CacheTTL {
+		r.mu.RUnlock()
+		// Evict expired entry under write lock to prevent unbounded growth.
+		r.mu.Lock()
+		// Re-check: another goroutine may have refreshed between locks.
+		if e, ok := r.cache[issuerURL]; ok && time.Since(e.fetchedAt) > r.cfg.CacheTTL {
+			delete(r.cache, issuerURL)
+		}
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.RUnlock()
 	return entry
 }
 
@@ -707,12 +722,13 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 	return result
 }
 
-func (r *Resolver) setCache(issuerURL string, parsed map[string]interface{}, validated bool) {
+func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{
-		parsed:    parsed,
+		parsed:    result.metadata,
 		fetchedAt: time.Now(),
-		validated: validated,
+		validated: result.validated,
+		signed:    result.signed,
 	}
 }

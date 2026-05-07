@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1598,9 +1599,9 @@ func TestResolve_KeySubject_ProxiesToPDP(t *testing.T) {
 }
 
 func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T) {
-	// When metadata contains a signed_metadata field whose JWT cannot be verified,
-	// the handler must reject immediately with 502 rather than forwarding
-	// potentially misleading unverified data.
+	// When metadata contains a signed_metadata field whose JWT has an embedded
+	// key (x5c/jwk) but verification fails, the handler must reject immediately
+	// with 502 rather than forwarding potentially misleading unverified data.
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := gotrust.EvaluationResponse{Decision: false}
 		w.Header().Set("Content-Type", "application/json")
@@ -1610,14 +1611,17 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 	pdpServer := httptest.NewServer(pdpHandler)
 	defer pdpServer.Close()
 
+	// Use a JWT with a jwk header (embedded key present) but an invalid signature
+	// so that VerifyJWTWithEmbeddedKey returns a verification failure.
+	fakeJWKHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","jwk":{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}}`))
+	fakeJWT := fakeJWKHeader + ".fake-payload.fake-signature"
+
 	resolver := &mockMetadataResolver{
 		result: &issuermetadata.ResolveResult{
+			Signed: true,
 			Metadata: map[string]interface{}{
 				"credential_issuer": "https://signed-untrusted.example.com",
-				"signed_metadata":   "eyJhbGciOiJFUzI1NiJ9.fake.signature",
-				"jwks": map[string]interface{}{
-					"keys": []interface{}{map[string]interface{}{"kty": "EC"}},
-				},
+				"signed_metadata":   fakeJWT,
 			},
 		},
 	}

@@ -413,11 +413,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		return
 	}
 
-	// Determine if metadata is signed (has signed_metadata field)
-	_, metadataIsSigned := result.Metadata["signed_metadata"].(string)
-	if sm, ok := result.Metadata["signed_metadata"].(string); ok && sm == "" {
-		metadataIsSigned = false
-	}
+	// Determine if metadata is signed (application/jwt or signed_metadata field).
+	// The resolver sets Signed=true for both cases.
+	metadataIsSigned := result.Signed
 
 	// Step 2: Extract key material from metadata
 	keyMaterial, signedButFailed := h.extractKeyMaterial(ctx, result.Metadata)
@@ -593,11 +591,19 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 	if signedMetadata, ok := metadata["signed_metadata"].(string); ok && signedMetadata != "" {
 		km, err := trust.VerifyJWTWithEmbeddedKey(signedMetadata)
 		if err != nil {
-			h.logger.Error("signed_metadata JWT verification failed",
-				zap.Error(err))
-			return nil, true // signal to caller: signing was attempted but failed
+			// If the JWT has no embedded key (x5c/jwk), fall through to
+			// check jwks/jwks_uri for kid-based verification.
+			if strings.Contains(err.Error(), "neither x5c nor jwk") {
+				h.logger.Debug("signed_metadata JWT has no embedded key, falling through to jwks/jwks_uri",
+					zap.Error(err))
+			} else {
+				h.logger.Error("signed_metadata JWT verification failed",
+					zap.Error(err))
+				return nil, true // signal to caller: signing was attempted but failed
+			}
+		} else {
+			return km, false
 		}
-		return km, false
 	}
 
 	// Check inline JWKS
