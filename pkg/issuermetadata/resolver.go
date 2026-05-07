@@ -253,7 +253,13 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 		req.Header.Set("Accept", "application/json, application/jwt;q=0.9")
 	}
 
-	resp, err := r.httpClient.Do(req)
+	// The issuerURL is validated by validateURL() (HTTPS required) before
+	// fetch() is called, and r.httpClient enforces SSRF protection via its
+	// DialContext (blocking private/loopback IPs). Fetching arbitrary public
+	// HTTPS endpoints is inherent to OpenID4VCI issuer metadata discovery —
+	// the issuer URL comes from a user-presented credential and can be any
+	// public HTTPS endpoint; there is no known-good allowlist.
+	resp, err := r.httpClient.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
