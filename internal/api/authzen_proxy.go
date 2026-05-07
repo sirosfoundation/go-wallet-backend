@@ -130,6 +130,14 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 	pdpURL := cfg.AuthZENProxy.GetPDPURL(cfg.Trust.GetPDPURL())
 	cfg.AuthZENProxy.PDPURL = pdpURL
 
+	// Invariant: when resolution is enabled, the resolver must be non-nil.
+	// A nil resolver here means the caller failed to construct it — that is a
+	// programming error, not a runtime condition, so panic immediately rather
+	// than silently serving requests without metadata resolution.
+	if cfg.AuthZENProxy.AllowResolution && metadataResolver == nil {
+		panic("authzen: AllowResolution=true but metadataResolver is nil — check server startup")
+	}
+
 	handler := NewAuthZENProxyHandler(
 		&cfg.AuthZENProxy,
 		authorizerInterface,
@@ -369,15 +377,17 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects, resolve locally when a metadata resolver is configured.
-	// If no resolver is configured, fall back to proxying to the PDP for
-	// backward compatibility.
+	// For URL subjects, resolve locally via the metadata resolver.
+	// A nil resolver at this point is a startup misconfiguration (caught by
+	// NewAuthZENProxyHandlerFromConfig); return 503 as defense-in-depth.
 	if subjectType == "url" {
-		if h.metadataResolver != nil {
-			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		if h.metadataResolver == nil {
+			h.logger.Error("metadata resolver is nil for URL subject — this is a startup misconfiguration")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "issuer metadata resolution not configured"})
 			return
 		}
-		// No local resolver configured — fall through to PDP proxy
+		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		return
 	}
 
 	// For key subjects, proxy to PDP

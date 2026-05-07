@@ -1597,8 +1597,10 @@ func TestResolve_KeySubject_ProxiesToPDP(t *testing.T) {
 	}
 }
 
-func TestResolve_URLSubject_SignedUntrusted_Error(t *testing.T) {
-	// When metadata contains signed_metadata but is untrusted, must return an error
+func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T) {
+	// When metadata contains a signed_metadata field whose JWT cannot be verified,
+	// the handler must reject immediately with 502 rather than forwarding
+	// potentially misleading unverified data.
 	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := gotrust.EvaluationResponse{Decision: false}
 		w.Header().Set("Content-Type", "application/json")
@@ -1646,8 +1648,8 @@ func TestResolve_URLSubject_SignedUntrusted_Error(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("expected status %d for signed+untrusted, got %d: %s", http.StatusForbidden, w.Code, w.Body.String())
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("expected status %d for unverifiable signed_metadata JWT, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
 	}
 }
 
