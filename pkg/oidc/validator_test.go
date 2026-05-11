@@ -538,3 +538,269 @@ func TestValidator_ValidateWithDiscovery(t *testing.T) {
 		t.Error("expected at least one hit to /jwks, got 0")
 	}
 }
+
+// =============================================================================
+// Retry and circuit breaker tests
+// =============================================================================
+
+// TestValidator_JWKS_RetryOnTransientFailure verifies that fetchJWKSWithRetry
+// retries on transient (5xx) failures and succeeds when the IdP recovers.
+func TestValidator_JWKS_RetryOnTransientFailure(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	_, jwkJSON := createTestRSAKey(t)
+
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			// Fail the first two attempts with 503.
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"keys":[%s]}`, jwkJSON)
+	}))
+	defer server.Close()
+
+	v := NewValidator(ValidatorConfig{
+		Issuer:         "https://issuer.example.com",
+		Audience:       "client-id",
+		JWKSURI:        server.URL + "/jwks",
+		JWKSMaxRetries: 3,
+	}, server.Client(), logger)
+
+	ctx := context.Background()
+	jwks, err := v.fetchJWKSWithRetry(ctx, server.URL+"/jwks")
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if len(jwks.Keys) == 0 {
+		t.Fatal("expected at least one key in JWKS")
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+// TestValidator_JWKS_NoRetryOn4xx verifies that 4xx errors are not retried.
+func TestValidator_JWKS_NoRetryOn4xx(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		http.Error(w, "Not Found", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	v := NewValidator(ValidatorConfig{
+		Issuer:         "https://issuer.example.com",
+		Audience:       "client-id",
+		JWKSURI:        server.URL + "/jwks",
+		JWKSMaxRetries: 3,
+	}, server.Client(), logger)
+
+	ctx := context.Background()
+	_, err := v.fetchJWKSWithRetry(ctx, server.URL+"/jwks")
+	if err == nil {
+		t.Fatal("expected error for 404, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("expected exactly 1 attempt (no retry on 404), got %d", attempts)
+	}
+}
+
+// TestValidator_JWKS_StaleCacheOnFailure verifies that a stale cached JWKS is
+// returned when a fresh fetch fails and no circuit breaker is involved.
+func TestValidator_JWKS_StaleCacheOnFailure(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	_, jwkJSON := createTestRSAKey(t)
+
+	// First request succeeds; subsequent ones fail.
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"keys":[%s]}`, jwkJSON)
+			return
+		}
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	v := NewValidator(ValidatorConfig{
+		Issuer:         "https://issuer.example.com",
+		Audience:       "client-id",
+		JWKSURI:        server.URL + "/jwks",
+		JWKSCacheTTL:   1 * time.Millisecond, // expire almost immediately
+		JWKSMaxRetries: 1,
+	}, server.Client(), logger)
+
+	ctx := context.Background()
+
+	// Warm the cache.
+	jwks1, err := v.getJWKS(ctx)
+	if err != nil || len(jwks1.Keys) == 0 {
+		t.Fatalf("initial JWKS fetch failed: %v", err)
+	}
+
+	// Let the cache expire.
+	time.Sleep(5 * time.Millisecond)
+
+	// Second call should fail the fetch but return stale cache.
+	jwks2, err := v.getJWKS(ctx)
+	if err != nil {
+		t.Fatalf("expected stale cache fallback, got error: %v", err)
+	}
+	if len(jwks2.Keys) == 0 {
+		t.Error("expected stale JWKS to be returned")
+	}
+}
+
+// TestValidator_JWKS_CircuitBreaker verifies that the circuit opens after the
+// threshold of consecutive failures and returns stale cache while open.
+func TestValidator_JWKS_CircuitBreaker(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	_, jwkJSON := createTestRSAKey(t)
+
+	alwaysFail := false
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if alwaysFail {
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"keys":[%s]}`, jwkJSON)
+	}))
+	defer server.Close()
+
+	const threshold = 3
+	v := NewValidator(ValidatorConfig{
+		Issuer:                      "https://issuer.example.com",
+		Audience:                    "client-id",
+		JWKSURI:                     server.URL + "/jwks",
+		JWKSCacheTTL:                1 * time.Millisecond,
+		JWKSMaxRetries:              1, // one attempt per getJWKS call
+		JWKSCircuitBreakerThreshold: threshold,
+		JWKSCircuitBreakerCooldown:  10 * time.Second, // long enough to stay open during test
+	}, server.Client(), logger)
+
+	ctx := context.Background()
+
+	// Prime the cache.
+	if _, err := v.getJWKS(ctx); err != nil {
+		t.Fatalf("initial fetch: %v", err)
+	}
+
+	// Switch IdP to always fail.
+	alwaysFail = true
+	time.Sleep(5 * time.Millisecond) // let cache expire
+
+	requestsBefore := requestCount
+	// Exhaust the threshold — each call tries the fetch, fails, increments counter.
+	for i := 0; i < threshold; i++ {
+		jwks, err := v.getJWKS(ctx)
+		if err != nil {
+			t.Fatalf("expected stale cache at failure %d, got error: %v", i+1, err)
+		}
+		if len(jwks.Keys) == 0 {
+			t.Errorf("failure %d: expected stale JWKS", i+1)
+		}
+	}
+
+	// Circuit should now be open — getJWKS must not make more HTTP requests.
+	requestsMidway := requestCount
+	jwks, err := v.getJWKS(ctx)
+	if err != nil {
+		t.Fatalf("expected stale cache while circuit open, got error: %v", err)
+	}
+	if len(jwks.Keys) == 0 {
+		t.Error("expected stale JWKS while circuit open")
+	}
+	if requestCount != requestsMidway {
+		t.Errorf("circuit open: expected no new HTTP requests (had %d before, %d after)",
+			requestsMidway, requestCount)
+	}
+	_ = requestsBefore
+}
+
+// TestValidator_JWKS_CircuitBreakerReset verifies the circuit closes after cooldown.
+func TestValidator_JWKS_CircuitBreakerReset(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	_, jwkJSON := createTestRSAKey(t)
+
+	alwaysFail := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if alwaysFail {
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"keys":[%s]}`, jwkJSON)
+	}))
+	defer server.Close()
+
+	const threshold = 2
+	cooldown := 20 * time.Millisecond
+	v := NewValidator(ValidatorConfig{
+		Issuer:                      "https://issuer.example.com",
+		Audience:                    "client-id",
+		JWKSURI:                     server.URL + "/jwks",
+		JWKSCacheTTL:                1 * time.Millisecond,
+		JWKSMaxRetries:              1,
+		JWKSCircuitBreakerThreshold: threshold,
+		JWKSCircuitBreakerCooldown:  cooldown,
+	}, server.Client(), logger)
+
+	ctx := context.Background()
+
+	// Prime cache.
+	if _, err := v.getJWKS(ctx); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	alwaysFail = true
+	time.Sleep(5 * time.Millisecond)
+
+	// Trigger threshold failures to open circuit.
+	for i := 0; i < threshold; i++ {
+		v.getJWKS(ctx) //nolint:errcheck
+	}
+
+	// Verify circuit is open.
+	v.jwksMu.RLock()
+	open := !v.jwksCircuitOpen.IsZero()
+	v.jwksMu.RUnlock()
+	if !open {
+		t.Fatal("expected circuit to be open")
+	}
+
+	// Wait for cooldown to elapse.
+	time.Sleep(cooldown + 10*time.Millisecond)
+
+	// IdP recovers.
+	alwaysFail = false
+
+	// After cooldown, a probe attempt should succeed and close the circuit.
+	jwks, err := v.getJWKS(ctx)
+	if err != nil {
+		t.Fatalf("expected circuit reset to allow fetch: %v", err)
+	}
+	if len(jwks.Keys) == 0 {
+		t.Error("expected fresh JWKS after circuit reset")
+	}
+
+	v.jwksMu.RLock()
+	failures := v.jwksFailures
+	circuitOpen := v.jwksCircuitOpen
+	v.jwksMu.RUnlock()
+	if failures != 0 {
+		t.Errorf("expected failure counter reset to 0, got %d", failures)
+	}
+	if !circuitOpen.IsZero() {
+		t.Error("expected circuit to be closed after successful fetch")
+	}
+}
