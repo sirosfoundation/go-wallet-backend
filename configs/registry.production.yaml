@@ -2,7 +2,7 @@
 # 
 # Environment variables override these settings with REGISTRY_ prefix:
 #   REGISTRY_SERVER_PORT=8097
-#   REGISTRY_SOURCE_URL=https://registry.siros.org/.well-known/vctm-registry.json
+#   REGISTRY_SOURCE_URL=https://registry.siros.org/api/v1/schemas.json
 #   REGISTRY_JWT_SECRET=your-secret-here
 #   REGISTRY_LOGGING_LEVEL=info
 
@@ -11,7 +11,7 @@ server:
   port: 8097
 
 source:
-  url: "https://registry.siros.org/.well-known/vctm-registry.json"
+  url: "https://registry.siros.org/api/v1/schemas.json"
   poll_interval: 5m
   timeout: 30s
 

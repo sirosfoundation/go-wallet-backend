@@ -47,6 +47,18 @@ type VCTMEntry struct {
 
 	// LastModified is the HTTP Last-Modified header value for conditional requests
 	LastModified string `json:"last_modified,omitempty"`
+
+	// AttestationLoS is the level of assurance per TS11 (e.g., "iso_18045_basic")
+	AttestationLoS string `json:"attestation_los,omitempty"`
+
+	// BindingType is the key binding type per TS11 (e.g., "key")
+	BindingType string `json:"binding_type,omitempty"`
+
+	// RulebookURI is the URI to the attestation rulebook per TS11
+	RulebookURI string `json:"rulebook_uri,omitempty"`
+
+	// SupportedFormats lists the credential formats supported per TS11 (e.g., ["dc+sd-jwt"])
+	SupportedFormats []string `json:"supported_formats,omitempty"`
 }
 
 // IsExpired returns true if this entry has expired based on its ExpiresAt time
