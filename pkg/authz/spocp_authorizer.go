@@ -263,6 +263,20 @@ func DefaultWalletRules() []sexp.Element {
 				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
 			),
 		),
+		// Rule 6: Allow credential offer URI resolution (subject.type="url", HTTPS URLs)
+		// Used by /v1/resolve with resource_type="credential_offer_uri".
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("credential_offer_uri")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
+			),
+		),
 	}
 }
 
@@ -320,6 +334,19 @@ func ProductionWalletRules() []sexp.Element {
 			sexp.NewList("action"),
 			sexp.NewList("resource",
 				sexp.NewList("type", sexp.NewAtom("credential_issuer")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
+			),
+		),
+		// Allow credential offer URI resolution (subject.type="url", HTTPS only in production)
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("credential_offer_uri")),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",

@@ -1114,6 +1114,47 @@ func TestResolve_CredentialOfferURI_ResponseTooLarge(t *testing.T) {
 	}
 }
 
+func TestResolve_UnknownResourceTypeURL_Rejected(t *testing.T) {
+	// An unknown resource_type for URL subjects must be rejected with 400,
+	// even if the SPOCP authorizer would otherwise permit it. Without this
+	// explicit allowlist, an unknown type silently falls through to the
+	// credential-issuer resolution path.
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, nil, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "https://issuer.example.com",
+		"subject_type":  "url",
+		"resource_type": "totally_unknown_type",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d for unknown resource_type, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
 // ============================================================================
 // Helper Function Tests
 // ============================================================================

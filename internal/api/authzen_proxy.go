@@ -388,7 +388,14 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 			h.resolveCredentialOfferURI(c, ctx, req.SubjectID)
 			return
 		}
-		// Default: resolve as credential issuer (fetches /.well-known/openid-credential-issuer)
+		// Allowlist: only credential_issuer is valid beyond this point.
+		// An unknown resource_type would silently fall through to credential-issuer
+		// resolution, creating a policy-bypass surface if SPOCP rules are permissive.
+		if resourceType != "credential_issuer" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported resource_type for URL subjects: %s", resourceType)})
+			return
+		}
+		// Resolve as credential issuer (fetches /.well-known/openid-credential-issuer)
 		if h.metadataResolver == nil {
 			h.logger.Debug("no metadata resolver configured for URL subject — proxying to PDP")
 			h.proxyToPDP(c, ctx, tenantID, evalReq)
