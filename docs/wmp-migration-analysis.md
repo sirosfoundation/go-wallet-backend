@@ -129,27 +129,50 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 
 ### SSE Reconnection
 
-The browser's native `EventSource` API handles reconnection automatically:
+The native browser `EventSource` API cannot send custom headers (no
+`Authorization`, no `X-Tenant-ID`). We use **`@microsoft/fetch-event-source`**
+(2.8k stars, MIT, ~3KB) which wraps `fetch()` to provide:
+
+- Custom headers on the SSE connection
+- Full control over reconnection strategy
+- Built-in Page Visibility API integration (closes on tab hide, reconnects on
+  visible with `Last-Event-ID`)
+- `AbortController` support
 
 ```typescript
-const events = new EventSource(`/wmp/events?session_id=${sessionId}`, {
-  headers: { 'Authorization': `Bearer ${token}` }
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+const ctrl = new AbortController();
+await fetchEventSource(`/wmp/events?session_id=${sessionId}`, {
+  headers: {
+    'Authorization': `Bearer ${token}`,
+    'X-Tenant-ID': tenantId,
+  },
+  signal: ctrl.signal,
+  onmessage(ev) {
+    handleNotification(JSON.parse(ev.data));
+  },
+  onclose() {
+    // Server closed — retry automatically
+    throw new RetriableError();
+  },
+  onerror(err) {
+    if (err instanceof FatalError) throw err; // stop retrying
+    // Return retry interval in ms, or undefined for default
+  },
 });
-events.onmessage = (e) => handleNotification(JSON.parse(e.data));
-// Browser auto-reconnects on disconnect — no custom logic needed
 ```
 
-For custom reconnection logic (e.g., to support `Last-Event-ID` for replay):
+The server includes event IDs in each SSE frame:
 
-```typescript
-// Server includes event IDs
-// event: notification
-// id: evt-42
-// data: {"method":"wmp.flow.progress","params":{...}}
-
-// On reconnect, browser sends Last-Event-ID: evt-42
-// Server replays missed events
 ```
+id: evt-42
+event: notification
+data: {"method":"wmp.flow.progress","params":{...}}
+```
+
+On reconnect, `fetch-event-source` sends `Last-Event-ID: evt-42` and the
+server replays missed events.
 
 This means **OAuth redirects are a non-issue** — when the user returns from the
 authorization server, the SSE stream reconnects and the server replays any missed
@@ -219,11 +242,17 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
       auth: { type: 'bearer', token }
     });
     
-    // Open SSE stream for notifications
-    this.events = new EventSource(
-      `/wmp/events?session_id=${this.sessionId}&tenant_id=${tenantId}`
-    );
-    this.events.onmessage = (e) => this.handleNotification(JSON.parse(e.data));
+    // Open SSE stream for notifications (with auth headers)
+    this.ctrl = new AbortController();
+    fetchEventSource(`/wmp/events?session_id=${this.sessionId}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'X-Tenant-ID': tenantId,
+      },
+      signal: this.ctrl.signal,
+      onmessage: (ev) => this.handleNotification(JSON.parse(ev.data)),
+      onclose: () => { throw new RetriableError(); },
+    });
   }
   
   async startFlow(protocol: string, params: any): Promise<any> {
@@ -820,12 +849,11 @@ Week 8: Cleanup
 
 ## Open Questions
 
-1. **Should the SSE stream use `text/event-stream` or fetch streaming?**
-   EventSource has native browser reconnection but limited header control
-   (no custom auth headers in some implementations). Fetch streaming with
-   `ReadableStream` gives full header control but requires manual reconnect.
-   **Leaning toward**: EventSource with token-in-query for SSE + auth-in-header
-   for POST, or a custom EventSource wrapper.
+1. ~~Should the SSE stream use `text/event-stream` or fetch streaming?~~
+   **Decided**: Use `@microsoft/fetch-event-source` (~3KB, MIT, from Azure).
+   Wraps `fetch()` to parse SSE streams with full header control, custom
+   reconnection, and built-in Page Visibility API integration. No token-in-URL
+   needed — `Authorization` and `X-Tenant-ID` headers on every SSE connection.
 
 2. **Event buffer sizing and eviction policy?**
    Options: fixed count (100 events), time-based (5 min), or flow-scoped
