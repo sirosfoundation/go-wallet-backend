@@ -91,3 +91,5 @@ require (
 )
 
 replace github.com/descope/virtualwebauthn => github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61
+
+replace github.com/sirosfoundation/go-wmp => ../go-wmp
