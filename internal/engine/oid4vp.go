@@ -1108,6 +1108,8 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 
 // Returns the verifier's encryption key as a JSONWebKey.
 // Used to compute the JWK thumbprint for the mdoc OID4VP session transcript.
+// Mirrors extractVerifierEncryptionKey: prefers client_metadata.jwks, then falls
+// back to an x5c-derived public key from the request JWT header.
 func (h *OID4VPHandler) extractVerifierEncryptionJWK(authReq *AuthorizationRequest) (*jose.JSONWebKey, error) {
 	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
 		var jwks struct {
@@ -1135,7 +1137,41 @@ func (h *OID4VPHandler) extractVerifierEncryptionJWK(authReq *AuthorizationReque
 			return fallback, nil
 		}
 	}
-	return nil, errors.New("no verifier encryption JWK found")
+
+	// Fallback: x5c from request JWT header (signing key, used when no
+	// dedicated encryption key is provided in client_metadata)
+	if authReq.RequestJWT != "" {
+		var kid string
+		parts := strings.Split(authReq.RequestJWT, ".")
+		if len(parts) >= 2 {
+			headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+			if err == nil {
+				var header struct {
+					Kid string `json:"kid"`
+				}
+				_ = json.Unmarshal(headerBytes, &header)
+				kid = header.Kid
+			}
+		}
+
+		km := trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
+		if km != nil && km.Type == "x5c" && len(km.X5C) > 0 {
+			certDER, err := base64.StdEncoding.DecodeString(km.X5C[0])
+			if err != nil {
+				certDER, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode x5c certificate: %w", err)
+				}
+			}
+			cert, err := x509.ParseCertificate(certDER)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse x5c certificate: %w", err)
+			}
+			return &jose.JSONWebKey{Key: cert.PublicKey, KeyID: kid}, nil
+		}
+	}
+
+	return nil, errors.New("no verifier encryption JWK found in client_metadata.jwks or request JWT x5c")
 }
 
 func mapKeyAlgorithm(alg string) (jose.KeyAlgorithm, error) {

@@ -6,13 +6,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
@@ -651,6 +655,39 @@ func TestExtractVerifierEncryptionJWK_NilMetadata(t *testing.T) {
 
 	_, err := h.extractVerifierEncryptionJWK(authReq)
 	require.Error(t, err)
+}
+
+func TestExtractVerifierEncryptionJWK_FallsBackToX5C(t *testing.T) {
+	// Generate a key and self-signed certificate for the verifier
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-verifier"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	// Build a minimal request JWT header containing x5c (no client_metadata.jwks)
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+	headerBytes, err := json.Marshal(map[string]interface{}{
+		"alg": "ES256",
+		"kid": "test-x5c-kid",
+		"x5c": []string{certB64},
+	})
+	require.NoError(t, err)
+	requestJWT := base64.RawURLEncoding.EncodeToString(headerBytes) + ".payload.signature"
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{RequestJWT: requestJWT}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "test-x5c-kid", jwk.KeyID)
+	assert.IsType(t, &ecdsa.PublicKey{}, jwk.Key)
 }
 
 func TestExtractVerifierEncryptionJWK_ThumbprintIsConsistent(t *testing.T) {
