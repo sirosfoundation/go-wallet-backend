@@ -855,10 +855,12 @@ Week 8: Cleanup
    reconnection, and built-in Page Visibility API integration. No token-in-URL
    needed — `Authorization` and `X-Tenant-ID` headers on every SSE connection.
 
-2. **Event buffer sizing and eviction policy?**
-   Options: fixed count (100 events), time-based (5 min), or flow-scoped
-   (keep events for active flows only). Need to balance memory vs replay.
-   **Leaning toward**: Per-session ring buffer of 100 events.
+2. ~~Event buffer sizing and eviction policy?~~
+   **Decided**: Flow-scoped buffer with 200-event hard cap per session.
+   Keep all events for active flows; discard completed/errored flow events
+   after 30s grace period. Typical flows produce ~7-15 events, so the cap
+   is generous. Batch issuance (`count=N`) is a single event regardless of
+   batch size — it doesn't multiply events.
 
 3. **Should tenant context be a WMP concept or application-level?**
    Multi-tenant wallets are common. Could add `wmp.session.create` param
