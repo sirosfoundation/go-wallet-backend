@@ -153,13 +153,18 @@ func (m *Manager) HandleEvents(w http.ResponseWriter, r *http.Request) {
 func (m *Manager) handleHTTPHandshake(w http.ResponseWriter, userID, tenantID string) {
 	transport := newSSETransport(200)
 
+	sessionLabel := userID
+	if len(sessionLabel) > 8 {
+		sessionLabel = sessionLabel[:8]
+	}
+
 	session := &Session{
 		ID:        uuid.New().String(),
 		UserID:    userID,
 		TenantID:  tenantID,
 		transport: transport,
 		flows:     make(map[string]*Flow),
-		logger:    m.logger.With(zap.String("session", userID[:8])),
+		logger:    m.logger.With(zap.String("session", sessionLabel)),
 		actionCh:  make(chan *FlowActionMessage, 50),
 		signCh:    make(chan *SignResponseMessage, 20),
 		matchCh:   make(chan *MatchResponseMessage, 20),
