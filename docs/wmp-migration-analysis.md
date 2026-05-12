@@ -869,10 +869,15 @@ Week 8: Cleanup
    consistency and Redis lookup). Middleware validates that the header
    matches the session's stored tenant on every request.
 
-4. **When should the WebSocket transport be fully removed?**
-   Native iOS/Android wrappers may benefit from persistent connections.
-   **Leaning toward**: Keep WebSocket as opt-in fallback indefinitely,
-   remove only if no clients use it after 6 months.
+4. ~~When should the WebSocket transport be fully removed?~~
+   **Decided**: No runtime fallback between transports. Transport is a
+   deployment-time configuration choice. Plan:
+   - First: validate HTTP+SSE-only deployment on web (no WebSocket endpoint)
+   - Then: validate on iOS (TestFlight) and Android
+   - WebSocket transport remains available as a separate deployment option
+     until mobile validation is complete
+   - No automatic fallback logic in the frontend — the deployment config
+     determines which transport class is instantiated
 
 5. **Should `wmp.flow.progress` with `step: "sign_request"` be promoted
    to a first-class WMP method (`wmp.sign.request`)?**
