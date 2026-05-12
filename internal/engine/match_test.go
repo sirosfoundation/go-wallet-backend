@@ -36,16 +36,16 @@ func wsTestServer(t *testing.T, handler func(conn *websocket.Conn)) (*websocket.
 // testSession creates a Session with channels wired and the given conn.
 func testSession(conn *websocket.Conn) *Session {
 	return &Session{
-		ID:       "test-session",
-		UserID:   "test-user",
-		TenantID: "default",
-		conn:     conn,
-		flows:    make(map[string]*Flow),
-		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 50),
-		signCh:   make(chan *SignResponseMessage, 20),
-		matchCh:  make(chan *MatchResponseMessage, 20),
-		closeCh:  make(chan struct{}, 1),
+		ID:        "test-session",
+		UserID:    "test-user",
+		TenantID:  "default",
+		transport: newWSTransport(conn),
+		flows:     make(map[string]*Flow),
+		logger:    zap.NewNop(),
+		actionCh:  make(chan *FlowActionMessage, 50),
+		signCh:    make(chan *SignResponseMessage, 20),
+		matchCh:   make(chan *MatchResponseMessage, 20),
+		closeCh:   make(chan struct{}, 1),
 	}
 }
 

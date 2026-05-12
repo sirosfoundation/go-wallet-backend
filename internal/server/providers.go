@@ -283,6 +283,16 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
 		p.manager.HandleConnection(c.Writer, c.Request)
 	})
+
+	// HTTP+SSE endpoints — same engine, same auth, same security posture.
+	// POST /api/v2/wallet/rpc — JSON messages (auth via Authorization: Bearer)
+	router.POST("/api/v2/wallet/rpc", func(c *gin.Context) {
+		p.manager.HandleRPC(c.Writer, c.Request)
+	})
+	// GET /api/v2/wallet/events — SSE stream (auth via Authorization: Bearer)
+	router.GET("/api/v2/wallet/events", func(c *gin.Context) {
+		p.manager.HandleEvents(c.Writer, c.Request)
+	})
 }
 
 // Close shuts down the engine manager
