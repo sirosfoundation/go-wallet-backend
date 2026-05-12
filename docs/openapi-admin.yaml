@@ -113,6 +113,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/TenantResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -154,6 +156,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -176,6 +180,8 @@ paths:
                 $ref: '#/components/schemas/TenantResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -202,6 +208,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -232,6 +240,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -263,6 +273,8 @@ paths:
                       - "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -309,6 +321,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -330,6 +344,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MessageResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -362,6 +378,8 @@ paths:
                       $ref: '#/components/schemas/IssuerResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -404,6 +422,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -429,6 +449,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -455,6 +477,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -475,6 +499,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -507,6 +533,8 @@ paths:
                       $ref: '#/components/schemas/VerifierResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -553,6 +581,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -578,6 +608,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -604,6 +636,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -624,6 +658,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -650,6 +686,8 @@ paths:
                       $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     post:
@@ -676,6 +714,8 @@ paths:
                 $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -698,6 +738,8 @@ paths:
                 $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     put:
@@ -732,6 +774,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     delete:
@@ -749,6 +793,8 @@ paths:
                 $ref: '#/components/schemas/MessageResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -993,6 +1039,15 @@ components:
             of the values defined in the OID4VP specification. When provided,
             `client_id` must also be set.
           example: "did"
+      # Enforce mutual dependency: client_id is required when client_id_scheme is set
+      oneOf:
+        - description: No explicit scheme — client identified by redirect_uri matching
+          not:
+            required: [client_id_scheme]
+        - description: Explicit scheme — both client_id and client_id_scheme required
+          required:
+            - client_id
+            - client_id_scheme
 
     VerifierResponse:
       type: object
@@ -1136,7 +1191,7 @@ components:
           format: uri
           description: |
             AuthZEN PDP URL for this tenant's `/v1/evaluate` proxy endpoint.
-            If empty, the global `authzen_proxy.pdp_url` configuration is used.
+            If omitted, the global `authzen_proxy.pdp_url` configuration is used.
             This allows different tenants to use different trust services.
           example: "https://pdp.trust.example.com/v1/evaluate"
 
@@ -1202,6 +1257,7 @@ components:
         mode:
           type: string
           enum: [none, registration, login, both]
+          default: none
           description: Which endpoints require OIDC pre-authentication
           example: registration
         registration_op:
@@ -1224,6 +1280,17 @@ components:
             When true, the enterprise IdP `sub` is permanently bound to the wallet
             user during registration. Cannot be used with mode `login`.
           example: false
+      # Enforce: bind_identity cannot be true when mode is "login"
+      if:
+        properties:
+          mode:
+            const: login
+        required: [mode]
+      then:
+        properties:
+          bind_identity:
+            enum: [false]
+            description: bind_identity must be false (or omitted) when mode is "login"
 
   responses:
     BadRequest:
