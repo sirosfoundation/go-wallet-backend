@@ -343,6 +343,38 @@ This means:
 For longer disconnects (session timeout), the client uses `wmp.session.resume`
 via POST to restore the full session state.
 
+### Mobile WebView Token Persistence
+
+On Android WebViews, `sessionStorage` may be cleared when the app goes to
+background or when the WebView is recreated. This affects the JWT auth token
+needed for API calls (see wallet-frontend PR #126).
+
+With WebSocket, losing the token is catastrophic — the connection dies and
+cannot be re-established. The entire flow is lost.
+
+With HTTP+SSE, losing the token is **recoverable**:
+
+1. The WMP session and in-progress flow survive server-side (Redis)
+2. The SSE stream disconnects but the flow handler goroutine keeps waiting
+3. When the app returns to foreground and re-authenticates (e.g., via
+   refresh token from native bridge storage), the client:
+   - Reconnects SSE with `Last-Event-ID` → missed events replayed
+   - POSTs any pending action (sign response, trust result) → flow resumes
+
+The token is only needed *when making a request*, not continuously to maintain
+a connection. This reduces the severity of token loss from "flow destroyed"
+to "flow paused."
+
+**Combined with native bridge storage** (for durable token persistence outside
+the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
+
+| Layer | What it handles |
+|-------|----------------|
+| Native bridge storage | Token survives WebView lifecycle (background, recreate) |
+| HTTP+SSE session | Flow state survives SSE disconnect (no connection = session) |
+| Event replay | Missed progress events replayed on SSE reconnect |
+| `wmp.session.resume` | Recovery from longer outages (session expiry + re-auth) |
+
 ## Detailed Mapping
 
 ### Wire Protocol
@@ -879,8 +911,10 @@ Week 8: Cleanup
    - No automatic fallback logic in the frontend — the deployment config
      determines which transport class is instantiated
 
-5. **Should `wmp.flow.progress` with `step: "sign_request"` be promoted
-   to a first-class WMP method (`wmp.sign.request`)?**
-   Explicit methods improve interop but add protocol surface area.
-   **Leaning toward**: Keep as flow progress/action — it's more flexible
-   and doesn't require WMP spec changes.
+5. ~~Should `wmp.flow.progress` with `step: "sign_request"` be promoted
+   to a first-class WMP method (`wmp.sign.request`)?~~
+   **Decided**: Keep as flow progress/action. The generic `step` field is
+   more flexible, doesn't require WMP spec changes, and maps directly to
+   the engine's existing `RequestSign`/`RequestMatch` pattern. If interop
+   with other WMP implementations becomes a concern, promote to first-class
+   methods at that point.
