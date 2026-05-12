@@ -1149,6 +1149,8 @@ func (h *OID4VPHandler) extractVerifierEncryptionJWK(authReq *AuthorizationReque
 				var header struct {
 					Kid string `json:"kid"`
 				}
+				// kid extraction is best-effort; an absent or unparseable kid is fine
+				// since the actual public key comes from the x5c certificate.
 				_ = json.Unmarshal(headerBytes, &header)
 				kid = header.Kid
 			}
