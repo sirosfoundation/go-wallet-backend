@@ -862,11 +862,12 @@ Week 8: Cleanup
    is generous. Batch issuance (`count=N`) is a single event regardless of
    batch size — it doesn't multiply events.
 
-3. **Should tenant context be a WMP concept or application-level?**
-   Multi-tenant wallets are common. Could add `wmp.session.create` param
-   for tenant or keep as HTTP header (transparent to WMP).
-   **Leaning toward**: HTTP header (X-Tenant-ID), extracted in middleware,
-   injected into WMP context. Keeps WMP protocol clean.
+3. ~~Should tenant context be a WMP concept or application-level?~~
+   **Decided**: Both. `X-Tenant-ID` HTTP header on every request (required
+   for transport-level load balancer routing) **plus** tenant stored in
+   `Session.Metadata["tenant_id"]` at session creation (for server-side
+   consistency and Redis lookup). Middleware validates that the header
+   matches the session's stored tenant on every request.
 
 4. **When should the WebSocket transport be fully removed?**
    Native iOS/Android wrappers may benefit from persistent connections.
