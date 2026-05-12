@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -738,21 +739,43 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 }
 
 func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
-	// Convert selections to credential refs
 	credRefs := make([]CredentialRef, len(selected))
 	for i, s := range selected {
 		credRefs[i] = CredentialRef(s)
 	}
 
-	// Use provided audience (configured client_id) or fall back to request client_id
 	if audience == "" {
 		audience = authReq.ClientID
 	}
 
+	responseURI := authReq.ResponseURI
+	if responseURI == "" {
+		responseURI = authReq.RedirectURI
+	}
+
+	// Compute verifier JWK thumbprint for direct_post.jwt (needed for mdoc session transcript).
+	// For other response modes this stays empty — the frontend treats empty as null.
+	var verifierJwkThumbprint string
+	if authReq.ResponseMode == "direct_post.jwt" {
+		jwk, err := h.extractVerifierEncryptionJWK(authReq)
+		if err != nil {
+			h.Logger.Warn("could not extract verifier encryption JWK for mdoc session transcript", zap.Error(err))
+		} else {
+			thumbBytes, err := jwk.Thumbprint(crypto.SHA256)
+			if err != nil {
+				h.Logger.Warn("could not compute JWK thumbprint for mdoc session transcript", zap.Error(err))
+			} else {
+				verifierJwkThumbprint = base64.RawURLEncoding.EncodeToString(thumbBytes)
+			}
+		}
+	}
+
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
-		Audience:             audience,
-		Nonce:                authReq.Nonce,
-		CredentialsToInclude: credRefs,
+		Audience:              audience,
+		Nonce:                 authReq.Nonce,
+		CredentialsToInclude:  credRefs,
+		ResponseURI:           responseURI,
+		VerifierJwkThumbprint: verifierJwkThumbprint,
 	})
 	if err != nil {
 		return "", err
@@ -1081,6 +1104,36 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 	}
 
 	return nil, "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
+}
+
+// Returns the verifier's encryption key as a JSONWebKey.
+// Used to compute the JWK thumbprint for the mdoc OID4VP session transcript.
+func (h *OID4VPHandler) extractVerifierEncryptionJWK(authReq *AuthorizationRequest) (*jose.JSONWebKey, error) {
+	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
+		var jwks struct {
+			Keys []json.RawMessage `json:"keys"`
+		}
+		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil {
+			var fallback *jose.JSONWebKey
+			for _, raw := range jwks.Keys {
+				var jwk jose.JSONWebKey
+				if err := jwk.UnmarshalJSON(raw); err != nil {
+					continue
+				}
+				if jwk.Use == "enc" {
+					return &jwk, nil
+				}
+				if fallback == nil {
+					k := jwk
+					fallback = &k
+				}
+			}
+			if fallback != nil {
+				return fallback, nil
+			}
+		}
+	}
+	return nil, errors.New("no verifier encryption JWK found")
 }
 
 func mapKeyAlgorithm(alg string) (jose.KeyAlgorithm, error) {
