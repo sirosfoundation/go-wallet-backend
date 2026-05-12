@@ -17,6 +17,26 @@ import (
 	"go.uber.org/zap"
 )
 
+type jwksTransportError struct {
+	Err error
+}
+
+func (e *jwksTransportError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *jwksTransportError) Unwrap() error {
+	return e.Err
+}
+
+type jwksHTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *jwksHTTPStatusError) Error() string {
+	return fmt.Sprintf("status %d", e.StatusCode)
+}
+
 // JWKS represents a JSON Web Key Set
 type JWKS struct {
 	Keys []JWK `json:"keys"`
@@ -136,12 +156,12 @@ func (v *Validator) fetchJWKS(ctx context.Context, jwksURI string) (*JWKS, error
 
 	resp, err := v.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrJWKSFetchFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrJWKSFetchFailed, &jwksTransportError{Err: err})
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d", ErrJWKSFetchFailed, resp.StatusCode)
+		return nil, fmt.Errorf("%w: %w", ErrJWKSFetchFailed, &jwksHTTPStatusError{StatusCode: resp.StatusCode})
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit

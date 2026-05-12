@@ -568,6 +568,7 @@ func TestValidator_JWKS_RetryOnTransientFailure(t *testing.T) {
 		JWKSURI:        server.URL + "/jwks",
 		JWKSMaxRetries: 3,
 	}, server.Client(), logger)
+	v.jwksRetryBaseDelay = 1 * time.Millisecond
 
 	ctx := context.Background()
 	jwks, err := v.fetchJWKSWithRetry(ctx, server.URL+"/jwks")
@@ -699,7 +700,6 @@ func TestValidator_JWKS_CircuitBreaker(t *testing.T) {
 	alwaysFail = true
 	time.Sleep(5 * time.Millisecond) // let cache expire
 
-	requestsBefore := requestCount
 	// Exhaust the threshold — each call tries the fetch, fails, increments counter.
 	for i := 0; i < threshold; i++ {
 		jwks, err := v.getJWKS(ctx)
@@ -724,7 +724,6 @@ func TestValidator_JWKS_CircuitBreaker(t *testing.T) {
 		t.Errorf("circuit open: expected no new HTTP requests (had %d before, %d after)",
 			requestsMidway, requestCount)
 	}
-	_ = requestsBefore
 }
 
 // TestValidator_JWKS_CircuitBreakerReset verifies the circuit closes after cooldown.
