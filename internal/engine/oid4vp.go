@@ -1113,24 +1113,26 @@ func (h *OID4VPHandler) extractVerifierEncryptionJWK(authReq *AuthorizationReque
 		var jwks struct {
 			Keys []json.RawMessage `json:"keys"`
 		}
-		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil {
-			var fallback *jose.JSONWebKey
-			for _, raw := range jwks.Keys {
-				var jwk jose.JSONWebKey
-				if err := jwk.UnmarshalJSON(raw); err != nil {
-					continue
-				}
-				if jwk.Use == "enc" {
-					return &jwk, nil
-				}
-				if fallback == nil {
-					k := jwk
-					fallback = &k
-				}
+		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal verifier encryption JWKS: %w", err)
+		}
+
+		var fallback *jose.JSONWebKey
+		for _, raw := range jwks.Keys {
+			var jwk jose.JSONWebKey
+			if err := jwk.UnmarshalJSON(raw); err != nil {
+				continue
 			}
-			if fallback != nil {
-				return fallback, nil
+			if jwk.Use == "enc" {
+				return &jwk, nil
 			}
+			if fallback == nil {
+				k := jwk
+				fallback = &k
+			}
+		}
+		if fallback != nil {
+			return fallback, nil
 		}
 	}
 	return nil, errors.New("no verifier encryption JWK found")
