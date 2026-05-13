@@ -68,16 +68,23 @@ type AuthZENProxyHandler struct {
 	metadataResolver IssuerMetadataResolver
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
-	httpClient       *http.Client
-	allowHTTP        bool // when true, plain HTTP URLs are permitted for logos and jwks_uri (test/dev envs)
-	logger           *zap.Logger
+	// httpClient is used for external (user-visible) fetches: VCTM, credential offers, logos, jwks_uri.
+	// SSRF restrictions are applied here because these URLs originate from user-supplied content.
+	httpClient *http.Client
+	// pdpClient is used exclusively for requests to operator-configured PDP endpoints.
+	// SSRF dial restrictions are not applied because the PDP URL is operator-controlled.
+	pdpClient *http.Client
+	allowHTTP bool // when true, plain HTTP URLs are permitted for logos and jwks_uri (test/dev envs)
+	logger    *zap.Logger
 }
 
 // NewAuthZENProxyHandler creates a new AuthZEN proxy handler.
 // The tenantLookup and issuerLookup parameters are optional - if nil, the respective
 // per-tenant features are disabled.
 // The metadataResolver is required for URL subject resolution on /v1/resolve.
-func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
+// httpClient is used for external/user-visible fetches (SSRF-protected).
+// pdpClient is used for PDP requests (no SSRF restriction; URL is operator-configured).
+func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, pdpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
 		authorizer:       authorizer,
@@ -86,6 +93,7 @@ func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Aut
 		metadataResolver: metadataResolver,
 		clients:          make(map[string]*authzenclient.Client),
 		httpClient:       httpClient,
+		pdpClient:        pdpClient,
 		logger:           logger.Named("authzen-proxy"),
 	}
 }
@@ -140,6 +148,14 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		panic("authzen: AllowResolution=true but metadataResolver is nil — check server startup")
 	}
 
+	// Build a separate client for PDP calls. This client:
+	// - does NOT use a proxy (PDP is an internal service, reached directly)
+	// - does NOT apply SSRF dial restrictions (PDP URL is operator-controlled)
+	// - uses PDP-specific TLS settings from cfg.Trust (CACertPath, InsecureSkipVerify)
+	pdpClient, err := cfg.Trust.NewPDPHTTPClient(0)
+	if err != nil {
+		return nil, fmt.Errorf("authzen: failed to create PDP HTTP client: %w", err)
+	}
 	handler := NewAuthZENProxyHandler(
 		&cfg.AuthZENProxy,
 		authorizerInterface,
@@ -147,6 +163,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		issuerLookup,
 		metadataResolver,
 		httpClient,
+		pdpClient,
 		logger,
 	)
 	// Propagate the HTTP client's allow_http setting so that logo and
@@ -181,7 +198,7 @@ func (h *AuthZENProxyHandler) getClient(pdpURL string) (*authzenclient.Client, e
 		return client, nil
 	}
 
-	client := authzenclient.New(pdpURL, authzenclient.WithHTTPClient(h.httpClient))
+	client := authzenclient.New(pdpURL, authzenclient.WithHTTPClient(h.pdpClient))
 	h.clients[pdpURL] = client
 	return client, nil
 }

@@ -2,6 +2,7 @@
 package engine
 
 import (
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,7 +35,13 @@ func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
 // tenant-aware transport for multi-tenant PDP routing.
 func newAuthZENEvaluatorFactory(cfg *config.Config) trust.EvaluatorFactory {
 	return func(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
-		httpClient := cfg.HTTPClient.NewHTTPClient(timeout)
+		// Use NewPDPHTTPClient so the SSRF dial restriction is not applied to
+		// operator-configured PDP URLs (which may use private/internal addresses).
+		// This client also uses PDP-specific TLS settings and no proxy.
+		httpClient, err := cfg.Trust.NewPDPHTTPClient(timeout)
+		if err != nil {
+			return nil, fmt.Errorf("trust: failed to create PDP HTTP client: %w", err)
+		}
 		// Wrap the transport with TenantTransport for multi-tenant support
 		httpClient.Transport = &trust.TenantTransport{
 			Base: httpClient.Transport,
