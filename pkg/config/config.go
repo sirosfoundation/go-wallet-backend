@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -396,6 +397,14 @@ type TrustConfig struct {
 	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
 	Timeout int `yaml:"timeout" envconfig:"TIMEOUT"`
 
+	// InsecureSkipVerify disables TLS certificate verification for PDP requests.
+	// Use only in development or when the PDP uses a self-signed certificate.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify" envconfig:"INSECURE_SKIP_VERIFY"`
+
+	// CACertPath is the path to a PEM-encoded CA certificate used to verify the PDP's
+	// TLS certificate. Set this when the PDP is signed by an internal/private CA.
+	CACertPath string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
+
 	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
 	// When not set, inherits the global trust configuration.
 	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
@@ -403,6 +412,50 @@ type TrustConfig struct {
 	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
 	// When not set, inherits the global trust configuration.
 	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
+}
+
+// NewPDPHTTPClient creates an *http.Client for use with operator-configured PDP endpoints.
+//
+// Unlike the global HTTP client, this client:
+//   - Does NOT use any configured HTTP proxy (PDP is expected to be directly reachable)
+//   - Does NOT apply SSRF dial restrictions (PDP URL is operator-controlled)
+//   - Uses PDP-specific TLS settings (InsecureSkipVerify, CACertPath) from this TrustConfig
+//
+// The timeout is taken from TrustConfig.Timeout unless timeoutOverride > 0.
+func (c *TrustConfig) NewPDPHTTPClient(timeoutOverride time.Duration) (*http.Client, error) {
+	timeout := time.Duration(c.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	if timeoutOverride > 0 {
+		timeout = timeoutOverride
+	}
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12} //nolint:gosec
+	if c.InsecureSkipVerify {
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec
+	}
+	if c.CACertPath != "" {
+		pem, err := os.ReadFile(c.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("trust: failed to read PDP CA certificate %q: %w", c.CACertPath, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("trust: failed to parse PDP CA certificate %q", c.CACertPath)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsCfg
+	// No proxy — PDP is an internal service reached directly.
+	transport.Proxy = nil
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}, nil
 }
 
 // GetPDPURL returns the effective global PDP URL, preferring PDPURL over the deprecated DefaultEndpoint.

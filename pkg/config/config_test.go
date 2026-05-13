@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1184,6 +1185,81 @@ func TestHTTPClientConfig_NewHTTPClient_TimeoutOverride(t *testing.T) {
 		t.Fatal("NewHTTPClient() returned nil")
 	}
 	// Can't easily check internal timeout, but validates it doesn't panic
+}
+
+// =============================================================================
+// TrustConfig.NewPDPHTTPClient tests
+// =============================================================================
+
+func TestTrustConfig_NewPDPHTTPClient_Defaults(t *testing.T) {
+	cfg := TrustConfig{Timeout: 10}
+	client, err := cfg.NewPDPHTTPClient(0)
+	if err != nil {
+		t.Fatalf("NewPDPHTTPClient() error = %v", err)
+	}
+	if client == nil {
+		t.Fatal("NewPDPHTTPClient() returned nil client")
+	}
+	if client.Timeout != 10*time.Second {
+		t.Errorf("Timeout = %v, want %v", client.Timeout, 10*time.Second)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("Transport is not *http.Transport")
+	}
+	// No proxy must be set
+	if tr.Proxy != nil {
+		t.Error("expected Proxy to be nil (no proxy for PDP)")
+	}
+}
+
+func TestTrustConfig_NewPDPHTTPClient_TimeoutOverride(t *testing.T) {
+	cfg := TrustConfig{Timeout: 10}
+	client, err := cfg.NewPDPHTTPClient(5 * time.Second)
+	if err != nil {
+		t.Fatalf("NewPDPHTTPClient() error = %v", err)
+	}
+	if client.Timeout != 5*time.Second {
+		t.Errorf("Timeout = %v, want %v", client.Timeout, 5*time.Second)
+	}
+}
+
+func TestTrustConfig_NewPDPHTTPClient_DefaultTimeout_WhenZero(t *testing.T) {
+	// Timeout=0 in config should fall back to 30s default
+	cfg := TrustConfig{Timeout: 0}
+	client, err := cfg.NewPDPHTTPClient(0)
+	if err != nil {
+		t.Fatalf("NewPDPHTTPClient() error = %v", err)
+	}
+	if client.Timeout != 30*time.Second {
+		t.Errorf("Timeout = %v, want 30s default", client.Timeout)
+	}
+}
+
+func TestTrustConfig_NewPDPHTTPClient_BadCACertPath(t *testing.T) {
+	cfg := TrustConfig{CACertPath: "/nonexistent/ca.pem"}
+	_, err := cfg.NewPDPHTTPClient(0)
+	if err == nil {
+		t.Fatal("expected error for missing CA cert file, got nil")
+	}
+}
+
+func TestTrustConfig_NewPDPHTTPClient_InvalidCACert(t *testing.T) {
+	// Write a temp file with invalid PEM content
+	f, err := os.CreateTemp(t.TempDir(), "ca*.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString("this is not valid PEM"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := TrustConfig{CACertPath: f.Name()}
+	_, err = cfg.NewPDPHTTPClient(0)
+	if err == nil {
+		t.Fatal("expected error for invalid CA cert PEM, got nil")
+	}
 }
 
 // =============================================================================
