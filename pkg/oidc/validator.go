@@ -52,6 +52,19 @@ type ValidatorConfig struct {
 
 	// JWKSCacheTTL is how long to cache JWKS (default: 1 hour)
 	JWKSCacheTTL time.Duration
+
+	// JWKSMaxRetries is the maximum number of fetch attempts for transient failures.
+	// Retries use exponential backoff starting at 500ms. (default: 3)
+	JWKSMaxRetries int
+
+	// JWKSCircuitBreakerThreshold is the number of consecutive fetch failures
+	// after which the circuit is opened and fetches are skipped until the
+	// cooldown period elapses. (default: 5)
+	JWKSCircuitBreakerThreshold int
+
+	// JWKSCircuitBreakerCooldown is how long the circuit stays open before a
+	// probe attempt is allowed. (default: 30s)
+	JWKSCircuitBreakerCooldown time.Duration
 }
 
 // ValidationResult contains the result of token validation
@@ -75,10 +88,17 @@ type Validator struct {
 	httpClient *http.Client
 	logger     *zap.Logger
 
+	// Base backoff for JWKS retry; kept internal so tests can run quickly.
+	jwksRetryBaseDelay time.Duration
+
 	// JWKS cache
 	jwksMu      sync.RWMutex
 	jwksCache   *JWKS
 	jwksFetched time.Time
+
+	// JWKS circuit breaker (guarded by jwksMu)
+	jwksFailures    int       // consecutive fetch failures
+	jwksCircuitOpen time.Time // zero = circuit closed; non-zero = when circuit was opened
 
 	// Discovery cache
 	discoveryMu      sync.RWMutex
@@ -89,11 +109,20 @@ type Validator struct {
 // NewValidator creates a new OIDC token validator.
 // If httpClient is nil, a default client with 10s timeout is used.
 func NewValidator(config ValidatorConfig, httpClient *http.Client, logger *zap.Logger) *Validator {
-	if config.ClockSkew == 0 {
+	if config.ClockSkew <= 0 {
 		config.ClockSkew = time.Minute
 	}
-	if config.JWKSCacheTTL == 0 {
+	if config.JWKSCacheTTL <= 0 {
 		config.JWKSCacheTTL = time.Hour
+	}
+	if config.JWKSMaxRetries <= 0 {
+		config.JWKSMaxRetries = 3
+	}
+	if config.JWKSCircuitBreakerThreshold <= 0 {
+		config.JWKSCircuitBreakerThreshold = 5
+	}
+	if config.JWKSCircuitBreakerCooldown <= 0 {
+		config.JWKSCircuitBreakerCooldown = 30 * time.Second
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{
@@ -102,9 +131,10 @@ func NewValidator(config ValidatorConfig, httpClient *http.Client, logger *zap.L
 	}
 
 	return &Validator{
-		config:     config,
-		httpClient: httpClient,
-		logger:     logger.Named("oidc"),
+		config:             config,
+		httpClient:         httpClient,
+		logger:             logger.Named("oidc"),
+		jwksRetryBaseDelay: 500 * time.Millisecond,
 	}
 }
 
@@ -264,44 +294,142 @@ func (v *Validator) getSigningKey(ctx context.Context, kid string) (interface{},
 	return key.PublicKey()
 }
 
-// getJWKS retrieves the JWKS, using cache if valid
+// getJWKS retrieves the JWKS, using cache if valid.
+//
+// Fetch failures are handled with exponential backoff retry (up to JWKSMaxRetries).
+// A circuit breaker opens after JWKSCircuitBreakerThreshold consecutive failures,
+// skipping further fetch attempts for JWKSCircuitBreakerCooldown to protect the IdP.
+// When a fetch fails but a stale cached JWKS exists, it is returned as a fallback
+// rather than failing the request outright (the cache may still have the needed key).
 func (v *Validator) getJWKS(ctx context.Context) (*JWKS, error) {
 	v.jwksMu.RLock()
-	if v.jwksCache != nil && time.Since(v.jwksFetched) < v.config.JWKSCacheTTL {
-		jwks := v.jwksCache
-		v.jwksMu.RUnlock()
-		return jwks, nil
-	}
+	cached := v.jwksCache
+	circuitOpenedAt := v.jwksCircuitOpen
+	fresh := cached != nil && time.Since(v.jwksFetched) < v.config.JWKSCacheTTL
+	circuitOpen := !circuitOpenedAt.IsZero() &&
+		time.Since(circuitOpenedAt) < v.config.JWKSCircuitBreakerCooldown
 	v.jwksMu.RUnlock()
 
-	// Need to fetch JWKS
+	if fresh {
+		return cached, nil
+	}
+
+	// Circuit is open — skip the fetch and return stale cache if available.
+	if circuitOpen {
+		if cached != nil {
+			v.logger.Warn("JWKS circuit open, returning stale cache",
+				zap.Duration("cooldown_remaining", v.config.JWKSCircuitBreakerCooldown-time.Since(circuitOpenedAt)))
+			return cached, nil
+		}
+		return nil, fmt.Errorf("%w: circuit open, no cached JWKS available", ErrJWKSFetchFailed)
+	}
+
+	// Need to fetch (fresh cache miss or circuit just closed for probe).
 	jwksURI := v.config.JWKSURI
 	if jwksURI == "" {
-		// Discover JWKS URI from issuer
 		discovery, err := v.getDiscovery(ctx)
 		if err != nil {
+			if cached != nil {
+				v.logger.Warn("JWKS discovery failed, returning stale cache", zap.Error(err))
+				return cached, nil
+			}
 			return nil, fmt.Errorf("failed to discover JWKS URI: %w", err)
 		}
 		jwksURI = discovery.JWKSURI
 	}
 
-	jwks, err := v.fetchJWKS(ctx, jwksURI)
+	jwks, err := v.fetchJWKSWithRetry(ctx, jwksURI)
 	if err != nil {
+		v.jwksMu.Lock()
+		v.jwksFailures++
+		failures := v.jwksFailures
+		if v.jwksFailures >= v.config.JWKSCircuitBreakerThreshold {
+			v.jwksCircuitOpen = time.Now()
+			v.logger.Warn("JWKS circuit breaker opened",
+				zap.Int("consecutive_failures", failures),
+				zap.Duration("cooldown", v.config.JWKSCircuitBreakerCooldown))
+		}
+		stale := v.jwksCache
+		v.jwksMu.Unlock()
+
+		if stale != nil {
+			v.logger.Warn("JWKS fetch failed, returning stale cache",
+				zap.Error(err),
+				zap.Int("consecutive_failures", failures))
+			return stale, nil
+		}
 		return nil, err
 	}
 
 	v.jwksMu.Lock()
 	v.jwksCache = jwks
 	v.jwksFetched = time.Now()
+	v.jwksFailures = 0
+	v.jwksCircuitOpen = time.Time{} // close circuit on success
 	v.jwksMu.Unlock()
 
 	return jwks, nil
 }
 
-// invalidateJWKSCache clears the JWKS cache
+// fetchJWKSWithRetry calls fetchJWKS with exponential backoff.
+// Only transient errors (network failures, 5xx responses) are retried.
+// 4xx responses and parse errors are returned immediately.
+func (v *Validator) fetchJWKSWithRetry(ctx context.Context, jwksURI string) (*JWKS, error) {
+	var lastErr error
+	backoff := v.jwksRetryBaseDelay
+	for attempt := 0; attempt < v.config.JWKSMaxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		jwks, err := v.fetchJWKS(ctx, jwksURI)
+		if err == nil {
+			if attempt > 0 {
+				v.logger.Info("JWKS fetch succeeded after retry",
+					zap.Int("attempt", attempt+1))
+			}
+			return jwks, nil
+		}
+
+		lastErr = err
+		// Retry only transient errors (transport and 5xx responses).
+		if !isRetryableJWKSError(err) {
+			return nil, err
+		}
+		v.logger.Warn("JWKS fetch failed, retrying",
+			zap.Int("attempt", attempt+1),
+			zap.Int("max_retries", v.config.JWKSMaxRetries),
+			zap.Duration("backoff", backoff),
+			zap.Error(err))
+	}
+	return nil, fmt.Errorf("%w after %d attempts: %v", ErrJWKSFetchFailed, v.config.JWKSMaxRetries, lastErr)
+}
+
+// isRetryableJWKSError returns true only for transient transport errors and 5xx HTTP responses.
+func isRetryableJWKSError(err error) bool {
+	var transportErr *jwksTransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+
+	var statusErr *jwksHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode >= http.StatusInternalServerError
+	}
+
+	return false
+}
+
+// invalidateJWKSCache marks the JWKS cache stale so next lookup refreshes,
+// while keeping keys available as stale fallback during transient outages.
 func (v *Validator) invalidateJWKSCache() {
 	v.jwksMu.Lock()
-	v.jwksCache = nil
+	v.jwksFetched = time.Time{}
 	v.jwksMu.Unlock()
 }
 
