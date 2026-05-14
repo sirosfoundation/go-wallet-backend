@@ -10,8 +10,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"go.uber.org/zap"
 )
+
+// specToEngineAction maps WMP spec action names to engine-internal action names.
+// The WMP specification (wmp-openid4x) defines canonical action names for
+// OpenID4VCI/VP flows. The engine uses its own action vocabulary internally.
+// This map ensures WMP clients can use spec-compliant action names.
+var specToEngineAction = map[string]string{
+	openid4x.ActionAcceptOffer:       ActionConsent,
+	openid4x.ActionProvideTxCode:     ActionProvidePin,
+	openid4x.ActionAuthorize:         ActionAuthorizationComplete,
+	openid4x.ActionSelectCredentials: ActionConsent,
+	openid4x.ActionCancel:            ActionDecline,
+}
 
 // WMPAdapter wraps the engine Manager and exposes it as WMP JSON-RPC.
 // It manages one wmp.Peer per engine Session, each backed by a
@@ -197,13 +210,31 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 		a.CloseSession(sessionID)
 	}()
 
-	// Build response.
+	// Build response with capability negotiation.
+	// The server advertises the capabilities it supports. If the client
+	// sent capabilities_offered, the result is the intersection; otherwise
+	// the server returns all its capabilities (per spec §4.2.1).
+	serverCaps := wmp.Capabilities{
+		"flows": json.RawMessage(`{"max_concurrent": 5}`),
+		"sign":  json.RawMessage(`{"proof_types": ["jwt"]}`),
+	}
+	negotiated := serverCaps
+	if len(params.CapabilitiesOffered) > 0 {
+		negotiated = make(wmp.Capabilities)
+		for name, val := range serverCaps {
+			if _, offered := params.CapabilitiesOffered[name]; offered {
+				negotiated[name] = val
+			}
+		}
+	}
+
 	result := wmp.SessionCreateResult{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
 			SessionID: sessionID,
 		},
-		Security: params.Security,
+		Capabilities: negotiated,
+		Security:     params.Security,
 	}
 
 	return wmpResponseBytes(req.ID, result)
@@ -359,7 +390,18 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 		})
 	}
 
-	switch params.Action {
+	// Translate spec action names to engine-internal names.
+	// This allows WMP clients to use spec-compliant action names
+	// (e.g. "accept_offer") while the engine expects its own vocabulary
+	// (e.g. "consent"). Engine-native names are also accepted for
+	// backwards compatibility and for engine extensions (sign_response,
+	// match_response, trust_result) that have no spec equivalent.
+	action := params.Action
+	if engineAction, ok := specToEngineAction[action]; ok {
+		action = engineAction
+	}
+
+	switch action {
 	case "sign_response":
 		var signResp SignResponseMessage
 		if params.Params != nil {
@@ -418,7 +460,7 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 			Message: Message{
 				FlowID: flowID,
 			},
-			Action:  params.Action,
+			Action:  action,
 			Payload: params.Params,
 		}
 		select {
