@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -33,8 +35,9 @@ type WMPAdapter struct {
 	manager *Manager
 	logger  *zap.Logger
 
-	mu    sync.RWMutex
-	peers map[string]*wmpSession // keyed by WMP session ID
+	mu               sync.RWMutex
+	peers            map[string]*wmpSession // keyed by WMP session ID
+	resumptionTokens map[string]string      // token -> session ID
 }
 
 // wmpSession associates a wmp.Peer with its channel transport and engine session.
@@ -48,9 +51,10 @@ type wmpSession struct {
 // NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
 func NewWMPAdapter(manager *Manager, logger *zap.Logger) *WMPAdapter {
 	return &WMPAdapter{
-		manager: manager,
-		logger:  logger.Named("wmp"),
-		peers:   make(map[string]*wmpSession),
+		manager:          manager,
+		logger:           logger.Named("wmp"),
+		peers:            make(map[string]*wmpSession),
+		resumptionTokens: make(map[string]string),
 	}
 }
 
@@ -68,6 +72,9 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID string, body []byt
 
 	if peek.Method == wmp.MethodSessionCreate {
 		return a.handleSessionCreate(ctx, body)
+	}
+	if peek.Method == wmp.MethodSessionResume {
+		return a.handleSessionResume(ctx, body)
 	}
 
 	// All other methods require an existing session.
@@ -106,6 +113,12 @@ func (a *WMPAdapter) CloseSession(sessionID string) {
 	if ok {
 		delete(a.peers, sessionID)
 	}
+	// Clean up any resumption tokens for this session.
+	for token, sid := range a.resumptionTokens {
+		if sid == sessionID {
+			delete(a.resumptionTokens, token)
+		}
+	}
 	a.mu.Unlock()
 	if ok {
 		ws.cancel()
@@ -130,6 +143,13 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 	var params wmp.SessionCreateParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return wmpErrorBytes(req.ID, wmp.ErrInvalidParams, nil)
+	}
+
+	// Version negotiation: reject unsupported versions.
+	if params.WMP.Version != "" && !wmp.IsSupportedVersion(params.WMP.Version) {
+		return wmpErrorBytes(req.ID, wmp.ErrVersionNotSupported, map[string]interface{}{
+			"supported_versions": wmp.SupportedVersions,
+		})
 	}
 
 	// Extract bearer token from auth object.
@@ -171,11 +191,14 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 
 	// Create the engine session with a translating transport that converts
 	// engine message types to WMP JSON-RPC notifications via the peer.
+	wmpTransport := newWMPSessionTransport(peer, ct)
+	wmpTransport.handler = handler
+
 	session := &Session{
 		ID:        sessionID,
 		UserID:    userID,
 		TenantID:  tenantID,
-		transport: newWMPSessionTransport(peer, ct),
+		transport: wmpTransport,
 		flows:     make(map[string]*Flow),
 		logger:    a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
 		actionCh:  make(chan *FlowActionMessage, 50),
@@ -233,8 +256,130 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 			Version:   wmp.Version,
 			SessionID: sessionID,
 		},
-		Capabilities: negotiated,
-		Security:     params.Security,
+		Capabilities:    negotiated,
+		Security:        params.Security,
+		ResumptionToken: a.generateResumptionToken(sessionID),
+	}
+
+	return wmpResponseBytes(req.ID, result)
+}
+
+// generateResumptionToken creates a cryptographically random resumption token
+// and stores the token→sessionID mapping. Per spec §4.5.2, tokens MUST have
+// at least 128 bits of entropy and are rotated on each successful resume.
+func (a *WMPAdapter) generateResumptionToken(sessionID string) string {
+	b := make([]byte, 32) // 256 bits
+	if _, err := rand.Read(b); err != nil {
+		// Should never happen with crypto/rand
+		a.logger.Error("failed to generate resumption token", zap.Error(err))
+		return ""
+	}
+	token := base64.RawURLEncoding.EncodeToString(b)
+
+	a.mu.Lock()
+	a.resumptionTokens[token] = sessionID
+	a.mu.Unlock()
+
+	return token
+}
+
+// handleSessionResume validates a resumption token, rotates it, and reconnects
+// the client to the existing engine session with a new transport/peer.
+func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]byte, error) {
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return wmpErrorBytes(nil, wmp.ErrParseError, nil)
+	}
+
+	var params wmp.SessionResumeParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return wmpErrorBytes(req.ID, wmp.ErrInvalidParams, nil)
+	}
+
+	// Version negotiation.
+	if params.WMP.Version != "" && !wmp.IsSupportedVersion(params.WMP.Version) {
+		return wmpErrorBytes(req.ID, wmp.ErrVersionNotSupported, map[string]interface{}{
+			"supported_versions": wmp.SupportedVersions,
+		})
+	}
+
+	// Validate resumption token — one-time use, must match session.
+	a.mu.Lock()
+	tokenSessionID, validToken := a.resumptionTokens[params.ResumptionToken]
+	if validToken {
+		// Consume the token (one-time use per spec §4.5.2).
+		delete(a.resumptionTokens, params.ResumptionToken)
+	}
+	a.mu.Unlock()
+
+	if !validToken || tokenSessionID != params.SessionID {
+		return wmpErrorBytes(req.ID, wmp.ErrSessionNotFound, map[string]string{
+			"reason": "invalid or expired resumption token",
+		})
+	}
+
+	// Look up the existing session.
+	a.mu.RLock()
+	oldWS, exists := a.peers[params.SessionID]
+	a.mu.RUnlock()
+	if !exists {
+		return wmpErrorBytes(req.ID, wmp.ErrSessionNotFound, nil)
+	}
+
+	// Close the old transport (SSE connection may have dropped) but keep the
+	// engine session alive.
+	oldWS.cancel()
+	_ = oldWS.transport.Close()
+
+	// Create a new channel transport and peer for the resumed connection.
+	ct := wmp.NewChannelTransport(50, 200)
+	handler := &wmpEngineHandler{
+		adapter:   a,
+		sessionID: params.SessionID,
+		session:   oldWS.session,
+	}
+	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
+
+	// Rewire the engine session's transport to use the new peer/channel.
+	wmpTransport := newWMPSessionTransport(peer, ct)
+	wmpTransport.handler = handler
+	oldWS.session.transport = wmpTransport
+
+	// Replace the old wmpSession entry.
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	ws := &wmpSession{
+		peer:      peer,
+		transport: ct,
+		session:   oldWS.session,
+		cancel:    cancel,
+	}
+
+	a.mu.Lock()
+	a.peers[params.SessionID] = ws
+	a.mu.Unlock()
+
+	go func() {
+		_ = peer.Serve(sessionCtx)
+		a.CloseSession(params.SessionID)
+	}()
+
+	// Issue a new rotated token.
+	newToken := a.generateResumptionToken(params.SessionID)
+
+	result := wmp.SessionResumeResult{
+		WMP: wmp.Metadata{
+			Version:   wmp.Version,
+			SessionID: params.SessionID,
+		},
+		Resumed:         true,
+		ResumptionToken: newToken,
+		MissedMessages:  0, // TODO: implement message replay via last_received_id
+		Security:        wmp.SecurityMode{Mode: "tls"},
 	}
 
 	return wmpResponseBytes(req.ID, result)
@@ -254,6 +399,41 @@ type wmpEngineHandler struct {
 	adapter   *WMPAdapter
 	sessionID string
 	session   *Session
+
+	childFlowsMu sync.Mutex
+	childFlows   map[string]*childFlowInfo // childFlowID → info
+}
+
+// childFlowInfo tracks a nested sub-flow (sign or match) so that when
+// the client sends wmp.flow.complete for the child, we can route the
+// result back to the appropriate engine channel.
+type childFlowInfo struct {
+	parentFlowID string
+	messageID    string
+	flowType     string // "sign" or "match"
+}
+
+func (h *wmpEngineHandler) registerChildFlow(childFlowID, parentFlowID, messageID, flowType string) {
+	h.childFlowsMu.Lock()
+	defer h.childFlowsMu.Unlock()
+	if h.childFlows == nil {
+		h.childFlows = make(map[string]*childFlowInfo)
+	}
+	h.childFlows[childFlowID] = &childFlowInfo{
+		parentFlowID: parentFlowID,
+		messageID:    messageID,
+		flowType:     flowType,
+	}
+}
+
+func (h *wmpEngineHandler) popChildFlow(childFlowID string) (*childFlowInfo, bool) {
+	h.childFlowsMu.Lock()
+	defer h.childFlowsMu.Unlock()
+	info, ok := h.childFlows[childFlowID]
+	if ok {
+		delete(h.childFlows, childFlowID)
+	}
+	return info, ok
 }
 
 // SessionClose cleans up when the client closes the session.
@@ -506,6 +686,47 @@ func (h *wmpEngineHandler) FlowCancel(_ context.Context, params *wmp.FlowCancelP
 	}, nil
 }
 
+// FlowComplete handles wmp.flow.complete notifications. For child sub-flows
+// (sign/match), this routes the result back to the engine session's signCh
+// or matchCh so the blocking RequestSign/RequestMatch calls can complete.
+func (h *wmpEngineHandler) FlowComplete(_ context.Context, params *wmp.FlowCompleteParams) {
+	info, ok := h.popChildFlow(params.FlowID)
+	if !ok {
+		// Not a child flow — top-level flow completion (handled elsewhere).
+		return
+	}
+
+	switch info.flowType {
+	case "sign":
+		var resp SignResponseMessage
+		if params.Result != nil {
+			_ = json.Unmarshal(params.Result, &resp)
+		}
+		resp.FlowID = info.parentFlowID
+		resp.MessageID = info.messageID
+		select {
+		case h.session.signCh <- &resp:
+		default:
+			h.adapter.logger.Warn("sign channel full, dropping child flow result",
+				zap.String("child_flow_id", params.FlowID))
+		}
+
+	case "match":
+		var resp MatchResponseMessage
+		if params.Result != nil {
+			_ = json.Unmarshal(params.Result, &resp)
+		}
+		resp.FlowID = info.parentFlowID
+		resp.MessageID = info.messageID
+		select {
+		case h.session.matchCh <- &resp:
+		default:
+			h.adapter.logger.Warn("match channel full, dropping child flow result",
+				zap.String("child_flow_id", params.FlowID))
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // wmpSessionTransport — translates engine messages to WMP JSON-RPC
 // ---------------------------------------------------------------------------
@@ -513,10 +734,11 @@ func (h *wmpEngineHandler) FlowCancel(_ context.Context, params *wmp.FlowCancelP
 // wmpSessionTransport implements engine SessionTransport. It intercepts
 // outgoing engine messages (FlowProgressMessage, SignRequestMessage, etc.)
 // and converts them to WMP JSON-RPC notifications sent via Peer.Notify.
-// This ensures the SSE stream emits proper WMP-formatted messages.
+// For sign/match requests, it starts nested sub-flows per the WMP spec.
 type wmpSessionTransport struct {
-	peer *wmp.Peer
-	ct   *wmp.ChannelTransport
+	peer    *wmp.Peer
+	ct      *wmp.ChannelTransport
+	handler *wmpEngineHandler
 }
 
 func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessionTransport {
@@ -555,29 +777,51 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		})
 
 	case *SignRequestMessage:
-		// Sign requests are sent as flow.progress with step="sign_request"
-		// per the migration plan (Option A: flow progress + action).
-		payload, err := json.Marshal(m)
+		// Start a nested sign sub-flow per WMP spec. The client handles
+		// the flow.start, performs the signing, then sends flow.complete
+		// with the proof. FlowComplete routes the result to signCh.
+		childFlowID := uuid.New().String()
+		t.handler.registerChildFlow(childFlowID, m.FlowID, m.MessageID, "sign")
+
+		subFlowParams := openid4x.SignSubFlowParams{
+			Action:       string(m.Action),
+			Nonce:        m.Params.Nonce,
+			Audience:     m.Params.Audience,
+			ProofType:    m.Params.ProofType,
+			ParentFlowID: m.FlowID,
+		}
+		paramsJSON, err := json.Marshal(subFlowParams)
 		if err != nil {
 			return err
 		}
-		return t.peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
-			FlowID:  m.FlowID,
-			Step:    "sign_request",
-			Payload: payload,
-		})
+		var startResult wmp.FlowStartResult
+		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+			FlowType: wmp.FlowTypeSign,
+			FlowID:   childFlowID,
+			Params:   paramsJSON,
+		}, &startResult)
+		return err
 
 	case *MatchRequestMessage:
-		// Match requests are sent as flow.progress with step="match_request".
-		payload, err := json.Marshal(m)
+		// Start a nested match sub-flow. Same pattern as sign.
+		childFlowID := uuid.New().String()
+		t.handler.registerChildFlow(childFlowID, m.FlowID, m.MessageID, "match")
+
+		matchParams := map[string]interface{}{
+			"dcql_query":     m.DCQLQuery,
+			"parent_flow_id": m.FlowID,
+		}
+		paramsJSON, err := json.Marshal(matchParams)
 		if err != nil {
 			return err
 		}
-		return t.peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
-			FlowID:  m.FlowID,
-			Step:    "match_request",
-			Payload: payload,
-		})
+		var startResult wmp.FlowStartResult
+		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+			FlowType: "match",
+			FlowID:   childFlowID,
+			Params:   paramsJSON,
+		}, &startResult)
+		return err
 
 	default:
 		// Fallback: marshal as raw JSON and write directly.
