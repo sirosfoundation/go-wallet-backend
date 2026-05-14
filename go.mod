@@ -30,7 +30,7 @@ require (
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/sirosfoundation/go-tokenauth v0.1.0
-	github.com/sirosfoundation/go-wmp v0.1.0
+	github.com/sirosfoundation/go-wmp v0.1.1-0.20260514120457-49b4cb2f2707
 )
 
 require (
