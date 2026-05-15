@@ -205,7 +205,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
 
-	metadataURL := issuerURL + "/.well-known/openid-credential-issuer"
+	// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
+	// https://{host}/.well-known/openid-credential-issuer{path}
+	parsed, _ := url.Parse(issuerURL) // already validated above
+	metadataURL := fmt.Sprintf("%s://%s/.well-known/openid-credential-issuer%s", parsed.Scheme, parsed.Host, parsed.Path)
 	result, err := r.fetch(ctx, issuerURL, metadataURL)
 	if err != nil {
 		return nil, err

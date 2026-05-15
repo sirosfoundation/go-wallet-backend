@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -81,9 +83,16 @@ func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Clie
 	return result
 }
 
-// fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint
+// fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint.
+// Uses RFC 8615 well-known URI construction as required by OID4VCI draft 16+:
+// https://{host}/.well-known/openid-credential-issuer{path}
 func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Client) (*IssuerMetadata, error) {
-	wellKnownURL := issuerURL + "/.well-known/openid-credential-issuer"
+	parsed, err := url.Parse(issuerURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing issuer URL: %w", err)
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	wellKnownURL := fmt.Sprintf("%s://%s/.well-known/openid-credential-issuer%s", parsed.Scheme, parsed.Host, path)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
 	if err != nil {

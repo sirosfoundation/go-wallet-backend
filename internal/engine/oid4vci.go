@@ -1063,7 +1063,12 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 		authServer = metadata.CredentialIssuer
 	}
 
-	oauthMetadataURL := strings.TrimSuffix(authServer, "/") + "/.well-known/oauth-authorization-server"
+	// RFC 8615 well-known URI construction for OAuth AS metadata
+	parsed, err := url.Parse(strings.TrimSuffix(authServer, "/"))
+	if err != nil {
+		return nil
+	}
+	oauthMetadataURL := fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server%s", parsed.Scheme, parsed.Host, parsed.Path)
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
 		return nil
