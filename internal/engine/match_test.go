@@ -46,6 +46,7 @@ func testSession(conn *websocket.Conn) *Session {
 		signCh:   make(chan *SignResponseMessage, 20),
 		matchCh:  make(chan *MatchResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1),
+		stopPing: make(chan struct{}),
 	}
 }
 
