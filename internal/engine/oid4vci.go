@@ -369,15 +369,12 @@ func isDPoPNonceError(resp *http.Response) bool {
 }
 
 // fetchNonce calls the OID4VCI Nonce Endpoint (§7) to obtain a fresh c_nonce.
+// Per the spec, the Nonce Endpoint does not require authentication.
 // Returns the nonce value or an error.
-func (h *OID4VCIHandler) fetchNonce(ctx context.Context, nonceEndpoint, accessToken string) (string, error) {
+func (h *OID4VCIHandler) fetchNonce(ctx context.Context, nonceEndpoint string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", nonceEndpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating nonce request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	if err := h.setDPoPHeader(req, nonceEndpoint, accessToken); err != nil {
-		return "", err
 	}
 
 	resp, err := h.httpClient.Do(req)
@@ -633,7 +630,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Fall back to token.CNonce for backward compatibility with pre-1.0 issuers.
 	nonce := token.CNonce
 	if metadata.NonceEndpoint != "" {
-		if n, err := h.fetchNonce(ctx, metadata.NonceEndpoint, token.AccessToken); err != nil {
+		if n, err := h.fetchNonce(ctx, metadata.NonceEndpoint); err != nil {
 			h.Logger.Warn("failed to fetch nonce from endpoint, falling back to token c_nonce",
 				zap.Error(err),
 				zap.String("fallback_nonce_present", fmt.Sprintf("%v", nonce != "")),
@@ -663,7 +660,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 				// Issuer signaled a nonce mismatch — get a fresh nonce and retry.
 				// Prefer Nonce Endpoint; fall back to the c_nonce from the error response.
 				if metadata.NonceEndpoint != "" {
-					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint, token.AccessToken); fetchErr == nil {
+					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint); fetchErr == nil {
 						nonce = n
 					} else {
 						h.Logger.Debug("nonce endpoint retry failed, using error response c_nonce", zap.Error(fetchErr))
