@@ -30,16 +30,15 @@ var (
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
 
-// Session represents an authenticated WebSocket session
+// Session represents an authenticated session (WebSocket or HTTP+SSE)
 type Session struct {
-	ID       string
-	UserID   string
-	TenantID string
-	conn     *websocket.Conn
-	sendMu   sync.Mutex
-	flows    map[string]*Flow
-	flowsMu  sync.RWMutex
-	logger   *zap.Logger
+	ID        string
+	UserID    string
+	TenantID  string
+	transport SessionTransport
+	flows     map[string]*Flow
+	flowsMu   sync.RWMutex
+	logger    *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -143,7 +142,8 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleNewConnection(conn *websocket.Conn) {
-	defer func() { _ = conn.Close() }()
+	transport := newWSTransport(conn)
+	defer func() { _ = transport.Close() }()
 
 	// Wait for handshake message
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -183,16 +183,16 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 
 	// Create session
 	session := &Session{
-		ID:       uuid.New().String(),
-		UserID:   userID,
-		TenantID: tenantID,
-		conn:     conn,
-		flows:    make(map[string]*Flow),
-		logger:   m.logger.With(zap.String("session", userID[:8])),
-		actionCh: make(chan *FlowActionMessage, 50),
-		signCh:   make(chan *SignResponseMessage, 20),
-		matchCh:  make(chan *MatchResponseMessage, 20),
-		closeCh:  make(chan struct{}, 1), // Buffered to prevent deadlock
+		ID:        uuid.New().String(),
+		UserID:    userID,
+		TenantID:  tenantID,
+		transport: transport,
+		flows:     make(map[string]*Flow),
+		logger:    m.logger.With(zap.String("session", userID[:8])),
+		actionCh:  make(chan *FlowActionMessage, 50),
+		signCh:    make(chan *SignResponseMessage, 20),
+		matchCh:   make(chan *MatchResponseMessage, 20),
+		closeCh:   make(chan struct{}, 1), // Buffered to prevent deadlock
 	}
 
 	// Register session
@@ -236,11 +236,9 @@ func (m *Manager) handleSession(session *Session) {
 	}()
 
 	for {
-		_, message, err := session.conn.ReadMessage()
+		message, err := session.transport.ReadMessage(context.Background())
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				session.logger.Error("Read error", zap.Error(err))
-			}
+			session.logger.Debug("Session read ended", zap.Error(err))
 			return
 		}
 
@@ -415,7 +413,7 @@ func (m *Manager) registerSession(session *Session) {
 	// Close existing session for this user
 	if existing, ok := m.userIndex[session.UserID]; ok {
 		m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
-		_ = existing.conn.Close()
+		_ = existing.transport.Close()
 		delete(m.sessions, existing.ID)
 		// Also remove from persistent store
 		if m.sessionStore != nil {
@@ -507,7 +505,11 @@ func (m *Manager) sendError(conn *websocket.Conn, flowID string, code ErrorCode,
 		Code:    code,
 		Details: message,
 	}
-	_ = conn.WriteJSON(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	_ = conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // GetSession returns a session by ID
@@ -554,7 +556,7 @@ func (m *Manager) Close() {
 	defer m.sessionsMu.Unlock()
 
 	for _, session := range m.sessions {
-		_ = session.conn.Close()
+		_ = session.transport.Close()
 	}
 	m.sessions = make(map[string]*Session)
 	m.userIndex = make(map[string]*Session)
@@ -577,9 +579,7 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 func (s *Session) Send(msg interface{}) error {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return s.conn.WriteJSON(msg)
+	return s.transport.SendJSON(msg)
 }
 
 // SendProgress sends a flow progress message

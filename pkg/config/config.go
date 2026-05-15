@@ -246,6 +246,7 @@ func (c *CORSConfig) SetDefaults() {
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+			"Wmp-Session-Id",
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {

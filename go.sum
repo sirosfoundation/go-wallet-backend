@@ -127,6 +127,10 @@ github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
 github.com/sirosfoundation/go-trust v0.4.1 h1:TTOlW2X9t/JfGfvkaZa1UI9r934IpQF82jzx5kcVX4s=
 github.com/sirosfoundation/go-trust v0.4.1/go.mod h1:jpZy/QnoVB+Ke7Aqq0utz+fOHQh/wKpzD5c11jT95I8=
+github.com/sirosfoundation/go-wmp v0.1.0 h1:VfiYSlGczVhAW9aFNDFoTUTRlsElczbCGro8GLkJiS0=
+github.com/sirosfoundation/go-wmp v0.1.0/go.mod h1:5crcT7K80qEJ8ZaS4rXXNyunAav0xkabrk86nXHy+Mo=
+github.com/sirosfoundation/go-wmp v0.1.1-0.20260514120457-49b4cb2f2707 h1:E7nVTQ2nDmKgHdL8fPt0IKcUi0L+biAO3H7KsTdyfdM=
+github.com/sirosfoundation/go-wmp v0.1.1-0.20260514120457-49b4cb2f2707/go.mod h1:5crcT7K80qEJ8ZaS4rXXNyunAav0xkabrk86nXHy+Mo=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61 h1:1XMBGQ57pLEZRkazk8AN7mhNu63czErGg9+I3stWSS0=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61/go.mod h1:gAxbvM0HnnY4c3aNYo6Za97nPpGSbqLfjUtxJ8qNGjs=
 github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w=

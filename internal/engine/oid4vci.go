@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -50,7 +51,8 @@ type OID4VCIHandler struct {
 	dpopKey          *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
 	dpopNonce        string                 // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
-	clientID         string // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -365,6 +367,94 @@ func isDPoPNonceError(resp *http.Response) bool {
 	return resp.Header.Get("DPoP-Nonce") != ""
 }
 
+// parseECPrivateKeyJWK parses a JSON-encoded EC private JWK into an *ecdsa.PrivateKey.
+func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
+	var raw struct {
+		Kty string `json:"kty"`
+		Crv string `json:"crv"`
+		X   string `json:"x"`
+		Y   string `json:"y"`
+		D   string `json:"d"`
+	}
+	if err := json.Unmarshal([]byte(jwkJSON), &raw); err != nil {
+		return nil, fmt.Errorf("parsing JWK JSON: %w", err)
+	}
+	if raw.Kty != "EC" {
+		return nil, fmt.Errorf("unsupported key type %q, expected EC", raw.Kty)
+	}
+
+	var curve elliptic.Curve
+	switch raw.Crv {
+	case "P-256":
+		curve = elliptic.P256()
+	case "P-384":
+		curve = elliptic.P384()
+	default:
+		return nil, fmt.Errorf("unsupported curve %q", raw.Crv)
+	}
+
+	xBytes, err := base64.RawURLEncoding.DecodeString(raw.X)
+	if err != nil {
+		return nil, fmt.Errorf("decoding x: %w", err)
+	}
+	yBytes, err := base64.RawURLEncoding.DecodeString(raw.Y)
+	if err != nil {
+		return nil, fmt.Errorf("decoding y: %w", err)
+	}
+	dBytes, err := base64.RawURLEncoding.DecodeString(raw.D)
+	if err != nil {
+		return nil, fmt.Errorf("decoding d: %w", err)
+	}
+
+	key := &ecdsa.PrivateKey{
+		PublicKey: ecdsa.PublicKey{
+			Curve: curve,
+			X:     new(big.Int).SetBytes(xBytes),
+			Y:     new(big.Int).SetBytes(yBytes),
+		},
+		D: new(big.Int).SetBytes(dBytes),
+	}
+	return key, nil
+}
+
+// createClientAssertion creates a client_assertion JWT for private_key_jwt authentication
+// per RFC 7523 §2.2 and OpenID Connect Core §9.
+func createClientAssertion(key *ecdsa.PrivateKey, clientID, tokenEndpoint string) (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": clientID,
+		"sub": clientID,
+		"aud": tokenEndpoint,
+		"jti": uuid.New().String(),
+		"iat": now.Unix(),
+		"exp": now.Add(5 * time.Minute).Unix(),
+	}
+
+	signingMethod := jwt.SigningMethodES256
+	if key.Curve == elliptic.P384() {
+		signingMethod = jwt.SigningMethodES384
+	}
+
+	tok := jwt.NewWithClaims(signingMethod, claims)
+	return tok.SignedString(key)
+}
+
+// setClientAuth adds private_key_jwt client authentication parameters to the request data
+// if h.clientJWK is set. Always adds client_id.
+func (h *OID4VCIHandler) setClientAuth(data url.Values, tokenEndpoint string) error {
+	data.Set("client_id", h.clientID)
+	if h.clientJWK == nil {
+		return nil
+	}
+	assertion, err := createClientAssertion(h.clientJWK, h.clientID, tokenEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to create client assertion: %w", err)
+	}
+	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+	data.Set("client_assertion", assertion)
+	return nil
+}
+
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
 type OAuthError struct {
 	Error            string `json:"error"`
@@ -440,6 +530,22 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			zap.String("client_id", h.clientID),
 			zap.String("issuer", offer.CredentialIssuer),
 		)
+	}
+
+	// Parse client JWK for private_key_jwt authentication if registered
+	if r := metaResult.RegisteredIssuer; r != nil && r.ClientJWK != "" {
+		key, err := parseECPrivateKeyJWK(r.ClientJWK)
+		if err != nil {
+			h.Logger.Warn("failed to parse registered client JWK, skipping client authentication",
+				zap.Error(err),
+				zap.String("issuer", offer.CredentialIssuer),
+			)
+		} else {
+			h.clientJWK = key
+			h.Logger.Debug("using private_key_jwt authentication for issuer",
+				zap.String("issuer", offer.CredentialIssuer),
+			)
+		}
 	}
 
 	// Step 3: Evaluate trust
@@ -1009,6 +1115,9 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	if txCode != "" {
 		data.Set("tx_code", txCode)
 	}
+	if err := h.setClientAuth(data, tokenEndpoint); err != nil {
+		return nil, err
+	}
 
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -1160,7 +1269,17 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 
 	if oauthMeta.PushedAuthorizationRequestEndpoint != "" {
 		// Use Pushed Authorization Request (RFC 9126)
-		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, params)
+		// Add client authentication for PAR if available
+		parParams := url.Values{}
+		for k, v := range params {
+			parParams[k] = v
+		}
+		if h.clientJWK != nil {
+			if err := h.setClientAuth(parParams, oauthMeta.PushedAuthorizationRequestEndpoint); err != nil {
+				h.Logger.Warn("failed to add client auth to PAR", zap.Error(err))
+			}
+		}
+		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
 		if parErr != nil {
 			// PAR failed — fall back to standard authorization URL
 			h.Logger.Debug("PAR request failed, falling back to standard authorization", zap.Error(parErr))
@@ -1304,9 +1423,11 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
 	data.Set("redirect_uri", redirectURI)
-	data.Set("client_id", h.clientID)
 	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
+	}
+	if err := h.setClientAuth(data, tokenEndpoint); err != nil {
+		return nil, err
 	}
 
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
