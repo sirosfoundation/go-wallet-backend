@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	"go.uber.org/zap"
 )
@@ -52,7 +53,8 @@ type RegisteredIssuerInfo struct {
 }
 
 // resolveURLResponse is the response type for /v1/resolve URL subject requests.
-// It extends gotrust.EvaluationResponse with optional registered issuer info.
+// It extends gotrust.EvaluationResponse with optional registered issuer info
+// and authorization server metadata.
 type resolveURLResponse struct {
 	gotrust.EvaluationResponse
 	RegisteredIssuer *RegisteredIssuerInfo `json:"registered_issuer,omitempty"`
@@ -408,7 +410,12 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 			h.proxyToPDP(c, ctx, tenantID, evalReq)
 			return
 		}
-		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		switch resourceType {
+		case "oauth-authorization-server":
+			h.resolveAuthorizationServerMetadata(c, ctx, tenantID, req.SubjectID)
+		default:
+			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		}
 		return
 	}
 
@@ -577,6 +584,81 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	)
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// resolveAuthorizationServerMetadata handles resource_type=oauth-authorization-server.
+// It fetches the RFC 8414 OAuth Authorization Server metadata for the given issuer
+// and returns it in the standard resolve response format (trust_metadata).
+// No trust evaluation or key extraction is performed — this is a simple metadata fetch.
+func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context, ctx context.Context, tenantID, issuerURL string) {
+	// Use the issuer URL directly as the authorization server base.
+	// In OID4VCI, the credential issuer metadata may contain an
+	// authorization_servers field, but fetching it here would trigger
+	// an additional request to /.well-known/openid-credential-issuer
+	// which can interfere with conformance suite state machines.
+	// The caller can pass the authorization server URL directly if different.
+	wellKnown, err := oidc.WellKnownURL(issuerURL, "oauth-authorization-server")
+	if err != nil {
+		h.logger.Error("could not construct authorization server well-known URL",
+			zap.String("issuer_url", issuerURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.Debug("failed to fetch authorization server metadata",
+			zap.String("url", wellKnown),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Debug("authorization server metadata returned non-200",
+			zap.String("url", wellKnown),
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", resp.StatusCode)})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read authorization server response"})
+		return
+	}
+
+	var authzMeta map[string]interface{}
+	if err := json.Unmarshal(body, &authzMeta); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server metadata JSON"})
+		return
+	}
+
+	h.logger.Info("authorization server metadata resolved",
+		zap.String("tenant_id", tenantID),
+		zap.String("issuer_url", issuerURL),
+	)
+
+	c.JSON(http.StatusOK, &resolveURLResponse{
+		EvaluationResponse: gotrust.EvaluationResponse{
+			Decision: true,
+			Context: &gotrust.EvaluationResponseContext{
+				TrustMetadata: authzMeta,
+			},
+		},
+	})
 }
 
 // proxyToPDP forwards an evaluation request directly to the PDP.
