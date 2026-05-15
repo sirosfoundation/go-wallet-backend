@@ -196,7 +196,6 @@ type fetchResult struct {
 // was served from cache and whether the metadata was validated (signed by a
 // trusted issuer).
 func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*ResolveResult, error) {
-	issuerURL = strings.TrimSuffix(issuerURL, "/")
 
 	if err := r.validateURL(issuerURL); err != nil {
 		return nil, err
