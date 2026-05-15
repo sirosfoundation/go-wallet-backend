@@ -26,6 +26,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -1063,7 +1064,11 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 		authServer = metadata.CredentialIssuer
 	}
 
-	oauthMetadataURL := strings.TrimSuffix(authServer, "/") + "/.well-known/oauth-authorization-server"
+	// RFC 8615 well-known URI construction for OAuth AS metadata
+	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
+	if err != nil {
+		return nil
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
 		return nil

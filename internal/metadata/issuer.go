@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 )
 
 // IssuerMetadata represents the credential issuer metadata from
@@ -81,9 +83,14 @@ func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Clie
 	return result
 }
 
-// fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint
+// fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint.
+// Uses RFC 8615 well-known URI construction as required by OID4VCI draft 16+:
+// https://{host}/.well-known/openid-credential-issuer{path}
 func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Client) (*IssuerMetadata, error) {
-	wellKnownURL := issuerURL + "/.well-known/openid-credential-issuer"
+	wellKnownURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
+	if err != nil {
+		return nil, err
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
 	if err != nil {

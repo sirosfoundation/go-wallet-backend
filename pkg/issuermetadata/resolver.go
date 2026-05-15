@@ -42,6 +42,7 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 )
 
 // supportedSignatureAlgorithms is the set of JWS algorithms accepted for
@@ -167,8 +168,8 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// A trailing slash is stripped before fetching. The endpoint queried is
-// <issuerURL>/.well-known/openid-credential-issuer.
+// A trailing slash is stripped before fetching. The endpoint queried follows
+// RFC 8615: https://{host}/.well-known/openid-credential-issuer{path}.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).
@@ -205,7 +206,9 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
 
-	metadataURL := issuerURL + "/.well-known/openid-credential-issuer"
+	// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
+	// https://{host}/.well-known/openid-credential-issuer{path}
+	metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
 	result, err := r.fetch(ctx, issuerURL, metadataURL)
 	if err != nil {
 		return nil, err
