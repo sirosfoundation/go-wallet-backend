@@ -53,6 +53,8 @@ type OID4VCIHandler struct {
 	redirectURI      string
 	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
 	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
+	clientKID        string            // key ID from client JWK (for JWT kid header)
+	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -402,20 +404,22 @@ func (h *OID4VCIHandler) fetchNonce(ctx context.Context, nonceEndpoint string) (
 	return nonceResp.CNonce, nil
 }
 
-// parseECPrivateKeyJWK parses a JSON-encoded EC private JWK into an *ecdsa.PrivateKey.
-func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
+// parseECPrivateKeyJWK parses a JSON-encoded EC private JWK into an *ecdsa.PrivateKey
+// and returns the key ID (kid) if present.
+func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, string, error) {
 	var raw struct {
 		Kty string `json:"kty"`
 		Crv string `json:"crv"`
 		X   string `json:"x"`
 		Y   string `json:"y"`
 		D   string `json:"d"`
+		Kid string `json:"kid"`
 	}
 	if err := json.Unmarshal([]byte(jwkJSON), &raw); err != nil {
-		return nil, fmt.Errorf("parsing JWK JSON: %w", err)
+		return nil, "", fmt.Errorf("parsing JWK JSON: %w", err)
 	}
 	if raw.Kty != "EC" {
-		return nil, fmt.Errorf("unsupported key type %q, expected EC", raw.Kty)
+		return nil, "", fmt.Errorf("unsupported key type %q, expected EC", raw.Kty)
 	}
 
 	var curve elliptic.Curve
@@ -425,20 +429,20 @@ func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
 	case "P-384":
 		curve = elliptic.P384()
 	default:
-		return nil, fmt.Errorf("unsupported curve %q", raw.Crv)
+		return nil, "", fmt.Errorf("unsupported curve %q", raw.Crv)
 	}
 
 	xBytes, err := base64.RawURLEncoding.DecodeString(raw.X)
 	if err != nil {
-		return nil, fmt.Errorf("decoding x: %w", err)
+		return nil, "", fmt.Errorf("decoding x: %w", err)
 	}
 	yBytes, err := base64.RawURLEncoding.DecodeString(raw.Y)
 	if err != nil {
-		return nil, fmt.Errorf("decoding y: %w", err)
+		return nil, "", fmt.Errorf("decoding y: %w", err)
 	}
 	dBytes, err := base64.RawURLEncoding.DecodeString(raw.D)
 	if err != nil {
-		return nil, fmt.Errorf("decoding d: %w", err)
+		return nil, "", fmt.Errorf("decoding d: %w", err)
 	}
 
 	key := &ecdsa.PrivateKey{
@@ -449,17 +453,18 @@ func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
 		},
 		D: new(big.Int).SetBytes(dBytes),
 	}
-	return key, nil
+	return key, raw.Kid, nil
 }
 
 // createClientAssertion creates a client_assertion JWT for private_key_jwt authentication
 // per RFC 7523 §2.2 and OpenID Connect Core §9.
-func createClientAssertion(key *ecdsa.PrivateKey, clientID, tokenEndpoint string) (string, error) {
+// The aud claim MUST be the authorization server's issuer identifier (not the token endpoint).
+func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"iss": clientID,
 		"sub": clientID,
-		"aud": tokenEndpoint,
+		"aud": audience,
 		"jti": uuid.New().String(),
 		"iat": now.Unix(),
 		"exp": now.Add(5 * time.Minute).Unix(),
@@ -471,17 +476,20 @@ func createClientAssertion(key *ecdsa.PrivateKey, clientID, tokenEndpoint string
 	}
 
 	tok := jwt.NewWithClaims(signingMethod, claims)
+	if kid != "" {
+		tok.Header["kid"] = kid
+	}
 	return tok.SignedString(key)
 }
 
 // setClientAuth adds private_key_jwt client authentication parameters to the request data
 // if h.clientJWK is set. Always adds client_id.
-func (h *OID4VCIHandler) setClientAuth(data url.Values, tokenEndpoint string) error {
+func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_id", h.clientID)
 	if h.clientJWK == nil {
 		return nil
 	}
-	assertion, err := createClientAssertion(h.clientJWK, h.clientID, tokenEndpoint)
+	assertion, err := createClientAssertion(h.clientJWK, h.clientKID, h.clientID, h.authServerIssuer)
 	if err != nil {
 		return fmt.Errorf("failed to create client assertion: %w", err)
 	}
@@ -569,7 +577,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 	// Parse client JWK for private_key_jwt authentication if registered
 	if r := metaResult.RegisteredIssuer; r != nil && r.ClientJWK != "" {
-		key, err := parseECPrivateKeyJWK(r.ClientJWK)
+		key, kid, err := parseECPrivateKeyJWK(r.ClientJWK)
 		if err != nil {
 			h.Logger.Warn("failed to parse registered client JWK, skipping client authentication",
 				zap.Error(err),
@@ -577,10 +585,18 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			)
 		} else {
 			h.clientJWK = key
+			h.clientKID = kid
 			h.Logger.Debug("using private_key_jwt authentication for issuer",
 				zap.String("issuer", offer.CredentialIssuer),
+				zap.String("kid", kid),
 			)
 		}
+	}
+
+	// Determine AS issuer URL for private_key_jwt aud claim (RFC 7523 §2.2)
+	h.authServerIssuer = metadata.AuthorizationServer
+	if h.authServerIssuer == "" {
+		h.authServerIssuer = metadata.CredentialIssuer
 	}
 
 	// Step 3: Evaluate trust
@@ -1169,7 +1185,7 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	if txCode != "" {
 		data.Set("tx_code", txCode)
 	}
-	if err := h.setClientAuth(data, tokenEndpoint); err != nil {
+	if err := h.setClientAuth(data); err != nil {
 		return nil, err
 	}
 
@@ -1329,7 +1345,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 			parParams[k] = v
 		}
 		if h.clientJWK != nil {
-			if err := h.setClientAuth(parParams, oauthMeta.PushedAuthorizationRequestEndpoint); err != nil {
+			if err := h.setClientAuth(parParams); err != nil {
 				h.Logger.Warn("failed to add client auth to PAR", zap.Error(err))
 			}
 		}
@@ -1480,7 +1496,7 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
 	}
-	if err := h.setClientAuth(data, tokenEndpoint); err != nil {
+	if err := h.setClientAuth(data); err != nil {
 		return nil, err
 	}
 
