@@ -205,9 +205,10 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 
 // EngineProvider provides WebSocket engine routes
 type EngineProvider struct {
-	cfg     *config.Config
-	logger  *zap.Logger
-	manager *wsengine.Manager
+	cfg        *config.Config
+	logger     *zap.Logger
+	manager    *wsengine.Manager
+	wmpAdapter *wsengine.WMPAdapter
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -263,10 +264,13 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
+	wmpAdapter := wsengine.NewWMPAdapter(manager, logger)
+
 	return &EngineProvider{
-		cfg:     cfg,
-		logger:  logger,
-		manager: manager,
+		cfg:        cfg,
+		logger:     logger,
+		manager:    manager,
+		wmpAdapter: wmpAdapter,
 	}, nil
 }
 
@@ -284,14 +288,14 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 		p.manager.HandleConnection(c.Writer, c.Request)
 	})
 
-	// HTTP+SSE endpoints — same engine, same auth, same security posture.
-	// POST /api/v2/wallet/rpc — JSON messages (auth via Authorization: Bearer)
+	// WMP JSON-RPC endpoints — same engine, same auth, same security posture.
+	// POST /api/v2/wallet/rpc — JSON-RPC 2.0 request/response (auth via Authorization: Bearer)
 	router.POST("/api/v2/wallet/rpc", func(c *gin.Context) {
-		p.manager.HandleRPC(c.Writer, c.Request)
+		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
 	})
-	// GET /api/v2/wallet/events — SSE stream (auth via Authorization: Bearer)
+	// GET /api/v2/wallet/events — SSE stream of WMP notifications (auth via Authorization: Bearer)
 	router.GET("/api/v2/wallet/events", func(c *gin.Context) {
-		p.manager.HandleEvents(c.Writer, c.Request)
+		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
 }
 
