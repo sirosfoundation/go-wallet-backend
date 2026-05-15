@@ -539,9 +539,10 @@ func (h *AdminHandlers) AdminStatus(c *gin.Context) {
 
 // IssuerRequest represents the request body for creating/updating an issuer
 type IssuerRequest struct {
-	CredentialIssuerIdentifier string `json:"credential_issuer_identifier" binding:"required"`
-	ClientID                   string `json:"client_id,omitempty"`
-	Visible                    *bool  `json:"visible,omitempty"`
+	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier" binding:"required"`
+	ClientID                   string  `json:"client_id,omitempty"`
+	ClientJWK                  *string `json:"client_jwk,omitempty"`
+	Visible                    *bool   `json:"visible,omitempty"`
 }
 
 // IssuerResponse represents an issuer in API responses
@@ -550,6 +551,7 @@ type IssuerResponse struct {
 	TenantID                   string  `json:"tenant_id"`
 	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier"`
 	ClientID                   string  `json:"client_id,omitempty"`
+	HasClientJWK               bool    `json:"has_client_jwk"`
 	Visible                    bool    `json:"visible"`
 	TrustStatus                string  `json:"trust_status,omitempty"`
 	TrustFramework             string  `json:"trust_framework,omitempty"`
@@ -562,6 +564,7 @@ func issuerToResponse(i *domain.CredentialIssuer) *IssuerResponse {
 		TenantID:                   string(i.TenantID),
 		CredentialIssuerIdentifier: i.CredentialIssuerIdentifier,
 		ClientID:                   i.ClientID,
+		HasClientJWK:               i.ClientJWK != "",
 		Visible:                    i.Visible,
 		TrustStatus:                string(i.TrustStatus),
 		TrustFramework:             i.TrustFramework,
@@ -672,6 +675,9 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 		ClientID:                   req.ClientID,
 		Visible:                    visible,
 	}
+	if req.ClientJWK != nil {
+		issuer.ClientJWK = *req.ClientJWK
+	}
 
 	if err := h.store.Issuers().Create(c.Request.Context(), issuer); err != nil {
 		h.logger.Error("Failed to create issuer", zap.Error(err))
@@ -718,6 +724,9 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 	// Update fields
 	issuer.CredentialIssuerIdentifier = req.CredentialIssuerIdentifier
 	issuer.ClientID = req.ClientID
+	if req.ClientJWK != nil {
+		issuer.ClientJWK = *req.ClientJWK
+	}
 	if req.Visible != nil {
 		issuer.Visible = *req.Visible
 	}
