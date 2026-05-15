@@ -156,6 +156,7 @@ type IssuerMetadata struct {
 	CredentialIssuer                  string                      `json:"credential_issuer"`
 	CredentialEndpoint                string                      `json:"credential_endpoint"`
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
+	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
@@ -365,6 +366,40 @@ func isDPoPNonceError(resp *http.Response) bool {
 		return false
 	}
 	return resp.Header.Get("DPoP-Nonce") != ""
+}
+
+// fetchNonce calls the OID4VCI Nonce Endpoint (§7) to obtain a fresh c_nonce.
+// Per the spec, the Nonce Endpoint does not require authentication.
+// Returns the nonce value or an error.
+func (h *OID4VCIHandler) fetchNonce(ctx context.Context, nonceEndpoint string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", nonceEndpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("creating nonce request: %w", err)
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("nonce request failed: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		return "", fmt.Errorf("nonce endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var nonceResp struct {
+		CNonce          string `json:"c_nonce"`
+		CNonceExpiresIn int    `json:"c_nonce_expires_in,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nonceResp); err != nil {
+		return "", fmt.Errorf("parsing nonce response: %w", err)
+	}
+	if nonceResp.CNonce == "" {
+		return "", errors.New("nonce endpoint returned empty c_nonce")
+	}
+	h.Logger.Debug("obtained c_nonce from nonce endpoint", zap.String("nonce_endpoint", nonceEndpoint))
+	return nonceResp.CNonce, nil
 }
 
 // parseECPrivateKeyJWK parses a JSON-encoded EC private JWK into an *ecdsa.PrivateKey.
@@ -591,10 +626,19 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Step 6 + 7: Request proofs and credential, with full retry on c_nonce refresh.
-	// OID4VCI spec: when the issuer returns a fresh c_nonce in an error response,
-	// the engine re-requests ALL proofs from the frontend with the new nonce and
-	// retries the credential request once.
+	// OID4VCI 1.0: prefer Nonce Endpoint (§7) over token response c_nonce.
+	// Fall back to token.CNonce for backward compatibility with pre-1.0 issuers.
 	nonce := token.CNonce
+	if metadata.NonceEndpoint != "" {
+		if n, err := h.fetchNonce(ctx, metadata.NonceEndpoint); err != nil {
+			h.Logger.Warn("failed to fetch nonce from endpoint, falling back to token c_nonce",
+				zap.Error(err),
+				zap.String("fallback_nonce_present", fmt.Sprintf("%v", nonce != "")),
+			)
+		} else {
+			nonce = n
+		}
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -613,9 +657,19 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		if credErr != nil {
 			var cNonceErr *CNonceRequiredError
 			if retries == 0 && errors.As(credErr, &cNonceErr) {
-				// Issuer returned a refreshed c_nonce — re-request all proofs and retry
-				h.Logger.Debug("c_nonce refreshed by issuer, re-requesting proofs")
-				nonce = cNonceErr.NewNonce
+				// Issuer signaled a nonce mismatch — get a fresh nonce and retry.
+				// Prefer Nonce Endpoint; fall back to the c_nonce from the error response.
+				if metadata.NonceEndpoint != "" {
+					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint); fetchErr == nil {
+						nonce = n
+					} else {
+						h.Logger.Debug("nonce endpoint retry failed, using error response c_nonce", zap.Error(fetchErr))
+						nonce = cNonceErr.NewNonce
+					}
+				} else {
+					nonce = cNonceErr.NewNonce
+				}
+				h.Logger.Debug("c_nonce refreshed, re-requesting proofs")
 				continue
 			}
 			// On the second attempt or for non-c_nonce errors, surface the error.
