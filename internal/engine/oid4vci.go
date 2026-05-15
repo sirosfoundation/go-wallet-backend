@@ -569,7 +569,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.clientID = h.redirectURI
 	if r := metaResult.RegisteredIssuer; r != nil && r.ClientID != "" {
 		h.clientID = r.ClientID
-		h.Logger.Debug("using registered client_id for issuer",
+		h.Logger.Info("using registered client_id for issuer",
 			zap.String("client_id", h.clientID),
 			zap.String("issuer", offer.CredentialIssuer),
 		)
@@ -586,7 +586,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		} else {
 			h.clientJWK = key
 			h.clientKID = kid
-			h.Logger.Debug("using private_key_jwt authentication for issuer",
+			h.Logger.Info("using private_key_jwt authentication for issuer",
 				zap.String("issuer", offer.CredentialIssuer),
 				zap.String("kid", kid),
 			)
@@ -830,8 +830,24 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		if tenantID != "" {
 			if reg, lookupErr := h.issuerLookup.GetByIdentifier(ctx, domain.TenantID(tenantID), issuer); lookupErr == nil {
 				registeredIssuer = reg
+				h.Logger.Info("found registered issuer",
+					zap.String("tenant_id", tenantID),
+					zap.String("issuer", issuer),
+					zap.Bool("has_client_jwk", reg.ClientJWK != ""),
+					zap.String("client_id", reg.ClientID),
+				)
+			} else {
+				h.Logger.Info("issuer not found in registry",
+					zap.String("tenant_id", tenantID),
+					zap.String("issuer", issuer),
+					zap.Error(lookupErr),
+				)
 			}
+		} else {
+			h.Logger.Warn("no tenant ID in context for issuer lookup")
 		}
+	} else {
+		h.Logger.Warn("issuerLookup is nil, skipping registered issuer enrichment")
 	}
 
 	_ = h.Progress(StepMetadataFetched, map[string]interface{}{
@@ -1655,11 +1671,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
-		"format":                      config.Format,
 		"credential_configuration_id": configID,
-	}
-	if config.VCT != "" {
-		reqBody["vct"] = config.VCT
 	}
 	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
 	if len(proofs) > 0 {

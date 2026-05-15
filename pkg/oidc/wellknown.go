@@ -13,7 +13,7 @@ import (
 //	https://example.com/.well-known/openid-credential-issuer/path/to/issuer
 //
 // The function preserves percent-encoded path segments (uses EscapedPath)
-// and strips a single trailing slash from the path before appending.
+// and preserves any trailing slash in the path.
 func WellKnownURL(baseURL, suffix string) (string, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
@@ -21,9 +21,6 @@ func WellKnownURL(baseURL, suffix string) (string, error) {
 	}
 
 	path := parsed.EscapedPath()
-	if len(path) > 1 && path[len(path)-1] == '/' {
-		path = path[:len(path)-1]
-	}
 
 	return fmt.Sprintf("%s://%s/.well-known/%s%s", parsed.Scheme, parsed.Host, suffix, path), nil
 }
