@@ -204,6 +204,11 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
+	// Normalize trailing slash for consistent cache keys.
+	// OID4VCI credential_issuer URLs may or may not have a trailing slash;
+	// both forms refer to the same issuer.
+	issuerURL = strings.TrimRight(issuerURL, "/")
+
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
