@@ -204,10 +204,13 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
-	// Normalize trailing slash for consistent cache keys.
-	// OID4VCI credential_issuer URLs may or may not have a trailing slash;
-	// both forms refer to the same issuer.
-	issuerURL = strings.TrimRight(issuerURL, "/")
+	// Normalize trailing slash for consistent cache keys, but only when the
+	// path is empty or just "/". Issuers with meaningful paths (e.g.
+	// https://host/issuer/) retain their trailing slash per RFC 8615.
+	parsed, _ := url.Parse(issuerURL) // already validated above
+	if parsed.Path == "" || parsed.Path == "/" {
+		issuerURL = strings.TrimRight(issuerURL, "/")
+	}
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -216,6 +219,8 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	// Use singleflight to coalesce concurrent requests for the same issuer.
 	// This prevents duplicate outgoing HTTP requests when multiple goroutines
 	// resolve the same issuer before the cache is populated.
+	// We detach from the caller's context to avoid cancelling the shared fetch
+	// when a single caller disconnects (a well-known singleflight pitfall).
 	val, err, _ := r.group.Do(issuerURL, func() (interface{}, error) {
 		// Re-check cache inside singleflight — another caller may have populated it.
 		if entry := r.getCachedEntry(issuerURL); entry != nil {
@@ -225,7 +230,9 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
 		// https://{host}/.well-known/openid-credential-issuer{path}
 		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
-		result, err := r.fetch(ctx, issuerURL, metadataURL)
+		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer fetchCancel()
+		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
 		if err != nil {
 			return nil, err
 		}

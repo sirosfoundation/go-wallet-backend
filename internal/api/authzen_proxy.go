@@ -310,12 +310,26 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 
 // Resolve handles POST /v1/resolve
 //
-// This endpoint resolves issuer metadata and evaluates trust. For URL subjects,
-// metadata is resolved locally and key material is extracted, then sent to the PDP
-// for trust evaluation. For key subjects, the request is proxied directly to the PDP.
+// This endpoint resolves metadata and evaluates trust. For URL subjects,
+// the behavior depends on the resource_type field:
 //
-// Request body: { "subject_id": "https://issuer.example.com", "subject_type": "url" }
-// Response: gotrust.EvaluationResponse with trust_metadata containing issuer metadata
+//   - "credential_issuer" (default for URL subjects): resolves issuer metadata
+//     locally, extracts key material, evaluates trust via PDP, and returns
+//     a composite response with decision and trust_metadata.
+//   - "oauth-authorization-server": fetches RFC 8414 authorization server
+//     metadata. No trust evaluation is performed (decision is always false).
+//
+// For key subjects, the request is proxied directly to the PDP.
+//
+// Request body:
+//
+//	{
+//	  "subject_id": "https://issuer.example.com",
+//	  "subject_type": "url",
+//	  "resource_type": "credential_issuer"  // optional, defaults per subject_type
+//	}
+//
+// Response: gotrust.EvaluationResponse with trust_metadata containing resolved metadata
 func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	// Check if resolution is enabled
 	if !h.cfg.AllowResolution {
@@ -653,7 +667,7 @@ func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context,
 
 	c.JSON(http.StatusOK, &resolveURLResponse{
 		EvaluationResponse: gotrust.EvaluationResponse{
-			Decision: true,
+			Decision: false, // No trust evaluation performed — metadata fetch only
 			Context: &gotrust.EvaluationResponseContext{
 				TrustMetadata: authzMeta,
 			},
