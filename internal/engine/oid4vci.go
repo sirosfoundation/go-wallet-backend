@@ -1195,18 +1195,18 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
-	data := url.Values{}
-	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
-	data.Set("pre-authorized_code", code)
-	if txCode != "" {
-		data.Set("tx_code", txCode)
-	}
-	if err := h.setClientAuth(data); err != nil {
-		return nil, err
-	}
-
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
+		data := url.Values{}
+		data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
+		data.Set("pre-authorized_code", code)
+		if txCode != "" {
+			data.Set("tx_code", txCode)
+		}
+		if err := h.setClientAuth(data); err != nil {
+			return nil, err
+		}
+
 		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
@@ -1505,19 +1505,19 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
-	data := url.Values{}
-	data.Set("grant_type", "authorization_code")
-	data.Set("code", code)
-	data.Set("redirect_uri", redirectURI)
-	if codeVerifier != "" {
-		data.Set("code_verifier", codeVerifier)
-	}
-	if err := h.setClientAuth(data); err != nil {
-		return nil, err
-	}
-
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
+		data := url.Values{}
+		data.Set("grant_type", "authorization_code")
+		data.Set("code", code)
+		data.Set("redirect_uri", redirectURI)
+		if codeVerifier != "" {
+			data.Set("code_verifier", codeVerifier)
+		}
+		if err := h.setClientAuth(data); err != nil {
+			return nil, err
+		}
+
 		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
