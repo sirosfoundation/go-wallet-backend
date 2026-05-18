@@ -111,7 +111,12 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := m.upgrader.Upgrade(w, r, nil)
+	var responseHeader http.Header
+	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
+		responseHeader = http.Header{}
+		responseHeader.Set("X-Served-By", servedBy)
+	}
+	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
