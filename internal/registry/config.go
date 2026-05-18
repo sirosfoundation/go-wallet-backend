@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
@@ -260,6 +261,10 @@ type JWTConfig struct {
 	// Secret is the shared secret for validating JWT signatures (HMAC)
 	Secret string `yaml:"secret"`
 
+	// SecretPath is an alternative to Secret: path to a file containing the JWT secret.
+	// If both Secret and SecretPath are set, SecretPath takes precedence.
+	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
+
 	// Issuer is the expected issuer claim in the JWT
 	Issuer string `yaml:"issuer"`
 
@@ -391,8 +396,15 @@ func (c *Config) Validate() error {
 	}
 
 	// JWT secret is only required if RequireAuth is true
+	if c.JWT.SecretPath != "" {
+		data, err := os.ReadFile(c.JWT.SecretPath)
+		if err != nil {
+			return fmt.Errorf("jwt.secret_path: %w", err)
+		}
+		c.JWT.Secret = strings.TrimSpace(string(data))
+	}
 	if c.JWT.RequireAuth && c.JWT.Secret == "" {
-		return fmt.Errorf("JWT secret is required when authentication is required")
+		return fmt.Errorf("JWT secret is required when authentication is required (set jwt.secret or jwt.secret_path)")
 	}
 
 	return nil
