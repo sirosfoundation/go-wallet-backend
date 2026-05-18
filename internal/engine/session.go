@@ -193,7 +193,10 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// Validate token and extract claims
 	userID, tenantID, err := m.validateToken(handshake.AppToken)
 	if err != nil {
-		m.logger.Warn("Authentication failed", zap.Error(err))
+		m.logger.Warn("Authentication failed",
+			zap.Error(err),
+			zap.Int("token_len", len(handshake.AppToken)),
+		)
 		m.sendError(conn, "", ErrCodeAuthFailed, "Invalid or expired token")
 		return
 	}
