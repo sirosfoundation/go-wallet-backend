@@ -78,15 +78,35 @@ func (c ServerConfig) ResolvedServedBy() string {
 	return *c.ServedByHeader
 }
 
+// APIMode determines which registry API format to use when fetching.
+type APIMode string
+
+const (
+	// APIModeTS11 uses the TS11 /api/v1/schemas.json endpoint which returns only
+	// fully TS11-compliant credentials with schemaURIs for VCTM fetching.
+	APIModeTS11 APIMode = "ts11"
+
+	// APIModeRegistry uses the /api/v1/registry.json endpoint which returns ALL
+	// credentials (including non-TS11) with minimal metadata. Individual VCTMs
+	// are fetched separately via their schemaURIs when available, or via the
+	// /api/v1/schemas/{id}.json detail endpoint.
+	APIModeRegistry APIMode = "registry"
+)
+
 // RemoteSourceConfig contains the minimal configuration needed to fetch schemas
 // from a single remote registry URL. It is used by Config.Sources to specify
 // multiple registries. Unlike SourceConfig it intentionally omits the global
 // settings (LocalOverrides, PollInterval) that are not meaningful per source.
 type RemoteSourceConfig struct {
-	// URL of the upstream registry index.
-	// Supports both the legacy vctm-registry.json format and the TS11-compliant
-	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
+	// URL is the base URL of the registry (e.g. "https://registry.siros.org").
+	// The actual endpoint path is determined by the Mode setting.
+	// For backward compatibility, if a full path to a specific endpoint is given
+	// (e.g. ending in schemas.json or registry.json), it is used as-is regardless of Mode.
 	URL string `yaml:"url"`
+
+	// Mode selects which API endpoint to use: "ts11" (default) for only TS11-compliant
+	// credentials, or "registry" for all credentials including non-TS11.
+	Mode APIMode `yaml:"mode"`
 
 	// Timeout for HTTP requests to this source. Zero means no per-source timeout
 	// (the shared http.Client timeout applies).
@@ -95,10 +115,12 @@ type RemoteSourceConfig struct {
 
 // SourceConfig contains upstream registry source configuration
 type SourceConfig struct {
-	// URL of the upstream registry index.
-	// Supports both the legacy vctm-registry.json format and the TS11-compliant
-	// /api/v1/schemas.json endpoint – the format is auto-detected from the response.
+	// URL of the upstream registry.
+	// The actual endpoint is determined by the Mode setting.
 	URL string `yaml:"url"`
+
+	// Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials).
+	Mode APIMode `yaml:"mode"`
 
 	// LocalOverrides is a list of local file or directory paths containing VCTM JSON files.
 	// These are loaded at startup and take priority over entries fetched from the remote registry.
@@ -340,19 +362,19 @@ func (c *Config) Validate() error {
 
 	// Normalize: if Sources is empty, populate from the legacy Source field
 	if len(c.Sources) == 0 {
-		c.Sources = []RemoteSourceConfig{{URL: c.Source.URL, Timeout: c.Source.Timeout}}
+		c.Sources = []RemoteSourceConfig{{URL: c.Source.URL, Mode: c.Source.Mode, Timeout: c.Source.Timeout}}
 	}
 
-	// Validate each Sources entry
-	for i, src := range c.Sources {
-		if src.URL == "" {
+	// Validate each Sources entry and default Mode to APIModeTS11
+	for i := range c.Sources {
+		if c.Sources[i].URL == "" {
 			return fmt.Errorf("sources[%d].url is required", i)
 		}
-	}
-
-	for i, source := range c.Sources {
-		if source.URL == "" {
-			return fmt.Errorf("sources[%d].url is required", i)
+		if c.Sources[i].Mode == "" {
+			c.Sources[i].Mode = APIModeTS11
+		}
+		if c.Sources[i].Mode != APIModeTS11 && c.Sources[i].Mode != APIModeRegistry {
+			return fmt.Errorf("sources[%d].mode must be %q or %q, got %q", i, APIModeTS11, APIModeRegistry, c.Sources[i].Mode)
 		}
 	}
 	if c.Source.PollInterval < time.Second {

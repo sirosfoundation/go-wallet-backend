@@ -111,3 +111,44 @@ func TestIntegration_LiveRegistry_TS11_Pagination(t *testing.T) {
 	assert.Equal(t, firstCount, secondCount,
 		"repeated Fetch() calls must yield the same number of entries (pagination is deterministic)")
 }
+
+// TestIntegration_LiveRegistry_AllCredentials verifies that using the "registry" mode
+// fetches ALL credentials (both TS11 and non-TS11) from the live registry.
+//
+// Run explicitly with: go test -tags=integration ./internal/registry/... -run TestIntegration_LiveRegistry_AllCredentials -v
+func TestIntegration_LiveRegistry_AllCredentials(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live-network integration test in short mode")
+	}
+
+	cfg := DefaultConfig()
+	cfg.Source.URL = "https://registry.siros.org"
+	cfg.Source.Mode = APIModeRegistry
+	cfg.Source.Timeout = 60 * time.Second
+	cfg.Sources = nil
+	require.NoError(t, cfg.Validate())
+
+	store := NewStore("")
+	logger, _ := zap.NewDevelopment()
+	fetcher := NewFetcher(cfg, store, logger, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	err := fetcher.Fetch(ctx)
+	require.NoError(t, err, "Fetch() in registry mode must succeed")
+
+	count := store.Count()
+	t.Logf("fetched %d credential entries in registry mode", count)
+
+	// The registry has more credentials in registry mode than in TS11 mode.
+	// Currently 9, but at least verify it's more than the 4 TS11-only entries.
+	assert.Greater(t, count, 4,
+		"registry mode should return more credentials than TS11-only mode (expected >4, got %d)", count)
+
+	// Log all entries for visibility
+	for _, entry := range store.List() {
+		t.Logf("  vct=%s name=%q los=%s formats=%v",
+			entry.VCT, entry.Name, entry.AttestationLoS, entry.SupportedFormats)
+	}
+}
