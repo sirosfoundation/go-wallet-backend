@@ -164,6 +164,9 @@ func main() {
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
 	}
 
+	if backendCfg != nil {
+		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+	}
 	serverCfg.IsProduction = isProduction
 
 	// Create unified server manager
