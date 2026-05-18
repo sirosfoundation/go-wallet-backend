@@ -147,7 +147,9 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	responseHeader := http.Header{}
-	responseHeader.Set("X-Served-By", m.cfg.Server.ResolvedServedBy())
+	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
+		responseHeader.Set("X-Served-By", servedBy)
+	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
