@@ -217,7 +217,7 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	})
+	}, jwt.WithLeeway(5*time.Second))
 
 	if err != nil {
 		return "", err
