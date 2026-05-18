@@ -360,6 +360,8 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount, errorCount int
 
+	// Use the resolved endpoint URL for pagination (not the raw base URL)
+	resolvedURL := source.resolveURL()
 	currentBody := body
 	for {
 		var page TS11SchemasResponse
@@ -415,7 +417,7 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 		if !page.HasMorePages() {
 			break
 		}
-		nextURL := page.NextPageURL(source.URL)
+		nextURL := page.NextPageURL(resolvedURL)
 		nextBody, err := f.fetchRaw(ctx, nextURL)
 		if err != nil {
 			f.logger.Warn("failed to fetch next page of schemas",
