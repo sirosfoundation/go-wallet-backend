@@ -454,6 +454,130 @@ func TestFetcher_FetchFromSource_TS11_Pagination(t *testing.T) {
 	assert.Len(t, entries, 2)
 }
 
+// TestFetcher_FetchFromSource_TS11_PaginatedDataFormat verifies that the fetcher
+// correctly handles the current TS11 API format that uses {"data": [...], "total", "limit", "offset"}
+// instead of the legacy {"schemas": [...], "next": "..."} format.
+func TestFetcher_FetchFromSource_TS11_PaginatedDataFormat(t *testing.T) {
+	vctmContent := `{"vct":"https://registry.example.org/cred.vctm.json","name":"Demo Credential","description":"A demo credential"}`
+
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer vctmServer.Close()
+
+	// Use the current format: {"data": [...], "total": N, "limit": N, "offset": N}
+	response := map[string]interface{}{
+		"data": []TS11SchemaMeta{
+			{
+				ID:               "c48100f6-f19d-5f79-9bf5-819c293a08a4",
+				Version:          "0.1.0",
+				AttestationLoS:   "iso_18045_basic",
+				BindingType:      "key",
+				SupportedFormats: []string{"dc+sd-jwt"},
+				SchemaURIs: []TS11SchemaURI{
+					{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/cred.vctm.json"},
+				},
+				RulebookURI: "https://registry.example.org/rulebook.html",
+			},
+		},
+		"total":  1,
+		"limit":  20,
+		"offset": 0,
+	}
+
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	store := NewStore("")
+	logger := testLogger()
+	fetcher := NewFetcher(config, store, logger, nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL, Timeout: 5 * time.Second}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	vct := "https://registry.example.org/cred.vctm.json"
+	entry, ok := entries[vct]
+	require.True(t, ok)
+
+	assert.Equal(t, vct, entry.VCT)
+	assert.Equal(t, "Demo Credential", entry.Name)
+	assert.Equal(t, "iso_18045_basic", entry.AttestationLoS)
+	assert.Equal(t, "key", entry.BindingType)
+	assert.Equal(t, []string{"dc+sd-jwt"}, entry.SupportedFormats)
+}
+
+// TestFetcher_FetchFromSource_TS11_PaginatedDataFormat_MultiPage verifies that
+// offset-based pagination is followed when total > offset+len(data).
+func TestFetcher_FetchFromSource_TS11_PaginatedDataFormat_MultiPage(t *testing.T) {
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cred2.json":
+			_, _ = w.Write([]byte(`{"vct":"https://example.org/cred2","name":"Cred2"}`))
+		default:
+			_, _ = w.Write([]byte(`{"vct":"https://example.org/cred1","name":"Cred1"}`))
+		}
+	}))
+	defer vctmServer.Close()
+
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		offset := q.Get("offset")
+		if offset == "1" {
+			// Second page
+			page2 := map[string]interface{}{
+				"data": []TS11SchemaMeta{
+					{
+						ID: "id-2", Version: "1.0",
+						SchemaURIs: []TS11SchemaURI{
+							{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/cred2.json"},
+						},
+					},
+				},
+				"total":  2,
+				"limit":  1,
+				"offset": 1,
+			}
+			_ = json.NewEncoder(w).Encode(page2)
+			return
+		}
+		// First page
+		page1 := map[string]interface{}{
+			"data": []TS11SchemaMeta{
+				{
+					ID: "id-1", Version: "1.0",
+					SchemaURIs: []TS11SchemaURI{
+						{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/cred1.json"},
+					},
+				},
+			},
+			"total":  2,
+			"limit":  1,
+			"offset": 0,
+		}
+		_ = json.NewEncoder(w).Encode(page1)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	assert.Len(t, entries, 2)
+	assert.Contains(t, entries, "https://example.org/cred1")
+	assert.Contains(t, entries, "https://example.org/cred2")
+}
+
 // TestFetcher_FetchFromSource_TS11_VCTFromDocument verifies that the VCT identifier is
 // read from the "vct" field in the VCTM document itself rather than derived from the
 // schemaURI.  This matters because the VCT may be a URN (e.g. "urn:eudi:diploma:1").
@@ -787,7 +911,6 @@ func TestConfig_Validate_BothSourceEmptyAndSourcesEmpty(t *testing.T) {
 	assert.Contains(t, err.Error(), "source URL is required")
 }
 
-
 func TestFetcher_Fetch_WithFilter(t *testing.T) {
 	index := RegistryIndex{
 		Name: "Test Registry",
@@ -974,4 +1097,167 @@ func TestRegistryIndex_JSONRoundtrip(t *testing.T) {
 	assert.Equal(t, original.BuildTime, loaded.BuildTime)
 	assert.Len(t, loaded.Credentials, 1)
 	assert.Equal(t, original.Credentials[0].VCT, loaded.Credentials[0].VCT)
+}
+
+// TestResolveURL verifies that resolveURL correctly appends endpoint paths based on Mode.
+func TestResolveURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   RemoteSourceConfig
+		expected string
+	}{
+		{
+			name:     "ts11 mode appends schemas.json",
+			source:   RemoteSourceConfig{URL: "https://registry.siros.org", Mode: APIModeTS11},
+			expected: "https://registry.siros.org/api/v1/schemas.json",
+		},
+		{
+			name:     "registry mode appends registry.json",
+			source:   RemoteSourceConfig{URL: "https://registry.siros.org", Mode: APIModeRegistry},
+			expected: "https://registry.siros.org/api/v1/registry.json",
+		},
+		{
+			name:     "trailing slash is stripped",
+			source:   RemoteSourceConfig{URL: "https://registry.siros.org/", Mode: APIModeTS11},
+			expected: "https://registry.siros.org/api/v1/schemas.json",
+		},
+		{
+			name:     "explicit .json URL is used as-is",
+			source:   RemoteSourceConfig{URL: "https://registry.siros.org/api/v1/schemas.json", Mode: APIModeRegistry},
+			expected: "https://registry.siros.org/api/v1/schemas.json",
+		},
+		{
+			name:     "empty mode defaults to ts11",
+			source:   RemoteSourceConfig{URL: "https://registry.siros.org"},
+			expected: "https://registry.siros.org/api/v1/schemas.json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.source.resolveURL())
+		})
+	}
+}
+
+// TestFetcher_FetchFromSource_RegistryFormat verifies that the fetcher correctly
+// processes the /api/v1/registry.json format which has ALL credentials.
+func TestFetcher_FetchFromSource_RegistryFormat(t *testing.T) {
+	vctmContent := `{"vct":"https://registry.example.org/cred.vctm.json","name":"TS11 Cred","description":"A TS11 credential"}`
+
+	mux := http.NewServeMux()
+	// Detail endpoint for TS11-compliant entry
+	mux.HandleFunc("/api/v1/schemas/ts11-id.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TS11SchemaMeta{
+			ID:               "ts11-id",
+			Version:          "0.1.0",
+			AttestationLoS:   "iso_18045_basic",
+			BindingType:      "key",
+			SupportedFormats: []string{"dc+sd-jwt"},
+			SchemaURIs: []TS11SchemaURI{
+				{FormatIdentifier: "dc+sd-jwt", URI: ""}, // placeholder, will be replaced
+			},
+		})
+	})
+	// Detail endpoint returns 404 for non-TS11 entry
+	mux.HandleFunc("/api/v1/schemas/non-ts11-id.json", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Update the TS11 detail schema URI to point to our VCTM server
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer vctmServer.Close()
+
+	// Override the detail endpoint to return the correct VCTM server URL
+	mux2 := http.NewServeMux()
+	mux2.HandleFunc("/api/v1/schemas/ts11-id.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TS11SchemaMeta{
+			ID:               "ts11-id",
+			Version:          "0.1.0",
+			AttestationLoS:   "iso_18045_basic",
+			BindingType:      "key",
+			SupportedFormats: []string{"dc+sd-jwt"},
+			SchemaURIs: []TS11SchemaURI{
+				{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/cred.vctm.json"},
+			},
+		})
+	})
+	mux2.HandleFunc("/api/v1/schemas/non-ts11-id.json", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux2.HandleFunc("/api/v1/registry.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		total := 2
+		_ = json.NewEncoder(w).Encode(RegistryResponse{
+			Total: total,
+			Credentials: []RegistryListEntry{
+				{
+					ID:               "ts11-id",
+					Version:          "0.1.0",
+					SupportedFormats: []string{"dc+sd-jwt"},
+					AttestationLoS:   "iso_18045_basic",
+					BindingType:      "key",
+				},
+				{
+					ID:               "non-ts11-id",
+					Version:          "0.2.0",
+					SupportedFormats: []string{"mso_mdoc", "dc+sd-jwt"},
+					AttestationLoS:   "iso_18045_moderate",
+					BindingType:      "key",
+				},
+			},
+		})
+	})
+
+	registryServer := httptest.NewServer(mux2)
+	defer registryServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: registryServer.URL + "/api/v1/registry.json", Mode: APIModeRegistry}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	// TS11 entry should have full metadata from the VCTM document
+	ts11Entry, ok := entries["https://registry.example.org/cred.vctm.json"]
+	require.True(t, ok, "TS11 entry should be keyed on its VCTM vct field")
+	assert.Equal(t, "TS11 Cred", ts11Entry.Name)
+	assert.Equal(t, "iso_18045_basic", ts11Entry.AttestationLoS)
+
+	// Non-TS11 entry should be a stub keyed on the schema ID
+	nonTS11Entry, ok := entries["non-ts11-id"]
+	require.True(t, ok, "non-TS11 entry should be keyed on schema ID")
+	assert.Equal(t, "iso_18045_moderate", nonTS11Entry.AttestationLoS)
+	assert.Equal(t, []string{"mso_mdoc", "dc+sd-jwt"}, nonTS11Entry.SupportedFormats)
+}
+
+// TestConfig_Validate_InvalidMode verifies that invalid Mode values are rejected.
+func TestConfig_Validate_InvalidMode(t *testing.T) {
+	config := DefaultConfig()
+	config.Sources = []RemoteSourceConfig{
+		{URL: "https://registry.example.org", Mode: "invalid"},
+	}
+	err := config.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `must be "ts11" or "registry"`)
+}
+
+// TestConfig_Validate_DefaultMode verifies that empty Mode defaults to ts11.
+func TestConfig_Validate_DefaultMode(t *testing.T) {
+	config := DefaultConfig()
+	config.Sources = []RemoteSourceConfig{
+		{URL: "https://registry.example.org"},
+	}
+	require.NoError(t, config.Validate())
+	assert.Equal(t, APIModeTS11, config.Sources[0].Mode)
 }
