@@ -344,6 +344,11 @@ type JWTConfig struct {
 	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
+// JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
+// (nbf, exp, iat). This accounts for minor clock differences between token
+// issuers and validators in distributed deployments.
+const JWTLeeway = 5 * time.Second
+
 // WalletProviderConfig contains wallet provider key attestation configuration
 type WalletProviderConfig struct {
 	PrivateKeyPath  string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
