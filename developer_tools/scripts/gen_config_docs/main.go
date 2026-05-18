@@ -1,8 +1,8 @@
 // Package main generates docs/CONFIGURATION.md from Go struct definitions.
 //
 // It parses config struct files using go/ast and extracts YAML keys, envconfig
-// tags, types, comments, and default values to produce a comprehensive Markdown
-// configuration reference.
+// tags, types, and comments (both doc comments and inline comments) to produce
+// a comprehensive Markdown configuration reference.
 //
 // Usage:
 //
@@ -54,6 +54,7 @@ type FieldInfo struct {
 	YAMLTag   string
 	EnvTag    string
 	Doc       string
+	InlineDoc string // trailing comment (e.g., `// Admin API bind address`)
 	TypeName  string // resolved struct type name, if embedded struct
 	Omitempty bool
 }
@@ -115,12 +116,13 @@ func (r *Registry) extractStructs(file *ast.File, pkgName string) {
 					continue // skip embedded
 				}
 				fi := FieldInfo{
-					GoName: field.Names[0].Name,
-					GoType: typeString(field.Type),
-					Doc:    cleanDoc(field.Doc),
+					GoName:    field.Names[0].Name,
+					GoType:    typeString(field.Type),
+					Doc:       cleanDoc(field.Doc),
+					InlineDoc: cleanInlineComment(field.Comment),
 				}
-				// Check if the type references another struct
-				fi.TypeName = resolveTypeName(field.Type)
+				// Check if the type references another struct (qualify with package)
+				fi.TypeName = resolveTypeName(field.Type, pkgName)
 
 				if field.Tag != nil {
 					tag := strings.Trim(field.Tag.Value, "`")
@@ -145,11 +147,12 @@ func (r *Registry) extractStructs(file *ast.File, pkgName string) {
 	}
 }
 
-func resolveTypeName(expr ast.Expr) string {
+func resolveTypeName(expr ast.Expr, currentPkg string) string {
 	switch t := expr.(type) {
 	case *ast.Ident:
 		if ast.IsExported(t.Name) {
-			return t.Name
+			// Qualify local type references with the current package
+			return currentPkg + "." + t.Name
 		}
 	case *ast.SelectorExpr:
 		// Return "pkg.Type" for qualified references like embed.Config
@@ -158,7 +161,7 @@ func resolveTypeName(expr ast.Expr) string {
 		}
 		return t.Sel.Name
 	case *ast.StarExpr:
-		return resolveTypeName(t.X)
+		return resolveTypeName(t.X, currentPkg)
 	}
 	return ""
 }
@@ -209,48 +212,73 @@ func cleanDoc(cg *ast.CommentGroup) string {
 		text := c.Text
 		text = strings.TrimPrefix(text, "//")
 		text = strings.TrimPrefix(text, " ")
-		// Skip Deprecated marker lines but keep the content
 		lines = append(lines, text)
 	}
 	return strings.TrimSpace(strings.Join(lines, " "))
 }
 
-// Lookup finds a struct by name (supports both qualified "pkg.Name" and simple "Name").
-// For cross-package references like "pkgconfig.HTTPClientConfig", it looks up by
-// the actual package name stored in the registry (e.g., "config.HTTPClientConfig").
-func (r *Registry) Lookup(name string) *StructInfo {
-	// Direct match (works for both qualified and simple names)
+func cleanInlineComment(cg *ast.CommentGroup) string {
+	if cg == nil {
+		return ""
+	}
+	var parts []string
+	for _, c := range cg.List {
+		text := strings.TrimPrefix(c.Text, "//")
+		text = strings.TrimSpace(text)
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// LookupFrom finds a struct by name, preferring types from preferPkg.
+// This prevents cross-package collisions (e.g., registry.ServerConfig vs config.ServerConfig).
+func (r *Registry) LookupFrom(name, preferPkg string) *StructInfo {
+	// Direct qualified match
 	if s, ok := r.types[name]; ok {
 		return s
 	}
-	// For qualified names like "pkgconfig.HTTPClientConfig", try just the type part
+	// For qualified names like "pkgconfig.HTTPClientConfig" or "embed.Config"
 	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		pkgAlias := name[:idx]
 		simple := name[idx+1:]
-		// Try to find a uniquely-named type (not "Config" which is ambiguous)
-		if simple != "Config" {
-			if s, ok := r.types[simple]; ok {
-				return s
-			}
-		}
-		// For ambiguous names, search for pkg-qualified matches
-		// e.g., "embed.Config" should match "embed.Config" in the registry
+		// Try exact package match first
 		for key, s := range r.types {
 			if strings.HasSuffix(key, "."+simple) {
-				// Check if the package alias matches
-				pkgAlias := name[:idx]
 				keyPkg := key[:strings.LastIndex(key, ".")]
 				if keyPkg == pkgAlias || strings.HasSuffix(keyPkg, pkgAlias) {
 					return s
 				}
 			}
 		}
+		// Fallback: try simple name but prefer preferPkg
+		if preferPkg != "" {
+			if s, ok := r.types[preferPkg+"."+simple]; ok {
+				return s
+			}
+		}
+		if s, ok := r.types[simple]; ok {
+			return s
+		}
+		return nil
+	}
+	// Unqualified name — prefer the type from preferPkg
+	if preferPkg != "" {
+		if s, ok := r.types[preferPkg+"."+name]; ok {
+			return s
+		}
+	}
+	if s, ok := r.types[name]; ok {
+		return s
 	}
 	return nil
 }
 
 // buildSections produces documentation sections from the root config struct.
-func buildSections(reg *Registry, rootName, envPrefix string) []SectionDoc {
-	root := reg.Lookup(rootName)
+// preferPkg is the package name whose types should be preferred for ambiguous lookups.
+func buildSections(reg *Registry, rootName, envPrefix, preferPkg string) []SectionDoc {
+	root := reg.LookupFrom(rootName, preferPkg)
 	if root == nil {
 		log.Fatalf("root struct %q not found in parsed types", rootName)
 	}
@@ -270,29 +298,29 @@ func buildSections(reg *Registry, rootName, envPrefix string) []SectionDoc {
 		sectionEnv := envPrefix + "_" + envKey
 
 		// If the field references a struct, expand it as a section
-		sub := reg.Lookup(field.TypeName)
+		sub := reg.LookupFrom(field.TypeName, preferPkg)
 		if sub != nil {
 			sec := SectionDoc{
 				Title:       yamlKey,
-				Description: field.Doc,
+				Description: fieldDescription(field),
 				Prefix:      yamlKey,
 				EnvPrefix:   sectionEnv,
 			}
-			sec.Fields = flattenStruct(reg, sub, yamlKey, sectionEnv, 0)
+			sec.Fields = flattenStruct(reg, sub, yamlKey, sectionEnv, 0, preferPkg)
 			sections = append(sections, sec)
 		} else {
 			// For slice-of-struct types, try to resolve the element type
 			elemType := sliceElementType(field.GoType)
-			elemSub := reg.Lookup(elemType)
+			elemSub := reg.LookupFrom(elemType, preferPkg)
 			if elemSub != nil {
 				// Create a section showing the struct fields within the slice
 				sec := SectionDoc{
 					Title:       yamlKey,
-					Description: field.Doc + " (list of entries, each with the fields below)",
+					Description: fieldDescription(field) + " (list of entries, each with the fields below)",
 					Prefix:      yamlKey + "[*]",
 					EnvPrefix:   sectionEnv,
 				}
-				sec.Fields = flattenStruct(reg, elemSub, yamlKey+"[*]", sectionEnv, 0)
+				sec.Fields = flattenStruct(reg, elemSub, yamlKey+"[*]", sectionEnv, 0, preferPkg)
 				sections = append(sections, sec)
 			} else {
 				// Scalar field at root level
@@ -300,7 +328,7 @@ func buildSections(reg *Registry, rootName, envPrefix string) []SectionDoc {
 					YAMLPath:    yamlKey,
 					EnvVar:      sectionEnv,
 					GoType:      friendlyType(field.GoType),
-					Description: field.Doc,
+					Description: fieldDescription(field),
 				})
 			}
 		}
@@ -318,7 +346,7 @@ func buildSections(reg *Registry, rootName, envPrefix string) []SectionDoc {
 	return sections
 }
 
-func flattenStruct(reg *Registry, info *StructInfo, pathPrefix, envPrefix string, depth int) []FieldDoc {
+func flattenStruct(reg *Registry, info *StructInfo, pathPrefix, envPrefix string, depth int, preferPkg string) []FieldDoc {
 	if depth > 5 {
 		return nil // guard against cycles
 	}
@@ -337,19 +365,28 @@ func flattenStruct(reg *Registry, info *StructInfo, pathPrefix, envPrefix string
 		fullEnv := envPrefix + "_" + envKey
 
 		// If field references another struct, recurse
-		sub := reg.Lookup(f.TypeName)
+		sub := reg.LookupFrom(f.TypeName, preferPkg)
 		if sub != nil {
-			docs = append(docs, flattenStruct(reg, sub, fullPath, fullEnv, depth+1)...)
+			docs = append(docs, flattenStruct(reg, sub, fullPath, fullEnv, depth+1, preferPkg)...)
 		} else {
 			docs = append(docs, FieldDoc{
 				YAMLPath:    fullPath,
 				EnvVar:      fullEnv,
 				GoType:      friendlyType(f.GoType),
-				Description: f.Doc,
+				Description: fieldDescription(f),
 			})
 		}
 	}
 	return docs
+}
+
+// fieldDescription returns the best description for a field,
+// combining doc comments and inline comments.
+func fieldDescription(f FieldInfo) string {
+	if f.Doc != "" {
+		return f.Doc
+	}
+	return f.InlineDoc
 }
 
 func friendlyType(goType string) string {
@@ -421,18 +458,18 @@ func renderMarkdown(sections []SectionDoc, title string) string {
 			fmt.Fprintf(&b, "Environment prefix: `%s`\n\n", sec.EnvPrefix)
 		}
 
-		// Write table
-		b.WriteString("| YAML Key | Env Variable | Type | Description |\n")
-		b.WriteString("|----------|-------------|------|-------------|\n")
-		for _, f := range sec.Fields {
-			desc := f.Description
-			if len(desc) > 120 {
-				desc = desc[:117] + "..."
+		// Write table (skip for marker sections with no fields)
+		if len(sec.Fields) > 0 {
+			b.WriteString("| YAML Key | Env Variable | Type | Description |\n")
+			b.WriteString("|----------|-------------|------|-------------|\n")
+			for _, f := range sec.Fields {
+				desc := f.Description
+				// Escape pipe characters and newlines in description
+				desc = strings.ReplaceAll(desc, "|", "\\|")
+				desc = strings.ReplaceAll(desc, "\n", " ")
+				fmt.Fprintf(&b, "| `%s` | `%s` | %s | %s |\n",
+					f.YAMLPath, f.EnvVar, f.GoType, desc)
 			}
-			// Escape pipe characters in description
-			desc = strings.ReplaceAll(desc, "|", "\\|")
-			fmt.Fprintf(&b, "| `%s` | `%s` | %s | %s |\n",
-				f.YAMLPath, f.EnvVar, f.GoType, desc)
 		}
 		b.WriteString("\n")
 	}
@@ -462,7 +499,7 @@ func main() {
 			log.Fatalf("error parsing %s: %v", pkgDir, err)
 		}
 	}
-	mainSections := buildSections(mainReg, "config.Config", "WALLET")
+	mainSections := buildSections(mainReg, "config.Config", "WALLET", "config")
 
 	// Parse registry config (internal/registry + internal/embed + pkg/config for cross-refs)
 	// Parse pkg/config first so its types are available but internal/registry's Config wins
@@ -484,7 +521,7 @@ func main() {
 			log.Fatalf("error parsing %s: %v", regDir, err)
 		}
 	}
-	registrySections := buildSections(regReg, "registry.Config", "REGISTRY")
+	registrySections := buildSections(regReg, "registry.Config", "REGISTRY", "registry")
 
 	// Render combined document
 	var allSections []SectionDoc
@@ -505,10 +542,10 @@ func main() {
 	markdown := renderMarkdown(allSections, "Configuration Reference")
 
 	outPath := filepath.Join(root, *outFlag)
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 		log.Fatalf("creating output dir: %v", err)
 	}
-	if err := os.WriteFile(outPath, []byte(markdown), 0o600); err != nil {
+	if err := os.WriteFile(outPath, []byte(markdown), 0o644); err != nil {
 		log.Fatalf("writing %s: %v", outPath, err)
 	}
 
