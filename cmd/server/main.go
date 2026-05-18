@@ -166,6 +166,8 @@ func main() {
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+	} else if registryCfg != nil {
+		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}
 	serverCfg.IsProduction = isProduction
 

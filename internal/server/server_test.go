@@ -395,30 +395,50 @@ func TestStartAdminServer_DevAutoGeneratesToken(t *testing.T) {
 func TestManager_ServedByMiddleware(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	cfg := &ServerConfig{
-		Roles: []string{"test"},
-		CORS: config.CORSConfig{
-			AllowedOrigins: []string{"*"},
-		},
-	}
-	// Use a custom logger to capture any issues
-	logger := zap.NewNop()
-	manager := NewManager(cfg, logger)
+	t.Run("enabled", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Roles:          []string{"test"},
+			ServedByHeader: "test-instance-42",
+			CORS: config.CORSConfig{
+				AllowedOrigins: []string{"*"},
+			},
+		}
+		manager := NewManager(cfg, zap.NewNop())
+		router := manager.buildRouter()
+		router.GET("/test", func(c *gin.Context) {
+			c.String(http.StatusOK, "ok")
+		})
 
-	// Build router and add test route
-	router := manager.buildRouter()
-	router.GET("/test", func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		router.ServeHTTP(w, req)
+
+		servedBy := w.Header().Get("X-Served-By")
+		if servedBy != "test-instance-42" {
+			t.Errorf("expected X-Served-By = %q, got %q", "test-instance-42", servedBy)
+		}
 	})
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
-	router.ServeHTTP(w, req)
+	t.Run("disabled", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Roles: []string{"test"},
+			CORS: config.CORSConfig{
+				AllowedOrigins: []string{"*"},
+			},
+		}
+		manager := NewManager(cfg, zap.NewNop())
+		router := manager.buildRouter()
+		router.GET("/test", func(c *gin.Context) {
+			c.String(http.StatusOK, "ok")
+		})
 
-	// Check that X-Served-By header is set
-	servedBy := w.Header().Get("X-Served-By")
-	if servedBy == "" {
-		// Middleware might not set if no config - this is optional
-		t.Log("X-Served-By header not set (may be expected)")
-	}
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		router.ServeHTTP(w, req)
+
+		servedBy := w.Header().Get("X-Served-By")
+		if servedBy != "" {
+			t.Errorf("expected no X-Served-By header, got %q", servedBy)
+		}
+	})
 }
