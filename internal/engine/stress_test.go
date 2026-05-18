@@ -158,6 +158,12 @@ func startFlow(t *testing.T, conn *websocket.Conn, protocol Protocol, offer stri
 // stubVCIHandler is a minimal OID4VCI handler for stress testing.
 // It requests a sign operation from the client, waits for the response,
 // and then completes (or errors if the sign times out).
+//
+// NOTE: This stub reads directly from session.signCh without MessageID matching.
+// The real Session.WaitForSign does MessageID-based matching, but for these tests
+// each session runs exactly one flow at a time, so there is no ambiguity.
+// Do not use this stub in scenarios that send sign responses to multiple
+// concurrent flows on the same session.
 type stubVCIHandler struct {
 	flow   *Flow
 	logger *zap.Logger
@@ -295,6 +301,9 @@ func TestStress_InvalidTokenHandshake(t *testing.T) {
 // during a flow. Since token is only checked at handshake, the flow should
 // still complete.
 func TestStress_ShortLivedTokenMidFlow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: requires real-time sleep for token expiry")
+	}
 	cfg := stressConfig()
 	_, wsURL, cleanup := engineServer(t, cfg)
 	defer cleanup()
@@ -422,6 +431,9 @@ func TestStress_ClientDisconnectMidFlow(t *testing.T) {
 // TestStress_SlowSignResponse verifies behavior when the client takes a long
 // time to respond to a sign request (simulates user thinking/slow network).
 func TestStress_SlowSignResponse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping: long sleep to simulate slow user")
+	}
 	cfg := stressConfig()
 	_, wsURL, cleanup := engineServer(t, cfg)
 	defer cleanup()
@@ -435,8 +447,9 @@ func TestStress_SlowSignResponse(t *testing.T) {
 	var signReq SignRequestMessage
 	require.NoError(t, json.Unmarshal(data, &signReq))
 
-	// Simulate a 30-second delay (long user interaction)
-	time.Sleep(30 * time.Second)
+	// Simulate a 5-second delay (long user interaction).
+	// The flow timeout is 5 minutes so this should complete fine.
+	time.Sleep(5 * time.Second)
 
 	// Send the response
 	signResp := SignResponseMessage{
@@ -499,6 +512,7 @@ func TestStress_MultipleUsersConcurrent(t *testing.T) {
 	const numUsers = 5
 	var wg sync.WaitGroup
 	var successes atomic.Int32
+	errCh := make(chan string, numUsers)
 
 	for i := 0; i < numUsers; i++ {
 		wg.Add(1)
@@ -508,17 +522,59 @@ func TestStress_MultipleUsersConcurrent(t *testing.T) {
 			userID := fmt.Sprintf("user-multi-%d", userIdx)
 			token := generateToken(userID, "default", time.Hour)
 
-			conn, _ := wsConnect(t, wsURL, token)
-			defer conn.Close()
-
-			flowID := startFlow(t, conn, ProtocolOID4VCI, "openid-credential-offer://test")
-
-			// Wait for sign request
-			data := readUntilType(t, conn, TypeSignRequest, 10*time.Second)
-			var signReq SignRequestMessage
-			if err := json.Unmarshal(data, &signReq); err != nil {
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + token}})
+			if err != nil {
+				errCh <- fmt.Sprintf("user %d: dial failed: %v", userIdx, err)
 				return
 			}
+			defer conn.Close()
+
+			// Wait for handshake_ack
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				errCh <- fmt.Sprintf("user %d: handshake read failed: %v", userIdx, err)
+				return
+			}
+			var ack Message
+			if err := json.Unmarshal(raw, &ack); err != nil || ack.Type != TypeHandshakeComplete {
+				errCh <- fmt.Sprintf("user %d: handshake ack unexpected: %s", userIdx, string(raw))
+				return
+			}
+
+			// Start flow
+			flowStart := FlowStartMessage{
+				Message:  Message{Type: TypeFlowStart, Timestamp: Now()},
+				Protocol: ProtocolOID4VCI,
+				Offer:    "openid-credential-offer://test",
+			}
+			if err := conn.WriteJSON(flowStart); err != nil {
+				errCh <- fmt.Sprintf("user %d: flow_start write failed: %v", userIdx, err)
+				return
+			}
+
+			// Read until sign_request
+			var signReq SignRequestMessage
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				conn.SetReadDeadline(deadline)
+				_, raw, err = conn.ReadMessage()
+				if err != nil {
+					errCh <- fmt.Sprintf("user %d: read failed waiting for sign_request: %v", userIdx, err)
+					return
+				}
+				var msg Message
+				_ = json.Unmarshal(raw, &msg)
+				if msg.Type == TypeSignRequest {
+					_ = json.Unmarshal(raw, &signReq)
+					break
+				}
+			}
+			if signReq.Type == "" {
+				errCh <- fmt.Sprintf("user %d: timed out waiting for sign_request", userIdx)
+				return
+			}
+
+			flowID := signReq.FlowID
 
 			// Respond
 			signResp := SignResponseMessage{
@@ -531,22 +587,38 @@ func TestStress_MultipleUsersConcurrent(t *testing.T) {
 				ProofJWT: "eyJhbGciOiJFUzI1NiJ9.test.sig",
 			}
 			if err := conn.WriteJSON(signResp); err != nil {
+				errCh <- fmt.Sprintf("user %d: sign_response write failed: %v", userIdx, err)
 				return
 			}
 
-			// Wait for completion
-			data = readUntilType(t, conn, TypeFlowComplete, 10*time.Second)
-			var complete FlowCompleteMessage
-			if err := json.Unmarshal(data, &complete); err != nil {
-				return
+			// Wait for flow_complete
+			for time.Now().Before(deadline) {
+				conn.SetReadDeadline(deadline)
+				_, raw, err = conn.ReadMessage()
+				if err != nil {
+					errCh <- fmt.Sprintf("user %d: read failed waiting for flow_complete: %v", userIdx, err)
+					return
+				}
+				var msg Message
+				_ = json.Unmarshal(raw, &msg)
+				if msg.Type == TypeFlowComplete {
+					var complete FlowCompleteMessage
+					_ = json.Unmarshal(raw, &complete)
+					if complete.FlowID == flowID {
+						successes.Add(1)
+					}
+					return
+				}
 			}
-			if complete.FlowID == flowID {
-				successes.Add(1)
-			}
+			errCh <- fmt.Sprintf("user %d: timed out waiting for flow_complete", userIdx)
 		}(i)
 	}
 
 	wg.Wait()
+	close(errCh)
+	for e := range errCh {
+		t.Errorf("worker error: %s", e)
+	}
 	assert.Equal(t, int32(numUsers), successes.Load(), "all users should complete their flows")
 }
 
