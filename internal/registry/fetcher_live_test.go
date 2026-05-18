@@ -14,12 +14,10 @@ import (
 )
 
 // TestIntegration_LiveRegistry_TS11 fetches the live registry.siros.org TS11
-// schemas API and validates that the implementation correctly parses the response.
+// schemas API and validates that the implementation correctly parses the
+// paginated response ({"data": [...], "total", "limit", "offset"}).
 //
-// The test is skipped when running with -short to allow CI pipelines that do not
-// have outbound network access to pass cleanly.  To run it explicitly:
-//
-//	go test ./internal/registry/... -run TestIntegration_LiveRegistry_TS11 -v
+// Run explicitly with: go test -tags=integration ./internal/registry/... -run TestIntegration_LiveRegistry_TS11 -v
 func TestIntegration_LiveRegistry_TS11(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live-network integration test in short mode")

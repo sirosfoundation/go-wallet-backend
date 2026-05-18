@@ -53,14 +53,76 @@ type CredentialSource struct {
 	Branch     string `json:"branch,omitempty"`
 }
 
-// TS11SchemasResponse represents the paginated response from /api/v1/schemas.json
+// TS11SchemasResponse represents the paginated response from /api/v1/schemas.json.
+// It supports two wire formats:
+//   - Legacy: {"schemas": [...], "next": "...", "total": N, "page": N, "pageSize": N}
+//   - Current: {"data": [...], "total": N, "limit": N, "offset": N}
 type TS11SchemasResponse struct {
-	Schemas  []TS11SchemaMeta `json:"schemas"`
-	Total    int              `json:"total,omitempty"`
-	Page     int              `json:"page,omitempty"`
-	PageSize int              `json:"pageSize,omitempty"`
-	// Next is the URL of the next page; empty when there are no more pages
+	// Schemas is the legacy key for the schema array.
+	Schemas []TS11SchemaMeta `json:"schemas"`
+	// Data is the current key for the schema array (paginated TS11 API).
+	Data []TS11SchemaMeta `json:"data"`
+
+	Total    int `json:"total,omitempty"`
+	Page     int `json:"page,omitempty"`
+	PageSize int `json:"pageSize,omitempty"`
+	Limit    int `json:"limit,omitempty"`
+	Offset   int `json:"offset,omitempty"`
+	// Next is the URL of the next page; empty when there are no more pages (legacy pagination).
 	Next string `json:"next,omitempty"`
+}
+
+// Entries returns whichever schema array is populated (Data takes precedence over Schemas).
+func (r *TS11SchemasResponse) Entries() []TS11SchemaMeta {
+	if len(r.Data) > 0 {
+		return r.Data
+	}
+	return r.Schemas
+}
+
+// HasMorePages returns true if there are additional pages to fetch.
+func (r *TS11SchemasResponse) HasMorePages() bool {
+	// Legacy: "next" URL
+	if r.Next != "" {
+		return true
+	}
+	// Current: offset+limit < total
+	if r.Limit > 0 && r.Offset+len(r.Entries()) < r.Total {
+		return true
+	}
+	return false
+}
+
+// NextPageURL returns the URL for the next page. For legacy format it returns
+// the "next" field directly. For the current format it constructs the URL by
+// incrementing the offset. baseURL is the original source URL.
+func (r *TS11SchemasResponse) NextPageURL(baseURL string) string {
+	if r.Next != "" {
+		return r.Next
+	}
+	// Build offset-based next URL
+	nextOffset := r.Offset + len(r.Entries())
+	sep := "?"
+	if strings.Contains(baseURL, "?") {
+		sep = "&"
+	}
+	// Strip any existing offset param from baseURL
+	clean := baseURL
+	if idx := strings.Index(clean, "offset="); idx > 0 {
+		// Remove offset=N (and preceding & or ?)
+		end := strings.IndexByte(clean[idx:], '&')
+		if end == -1 {
+			clean = clean[:idx-1] // remove the preceding ? or &
+		} else {
+			clean = clean[:idx] + clean[idx+end+1:]
+		}
+		if !strings.Contains(clean, "?") {
+			sep = "?"
+		} else {
+			sep = "&"
+		}
+	}
+	return fmt.Sprintf("%s%soffset=%d", clean, sep, nextOffset)
 }
 
 // TS11SchemaMeta represents a single schema entry in the TS11 API
@@ -223,9 +285,11 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 	}
 
 	// Auto-detect format based on top-level JSON keys.
-	// TS11 /api/v1/schemas.json has a "schemas" array.
-	// Legacy vctm-registry.json has a "credentials" array.
+	// Current TS11: {"data": [...], "total": N, "limit": N, "offset": N}
+	// Legacy TS11:  {"schemas": [...], "next": "...", ...}
+	// Legacy index: {"credentials": [...], ...}
 	var detector struct {
+		Data        json.RawMessage `json:"data"`
 		Schemas     json.RawMessage `json:"schemas"`
 		Credentials json.RawMessage `json:"credentials"`
 	}
@@ -237,14 +301,14 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 		return f.processLegacyResponse(ctx, source, body)
 	}
 
-	if detector.Schemas != nil {
+	if detector.Data != nil || detector.Schemas != nil {
 		return f.processTS11Response(ctx, source, body)
 	}
 	return f.processLegacyResponse(ctx, source, body)
 }
 
 // processTS11Response processes a TS11-format /api/v1/schemas.json response,
-// including following pagination via the "next" field.
+// including following pagination via offset/limit or legacy "next" field.
 func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount, errorCount int
@@ -256,7 +320,7 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 			return nil, fmt.Errorf("failed to unmarshal TS11 schemas response: %w", err)
 		}
 
-		for _, schema := range page.Schemas {
+		for _, schema := range page.Entries() {
 			// Determine which schemaURI to use as the VCTM fetch URL.
 			// Prefer the dc+sd-jwt entry; fall back to the first URI.
 			var vctmURI string
@@ -300,14 +364,15 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 			fetchedCount++
 		}
 
-		// Follow pagination if a next-page URL is provided.
-		if page.Next == "" {
+		// Follow pagination if more pages are available.
+		if !page.HasMorePages() {
 			break
 		}
-		nextBody, err := f.fetchRaw(ctx, page.Next)
+		nextURL := page.NextPageURL(source.URL)
+		nextBody, err := f.fetchRaw(ctx, nextURL)
 		if err != nil {
 			f.logger.Warn("failed to fetch next page of schemas",
-				zap.String("url", page.Next),
+				zap.String("url", nextURL),
 				zap.Error(err))
 			break
 		}
