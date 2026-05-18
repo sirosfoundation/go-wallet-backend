@@ -152,6 +152,11 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clear the write deadline inherited from net/http's WriteTimeout.
+	// After upgrade, the WebSocket connection manages its own deadlines;
+	// the stale deadline would cause writes to fail after the timeout elapses.
+	_ = conn.SetWriteDeadline(time.Time{})
+
 	m.logger.Debug("WebSocket client connected")
 	go m.handleNewConnection(conn)
 }
