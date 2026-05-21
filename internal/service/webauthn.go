@@ -492,7 +492,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	s.logger.Debug("Parsing credential response",
 		zap.Int("original_len", len(req.Credential)),
 		zap.Int("decoded_len", len(credData)),
-		zap.ByteString("decoded_preview", credData[:min(500, len(credData))]),
+		zap.ByteString("decoded_preview", credData[:min(1000, len(credData))]),
 	)
 
 	parsedResponse, err := protocol.ParseCredentialCreationResponseBody(
@@ -829,6 +829,14 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 
 	// Delete challenge (one-time use)
 	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
+
+	// Debug: log the credential data being parsed
+	credData := taggedbinary.MustDecodeJSON(req.Credential)
+	s.logger.Debug("Parsing credential assertion response",
+		zap.Int("original_len", len(req.Credential)),
+		zap.Int("decoded_len", len(credData)),
+		zap.ByteString("decoded_preview", credData[:min(1000, len(credData))]),
+	)
 
 	// Parse the credential assertion response
 	parsedResponse, err := protocol.ParseCredentialRequestResponseBody(
