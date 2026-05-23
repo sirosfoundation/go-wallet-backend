@@ -1,0 +1,110 @@
+# Trigger conformance tests via @conformance in a PR comment.
+#
+# Copy this file into your repo as .github/workflows/conformance.yml.
+#
+# Usage — add a comment on any PR:
+#   @conformance                                    → all profiles, :latest
+#   @conformance issuer                             → issuer profile only
+#   @conformance wallet                             → wallet profile only
+#   @conformance vc-issuer:pr-42                    → auto-detect profile
+#   @conformance wallet wallet-frontend:pr-111      → explicit profile + override
+#   @conformance vc-issuer:pr-42 go-trust:sha-abc   → multiple overrides
+#
+# Prerequisites:
+#   - CONFORMANCE_DISPATCH_TOKEN secret: PAT with repo scope for
+#     sirosfoundation/siros-conformance (to trigger repository_dispatch)
+#
+# Flow:
+#   1. Comment containing @conformance is posted on a PR
+#   2. This workflow parses the comment for profile + image overrides
+#   3. Fires repository_dispatch on siros-conformance for each profile
+#   4. Conformance results are posted back as a comment on the PR
+
+name: Conformance Tests
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger-conformance:
+    runs-on: ubuntu-latest
+    # Only run on PR comments (not issue comments) containing @conformance
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@conformance')
+    steps:
+      - name: Acknowledge trigger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content=rocket \
+            --silent
+
+      - name: Checkout siros-conformance scripts
+        uses: actions/checkout@v4
+        with:
+          repository: sirosfoundation/siros-conformance
+          sparse-checkout: scripts
+          path: _conformance
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Parse comment
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          PARSED=$(echo "$COMMENT_BODY" | node _conformance/scripts/parse-comment.mjs)
+          echo "parsed=${PARSED}" >> $GITHUB_OUTPUT
+          echo "Parsed: ${PARSED}"
+
+      - name: Dispatch conformance tests
+        env:
+          GH_TOKEN: ${{ secrets.CONFORMANCE_DISPATCH_TOKEN }}
+        run: |
+          PARSED='${{ steps.parse.outputs.parsed }}'
+          EVENTS=$(echo "$PARSED" | jq -r '.["dispatch-events"][]')
+          OVERRIDES=$(echo "$PARSED" | jq -c '.["image-overrides"]')
+          PR_NUMBER=${{ github.event.issue.number }}
+          REPO=${{ github.repository }}
+
+          for EVENT in $EVENTS; do
+            echo "Dispatching ${EVENT} with overrides=${OVERRIDES}"
+            gh api repos/sirosfoundation/siros-conformance/dispatches \
+              -f event_type="${EVENT}" \
+              -f "client_payload[target-repo]=${REPO}" \
+              -f "client_payload[target-pr]=${PR_NUMBER}" \
+              -f "client_payload[image-overrides]=${OVERRIDES}"
+          done
+
+      - name: Post status comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PARSED='${{ steps.parse.outputs.parsed }}'
+          PROFILES=$(echo "$PARSED" | jq -r '.profiles | join(", ")')
+          OVERRIDES=$(echo "$PARSED" | jq -r '
+            .["image-overrides"] |
+            to_entries |
+            if length == 0 then "none (using :latest)"
+            else map("\(.key):\(.value)") | join(", ")
+            end
+          ')
+          RUN_URL="${{ github.server_url }}/sirosfoundation/siros-conformance/actions"
+
+          BODY="🚀 **Conformance tests triggered**
+          
+          | | |
+          |---|---|
+          | **Profiles** | ${PROFILES} |
+          | **Image overrides** | ${OVERRIDES} |
+          | **Results** | [siros-conformance actions](${RUN_URL}) |
+          
+          Results will be posted here when complete."
+
+          gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
+            -f body="${BODY}"
