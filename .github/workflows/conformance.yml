@@ -11,8 +11,8 @@
 #   @conformance vc-issuer:pr-42 go-trust:sha-abc   → multiple overrides
 #
 # Prerequisites:
-#   - CONFORMANCE_DISPATCH_TOKEN secret: PAT with repo scope for
-#     sirosfoundation/siros-conformance (to trigger repository_dispatch)
+#   - CONFORMANCE_DISPATCH_TOKEN secret: fine-grained PAT with Contents
+#     read/write on sirosfoundation/siros-conformance (to trigger repository_dispatch)
 #
 # Flow:
 #   1. Comment containing @conformance is posted on a PR
@@ -26,13 +26,23 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
 jobs:
   trigger-conformance:
     runs-on: ubuntu-latest
-    # Only run on PR comments (not issue comments) containing @conformance
+    # Only run on PR comments from org members/collaborators starting with @conformance
     if: |
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@conformance')
+      startsWith(github.event.comment.body, '@conformance') &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
     steps:
       - name: Acknowledge trigger
         env:
@@ -43,13 +53,14 @@ jobs:
             --silent
 
       - name: Checkout siros-conformance scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: sirosfoundation/siros-conformance
+          ref: main
           sparse-checkout: scripts
           path: _conformance
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
 
