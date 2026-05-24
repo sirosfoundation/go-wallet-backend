@@ -1,24 +1,9 @@
 # Trigger conformance tests via @conformance in a PR comment.
-#
-# Copy this file into your repo as .github/workflows/conformance.yml.
-#
-# Usage — add a comment on any PR:
-#   @conformance                                    → all profiles, :latest
-#   @conformance issuer                             → issuer profile only
-#   @conformance wallet                             → wallet profile only
-#   @conformance vc-issuer:pr-42                    → auto-detect profile
-#   @conformance wallet wallet-frontend:pr-111      → explicit profile + override
-#   @conformance vc-issuer:pr-42 go-trust:sha-abc   → multiple overrides
+# See https://developers.siros.org/docs/howto/running-conformance-tests
 #
 # Prerequisites:
 #   - CONFORMANCE_DISPATCH_TOKEN secret: fine-grained PAT with Contents
 #     read/write on sirosfoundation/siros-conformance (to trigger repository_dispatch)
-#
-# Flow:
-#   1. Comment containing @conformance is posted on a PR
-#   2. This workflow parses the comment for profile + image overrides
-#   3. Fires repository_dispatch on siros-conformance for each profile
-#   4. Conformance results are posted back as a comment on the PR
 
 name: Conformance Tests
 
