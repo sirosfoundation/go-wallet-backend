@@ -1,5 +1,5 @@
 # Trigger conformance tests via @conformance in a PR comment.
-# See https://developers.siros.org/docs/howto/running-conformance-tests
+# See https://developers.siros.org/howto/running-conformance-tests
 #
 # Prerequisites:
 #   - CONFORMANCE_DISPATCH_TOKEN secret: fine-grained PAT with Contents
