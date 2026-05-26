@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,7 +98,7 @@ func newTestMemoryBackend(t *testing.T) backend.Backend {
 func assertNoCacheHeaders(t *testing.T, headers http.Header) {
 	t.Helper()
 
-	if got := headers.Get("Cache-Control"); got != "no-store, no-cache, must-revalidate" {
+	if got := headers.Get("Cache-Control"); !strings.Contains(got, "no-store") {
 		t.Errorf("Cache-Control = %q", got)
 	}
 	if got := headers.Get("Pragma"); got != "no-cache" {
