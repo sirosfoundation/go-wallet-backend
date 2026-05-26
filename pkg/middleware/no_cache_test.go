@@ -20,13 +20,13 @@ func TestNoCacheMiddleware_SetsHeaders(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	if got := w.Header().Get("Cache-Control"); got != noCacheControlValue {
-		t.Fatalf("Cache-Control = %q, want %q", got, noCacheControlValue)
+		t.Errorf("Cache-Control = %q, want %q", got, noCacheControlValue)
 	}
 	if got := w.Header().Get("Pragma"); got != "no-cache" {
-		t.Fatalf("Pragma = %q, want %q", got, "no-cache")
+		t.Errorf("Pragma = %q, want %q", got, "no-cache")
 	}
 	if got := w.Header().Get("Expires"); got != "0" {
-		t.Fatalf("Expires = %q, want %q", got, "0")
+		t.Errorf("Expires = %q, want %q", got, "0")
 	}
 }
 
@@ -45,12 +45,12 @@ func TestNoCacheMiddleware_AllowsExplicitOverride(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	if got := w.Header().Get("Cache-Control"); got != "private, max-age=60" {
-		t.Fatalf("Cache-Control = %q, want override", got)
+		t.Errorf("Cache-Control = %q, want override", got)
 	}
 	if got := w.Header().Get("Pragma"); got != "custom" {
-		t.Fatalf("Pragma = %q, want override", got)
+		t.Errorf("Pragma = %q, want override", got)
 	}
 	if got := w.Header().Get("Expires"); got != "60" {
-		t.Fatalf("Expires = %q, want override", got)
+		t.Errorf("Expires = %q, want override", got)
 	}
 }

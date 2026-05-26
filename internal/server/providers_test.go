@@ -107,13 +107,13 @@ func assertNoCacheHeaders(t *testing.T, headers http.Header) {
 	t.Helper()
 
 	if got := headers.Get("Cache-Control"); got != "no-store, no-cache, must-revalidate" {
-		t.Fatalf("Cache-Control = %q", got)
+		t.Errorf("Cache-Control = %q", got)
 	}
 	if got := headers.Get("Pragma"); got != "no-cache" {
-		t.Fatalf("Pragma = %q", got)
+		t.Errorf("Pragma = %q", got)
 	}
 	if got := headers.Get("Expires"); got != "0" {
-		t.Fatalf("Expires = %q", got)
+		t.Errorf("Expires = %q", got)
 	}
 }
 
