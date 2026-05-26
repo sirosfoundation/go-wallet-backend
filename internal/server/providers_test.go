@@ -91,15 +91,6 @@ func newTestMemoryBackend(t *testing.T) backend.Backend {
 	t.Helper()
 
 	store := memory.NewStore()
-	if _, err := store.Tenants().GetByID(context.Background(), domain.DefaultTenantID); err != nil {
-		if err := store.Tenants().Create(context.Background(), &domain.Tenant{
-			ID:      domain.DefaultTenantID,
-			Name:    "Default",
-			Enabled: true,
-		}); err != nil {
-			t.Fatalf("create default tenant: %v", err)
-		}
-	}
 	return &memoryBackend{store: store}
 }
 
