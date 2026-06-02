@@ -796,6 +796,16 @@ func (h *AuthZENProxyHandler) inlineLogos(ctx context.Context, metadata map[stri
 					}
 				}
 			}
+			// Inline logos in credential_metadata.display (merged VCTM)
+			if credMeta, ok := cc["credential_metadata"].(map[string]interface{}); ok {
+				if display, ok := credMeta["display"].([]interface{}); ok {
+					for _, d := range display {
+						if dm, ok := d.(map[string]interface{}); ok {
+							h.inlineLogoField(ctx, dm)
+						}
+					}
+				}
+			}
 		}
 	}
 }
