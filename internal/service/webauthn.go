@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/golang-jwt/jwt/v5"
+	cryptoutil "github.com/sirosfoundation/go-cryptoutil"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -509,10 +511,27 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// Verify the registration using CreateCredential
 	credential, err := s.webauthn.CreateCredential(waUser, sessionData, parsedResponse)
 	if err != nil {
+		sigLen, sigHash, normalizedChanged, normalizeErr := attestationSignatureDiagnostics(parsedResponse.Response.AttestationObject)
+		leafCertHash, leafCertLen := attestationLeafCertDiagnostics(parsedResponse.Response.AttestationObject)
+		signatureInputHash := attestationSignatureInputHash(
+			parsedResponse.Response.AttestationObject.RawAuthData,
+			parsedResponse.Raw.AttestationResponse.ClientDataJSON,
+		)
+
 		// Log failure at error level
 		s.logger.Error("Failed to verify registration",
 			zap.Error(err),
 			zap.String("error_type", fmt.Sprintf("%T", err)),
+			zap.String("attestation_format", parsedResponse.Response.AttestationObject.Format),
+			zap.String("auth_data_sha256", sha256Hex(parsedResponse.Response.AttestationObject.RawAuthData)),
+			zap.String("client_data_json_sha256", sha256Hex(parsedResponse.Raw.AttestationResponse.ClientDataJSON)),
+			zap.String("signature_input_sha256", signatureInputHash),
+			zap.Int("signature_len", sigLen),
+			zap.String("signature_sha256", sigHash),
+			zap.Bool("signature_normalized_changed", normalizedChanged),
+			zap.String("signature_normalize_error", normalizeErr),
+			zap.Int("x5c_leaf_len", leafCertLen),
+			zap.String("x5c_leaf_sha256", leafCertHash),
 		)
 
 		// Log detailed attestation data at debug level for troubleshooting
@@ -1546,6 +1565,59 @@ func (r *credentialReader) Read(p []byte) (n int, err error) {
 	n = copy(p, r.data[r.offset:])
 	r.offset += n
 	return n, nil
+}
+
+func sha256Hex(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h[:])
+}
+
+func attestationSignatureInputHash(authData, clientDataJSON []byte) string {
+	if len(authData) == 0 || len(clientDataJSON) == 0 {
+		return ""
+	}
+
+	clientHash := sha256.Sum256(clientDataJSON)
+	data := make([]byte, 0, len(authData)+len(clientHash))
+	data = append(data, authData...)
+	data = append(data, clientHash[:]...)
+
+	return sha256Hex(data)
+}
+
+func attestationSignatureDiagnostics(att protocol.AttestationObject) (sigLen int, sigHash string, normalizedChanged bool, normalizeErr string) {
+	rawSig, ok := att.AttStatement["sig"].([]byte)
+	if !ok || len(rawSig) == 0 {
+		return 0, "", false, "signature-not-present"
+	}
+
+	sigLen = len(rawSig)
+	sigHash = sha256Hex(rawSig)
+
+	normalized, err := cryptoutil.NormalizeECDSASignature(rawSig)
+	if err != nil {
+		return sigLen, sigHash, false, err.Error()
+	}
+
+	return sigLen, sigHash, !bytes.Equal(rawSig, normalized), ""
+}
+
+func attestationLeafCertDiagnostics(att protocol.AttestationObject) (leafCertHash string, leafCertLen int) {
+	x5c, ok := att.AttStatement["x5c"].([]any)
+	if !ok || len(x5c) == 0 {
+		return "", 0
+	}
+
+	leaf, ok := x5c[0].([]byte)
+	if !ok || len(leaf) == 0 {
+		return "", 0
+	}
+
+	return sha256Hex(leaf), len(leaf)
 }
 
 // TenantWebAuthnUser wraps a user with a tenant-scoped user handle
