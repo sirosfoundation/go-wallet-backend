@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,13 +13,13 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
-	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 func init() {
@@ -98,7 +97,7 @@ func newTestMemoryBackend(t *testing.T) backend.Backend {
 func assertNoCacheHeaders(t *testing.T, headers http.Header) {
 	t.Helper()
 
-	if got := headers.Get("Cache-Control"); !strings.Contains(got, "no-store") {
+	if got := headers.Get("Cache-Control"); got != middleware.NoCacheControlValue {
 		t.Errorf("Cache-Control = %q", got)
 	}
 	if got := headers.Get("Pragma"); got != "no-cache" {
