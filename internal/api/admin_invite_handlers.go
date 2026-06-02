@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
 
 // CreateInviteRequest represents the request body for creating an invite
@@ -113,10 +114,26 @@ func (h *AdminHandlers) CreateInvite(c *gin.Context) {
 
 	if err := h.store.Invites().Create(c.Request.Context(), invite); err != nil {
 		h.logger.Error("Failed to create invite", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "invite.create",
+			ResourceType: "invite",
+			ResourceID:   invite.ID,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create invite"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "invite.create",
+		ResourceType: "invite",
+		ResourceID:   invite.ID,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Invite created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", invite.ID))
@@ -241,10 +258,26 @@ func (h *AdminHandlers) UpdateInvite(c *gin.Context) {
 
 	if err := h.store.Invites().Update(c.Request.Context(), invite); err != nil {
 		h.logger.Error("Failed to update invite", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "invite.update",
+			ResourceType: "invite",
+			ResourceID:   inviteID,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update invite"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "invite.update",
+		ResourceType: "invite",
+		ResourceID:   inviteID,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Invite updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", inviteID),
@@ -277,10 +310,26 @@ func (h *AdminHandlers) DeleteInvite(c *gin.Context) {
 
 	if err := h.store.Invites().Delete(c.Request.Context(), tenantID, inviteID); err != nil {
 		h.logger.Error("Failed to delete invite", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "invite.delete",
+			ResourceType: "invite",
+			ResourceID:   inviteID,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete invite"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "invite.delete",
+		ResourceType: "invite",
+		ResourceID:   inviteID,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Invite deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", inviteID))
