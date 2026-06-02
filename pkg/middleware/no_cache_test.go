@@ -19,8 +19,8 @@ func TestNoCacheMiddleware_SetsHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	router.ServeHTTP(w, req)
 
-	if got := w.Header().Get("Cache-Control"); got != noCacheControlValue {
-		t.Errorf("Cache-Control = %q, want %q", got, noCacheControlValue)
+	if got := w.Header().Get("Cache-Control"); got != NoCacheControlValue {
+		t.Errorf("Cache-Control = %q, want %q", got, NoCacheControlValue)
 	}
 	if got := w.Header().Get("Pragma"); got != "no-cache" {
 		t.Errorf("Pragma = %q, want %q", got, "no-cache")
