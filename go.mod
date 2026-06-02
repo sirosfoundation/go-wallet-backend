@@ -12,7 +12,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/redis/go-redis/v9 v9.19.0
+	github.com/redis/go-redis/v9 v9.20.0
 	github.com/sirosfoundation/go-cryptoutil v0.5.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-trust v0.5.0
