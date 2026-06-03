@@ -118,6 +118,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", p.handlers.DeleteWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/deactivate", p.handlers.DeactivateWebAuthnCredential)
+			session.POST("/webauthn/deactivate-all", p.handlers.DeactivateAllWebAuthnCredentials)
 		}
 		protected.DELETE("/user/session", p.handlers.DeleteUser)
 
@@ -436,7 +438,7 @@ func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlersWithUserService(p.store, p.Services().User, p.logger)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 

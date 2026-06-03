@@ -2,14 +2,17 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
@@ -533,6 +536,98 @@ func TestAdminHandlers_TenantUsers(t *testing.T) {
 
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+		}
+	})
+}
+
+func TestAdminHandlers_UserCredentials(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	router.POST("/admin/tenants", handlers.CreateTenant)
+	router.POST("/admin/tenants/:id/users", handlers.AddUserToTenant)
+	router.GET("/admin/tenants/:id/users/:user_id/credentials", handlers.ListUserCredentials)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/deactivate-all", handlers.DeactivateAllUserCredentials)
+
+	createTenantReq := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(`{"id":"cred-admin","name":"Cred Admin"}`))
+	createTenantReq.Header.Set("Content-Type", "application/json")
+	createTenantResp := httptest.NewRecorder()
+	router.ServeHTTP(createTenantResp, createTenantReq)
+	if createTenantResp.Code != http.StatusCreated {
+		t.Fatalf("Expected tenant create 201, got %d", createTenantResp.Code)
+	}
+
+	displayName := "Credential User"
+	user := &domain.User{
+		UUID:        domain.NewUserID(),
+		DID:         "did:key:admin-cred-user",
+		DisplayName: &displayName,
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-a", CreatedAt: time.Now(), PRFCapable: true},
+			{ID: "cred-b", CreatedAt: time.Now(), Status: "deactivated"},
+		},
+		PrivateData:     []byte(`{"encrypted":"data"}`),
+		PrivateDataETag: domain.ComputePrivateDataETag([]byte(`{"encrypted":"data"}`)),
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+	if err := handlers.store.Users().Create(context.Background(), user); err != nil {
+		t.Fatalf("create user error: %v", err)
+	}
+
+	addMemberReq := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users", bytes.NewBufferString(`{"user_id":"`+user.UUID.String()+`"}`))
+	addMemberReq.Header.Set("Content-Type", "application/json")
+	addMemberResp := httptest.NewRecorder()
+	router.ServeHTTP(addMemberResp, addMemberReq)
+	if addMemberResp.Code != http.StatusOK {
+		t.Fatalf("Expected add member 200, got %d", addMemberResp.Code)
+	}
+
+	t.Run("list credentials returns normalized statuses", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Credentials []AdminCredentialResponse `json:"credentials"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if len(body.Credentials) != 2 {
+			t.Fatalf("Expected 2 credentials, got %d", len(body.Credentials))
+		}
+		if body.Credentials[0].Status == "" || body.Credentials[1].Status == "" {
+			t.Fatal("Expected non-empty status for all credentials")
+		}
+	})
+
+	t.Run("deactivate single credential", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/cred-a/deactivate", bytes.NewBufferString(`{"reason":"lost device"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var body AdminCredentialResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if body.DeactivatedBy != "provider" || body.Status != "deactivated" || body.DeactivationReason != "lost device" {
+			t.Fatalf("unexpected response: %+v", body)
+		}
+	})
+
+	t.Run("deactivate all credentials conflicts when none active", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/deactivate-all", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("Expected status 409, got %d: %s", w.Code, w.Body.String())
 		}
 	})
 }

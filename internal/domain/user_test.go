@@ -200,6 +200,48 @@ func TestWebauthnCredential_Fields(t *testing.T) {
 	}
 }
 
+func TestWebauthnCredential_IsActive(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "empty status is active", status: "", want: true},
+		{name: "active status", status: "active", want: true},
+		{name: "deactivated status", status: "deactivated", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cred := WebauthnCredential{Status: tt.status}
+			if got := cred.IsActive(); got != tt.want {
+				t.Errorf("IsActive() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWebauthnCredential_NormalizedStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+		want   string
+	}{
+		{name: "empty status normalizes to active", status: "", want: "active"},
+		{name: "active status stays active", status: "active", want: "active"},
+		{name: "deactivated status stays deactivated", status: "deactivated", want: "deactivated"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cred := WebauthnCredential{Status: tt.status}
+			if got := cred.NormalizedStatus(); got != tt.want {
+				t.Errorf("NormalizedStatus() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRegisterRequest_Fields(t *testing.T) {
 	username := "newuser"
 	password := "secret123"
