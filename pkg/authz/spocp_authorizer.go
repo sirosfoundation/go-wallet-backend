@@ -263,6 +263,35 @@ func DefaultWalletRules() []sexp.Element {
 				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
 			),
 		),
+
+		// Rule 6: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
+		// Used by /v1/resolve with resource_type="oauth-authorization-server" to fetch RFC 8414 metadata.
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("oauth-authorization-server")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
+			),
+		),
+
+		// Rule 7: Allow OAuth authorization server metadata resolution for HTTP URLs (dev environments)
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", sexp.NewAtom("oauth-authorization-server")),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "http://"}),
+			),
+		),
 	}
 }
 
