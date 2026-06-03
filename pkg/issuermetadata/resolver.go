@@ -168,8 +168,9 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// A trailing slash is stripped before fetching. The endpoint queried follows
-// RFC 8615: https://{host}/.well-known/openid-credential-issuer{path}.
+// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
+// The endpoint queried follows RFC 8615:
+// https://{host}/.well-known/openid-credential-issuer{path}.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).

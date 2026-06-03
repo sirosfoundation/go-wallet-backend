@@ -660,6 +660,18 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
+	// Log public key diagnostics for registration
+	if s.logger.Core().Enabled(zap.DebugLevel) {
+		publicKeyHash := sha256Hex(credential.PublicKey)
+		s.logger.Debug("Registration: storing credential with public key",
+			zap.String("user_id", userID.String()),
+			zap.String("stored_public_key_sha256", publicKeyHash),
+			zap.Int("stored_public_key_len", len(credential.PublicKey)),
+			zap.String("attestation_type", credential.AttestationType),
+			zap.String("credential_id", base64.RawURLEncoding.EncodeToString(credential.ID)),
+		)
+	}
+
 	// Bind enterprise identity if OIDC gate binding was provided
 	if req.OIDCGateBinding != nil && tenantID != "" {
 		user.AddEnterpriseIdentity(domain.EnterpriseIdentity{
@@ -1028,6 +1040,10 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				parsedResponse.Raw.AssertionResponse.ClientDataJSON,
 			)
 
+			// Diagnostic info about stored public key
+			storedPublicKeyHash := sha256Hex(matchedCred.PublicKey)
+			storedPublicKeyLen := len(matchedCred.PublicKey)
+
 			s.logger.Debug("Login verification fingerprints",
 				zap.Error(err),
 				zap.String("auth_data_sha256", sha256Hex(parsedResponse.Raw.AssertionResponse.AuthenticatorData)),
@@ -1039,6 +1055,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("signature_normalize_error", normalizeErr),
 				zap.Uint32("sign_count", parsedResponse.Response.AuthenticatorData.Counter),
 				zap.String("credential_id", credentialID),
+				zap.String("stored_public_key_sha256", storedPublicKeyHash),
+				zap.Int("stored_public_key_len", storedPublicKeyLen),
 			)
 		}
 
@@ -1048,6 +1066,18 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// Update the credential's signature count
 	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
 	user.UpdatedAt = time.Now()
+
+	// Log public key diagnostics for successful login
+	if s.logger.Core().Enabled(zap.DebugLevel) {
+		storedPublicKeyHash := sha256Hex(matchedCred.PublicKey)
+		storedPublicKeyLen := len(matchedCred.PublicKey)
+		s.logger.Debug("Login verification succeeded",
+			zap.String("user_id", userID.String()),
+			zap.String("stored_public_key_sha256", storedPublicKeyHash),
+			zap.Int("stored_public_key_len", storedPublicKeyLen),
+			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+		)
+	}
 
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		s.logger.Error("Failed to update user", zap.Error(err))
