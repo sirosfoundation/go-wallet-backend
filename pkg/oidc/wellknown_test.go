@@ -23,10 +23,10 @@ func TestWellKnownURL(t *testing.T) {
 			want:    "https://example.com/.well-known/openid-credential-issuer/test/a/alias",
 		},
 		{
-			name:    "trailing slash preserved",
+			name:    "trailing slash stripped",
 			baseURL: "https://example.com/issuer/",
 			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/issuer/",
+			want:    "https://example.com/.well-known/openid-credential-issuer/issuer",
 		},
 		{
 			name:    "oauth authorization server",
