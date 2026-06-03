@@ -1011,7 +1011,25 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		parsedResponse,
 	)
 	if err != nil {
-		s.logger.Error("Failed to verify login", zap.Error(err))
+		sigLen, sigHash, normalizedChanged, normalizeErr := assertionSignatureDiagnostics(parsedResponse.Response.Signature)
+		signatureInputHash := attestationSignatureInputHash(
+			parsedResponse.Raw.AssertionResponse.AuthenticatorData,
+			parsedResponse.Raw.AssertionResponse.ClientDataJSON,
+		)
+
+		s.logger.Error("Failed to verify login",
+			zap.Error(err),
+			zap.String("error_type", fmt.Sprintf("%T", err)),
+			zap.String("auth_data_sha256", sha256Hex(parsedResponse.Raw.AssertionResponse.AuthenticatorData)),
+			zap.String("client_data_json_sha256", sha256Hex(parsedResponse.Raw.AssertionResponse.ClientDataJSON)),
+			zap.String("signature_input_sha256", signatureInputHash),
+			zap.Int("signature_len", sigLen),
+			zap.String("signature_sha256", sigHash),
+			zap.Bool("signature_normalized_changed", normalizedChanged),
+			zap.String("signature_normalize_error", normalizeErr),
+			zap.Uint32("sign_count", parsedResponse.Response.AuthenticatorData.Counter),
+			zap.String("credential_id", credentialID),
+		)
 		return nil, ErrVerificationFailed
 	}
 
@@ -1592,6 +1610,22 @@ func attestationSignatureInputHash(authData, clientDataJSON []byte) string {
 func attestationSignatureDiagnostics(att protocol.AttestationObject) (sigLen int, sigHash string, normalizedChanged bool, normalizeErr string) {
 	rawSig, ok := att.AttStatement["sig"].([]byte)
 	if !ok || len(rawSig) == 0 {
+		return 0, "", false, "signature-not-present"
+	}
+
+	sigLen = len(rawSig)
+	sigHash = sha256Hex(rawSig)
+
+	normalized, err := cryptoutil.NormalizeECDSASignature(rawSig)
+	if err != nil {
+		return sigLen, sigHash, false, err.Error()
+	}
+
+	return sigLen, sigHash, !bytes.Equal(rawSig, normalized), ""
+}
+
+func assertionSignatureDiagnostics(rawSig []byte) (sigLen int, sigHash string, normalizedChanged bool, normalizeErr string) {
+	if len(rawSig) == 0 {
 		return 0, "", false, "signature-not-present"
 	}
 
