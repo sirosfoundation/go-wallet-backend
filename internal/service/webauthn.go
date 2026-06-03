@@ -511,32 +511,36 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// Verify the registration using CreateCredential
 	credential, err := s.webauthn.CreateCredential(waUser, sessionData, parsedResponse)
 	if err != nil {
-		sigLen, sigHash, normalizedChanged, normalizeErr := attestationSignatureDiagnostics(parsedResponse.Response.AttestationObject)
-		leafCertHash, leafCertLen := attestationLeafCertDiagnostics(parsedResponse.Response.AttestationObject)
-		signatureInputHash := attestationSignatureInputHash(
-			parsedResponse.Response.AttestationObject.RawAuthData,
-			parsedResponse.Raw.AttestationResponse.ClientDataJSON,
-		)
-
 		// Log failure at error level
 		s.logger.Error("Failed to verify registration",
 			zap.Error(err),
 			zap.String("error_type", fmt.Sprintf("%T", err)),
-			zap.String("attestation_format", parsedResponse.Response.AttestationObject.Format),
-			zap.String("auth_data_sha256", sha256Hex(parsedResponse.Response.AttestationObject.RawAuthData)),
-			zap.String("client_data_json_sha256", sha256Hex(parsedResponse.Raw.AttestationResponse.ClientDataJSON)),
-			zap.String("signature_input_sha256", signatureInputHash),
-			zap.Int("signature_len", sigLen),
-			zap.String("signature_sha256", sigHash),
-			zap.Bool("signature_normalized_changed", normalizedChanged),
-			zap.String("signature_normalize_error", normalizeErr),
-			zap.Int("x5c_leaf_len", leafCertLen),
-			zap.String("x5c_leaf_sha256", leafCertHash),
 		)
 
-		// Log detailed attestation data at debug level for troubleshooting
-		// Guard with level check to avoid expensive encoding when debug is disabled
+		// Log detailed diagnostics at debug level for troubleshooting
+		// Guard with level check to avoid expensive hashing when debug is disabled
 		if s.logger.Core().Enabled(zap.DebugLevel) {
+			sigLen, sigHash, normalizedChanged, normalizeErr := attestationSignatureDiagnostics(parsedResponse.Response.AttestationObject)
+			leafCertHash, leafCertLen := attestationLeafCertDiagnostics(parsedResponse.Response.AttestationObject)
+			signatureInputHash := attestationSignatureInputHash(
+				parsedResponse.Response.AttestationObject.RawAuthData,
+				parsedResponse.Raw.AttestationResponse.ClientDataJSON,
+			)
+
+			s.logger.Debug("Registration verification fingerprints",
+				zap.Error(err),
+				zap.String("attestation_format", parsedResponse.Response.AttestationObject.Format),
+				zap.String("auth_data_sha256", sha256Hex(parsedResponse.Response.AttestationObject.RawAuthData)),
+				zap.String("client_data_json_sha256", sha256Hex(parsedResponse.Raw.AttestationResponse.ClientDataJSON)),
+				zap.String("signature_input_sha256", signatureInputHash),
+				zap.Int("signature_len", sigLen),
+				zap.String("signature_sha256", sigHash),
+				zap.Bool("signature_normalized_changed", normalizedChanged),
+				zap.String("signature_normalize_error", normalizeErr),
+				zap.Int("x5c_leaf_len", leafCertLen),
+				zap.String("x5c_leaf_sha256", leafCertHash),
+			)
+
 			attObj := parsedResponse.Response.AttestationObject
 			s.logger.Debug("Attestation object details",
 				zap.String("format", attObj.Format),
@@ -1011,7 +1015,33 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		parsedResponse,
 	)
 	if err != nil {
-		s.logger.Error("Failed to verify login", zap.Error(err))
+		s.logger.Error("Failed to verify login",
+			zap.Error(err),
+			zap.String("error_type", fmt.Sprintf("%T", err)),
+		)
+
+		// Log detailed diagnostics at debug level for troubleshooting
+		if s.logger.Core().Enabled(zap.DebugLevel) {
+			sigLen, sigHash, normalizedChanged, normalizeErr := assertionSignatureDiagnostics(parsedResponse.Response.Signature)
+			signatureInputHash := attestationSignatureInputHash(
+				parsedResponse.Raw.AssertionResponse.AuthenticatorData,
+				parsedResponse.Raw.AssertionResponse.ClientDataJSON,
+			)
+
+			s.logger.Debug("Login verification fingerprints",
+				zap.Error(err),
+				zap.String("auth_data_sha256", sha256Hex(parsedResponse.Raw.AssertionResponse.AuthenticatorData)),
+				zap.String("client_data_json_sha256", sha256Hex(parsedResponse.Raw.AssertionResponse.ClientDataJSON)),
+				zap.String("signature_input_sha256", signatureInputHash),
+				zap.Int("signature_len", sigLen),
+				zap.String("signature_sha256", sigHash),
+				zap.Bool("signature_normalized_changed", normalizedChanged),
+				zap.String("signature_normalize_error", normalizeErr),
+				zap.Uint32("sign_count", parsedResponse.Response.AuthenticatorData.Counter),
+				zap.String("credential_id", credentialID),
+			)
+		}
+
 		return nil, ErrVerificationFailed
 	}
 
@@ -1592,6 +1622,22 @@ func attestationSignatureInputHash(authData, clientDataJSON []byte) string {
 func attestationSignatureDiagnostics(att protocol.AttestationObject) (sigLen int, sigHash string, normalizedChanged bool, normalizeErr string) {
 	rawSig, ok := att.AttStatement["sig"].([]byte)
 	if !ok || len(rawSig) == 0 {
+		return 0, "", false, "signature-not-present"
+	}
+
+	sigLen = len(rawSig)
+	sigHash = sha256Hex(rawSig)
+
+	normalized, err := cryptoutil.NormalizeECDSASignature(rawSig)
+	if err != nil {
+		return sigLen, sigHash, false, err.Error()
+	}
+
+	return sigLen, sigHash, !bytes.Equal(rawSig, normalized), ""
+}
+
+func assertionSignatureDiagnostics(rawSig []byte) (sigLen int, sigHash string, normalizedChanged bool, normalizeErr string) {
+	if len(rawSig) == 0 {
 		return 0, "", false, "signature-not-present"
 	}
 

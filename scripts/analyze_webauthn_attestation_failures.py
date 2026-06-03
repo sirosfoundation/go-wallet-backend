@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Cluster WebAuthn registration attestation failures from NDJSON logs.
+"""Cluster WebAuthn verification failures from NDJSON logs.
 
 This tool is designed for backend logs emitted by internal/service/webauthn.go.
-It groups intermittent registration failures by stable fingerprint fields so
-operators can quickly see if failures share the same signature input tuple.
+It groups intermittent registration and login failures by stable fingerprint
+fields so operators can quickly see if failures share the same signature input
+tuple.
 """
 
 from __future__ import annotations
@@ -16,13 +17,14 @@ from pathlib import Path
 from typing import Any
 
 
-TARGET_MSG = "Failed to verify registration"
+TARGET_MSGS = {"Failed to verify registration", "Failed to verify login"}
 
 
 @dataclass
 class Event:
     ts: float | None
     error: str
+    phase: str  # "registration" or "login"
     attestation_format: str
     signature_input_sha256: str
     signature_sha256: str
@@ -31,6 +33,8 @@ class Event:
     x5c_leaf_sha256: str
     auth_data_sha256: str
     client_data_json_sha256: str
+    credential_id: str
+    sign_count: int | None
     source: str
 
 
@@ -53,12 +57,15 @@ def read_ndjson(path: Path) -> list[dict[str, Any]]:
 
 def as_event(row: dict[str, Any], source: str) -> Event | None:
     msg = str(row.get("msg", ""))
-    if msg != TARGET_MSG:
+    if msg not in TARGET_MSGS:
         return None
+
+    phase = "login" if "login" in msg.lower() else "registration"
 
     return Event(
         ts=row.get("ts") if isinstance(row.get("ts"), (int, float)) else None,
         error=str(row.get("error", "")),
+        phase=phase,
         attestation_format=str(row.get("attestation_format", "")),
         signature_input_sha256=str(row.get("signature_input_sha256", "")),
         signature_sha256=str(row.get("signature_sha256", "")),
@@ -67,14 +74,18 @@ def as_event(row: dict[str, Any], source: str) -> Event | None:
         x5c_leaf_sha256=str(row.get("x5c_leaf_sha256", "")),
         auth_data_sha256=str(row.get("auth_data_sha256", "")),
         client_data_json_sha256=str(row.get("client_data_json_sha256", "")),
+        credential_id=str(row.get("credential_id", "")),
+        sign_count=row.get("sign_count") if isinstance(row.get("sign_count"), int) else None,
         source=source,
     )
 
 
 def cluster_key(event: Event) -> tuple[str, ...]:
+    # Always include phase to separate registration vs login failures.
     # Prefer tuple that represents the signed input and signer identity.
     if event.signature_input_sha256 and event.signature_sha256 and event.x5c_leaf_sha256:
         return (
+            event.phase,
             event.attestation_format,
             event.error,
             event.signature_input_sha256,
@@ -83,8 +94,9 @@ def cluster_key(event: Event) -> tuple[str, ...]:
             event.signature_normalized_changed,
         )
 
-    # Fallback for old logs without new fingerprint fields.
+    # Fallback for old logs or login events without x5c.
     return (
+        event.phase,
         event.attestation_format,
         event.error,
         event.auth_data_sha256,
@@ -115,7 +127,7 @@ def print_cluster_report(events: list[Event], max_examples: int) -> None:
 
     for idx, (key, members) in enumerate(clusters, 1):
         sample = members[0]
-        print(f"[{idx}] count={len(members)}")
+        print(f"[{idx}] count={len(members)} phase={sample.phase}")
         print(f"  error: {sample.error or '-'}")
         print(f"  format: {sample.attestation_format or '-'}")
         print(f"  sig_input: {short(sample.signature_input_sha256)}")
@@ -137,7 +149,7 @@ def print_cluster_report(events: list[Event], max_examples: int) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Cluster WebAuthn attestation verification failures from NDJSON logs")
+    parser = argparse.ArgumentParser(description="Cluster WebAuthn verification failures (registration and login) from NDJSON logs")
     parser.add_argument("files", nargs="+", help="One or more NDJSON log files")
     parser.add_argument("--examples", type=int, default=2, help="Example rows per cluster (default: 2)")
     args = parser.parse_args()
@@ -155,7 +167,7 @@ def main() -> int:
                 events.append(event)
 
     if not events:
-        print("No matching registration verification failures found.")
+        print("No matching verification failures found.")
         return 1
 
     print_cluster_report(events, max_examples=max(1, args.examples))
