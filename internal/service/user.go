@@ -233,11 +233,23 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	return user.PrivateDataETag, nil
 }
 
+// DeletionSummary contains counts of deleted items for the GDPR erasure response.
+type DeletionSummary struct {
+	Credentials       int `json:"credentials"`
+	Presentations     int `json:"presentations"`
+	TenantMemberships int `json:"tenant_memberships"`
+	Challenges        int `json:"challenges"`
+	Invites           int `json:"invites"`
+	Sessions          int `json:"sessions"`
+}
+
 // DeleteUser deletes a user and all associated data across ALL tenants.
 // Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
 // which may leave orphaned data in other tenants. This is a best-effort cleanup
 // that prioritizes completing the user deletion over strict data consistency.
-func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
+func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) (*DeletionSummary, error) {
+	summary := &DeletionSummary{}
+
 	// Get all tenants the user belongs to
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
@@ -261,6 +273,8 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, cred := range credentials {
 			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
 				s.logger.Warn("Failed to delete credential", zap.Error(err))
+			} else {
+				summary.Credentials++
 			}
 		}
 
@@ -272,39 +286,49 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, pres := range presentations {
 			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
 				s.logger.Warn("Failed to delete presentation", zap.Error(err))
+			} else {
+				summary.Presentations++
 			}
 		}
 
 		// Remove tenant membership
 		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
 			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		} else {
+			summary.TenantMemberships++
 		}
 	}
 
 	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		s.logger.Warn("Failed to delete challenges for user", zap.Error(err))
+	} else {
+		summary.Challenges = 1
 	}
 
 	// Clear user reference from consumed invites
 	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
+	} else {
+		summary.Invites = 1
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
+		} else {
+			summary.Sessions = 1
 		}
 	}
 
 	// Delete the user
 	if err := s.store.Users().Delete(ctx, userID); err != nil {
-		return fmt.Errorf("failed to delete user: %w", err)
+		return nil, fmt.Errorf("failed to delete user: %w", err)
 	}
 
 	s.logger.Info("User deleted")
-	return nil
+	return summary, nil
 }
 
 // DeleteWebAuthnCredential deletes a WebAuthn credential

@@ -513,7 +513,7 @@ func TestUserService_DeleteUser(t *testing.T) {
 	}
 
 	// Delete user
-	err = service.DeleteUser(ctx, user.UUID, user.DID)
+	_, err = service.DeleteUser(ctx, user.UUID, user.DID)
 	if err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
@@ -572,7 +572,7 @@ func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
 	}
 
 	// Delete user
-	if err := service.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+	if _, err := service.DeleteUser(ctx, user.UUID, user.DID); err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
 
@@ -630,7 +630,7 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 
 	// Delete user
-	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+	if _, err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
 
@@ -698,7 +698,7 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 	}
 
 	// Delete user
-	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+	if _, err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
 

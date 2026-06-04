@@ -815,17 +815,18 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 
 	holderDID := userID.(string) // Using userID as holderDID
 
-	if err := h.services.User.DeleteUser(
+	summary, err := h.services.User.DeleteUser(
 		c.Request.Context(),
 		domain.UserIDFromString(userID.(string)),
 		holderDID,
-	); err != nil {
+	)
+	if err != nil {
 		h.logger.Error("Failed to delete user", zap.Error(err))
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(200, gin.H{"result": "DELETED"})
+	c.JSON(200, gin.H{"result": "DELETED", "summary": summary})
 }
 
 // AccountInfo represents the account info response
