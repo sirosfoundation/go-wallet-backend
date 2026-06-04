@@ -554,8 +554,9 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store  backend.Backend
-	logger *zap.Logger
+	store       backend.Backend
+	userService *service.UserService
+	logger      *zap.Logger
 }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -575,9 +576,12 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
+	userSvc := service.NewUserService(store, cfg, logger)
+
 	return &AdminProvider{
-		store:  store,
-		logger: logger,
+		store:       store,
+		userService: userSvc,
+		logger:      logger,
 	}, nil
 }
 
@@ -607,7 +611,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlersWithUserService(p.store, p.userService, p.logger)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
