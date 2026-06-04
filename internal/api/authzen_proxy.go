@@ -406,6 +406,17 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		},
 	}
 
+	// Attach credential_types as action.parameters so they reach the PDP
+	// on all code paths (proxy fallback, key subjects, URL resolution).
+	if len(req.CredentialTypes) > 0 {
+		evalReq.Action = &gotrust.Action{
+			Name: resourceType,
+			Parameters: map[string]interface{}{
+				"credential_types": req.CredentialTypes,
+			},
+		}
+	}
+
 	// Authorize the query
 	authzReq := &authz.AuthorizationRequest{
 		TenantID: tenantID,
