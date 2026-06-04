@@ -581,7 +581,11 @@ func (h *AdminHandlers) ListUserCredentials(c *gin.Context) {
 
 	resp := make([]AdminCredentialResponse, 0, len(user.WebauthnCredentials))
 	for _, cred := range user.WebauthnCredentials {
-		if cred.TenantID != "" && cred.TenantID != tenantID {
+		credTenant := cred.TenantID
+		if credTenant == "" {
+			credTenant = domain.DefaultTenantID
+		}
+		if credTenant != tenantID {
 			continue
 		}
 		resp = append(resp, AdminCredentialResponse{

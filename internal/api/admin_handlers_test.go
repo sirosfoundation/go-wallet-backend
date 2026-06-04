@@ -562,8 +562,8 @@ func TestAdminHandlers_UserCredentials(t *testing.T) {
 		DID:         "did:key:admin-cred-user",
 		DisplayName: &displayName,
 		WebauthnCredentials: []domain.WebauthnCredential{
-			{ID: "cred-a", CreatedAt: time.Now(), PRFCapable: true},
-			{ID: "cred-b", CreatedAt: time.Now(), Status: "deactivated"},
+			{ID: "cred-a", TenantID: "cred-admin", CreatedAt: time.Now(), PRFCapable: true},
+			{ID: "cred-b", TenantID: "cred-admin", CreatedAt: time.Now(), Status: "deactivated"},
 		},
 		PrivateData:     []byte(`{"encrypted":"data"}`),
 		PrivateDataETag: domain.ComputePrivateDataETag([]byte(`{"encrypted":"data"}`)),

@@ -364,12 +364,17 @@ func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID d
 			activeLeft++
 		}
 	}
-	if activeLeft == 0 {
+	lockout := activeLeft == 0
+	if lockout {
 		s.cascadeWalletLockout(ctx, user)
 	}
 
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+
+	if lockout {
+		s.runLockoutSideEffects(ctx, user)
 	}
 
 	out := *target
@@ -404,10 +409,20 @@ func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, user
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		return 0, fmt.Errorf("failed to update user: %w", err)
 	}
+
+	s.runLockoutSideEffects(ctx, user)
 	return updated, nil
 }
 
 func (s *UserService) cascadeWalletLockout(ctx context.Context, user *domain.User) {
+	// Clear private data on the user object (persisted by caller)
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+}
+
+// runLockoutSideEffects performs non-critical side effects after a successful lockout persist.
+// These are best-effort; failures are logged but do not roll back the deactivation.
+func (s *UserService) runLockoutSideEffects(ctx context.Context, user *domain.User) {
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, user.UUID)
 	if err != nil {
 		s.logger.Warn("Failed to get user tenants for lockout cleanup", zap.Error(err))
@@ -438,9 +453,6 @@ func (s *UserService) cascadeWalletLockout(ctx context.Context, user *domain.Use
 			}
 		}
 	}
-
-	user.PrivateData = nil
-	user.PrivateDataETag = ""
 
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, user.UUID.String()); err != nil {
