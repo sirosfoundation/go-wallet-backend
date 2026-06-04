@@ -1802,3 +1802,187 @@ func TestResolve_URLSubject_RegisteredIssuerInfo_OmittedWhenNotFound(t *testing.
 		t.Errorf("expected registered_issuer to be absent, got: %v", resp["registered_issuer"])
 	}
 }
+
+func TestResolve_URLSubject_CredentialTypes_ForwardedToPDP(t *testing.T) {
+	// Verify that credential_types from the resolve request are forwarded
+	// to the PDP as action.parameters.credential_types.
+	var receivedReq gotrust.EvaluationRequest
+
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Return a response with credential_type_trust_marks in reason
+		resp := gotrust.EvaluationResponse{
+			Decision: true,
+			Context: &gotrust.EvaluationResponseContext{
+				Reason: map[string]interface{}{
+					"credential_types": []interface{}{"eu.europa.ec.eudi.pid.1"},
+					"credential_type_trust_marks": map[string]interface{}{
+						"eu.europa.ec.eudi.pid.1": []interface{}{"http://registry.example.com/tm/pid"},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp) //nolint:errcheck
+	})
+
+	pdpServer := httptest.NewServer(pdpHandler)
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer":   "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"jwks": map[string]interface{}{
+			"keys": []interface{}{
+				map[string]interface{}{
+					"kty": "EC",
+					"crv": "P-256",
+					"x":   "test-x",
+					"y":   "test-y",
+				},
+			},
+		},
+	}
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: metadata},
+	}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"subject_id":       "https://issuer.example.com",
+		"subject_type":     "url",
+		"credential_types": []string{"eu.europa.ec.eudi.pid.1"},
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// Verify credential_types were forwarded to PDP in action.parameters
+	if receivedReq.Action == nil {
+		t.Fatal("expected action to be set in PDP request")
+	}
+	if receivedReq.Action.Name != "credential-issuer" {
+		t.Errorf("expected action.name='credential-issuer', got '%s'", receivedReq.Action.Name)
+	}
+	if receivedReq.Action.Parameters == nil {
+		t.Fatal("expected action.parameters to be set")
+	}
+	ct, ok := receivedReq.Action.Parameters["credential_types"]
+	if !ok {
+		t.Fatal("expected credential_types in action.parameters")
+	}
+	ctSlice, ok := ct.([]interface{})
+	if !ok {
+		t.Fatalf("expected credential_types to be a slice, got %T", ct)
+	}
+	if len(ctSlice) != 1 || ctSlice[0] != "eu.europa.ec.eudi.pid.1" {
+		t.Errorf("unexpected credential_types: %v", ctSlice)
+	}
+
+	// Verify credential_type_trust_marks is returned in response
+	var resp gotrust.EvaluationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp.Context == nil || resp.Context.Reason == nil {
+		t.Fatal("expected context.reason in response")
+	}
+	if _, ok := resp.Context.Reason["credential_type_trust_marks"]; !ok {
+		t.Error("expected credential_type_trust_marks in response reason")
+	}
+}
+
+func TestResolve_URLSubject_NoCredentialTypes_OmitsParameters(t *testing.T) {
+	// When credential_types is not provided, action.parameters should be nil.
+	var receivedReq gotrust.EvaluationRequest
+
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedReq) //nolint:errcheck
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp) //nolint:errcheck
+	})
+
+	pdpServer := httptest.NewServer(pdpHandler)
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer":   "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"jwks": map[string]interface{}{
+			"keys": []interface{}{
+				map[string]interface{}{"kty": "EC", "crv": "P-256", "x": "test-x", "y": "test-y"},
+			},
+		},
+	}
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: metadata},
+	}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"subject_id":   "https://issuer.example.com",
+		"subject_type": "url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// Verify action.parameters is nil when no credential_types provided
+	if receivedReq.Action == nil {
+		t.Fatal("expected action to be set")
+	}
+	if receivedReq.Action.Parameters != nil {
+		t.Errorf("expected nil action.parameters when no credential_types, got: %v", receivedReq.Action.Parameters)
+	}
+}

@@ -355,9 +355,10 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Parse the resolve request
 	var req struct {
-		SubjectID    string `json:"subject_id" binding:"required"`
-		SubjectType  string `json:"subject_type"`  // "key" (default) or "url"
-		ResourceType string `json:"resource_type"` // e.g. "credential_issuer" (default for url subjects)
+		SubjectID       string   `json:"subject_id" binding:"required"`
+		SubjectType     string   `json:"subject_type"`     // "key" (default) or "url"
+		ResourceType    string   `json:"resource_type"`    // e.g. "credential_issuer" (default for url subjects)
+		CredentialTypes []string `json:"credential_types"` // optional credential type filter (e.g. VCT values)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -428,7 +429,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		case "oauth-authorization-server":
 			h.resolveAuthorizationServerMetadata(c, ctx, tenantID, req.SubjectID)
 		default:
-			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID, req.CredentialTypes)
 		}
 		return
 	}
@@ -444,7 +445,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 //   - metadata is signed AND the PDP returns trusted
 //
 // If metadata is signed but untrusted, an error is returned.
-func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Context, tenantID, issuerURL string) {
+func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Context, tenantID, issuerURL string, credentialTypes []string) {
 	// Step 1: Resolve issuer metadata locally
 	result, err := h.metadataResolver.ResolveWithInfo(ctx, issuerURL)
 	if err != nil {
@@ -503,6 +504,13 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// Build trust evaluation request with key material.
 	// Action is set to "credential-issuer" so PDP policy can distinguish
 	// issuer trust evaluation from verifier or general resolution requests.
+	action := &gotrust.Action{Name: "credential-issuer"}
+	if len(credentialTypes) > 0 {
+		action.Parameters = map[string]interface{}{
+			"credential_types": credentialTypes,
+		}
+	}
+
 	trustReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
 			Type: "key",
@@ -511,7 +519,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		Resource: gotrust.Resource{
 			ID: issuerURL,
 		},
-		Action: &gotrust.Action{Name: "credential-issuer"},
+		Action: action,
 	}
 
 	if keyMaterial != nil {
