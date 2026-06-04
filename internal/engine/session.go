@@ -30,6 +30,17 @@ var (
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
 
+const (
+	// wsPingInterval is how often the server sends a WebSocket ping to the client.
+	// Must be shorter than any intermediate proxy/LB idle timeout (typically 60–120s).
+	wsPingInterval = 30 * time.Second
+
+	// wsPongTimeout is how long the server waits for a pong after sending a ping.
+	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
+	// and the connection is considered dead.
+	wsPongTimeout = 10 * time.Second
+)
+
 // Session represents an authenticated WebSocket session
 type Session struct {
 	ID       string
@@ -46,6 +57,9 @@ type Session struct {
 	signCh   chan *SignResponseMessage
 	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
+
+	// stopPing signals the ping goroutine to exit.
+	stopPing chan struct{}
 }
 
 // Flow represents an active credential flow
@@ -132,11 +146,20 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := m.upgrader.Upgrade(w, r, nil)
+	responseHeader := http.Header{}
+	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
+		responseHeader.Set("X-Served-By", servedBy)
+	}
+	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
+
+	// Clear the write deadline inherited from net/http's WriteTimeout.
+	// After upgrade, the WebSocket connection manages its own deadlines;
+	// the stale deadline would cause writes to fail after the timeout elapses.
+	_ = conn.SetWriteDeadline(time.Time{})
 
 	m.logger.Debug("WebSocket client connected")
 	go m.handleNewConnection(conn)
@@ -152,8 +175,6 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		m.logger.Error("Failed to read handshake", zap.Error(err))
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{}) // Clear deadline
-
 	// Parse handshake
 	var msg Message
 	if err := json.Unmarshal(message, &msg); err != nil {
@@ -176,10 +197,23 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// Validate token and extract claims
 	userID, tenantID, err := m.validateToken(handshake.AppToken)
 	if err != nil {
-		m.logger.Warn("Authentication failed", zap.Error(err))
+		m.logger.Warn("Authentication failed",
+			zap.Error(err),
+			zap.Int("token_len", len(handshake.AppToken)),
+		)
 		m.sendError(conn, "", ErrCodeAuthFailed, "Invalid or expired token")
 		return
 	}
+
+	// Configure WebSocket ping/pong keepalive.
+	// The pong handler resets the read deadline each time the client responds,
+	// keeping the connection alive across idle periods. Browser WebSocket
+	// implementations respond to protocol-level pings automatically.
+	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		return nil
+	})
 
 	// Create session
 	session := &Session{
@@ -193,6 +227,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		signCh:   make(chan *SignResponseMessage, 20),
 		matchCh:  make(chan *MatchResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1), // Buffered to prevent deadlock
+		stopPing: make(chan struct{}),
 	}
 
 	// Register session
@@ -218,12 +253,37 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		zap.String("session_id", session.ID),
 		zap.Strings("capabilities", capabilities))
 
+	// Start ping keepalive goroutine
+	go session.pingLoop()
+
 	// Main message loop
 	m.handleSession(session)
 }
 
+// pingLoop sends WebSocket ping frames at wsPingInterval.
+// Browser WebSocket implementations respond with pong automatically.
+func (s *Session) pingLoop() {
+	ticker := time.NewTicker(wsPingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.sendMu.Lock()
+			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
+			s.sendMu.Unlock()
+			if err != nil {
+				return // connection is dead; ReadMessage will surface the error
+			}
+		case <-s.stopPing:
+			return
+		}
+	}
+}
+
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
+		close(session.stopPing) // stop the ping goroutine
 		close(session.closeCh)
 		// Cancel all active flows
 		session.flowsMu.Lock()
@@ -464,7 +524,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	})
+	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
 		return "", "", err

@@ -367,6 +367,29 @@ func TestManager_validateToken_ValidToken(t *testing.T) {
 	assert.Equal(t, "test-user-123", userID)
 }
 
+func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret",
+		},
+	}
+	logger := zap.NewNop()
+	m := NewManager(cfg, logger)
+
+	// Token with nbf 2 seconds in the future — within the 5s leeway
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user",
+		"nbf":     time.Now().Add(2 * time.Second).Unix(),
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	userID, err := m.validateToken(tokenString)
+	require.NoError(t, err)
+	assert.Equal(t, "test-user", userID)
+}
+
 func TestErrorVariables(t *testing.T) {
 	assert.Equal(t, "user not connected", ErrUserNotConnected.Error())
 	assert.Equal(t, "wrong message id", ErrWrongMessageID.Error())

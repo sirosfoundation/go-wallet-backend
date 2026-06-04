@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -228,6 +230,53 @@ func TestConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfig_Validate_SecretPath(t *testing.T) {
+	t.Run("populates Secret from file", func(t *testing.T) {
+		dir := t.TempDir()
+		f := filepath.Join(dir, "secret")
+		require.NoError(t, os.WriteFile(f, []byte("file-secret\n"), 0600))
+
+		cfg := DefaultConfig()
+		cfg.JWT.RequireAuth = true
+		cfg.JWT.SecretPath = f
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "file-secret", cfg.JWT.Secret)
+	})
+
+	t.Run("SecretPath overrides Secret", func(t *testing.T) {
+		dir := t.TempDir()
+		f := filepath.Join(dir, "secret")
+		require.NoError(t, os.WriteFile(f, []byte("from-file"), 0600))
+
+		cfg := DefaultConfig()
+		cfg.JWT.RequireAuth = true
+		cfg.JWT.Secret = "inline-secret"
+		cfg.JWT.SecretPath = f
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "from-file", cfg.JWT.Secret)
+	})
+
+	t.Run("missing file returns error", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.JWT.SecretPath = "/nonexistent/path/secret"
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "jwt.secret_path:")
+	})
+
+	t.Run("empty file returns error", func(t *testing.T) {
+		dir := t.TempDir()
+		f := filepath.Join(dir, "secret")
+		require.NoError(t, os.WriteFile(f, []byte("  \n"), 0600))
+
+		cfg := DefaultConfig()
+		cfg.JWT.SecretPath = f
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "file is empty or contains only whitespace")
+	})
 }
 
 func TestFilterConfig_Compile(t *testing.T) {

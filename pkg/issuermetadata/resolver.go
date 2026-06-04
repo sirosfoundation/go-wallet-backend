@@ -42,6 +42,8 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
+	"golang.org/x/sync/singleflight"
 )
 
 // supportedSignatureAlgorithms is the set of JWS algorithms accepted for
@@ -116,13 +118,15 @@ func readLimitedBody(r io.Reader) ([]byte, error) {
 }
 
 // Resolver fetches and caches OpenID4VCI issuer metadata.
-// Safe for concurrent use.
+// Safe for concurrent use. Concurrent requests for the same issuer
+// are coalesced via singleflight to avoid duplicate outgoing HTTP requests.
 type Resolver struct {
 	cfg        Config
 	httpClient *http.Client
 
 	mu    sync.RWMutex
 	cache map[string]*cachedEntry
+	group singleflight.Group
 }
 
 // New creates a Resolver with the given configuration.
@@ -167,8 +171,9 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// A trailing slash is stripped before fetching. The endpoint queried is
-// <issuerURL>/.well-known/openid-credential-issuer.
+// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
+// The endpoint queried follows RFC 8615:
+// https://{host}/.well-known/openid-credential-issuer{path}.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).
@@ -195,24 +200,51 @@ type fetchResult struct {
 // was served from cache and whether the metadata was validated (signed by a
 // trusted issuer).
 func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*ResolveResult, error) {
-	issuerURL = strings.TrimSuffix(issuerURL, "/")
 
 	if err := r.validateURL(issuerURL); err != nil {
 		return nil, err
+	}
+
+	// Normalize trailing slash for consistent cache keys, but only when the
+	// path is empty or just "/". Issuers with meaningful paths (e.g.
+	// https://host/issuer/) retain their trailing slash per RFC 8615.
+	parsed, _ := url.Parse(issuerURL) // already validated above
+	if parsed.Path == "" || parsed.Path == "/" {
+		issuerURL = strings.TrimRight(issuerURL, "/")
 	}
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
 
-	metadataURL := issuerURL + "/.well-known/openid-credential-issuer"
-	result, err := r.fetch(ctx, issuerURL, metadataURL)
+	// Use singleflight to coalesce concurrent requests for the same issuer.
+	// This prevents duplicate outgoing HTTP requests when multiple goroutines
+	// resolve the same issuer before the cache is populated.
+	// We detach from the caller's context to avoid cancelling the shared fetch
+	// when a single caller disconnects (a well-known singleflight pitfall).
+	val, err, _ := r.group.Do(issuerURL, func() (interface{}, error) {
+		// Re-check cache inside singleflight — another caller may have populated it.
+		if entry := r.getCachedEntry(issuerURL); entry != nil {
+			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
+		}
+
+		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
+		// https://{host}/.well-known/openid-credential-issuer{path}
+		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer fetchCancel()
+		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
+		if err != nil {
+			return nil, err
+		}
+
+		r.setCache(issuerURL, result)
+		return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed, SignerKeyMaterial: result.signerKeyMaterial}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	r.setCache(issuerURL, result)
-	return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed, SignerKeyMaterial: result.signerKeyMaterial}, nil
+	return val.(*ResolveResult), nil
 }
 
 func (r *Resolver) validateURL(issuerURL string) error {

@@ -53,14 +53,98 @@ type CredentialSource struct {
 	Branch     string `json:"branch,omitempty"`
 }
 
-// TS11SchemasResponse represents the paginated response from /api/v1/schemas.json
+// RegistryResponse represents the /api/v1/registry.json response which includes
+// ALL credentials (both TS11-compliant and non-TS11). Each entry has minimal
+// metadata (id, version, supportedFormats, attestationLoS, bindingType) without
+// schemaURIs. The TS11 detail endpoint /api/v1/schemas/{id}.json provides full
+// metadata for TS11-compliant entries; for non-TS11 entries, VCTMs are resolved
+// from the credential's known URLs in the registry.
+type RegistryResponse struct {
+	Total       int                 `json:"total"`
+	Credentials []RegistryListEntry `json:"credentials"`
+}
+
+// RegistryListEntry is a single entry from /api/v1/registry.json.
+type RegistryListEntry struct {
+	ID               string   `json:"id"`
+	Version          string   `json:"version"`
+	SupportedFormats []string `json:"supportedFormats"`
+	AttestationLoS   string   `json:"attestationLoS,omitempty"`
+	BindingType      string   `json:"bindingType,omitempty"`
+	// SchemaURIs may be present in future versions; handle gracefully.
+	SchemaURIs []TS11SchemaURI `json:"schemaURIs,omitempty"`
+}
+
+// TS11SchemasResponse represents the paginated response from /api/v1/schemas.json.
+// It supports two wire formats:
+//   - Legacy: {"schemas": [...], "next": "...", "total": N, "page": N, "pageSize": N}
+//   - Current: {"data": [...], "total": N, "limit": N, "offset": N}
 type TS11SchemasResponse struct {
-	Schemas  []TS11SchemaMeta `json:"schemas"`
-	Total    int              `json:"total,omitempty"`
-	Page     int              `json:"page,omitempty"`
-	PageSize int              `json:"pageSize,omitempty"`
-	// Next is the URL of the next page; empty when there are no more pages
+	// Schemas is the legacy key for the schema array.
+	Schemas []TS11SchemaMeta `json:"schemas"`
+	// Data is the current key for the schema array (paginated TS11 API).
+	Data []TS11SchemaMeta `json:"data"`
+
+	Total    int `json:"total,omitempty"`
+	Page     int `json:"page,omitempty"`
+	PageSize int `json:"pageSize,omitempty"`
+	Limit    int `json:"limit,omitempty"`
+	Offset   int `json:"offset,omitempty"`
+	// Next is the URL of the next page; empty when there are no more pages (legacy pagination).
 	Next string `json:"next,omitempty"`
+}
+
+// Entries returns whichever schema array is populated (Data takes precedence over Schemas).
+func (r *TS11SchemasResponse) Entries() []TS11SchemaMeta {
+	if len(r.Data) > 0 {
+		return r.Data
+	}
+	return r.Schemas
+}
+
+// HasMorePages returns true if there are additional pages to fetch.
+func (r *TS11SchemasResponse) HasMorePages() bool {
+	// Legacy: "next" URL
+	if r.Next != "" {
+		return true
+	}
+	// Current: offset+limit < total
+	if r.Limit > 0 && r.Offset+len(r.Entries()) < r.Total {
+		return true
+	}
+	return false
+}
+
+// NextPageURL returns the URL for the next page. For legacy format it returns
+// the "next" field directly. For the current format it constructs the URL by
+// incrementing the offset. baseURL is the original source URL.
+func (r *TS11SchemasResponse) NextPageURL(baseURL string) string {
+	if r.Next != "" {
+		return r.Next
+	}
+	// Build offset-based next URL
+	nextOffset := r.Offset + len(r.Entries())
+	sep := "?"
+	if strings.Contains(baseURL, "?") {
+		sep = "&"
+	}
+	// Strip any existing offset param from baseURL
+	clean := baseURL
+	if idx := strings.Index(clean, "offset="); idx > 0 {
+		// Remove offset=N (and preceding & or ?)
+		end := strings.IndexByte(clean[idx:], '&')
+		if end == -1 {
+			clean = clean[:idx-1] // remove the preceding ? or &
+		} else {
+			clean = clean[:idx] + clean[idx+end+1:]
+		}
+		if !strings.Contains(clean, "?") {
+			sep = "?"
+		} else {
+			sep = "&"
+		}
+	}
+	return fmt.Sprintf("%s%soffset=%d", clean, sep, nextOffset)
 }
 
 // TS11SchemaMeta represents a single schema entry in the TS11 API
@@ -204,8 +288,8 @@ func (f *Fetcher) Fetch(ctx context.Context) error {
 	return nil
 }
 
-// fetchFromSource fetches entries from a single source URL, auto-detecting whether
-// the endpoint returns the legacy vctm-registry.json format or the TS11 schemas.json format.
+// fetchFromSource fetches entries from a single source, using the configured Mode to
+// determine which endpoint to hit. Format auto-detection is applied to the response.
 // If source.Timeout is non-zero it is applied as a context deadline for the entire
 // source fetch (index + all VCTM documents).
 func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig) (map[string]*VCTMEntry, error) {
@@ -215,40 +299,69 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 		defer cancel()
 	}
 
-	f.logger.Info("fetching registry source", zap.String("url", source.URL))
+	fetchURL := source.resolveURL()
+	f.logger.Info("fetching registry source", zap.String("url", fetchURL), zap.String("mode", string(source.Mode)))
 
-	body, err := f.fetchRaw(ctx, source.URL)
+	body, err := f.fetchRaw(ctx, fetchURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch source: %w", err)
 	}
 
 	// Auto-detect format based on top-level JSON keys.
-	// TS11 /api/v1/schemas.json has a "schemas" array.
-	// Legacy vctm-registry.json has a "credentials" array.
+	// Current TS11: {"data": [...], "total": N, "limit": N, "offset": N}
+	// Legacy TS11:  {"schemas": [...], "next": "...", ...}
+	// Registry:     {"credentials": [...], "total": N} (all credentials, minimal metadata)
+	// Legacy index: {"credentials": [...], "name": ..., ...} (vctm-registry.json)
 	var detector struct {
+		Data        json.RawMessage `json:"data"`
 		Schemas     json.RawMessage `json:"schemas"`
 		Credentials json.RawMessage `json:"credentials"`
+		Name        string          `json:"name"`  // present in legacy vctm-registry.json
+		Total       *int            `json:"total"` // present in new registry.json
 	}
 	if err := json.Unmarshal(body, &detector); err != nil {
-		// Not valid JSON at the top level – fall through to legacy processing
-		// which will surface the parse error with a clear message.
 		f.logger.Debug("format auto-detection failed, falling back to legacy parser",
-			zap.String("url", source.URL), zap.Error(err))
+			zap.String("url", fetchURL), zap.Error(err))
 		return f.processLegacyResponse(ctx, source, body)
 	}
 
-	if detector.Schemas != nil {
+	if detector.Data != nil || detector.Schemas != nil {
 		return f.processTS11Response(ctx, source, body)
+	}
+	if detector.Credentials != nil && detector.Total != nil && detector.Name == "" {
+		// Registry format: {"credentials": [...], "total": N} without legacy fields
+		return f.processRegistryResponse(ctx, source, body)
 	}
 	return f.processLegacyResponse(ctx, source, body)
 }
 
+// resolveURL determines the actual fetch URL based on the Mode setting.
+// If the URL already points to a specific JSON file, it is used as-is.
+// Otherwise, the appropriate endpoint path is appended based on Mode.
+func (s *RemoteSourceConfig) resolveURL() string {
+	u := s.URL
+	// If the URL already ends with a known endpoint file, use it directly.
+	if strings.HasSuffix(u, ".json") {
+		return u
+	}
+	// Strip trailing slash for consistent joining.
+	u = strings.TrimRight(u, "/")
+	switch s.Mode {
+	case APIModeRegistry:
+		return u + "/api/v1/registry.json"
+	default:
+		return u + "/api/v1/schemas.json"
+	}
+}
+
 // processTS11Response processes a TS11-format /api/v1/schemas.json response,
-// including following pagination via the "next" field.
+// including following pagination via offset/limit or legacy "next" field.
 func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount, errorCount int
 
+	// Use the resolved endpoint URL for pagination (not the raw base URL)
+	resolvedURL := source.resolveURL()
 	currentBody := body
 	for {
 		var page TS11SchemasResponse
@@ -256,7 +369,7 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 			return nil, fmt.Errorf("failed to unmarshal TS11 schemas response: %w", err)
 		}
 
-		for _, schema := range page.Schemas {
+		for _, schema := range page.Entries() {
 			// Determine which schemaURI to use as the VCTM fetch URL.
 			// Prefer the dc+sd-jwt entry; fall back to the first URI.
 			var vctmURI string
@@ -300,14 +413,15 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 			fetchedCount++
 		}
 
-		// Follow pagination if a next-page URL is provided.
-		if page.Next == "" {
+		// Follow pagination if more pages are available.
+		if !page.HasMorePages() {
 			break
 		}
-		nextBody, err := f.fetchRaw(ctx, page.Next)
+		nextURL := page.NextPageURL(resolvedURL)
+		nextBody, err := f.fetchRaw(ctx, nextURL)
 		if err != nil {
 			f.logger.Warn("failed to fetch next page of schemas",
-				zap.String("url", page.Next),
+				zap.String("url", nextURL),
 				zap.Error(err))
 			break
 		}
@@ -412,6 +526,101 @@ func (f *Fetcher) processLegacyResponse(ctx context.Context, source RemoteSource
 	f.logger.Info("legacy fetch complete",
 		zap.String("url", source.URL),
 		zap.Int("fetched", fetchedCount),
+		zap.Int("filtered", filteredCount),
+		zap.Int("errors", errorCount))
+
+	return entries, nil
+}
+
+// processRegistryResponse processes a /api/v1/registry.json response which
+// contains ALL credentials (TS11 and non-TS11) with minimal metadata.
+// For each entry, it attempts to fetch the full TS11 detail from
+// /api/v1/schemas/{id}.json. If that fails (non-TS11 entry), a stub entry
+// is created with the available metadata.
+func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
+	var resp RegistryResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal registry response: %w", err)
+	}
+
+	f.logger.Info("fetched registry index",
+		zap.String("url", source.resolveURL()),
+		zap.Int("credentials", len(resp.Credentials)))
+
+	entries := make(map[string]*VCTMEntry)
+	var fetchedCount, detailCount, stubCount, filteredCount, errorCount int
+
+	// Derive the base URL for fetching individual schema details.
+	baseURL := strings.TrimRight(source.URL, "/")
+	if strings.HasSuffix(baseURL, ".json") {
+		// Strip the file name to get the base path
+		if idx := strings.LastIndex(baseURL, "/"); idx > 0 {
+			baseURL = baseURL[:idx]
+		}
+	}
+	// Remove /api/v1/registry.json path if present to get the registry root
+	baseURL = strings.TrimSuffix(baseURL, "/api/v1")
+
+	for _, cred := range resp.Credentials {
+		// Try to fetch TS11 detail for this credential (includes schemaURIs).
+		detailURL := baseURL + "/api/v1/schemas/" + cred.ID + ".json"
+		detailBody, err := f.fetchRaw(ctx, detailURL)
+		if err == nil {
+			// Successfully fetched detail — process as TS11 schema with VCTM fetch.
+			var schema TS11SchemaMeta
+			if jsonErr := json.Unmarshal(detailBody, &schema); jsonErr == nil && len(schema.SchemaURIs) > 0 {
+				// Pick the VCTM URI
+				var vctmURI string
+				for _, su := range schema.SchemaURIs {
+					if su.FormatIdentifier == "dc+sd-jwt" {
+						vctmURI = su.URI
+						break
+					}
+				}
+				if vctmURI == "" {
+					vctmURI = schema.SchemaURIs[0].URI
+				}
+
+				entry, fetchErr := f.fetchTS11VCTM(ctx, schema, vctmURI)
+				if fetchErr == nil {
+					if !f.config.Filter.Matches(entry.VCT) {
+						filteredCount++
+						continue
+					}
+					entries[entry.VCT] = entry
+					fetchedCount++
+					detailCount++
+					continue
+				}
+				f.logger.Debug("failed to fetch VCTM from detail", zap.String("id", cred.ID), zap.Error(fetchErr))
+			}
+		}
+
+		// Detail not available (non-TS11) or VCTM fetch failed.
+		// Create a stub entry with the metadata we have from the registry list.
+		// Use the schema ID as a placeholder VCT (the real VCT is unknown without VCTM).
+		vct := cred.ID
+		if !f.config.Filter.Matches(vct) {
+			filteredCount++
+			continue
+		}
+
+		entries[vct] = &VCTMEntry{
+			VCT:              vct,
+			AttestationLoS:   cred.AttestationLoS,
+			BindingType:      cred.BindingType,
+			SupportedFormats: cred.SupportedFormats,
+			FetchedAt:        time.Now(),
+		}
+		fetchedCount++
+		stubCount++
+	}
+
+	f.logger.Info("registry fetch complete",
+		zap.String("url", source.resolveURL()),
+		zap.Int("fetched", fetchedCount),
+		zap.Int("detail", detailCount),
+		zap.Int("stubs", stubCount),
 		zap.Int("filtered", filteredCount),
 		zap.Int("errors", errorCount))
 

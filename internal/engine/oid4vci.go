@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -26,6 +27,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -49,7 +51,10 @@ type OID4VCIHandler struct {
 	dpopKey          *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
 	dpopNonce        string                 // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
-	clientID         string // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
+	clientKID        string            // key ID from client JWK (for JWT kid header)
+	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -153,6 +158,7 @@ type IssuerMetadata struct {
 	CredentialIssuer                  string                      `json:"credential_issuer"`
 	CredentialEndpoint                string                      `json:"credential_endpoint"`
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
+	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
@@ -364,6 +370,134 @@ func isDPoPNonceError(resp *http.Response) bool {
 	return resp.Header.Get("DPoP-Nonce") != ""
 }
 
+// fetchNonce calls the OID4VCI Nonce Endpoint (§7) to obtain a fresh c_nonce.
+// Per the spec, the Nonce Endpoint does not require authentication.
+// Returns the nonce value or an error.
+func (h *OID4VCIHandler) fetchNonce(ctx context.Context, nonceEndpoint string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", nonceEndpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("creating nonce request: %w", err)
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("nonce request failed: %w", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+		return "", fmt.Errorf("nonce endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var nonceResp struct {
+		CNonce          string `json:"c_nonce"`
+		CNonceExpiresIn int    `json:"c_nonce_expires_in,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nonceResp); err != nil {
+		return "", fmt.Errorf("parsing nonce response: %w", err)
+	}
+	if nonceResp.CNonce == "" {
+		return "", errors.New("nonce endpoint returned empty c_nonce")
+	}
+	h.Logger.Debug("obtained c_nonce from nonce endpoint", zap.String("nonce_endpoint", nonceEndpoint))
+	return nonceResp.CNonce, nil
+}
+
+// parseECPrivateKeyJWK parses a JSON-encoded EC private JWK into an *ecdsa.PrivateKey
+// and returns the key ID (kid) if present.
+func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, string, error) {
+	var raw struct {
+		Kty string `json:"kty"`
+		Crv string `json:"crv"`
+		X   string `json:"x"`
+		Y   string `json:"y"`
+		D   string `json:"d"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal([]byte(jwkJSON), &raw); err != nil {
+		return nil, "", fmt.Errorf("parsing JWK JSON: %w", err)
+	}
+	if raw.Kty != "EC" {
+		return nil, "", fmt.Errorf("unsupported key type %q, expected EC", raw.Kty)
+	}
+
+	var curve elliptic.Curve
+	switch raw.Crv {
+	case "P-256":
+		curve = elliptic.P256()
+	case "P-384":
+		curve = elliptic.P384()
+	default:
+		return nil, "", fmt.Errorf("unsupported curve %q", raw.Crv)
+	}
+
+	xBytes, err := base64.RawURLEncoding.DecodeString(raw.X)
+	if err != nil {
+		return nil, "", fmt.Errorf("decoding x: %w", err)
+	}
+	yBytes, err := base64.RawURLEncoding.DecodeString(raw.Y)
+	if err != nil {
+		return nil, "", fmt.Errorf("decoding y: %w", err)
+	}
+	dBytes, err := base64.RawURLEncoding.DecodeString(raw.D)
+	if err != nil {
+		return nil, "", fmt.Errorf("decoding d: %w", err)
+	}
+
+	key := &ecdsa.PrivateKey{
+		PublicKey: ecdsa.PublicKey{
+			Curve: curve,
+			X:     new(big.Int).SetBytes(xBytes),
+			Y:     new(big.Int).SetBytes(yBytes),
+		},
+		D: new(big.Int).SetBytes(dBytes),
+	}
+	return key, raw.Kid, nil
+}
+
+// createClientAssertion creates a client_assertion JWT for private_key_jwt authentication
+// per RFC 7523 §2.2 and OpenID Connect Core §9.
+// The aud claim MUST be the authorization server's issuer identifier (not the token endpoint).
+func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string) (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": clientID,
+		"sub": clientID,
+		"aud": audience,
+		"jti": uuid.New().String(),
+		"iat": now.Unix(),
+		"exp": now.Add(5 * time.Minute).Unix(),
+	}
+
+	signingMethod := jwt.SigningMethodES256
+	if key.Curve == elliptic.P384() {
+		signingMethod = jwt.SigningMethodES384
+	}
+
+	tok := jwt.NewWithClaims(signingMethod, claims)
+	if kid != "" {
+		tok.Header["kid"] = kid
+	}
+	return tok.SignedString(key)
+}
+
+// setClientAuth adds private_key_jwt client authentication parameters to the request data
+// if h.clientJWK is set. Always adds client_id.
+func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
+	data.Set("client_id", h.clientID)
+	if h.clientJWK == nil {
+		return nil
+	}
+	assertion, err := createClientAssertion(h.clientJWK, h.clientKID, h.clientID, h.authServerIssuer)
+	if err != nil {
+		return fmt.Errorf("failed to create client assertion: %w", err)
+	}
+	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+	data.Set("client_assertion", assertion)
+	return nil
+}
+
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
 type OAuthError struct {
 	Error            string `json:"error"`
@@ -435,10 +569,34 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.clientID = h.redirectURI
 	if r := metaResult.RegisteredIssuer; r != nil && r.ClientID != "" {
 		h.clientID = r.ClientID
-		h.Logger.Debug("using registered client_id for issuer",
+		h.Logger.Info("using registered client_id for issuer",
 			zap.String("client_id", h.clientID),
 			zap.String("issuer", offer.CredentialIssuer),
 		)
+	}
+
+	// Parse client JWK for private_key_jwt authentication if registered
+	if r := metaResult.RegisteredIssuer; r != nil && r.ClientJWK != "" {
+		key, kid, err := parseECPrivateKeyJWK(r.ClientJWK)
+		if err != nil {
+			h.Logger.Warn("failed to parse registered client JWK, skipping client authentication",
+				zap.Error(err),
+				zap.String("issuer", offer.CredentialIssuer),
+			)
+		} else {
+			h.clientJWK = key
+			h.clientKID = kid
+			h.Logger.Info("using private_key_jwt authentication for issuer",
+				zap.String("issuer", offer.CredentialIssuer),
+				zap.String("kid", kid),
+			)
+		}
+	}
+
+	// Determine AS issuer URL for private_key_jwt aud claim (RFC 7523 §2.2)
+	h.authServerIssuer = metadata.AuthorizationServer
+	if h.authServerIssuer == "" {
+		h.authServerIssuer = metadata.CredentialIssuer
 	}
 
 	// Step 3: Evaluate trust
@@ -484,10 +642,19 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Step 6 + 7: Request proofs and credential, with full retry on c_nonce refresh.
-	// OID4VCI spec: when the issuer returns a fresh c_nonce in an error response,
-	// the engine re-requests ALL proofs from the frontend with the new nonce and
-	// retries the credential request once.
+	// OID4VCI 1.0: prefer Nonce Endpoint (§7) over token response c_nonce.
+	// Fall back to token.CNonce for backward compatibility with pre-1.0 issuers.
 	nonce := token.CNonce
+	if metadata.NonceEndpoint != "" {
+		if n, err := h.fetchNonce(ctx, metadata.NonceEndpoint); err != nil {
+			h.Logger.Warn("failed to fetch nonce from endpoint, falling back to token c_nonce",
+				zap.Error(err),
+				zap.String("fallback_nonce_present", fmt.Sprintf("%v", nonce != "")),
+			)
+		} else {
+			nonce = n
+		}
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -506,9 +673,19 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		if credErr != nil {
 			var cNonceErr *CNonceRequiredError
 			if retries == 0 && errors.As(credErr, &cNonceErr) {
-				// Issuer returned a refreshed c_nonce — re-request all proofs and retry
-				h.Logger.Debug("c_nonce refreshed by issuer, re-requesting proofs")
-				nonce = cNonceErr.NewNonce
+				// Issuer signaled a nonce mismatch — get a fresh nonce and retry.
+				// Prefer Nonce Endpoint; fall back to the c_nonce from the error response.
+				if metadata.NonceEndpoint != "" {
+					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint); fetchErr == nil {
+						nonce = n
+					} else {
+						h.Logger.Debug("nonce endpoint retry failed, using error response c_nonce", zap.Error(fetchErr))
+						nonce = cNonceErr.NewNonce
+					}
+				} else {
+					nonce = cNonceErr.NewNonce
+				}
+				h.Logger.Debug("c_nonce refreshed, re-requesting proofs")
 				continue
 			}
 			// On the second attempt or for non-c_nonce errors, surface the error.
@@ -653,8 +830,24 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		if tenantID != "" {
 			if reg, lookupErr := h.issuerLookup.GetByIdentifier(ctx, domain.TenantID(tenantID), issuer); lookupErr == nil {
 				registeredIssuer = reg
+				h.Logger.Info("found registered issuer",
+					zap.String("tenant_id", tenantID),
+					zap.String("issuer", issuer),
+					zap.Bool("has_client_jwk", reg.ClientJWK != ""),
+					zap.String("client_id", reg.ClientID),
+				)
+			} else {
+				h.Logger.Info("issuer not found in registry",
+					zap.String("tenant_id", tenantID),
+					zap.String("issuer", issuer),
+					zap.Error(lookupErr),
+				)
 			}
+		} else {
+			h.Logger.Warn("no tenant ID in context for issuer lookup")
 		}
+	} else {
+		h.Logger.Warn("issuerLookup is nil, skipping registered issuer enrichment")
 	}
 
 	_ = h.Progress(StepMetadataFetched, map[string]interface{}{
@@ -1002,15 +1195,18 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
-	data := url.Values{}
-	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
-	data.Set("pre-authorized_code", code)
-	if txCode != "" {
-		data.Set("tx_code", txCode)
-	}
-
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
+		data := url.Values{}
+		data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
+		data.Set("pre-authorized_code", code)
+		if txCode != "" {
+			data.Set("tx_code", txCode)
+		}
+		if err := h.setClientAuth(data); err != nil {
+			return nil, err
+		}
+
 		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
@@ -1063,7 +1259,11 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 		authServer = metadata.CredentialIssuer
 	}
 
-	oauthMetadataURL := strings.TrimSuffix(authServer, "/") + "/.well-known/oauth-authorization-server"
+	// RFC 8615 well-known URI construction for OAuth AS metadata
+	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
+	if err != nil {
+		return nil
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
 		return nil
@@ -1155,7 +1355,17 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 
 	if oauthMeta.PushedAuthorizationRequestEndpoint != "" {
 		// Use Pushed Authorization Request (RFC 9126)
-		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, params)
+		// Add client authentication for PAR if available
+		parParams := url.Values{}
+		for k, v := range params {
+			parParams[k] = v
+		}
+		if h.clientJWK != nil {
+			if err := h.setClientAuth(parParams); err != nil {
+				h.Logger.Warn("failed to add client auth to PAR", zap.Error(err))
+			}
+		}
+		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
 		if parErr != nil {
 			// PAR failed — fall back to standard authorization URL
 			h.Logger.Debug("PAR request failed, falling back to standard authorization", zap.Error(parErr))
@@ -1295,17 +1505,19 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
-	data := url.Values{}
-	data.Set("grant_type", "authorization_code")
-	data.Set("code", code)
-	data.Set("redirect_uri", redirectURI)
-	data.Set("client_id", h.clientID)
-	if codeVerifier != "" {
-		data.Set("code_verifier", codeVerifier)
-	}
-
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
+		data := url.Values{}
+		data.Set("grant_type", "authorization_code")
+		data.Set("code", code)
+		data.Set("redirect_uri", redirectURI)
+		if codeVerifier != "" {
+			data.Set("code_verifier", codeVerifier)
+		}
+		if err := h.setClientAuth(data); err != nil {
+			return nil, err
+		}
+
 		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
@@ -1459,11 +1671,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
-		"format":                      config.Format,
 		"credential_configuration_id": configID,
-	}
-	if config.VCT != "" {
-		reqBody["vct"] = config.VCT
 	}
 	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
 	if len(proofs) > 0 {

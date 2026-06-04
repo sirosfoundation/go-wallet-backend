@@ -99,6 +99,10 @@ type ServerConfig struct {
 	// Active roles for status endpoint
 	Roles []string
 
+	// ServedByHeader is the value for the X-Served-By response header.
+	// Empty string disables the header.
+	ServedByHeader string
+
 	// IsProduction is true when the server runs in a production environment.
 	// In production, admin token auto-generation is disabled and the server
 	// refuses to start without a pre-configured admin token.
@@ -321,6 +325,9 @@ func (m *Manager) buildRouter() *gin.Engine {
 	router.Use(gin.Recovery())
 	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))
 	router.Use(middleware.Logger(m.logger, "/status", "/health", "/healthz", "/readyz"))
+	if m.cfg.ServedByHeader != "" {
+		router.Use(middleware.ServedByMiddleware(m.cfg.ServedByHeader))
+	}
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     m.cfg.CORS.AllowedOrigins,
 		AllowMethods:     m.cfg.CORS.AllowedMethods,
@@ -387,6 +394,9 @@ func (m *Manager) startAdminServer() error {
 	// Admin router
 	adminRouter := gin.New()
 	adminRouter.Use(gin.Recovery())
+	if m.cfg.ServedByHeader != "" {
+		adminRouter.Use(middleware.ServedByMiddleware(m.cfg.ServedByHeader))
+	}
 
 	// Public admin status endpoint (no auth required)
 	adminRouter.GET("/admin/status", func(c *gin.Context) {

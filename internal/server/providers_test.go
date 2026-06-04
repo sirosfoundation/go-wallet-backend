@@ -316,6 +316,7 @@ func newTestAuthZENHandler(cfg *config.Config, logger *zap.Logger) *api.AuthZENP
 		nil,
 		nil,
 		http.DefaultClient,
+		http.DefaultClient,
 		logger,
 	)
 }

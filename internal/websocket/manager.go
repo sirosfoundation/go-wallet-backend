@@ -111,11 +111,21 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := m.upgrader.Upgrade(w, r, nil)
+	var responseHeader http.Header
+	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
+		responseHeader = http.Header{}
+		responseHeader.Set("X-Served-By", servedBy)
+	}
+	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
+
+	// Clear the write deadline inherited from net/http's WriteTimeout.
+	// After upgrade, the WebSocket connection manages its own deadlines;
+	// the stale deadline would cause writes to fail after the timeout elapses.
+	_ = conn.SetWriteDeadline(time.Time{})
 
 	m.logger.Info("WebSocket client connected")
 
@@ -217,7 +227,7 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	})
+	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
 		return "", err

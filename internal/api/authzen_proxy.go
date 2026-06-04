@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	"go.uber.org/zap"
 )
@@ -52,7 +53,8 @@ type RegisteredIssuerInfo struct {
 }
 
 // resolveURLResponse is the response type for /v1/resolve URL subject requests.
-// It extends gotrust.EvaluationResponse with optional registered issuer info.
+// It extends gotrust.EvaluationResponse with optional registered issuer info
+// and authorization server metadata.
 type resolveURLResponse struct {
 	gotrust.EvaluationResponse
 	RegisteredIssuer *RegisteredIssuerInfo `json:"registered_issuer,omitempty"`
@@ -68,16 +70,23 @@ type AuthZENProxyHandler struct {
 	metadataResolver IssuerMetadataResolver
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
-	httpClient       *http.Client
-	allowHTTP        bool // when true, plain HTTP URLs are permitted for logos and jwks_uri (test/dev envs)
-	logger           *zap.Logger
+	// httpClient is used for external (user-visible) fetches: VCTM, credential offers, logos, jwks_uri.
+	// SSRF restrictions are applied here because these URLs originate from user-supplied content.
+	httpClient *http.Client
+	// pdpClient is used exclusively for requests to operator-configured PDP endpoints.
+	// SSRF dial restrictions are not applied because the PDP URL is operator-controlled.
+	pdpClient *http.Client
+	allowHTTP bool // when true, plain HTTP URLs are permitted for logos and jwks_uri (test/dev envs)
+	logger    *zap.Logger
 }
 
 // NewAuthZENProxyHandler creates a new AuthZEN proxy handler.
 // The tenantLookup and issuerLookup parameters are optional - if nil, the respective
 // per-tenant features are disabled.
 // The metadataResolver is required for URL subject resolution on /v1/resolve.
-func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
+// httpClient is used for external/user-visible fetches (SSRF-protected).
+// pdpClient is used for PDP requests (no SSRF restriction; URL is operator-configured).
+func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, pdpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
 		authorizer:       authorizer,
@@ -86,6 +95,7 @@ func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Aut
 		metadataResolver: metadataResolver,
 		clients:          make(map[string]*authzenclient.Client),
 		httpClient:       httpClient,
+		pdpClient:        pdpClient,
 		logger:           logger.Named("authzen-proxy"),
 	}
 }
@@ -140,6 +150,14 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		panic("authzen: AllowResolution=true but metadataResolver is nil — check server startup")
 	}
 
+	// Build a separate client for PDP calls. This client:
+	// - does NOT use a proxy (PDP is an internal service, reached directly)
+	// - does NOT apply SSRF dial restrictions (PDP URL is operator-controlled)
+	// - uses PDP-specific TLS settings from cfg.Trust (CACertPath, InsecureSkipVerify)
+	pdpClient, err := cfg.Trust.NewPDPHTTPClient(0)
+	if err != nil {
+		return nil, fmt.Errorf("authzen: failed to create PDP HTTP client: %w", err)
+	}
 	handler := NewAuthZENProxyHandler(
 		&cfg.AuthZENProxy,
 		authorizerInterface,
@@ -147,6 +165,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 		issuerLookup,
 		metadataResolver,
 		httpClient,
+		pdpClient,
 		logger,
 	)
 	// Propagate the HTTP client's allow_http setting so that logo and
@@ -181,7 +200,7 @@ func (h *AuthZENProxyHandler) getClient(pdpURL string) (*authzenclient.Client, e
 		return client, nil
 	}
 
-	client := authzenclient.New(pdpURL, authzenclient.WithHTTPClient(h.httpClient))
+	client := authzenclient.New(pdpURL, authzenclient.WithHTTPClient(h.pdpClient))
 	h.clients[pdpURL] = client
 	return client, nil
 }
@@ -291,12 +310,26 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 
 // Resolve handles POST /v1/resolve
 //
-// This endpoint resolves issuer metadata and evaluates trust. For URL subjects,
-// metadata is resolved locally and key material is extracted, then sent to the PDP
-// for trust evaluation. For key subjects, the request is proxied directly to the PDP.
+// This endpoint resolves metadata and evaluates trust. For URL subjects,
+// the behavior depends on the resource_type field:
 //
-// Request body: { "subject_id": "https://issuer.example.com", "subject_type": "url" }
-// Response: gotrust.EvaluationResponse with trust_metadata containing issuer metadata
+//   - "credential_issuer" (default for URL subjects): resolves issuer metadata
+//     locally, extracts key material, evaluates trust via PDP, and returns
+//     a composite response with decision and trust_metadata.
+//   - "oauth-authorization-server": fetches RFC 8414 authorization server
+//     metadata. No trust evaluation is performed (decision is always false).
+//
+// For key subjects, the request is proxied directly to the PDP.
+//
+// Request body:
+//
+//	{
+//	  "subject_id": "https://issuer.example.com",
+//	  "subject_type": "url",
+//	  "resource_type": "credential_issuer"  // optional, defaults per subject_type
+//	}
+//
+// Response: gotrust.EvaluationResponse with trust_metadata containing resolved metadata
 func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	// Check if resolution is enabled
 	if !h.cfg.AllowResolution {
@@ -401,7 +434,12 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 			h.proxyToPDP(c, ctx, tenantID, evalReq)
 			return
 		}
-		h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		switch resourceType {
+		case "oauth-authorization-server":
+			h.resolveAuthorizationServerMetadata(c, ctx, tenantID, req.SubjectID)
+		default:
+			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+		}
 		return
 	}
 
@@ -678,6 +716,81 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	c.JSON(http.StatusOK, resp)
 }
 
+// resolveAuthorizationServerMetadata handles resource_type=oauth-authorization-server.
+// It fetches the RFC 8414 OAuth Authorization Server metadata for the given issuer
+// and returns it in the standard resolve response format (trust_metadata).
+// No trust evaluation or key extraction is performed — this is a simple metadata fetch.
+func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context, ctx context.Context, tenantID, issuerURL string) {
+	// Use the issuer URL directly as the authorization server base.
+	// In OID4VCI, the credential issuer metadata may contain an
+	// authorization_servers field, but fetching it here would trigger
+	// an additional request to /.well-known/openid-credential-issuer
+	// which can interfere with conformance suite state machines.
+	// The caller can pass the authorization server URL directly if different.
+	wellKnown, err := oidc.WellKnownURL(issuerURL, "oauth-authorization-server")
+	if err != nil {
+		h.logger.Error("could not construct authorization server well-known URL",
+			zap.String("issuer_url", issuerURL),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.logger.Debug("failed to fetch authorization server metadata",
+			zap.String("url", wellKnown),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Debug("authorization server metadata returned non-200",
+			zap.String("url", wellKnown),
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", resp.StatusCode)})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read authorization server response"})
+		return
+	}
+
+	var authzMeta map[string]interface{}
+	if err := json.Unmarshal(body, &authzMeta); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server metadata JSON"})
+		return
+	}
+
+	h.logger.Info("authorization server metadata resolved",
+		zap.String("tenant_id", tenantID),
+		zap.String("issuer_url", issuerURL),
+	)
+
+	c.JSON(http.StatusOK, &resolveURLResponse{
+		EvaluationResponse: gotrust.EvaluationResponse{
+			Decision: false, // No trust evaluation performed — metadata fetch only
+			Context: &gotrust.EvaluationResponseContext{
+				TrustMetadata: authzMeta,
+			},
+		},
+	})
+}
+
 // proxyToPDP forwards an evaluation request directly to the PDP.
 func (h *AuthZENProxyHandler) proxyToPDP(c *gin.Context, ctx context.Context, tenantID string, evalReq *gotrust.EvaluationRequest) {
 	pdpURL, err := h.getPDPURL(ctx, tenantID)
@@ -796,6 +909,16 @@ func (h *AuthZENProxyHandler) inlineLogos(ctx context.Context, metadata map[stri
 				for _, d := range display {
 					if dm, ok := d.(map[string]interface{}); ok {
 						h.inlineLogoField(ctx, dm)
+					}
+				}
+			}
+			// Inline logos in credential_metadata.display (merged VCTM)
+			if credMeta, ok := cc["credential_metadata"].(map[string]interface{}); ok {
+				if display, ok := credMeta["display"].([]interface{}); ok {
+					for _, d := range display {
+						if dm, ok := d.(map[string]interface{}); ok {
+							h.inlineLogoField(ctx, dm)
+						}
 					}
 				}
 			}

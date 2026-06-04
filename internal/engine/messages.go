@@ -258,6 +258,12 @@ type SignRequestParams struct {
 	// Defaults to 1 when absent.
 	Count                int             `json:"count,omitempty"`
 	CredentialsToInclude []CredentialRef `json:"credentials_to_include,omitempty"`
+	// ResponseURI is the verifier's response endpoint, needed for mdoc session transcript.
+	ResponseURI string `json:"response_uri,omitempty"`
+	// VerifierJwkThumbprint is the base64url-encoded JWK SHA-256 thumbprint of the
+	// verifier's encryption key (for direct_post.jwt). Empty for other response modes.
+	// The frontend uses this to build the OID4VP 1.0 OpenID4VPHandover session transcript.
+	VerifierJwkThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
 }
 
 // CredentialRef references a credential for signing

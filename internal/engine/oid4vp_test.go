@@ -2,17 +2,23 @@ package engine
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -536,19 +542,10 @@ func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
 	sigKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 
-	sigJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(sigKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(sigKey.PublicKey.Y.Bytes(), 32)),
-		"use": "sig", "kid": "sig-key-1",
-	}
-	encJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc", "kid": "enc-key-1",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{sigJWK, encJWK}})
+	jwksBytes := makeJWKS(
+		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
+		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc"},
+	)
 
 	h := &OID4VPHandler{}
 	authReq := &AuthorizationRequest{
@@ -604,4 +601,173 @@ func splitDots(s string) []string {
 	}
 	parts = append(parts, s[start:])
 	return parts
+}
+
+// ===== extractVerifierEncryptionJWK tests =====
+
+func TestExtractVerifierEncryptionJWK_PrefersUseEnc(t *testing.T) {
+	sigKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	jwksBytes := makeJWKS(
+		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
+		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc"},
+	)
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "enc-key-1", jwk.KeyID)
+}
+
+func TestExtractVerifierEncryptionJWK_FallsBackToFirstKey(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwksBytes := makeJWKS(jose.JSONWebKey{Key: &key.PublicKey, KeyID: "only-key"})
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	result, err := h.extractVerifierEncryptionJWK(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "only-key", result.KeyID)
+}
+
+func TestExtractVerifierEncryptionJWK_NoKeysReturnsError(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{},
+	}
+
+	_, err := h.extractVerifierEncryptionJWK(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no verifier encryption JWK found")
+}
+
+func TestExtractVerifierEncryptionJWK_NilMetadata(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{}
+
+	_, err := h.extractVerifierEncryptionJWK(authReq)
+	require.Error(t, err)
+}
+
+func TestExtractVerifierEncryptionJWK_FallsBackToX5C(t *testing.T) {
+	// Generate a key and self-signed certificate for the verifier
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-verifier"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	// Build a minimal request JWT header containing x5c (no client_metadata.jwks)
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+	headerBytes, err := json.Marshal(map[string]interface{}{
+		"alg": "ES256",
+		"kid": "test-x5c-kid",
+		"x5c": []string{certB64},
+	})
+	require.NoError(t, err)
+	requestJWT := base64.RawURLEncoding.EncodeToString(headerBytes) + ".payload.signature"
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{RequestJWT: requestJWT}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "test-x5c-kid", jwk.KeyID)
+	assert.IsType(t, &ecdsa.PublicKey{}, jwk.Key)
+}
+
+func TestExtractVerifierEncryptionJWK_ThumbprintIsConsistent(t *testing.T) {
+	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	jwksBytes := makeJWKS(jose.JSONWebKey{
+		Key:   &encKey.PublicKey,
+		KeyID: "enc-key-1",
+		Use:   "enc",
+	})
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	require.NoError(t, err)
+
+	// Compute thumbprint twice — must be deterministic
+	thumb1, err := jwk.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+	thumb2, err := jwk.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+
+	assert.Equal(t, thumb1, thumb2, "thumbprint must be deterministic")
+	assert.Len(t, thumb1, 32, "SHA-256 thumbprint must be 32 bytes")
+
+	// Base64url encoding must round-trip
+	encoded := base64.RawURLEncoding.EncodeToString(thumb1)
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, thumb1, decoded)
+}
+
+// ===== SignRequestParams serialization =====
+
+func TestSignRequestParams_VerifierJwkThumbprint_JSON(t *testing.T) {
+	params := SignRequestParams{
+		Audience:              "https://verifier.example.com",
+		Nonce:                 "test-nonce",
+		ResponseURI:           "https://verifier.example.com/response",
+		VerifierJwkThumbprint: "abc123thumbprint",
+	}
+
+	data, err := json.Marshal(params)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	assert.Equal(t, "abc123thumbprint", parsed["verifier_jwk_thumbprint"])
+	// MdocNonce field should not exist
+	_, hasMdocNonce := parsed["mdoc_nonce"]
+	assert.False(t, hasMdocNonce, "mdoc_nonce field should not be present")
+}
+
+func TestSignRequestParams_VerifierJwkThumbprint_OmittedWhenEmpty(t *testing.T) {
+	params := SignRequestParams{
+		Audience: "https://verifier.example.com",
+		Nonce:    "test-nonce",
+	}
+
+	data, err := json.Marshal(params)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(data, &parsed))
+
+	_, hasThumbprint := parsed["verifier_jwk_thumbprint"]
+	assert.False(t, hasThumbprint, "verifier_jwk_thumbprint should be omitted when empty")
+}
+
+// makeJWKS builds a JWKS JSON blob from jose.JSONWebKey values.
+func makeJWKS(keys ...jose.JSONWebKey) json.RawMessage {
+	rawKeys := make([]json.RawMessage, len(keys))
+	for i, k := range keys {
+		b, _ := k.MarshalJSON()
+		rawKeys[i] = b
+	}
+	out, _ := json.Marshal(map[string]any{"keys": rawKeys})
+	return out
 }
