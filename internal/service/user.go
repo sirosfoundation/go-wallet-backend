@@ -234,9 +234,9 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 }
 
 // DeletionSummary contains counts of deleted items for the GDPR erasure response.
+// Note: credentials and presentations are stored client-side in the wallet's
+// local storage and are not managed by the backend.
 type DeletionSummary struct {
-	Credentials       int `json:"credentials"`
-	Presentations     int `json:"presentations"`
 	TenantMemberships int `json:"tenant_memberships"`
 	Challenges        int `json:"challenges"`
 	Invites           int `json:"invites"`
@@ -273,8 +273,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, cred := range credentials {
 			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
 				s.logger.Warn("Failed to delete credential", zap.Error(err))
-			} else {
-				summary.Credentials++
 			}
 		}
 
@@ -286,8 +284,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, pres := range presentations {
 			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
 				s.logger.Warn("Failed to delete presentation", zap.Error(err))
-			} else {
-				summary.Presentations++
 			}
 		}
 
@@ -300,17 +296,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	}
 
 	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
-	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
+	if n, err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		s.logger.Warn("Failed to delete challenges for user", zap.Error(err))
 	} else {
-		summary.Challenges = 1
+		summary.Challenges = int(n)
 	}
 
 	// Clear user reference from consumed invites
-	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
+	if n, err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
 	} else {
-		summary.Invites = 1
+		summary.Invites = int(n)
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)

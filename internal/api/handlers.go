@@ -813,7 +813,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	holderDID := userID.(string) // Using userID as holderDID
+	holderDID, _ := h.getHolderDID(c)
 
 	summary, err := h.services.User.DeleteUser(
 		c.Request.Context(),

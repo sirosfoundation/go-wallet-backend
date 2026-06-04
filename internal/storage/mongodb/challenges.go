@@ -58,12 +58,12 @@ func (s *ChallengeStore) DeleteExpired(ctx context.Context) error {
 	return nil
 }
 
-func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) error {
-	_, err := s.collection.DeleteMany(ctx, bson.M{"user_id": userID})
+func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) (int64, error) {
+	res, err := s.collection.DeleteMany(ctx, bson.M{"user_id": userID})
 	if err != nil {
-		return fmt.Errorf("failed to delete challenges for user: %w", err)
+		return 0, fmt.Errorf("failed to delete challenges for user: %w", err)
 	}
-	return nil
+	return res.DeletedCount, nil
 }
 
 // IssuerStore implements MongoDB issuer storage

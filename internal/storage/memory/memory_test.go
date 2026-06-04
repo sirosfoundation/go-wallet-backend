@@ -1860,7 +1860,7 @@ func TestChallengeStore_DeleteByUserID(t *testing.T) {
 	}
 
 	// Delete user-A's challenges
-	if err := challenges.DeleteByUserID(ctx, "user-A"); err != nil {
+	if _, err := challenges.DeleteByUserID(ctx, "user-A"); err != nil {
 		t.Fatalf("DeleteByUserID() error = %v", err)
 	}
 
@@ -1898,7 +1898,7 @@ func TestInviteStore_ClearUsedBy(t *testing.T) {
 	}
 
 	// Clear user-A references
-	if err := invites.ClearUsedBy(ctx, userA); err != nil {
+	if _, err := invites.ClearUsedBy(ctx, userA); err != nil {
 		t.Fatalf("ClearUsedBy() error = %v", err)
 	}
 

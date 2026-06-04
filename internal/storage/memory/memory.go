@@ -547,16 +547,18 @@ func (s *ChallengeStore) DeleteExpired(ctx context.Context) error {
 	return nil
 }
 
-func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) error {
+func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var count int64
 	for id, challenge := range s.data {
 		if challenge.UserID == userID {
 			delete(s.data, id)
+			count++
 		}
 	}
-	return nil
+	return count, nil
 }
 
 // IssuerStore implements in-memory issuer storage

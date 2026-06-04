@@ -572,8 +572,16 @@ func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
 	}
 
 	// Delete user
-	if _, err := service.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+	summary, err := service.DeleteUser(ctx, user.UUID, user.DID)
+	if err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	if summary.Challenges != 1 {
+		t.Errorf("summary.Challenges = %d, want 1", summary.Challenges)
+	}
+	if summary.Invites != 1 {
+		t.Errorf("summary.Invites = %d, want 1", summary.Invites)
 	}
 
 	// Verify challenge is deleted
@@ -630,8 +638,13 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 
 	// Delete user
-	if _, err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+	summary, err := svc.DeleteUser(ctx, user.UUID, user.DID)
+	if err != nil {
 		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	if summary.Sessions != 1 {
+		t.Errorf("summary.Sessions = %d, want 1", summary.Sessions)
 	}
 
 	// Verify session cleaner was called with correct user ID

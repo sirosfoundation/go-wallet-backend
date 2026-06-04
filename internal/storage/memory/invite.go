@@ -94,13 +94,15 @@ func (s *InviteStore) Delete(ctx context.Context, tenantID domain.TenantID, id s
 	return nil
 }
 
-func (s *InviteStore) ClearUsedBy(ctx context.Context, userID domain.UserID) error {
+func (s *InviteStore) ClearUsedBy(ctx context.Context, userID domain.UserID) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var count int64
 	for _, inv := range s.data {
 		if inv.UsedBy != nil && *inv.UsedBy == userID {
 			inv.UsedBy = nil
+			count++
 		}
 	}
-	return nil
+	return count, nil
 }
