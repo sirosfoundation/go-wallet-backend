@@ -249,27 +249,16 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
-		// Rule 5: Allow issuer metadata resolution (subject.type="url", HTTPS URLs)
-		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata.
+		// Rule 5: Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS URLs)
+		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata or credential offers.
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_issuer")),
-				sexp.NewList("id"),
-			),
-			sexp.NewList("subject",
-				sexp.NewList("type", sexp.NewAtom("url")),
-				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
-			),
-		),
-		// Rule 6: Allow credential offer URI resolution (subject.type="url", HTTPS URLs)
-		// Used by /v1/resolve with resource_type="credential_offer_uri".
-		sexp.NewList("authzen",
-			sexp.NewList("tenant"),
-			sexp.NewList("action"),
-			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_offer_uri")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",
@@ -278,7 +267,7 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
-		// Rule 7: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
+		// Rule 6: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with resource_type="oauth-authorization-server" to fetch RFC 8414 metadata.
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
@@ -293,7 +282,7 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
-		// Rule 8: Allow OAuth authorization server metadata resolution for HTTP URLs (dev environments)
+		// Rule 7: Allow OAuth authorization server metadata resolution for HTTP URLs (dev environments)
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
@@ -357,25 +346,15 @@ func ProductionWalletRules() []sexp.Element {
 			),
 		),
 
-		// Allow issuer metadata resolution (subject.type="url", HTTPS only in production)
+		// Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS only in production)
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_issuer")),
-				sexp.NewList("id"),
-			),
-			sexp.NewList("subject",
-				sexp.NewList("type", sexp.NewAtom("url")),
-				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
-			),
-		),
-		// Allow credential offer URI resolution (subject.type="url", HTTPS only in production)
-		sexp.NewList("authzen",
-			sexp.NewList("tenant"),
-			sexp.NewList("action"),
-			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_offer_uri")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",
