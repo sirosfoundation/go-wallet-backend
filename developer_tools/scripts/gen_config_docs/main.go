@@ -437,7 +437,6 @@ func renderMarkdown(sections []SectionDoc, title string) string {
 			continue
 		}
 		anchor := strings.ToLower(sec.Title)
-		anchor = strings.ReplaceAll(anchor, "_", "-")
 		anchor = strings.ReplaceAll(anchor, ".", "")
 		anchor = strings.ReplaceAll(anchor, " ", "-")
 		anchor = strings.ReplaceAll(anchor, "[*]", "")
