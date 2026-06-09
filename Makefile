@@ -68,6 +68,10 @@ lint: ## Run linter
 	@echo "Running linter..."
 	@golangci-lint run
 
+spec-check: ## Verify OpenAPI spec covers all registered routes
+	@echo "Checking OpenAPI spec coverage..."
+	@go test ./docs/ -count=1 -timeout 30s -run 'TestAdminOpenAPI|TestOpenAPISpec'
+
 clean: ## Clean build artifacts
 	@echo "Cleaning..."
 	@rm -rf bin/
