@@ -249,13 +249,16 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
-		// Rule 5: Allow issuer metadata resolution (subject.type="url", HTTPS URLs)
-		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata.
+		// Rule 5: Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS URLs)
+		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata or credential offers.
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_issuer")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",
@@ -343,12 +346,15 @@ func ProductionWalletRules() []sexp.Element {
 			),
 		),
 
-		// Allow issuer metadata resolution (subject.type="url", HTTPS only in production)
+		// Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS only in production)
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("credential_issuer")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",
