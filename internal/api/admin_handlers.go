@@ -1034,6 +1034,13 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 
 	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
+			h.audit.Log(audit.Event{
+				Operation:    "verifier.create",
+				ResourceType: "verifier",
+				TenantID:     string(tenantID),
+				OperatorIP:   c.ClientIP(),
+				Result:       audit.ResultFailure,
+			})
 			c.JSON(http.StatusConflict, gin.H{"error": "Verifier with this URL already exists in tenant"})
 			return
 		}
@@ -1041,7 +1048,6 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 		h.audit.Log(audit.Event{
 			Operation:    "verifier.create",
 			ResourceType: "verifier",
-			ResourceID:   req.Name,
 			TenantID:     string(tenantID),
 			OperatorIP:   c.ClientIP(),
 			Result:       audit.ResultFailure,

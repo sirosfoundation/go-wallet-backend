@@ -393,6 +393,9 @@ func (m *Manager) startAdminServer() error {
 
 	// Admin router
 	adminRouter := gin.New()
+	// Restrict trusted proxies to loopback by default so that c.ClientIP()
+	// (used in audit logs) cannot be spoofed via X-Forwarded-For.
+	_ = adminRouter.SetTrustedProxies([]string{"127.0.0.1", "::1"})
 	adminRouter.Use(gin.Recovery())
 	if m.cfg.ServedByHeader != "" {
 		adminRouter.Use(middleware.ServedByMiddleware(m.cfg.ServedByHeader))
