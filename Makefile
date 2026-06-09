@@ -1,6 +1,6 @@
 # Go Wallet Backend
 
-.PHONY: help build run test clean docker-build docker-run man install-man
+.PHONY: help build run test clean docker-build docker-run man install-man gen-config-docs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -135,5 +135,9 @@ init-db: ## Initialize database (for SQLite)
 	@echo "Initializing database..."
 	@rm -f wallet.db
 	@./bin/server --init-db
+
+gen-config-docs: ## Generate docs/CONFIGURATION.md from Go structs
+	@echo "Generating configuration reference..."
+	@go run developer_tools/scripts/gen_config_docs/main.go
 
 .DEFAULT_GOAL := help
