@@ -393,9 +393,15 @@ func (m *Manager) startAdminServer() error {
 
 	// Admin router
 	adminRouter := gin.New()
-	// Restrict trusted proxies to loopback by default so that c.ClientIP()
-	// (used in audit logs) cannot be spoofed via X-Forwarded-For.
-	_ = adminRouter.SetTrustedProxies([]string{"127.0.0.1", "::1"})
+	// Restrict trusted proxies so that c.ClientIP() (used in audit logs)
+	// cannot be spoofed via X-Forwarded-For. Includes loopback, Docker
+	// bridge networks, and standard Kubernetes pod/service CIDRs.
+	_ = adminRouter.SetTrustedProxies([]string{
+		"127.0.0.1", "::1",
+		"10.0.0.0/8",     // k8s pods, services, and private networks
+		"172.16.0.0/12",  // Docker bridge, k8s clusters
+		"192.168.0.0/16", // local/private networks
+	})
 	adminRouter.Use(gin.Recovery())
 	if m.cfg.ServedByHeader != "" {
 		adminRouter.Use(middleware.ServedByMiddleware(m.cfg.ServedByHeader))
