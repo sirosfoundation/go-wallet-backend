@@ -17,15 +17,36 @@ info:
     Users are associated with tenants through memberships. Each user can belong to multiple
     tenants with different roles (user, admin).
     
+    ## OIDC Gate
+    
+    Tenants can optionally require users to authenticate with an enterprise Identity Provider
+    (OpenID Connect) before accessing registration and/or login endpoints. The gate supports:
+    - `registration` mode: OIDC required for new wallet registrations
+    - `login` mode: OIDC required for wallet logins
+    - `both` mode: OIDC required for registration and login (with separate OPs per operation)
+    - `none` mode: default open behavior (no OIDC pre-authentication)
+    
+    When enabled, a separate `registration_op` and/or `login_op` (OIDC Provider Config) must
+    be supplied. An optional `bind_identity` flag permanently links the enterprise IdP subject
+    to the wallet user so that subsequent logins can verify the same enterprise identity.
+    
+    ## Verifier Client ID
+    
+    Verifiers may carry an optional `client_id` and `client_id_scheme` that the wallet uses
+    when matching incoming OID4VP authorization requests to a trusted verifier. Supported
+    schemes follow the OID4VP specification: `redirect_uri`, `pre-registered`, `x509_san_dns`,
+    `x509_san_uri`, `verifier_attestation`, and `did`.
+    
     ## Security
     
-    This API requires bearer token authentication via the `Authorization` header.
-    Set `WALLET_SERVER_ADMIN_TOKEN` to configure a fixed token; if not set, a random
-    token is generated at startup and logged. In production, you should also:
+    All `/admin/*` routes (except `/admin/status`) require bearer token authentication via the
+    `Authorization: Bearer <token>` header. Set `WALLET_SERVER_ADMIN_TOKEN` to configure a
+    fixed token; if not set, a random token is generated at startup and logged. In production,
+    you should also:
     - Only expose this API on internal networks
     - Use network-level access control (firewalls, VPNs)
     - Set a strong, persistent admin token via environment variable
-  version: 1.0.0
+  version: 1.1.0
   contact:
     name: SIROS Foundation
     url: https://siros.org
@@ -38,6 +59,9 @@ servers:
     description: Local development admin server
   - url: http://admin.wallet.internal:8081
     description: Internal admin server (example)
+
+security:
+  - bearerAuth: []
 
 tags:
   - name: Status
@@ -61,6 +85,7 @@ paths:
       summary: Get admin server status
       description: Health check endpoint for the admin server
       operationId: getAdminStatus
+      security: []
       responses:
         '200':
           description: Server is healthy
@@ -88,6 +113,8 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/TenantResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -129,6 +156,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -151,6 +180,8 @@ paths:
                 $ref: '#/components/schemas/TenantResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -177,6 +208,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -207,6 +240,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -238,6 +273,8 @@ paths:
                       - "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -284,6 +321,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -305,6 +344,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MessageResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -337,6 +378,8 @@ paths:
                       $ref: '#/components/schemas/IssuerResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -379,6 +422,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -404,6 +449,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -430,6 +477,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -450,6 +499,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -482,6 +533,8 @@ paths:
                       $ref: '#/components/schemas/VerifierResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -495,6 +548,10 @@ paths:
         Verifiers are services that can request credential presentations from
         users. The name and URL are displayed to users when they choose where
         to present their credentials.
+        
+        An optional `client_id` and `client_id_scheme` may be provided so that
+        the wallet can match incoming OID4VP authorization requests from this
+        verifier. When `client_id_scheme` is set, `client_id` is required.
       operationId: createVerifier
       requestBody:
         required: true
@@ -505,6 +562,8 @@ paths:
             example:
               name: "University Portal"
               url: "https://verifier.university.edu"
+              client_id: "did:web:verifier.university.edu"
+              client_id_scheme: "did"
       responses:
         '201':
           description: Verifier created successfully
@@ -516,6 +575,14 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: Verifier with this URL already exists in tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -541,6 +608,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -567,6 +636,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     
@@ -587,6 +658,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -613,6 +686,8 @@ paths:
                       $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     post:
@@ -639,6 +714,8 @@ paths:
                 $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -661,6 +738,8 @@ paths:
                 $ref: '#/components/schemas/InviteResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     put:
@@ -695,6 +774,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
     delete:
@@ -712,6 +793,8 @@ paths:
                 $ref: '#/components/schemas/MessageResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -821,6 +904,14 @@ components:
           type: boolean
           default: true
           description: Whether the tenant is enabled
+        require_invite:
+          type: boolean
+          default: false
+          description: Whether new users must supply a valid invite code to register
+        trust_config:
+          $ref: '#/components/schemas/TrustConfig'
+        oidc_gate:
+          $ref: '#/components/schemas/OIDCGateConfig'
 
     TenantResponse:
       type: object
@@ -837,6 +928,14 @@ components:
         enabled:
           type: boolean
           example: true
+        require_invite:
+          type: boolean
+          example: false
+          description: Whether new users must supply a valid invite code to register
+        trust_config:
+          $ref: '#/components/schemas/TrustConfig'
+        oidc_gate:
+          $ref: '#/components/schemas/OIDCGateConfig'
         created_at:
           type: string
           format: date-time
@@ -889,6 +988,20 @@ components:
         visible:
           type: boolean
           example: true
+        trust_status:
+          type: string
+          enum: [trusted, untrusted, unknown]
+          description: Trust evaluation result for this issuer
+          example: trusted
+        trust_framework:
+          type: string
+          description: Name of the trust framework used for evaluation (e.g. EUDIW)
+          example: EUDIW
+        trust_evaluated_at:
+          type: string
+          format: date-time
+          description: Timestamp of the most recent trust evaluation
+          example: "2025-01-16T14:20:00Z"
 
     VerifierRequest:
       type: object
@@ -905,6 +1018,36 @@ components:
           format: uri
           description: URL of the verifier service
           example: "https://verifier.university.edu"
+        client_id:
+          type: string
+          description: |
+            OAuth2/OID4VP client ID used by this verifier. Required when
+            `client_id_scheme` is set. If omitted, the wallet falls back to
+            matching by URL (`redirect_uri` scheme).
+          example: "did:web:verifier.university.edu"
+        client_id_scheme:
+          type: string
+          enum:
+            - redirect_uri
+            - pre-registered
+            - x509_san_dns
+            - x509_san_uri
+            - verifier_attestation
+            - did
+          description: |
+            OID4VP `client_id_scheme` associated with `client_id`. Must be one
+            of the values defined in the OID4VP specification. When provided,
+            `client_id` must also be set.
+          example: "did"
+      # Enforce mutual dependency: client_id is required when client_id_scheme is set
+      oneOf:
+        - description: No explicit scheme — client identified by redirect_uri matching
+          not:
+            required: [client_id_scheme]
+        - description: Explicit scheme — both client_id and client_id_scheme required
+          required:
+            - client_id
+            - client_id_scheme
 
     VerifierResponse:
       type: object
@@ -923,6 +1066,30 @@ components:
           type: string
           format: uri
           example: "https://verifier.university.edu"
+        client_id:
+          type: string
+          description: OID4VP client ID for this verifier (omitted when not set)
+          example: "did:web:verifier.university.edu"
+        client_id_scheme:
+          type: string
+          enum:
+            - redirect_uri
+            - pre-registered
+            - x509_san_dns
+            - x509_san_uri
+            - verifier_attestation
+            - did
+          description: OID4VP client_id_scheme for this verifier (omitted when not set)
+          example: "did"
+        trust_status:
+          type: string
+          enum: [trusted, untrusted, unknown]
+          description: Trust evaluation result for this verifier
+          example: trusted
+        trust_framework:
+          type: string
+          description: Name of the trust framework used for evaluation (e.g. EUDIW)
+          example: EUDIW
 
     InviteRequest:
       type: object
@@ -1009,6 +1176,122 @@ components:
           format: date-time
           example: "2025-01-15T10:00:00Z"
 
+    TrustConfig:
+      type: object
+      description: Trust evaluation configuration for the tenant
+      properties:
+        trust_ttl:
+          type: integer
+          description: |
+            How long trust evaluations remain valid, in seconds.
+            Defaults to 86400 (24 hours) when not set.
+          example: 86400
+        pdp_url:
+          type: string
+          format: uri
+          description: |
+            AuthZEN PDP URL for this tenant's `/v1/evaluate` proxy endpoint.
+            If omitted, the global `authzen_proxy.pdp_url` configuration is used.
+            This allows different tenants to use different trust services.
+          example: "https://pdp.trust.example.com/v1/evaluate"
+
+    OIDCProviderConfig:
+      type: object
+      required:
+        - issuer
+        - client_id
+      description: Configuration for an OIDC Identity Provider used by the OIDC gate
+      properties:
+        display_name:
+          type: string
+          description: User-friendly name shown on the IdP login button (e.g. "Corporate SSO")
+          example: "Corporate SSO"
+        issuer:
+          type: string
+          format: uri
+          description: |
+            OIDC issuer URL. Used for token validation and OIDC discovery
+            (`{issuer}/.well-known/openid-configuration`).
+          example: "https://login.acme.com"
+        client_id:
+          type: string
+          description: |
+            Public OIDC client ID for PKCE. No client secret is required because
+            the frontend performs the authorization code + PKCE flow.
+          example: "wallet-app"
+        jwks_uri:
+          type: string
+          format: uri
+          description: |
+            Optional explicit JWKS URI for token signature validation.
+            If omitted, the URI is discovered from the issuer's OpenID configuration.
+          example: "https://login.acme.com/.well-known/jwks.json"
+        audience:
+          type: string
+          description: |
+            Required `aud` claim value. Defaults to `client_id` when not set.
+          example: "wallet-app"
+        scopes:
+          type: string
+          description: |
+            Space-separated OIDC scopes to request. Defaults to
+            `openid profile email` when not set.
+          example: "openid profile email"
+
+    OIDCGateConfig:
+      type: object
+      description: |
+        OIDC pre-authentication gate for the tenant. Protects registration and/or
+        login endpoints with enterprise IdP authentication.
+        
+        - `none`: OIDC gate disabled (default open behavior)
+        - `registration`: OIDC required only for new wallet registrations
+        - `login`: OIDC required only for wallet logins
+        - `both`: OIDC required for both registration and login
+        
+        When `bind_identity` is true, the enterprise IdP `sub` claim is permanently
+        linked to the wallet user during registration. Subsequent logins verify
+        that the same enterprise identity is used. `bind_identity` cannot be used
+        with mode `login` (binding only occurs during registration).
+      properties:
+        mode:
+          type: string
+          enum: [none, registration, login, both]
+          default: none
+          description: Which endpoints require OIDC pre-authentication
+          example: registration
+        registration_op:
+          $ref: '#/components/schemas/OIDCProviderConfig'
+        login_op:
+          $ref: '#/components/schemas/OIDCProviderConfig'
+        required_claims:
+          type: object
+          additionalProperties: true
+          description: |
+            Optional map of claim names to expected values that must be present
+            in the validated ID token (e.g. `{"email_verified": true}`).
+            Array values are matched as subsets.
+          example:
+            email_verified: true
+        bind_identity:
+          type: boolean
+          default: false
+          description: |
+            When true, the enterprise IdP `sub` is permanently bound to the wallet
+            user during registration. Cannot be used with mode `login`.
+          example: false
+      # Enforce: bind_identity cannot be true when mode is "login"
+      if:
+        properties:
+          mode:
+            const: login
+        required: [mode]
+      then:
+        properties:
+          bind_identity:
+            enum: [false]
+            description: bind_identity must be false (or omitted) when mode is "login"
+
   responses:
     BadRequest:
       description: Invalid request parameters
@@ -1036,3 +1319,22 @@ components:
             $ref: '#/components/schemas/ErrorResponse'
           example:
             error: "Failed to process request"
+
+    Unauthorized:
+      description: Missing or invalid admin bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Invalid token"
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Static bearer token for admin API authentication. Configure via the
+        `WALLET_SERVER_ADMIN_TOKEN` environment variable or `server.admin_token`
+        config key. If not set, a random token is generated at startup and
+        logged (development mode only).
