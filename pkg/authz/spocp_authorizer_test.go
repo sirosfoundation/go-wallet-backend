@@ -91,6 +91,51 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 			shouldPass: true,
 		},
 		{
+			name:     "credential_issuer for DID key subject",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "key",
+					ID:   "did:web:dev-i4mlab.aegean.gr:rfc-issuer",
+				},
+				Resource: gotrust.Resource{
+					Type: "credential_issuer",
+					ID:   "did:web:dev-i4mlab.aegean.gr:rfc-issuer",
+				},
+			},
+			shouldPass: true,
+		},
+		{
+			name:     "credential_offer_uri for DID key subject",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "key",
+					ID:   "did:web:example.com:issuer",
+				},
+				Resource: gotrust.Resource{
+					Type: "credential_offer_uri",
+					ID:   "did:web:example.com:issuer",
+				},
+			},
+			shouldPass: true,
+		},
+		{
+			name:     "credential_issuer rejected for non-DID key subject",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "key",
+					ID:   "not-a-did:example.com",
+				},
+				Resource: gotrust.Resource{
+					Type: "credential_issuer",
+					ID:   "not-a-did:example.com",
+				},
+			},
+			shouldPass: false,
+		},
+		{
 			name:     "issuer metadata resolution (url type)",
 			tenantID: "default",
 			request: &gotrust.EvaluationRequest{

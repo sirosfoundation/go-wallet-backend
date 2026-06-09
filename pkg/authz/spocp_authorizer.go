@@ -210,7 +210,7 @@ func DefaultWalletRules() []sexp.Element {
 		// (authzen (tenant)(action)(resource (type <resolution|credential_issuer|credential_offer_uri>)(id))(subject (type key)(id did:*)))
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
-			sexp.NewList("action"), // empty action = resolution
+			sexp.NewList("action"), // any action (empty = match all)
 			sexp.NewList("resource",
 				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
 					sexp.NewAtom("resolution"),
