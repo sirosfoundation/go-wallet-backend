@@ -206,13 +206,17 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
-		// Rule 2: Allow resolution-only requests for DIDs
-		// (authzen (tenant)(action)(resource (type resolution)(id))(subject (type key)(id did:*)))
+		// Rule 2: Allow resolution and issuer metadata requests for DIDs
+		// (authzen (tenant)(action)(resource (type <resolution|credential_issuer|credential_offer_uri>)(id))(subject (type key)(id did:*)))
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
-			sexp.NewList("action"), // empty action = resolution
+			sexp.NewList("action"), // any action (empty = match all)
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("resolution")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("resolution"),
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",
@@ -318,12 +322,16 @@ func ProductionWalletRules() []sexp.Element {
 			),
 		),
 
-		// Allow DID resolution only (HTTPS only in production)
+		// Allow DID resolution and issuer metadata (did:web: only in production)
 		sexp.NewList("authzen",
 			sexp.NewList("tenant"),
 			sexp.NewList("action"),
 			sexp.NewList("resource",
-				sexp.NewList("type", sexp.NewAtom("resolution")),
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("resolution"),
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
 				sexp.NewList("id"),
 			),
 			sexp.NewList("subject",

@@ -10,6 +10,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// didKeyReq creates an EvaluationRequest for a DID key subject with the given resource type.
+func didKeyReq(id, resourceType string) *gotrust.EvaluationRequest {
+	return &gotrust.EvaluationRequest{
+		Subject:  gotrust.Subject{Type: "key", ID: id},
+		Resource: gotrust.Resource{Type: resourceType, ID: id},
+	}
+}
+
 func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -90,6 +98,10 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 			},
 			shouldPass: true,
 		},
+		// DID subject + credential_issuer/credential_offer_uri combinations (Rule 2)
+		{name: "credential_issuer for DID", tenantID: "default", shouldPass: true, request: didKeyReq("did:web:dev-i4mlab.aegean.gr:rfc-issuer", "credential_issuer")},
+		{name: "credential_offer_uri for DID", tenantID: "default", shouldPass: true, request: didKeyReq("did:web:example.com:issuer", "credential_offer_uri")},
+		{name: "credential_issuer rejected for non-DID", tenantID: "default", shouldPass: false, request: didKeyReq("not-a-did:example.com", "credential_issuer")},
 		{
 			name:     "issuer metadata resolution (url type)",
 			tenantID: "default",
