@@ -1,4 +1,4 @@
-package docs_test
+package docs
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -24,7 +23,7 @@ import (
 func TestAdminOpenAPIRouteCoverage(t *testing.T) {
 	specPath := resolveSpecPath("openapi-admin.yaml")
 	if _, err := os.Stat(specPath); os.IsNotExist(err) {
-		t.Skipf("OpenAPI spec not found at %s", specPath)
+		t.Fatalf("OpenAPI spec not found at %s — spec must exist for CI enforcement", specPath)
 	}
 
 	// Load and validate spec
@@ -109,17 +108,17 @@ func normalizePathParams(path string) string {
 	return re.ReplaceAllString(path, `{_}`)
 }
 
-// resolveSpecPath returns the absolute path to the spec file relative to the test file location.
+// resolveSpecPath returns the absolute path to the spec file relative to the package
+// working directory. This is stable under -trimpath unlike runtime.Caller(0).
 func resolveSpecPath(filename string) string {
-	_, testFile, _, _ := runtime.Caller(0)
-	return filepath.Join(filepath.Dir(testFile), filename)
+	return filepath.Join(".", filename)
 }
 
 // TestOpenAPISpecValid ensures the spec itself is valid OpenAPI 3.x.
 func TestOpenAPISpecValid(t *testing.T) {
 	specPath := resolveSpecPath("openapi-admin.yaml")
 	if _, err := os.Stat(specPath); os.IsNotExist(err) {
-		t.Skipf("OpenAPI spec not found at %s", specPath)
+		t.Fatalf("OpenAPI spec not found at %s — spec must exist for CI enforcement", specPath)
 	}
 
 	loader := openapi3.NewLoader()
