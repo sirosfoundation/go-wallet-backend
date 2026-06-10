@@ -1,0 +1,39 @@
+name: Build and Publish Docker Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  server:
+    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    with:
+      image-name: sirosfoundation/go-wallet-backend
+      dockerfile: ./Dockerfile
+
+  registry:
+    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    with:
+      image-name: sirosfoundation/go-wallet-registry
+      dockerfile: ./Dockerfile.registry
+
+  wallet-admin:
+    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    with:
+      image-name: sirosfoundation/go-wallet-admin
+      dockerfile: ./Dockerfile.wallet-admin
