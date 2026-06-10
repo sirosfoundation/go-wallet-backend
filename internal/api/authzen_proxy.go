@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/authzenclient"
+	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -24,7 +25,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	"go.uber.org/zap"
-	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
 )
 
 // IssuerMetadataResolver resolves OpenID4VCI issuer metadata from a credential issuer URL.
@@ -458,7 +458,12 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// For key subjects with resource_type=credential_issuer
 	if subjectType == "key" && resourceType == "credential_issuer" && strings.HasPrefix(req.SubjectID, "did:web:") {
-		issuerURL, err := didWebToIssuerURL(req.SubjectID)
+		parsed, err := didutil.Parse(req.SubjectID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		issuerURL, err := parsed.ToBaseURL("https")
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1088,23 +1093,4 @@ func getActionName(req *gotrust.EvaluationRequest) string {
 		return req.Action.Name
 	}
 	return ""
-}
-
-// didWebToIssuerURL converts a DID:web URL to an issuer URL.
-func didWebToIssuerURL(did string) (string, error) {
-	parsed, err := didutil.Parse(did)
-	if err != nil {
-		return "", err
-	}
-	if parsed.Method != "web" {
-		return "", fmt.Errorf("only did:web supported, got did:%s", parsed.Method)
-	}
-
-	domain := parsed.Domain()
-	path := parsed.PathFromSegments()
-
-	if path == "" {
-		return "https://" + domain, nil
-	}
-	return "https://" + domain + "/" + path, nil
 }
