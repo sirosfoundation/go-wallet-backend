@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/authzenclient"
+	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -452,6 +453,23 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		default:
 			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID, req.CredentialTypes)
 		}
+		return
+	}
+
+	// For key subjects with resource_type=credential_issuer
+	if subjectType == "key" && resourceType == "credential_issuer" && strings.HasPrefix(req.SubjectID, "did:web:") {
+		parsed, err := didutil.Parse(req.SubjectID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		issuerURL, err := parsed.ToBaseURL("https")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		// Reuse existing URL subject resolution (fetches metadata, evaluates trust)
+		h.resolveURLSubject(c, ctx, tenantID, issuerURL, req.CredentialTypes)
 		return
 	}
 
