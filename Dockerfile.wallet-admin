@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o wallet-admin cmd/wallet-admin/main.go
 
 # Runtime stage (based on Alpine to provide a shell and enable scripting)
-FROM docker.io/library/alpine:3.23
+FROM docker.io/library/alpine:3.24
 
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/wallet-admin /usr/local/bin/
