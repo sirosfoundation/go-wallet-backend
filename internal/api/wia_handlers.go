@@ -80,9 +80,10 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"message": "Challenge is expired or has already been used",
 			})
 		case errors.Is(err, service.ErrWIAPopInvalid):
+			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "POP_INVALID",
-				"message": err.Error(),
+				"message": "WIA-PoP validation failed",
 			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))

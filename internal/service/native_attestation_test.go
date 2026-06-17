@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
@@ -312,23 +314,55 @@ func TestAppleAppAttestRootCAs_NotEmpty(t *testing.T) {
 	// We test by checking the pool is usable
 }
 
-func TestContainsBytes(t *testing.T) {
-	tests := []struct {
-		haystack []byte
-		needle   []byte
-		expected bool
-	}{
-		{[]byte{1, 2, 3, 4, 5}, []byte{3, 4}, true},
-		{[]byte{1, 2, 3, 4, 5}, []byte{5, 6}, false},
-		{[]byte{1, 2, 3}, []byte{1, 2, 3, 4}, false},
-		{[]byte{}, []byte{}, true},
-		{[]byte{1}, []byte{}, true},
+func TestExtractAppAttestNonce(t *testing.T) {
+	// Test with a well-formed ASN.1 extension value
+	// SEQUENCE { SEQUENCE { [0] EXPLICIT OCTET STRING { 32 bytes of nonce } } }
+	expectedNonce := make([]byte, 32)
+	for i := range expectedNonce {
+		expectedNonce[i] = byte(i)
 	}
-	for _, tt := range tests {
-		got := containsBytes(tt.haystack, tt.needle)
-		if got != tt.expected {
-			t.Errorf("containsBytes(%v, %v) = %v, want %v", tt.haystack, tt.needle, got, tt.expected)
-		}
+
+	// Build the ASN.1 structure manually
+	// Inner: context-specific [0] EXPLICIT wrapping OCTET STRING
+	innerOctetStr, _ := asn1.Marshal(expectedNonce)
+	tagged := asn1.RawValue{
+		Class:      asn1.ClassContextSpecific,
+		Tag:        0,
+		IsCompound: true,
+		Bytes:      innerOctetStr,
+	}
+	taggedBytes, _ := asn1.Marshal(tagged)
+
+	// Inner SEQUENCE
+	innerSeq := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      taggedBytes,
+	}
+	innerSeqBytes, _ := asn1.Marshal(innerSeq)
+
+	// Outer SEQUENCE
+	outerSeq := asn1.RawValue{
+		Class:      asn1.ClassUniversal,
+		Tag:        asn1.TagSequence,
+		IsCompound: true,
+		Bytes:      innerSeqBytes,
+	}
+	extValue, _ := asn1.Marshal(outerSeq)
+
+	got, err := extractAppAttestNonce(extValue)
+	if err != nil {
+		t.Fatalf("extractAppAttestNonce() error = %v", err)
+	}
+	if !bytes.Equal(got, expectedNonce) {
+		t.Errorf("extractAppAttestNonce() = %x, want %x", got, expectedNonce)
+	}
+
+	// Test with invalid data
+	_, err = extractAppAttestNonce([]byte{0x00, 0x01})
+	if err == nil {
+		t.Error("extractAppAttestNonce(invalid) should have returned error")
 	}
 }
 
