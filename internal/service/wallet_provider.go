@@ -124,29 +124,35 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		return "", ErrKeyAttestationNotSupported
 	}
 
-	// Enrich each key with security properties if provided
-	if secProps != nil {
-		for i := range jwks {
+	// Enrich each key with security properties if provided.
+	// Clone each JWK map to avoid mutating the caller's data.
+	enriched := make([]map[string]interface{}, len(jwks))
+	for i, jwk := range jwks {
+		clone := make(map[string]interface{}, len(jwk)+3)
+		for k, v := range jwk {
+			clone[k] = v
+		}
+		if secProps != nil {
 			if secProps.KeyStorage != "" {
-				jwks[i]["key_storage"] = secProps.KeyStorage
+				clone["key_storage"] = secProps.KeyStorage
 			}
 			if len(secProps.UserAuthentication) > 0 {
-				jwks[i]["user_authentication"] = secProps.UserAuthentication
+				clone["user_authentication"] = secProps.UserAuthentication
 			}
 			if secProps.Certification != "" {
-				jwks[i]["certification"] = secProps.Certification
+				clone["certification"] = secProps.Certification
 			}
 		}
+		enriched[i] = clone
 	}
 
 	// Create the JWT claims
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"attested_keys":      jwks,
-		"key_storage_status": map[string]interface{}{},
-		"nonce":              nonce,
-		"iat":                now.Unix(),
-		"exp":                now.Add(15 * time.Second).Unix(),
+		"attested_keys": enriched,
+		"nonce":         nonce,
+		"iat":           now.Unix(),
+		"exp":           now.Add(15 * time.Second).Unix(),
 	}
 
 	// Create the token with ES256 and x5c header
