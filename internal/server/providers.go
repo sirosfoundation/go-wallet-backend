@@ -152,8 +152,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
-			walletProvider.POST("/wia/challenge", p.handlers.WIAChallenge)
-			walletProvider.POST("/wia/generate", p.handlers.WIAGenerate)
+			if p.cfg.WalletProvider.WIA.Enabled {
+				walletProvider.POST("/wia/challenge", p.handlers.WIAChallenge)
+				walletProvider.POST("/wia/generate", p.handlers.WIAGenerate)
+			}
 		}
 	}
 }

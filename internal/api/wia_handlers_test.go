@@ -1,0 +1,133 @@
+package api
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+)
+
+func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine) {
+	t.Helper()
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host:     "localhost",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			RPName:   "Test Wallet",
+		},
+		JWT: config.JWTConfig{
+			Secret:      "test-secret",
+			ExpiryHours: 24,
+			Issuer:      "test-wallet",
+		},
+	}
+	cfg.WalletProvider.WIA = config.WIAConfig{
+		Enabled:             wiaEnabled,
+		WalletName:          "Test Wallet",
+		WalletVersion:       "1.0.0",
+		MaxExpirySeconds:    86400,
+		ChallengeTTLSeconds: 300,
+	}
+
+	store := memory.NewStore()
+	services := service.NewServices(store, cfg, logger)
+
+	// If WIA is enabled but keys aren't configured, inject a test WIA service
+	if wiaEnabled && services.WIA == nil {
+		privKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		certDER, _ := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+			SerialNumber: big.NewInt(1),
+		}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
+		certB64 := base64.StdEncoding.EncodeToString(certDER)
+		services.WIA = service.NewWIAService(cfg, logger, privKey, []string{certB64})
+	}
+
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	router := gin.New()
+	return handlers, router
+}
+
+func TestWIAChallenge_WIADisabled(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, false)
+	router.POST("/wia/challenge", handlers.WIAChallenge)
+
+	req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "WIA_NOT_SUPPORTED" {
+		t.Errorf("expected WIA_NOT_SUPPORTED error, got %v", resp["error"])
+	}
+}
+
+func TestWIAGenerate_InvalidBody(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, true)
+	router.POST("/wia/generate", handlers.WIAGenerate)
+
+	// Empty body
+	req := httptest.NewRequest(http.MethodPost, "/wia/generate", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "INVALID_REQUEST" {
+		t.Errorf("expected INVALID_REQUEST error, got %v", resp["error"])
+	}
+}
+
+func TestWIAGenerate_ExpiredChallenge(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, true)
+	router.POST("/wia/generate", handlers.WIAGenerate)
+
+	// Use a challenge that was never issued
+	body := map[string]string{
+		"pop":       "dummy.jwt.token",
+		"challenge": "nonexistent-challenge",
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/wia/generate", bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "CHALLENGE_EXPIRED" {
+		t.Errorf("expected CHALLENGE_EXPIRED error, got %v", resp["error"])
+	}
+}

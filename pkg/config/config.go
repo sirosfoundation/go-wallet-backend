@@ -362,17 +362,17 @@ type WalletProviderConfig struct {
 // WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
 type WIAConfig struct {
 	// Enabled controls whether WIA endpoints are registered
-	Enabled bool `yaml:"enabled" envconfig:"ENABLED" default:"true"`
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 	// WalletName is the wallet_name claim in WIA JWT
-	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME" default:"SIROS ID"`
+	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME"`
 	// WalletVersion is the wallet_version claim
 	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
 	// WalletLink is the wallet download/info URI
 	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
 	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
-	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS" default:"86400"`
+	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
 	// ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds
-	ChallengeTTLSeconds int `yaml:"challenge_ttl_seconds" envconfig:"CHALLENGE_TTL_SECONDS" default:"300"`
+	ChallengeTTLSeconds int `yaml:"challenge_ttl_seconds" envconfig:"CHALLENGE_TTL_SECONDS"`
 }
 
 // FlowTrustConfig contains per-flow trust evaluation overrides.
@@ -918,6 +918,14 @@ func defaultConfig() *Config {
 			Enabled:         true, // Enabled by default - required for engine flows
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
+		},
+		WalletProvider: WalletProviderConfig{
+			WIA: WIAConfig{
+				Enabled:             true,
+				WalletName:          "SIROS ID",
+				MaxExpirySeconds:    86400,
+				ChallengeTTLSeconds: 300,
+			},
 		},
 	}
 }

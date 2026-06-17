@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/pem"
 	"math/big"
 	"testing"
 	"time"
@@ -314,6 +313,3 @@ func TestParseECPublicKeyFromJWK(t *testing.T) {
 		t.Fatal("parsed key doesn't match original")
 	}
 }
-
-// Suppress unused import warning for pem
-var _ = pem.Decode
