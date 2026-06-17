@@ -56,6 +56,16 @@ const (
 	ClientIDSchemeVerifierAttestation = "verifier_attestation"
 )
 
+// TransactionData represents a single transaction data object from
+// the verifier's OID4VP authorization request (TS12/SCA per OID4VP draft §7.4).
+type TransactionData struct {
+	Type                     string                 `json:"type"`
+	Params                   map[string]interface{} `json:"params,omitempty"`
+	CredentialIDs            []string               `json:"credential_ids,omitempty"`
+	HashAlgorithm            string                 `json:"hash_alg,omitempty"`
+	TransactionDataHashesAlg string                 `json:"transaction_data_hashes_alg,omitempty"`
+}
+
 // AuthorizationRequest represents an OpenID4VP authorization request
 type AuthorizationRequest struct {
 	ResponseType      string          `json:"response_type"`
@@ -70,6 +80,8 @@ type AuthorizationRequest struct {
 	DCQLQuery         json.RawMessage `json:"dcql_query,omitempty"`
 	ClientMetadata    *ClientMetadata `json:"client_metadata,omitempty"`
 	ClientMetadataURI string          `json:"client_metadata_uri,omitempty"`
+	// TransactionData carries TS12 transaction data from the verifier (OID4VP draft §7.4).
+	TransactionData []TransactionData `json:"transaction_data,omitempty"`
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
@@ -776,6 +788,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		CredentialsToInclude:  credRefs,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
+		TransactionData:       authReq.TransactionData,
 	})
 	if err != nil {
 		return "", err
