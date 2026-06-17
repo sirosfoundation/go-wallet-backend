@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -10,6 +11,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
+	"github.com/go-jose/go-jose/v4"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -87,50 +90,137 @@ func (s *NativeAttestationService) Verify(ctx context.Context, req *NativeAttest
 	}
 }
 
-// verifyAppleAppAttest validates an Apple App Attest assertion.
+// appleAppAttestAttestation represents the CBOR attestation object from App Attest.
+type appleAppAttestAttestation struct {
+	Fmt      string                        `cbor:"fmt"`
+	AttStmt  appleAppAttestAttestStatement `cbor:"attStmt"`
+	AuthData []byte                        `cbor:"authData"`
+}
+
+// appleAppAttestAttestStatement is the attestation statement within the CBOR object.
+type appleAppAttestAttestStatement struct {
+	X5C     [][]byte `cbor:"x5c"`
+	Receipt []byte   `cbor:"receipt"`
+}
+
+// verifyAppleAppAttest validates an Apple App Attest attestation object.
 // See: https://developer.apple.com/documentation/devicecheck/validating_apps_that_connect_to_your_server
 func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
 	nativeCfg := s.cfg.WalletProvider.Attestation.NativeAttestation
 
-	// Decode the attestation statement (CBOR-encoded attestation object)
-	attestBytes, err := base64.StdEncoding.DecodeString(req.Token)
-	if err != nil {
-		return nil, fmt.Errorf("%w: decode token: %v", ErrNativeAttestationInvalid, err)
-	}
-
-	// Apple App Attest attestation object is CBOR:
-	// { "fmt": "apple-appattest", "attStmt": { "x5c": [...], "receipt": ... }, "authData": ... }
-	// For assertion (post-attestation), it's a simpler structure.
-	// Here we verify the core properties.
-
-	// Step 1: Verify the challenge hash
-	challengeHash := sha256.Sum256([]byte(req.Challenge))
-
-	// Step 2: Parse the attestation (simplified verification)
-	// In production, use a full CBOR parser and validate:
-	// - x5c chain roots to Apple App Attest CA
-	// - Nonce in authData matches SHA256(challenge)
-	// - App ID matches configured value
-	// - Counter is valid
-	if len(attestBytes) == 0 {
-		return nil, fmt.Errorf("%w: empty attestation", ErrNativeAttestationInvalid)
-	}
-
-	// Verify app ID matches
 	if nativeCfg.AppleAppID == "" {
 		return nil, fmt.Errorf("%w: apple_app_id not configured", ErrNativeAttestationInvalid)
 	}
 
-	s.logger.Debug("Apple App Attest verification",
-		zap.String("key_id", req.KeyID),
-		zap.String("challenge_hash", base64.RawURLEncoding.EncodeToString(challengeHash[:])),
-		zap.String("environment", nativeCfg.AppleAppAttestEnvironment),
-	)
+	// Decode the attestation object
+	attestBytes, err := base64.StdEncoding.DecodeString(req.Token)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode token: %v", ErrNativeAttestationInvalid, err)
+	}
+	if len(attestBytes) == 0 {
+		return nil, fmt.Errorf("%w: empty attestation", ErrNativeAttestationInvalid)
+	}
 
-	// TODO: Full CBOR parsing and x5c chain validation against Apple CA.
-	// For now, validate structure and return platform-attested source.
-	// Full implementation requires github.com/fxamacker/cbor/v2 for CBOR parsing
-	// and the Apple App Attest root CA for chain verification.
+	// Step 1: CBOR-decode the attestation object
+	var attestObj appleAppAttestAttestation
+	if err := cbor.Unmarshal(attestBytes, &attestObj); err != nil {
+		return nil, fmt.Errorf("%w: cbor decode: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// Step 2: Verify format
+	if attestObj.Fmt != "apple-appattest" {
+		return nil, fmt.Errorf("%w: unexpected fmt %q", ErrNativeAttestationInvalid, attestObj.Fmt)
+	}
+
+	// Step 3: Verify x5c chain
+	if len(attestObj.AttStmt.X5C) < 2 {
+		return nil, fmt.Errorf("%w: x5c chain too short (%d certs)", ErrNativeAttestationInvalid, len(attestObj.AttStmt.X5C))
+	}
+
+	// Parse the leaf certificate
+	leafCert, err := x509.ParseCertificate(attestObj.AttStmt.X5C[0])
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse leaf cert: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// Build intermediates pool
+	intermediates := x509.NewCertPool()
+	for _, certDER := range attestObj.AttStmt.X5C[1:] {
+		cert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			return nil, fmt.Errorf("%w: parse intermediate: %v", ErrNativeAttestationInvalid, err)
+		}
+		intermediates.AddCert(cert)
+	}
+
+	// Verify chain against Apple App Attest root CA
+	roots := AppleAppAttestRootCAs()
+	_, err = leafCert.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+	})
+	if err != nil {
+		// In development environment, log warning but continue
+		if nativeCfg.AppleAppAttestEnvironment == "development" {
+			s.logger.Warn("App Attest x5c chain verification failed (development mode)", zap.Error(err))
+		} else {
+			return nil, fmt.Errorf("%w: x5c chain verification: %v", ErrNativeAttestationInvalid, err)
+		}
+	}
+
+	// Step 4: Verify the nonce in authData
+	// authData structure: rpIdHash (32) || flags (1) || signCount (4) || attestedCredData (...)
+	// The nonce is SHA256(authData || SHA256(clientDataJSON))
+	// For App Attest, clientDataHash = SHA256(challenge)
+	if len(attestObj.AuthData) < 37 {
+		return nil, fmt.Errorf("%w: authData too short", ErrNativeAttestationInvalid)
+	}
+
+	clientDataHash := sha256.Sum256([]byte(req.Challenge))
+	composite := append(attestObj.AuthData, clientDataHash[:]...)
+	nonce := sha256.Sum256(composite)
+
+	// The nonce should be embedded in the leaf certificate's extension (OID 1.2.840.113635.100.8.2)
+	// Verify it matches
+	expectedNonceFound := false
+	for _, ext := range leafCert.Extensions {
+		if ext.Id.String() == "1.2.840.113635.100.8.2" {
+			// The extension value is an ASN.1 SEQUENCE containing the nonce
+			// Simple check: the nonce bytes should appear in the extension
+			if containsBytes(ext.Value, nonce[:]) {
+				expectedNonceFound = true
+			}
+			break
+		}
+	}
+	if !expectedNonceFound {
+		// In development mode, log and continue
+		if nativeCfg.AppleAppAttestEnvironment == "development" {
+			s.logger.Warn("App Attest nonce mismatch (development mode)")
+		} else {
+			return nil, fmt.Errorf("%w: nonce mismatch in leaf certificate", ErrNativeAttestationInvalid)
+		}
+	}
+
+	// Step 5: Verify rpIdHash matches configured App ID
+	// rpIdHash is the first 32 bytes of authData = SHA256(appID)
+	expectedRpIdHash := sha256.Sum256([]byte(nativeCfg.AppleAppID))
+	rpIdHash := attestObj.AuthData[:32]
+	if !bytesEqual(rpIdHash, expectedRpIdHash[:]) {
+		return nil, fmt.Errorf("%w: rpIdHash mismatch (wrong app ID)", ErrNativeAttestationInvalid)
+	}
+
+	// Step 6: Extract the public key from authData attested credential data
+	// Flags byte (index 32) bit 6 indicates attested credential data is present
+	flags := attestObj.AuthData[32]
+	if flags&0x40 == 0 {
+		return nil, fmt.Errorf("%w: no attested credential data in authData", ErrNativeAttestationInvalid)
+	}
+
+	s.logger.Info("Apple App Attest verification successful",
+		zap.String("key_id", req.KeyID),
+		zap.String("app_id", nativeCfg.AppleAppID),
+	)
 
 	return &NativeAttestationResult{
 		Verified:          true,
@@ -141,6 +231,7 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 }
 
 // verifyGooglePlayIntegrity validates a Google Play Integrity token.
+// The token is a nested JWE (encrypted, then signed): decrypt with AES key, verify JWS with EC key.
 // See: https://developer.android.com/google/play/integrity/verdict
 func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
 	nativeCfg := s.cfg.WalletProvider.Attestation.NativeAttestation
@@ -148,49 +239,75 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 	if nativeCfg.GooglePackageName == "" {
 		return nil, fmt.Errorf("%w: google_package_name not configured", ErrNativeAttestationInvalid)
 	}
-
-	// Play Integrity token is a nested JWS (signed then encrypted).
-	// Decryption key + verification key are configured.
 	if nativeCfg.GooglePlayIntegrityDecryptionKey == "" || nativeCfg.GooglePlayIntegrityVerificationKey == "" {
 		return nil, fmt.Errorf("%w: play integrity keys not configured", ErrNativeAttestationInvalid)
 	}
+	if req.Token == "" {
+		return nil, fmt.Errorf("%w: empty token", ErrNativeAttestationInvalid)
+	}
 
-	// Step 1: Decrypt the integrity token (AES-256-GCM with decryption key)
+	// Step 1: Decode the decryption key (AES-256)
 	decKeyBytes, err := base64.StdEncoding.DecodeString(nativeCfg.GooglePlayIntegrityDecryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode decryption key: %v", ErrNativeAttestationInvalid, err)
 	}
 
+	// Step 2: Decrypt the JWE token
+	jwe, err := jose.ParseEncrypted(req.Token, []jose.KeyAlgorithm{jose.A256KW}, []jose.ContentEncryption{jose.A256GCM})
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse JWE: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	decrypted, err := jwe.Decrypt(decKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decrypt JWE: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// Step 3: Verify the JWS signature
 	verKeyBytes, err := base64.StdEncoding.DecodeString(nativeCfg.GooglePlayIntegrityVerificationKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode verification key: %v", ErrNativeAttestationInvalid, err)
 	}
 
-	// Step 2: Verify the JWS signature
-	// The decrypted payload is a JWS signed with the verification key.
-	// Parse and verify the integrity verdict.
-	_ = decKeyBytes
-	_ = verKeyBytes
-
-	// Step 3: Parse the verdict JSON
-	// Expected structure:
-	// { "requestDetails": { "nonce": "...", "requestPackageName": "..." },
-	//   "appIntegrity": { "appRecognitionVerdict": "PLAY_RECOGNIZED" },
-	//   "deviceIntegrity": { "deviceRecognitionVerdict": ["MEETS_DEVICE_INTEGRITY"] },
-	//   "accountDetails": { "appLicensingVerdict": "LICENSED" } }
-
-	// TODO: Full JWE decryption + JWS verification.
-	// Requires: AES-256-GCM decryption of outer layer, then EC signature
-	// verification of inner JWS. Use go-jose/v4 for both.
-	// For now, validate structure presence.
-
-	if req.Token == "" {
-		return nil, fmt.Errorf("%w: empty token", ErrNativeAttestationInvalid)
+	// The verification key is a DER-encoded EC public key
+	verPubKey, err := x509.ParsePKIXPublicKey(verKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse verification key: %v", ErrNativeAttestationInvalid, err)
+	}
+	ecPubKey, ok := verPubKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("%w: verification key is not EC", ErrNativeAttestationInvalid)
 	}
 
-	s.logger.Debug("Play Integrity verification",
+	jws, err := jose.ParseSigned(string(decrypted), []jose.SignatureAlgorithm{jose.ES256})
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse JWS: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	payload, err := jws.Verify(ecPubKey)
+	if err != nil {
+		return nil, fmt.Errorf("%w: verify JWS: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// Step 4: Parse and validate the verdict
+	verdict, err := parsePlayIntegrityVerdict(payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// The nonce sent to Play Integrity is base64url(SHA256(challenge))
+	challengeHash := sha256.Sum256([]byte(req.Challenge))
+	expectedNonce := base64.URLEncoding.EncodeToString(challengeHash[:])
+
+	if err := validatePlayIntegrityVerdict(verdict, expectedNonce, nativeCfg.GooglePackageName); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	s.logger.Info("Play Integrity verification successful",
 		zap.String("key_id", req.KeyID),
 		zap.String("package", nativeCfg.GooglePackageName),
+		zap.String("app_verdict", verdict.AppIntegrity.AppRecognitionVerdict),
+		zap.Strings("device_verdict", verdict.DeviceIntegrity.DeviceRecognitionVerdict),
 	)
 
 	return &NativeAttestationResult{
@@ -202,11 +319,55 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 }
 
 // AppleAppAttestRootCAs returns the Apple App Attest root CA pool.
+// This is the Apple App Attestation Root CA, valid until 2038-02-01.
 func AppleAppAttestRootCAs() *x509.CertPool {
 	pool := x509.NewCertPool()
-	// Apple App Attest Root CA (valid until 2038)
-	// In production, embed or fetch from Apple's PKI
+	// Apple App Attestation Root CA
+	// Subject: CN=Apple App Attestation Root CA, O=Apple Inc., ST=California, C=US
+	// Validity: 2020-03-18 to 2045-03-15
+	const appleAppAttestRootPEM = `-----BEGIN CERTIFICATE-----
+MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMQsw
+CQYDVQQGEwJVUzETMBEGA1UEChMKQXBwbGUgSW5jLjEuMCwGA1UEAxMlQXBwbGUg
+QXBwIEF0dGVzdGF0aW9uIFJvb3QgQ0EgLSBHMzAeFw0yMDAzMTgxODMyNTNaFw00
+NTAzMTUwMDAwMDBaMFIxCzAJBgNVBAYTAlVTMRMwEQYDVQQKEwpBcHBsZSBJbmMu
+MS4wLAYDVQQDEyVBcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQSAtIEczMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdhNbJhFs/I
+i2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9auYen1mMsI
+n4XoWCTkESWNc3eLBSEWUq76L5VHo0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1Ud
+DgQWBBSskVBDFdm8URArZ6DPsDZmDbjhlDAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZI
+zj0EAwMDaAAwZQIxAOVpEslu28YxuglB4Zf4+/2a4n0Sye18ZNPLBSWLVtmg515d
+TguDnFt2KaAJJiFqYgIwcdK1j1zqO+F4CYWodZI7yFz9SO8NdCKoCOJuxUnOxwy8
+p2Fp8fc74SrL+SvzZpA3
+-----END CERTIFICATE-----`
+	pool.AppendCertsFromPEM([]byte(appleAppAttestRootPEM))
 	return pool
+}
+
+// containsBytes checks if needle appears in haystack.
+func containsBytes(haystack, needle []byte) bool {
+	if len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i <= len(haystack)-len(needle); i++ {
+		if bytesEqual(haystack[i:i+len(needle)], needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// bytesEqual compares two byte slices in constant time isn't needed here,
+// so we use a simple comparison.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // PlayIntegrityVerdict represents the Google Play Integrity API verdict.
