@@ -42,7 +42,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// WIA shares the same signing key as the wallet provider
 	var wiaSvc *WIAService
 	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.privateKey, wpSvc.certChain)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain)
 	}
 
 	return &Services{

@@ -447,8 +447,58 @@ type WalletProviderConfig struct {
 	CertificatePath string `yaml:"certificate_path" envconfig:"CERTIFICATE_PATH"`
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 
+	// PKCS11 enables HSM-backed signing (takes precedence over file-based key)
+	PKCS11 *PKCS11SigningConfig `yaml:"pkcs11,omitempty" envconfig:"PKCS11"`
+
 	// WIA (Wallet Instance Attestation) configuration
 	WIA WIAConfig `yaml:"wia" envconfig:"WIA"`
+
+	// Attestation controls attestation behavior for both WIA and KA
+	Attestation AttestationConfig `yaml:"attestation" envconfig:"ATTESTATION"`
+}
+
+// PKCS11SigningConfig holds PKCS#11 HSM configuration for the wallet provider signer.
+type PKCS11SigningConfig struct {
+	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
+	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
+	PIN        string `yaml:"pin" envconfig:"PIN"`
+	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
+}
+
+// AttestationConfig controls attestation lifecycle behavior.
+type AttestationConfig struct {
+	// LifetimeSeconds is the global attestation lifetime (WIA + KA).
+	// CS-04 requires < 24h (86400). Default: 3600 (1 hour).
+	LifetimeSeconds int `yaml:"lifetime_seconds" envconfig:"LIFETIME_SECONDS"`
+
+	// StatusListMode controls whether attestations include a status_list entry.
+	// Values: "always" (always include), "never" (omit for short-lived),
+	// "auto" (include only if lifetime > threshold). Default: "never".
+	StatusListMode string `yaml:"status_list_mode" envconfig:"STATUS_LIST_MODE"`
+
+	// StatusListURL is the base URL for the Token Status List endpoint.
+	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
+
+	// NativeAttestation controls platform attestation verification.
+	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
+}
+
+// NativeAttestationConfig controls platform-specific attestation verification.
+type NativeAttestationConfig struct {
+	// Enabled controls whether native platform attestation is required.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// AppleAppAttestEnvironment: "production" or "development"
+	AppleAppAttestEnvironment string `yaml:"apple_app_attest_environment" envconfig:"APPLE_APP_ATTEST_ENVIRONMENT"`
+	// AppleAppID is the full App ID (TeamID.BundleID) for Apple App Attest.
+	AppleAppID string `yaml:"apple_app_id" envconfig:"APPLE_APP_ID"`
+
+	// GooglePackageName is the Android package name for Play Integrity.
+	GooglePackageName string `yaml:"google_package_name" envconfig:"GOOGLE_PACKAGE_NAME"`
+	// GooglePlayIntegrityDecryptionKey is the base64-encoded decryption key.
+	GooglePlayIntegrityDecryptionKey string `yaml:"google_play_integrity_decryption_key" envconfig:"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY"`
+	// GooglePlayIntegrityVerificationKey is the base64-encoded verification key.
+	GooglePlayIntegrityVerificationKey string `yaml:"google_play_integrity_verification_key" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY"`
 }
 
 // WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
@@ -1024,6 +1074,10 @@ func defaultConfig() *Config {
 				WalletName:          "SIROS ID",
 				MaxExpirySeconds:    86400,
 				ChallengeTTLSeconds: 300,
+			},
+			Attestation: AttestationConfig{
+				LifetimeSeconds: 3600,
+				StatusListMode:  "never",
 			},
 		},
 	}
