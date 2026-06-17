@@ -111,19 +111,42 @@ func (s *WalletProviderService) IsSupported() bool {
 	return s.privateKey != nil && len(s.certChain) > 0
 }
 
+// SecurityProperties carries WSCD-reported security metadata for KA claims.
+type SecurityProperties struct {
+	KeyStorage         string   `json:"key_storage"`
+	UserAuthentication []string `json:"user_authentication"`
+	Certification      string   `json:"certification"`
+}
+
 // GenerateKeyAttestation generates a key attestation JWT
-func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string) (string, error) {
+func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string, secProps *SecurityProperties) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrKeyAttestationNotSupported
+	}
+
+	// Enrich each key with security properties if provided
+	if secProps != nil {
+		for i := range jwks {
+			if secProps.KeyStorage != "" {
+				jwks[i]["key_storage"] = secProps.KeyStorage
+			}
+			if len(secProps.UserAuthentication) > 0 {
+				jwks[i]["user_authentication"] = secProps.UserAuthentication
+			}
+			if secProps.Certification != "" {
+				jwks[i]["certification"] = secProps.Certification
+			}
+		}
 	}
 
 	// Create the JWT claims
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"attested_keys": jwks,
-		"nonce":         nonce,
-		"iat":           now.Unix(),
-		"exp":           now.Add(15 * time.Second).Unix(),
+		"attested_keys":      jwks,
+		"key_storage_status": map[string]interface{}{},
+		"nonce":              nonce,
+		"iat":                now.Unix(),
+		"exp":                now.Add(15 * time.Second).Unix(),
 	}
 
 	// Create the token with ES256 and x5c header
