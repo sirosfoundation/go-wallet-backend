@@ -22,7 +22,6 @@ var (
 	ErrWIANotSupported     = errors.New("WIA not supported: keys not configured")
 	ErrWIAChallengeExpired = errors.New("WIA challenge expired or invalid")
 	ErrWIAPopInvalid       = errors.New("WIA-PoP validation failed")
-	ErrWIACNFMissing       = errors.New("WIA request missing cnf.jwk")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -78,6 +77,13 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	expiresAt := time.Now().Add(ttl)
 
 	s.mu.Lock()
+	// Best-effort pruning of expired, unconsumed challenges
+	now := time.Now()
+	for k, v := range s.challenges {
+		if now.After(v.ExpiresAt) {
+			delete(s.challenges, k)
+		}
+	}
 	s.challenges[challenge] = &WIAChallenge{
 		Challenge: challenge,
 		ExpiresAt: expiresAt,
@@ -178,7 +184,8 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return pubKey, nil
-	}, jwt.WithValidMethods([]string{"ES256", "ES384", "ES512"}))
+	}, jwt.WithValidMethods([]string{"ES256", "ES384", "ES512"}),
+		jwt.WithLeeway(config.JWTLeeway))
 	if err != nil {
 		return nil, fmt.Errorf("pop signature verification: %w", err)
 	}
@@ -188,9 +195,13 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 		return nil, fmt.Errorf("nonce mismatch")
 	}
 
-	// Validate exp is present and not too far in the future
+	// Validate exp is present and not too far in the future (max 10 minutes)
 	if claims.ExpiresAt == nil {
 		return nil, errors.New("pop missing exp claim")
+	}
+	maxPopExpiry := time.Now().Add(10 * time.Minute)
+	if claims.ExpiresAt.After(maxPopExpiry) {
+		return nil, fmt.Errorf("pop exp too far in future (max 10m)")
 	}
 
 	// Validate iss is present (wallet instance identifier)
