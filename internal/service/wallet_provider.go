@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -14,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 var (
@@ -22,10 +24,11 @@ var (
 
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
-	cfg        *config.Config
-	logger     *zap.Logger
-	privateKey *ecdsa.PrivateKey
-	certChain  []string
+	cfg       *config.Config
+	logger    *zap.Logger
+	signer    crypto.Signer
+	jwtSigner *signing.CryptoSignerES256
+	certChain []string
 }
 
 // NewWalletProviderService creates a new WalletProviderService
@@ -35,8 +38,33 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletPro
 		logger: logger.Named("wallet-provider-service"),
 	}
 
-	// Try to load keys if paths are configured
-	if cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
+	// Try PKCS#11 first, then fall back to file-based key loading
+	if cfg.WalletProvider.PKCS11 != nil && cfg.WalletProvider.PKCS11.ModulePath != "" {
+		keyCfg := &signing.KeyConfig{
+			CertificatePath: cfg.WalletProvider.CertificatePath,
+			CACertPath:      cfg.WalletProvider.CACertPath,
+			PKCS11: &signing.PKCS11Config{
+				ModulePath: cfg.WalletProvider.PKCS11.ModulePath,
+				SlotID:     cfg.WalletProvider.PKCS11.SlotID,
+				PIN:        cfg.WalletProvider.PKCS11.PIN,
+				KeyLabel:   cfg.WalletProvider.PKCS11.KeyLabel,
+			},
+		}
+		km, err := signing.LoadKeyMaterial(keyCfg)
+		if err != nil {
+			svc.logger.Warn("Failed to load PKCS#11 key material", zap.Error(err))
+		} else {
+			svc.signer = km.Signer
+			svc.certChain = km.CertChain
+			jwtSigner, err := signing.NewCryptoSignerES256(km.Signer)
+			if err != nil {
+				svc.logger.Warn("Failed to create JWT signer from PKCS#11 key", zap.Error(err))
+			} else {
+				svc.jwtSigner = jwtSigner
+				svc.logger.Info("Loaded wallet provider keys from PKCS#11")
+			}
+		}
+	} else if cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
 		if err := svc.loadKeys(); err != nil {
 			svc.logger.Warn("Failed to load wallet provider keys", zap.Error(err))
 		}
@@ -70,7 +98,13 @@ func (s *WalletProviderService) loadKeys() error {
 			return errors.New("not an ECDSA private key")
 		}
 	}
-	s.privateKey = key
+	s.signer = key
+
+	jwtSigner, err := signing.NewCryptoSignerES256(key)
+	if err != nil {
+		return err
+	}
+	s.jwtSigner = jwtSigner
 
 	// Load certificate
 	certPEM, err := os.ReadFile(s.cfg.WalletProvider.CertificatePath)
@@ -108,7 +142,7 @@ func (s *WalletProviderService) loadKeys() error {
 
 // IsSupported returns true if key attestation is supported
 func (s *WalletProviderService) IsSupported() bool {
-	return s.privateKey != nil && len(s.certChain) > 0
+	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
 // SecurityProperties carries WSCD-reported security metadata for KA claims.
@@ -160,8 +194,8 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	token.Header["typ"] = "keyattestation+jwt"
 	token.Header["x5c"] = s.certChain
 
-	// Sign the token
-	tokenString, err := token.SignedString(s.privateKey)
+	// Sign the token via crypto.Signer (supports both file and PKCS#11)
+	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
 		s.logger.Error("Failed to sign key attestation JWT", zap.Error(err))
 		return "", err

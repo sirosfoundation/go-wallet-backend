@@ -19,6 +19,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine) {
@@ -45,6 +46,10 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 		MaxExpirySeconds:    86400,
 		ChallengeTTLSeconds: 300,
 	}
+	cfg.WalletProvider.Attestation = config.AttestationConfig{
+		LifetimeSeconds: 3600,
+		StatusListMode:  "never",
+	}
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
@@ -56,7 +61,8 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 			SerialNumber: big.NewInt(1),
 		}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
 		certB64 := base64.StdEncoding.EncodeToString(certDER)
-		services.WIA = service.NewWIAService(cfg, logger, privKey, []string{certB64})
+		jwtSigner, _ := signing.NewCryptoSignerES256(privKey)
+		services.WIA = service.NewWIAService(cfg, logger, jwtSigner, []string{certB64})
 	}
 
 	handlers := NewHandlers(services, cfg, logger, []string{"test"})

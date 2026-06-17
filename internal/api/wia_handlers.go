@@ -43,6 +43,8 @@ type WIAGenerateRequest struct {
 	Pop string `json:"pop" binding:"required"`
 	// Challenge is the nonce from the challenge endpoint
 	Challenge string `json:"challenge" binding:"required"`
+	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
+	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
 
 // WIAGenerate handles POST /wallet-provider/wia/generate
@@ -66,8 +68,9 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 	}
 
 	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), &service.WIARequest{
-		Pop:       req.Pop,
-		Challenge: req.Challenge,
+		Pop:               req.Pop,
+		Challenge:         req.Challenge,
+		NativeAttestation: req.NativeAttestation,
 	})
 	if err != nil {
 		switch {

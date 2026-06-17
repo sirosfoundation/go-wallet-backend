@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
@@ -44,9 +45,17 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 		MaxExpirySeconds:    86400,
 		ChallengeTTLSeconds: 300,
 	}
+	cfg.WalletProvider.Attestation = config.AttestationConfig{
+		LifetimeSeconds: 3600,
+		StatusListMode:  "never",
+	}
 
 	logger := zap.NewNop()
-	svc := NewWIAService(cfg, logger, privKey, []string{certB64})
+	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64})
 
 	return svc, privKey
 }

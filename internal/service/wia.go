@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 var (
@@ -32,10 +33,11 @@ type WIAChallenge struct {
 
 // WIAService handles Wallet Instance Attestation (CS-04 §7.1.2, §7.1.4).
 type WIAService struct {
-	cfg        *config.Config
-	logger     *zap.Logger
-	privateKey *ecdsa.PrivateKey
-	certChain  []string
+	cfg          *config.Config
+	logger       *zap.Logger
+	jwtSigner    *signing.CryptoSignerES256
+	certChain    []string
+	nativeAttSvc *NativeAttestationService
 
 	// In-memory challenge store (single-use nonces).
 	// Production: replace with storage.Store for multi-instance.
@@ -45,19 +47,26 @@ type WIAService struct {
 
 // NewWIAService creates a new WIA service.
 // It shares the same signing key as the WalletProviderService (same x5c chain).
-func NewWIAService(cfg *config.Config, logger *zap.Logger, privateKey *ecdsa.PrivateKey, certChain []string) *WIAService {
-	return &WIAService{
+func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string) *WIAService {
+	svc := &WIAService{
 		cfg:        cfg,
 		logger:     logger.Named("wia-service"),
-		privateKey: privateKey,
+		jwtSigner:  jwtSigner,
 		certChain:  certChain,
 		challenges: make(map[string]*WIAChallenge),
 	}
+
+	// Wire native attestation if configured
+	if cfg.WalletProvider.Attestation.NativeAttestation.Enabled {
+		svc.nativeAttSvc = NewNativeAttestationService(cfg, logger)
+	}
+
+	return svc
 }
 
 // IsSupported returns true if WIA generation is available.
 func (s *WIAService) IsSupported() bool {
-	return s.privateKey != nil && len(s.certChain) > 0
+	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
 // CreateChallenge generates a new single-use challenge nonce.
@@ -117,6 +126,8 @@ type WIARequest struct {
 	Pop string `json:"pop"`
 	// Challenge is the nonce from CreateChallenge
 	Challenge string `json:"challenge"`
+	// NativeAttestation is optional platform attestation evidence
+	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -142,8 +153,20 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	// Step 3: Generate WIA JWT
-	return s.signWIA(cnfJWK)
+	// Step 3: Determine attestation source
+	attestationSource := "backend_attested" // Tier 3 baseline
+	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
+		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
+		if err != nil {
+			s.logger.Warn("Native attestation verification failed", zap.Error(err))
+			// Fall back to backend_attested rather than failing entirely
+		} else if result.Verified {
+			attestationSource = result.AttestationSource
+		}
+	}
+
+	// Step 4: Generate WIA JWT
+	return s.signWIA(cnfJWK, attestationSource)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -213,9 +236,15 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 }
 
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource string) (string, error) {
 	now := time.Now()
+
+	// Use global attestation lifetime, capped by WIA max expiry
+	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
 	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if lifetime > maxExpiry || lifetime == 0 {
+		lifetime = maxExpiry
+	}
 
 	// Build cnf claim with JWK thumbprint and full key
 	jkt, err := computeJKT(cnfJWK)
@@ -228,20 +257,31 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}) (string, error) {
 			"jwk": cnfJWK,
 			"jkt": jkt,
 		},
-		"wallet_name":    s.cfg.WalletProvider.WIA.WalletName,
-		"wallet_version": s.cfg.WalletProvider.WIA.WalletVersion,
-		"iat":            now.Unix(),
-		"exp":            now.Add(maxExpiry).Unix(),
-		// attestation_source indicates backend-only attestation (Tier 3 baseline)
-		"attestation_source": "backend_attested",
+		"wallet_name":        s.cfg.WalletProvider.WIA.WalletName,
+		"wallet_version":     s.cfg.WalletProvider.WIA.WalletVersion,
+		"iat":                now.Unix(),
+		"exp":                now.Add(lifetime).Unix(),
+		"attestation_source": attestationSource,
 	}
 
 	if s.cfg.WalletProvider.WIA.WalletLink != "" {
 		claims["wallet_link"] = s.cfg.WalletProvider.WIA.WalletLink
 	}
 
-	// client_status placeholder — populated when Token Status List is implemented
-	claims["client_status"] = map[string]interface{}{}
+	// Status list: include based on configuration
+	switch s.cfg.WalletProvider.Attestation.StatusListMode {
+	case "always":
+		claims["status"] = map[string]interface{}{
+			"status_list": map[string]interface{}{
+				"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
+				"idx": 0, // TODO: assign from status list allocator
+			},
+		}
+	case "never":
+		// Omit status list for short-lived attestations
+	default:
+		// "auto" or unset: omit (same as "never" for now)
+	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
@@ -249,7 +289,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}) (string, error) {
 
 	// Per EC TS03 §2.2.1: no `iss` claim — identity derived from x5c chain
 
-	tokenString, err := token.SignedString(s.privateKey)
+	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
 		s.logger.Error("Failed to sign WIA JWT", zap.Error(err))
 		return "", err
