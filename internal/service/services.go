@@ -20,6 +20,7 @@ type Services struct {
 	Proxy            *ProxyService
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
+	WIA              *WIAService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	AAGUIDValidator  *AAGUIDValidator
@@ -36,6 +37,14 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
+	wpSvc := NewWalletProviderService(cfg, logger)
+
+	// WIA shares the same signing key as the wallet provider
+	var wiaSvc *WIAService
+	if wpSvc.IsSupported() {
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.privateKey, wpSvc.certChain)
+	}
+
 	return &Services{
 		User:             NewUserService(store, cfg, logger),
 		Tenant:           NewTenantService(store, logger),
@@ -47,7 +56,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Keystore:         NewKeystoreService(store, cfg, logger),
 		Proxy:            NewProxyService(cfg, logger),
 		Helper:           NewHelperService(logger),
-		WalletProvider:   NewWalletProviderService(cfg, logger),
+		WalletProvider:   wpSvc,
+		WIA:              wiaSvc,
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
