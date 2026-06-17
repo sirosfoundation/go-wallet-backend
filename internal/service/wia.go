@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -69,6 +70,10 @@ func (s *WIAService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
+// maxChallenges is the maximum number of concurrent pending challenges.
+// Prevents memory exhaustion from challenge endpoint abuse.
+const maxChallenges = 10000
+
 // CreateChallenge generates a new single-use challenge nonce.
 func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, error) {
 	if !s.IsSupported() {
@@ -83,15 +88,23 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	challenge := base64.RawURLEncoding.EncodeToString(nonce)
 
 	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
+	if ttl == 0 {
+		ttl = 5 * time.Minute // sensible default
+	}
 	expiresAt := time.Now().Add(ttl)
 
 	s.mu.Lock()
-	// Best-effort pruning of expired, unconsumed challenges
+	// Prune expired challenges
 	now := time.Now()
 	for k, v := range s.challenges {
 		if now.After(v.ExpiresAt) {
 			delete(s.challenges, k)
 		}
+	}
+	// Capacity check after pruning
+	if len(s.challenges) >= maxChallenges {
+		s.mu.Unlock()
+		return "", time.Time{}, fmt.Errorf("challenge capacity exceeded")
 	}
 	s.challenges[challenge] = &WIAChallenge{
 		Challenge: challenge,
@@ -213,8 +226,8 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 		return nil, fmt.Errorf("pop signature verification: %w", err)
 	}
 
-	// Validate nonce matches challenge
-	if claims.Nonce != expectedNonce {
+	// Validate nonce matches challenge (constant-time comparison)
+	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(expectedNonce)) != 1 {
 		return nil, fmt.Errorf("nonce mismatch")
 	}
 
@@ -253,6 +266,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	}
 
 	claims := jwt.MapClaims{
+		"sub": jkt, // wallet instance identifier (JWK Thumbprint)
 		"cnf": map[string]interface{}{
 			"jwk": cnfJWK,
 			"jkt": jkt,

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -181,13 +183,15 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 	nonce := sha256.Sum256(composite)
 
 	// The nonce should be embedded in the leaf certificate's extension (OID 1.2.840.113635.100.8.2)
-	// Verify it matches
+	// The extension value is ASN.1: SEQUENCE { SET { SEQUENCE { [0] EXPLICIT OCTET STRING { nonce } } } }
 	expectedNonceFound := false
 	for _, ext := range leafCert.Extensions {
 		if ext.Id.String() == "1.2.840.113635.100.8.2" {
-			// The extension value is an ASN.1 SEQUENCE containing the nonce
-			// Simple check: the nonce bytes should appear in the extension
-			if containsBytes(ext.Value, nonce[:]) {
+			extractedNonce, err := extractAppAttestNonce(ext.Value)
+			if err != nil {
+				return nil, fmt.Errorf("%w: failed to parse nonce extension: %v", ErrNativeAttestationInvalid, err)
+			}
+			if subtle.ConstantTimeCompare(extractedNonce, nonce[:]) == 1 {
 				expectedNonceFound = true
 			}
 			break
@@ -206,7 +210,7 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 	// rpIdHash is the first 32 bytes of authData = SHA256(appID)
 	expectedRpIdHash := sha256.Sum256([]byte(nativeCfg.AppleAppID))
 	rpIdHash := attestObj.AuthData[:32]
-	if !bytesEqual(rpIdHash, expectedRpIdHash[:]) {
+	if subtle.ConstantTimeCompare(rpIdHash, expectedRpIdHash[:]) != 1 {
 		return nil, fmt.Errorf("%w: rpIdHash mismatch (wrong app ID)", ErrNativeAttestationInvalid)
 	}
 
@@ -343,31 +347,60 @@ p2Fp8fc74SrL+SvzZpA3
 	return pool
 }
 
-// containsBytes checks if needle appears in haystack.
-func containsBytes(haystack, needle []byte) bool {
-	if len(needle) > len(haystack) {
-		return false
+// extractAppAttestNonce parses the Apple App Attest nonce from the
+// credCert extension OID 1.2.840.113635.100.8.2.
+// The ASN.1 structure is: SEQUENCE { SEQUENCE { [0] EXPLICIT OCTET STRING } }
+func extractAppAttestNonce(extValue []byte) ([]byte, error) {
+	// Outer SEQUENCE
+	var outer asn1.RawValue
+	rest, err := asn1.Unmarshal(extValue, &outer)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal outer: %w", err)
 	}
-	for i := 0; i <= len(haystack)-len(needle); i++ {
-		if bytesEqual(haystack[i:i+len(needle)], needle) {
-			return true
-		}
+	if len(rest) > 0 {
+		return nil, fmt.Errorf("trailing data after outer SEQUENCE")
 	}
-	return false
-}
+	if outer.Tag != asn1.TagSequence {
+		return nil, fmt.Errorf("expected SEQUENCE, got tag %d", outer.Tag)
+	}
 
-// bytesEqual compares two byte slices in constant time isn't needed here,
-// so we use a simple comparison.
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+	// Inner SEQUENCE
+	var inner asn1.RawValue
+	rest, err = asn1.Unmarshal(outer.Bytes, &inner)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal inner: %w", err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	_ = rest // may have additional elements
+
+	// Context-specific [0] EXPLICIT wrapping the OCTET STRING
+	var tagged asn1.RawValue
+	if inner.Tag == asn1.TagSequence {
+		// Nested: SEQUENCE { [0] OCTET STRING }
+		_, err = asn1.Unmarshal(inner.Bytes, &tagged)
+	} else {
+		tagged = inner
+	}
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal tagged: %w", err)
+	}
+
+	// Extract the OCTET STRING nonce
+	if tagged.Class == asn1.ClassContextSpecific && tagged.Tag == 0 {
+		// Explicit tagging: the content is the OCTET STRING
+		var octetStr []byte
+		_, err = asn1.Unmarshal(tagged.Bytes, &octetStr)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal octet string: %w", err)
 		}
+		return octetStr, nil
 	}
-	return true
+
+	// Fallback: try treating as raw OCTET STRING
+	if tagged.Tag == asn1.TagOctetString {
+		return tagged.Bytes, nil
+	}
+
+	return nil, fmt.Errorf("unexpected ASN.1 structure: class=%d tag=%d", tagged.Class, tagged.Tag)
 }
 
 // PlayIntegrityVerdict represents the Google Play Integrity API verdict.
@@ -396,17 +429,20 @@ func parsePlayIntegrityVerdict(data []byte) (*PlayIntegrityVerdict, error) {
 
 // validatePlayIntegrityVerdict checks that the verdict meets minimum requirements.
 func validatePlayIntegrityVerdict(verdict *PlayIntegrityVerdict, expectedNonce string, expectedPackage string) error {
-	if verdict.RequestDetails.Nonce != expectedNonce {
+	if subtle.ConstantTimeCompare([]byte(verdict.RequestDetails.Nonce), []byte(expectedNonce)) != 1 {
 		return fmt.Errorf("nonce mismatch")
 	}
 	if verdict.RequestDetails.RequestPackageName != expectedPackage {
 		return fmt.Errorf("package mismatch: got %q, want %q", verdict.RequestDetails.RequestPackageName, expectedPackage)
 	}
 
-	// Verify timestamp is recent (within 10 minutes)
+	// Verify timestamp is recent (within 10 minutes) and not in the future (+ 1 min tolerance)
 	ts := time.UnixMilli(verdict.RequestDetails.TimestampMillis)
 	if time.Since(ts) > 10*time.Minute {
 		return fmt.Errorf("verdict too old: %v", ts)
+	}
+	if ts.After(time.Now().Add(1 * time.Minute)) {
+		return fmt.Errorf("verdict timestamp in the future: %v", ts)
 	}
 
 	// Require device integrity

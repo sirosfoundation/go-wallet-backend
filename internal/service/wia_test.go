@@ -244,17 +244,39 @@ func TestWIAService_InvalidNonce(t *testing.T) {
 	}
 }
 
+func TestWIAService_ChallengeCapacityLimit(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 300
+
+	// Fill up the challenge store
+	for i := 0; i < maxChallenges; i++ {
+		_, _, err := svc.CreateChallenge(context.Background())
+		if err != nil {
+			t.Fatalf("CreateChallenge(%d) failed: %v", i, err)
+		}
+	}
+
+	// Next one should fail
+	_, _, err := svc.CreateChallenge(context.Background())
+	if err == nil {
+		t.Fatal("should fail when capacity exceeded")
+	}
+}
+
 func TestWIAService_ExpiredChallenge(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
-	// Override TTL to 0 to create instantly-expired challenge
-	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 0
+	// Set TTL to 1 second
+	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 1
 
 	challenge, _, _ := svc.CreateChallenge(context.Background())
-	pop, _ := createTestPop(t, challenge)
 
-	// Wait a tiny bit to ensure expiry
-	time.Sleep(time.Millisecond)
+	// Manually expire the challenge
+	svc.mu.Lock()
+	svc.challenges[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
+	svc.mu.Unlock()
+
+	pop, _ := createTestPop(t, challenge)
 
 	_, err := svc.GenerateWIA(context.Background(), &WIARequest{
 		Pop:       pop,
