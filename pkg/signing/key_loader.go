@@ -101,6 +101,8 @@ func loadCertChain(certPath, caPath string) ([]string, error) {
 	certStr := string(certPEM)
 	certStr = strings.ReplaceAll(certStr, "-----BEGIN CERTIFICATE-----", "")
 	certStr = strings.ReplaceAll(certStr, "-----END CERTIFICATE-----", "")
+	certStr = strings.ReplaceAll(certStr, "\r\n", "\n")
+	certStr = strings.ReplaceAll(certStr, "\r", "")
 	certStr = strings.ReplaceAll(certStr, "\n", "")
 	certStr = strings.TrimSpace(certStr)
 
@@ -112,6 +114,8 @@ func loadCertChain(certPath, caPath string) ([]string, error) {
 			caStr := string(caPEM)
 			caStr = strings.ReplaceAll(caStr, "-----BEGIN CERTIFICATE-----", "")
 			caStr = strings.ReplaceAll(caStr, "-----END CERTIFICATE-----", "")
+			caStr = strings.ReplaceAll(caStr, "\r\n", "\n")
+			caStr = strings.ReplaceAll(caStr, "\r", "")
 			caStr = strings.ReplaceAll(caStr, "\n", "")
 			caStr = strings.TrimSpace(caStr)
 			if caStr != "" {

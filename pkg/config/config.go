@@ -471,6 +471,10 @@ type AttestationConfig struct {
 	// CS-04 requires < 24h (86400). Default: 3600 (1 hour).
 	LifetimeSeconds int `yaml:"lifetime_seconds" envconfig:"LIFETIME_SECONDS"`
 
+	// KAExpirySeconds is the key attestation JWT expiry.
+	// Short-lived by default (15s) for single-use credential issuance.
+	KAExpirySeconds int `yaml:"ka_expiry_seconds" envconfig:"KA_EXPIRY_SECONDS"`
+
 	// StatusListMode controls whether attestations include a status_list entry.
 	// Values: "always" (always include), "never" (omit for short-lived),
 	// "auto" (include only if lifetime > threshold). Default: "never".
@@ -1077,6 +1081,7 @@ func defaultConfig() *Config {
 			},
 			Attestation: AttestationConfig{
 				LifetimeSeconds: 3600,
+				KAExpirySeconds: 15,
 				StatusListMode:  "never",
 			},
 		},

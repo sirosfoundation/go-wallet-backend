@@ -11,7 +11,6 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
-	"math/big"
 	"testing"
 	"time"
 
@@ -214,7 +213,7 @@ func TestNativeAttestationService_PlayIntegrity_FullFlow(t *testing.T) {
 
 	challenge := "test-challenge-12345"
 	challengeHash := sha256.Sum256([]byte(challenge))
-	expectedNonce := base64.URLEncoding.EncodeToString(challengeHash[:])
+	expectedNonce := base64.RawURLEncoding.EncodeToString(challengeHash[:])
 
 	// Build a Play Integrity verdict payload
 	now := time.Now()
@@ -425,7 +424,3 @@ func TestValidatePlayIntegrityVerdict(t *testing.T) {
 		t.Fatal("expected error for wrong package name")
 	}
 }
-
-// Suppress unused import warnings
-var _ = big.Int{}
-var _ = time.Now

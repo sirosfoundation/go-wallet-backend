@@ -220,7 +220,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return pubKey, nil
-	}, jwt.WithValidMethods([]string{"ES256", "ES384", "ES512"}),
+	}, jwt.WithValidMethods([]string{"ES256"}),
 		jwt.WithLeeway(config.JWTLeeway))
 	if err != nil {
 		return nil, fmt.Errorf("pop signature verification: %w", err)
