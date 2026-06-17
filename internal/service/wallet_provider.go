@@ -111,16 +111,45 @@ func (s *WalletProviderService) IsSupported() bool {
 	return s.privateKey != nil && len(s.certChain) > 0
 }
 
+// SecurityProperties carries WSCD-reported security metadata for KA claims.
+type SecurityProperties struct {
+	KeyStorage         string   `json:"key_storage"`
+	UserAuthentication []string `json:"user_authentication"`
+	Certification      string   `json:"certification"`
+}
+
 // GenerateKeyAttestation generates a key attestation JWT
-func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string) (string, error) {
+func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string, secProps *SecurityProperties) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrKeyAttestationNotSupported
+	}
+
+	// Enrich each key with security properties if provided.
+	// Clone each JWK map to avoid mutating the caller's data.
+	enriched := make([]map[string]interface{}, len(jwks))
+	for i, jwk := range jwks {
+		clone := make(map[string]interface{}, len(jwk)+3)
+		for k, v := range jwk {
+			clone[k] = v
+		}
+		if secProps != nil {
+			if secProps.KeyStorage != "" {
+				clone["key_storage"] = secProps.KeyStorage
+			}
+			if len(secProps.UserAuthentication) > 0 {
+				clone["user_authentication"] = secProps.UserAuthentication
+			}
+			if secProps.Certification != "" {
+				clone["certification"] = secProps.Certification
+			}
+		}
+		enriched[i] = clone
 	}
 
 	// Create the JWT claims
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"attested_keys": jwks,
+		"attested_keys": enriched,
 		"nonce":         nonce,
 		"iat":           now.Unix(),
 		"exp":           now.Add(15 * time.Second).Unix(),
