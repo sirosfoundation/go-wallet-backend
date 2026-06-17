@@ -673,6 +673,24 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
+	// Validate that each JWK entry is non-nil and contains required fields
+	for i, jwk := range req.JWKS {
+		if jwk == nil {
+			c.JSON(400, gin.H{
+				"error":   "INVALID_JWKS",
+				"message": fmt.Sprintf("jwks[%d] is null", i),
+			})
+			return
+		}
+		if _, ok := jwk["kty"]; !ok {
+			c.JSON(400, gin.H{
+				"error":   "INVALID_JWKS",
+				"message": fmt.Sprintf("jwks[%d] is missing 'kty' field", i),
+			})
+			return
+		}
+	}
+
 	if req.OpenID4VCI.Nonce == "" {
 		c.JSON(400, gin.H{
 			"error":   "INVALID_OPENID4VCI_NONCE_VALUE",
