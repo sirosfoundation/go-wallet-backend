@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"encoding/asn1"
 	"fmt"
 	"math/big"
 
@@ -75,37 +76,19 @@ func (m *CryptoSignerES256) SignToken(token *jwt.Token) (string, error) {
 
 // parseASN1Signature parses a DER-encoded ECDSA signature into (r, s).
 func parseASN1Signature(sig []byte) (*big.Int, *big.Int, error) {
-	// ASN.1 SEQUENCE { INTEGER r, INTEGER s }
-	if len(sig) < 6 || sig[0] != 0x30 {
-		return nil, nil, fmt.Errorf("invalid ASN.1 signature")
+	var seq struct {
+		R *big.Int
+		S *big.Int
 	}
-
-	// Parse outer SEQUENCE
-	pos := 2 // skip tag + length byte (simplified; works for short form)
-	if sig[1]&0x80 != 0 {
-		// Long form length — not expected for ECDSA sigs but handle gracefully
-		lenBytes := int(sig[1] & 0x7f)
-		pos = 2 + lenBytes
+	rest, err := asn1.Unmarshal(sig, &seq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unmarshal ASN.1 signature: %w", err)
 	}
-
-	// Parse r INTEGER
-	if pos >= len(sig) || sig[pos] != 0x02 {
-		return nil, nil, fmt.Errorf("expected INTEGER tag for r")
+	if len(rest) > 0 {
+		return nil, nil, fmt.Errorf("trailing data after ASN.1 signature")
 	}
-	pos++
-	rLen := int(sig[pos])
-	pos++
-	r := new(big.Int).SetBytes(sig[pos : pos+rLen])
-	pos += rLen
-
-	// Parse s INTEGER
-	if pos >= len(sig) || sig[pos] != 0x02 {
-		return nil, nil, fmt.Errorf("expected INTEGER tag for s")
+	if seq.R == nil || seq.S == nil {
+		return nil, nil, fmt.Errorf("nil r or s in ASN.1 signature")
 	}
-	pos++
-	sLen := int(sig[pos])
-	pos++
-	s := new(big.Int).SetBytes(sig[pos : pos+sLen])
-
-	return r, s, nil
+	return seq.R, seq.S, nil
 }

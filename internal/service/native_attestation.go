@@ -299,9 +299,9 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)
 	}
 
-	// The nonce sent to Play Integrity is base64url(SHA256(challenge))
+	// The nonce sent to Play Integrity is base64url-no-pad(SHA256(challenge))
 	challengeHash := sha256.Sum256([]byte(req.Challenge))
-	expectedNonce := base64.URLEncoding.EncodeToString(challengeHash[:])
+	expectedNonce := base64.RawURLEncoding.EncodeToString(challengeHash[:])
 
 	if err := validatePlayIntegrityVerdict(verdict, expectedNonce, nativeCfg.GooglePackageName); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)

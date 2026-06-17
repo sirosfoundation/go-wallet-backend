@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"encoding/asn1"
 	"fmt"
 	"io"
 	"math/big"
@@ -26,6 +27,7 @@ type PKCS11Config struct {
 // It holds a long-lived session and is safe for concurrent use.
 type PKCS11Signer struct {
 	mu         sync.Mutex
+	cfg        *PKCS11Config
 	ctx        *pkcs11.Ctx
 	session    pkcs11.SessionHandle
 	privateKey pkcs11.ObjectHandle
@@ -56,7 +58,7 @@ func NewPKCS11Signer(cfg *PKCS11Config) (*PKCS11Signer, error) {
 		return nil, fmt.Errorf("pkcs11 login: %w", err)
 	}
 
-	s := &PKCS11Signer{ctx: ctx, session: session}
+	s := &PKCS11Signer{cfg: cfg, ctx: ctx, session: session}
 	if err := s.findKey(cfg.KeyLabel); err != nil {
 		s.Close()
 		return nil, err
@@ -76,6 +78,21 @@ func (s *PKCS11Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	sig, err := s.signOnce(digest)
+	if err != nil {
+		// Attempt session recovery on session handle invalid errors
+		if s.recoverSession() == nil {
+			sig, err = s.signOnce(digest)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sig, nil
+}
+
+// signOnce performs a single sign attempt (must hold mu).
+func (s *PKCS11Signer) signOnce(digest []byte) ([]byte, error) {
 	// CKM_ECDSA expects a pre-hashed digest
 	mechanism := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_ECDSA, nil)}
 
@@ -96,6 +113,33 @@ func (s *PKCS11Signer) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) 
 	sVal := new(big.Int).SetBytes(rawSig[keyBytes:])
 
 	return asn1EncodeSignature(r, sVal), nil
+}
+
+// recoverSession attempts to re-establish a PKCS#11 session after failure.
+// Must be called with mu held.
+func (s *PKCS11Signer) recoverSession() error {
+	// Close old session (ignore error — it may already be invalid)
+	_ = s.ctx.CloseSession(s.session)
+
+	session, err := s.ctx.OpenSession(s.cfg.SlotID, pkcs11.CKF_SERIAL_SESSION)
+	if err != nil {
+		return fmt.Errorf("pkcs11 recover session: %w", err)
+	}
+
+	if err := s.ctx.Login(session, pkcs11.CKU_USER, s.cfg.PIN); err != nil {
+		// CKR_USER_ALREADY_LOGGED_IN is acceptable
+		_ = s.ctx.CloseSession(session)
+		return fmt.Errorf("pkcs11 recover login: %w", err)
+	}
+
+	s.session = session
+
+	// Re-find the private key handle
+	if err := s.findKey(s.cfg.KeyLabel); err != nil {
+		return fmt.Errorf("pkcs11 recover findKey: %w", err)
+	}
+
+	return nil
 }
 
 // Close releases the PKCS#11 session and context.
@@ -165,16 +209,30 @@ func (s *PKCS11Signer) findKey(label string) error {
 	}
 
 	ecPoint := attrs[0].Value
-	// EC_POINT is DER-encoded OCTET STRING containing uncompressed point
-	// Strip the ASN.1 OCTET STRING wrapper if present
-	if len(ecPoint) > 0 && ecPoint[0] == 0x04 {
-		// Already uncompressed point
-	} else if len(ecPoint) > 2 && ecPoint[0] == 0x04 && ecPoint[1] == 0x41 {
-		// OCTET STRING { uncompressed point }
-		ecPoint = ecPoint[2:]
-	} else if len(ecPoint) > 2 {
-		// Try stripping DER OCTET STRING header
-		ecPoint = ecPoint[2:]
+	// CKA_EC_POINT is a DER-encoded OCTET STRING containing the uncompressed point.
+	// Parse it properly using ASN.1 to unwrap the OCTET STRING wrapper.
+	if len(ecPoint) == 0 {
+		return fmt.Errorf("empty EC_POINT attribute")
+	}
+	// If the first byte is the ASN.1 OCTET STRING tag (0x04) and the length
+	// indicates it wraps a 65-byte P-256 uncompressed point, unwrap it.
+	// A raw uncompressed P-256 point is exactly 65 bytes (0x04 || x[32] || y[32]).
+	if len(ecPoint) == 65 && ecPoint[0] == 0x04 {
+		// Already a raw uncompressed point
+	} else {
+		// Try ASN.1 OCTET STRING unwrap
+		var rawPoint []byte
+		rest, err := asn1.Unmarshal(ecPoint, &rawPoint)
+		if err != nil {
+			return fmt.Errorf("unmarshal EC_POINT OCTET STRING: %w", err)
+		}
+		if len(rest) > 0 {
+			return fmt.Errorf("trailing data after EC_POINT OCTET STRING")
+		}
+		if len(rawPoint) != 65 || rawPoint[0] != 0x04 {
+			return fmt.Errorf("unexpected EC point format: len=%d, first_byte=0x%02x", len(rawPoint), rawPoint[0])
+		}
+		ecPoint = rawPoint
 	}
 
 	// Parse as P-256 uncompressed point (0x04 || x || y)

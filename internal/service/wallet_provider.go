@@ -182,11 +182,16 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 
 	// Create the JWT claims
 	now := time.Now()
+	kaExpiry := time.Duration(s.cfg.WalletProvider.Attestation.KAExpirySeconds) * time.Second
+	if kaExpiry == 0 {
+		kaExpiry = 15 * time.Second
+	}
 	claims := jwt.MapClaims{
+		"iss":           s.cfg.Server.BaseURL,
 		"attested_keys": enriched,
 		"nonce":         nonce,
 		"iat":           now.Unix(),
-		"exp":           now.Add(15 * time.Second).Unix(),
+		"exp":           now.Add(kaExpiry).Unix(),
 	}
 
 	// Create the token with ES256 and x5c header
