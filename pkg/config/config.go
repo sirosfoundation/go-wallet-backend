@@ -354,6 +354,25 @@ type WalletProviderConfig struct {
 	PrivateKeyPath  string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
 	CertificatePath string `yaml:"certificate_path" envconfig:"CERTIFICATE_PATH"`
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
+
+	// WIA (Wallet Instance Attestation) configuration
+	WIA WIAConfig `yaml:"wia" envconfig:"WIA"`
+}
+
+// WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
+type WIAConfig struct {
+	// Enabled controls whether WIA endpoints are registered
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED" default:"true"`
+	// WalletName is the wallet_name claim in WIA JWT
+	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME" default:"SIROS ID"`
+	// WalletVersion is the wallet_version claim
+	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
+	// WalletLink is the wallet download/info URI
+	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
+	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
+	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS" default:"86400"`
+	// ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds
+	ChallengeTTLSeconds int `yaml:"challenge_ttl_seconds" envconfig:"CHALLENGE_TTL_SECONDS" default:"300"`
 }
 
 // FlowTrustConfig contains per-flow trust evaluation overrides.
