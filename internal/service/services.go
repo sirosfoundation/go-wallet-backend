@@ -72,10 +72,16 @@ func (s *Services) Start() {
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Start()
 	}
+	if s.WIA != nil {
+		s.WIA.Start()
+	}
 }
 
 // Stop gracefully stops background workers
 func (s *Services) Stop() {
+	if s.WIA != nil {
+		s.WIA.Stop()
+	}
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Stop()
 	}

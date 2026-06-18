@@ -59,4 +59,18 @@ var (
 		Name:      "generation_errors_total",
 		Help:      "Total number of Key Attestation generation failures.",
 	})
+
+	// Native attestation metrics
+	nativeAttestationSuccess = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "native_attestation_success_total",
+		Help:      "Total number of successful native attestation verifications.",
+	})
+	nativeAttestationErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "native_attestation_errors_total",
+		Help:      "Total number of failed native attestation verifications.",
+	})
 )

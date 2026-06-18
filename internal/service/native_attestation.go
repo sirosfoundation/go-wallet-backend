@@ -226,11 +226,16 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		zap.String("app_id", nativeCfg.AppleAppID),
 	)
 
+	attSource := "platform_attested"
+	if nativeCfg.AppleAppAttestEnvironment == "development" {
+		attSource = "development_attested"
+	}
+
 	return &NativeAttestationResult{
 		Verified:          true,
 		Platform:          NativeAttestationAppleAppAttest,
 		AppID:             nativeCfg.AppleAppID,
-		AttestationSource: "platform_attested",
+		AttestationSource: attSource,
 	}, nil
 }
 
