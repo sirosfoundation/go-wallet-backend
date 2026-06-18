@@ -137,3 +137,82 @@ func TestWIAGenerate_ExpiredChallenge(t *testing.T) {
 		t.Errorf("expected CHALLENGE_EXPIRED error, got %v", resp["error"])
 	}
 }
+
+func TestWIAChallenge_Success(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, true)
+	router.POST("/wia/challenge", handlers.WIAChallenge)
+
+	req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["challenge"] == nil || resp["challenge"] == "" {
+		t.Error("missing challenge in response")
+	}
+	if resp["expires_at"] == nil {
+		t.Error("missing expires_at in response")
+	}
+}
+
+func TestWIAGenerate_WIADisabled(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, false)
+	router.POST("/wia/generate", handlers.WIAGenerate)
+
+	body := map[string]string{
+		"pop":       "dummy.jwt.token",
+		"challenge": "some-challenge",
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/wia/generate", bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestWIAGenerate_InvalidPopFormat(t *testing.T) {
+	handlers, router := setupWIATestHandlers(t, true)
+	router.POST("/wia/challenge", handlers.WIAChallenge)
+	router.POST("/wia/generate", handlers.WIAGenerate)
+
+	// First get a valid challenge
+	req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var challengeResp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &challengeResp)
+	challenge := challengeResp["challenge"].(string)
+
+	// Use an invalid JWT as PoP
+	body := map[string]string{
+		"pop":       "not.a.valid-jwt",
+		"challenge": challenge,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req = httptest.NewRequest(http.MethodPost, "/wia/generate", bytes.NewBuffer(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "POP_INVALID" {
+		t.Errorf("expected POP_INVALID error, got %v", resp["error"])
+	}
+}

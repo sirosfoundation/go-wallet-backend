@@ -344,3 +344,214 @@ func TestParseECPublicKeyFromJWK(t *testing.T) {
 		t.Fatal("parsed key doesn't match original")
 	}
 }
+
+func TestEllipticCurveForName(t *testing.T) {
+	tests := []struct {
+		name  string
+		curve elliptic.Curve
+	}{
+		{"P-256", elliptic.P256()},
+		{"P-384", elliptic.P384()},
+		{"P-521", elliptic.P521()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ellipticCurveForName(tt.name)
+			if got != tt.curve {
+				t.Errorf("ellipticCurveForName(%q) mismatch", tt.name)
+			}
+		})
+	}
+	if c := ellipticCurveForName("unsupported"); c != nil {
+		t.Error("expected nil for unsupported curve")
+	}
+}
+
+func TestChallengeStoreLen(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+
+	if svc.challenges.len() != 0 {
+		t.Errorf("initial len = %d, want 0", svc.challenges.len())
+	}
+
+	// Create a challenge
+	ctx := context.Background()
+	_, _, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	if svc.challenges.len() != 1 {
+		t.Errorf("after create len = %d, want 1", svc.challenges.len())
+	}
+}
+
+func TestCleanupExpiredChallenges(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+
+	// Insert a challenge, then immediately clean up (shouldn't remove it since it's not expired)
+	ctx := context.Background()
+	_, _, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+
+	svc.CleanupExpiredChallenges()
+	if svc.challenges.len() != 1 {
+		t.Errorf("non-expired challenge removed; len = %d", svc.challenges.len())
+	}
+}
+
+func TestWIAChallenge_Success(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+
+	ctx := context.Background()
+	challenge, expiresAt, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	if challenge == "" {
+		t.Error("challenge is empty")
+	}
+	if expiresAt.Before(time.Now()) {
+		t.Error("expiresAt is in the past")
+	}
+}
+
+func TestWIAIsSupported(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	if !svc.IsSupported() {
+		t.Error("IsSupported() = false, want true")
+	}
+}
+
+func TestWIAGenerateEndToEnd(t *testing.T) {
+	svc, privKey := newTestWIAService(t)
+	ctx := context.Background()
+
+	// 1) Create challenge
+	challenge, _, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+
+	// 2) Build a valid PoP JWT signed by a fresh key
+	walletKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	xBytes := walletKey.PublicKey.X.Bytes()
+	yBytes := walletKey.PublicKey.Y.Bytes()
+	for len(xBytes) < 32 {
+		xBytes = append([]byte{0}, xBytes...)
+	}
+	for len(yBytes) < 32 {
+		yBytes = append([]byte{0}, yBytes...)
+	}
+
+	jwk := map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
+	}
+
+	popToken := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss":   "test-wallet-instance",
+		"aud":   svc.cfg.WalletProvider.WIA.WalletName,
+		"iat":   time.Now().Unix(),
+		"exp":   time.Now().Add(5 * time.Minute).Unix(),
+		"nonce": challenge,
+	})
+	popToken.Header["typ"] = "oauth-client-attestation-pop+jwt"
+	popToken.Header["jwk"] = jwk
+	popString, err := popToken.SignedString(walletKey)
+	if err != nil {
+		t.Fatalf("sign PoP: %v", err)
+	}
+
+	// 3) Generate WIA
+	wia, err := svc.GenerateWIA(ctx, &WIARequest{
+		Pop:       popString,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+	if wia == "" {
+		t.Fatal("WIA is empty")
+	}
+
+	// 4) Parse and verify the WIA JWT
+	parsed, err := jwt.Parse(wia, func(token *jwt.Token) (interface{}, error) {
+		return &privKey.PublicKey, nil
+	}, jwt.WithValidMethods([]string{"ES256"}))
+	if err != nil {
+		t.Fatalf("parse WIA: %v", err)
+	}
+	if !parsed.Valid {
+		t.Fatal("WIA token is invalid")
+	}
+
+	claims := parsed.Claims.(jwt.MapClaims)
+	if claims["cnf"] == nil {
+		t.Error("WIA missing cnf claim")
+	}
+}
+
+func TestWIAGenerateDuplicateChallenge(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First consume should succeed (via internal consume)
+	_, ok := svc.challenges.consume(challenge)
+	if !ok {
+		t.Fatal("first consume should succeed")
+	}
+
+	// Second consume should fail
+	_, ok = svc.challenges.consume(challenge)
+	if ok {
+		t.Fatal("expected failure on second consume")
+	}
+}
+
+func TestParseECPublicKeyFromJWK_InvalidCurve(t *testing.T) {
+	jwk := map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-999",
+		"x":   base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3}),
+		"y":   base64.RawURLEncoding.EncodeToString([]byte{4, 5, 6}),
+	}
+	_, err := parseECPublicKeyFromJWK(jwk)
+	if err == nil {
+		t.Error("expected error for unsupported curve")
+	}
+}
+
+func TestParseECPublicKeyFromJWK_MissingFields(t *testing.T) {
+	// Missing x
+	_, err := parseECPublicKeyFromJWK(map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"y":   "AAAA",
+	})
+	if err == nil {
+		t.Error("expected error for missing x")
+	}
+
+	// Missing crv
+	_, err = parseECPublicKeyFromJWK(map[string]interface{}{
+		"kty": "EC",
+		"x":   "AAAA",
+		"y":   "BBBB",
+	})
+	if err == nil {
+		t.Error("expected error for missing crv")
+	}
+}
