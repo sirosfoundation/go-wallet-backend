@@ -39,7 +39,7 @@ type NativeAttestationRequest struct {
 	Type NativeAttestationType `json:"type"`
 	// Token is the platform-specific attestation token/assertion
 	Token string `json:"token"`
-	// KeyID is the key identifier bound to the attestation
+	// KeyID is the key identifier for logging/correlation (not cryptographically validated)
 	KeyID string `json:"key_id"`
 	// Challenge is the nonce/challenge that was attested
 	Challenge string `json:"challenge"`
@@ -214,7 +214,10 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		return nil, fmt.Errorf("%w: rpIdHash mismatch (wrong app ID)", ErrNativeAttestationInvalid)
 	}
 
-	// Step 6: Extract the public key from authData attested credential data
+	// Step 6: Verify attested credential data flag is present in authData.
+	// Note: full public key extraction/binding is not implemented yet —
+	// this only checks the flags bit to confirm the attestation statement
+	// includes credential data per the App Attest format.
 	// Flags byte (index 32) bit 6 indicates attested credential data is present
 	flags := attestObj.AuthData[32]
 	if flags&0x40 == 0 {
@@ -259,6 +262,9 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 	decKeyBytes, err := base64.StdEncoding.DecodeString(nativeCfg.GooglePlayIntegrityDecryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode decryption key: %v", ErrNativeAttestationInvalid, err)
+	}
+	if len(decKeyBytes) != 32 {
+		return nil, fmt.Errorf("%w: decryption key must be 32 bytes (AES-256), got %d", ErrNativeAttestationInvalid, len(decKeyBytes))
 	}
 
 	// Step 2: Decrypt the JWE token

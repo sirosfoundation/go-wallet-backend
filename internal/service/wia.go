@@ -141,7 +141,9 @@ type WIAService struct {
 	challenges *challengeStore
 
 	// stopCh signals the cleanup goroutine to exit.
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	started  bool
 }
 
 // NewWIAService creates a new WIA service.
@@ -186,7 +188,7 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	challenge := base64.RawURLEncoding.EncodeToString(nonce)
 
 	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = 5 * time.Minute // sensible default
 	}
 	expiresAt := time.Now().Add(ttl)
@@ -556,17 +558,27 @@ func (s *WIAService) CleanupExpiredChallenges() {
 }
 
 // Start begins the periodic challenge cleanup goroutine.
+// Safe to call multiple times; only the first call starts the worker.
 func (s *WIAService) Start() {
+	if s.started {
+		return
+	}
+	s.started = true
 	s.stopCh = make(chan struct{})
+	s.stopOnce = sync.Once{}
 	go s.cleanupLoop()
 	s.logger.Info("WIA challenge cleanup worker started")
 }
 
 // Stop signals the cleanup goroutine to exit.
+// Safe to call multiple times; only the first call closes the channel.
 func (s *WIAService) Stop() {
-	if s.stopCh != nil {
-		close(s.stopCh)
+	if !s.started {
+		return
 	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
 func (s *WIAService) cleanupLoop() {
