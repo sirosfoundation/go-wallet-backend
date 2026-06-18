@@ -813,4 +813,4 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 func (p *WalletProviderProvider) Services() *service.Services { return p.services }
 
 // Close releases resources.
-func (p *WalletProviderProvider) Close() error { return nil }
+func (p *WalletProviderProvider) Close() error { return p.store.Close() }

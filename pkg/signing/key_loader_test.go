@@ -268,12 +268,10 @@ func TestPKCS11Stub_Methods(t *testing.T) {
 	}
 }
 
-func TestPKCS11Stub_Public_Panics(t *testing.T) {
+func TestPKCS11Stub_Public_ReturnsNil(t *testing.T) {
 	s := &PKCS11Signer{}
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("Public() should panic")
-		}
-	}()
-	s.Public()
+	pub := s.Public()
+	if pub != nil {
+		t.Errorf("Public() should return nil, got %T", pub)
+	}
 }

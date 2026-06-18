@@ -222,6 +222,14 @@ func (m *Manager) Start(ctx context.Context) error {
 		p.RegisterRoutes(m.httpRouter)
 	}
 
+	// Co-host wallet-provider routes on main HTTP server when no separate port
+	if len(wpProviders) > 0 && m.cfg.WPPort == 0 {
+		for _, p := range wpProviders {
+			m.logger.Info("Registering wallet-provider routes (co-hosted)", zap.String("mode", p.Name()))
+			p.RegisterRoutes(m.httpRouter)
+		}
+	}
+
 	// Handle WebSocket providers - always on separate port (different protocol)
 	if len(wsProviders) > 0 {
 		m.wsRouter = m.buildRouter()
@@ -297,12 +305,6 @@ func (m *Manager) Start(ctx context.Context) error {
 				m.logger.Error("Wallet-provider server error", zap.Error(err))
 			}
 		}()
-	} else if len(wpProviders) > 0 {
-		// No separate port configured — fall back to shared HTTP router
-		for _, p := range wpProviders {
-			m.logger.Info("Registering wallet-provider routes (co-hosted)", zap.String("mode", p.Name()))
-			p.RegisterRoutes(m.httpRouter)
-		}
 	}
 
 	// Start admin server if configured

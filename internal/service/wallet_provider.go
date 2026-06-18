@@ -60,6 +60,12 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletPro
 			jwtSigner, err := signing.NewCryptoSignerES256(km.Signer)
 			if err != nil {
 				svc.logger.Warn("Failed to create JWT signer from PKCS#11 key", zap.Error(err))
+				// Close the underlying signer to release PKCS#11 session
+				if closer, ok := km.Signer.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+				svc.signer = nil
+				svc.certChain = nil
 			} else {
 				svc.jwtSigner = jwtSigner
 				svc.logger.Info("Loaded wallet provider keys from PKCS#11")
