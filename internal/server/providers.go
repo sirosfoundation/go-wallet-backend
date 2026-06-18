@@ -634,3 +634,64 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 	}
 	return nil
 }
+
+// =============================================================================
+// Wallet Provider (Isolated) - runs wallet-provider on a separate port
+// =============================================================================
+
+// WalletProviderProvider serves only the wallet-provider endpoints
+// (key attestation + WIA) on a dedicated HTTP server for PKCS#11 operational
+// isolation. When deployed separately, this process holds the HSM session
+// while the main backend runs without PKCS#11 access.
+type WalletProviderProvider struct {
+	cfg      *config.Config
+	logger   *zap.Logger
+	store    backend.Backend
+	handlers *api.Handlers
+	services *service.Services
+}
+
+// NewWalletProviderProvider creates a new isolated wallet-provider.
+func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletProviderProvider, error) {
+	store, err := backend.New(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create backend: %w", err)
+	}
+
+	services := service.NewServices(store, cfg, logger)
+	if services.WalletProvider == nil || !services.WalletProvider.IsSupported() {
+		return nil, fmt.Errorf("wallet-provider signing keys not configured or not supported")
+	}
+
+	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
+
+	return &WalletProviderProvider{
+		cfg:      cfg,
+		logger:   logger,
+		store:    store,
+		handlers: handlers,
+		services: services,
+	}, nil
+}
+
+func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
+func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
+
+func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
+	// Wallet-provider routes with auth middleware
+	wp := router.Group("/wallet-provider")
+	wp.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	{
+		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+		if p.cfg.WalletProvider.WIA.Enabled {
+			wp.POST("/wia/challenge", p.handlers.WIAChallenge)
+			wp.POST("/wia/generate", p.handlers.WIAGenerate)
+		}
+	}
+}
+
+// Services returns the service aggregate.
+func (p *WalletProviderProvider) Services() *service.Services { return p.services }
+
+// Close releases resources.
+func (p *WalletProviderProvider) Close() error { return nil }
