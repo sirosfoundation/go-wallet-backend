@@ -272,9 +272,9 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	// Manually expire the challenge
-	svc.mu.Lock()
-	svc.challenges[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
-	svc.mu.Unlock()
+	svc.challenges.mu.Lock()
+	svc.challenges.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
+	svc.challenges.mu.Unlock()
 
 	pop, _ := createTestPop(t, challenge)
 

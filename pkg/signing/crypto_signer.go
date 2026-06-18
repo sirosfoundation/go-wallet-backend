@@ -34,7 +34,15 @@ func (m *CryptoSignerES256) Verify(signingString string, sig []byte, key interfa
 	return jwt.SigningMethodES256.Verify(signingString, sig, key)
 }
 
+// Sign implements jwt.SigningMethod. The key parameter is intentionally ignored:
+// the real private key is held inside the crypto.Signer (which may be PKCS#11
+// or HSM-backed and non-exportable). Callers MUST pass nil as the key via
+// SignToken(); passing a non-nil key is rejected to prevent silent misuse.
 func (m *CryptoSignerES256) Sign(signingString string, key interface{}) ([]byte, error) {
+	if key != nil {
+		return nil, fmt.Errorf("CryptoSignerES256.Sign: key must be nil (signing key is held by the internal crypto.Signer); got %T", key)
+	}
+
 	hasher := crypto.SHA256.New()
 	hasher.Write([]byte(signingString))
 	digest := hasher.Sum(nil)

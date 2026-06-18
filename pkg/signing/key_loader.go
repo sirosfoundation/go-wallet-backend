@@ -4,11 +4,11 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 )
 
 // KeyMaterial holds a loaded signing key and its certificate chain.
@@ -93,36 +93,43 @@ func loadFromFile(cfg *KeyConfig) (*KeyMaterial, error) {
 }
 
 func loadCertChain(certPath, caPath string) ([]string, error) {
-	certPEM, err := os.ReadFile(certPath)
+	chain, err := parsePEMCerts(certPath)
 	if err != nil {
-		return nil, fmt.Errorf("read certificate: %w", err)
+		return nil, err
+	}
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("no certificates found in %s", certPath)
 	}
 
-	certStr := string(certPEM)
-	certStr = strings.ReplaceAll(certStr, "-----BEGIN CERTIFICATE-----", "")
-	certStr = strings.ReplaceAll(certStr, "-----END CERTIFICATE-----", "")
-	certStr = strings.ReplaceAll(certStr, "\r\n", "\n")
-	certStr = strings.ReplaceAll(certStr, "\r", "")
-	certStr = strings.ReplaceAll(certStr, "\n", "")
-	certStr = strings.TrimSpace(certStr)
-
-	chain := []string{certStr}
-
 	if caPath != "" {
-		caPEM, err := os.ReadFile(caPath)
-		if err == nil {
-			caStr := string(caPEM)
-			caStr = strings.ReplaceAll(caStr, "-----BEGIN CERTIFICATE-----", "")
-			caStr = strings.ReplaceAll(caStr, "-----END CERTIFICATE-----", "")
-			caStr = strings.ReplaceAll(caStr, "\r\n", "\n")
-			caStr = strings.ReplaceAll(caStr, "\r", "")
-			caStr = strings.ReplaceAll(caStr, "\n", "")
-			caStr = strings.TrimSpace(caStr)
-			if caStr != "" {
-				chain = append(chain, caStr)
-			}
+		caCerts, err := parsePEMCerts(caPath)
+		if err == nil && len(caCerts) > 0 {
+			chain = append(chain, caCerts...)
 		}
 	}
 
 	return chain, nil
+}
+
+// parsePEMCerts reads a PEM file and returns all CERTIFICATE blocks as
+// base64-encoded DER strings (suitable for x5c JWT headers per RFC 7515 §4.1.6).
+func parsePEMCerts(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read certificate %s: %w", path, err)
+	}
+
+	var certs []string
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		certs = append(certs, base64.StdEncoding.EncodeToString(block.Bytes))
+	}
+	return certs, nil
 }

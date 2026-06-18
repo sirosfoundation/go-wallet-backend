@@ -62,3 +62,20 @@ func TestCryptoSignerES256_RejectsNonP256(t *testing.T) {
 		t.Fatal("should reject P-384 key")
 	}
 }
+
+func TestCryptoSignerES256_RejectsNonNilKey(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, err := NewCryptoSignerES256(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = signer.Sign("test-string", "unexpected-key")
+	if err == nil {
+		t.Fatal("Sign should reject non-nil key")
+	}
+}

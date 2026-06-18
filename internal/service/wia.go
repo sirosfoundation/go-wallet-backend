@@ -30,6 +30,101 @@ var (
 type WIAChallenge struct {
 	Challenge string
 	ExpiresAt time.Time
+	// Linked list pointers for expiry-ordered eviction.
+	prev, next *WIAChallenge
+}
+
+// challengeStore is a bounded, expiry-ordered map of challenges.
+// Expired entries are evicted in O(1) from the front of the list on insert.
+type challengeStore struct {
+	mu      sync.Mutex
+	items   map[string]*WIAChallenge
+	head    *WIAChallenge // oldest expiry
+	tail    *WIAChallenge // newest expiry
+	maxSize int
+}
+
+func newChallengeStore(maxSize int) *challengeStore {
+	return &challengeStore{
+		items:   make(map[string]*WIAChallenge, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// put adds a challenge, evicting expired entries first. Returns false if at capacity.
+func (cs *challengeStore) put(c *WIAChallenge) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.evictExpired()
+
+	if len(cs.items) >= cs.maxSize {
+		return false
+	}
+
+	cs.items[c.Challenge] = c
+
+	// Append to tail (newest expiry)
+	c.prev = cs.tail
+	c.next = nil
+	if cs.tail != nil {
+		cs.tail.next = c
+	}
+	cs.tail = c
+	if cs.head == nil {
+		cs.head = c
+	}
+	return true
+}
+
+// consume removes and returns a challenge if it exists and is not expired.
+func (cs *challengeStore) consume(challenge string) (*WIAChallenge, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	c, ok := cs.items[challenge]
+	if !ok {
+		return nil, false
+	}
+	cs.removeLocked(c)
+	if time.Now().After(c.ExpiresAt) {
+		return nil, false
+	}
+	return c, true
+}
+
+// evictExpired removes expired entries from the front of the list (O(1) per entry).
+// Must hold cs.mu.
+func (cs *challengeStore) evictExpired() {
+	now := time.Now()
+	for cs.head != nil && now.After(cs.head.ExpiresAt) {
+		cs.removeLocked(cs.head)
+	}
+}
+
+// removeLocked removes a challenge from both the map and the linked list.
+// Must hold cs.mu.
+func (cs *challengeStore) removeLocked(c *WIAChallenge) {
+	delete(cs.items, c.Challenge)
+	if c.prev != nil {
+		c.prev.next = c.next
+	} else {
+		cs.head = c.next
+	}
+	if c.next != nil {
+		c.next.prev = c.prev
+	} else {
+		cs.tail = c.prev
+	}
+	c.prev = nil
+	c.next = nil
+}
+
+// len returns the number of stored challenges.
+func (cs *challengeStore) len() int {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return len(cs.items)
 }
 
 // WIAService handles Wallet Instance Attestation (CS-04 §7.1.2, §7.1.4).
@@ -42,8 +137,7 @@ type WIAService struct {
 
 	// In-memory challenge store (single-use nonces).
 	// Production: replace with storage.Store for multi-instance.
-	mu         sync.Mutex
-	challenges map[string]*WIAChallenge
+	challenges *challengeStore
 }
 
 // NewWIAService creates a new WIA service.
@@ -54,7 +148,7 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 		logger:     logger.Named("wia-service"),
 		jwtSigner:  jwtSigner,
 		certChain:  certChain,
-		challenges: make(map[string]*WIAChallenge),
+		challenges: newChallengeStore(maxChallenges),
 	}
 
 	// Wire native attestation if configured
@@ -93,43 +187,27 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 	expiresAt := time.Now().Add(ttl)
 
-	s.mu.Lock()
-	// Prune expired challenges
-	now := time.Now()
-	for k, v := range s.challenges {
-		if now.After(v.ExpiresAt) {
-			delete(s.challenges, k)
-		}
-	}
-	// Capacity check after pruning
-	if len(s.challenges) >= maxChallenges {
-		s.mu.Unlock()
-		return "", time.Time{}, fmt.Errorf("challenge capacity exceeded")
-	}
-	s.challenges[challenge] = &WIAChallenge{
+	c := &WIAChallenge{
 		Challenge: challenge,
 		ExpiresAt: expiresAt,
 	}
-	s.mu.Unlock()
+	if !s.challenges.put(c) {
+		challengeCapacityExceeded.Inc()
+		return "", time.Time{}, fmt.Errorf("challenge capacity exceeded")
+	}
 
+	challengeCreatedTotal.Inc()
 	s.logger.Debug("WIA challenge created", zap.String("challenge", challenge[:8]+"..."))
 	return challenge, expiresAt, nil
 }
 
 // consumeChallenge validates and removes a challenge (single-use).
 func (s *WIAService) consumeChallenge(challenge string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	c, ok := s.challenges[challenge]
-	if !ok {
+	if _, ok := s.challenges.consume(challenge); !ok {
+		challengeExpiredTotal.Inc()
 		return ErrWIAChallengeExpired
 	}
-	delete(s.challenges, challenge)
-
-	if time.Now().After(c.ExpiresAt) {
-		return ErrWIAChallengeExpired
-	}
+	challengeConsumedTotal.Inc()
 	return nil
 }
 
@@ -306,9 +384,11 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
 		s.logger.Error("Failed to sign WIA JWT", zap.Error(err))
+		wiaGenerationErrors.Inc()
 		return "", err
 	}
 
+	wiaGeneratedTotal.Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 	return tokenString, nil
 }
@@ -402,13 +482,7 @@ func ellipticCurveForName(name string) elliptic.Curve {
 
 // CleanupExpiredChallenges removes expired challenges from the in-memory store.
 func (s *WIAService) CleanupExpiredChallenges() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	for k, c := range s.challenges {
-		if now.After(c.ExpiresAt) {
-			delete(s.challenges, k)
-		}
-	}
+	s.challenges.mu.Lock()
+	s.challenges.evictExpired()
+	s.challenges.mu.Unlock()
 }

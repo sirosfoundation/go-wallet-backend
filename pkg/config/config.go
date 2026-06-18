@@ -373,6 +373,7 @@ type PKCS11SigningConfig struct {
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
+	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
 }
 
 // AttestationConfig controls attestation lifecycle behavior.
