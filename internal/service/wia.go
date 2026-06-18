@@ -411,15 +411,26 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		claims["wallet_link"] = s.cfg.WalletProvider.WIA.WalletLink
 	}
 
-	// Status list: include based on configuration
+	// Wallet solution certification information (Annex C §C.3.2)
+	if len(s.cfg.WalletProvider.WIA.CertificationInfo) > 0 {
+		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
+	}
+
+	// Client status (WIA revocation via Token Status List, Annex C §C.3.2)
 	switch s.cfg.WalletProvider.Attestation.StatusListMode {
 	case "always":
-		claims["status"] = map[string]interface{}{
-			"status_list": map[string]interface{}{
-				"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-				"idx": 0, // TODO: assign from status list allocator
+		clientStatus := map[string]interface{}{
+			"status": map[string]interface{}{
+				"status_list": map[string]interface{}{
+					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
+					"idx": 0, // TODO: assign from status list allocator
+				},
 			},
 		}
+		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
+			clientStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
+		}
+		claims["client_status"] = clientStatus
 	case "never":
 		// Omit status list for short-lived attestations
 	default:

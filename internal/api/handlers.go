@@ -630,11 +630,11 @@ func (h *Handlers) GetCertificate(c *gin.Context) {
 }
 
 // SecurityPropertiesRequest carries WSCD security metadata from native SDKs.
-// When provided, these values are included in the KA JWT per CS-04 §7.1.3.
+// These become top-level KA JWT claims per Annex C §C.3.1.
 type SecurityPropertiesRequest struct {
-	KeyStorage         string   `json:"key_storage"`
-	UserAuthentication []string `json:"user_authentication"`
-	Certification      string   `json:"certification"`
+	KeyStorage         []string    `json:"key_storage"`
+	UserAuthentication []string    `json:"user_authentication"`
+	Certification      interface{} `json:"certification,omitempty"`
 }
 
 func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
