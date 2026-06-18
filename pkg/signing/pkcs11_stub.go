@@ -17,6 +17,7 @@ type PKCS11Config struct {
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
+	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"`
 }
 
 // NewPKCS11Signer returns an error when pkcs11 is not compiled in.

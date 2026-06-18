@@ -48,6 +48,7 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletPro
 				SlotID:     cfg.WalletProvider.PKCS11.SlotID,
 				PIN:        cfg.WalletProvider.PKCS11.PIN,
 				KeyLabel:   cfg.WalletProvider.PKCS11.KeyLabel,
+				PoolSize:   cfg.WalletProvider.PKCS11.PoolSize,
 			},
 		}
 		km, err := signing.LoadKeyMaterial(keyCfg)
@@ -203,8 +204,10 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
 		s.logger.Error("Failed to sign key attestation JWT", zap.Error(err))
+		kaGenerationErrors.Inc()
 		return "", err
 	}
 
+	kaGeneratedTotal.Inc()
 	return tokenString, nil
 }
