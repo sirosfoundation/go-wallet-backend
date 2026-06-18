@@ -93,6 +93,18 @@ func (cs *challengeStore) consume(challenge string) (*WIAChallenge, bool) {
 	return c, true
 }
 
+// exists checks if a challenge is present and not expired (without consuming it).
+func (cs *challengeStore) exists(challenge string) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	c, ok := cs.items[challenge]
+	if !ok {
+		return false
+	}
+	return !time.Now().After(c.ExpiresAt)
+}
+
 // evictExpired removes expired entries from the front of the list (O(1) per entry).
 // Must hold cs.mu.
 func (cs *challengeStore) evictExpired() {
@@ -233,19 +245,26 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		return "", ErrWIANotSupported
 	}
 
-	// Step 1: Parse and validate WIA-PoP (before consuming challenge,
-	// so a malformed PoP doesn't burn the single-use nonce)
+	// Step 1: Verify challenge exists (fast-fail unknown/expired challenges
+	// without doing expensive PoP crypto)
+	if !s.challenges.exists(req.Challenge) {
+		challengeExpiredTotal.Inc()
+		return "", ErrWIAChallengeExpired
+	}
+
+	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	// Step 2: Consume challenge (single-use) — only after PoP is valid
+	// Step 3: Consume challenge (single-use) — only after PoP is valid,
+	// so a malformed PoP doesn't burn the nonce
 	if err := s.consumeChallenge(req.Challenge); err != nil {
 		return "", err
 	}
 
-	// Step 3: Determine attestation source
+	// Step 4: Determine attestation source
 	attestationSource := "backend_attested" // Tier 3 baseline
 	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
 		// Bind native attestation challenge to the WIA challenge nonce
@@ -261,15 +280,17 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		}
 	}
 
-	// Step 4: Generate WIA JWT
+	// Step 5: Generate WIA JWT
 	return s.signWIA(cnfJWK, attestationSource)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
 func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[string]interface{}, error) {
-	// Parse without verification first to extract the key
+	// Parse without verification first to extract the self-signed JWK from the header.
+	// This is the standard pattern for self-signed PoP JWTs (RFC 9449 / DPoP):
+	// the key is in the header, so we must parse to get it, then verify below.
 	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, err := parser.ParseUnverified(popJWT, &WIAPopClaims{})
+	token, _, err := parser.ParseUnverified(popJWT, &WIAPopClaims{}) //NOSONAR — verified immediately below with ParseWithClaims+WithValidMethods
 	if err != nil {
 		return nil, fmt.Errorf("parse pop: %w", err)
 	}
