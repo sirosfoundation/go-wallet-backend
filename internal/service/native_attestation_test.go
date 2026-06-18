@@ -308,9 +308,12 @@ func TestAppleAppAttestRootCAs_NotEmpty(t *testing.T) {
 	if pool == nil {
 		t.Fatal("expected non-nil pool")
 	}
-	// Verify the pool can verify a self-signed cert (i.e. it has contents)
-	// In Go 1.22+, pool.Subjects() is deprecated but still works
-	// We test by checking the pool is usable
+	// Verify the pool actually contains certificates by checking Subjects()
+	//nolint:staticcheck // Subjects() is deprecated in Go 1.22+ but still works for this test
+	subjects := pool.Subjects()
+	if len(subjects) == 0 {
+		t.Fatal("expected at least one certificate in the Apple App Attest root pool")
+	}
 }
 
 func TestExtractAppAttestNonce(t *testing.T) {

@@ -40,6 +40,10 @@ func LoadKeyMaterial(cfg *KeyConfig) (*KeyMaterial, error) {
 }
 
 func loadFromPKCS11(cfg *KeyConfig) (*KeyMaterial, error) {
+	if cfg.CertificatePath == "" {
+		return nil, errors.New("certificate_path is required for PKCS#11 mode (x5c chain)")
+	}
+
 	signer, err := NewPKCS11Signer(cfg.PKCS11)
 	if err != nil {
 		return nil, fmt.Errorf("pkcs11 signer: %w", err)

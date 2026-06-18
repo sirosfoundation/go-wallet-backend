@@ -1101,7 +1101,12 @@ func (c *Config) Validate() error {
 	if c.Server.WPPort != 0 && (c.Server.WPPort < 1 || c.Server.WPPort > 65535) {
 		return fmt.Errorf("invalid wallet-provider port: %d", c.Server.WPPort)
 	}
-	if c.Server.WPPort != 0 && c.Server.WPPort == c.Server.Port && c.Server.WPHost == c.Server.Host {
+	// WPHost defaults to Host when empty, so treat empty as equivalent
+	effectiveWPHost := c.Server.WPHost
+	if effectiveWPHost == "" {
+		effectiveWPHost = c.Server.Host
+	}
+	if c.Server.WPPort != 0 && c.Server.WPPort == c.Server.Port && effectiveWPHost == c.Server.Host {
 		return fmt.Errorf("wallet-provider port %d conflicts with main server port on the same host", c.Server.WPPort)
 	}
 
