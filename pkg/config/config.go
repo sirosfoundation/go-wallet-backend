@@ -998,6 +998,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
 	}
 
+	// Validate wallet-provider port when explicitly configured
+	if c.Server.WPPort != 0 && (c.Server.WPPort < 1 || c.Server.WPPort > 65535) {
+		return fmt.Errorf("invalid wallet-provider port: %d", c.Server.WPPort)
+	}
+	if c.Server.WPPort != 0 && c.Server.WPPort == c.Server.Port && c.Server.WPHost == c.Server.Host {
+		return fmt.Errorf("wallet-provider port %d conflicts with main server port on the same host", c.Server.WPPort)
+	}
+
 	if c.Server.RPID == "" {
 		return fmt.Errorf("rp_id is required")
 	}

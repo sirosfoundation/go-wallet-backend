@@ -323,7 +323,7 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 }
 
 // AppleAppAttestRootCAs returns the Apple App Attest root CA pool.
-// This is the Apple App Attestation Root CA, valid until 2038-02-01.
+// This is the Apple App Attestation Root CA, valid until 2045-03-15.
 func AppleAppAttestRootCAs() *x509.CertPool {
 	pool := x509.NewCertPool()
 	// Apple App Attestation Root CA

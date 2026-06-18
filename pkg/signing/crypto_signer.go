@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/asn1"
 	"fmt"
 	"math/big"
@@ -47,7 +48,7 @@ func (m *CryptoSignerES256) Sign(signingString string, key interface{}) ([]byte,
 	hasher.Write([]byte(signingString))
 	digest := hasher.Sum(nil)
 
-	sigBytes, err := m.signer.Sign(nil, digest, crypto.SHA256)
+	sigBytes, err := m.signer.Sign(rand.Reader, digest, crypto.SHA256)
 	if err != nil {
 		return nil, fmt.Errorf("crypto.Signer.Sign: %w", err)
 	}

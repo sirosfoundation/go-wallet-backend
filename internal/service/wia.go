@@ -233,20 +233,25 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		return "", ErrWIANotSupported
 	}
 
-	// Step 1: Consume challenge (single-use)
-	if err := s.consumeChallenge(req.Challenge); err != nil {
-		return "", err
-	}
-
-	// Step 2: Parse and validate WIA-PoP
+	// Step 1: Parse and validate WIA-PoP (before consuming challenge,
+	// so a malformed PoP doesn't burn the single-use nonce)
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
+	// Step 2: Consume challenge (single-use) — only after PoP is valid
+	if err := s.consumeChallenge(req.Challenge); err != nil {
+		return "", err
+	}
+
 	// Step 3: Determine attestation source
 	attestationSource := "backend_attested" // Tier 3 baseline
 	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
+		// Bind native attestation challenge to the WIA challenge nonce
+		if req.NativeAttestation.Challenge != req.Challenge {
+			return "", fmt.Errorf("%w: native attestation challenge does not match WIA challenge", ErrWIAPopInvalid)
+		}
 		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
 		if err != nil {
 			s.logger.Warn("Native attestation verification failed", zap.Error(err))
@@ -333,6 +338,9 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	// Use global attestation lifetime, capped by WIA max expiry
 	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
 	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if maxExpiry <= 0 {
+		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
+	}
 	if lifetime > maxExpiry || lifetime == 0 {
 		lifetime = maxExpiry
 	}
@@ -416,6 +424,7 @@ func computeJKT(jwk map[string]interface{}) (string, error) {
 }
 
 // parseECPublicKeyFromJWK parses an EC public key from a JWK map.
+// Only P-256 is accepted (consistent with ES256-only PoP validation).
 func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
 	kty, _ := jwk["kty"].(string)
 	if kty != "EC" {
@@ -428,6 +437,10 @@ func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, erro
 
 	if crv == "" || xB64 == "" || yB64 == "" {
 		return nil, errors.New("incomplete EC JWK")
+	}
+
+	if crv != "P-256" {
+		return nil, fmt.Errorf("unsupported curve %q: only P-256 is accepted for WIA PoP", crv)
 	}
 
 	xBytes, err := base64.RawURLEncoding.DecodeString(xB64)

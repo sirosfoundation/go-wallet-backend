@@ -26,10 +26,11 @@ func NewPKCS11Signer(cfg *PKCS11Config) (*PKCS11Signer, error) {
 }
 
 // PKCS11Signer is a stub when pkcs11 is not compiled in.
-// It implements crypto.Signer to satisfy the compiler, but always panics.
+// It implements crypto.Signer to satisfy the compiler, but all methods
+// return errors or nil (never panics).
 type PKCS11Signer struct{}
 
-func (s *PKCS11Signer) Public() crypto.PublicKey { panic("pkcs11 not compiled in") }
+func (s *PKCS11Signer) Public() crypto.PublicKey { return nil }
 func (s *PKCS11Signer) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
 	return nil, ErrPKCS11NotSupported
 }
