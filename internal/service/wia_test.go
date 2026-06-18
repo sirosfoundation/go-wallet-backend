@@ -860,6 +860,58 @@ func TestSignWIA_EmptyWalletNameVersion(t *testing.T) {
 	}
 }
 
+func TestSignWIA_CertificationInfo(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.CertificationInfo = map[string]interface{}{
+		"scheme":          "EUCC",
+		"assurance_level": "substantial",
+	}
+
+	challenge, _, _ := svc.CreateChallenge(context.Background())
+	pop, _ := createTestPop(t, challenge)
+
+	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	certInfo, ok := claims["wallet_solution_certification_information"].(map[string]interface{})
+	if !ok {
+		t.Fatal("wallet_solution_certification_information claim missing")
+	}
+	if certInfo["scheme"] != "EUCC" {
+		t.Errorf("scheme = %v, want EUCC", certInfo["scheme"])
+	}
+	if certInfo["assurance_level"] != "substantial" {
+		t.Errorf("assurance_level = %v, want substantial", certInfo["assurance_level"])
+	}
+}
+
+func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.CertificationInfo = nil
+
+	challenge, _, _ := svc.CreateChallenge(context.Background())
+	pop, _ := createTestPop(t, challenge)
+
+	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	if _, ok := claims["wallet_solution_certification_information"]; ok {
+		t.Error("wallet_solution_certification_information should be omitted when not configured")
+	}
+}
+
 func TestSignWIA_StatusListAlways(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
@@ -877,16 +929,47 @@ func TestSignWIA_StatusListAlways(t *testing.T) {
 	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
 	claims := token.Claims.(jwt.MapClaims)
 
-	status, ok := claims["status"].(map[string]interface{})
+	clientStatus, ok := claims["client_status"].(map[string]interface{})
 	if !ok {
-		t.Fatal("status claim missing when StatusListMode=always")
+		t.Fatal("client_status claim missing when StatusListMode=always")
 	}
-	sl, ok := status["status_list"].(map[string]interface{})
+	statusObj, ok := clientStatus["status"].(map[string]interface{})
 	if !ok {
-		t.Fatal("status_list missing")
+		t.Fatal("client_status.status missing")
+	}
+	sl, ok := statusObj["status_list"].(map[string]interface{})
+	if !ok {
+		t.Fatal("client_status.status.status_list missing")
 	}
 	if sl["uri"] != "https://status.example.com/list" {
 		t.Errorf("status_list.uri = %v", sl["uri"])
+	}
+}
+
+func TestSignWIA_StatusListAlwaysWithExpiry(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
+	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://status.example.com/list"
+	svc.cfg.WalletProvider.Attestation.StatusListExpiry = 3600
+
+	challenge, _, _ := svc.CreateChallenge(context.Background())
+	pop, _ := createTestPop(t, challenge)
+
+	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	clientStatus, ok := claims["client_status"].(map[string]interface{})
+	if !ok {
+		t.Fatal("client_status claim missing")
+	}
+	if _, ok := clientStatus["exp"]; !ok {
+		t.Error("client_status.exp should be present when StatusListExpiry > 0")
 	}
 }
 

@@ -394,6 +394,10 @@ type AttestationConfig struct {
 	// StatusListURL is the base URL for the Token Status List endpoint.
 	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
 
+	// StatusListExpiry is the lifetime (seconds) of a status list entry.
+	// When > 0, the client_status object includes an "exp" field (Annex C §C.3.2).
+	StatusListExpiry int `yaml:"status_list_expiry" envconfig:"STATUS_LIST_EXPIRY"`
+
 	// NativeAttestation controls platform attestation verification.
 	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
 }
@@ -428,6 +432,9 @@ type WIAConfig struct {
 	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
 	// WalletLink is the wallet download/info URI
 	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
+	// CertificationInfo is the wallet_solution_certification_information claim.
+	// Free-form map included as-is in the WIA JWT (Annex C §C.3.2).
+	CertificationInfo map[string]interface{} `yaml:"certification_info,omitempty"`
 	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
 	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
 	// ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds

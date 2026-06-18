@@ -153,10 +153,16 @@ func (s *WalletProviderService) IsSupported() bool {
 }
 
 // SecurityProperties carries WSCD-reported security metadata for KA claims.
+// These become top-level KA JWT claims per Annex C §C.3.1.
 type SecurityProperties struct {
-	KeyStorage         string   `json:"key_storage"`
+	// KeyStorage is the key storage security level (e.g., ["iso_18045_high"]).
+	KeyStorage []string `json:"key_storage"`
+	// UserAuthentication is the user auth mechanism (e.g., ["iso_18045_high"]).
 	UserAuthentication []string `json:"user_authentication"`
-	Certification      string   `json:"certification"`
+	// Certification describes the certification status.
+	// String "none" for no certification, or an object like
+	// {"scheme":"EUCC","assurance_level":"substantial"} for certified devices.
+	Certification interface{} `json:"certification"`
 }
 
 // GenerateKeyAttestation generates a key attestation JWT
@@ -165,26 +171,14 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		return "", ErrKeyAttestationNotSupported
 	}
 
-	// Enrich each key with security properties if provided.
 	// Clone each JWK map to avoid mutating the caller's data.
-	enriched := make([]map[string]interface{}, len(jwks))
+	attested := make([]map[string]interface{}, len(jwks))
 	for i, jwk := range jwks {
-		clone := make(map[string]interface{}, len(jwk)+3)
+		clone := make(map[string]interface{}, len(jwk))
 		for k, v := range jwk {
 			clone[k] = v
 		}
-		if secProps != nil {
-			if secProps.KeyStorage != "" {
-				clone["key_storage"] = secProps.KeyStorage
-			}
-			if len(secProps.UserAuthentication) > 0 {
-				clone["user_authentication"] = secProps.UserAuthentication
-			}
-			if secProps.Certification != "" {
-				clone["certification"] = secProps.Certification
-			}
-		}
-		enriched[i] = clone
+		attested[i] = clone
 	}
 
 	// Create the JWT claims
@@ -195,10 +189,39 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	}
 	claims := jwt.MapClaims{
 		"iss":           s.cfg.Server.BaseURL,
-		"attested_keys": enriched,
+		"attested_keys": attested,
 		"nonce":         nonce,
 		"iat":           now.Unix(),
 		"exp":           now.Add(kaExpiry).Unix(),
+	}
+
+	// Security properties are top-level KA claims (Annex C §C.3.1)
+	if secProps != nil {
+		if len(secProps.KeyStorage) > 0 {
+			claims["key_storage"] = secProps.KeyStorage
+		}
+		if len(secProps.UserAuthentication) > 0 {
+			claims["user_authentication"] = secProps.UserAuthentication
+		}
+		if secProps.Certification != nil {
+			claims["certification"] = secProps.Certification
+		}
+	}
+
+	// key_storage_status: KA revocation via Token Status List (CS-04 §7.1.3)
+	if s.cfg.WalletProvider.Attestation.StatusListMode == "always" && s.cfg.WalletProvider.Attestation.StatusListURL != "" {
+		ksStatus := map[string]interface{}{
+			"status": map[string]interface{}{
+				"status_list": map[string]interface{}{
+					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
+					"idx": 0, // TODO: assign from status list allocator
+				},
+			},
+		}
+		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
+			ksStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
+		}
+		claims["key_storage_status"] = ksStatus
 	}
 
 	// Create the token with ES256 and x5c header
