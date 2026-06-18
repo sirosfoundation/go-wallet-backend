@@ -420,6 +420,8 @@ type NativeAttestationConfig struct {
 type WIAConfig struct {
 	// Enabled controls whether WIA endpoints are registered
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
+	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
 	// WalletName is the wallet_name claim in WIA JWT
 	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME"`
 	// WalletVersion is the wallet_version claim

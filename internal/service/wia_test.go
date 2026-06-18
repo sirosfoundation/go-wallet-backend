@@ -351,8 +351,6 @@ func TestEllipticCurveForName(t *testing.T) {
 		curve elliptic.Curve
 	}{
 		{"P-256", elliptic.P256()},
-		{"P-384", elliptic.P384()},
-		{"P-521", elliptic.P521()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -362,8 +360,11 @@ func TestEllipticCurveForName(t *testing.T) {
 			}
 		})
 	}
-	if c := ellipticCurveForName("unsupported"); c != nil {
-		t.Error("expected nil for unsupported curve")
+	// Unsupported curves should return nil
+	for _, name := range []string{"P-384", "P-521", "unsupported"} {
+		if c := ellipticCurveForName(name); c != nil {
+			t.Errorf("expected nil for %q curve", name)
+		}
 	}
 }
 

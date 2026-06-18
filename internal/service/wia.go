@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -93,18 +94,6 @@ func (cs *challengeStore) consume(challenge string) (*WIAChallenge, bool) {
 	return c, true
 }
 
-// exists checks if a challenge is present and not expired (without consuming it).
-func (cs *challengeStore) exists(challenge string) bool {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	c, ok := cs.items[challenge]
-	if !ok {
-		return false
-	}
-	return !time.Now().After(c.ExpiresAt)
-}
-
 // evictExpired removes expired entries from the front of the list (O(1) per entry).
 // Must hold cs.mu.
 func (cs *challengeStore) evictExpired() {
@@ -150,6 +139,9 @@ type WIAService struct {
 	// In-memory challenge store (single-use nonces).
 	// Production: replace with storage.Store for multi-instance.
 	challenges *challengeStore
+
+	// stopCh signals the cleanup goroutine to exit.
+	stopCh chan struct{}
 }
 
 // NewWIAService creates a new WIA service.
@@ -245,11 +237,12 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		return "", ErrWIANotSupported
 	}
 
-	// Step 1: Verify challenge exists (fast-fail unknown/expired challenges
-	// without doing expensive PoP crypto)
-	if !s.challenges.exists(req.Challenge) {
-		challengeExpiredTotal.Inc()
-		return "", ErrWIAChallengeExpired
+	// Step 1: Consume challenge (single-use, atomic).
+	// Must happen before PoP validation to prevent concurrent crypto amplification
+	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
+	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
+	if err := s.consumeChallenge(req.Challenge); err != nil {
+		return "", err
 	}
 
 	// Step 2: Parse and validate WIA-PoP
@@ -258,13 +251,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	// Step 3: Consume challenge (single-use) — only after PoP is valid,
-	// so a malformed PoP doesn't burn the nonce
-	if err := s.consumeChallenge(req.Challenge); err != nil {
-		return "", err
-	}
-
-	// Step 4: Determine attestation source
+	// Step 3: Determine attestation source
 	attestationSource := "backend_attested" // Tier 3 baseline
 	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
 		// Bind native attestation challenge to the WIA challenge nonce
@@ -273,14 +260,18 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 		}
 		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
 		if err != nil {
-			s.logger.Warn("Native attestation verification failed", zap.Error(err))
-			// Fall back to backend_attested rather than failing entirely
-		} else if result.Verified {
+			// When native attestation is submitted but fails, reject the request.
+			// If the client doesn't want native attestation, it should omit the field.
+			nativeAttestationErrors.Inc()
+			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)
+		}
+		if result.Verified {
 			attestationSource = result.AttestationSource
+			nativeAttestationSuccess.Inc()
 		}
 	}
 
-	// Step 5: Generate WIA JWT
+	// Step 4: Generate WIA JWT
 	return s.signWIA(cnfJWK, attestationSource)
 }
 
@@ -344,9 +335,34 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 		return nil, fmt.Errorf("pop exp too far in future (max 10m)")
 	}
 
+	// Validate iat is present and not too far in the past (max 10 minutes)
+	if claims.IssuedAt == nil {
+		return nil, errors.New("pop missing iat claim")
+	}
+	if claims.IssuedAt.Before(time.Now().Add(-10 * time.Minute)) {
+		return nil, fmt.Errorf("pop iat too far in past (max 10m)")
+	}
+
 	// Validate iss is present (wallet instance identifier)
 	if claims.Issuer == "" {
 		return nil, errors.New("pop missing iss claim")
+	}
+
+	// Validate aud matches wallet provider URI (if configured)
+	if s.cfg.WalletProvider.WIA.WalletProviderURI != "" {
+		if len(claims.Audience) == 0 {
+			return nil, errors.New("pop missing aud claim")
+		}
+		found := false
+		for _, aud := range claims.Audience {
+			if aud == s.cfg.WalletProvider.WIA.WalletProviderURI {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("pop aud %v does not match wallet provider URI", claims.Audience)
+		}
 	}
 
 	return jwkMap, nil
@@ -378,13 +394,17 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 			"jwk": cnfJWK,
 			"jkt": jkt,
 		},
-		"wallet_name":        s.cfg.WalletProvider.WIA.WalletName,
-		"wallet_version":     s.cfg.WalletProvider.WIA.WalletVersion,
 		"iat":                now.Unix(),
 		"exp":                now.Add(lifetime).Unix(),
 		"attestation_source": attestationSource,
 	}
 
+	if s.cfg.WalletProvider.WIA.WalletName != "" {
+		claims["wallet_name"] = s.cfg.WalletProvider.WIA.WalletName
+	}
+	if s.cfg.WalletProvider.WIA.WalletVersion != "" {
+		claims["wallet_version"] = s.cfg.WalletProvider.WIA.WalletVersion
+	}
 	if s.cfg.WalletProvider.WIA.WalletLink != "" {
 		claims["wallet_link"] = s.cfg.WalletProvider.WIA.WalletLink
 	}
@@ -438,9 +458,26 @@ func computeJKT(jwk map[string]interface{}) (string, error) {
 		return "", errors.New("incomplete EC JWK (missing crv, x, or y)")
 	}
 
-	// RFC 7638: lexicographic order of required members
-	thumbprintInput := fmt.Sprintf(`{"crv":"%s","kty":"EC","x":"%s","y":"%s"}`, crv, x, y)
-	hash := sha256.Sum256([]byte(thumbprintInput))
+	// RFC 7638: JSON with lexicographic order of required members.
+	// Using a struct with ordered fields ensures deterministic serialization.
+	thumbprintInput := struct {
+		Crv string `json:"crv"`
+		Kty string `json:"kty"`
+		X   string `json:"x"`
+		Y   string `json:"y"`
+	}{
+		Crv: crv,
+		Kty: kty,
+		X:   x,
+		Y:   y,
+	}
+
+	data, err := json.Marshal(thumbprintInput)
+	if err != nil {
+		return "", fmt.Errorf("marshal JKT input: %w", err)
+	}
+
+	hash := sha256.Sum256(data)
 	return base64.RawURLEncoding.EncodeToString(hash[:]), nil
 }
 
@@ -501,14 +538,11 @@ func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, erro
 }
 
 // ellipticCurveForName returns the elliptic curve for the given JWK crv name.
+// Only P-256 is supported (consistent with ES256-only PoP validation).
 func ellipticCurveForName(name string) elliptic.Curve {
 	switch name {
 	case "P-256":
 		return elliptic.P256()
-	case "P-384":
-		return elliptic.P384()
-	case "P-521":
-		return elliptic.P521()
 	default:
 		return nil
 	}
@@ -519,4 +553,31 @@ func (s *WIAService) CleanupExpiredChallenges() {
 	s.challenges.mu.Lock()
 	s.challenges.evictExpired()
 	s.challenges.mu.Unlock()
+}
+
+// Start begins the periodic challenge cleanup goroutine.
+func (s *WIAService) Start() {
+	s.stopCh = make(chan struct{})
+	go s.cleanupLoop()
+	s.logger.Info("WIA challenge cleanup worker started")
+}
+
+// Stop signals the cleanup goroutine to exit.
+func (s *WIAService) Stop() {
+	if s.stopCh != nil {
+		close(s.stopCh)
+	}
+}
+
+func (s *WIAService) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.CleanupExpiredChallenges()
+		case <-s.stopCh:
+			return
+		}
+	}
 }
