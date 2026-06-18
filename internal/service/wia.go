@@ -209,7 +209,7 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 
 	challengeCreatedTotal.Inc()
-	s.logger.Debug("WIA challenge created", zap.String("challenge", challenge[:8]+"..."))
+	s.logger.Debug("WIA challenge created")
 	return challenge, expiresAt, nil
 }
 

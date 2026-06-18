@@ -154,7 +154,9 @@ func TestLoadKeyMaterial_InvalidPEM(t *testing.T) {
 	_, certPath := generateTestKeyAndCert(t, dir)
 
 	keyPath := filepath.Join(dir, "invalid.pem")
-	os.WriteFile(keyPath, []byte("not a PEM block"), 0o600)
+	if err := os.WriteFile(keyPath, []byte("not a PEM block"), 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
 
 	cfg := &KeyConfig{
 		PrivateKeyPath:  keyPath,
