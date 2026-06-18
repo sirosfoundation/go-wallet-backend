@@ -190,7 +190,7 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// Create the JWT claims
 	now := time.Now()
 	kaExpiry := time.Duration(s.cfg.WalletProvider.Attestation.KAExpirySeconds) * time.Second
-	if kaExpiry == 0 {
+	if kaExpiry <= 0 {
 		kaExpiry = 15 * time.Second
 	}
 	claims := jwt.MapClaims{

@@ -184,7 +184,9 @@ func TestLoadKeyMaterial_WithCACert(t *testing.T) {
 	caDER, _ := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
 	caPath := filepath.Join(dir, "ca.pem")
 	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
-	os.WriteFile(caPath, caPEM, 0o644)
+	if err := os.WriteFile(caPath, caPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := &KeyConfig{
 		PrivateKeyPath:  keyPath,
@@ -219,7 +221,9 @@ func TestLoadKeyMaterial_PKCS11NotCompiled(t *testing.T) {
 func TestParsePEMCerts_NoCerts(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "empty.pem")
-	os.WriteFile(p, []byte(""), 0o644)
+	if err := os.WriteFile(p, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	certs, err := parsePEMCerts(p)
 	if err != nil {
@@ -238,7 +242,9 @@ func TestParsePEMCerts_SkipsNonCertBlocks(t *testing.T) {
 	data := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
 	p := filepath.Join(dir, "mixed.pem")
-	os.WriteFile(p, data, 0o644)
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	certs, err := parsePEMCerts(p)
 	if err != nil {

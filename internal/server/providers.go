@@ -39,6 +39,7 @@ type AuthProvider struct {
 // NewAuthProvider creates a new auth route provider
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
 	services := service.NewServices(store, cfg, logger)
+	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
 		cfg:      cfg,
@@ -55,6 +56,12 @@ func (p *AuthProvider) Name() string         { return "auth" }
 
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
+
+// Close stops background workers in the auth provider.
+func (p *AuthProvider) Close() error {
+	p.services.Stop()
+	return nil
+}
 
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
@@ -662,6 +669,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	if services.WalletProvider == nil || !services.WalletProvider.IsSupported() {
 		return nil, fmt.Errorf("wallet-provider signing keys not configured or not supported")
 	}
+	services.Start()
 
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
@@ -694,4 +702,7 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 func (p *WalletProviderProvider) Services() *service.Services { return p.services }
 
 // Close releases resources.
-func (p *WalletProviderProvider) Close() error { return p.store.Close() }
+func (p *WalletProviderProvider) Close() error {
+	p.services.Stop()
+	return p.store.Close()
+}
