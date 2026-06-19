@@ -1604,3 +1604,195 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
 }
+
+// ============================================================================
+// Token Expiry & Refresh Tests
+// ============================================================================
+
+func TestGenerateToken_UsesAccessExpiry(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			RPName:   testRPName,
+			RPID:     testRPID,
+			RPOrigin: testRPOrigin,
+		},
+		JWT: config.JWTConfig{
+			Secret:        testJWTSecret,
+			Issuer:        testJWTIssuer,
+			ExpiryMinutes: 15,
+		},
+	}
+
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test"}
+	tokenStr, err := svc.generateToken(user, domain.DefaultTenantID)
+	require.NoError(t, err)
+
+	// Parse token and verify expiry is ~15 minutes from now
+	parsed, err := parseTestToken(tokenStr, testJWTSecret)
+	require.NoError(t, err)
+
+	exp, ok := parsed["exp"].(float64)
+	require.True(t, ok)
+	iat, ok := parsed["iat"].(float64)
+	require.True(t, ok)
+
+	diffSeconds := exp - iat
+	// Should be 15 minutes = 900 seconds
+	assert.InDelta(t, 900, diffSeconds, 1, "Token expiry should be ~15 minutes")
+}
+
+func TestGenerateToken_FallsBackToExpiryHours(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			RPName:   testRPName,
+			RPID:     testRPID,
+			RPOrigin: testRPOrigin,
+		},
+		JWT: config.JWTConfig{
+			Secret:      testJWTSecret,
+			Issuer:      testJWTIssuer,
+			ExpiryHours: 24,
+		},
+	}
+
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test"}
+	tokenStr, err := svc.generateToken(user, domain.DefaultTenantID)
+	require.NoError(t, err)
+
+	parsed, err := parseTestToken(tokenStr, testJWTSecret)
+	require.NoError(t, err)
+
+	exp := parsed["exp"].(float64)
+	iat := parsed["iat"].(float64)
+	diffSeconds := exp - iat
+	// Should be 24 hours = 86400 seconds
+	assert.InDelta(t, 86400, diffSeconds, 1, "Token expiry should be ~24 hours")
+}
+
+func TestFinishLogin_ReturnsExpiresInAndRefreshToken(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Enable refresh tokens and set expiry
+	setup.service.cfg.JWT.RefreshDays = 7
+	setup.service.cfg.JWT.ExpiryMinutes = 15
+
+	// Register first
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "Test User"})
+	require.NoError(t, err)
+
+	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
+	require.NoError(t, err)
+
+	attestation := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, setup.credential, *attestationOptions)
+	regResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(attestation),
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, regResp.RefreshToken, "Registration should also return refresh token")
+	assert.Equal(t, int64(900), regResp.ExpiresIn, "Registration ExpiresIn should be 900 seconds")
+
+	// Set up authenticator with user handle for discoverable credential assertion
+	userID := domain.UserIDFromString(regResp.UUID)
+	setup.authenticator.Options.UserHandle = userID.AsUserHandle()
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Login
+	loginBegin, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(loginBegin.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertion := virtualwebauthn.CreateAssertionResponse(setup.rp, setup.authenticator, setup.credential, *assertionOptions)
+	loginResp, err := setup.service.FinishLogin(setup.ctx, &FinishLoginRequest{
+		ChallengeID: loginBegin.ChallengeID,
+		Credential:  json.RawMessage(assertion),
+	})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, loginResp.Token, "Should have access token")
+	assert.NotEmpty(t, loginResp.RefreshToken, "Should have refresh token")
+	assert.Equal(t, int64(900), loginResp.ExpiresIn, "ExpiresIn should be 900 seconds (15 min)")
+}
+
+func TestRefreshAccessToken_BlacklistsOldRefreshToken(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			RPName:   testRPName,
+			RPID:     testRPID,
+			RPOrigin: testRPOrigin,
+		},
+		JWT: config.JWTConfig{
+			Secret:        testJWTSecret,
+			Issuer:        testJWTIssuer,
+			ExpiryMinutes: 15,
+			RefreshDays:   7,
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{
+				Enabled:                true,
+				CleanupIntervalSeconds: 3600,
+			},
+		},
+	}
+
+	store := memory.NewStore()
+	logger := zap.NewNop()
+	svc, err := NewWebAuthnService(store, cfg, logger)
+	require.NoError(t, err)
+
+	bl := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	svc.SetTokenBlacklist(bl)
+
+	// Create a user
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test"}
+	require.NoError(t, store.Users().Create(context.Background(), user))
+
+	// Generate a refresh token
+	refreshTokenStr, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+	require.NoError(t, err)
+	require.NotEmpty(t, refreshTokenStr)
+
+	// First refresh should succeed
+	resp, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{
+		RefreshToken: refreshTokenStr,
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, resp.Token)
+	assert.NotEmpty(t, resp.RefreshToken)
+	assert.Equal(t, int64(900), resp.ExpiresIn)
+
+	// Second use of the same refresh token should fail (blacklisted)
+	_, err = svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{
+		RefreshToken: refreshTokenStr,
+	})
+	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "Reused refresh token should be rejected")
+}
+
+// parseTestToken is a helper to parse a JWT token and return its claims
+func parseTestToken(tokenStr, secret string) (map[string]interface{}, error) {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return nil, assert.AnError
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	var claims map[string]interface{}
+	err = json.Unmarshal(payload, &claims)
+	return claims, err
+}
