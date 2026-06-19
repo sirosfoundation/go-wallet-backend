@@ -70,7 +70,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 		},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
 		Certification: "none",
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", nil)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", nil, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "my-nonce", nil)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "my-nonce", nil, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestGenerateKeyAttestation_NotSupported(t *testing.T) {
 		// No signer or certChain — not supported
 	}
 
-	_, err := svc.GenerateKeyAttestation(context.Background(), nil, "nonce", nil)
+	_, err := svc.GenerateKeyAttestation(context.Background(), nil, "nonce", nil, "", "")
 	if err != ErrKeyAttestationNotSupported {
 		t.Errorf("expected ErrKeyAttestationNotSupported, got %v", err)
 	}
@@ -244,7 +244,7 @@ func TestGenerateKeyAttestation_KeyStorageStatus(t *testing.T) {
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil)
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}

@@ -33,12 +33,12 @@ var (
 	})
 
 	// WIA generation metrics
-	wiaGeneratedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	wiaGeneratedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "siros",
 		Subsystem: "wia",
 		Name:      "generated_total",
 		Help:      "Total number of WIA JWTs successfully generated.",
-	})
+	}, []string{"attestation_source"})
 	wiaGenerationErrors = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "siros",
 		Subsystem: "wia",
@@ -58,6 +58,22 @@ var (
 		Subsystem: "ka",
 		Name:      "generation_errors_total",
 		Help:      "Total number of Key Attestation generation failures.",
+	})
+
+	// Latency histograms
+	wiaGenerationDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "generation_duration_seconds",
+		Help:      "Duration of WIA JWT generation.",
+		Buckets:   prometheus.DefBuckets,
+	})
+	kaGenerationDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "siros",
+		Subsystem: "ka",
+		Name:      "generation_duration_seconds",
+		Help:      "Duration of KA JWT generation.",
+		Buckets:   prometheus.DefBuckets,
 	})
 
 	// Native attestation metrics

@@ -372,6 +372,7 @@ type PKCS11SigningConfig struct {
 	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
+	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN)
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
 	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
 }
@@ -424,6 +425,10 @@ type NativeAttestationConfig struct {
 type WIAConfig struct {
 	// Enabled controls whether WIA endpoints are registered
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// Issuer is the optional `iss` claim in WIA JWTs.
+	// Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain).
+	// Some national profiles require an explicit iss for interop.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
 	// WalletName is the wallet_name claim in WIA JWT
@@ -873,6 +878,14 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
+	// Load PKCS#11 PIN from file
+	if c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.PINPath != "" {
+		c.WalletProvider.PKCS11.PIN, err = readSecretFile(c.WalletProvider.PKCS11.PINPath)
+		if err != nil {
+			return fmt.Errorf("wallet_provider.pkcs11.pin_path: %w", err)
+		}
+	}
+
 	// Load MongoDB password from file and inject into URI
 	if c.Storage.MongoDB.PasswordPath != "" {
 		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
@@ -1072,6 +1085,14 @@ func (c *Config) Validate() error {
 
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required")
+	}
+
+	// Validate StatusListMode if set
+	switch c.WalletProvider.Attestation.StatusListMode {
+	case "", "always", "never", "auto":
+		// valid values
+	default:
+		return fmt.Errorf("invalid wallet_provider.attestation.status_list_mode: %q (must be always, never, or auto)", c.WalletProvider.Attestation.StatusListMode)
 	}
 
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins

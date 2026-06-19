@@ -5,13 +5,16 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
-	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -21,6 +24,17 @@ import (
 var (
 	ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
 )
+
+// statusIndexCounter is a process-scoped monotonic counter for status list indices.
+// Each attestation (WIA or KA) gets a unique index. In a multi-instance deployment,
+// each instance maintains its own counter range — uniqueness across instances must
+// be ensured by configuring non-overlapping StatusListIndexOffset values or by
+// using an external allocator behind the StatusListURL endpoint.
+var statusIndexCounter atomic.Uint64
+
+// MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
+// Prevents DoS via expensive JWT signing with excessively large arrays.
+const MaxJWKSPerRequest = 20
 
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
@@ -92,6 +106,14 @@ func (s *WalletProviderService) loadKeys() error {
 		return errors.New("failed to decode PEM block")
 	}
 
+	// Validate PEM block type before parsing
+	switch block.Type {
+	case "EC PRIVATE KEY", "PRIVATE KEY":
+		// accepted types
+	default:
+		return fmt.Errorf("unexpected PEM block type %q, expected EC PRIVATE KEY or PRIVATE KEY", block.Type)
+	}
+
 	key, err := x509.ParseECPrivateKey(block.Bytes)
 	if err != nil {
 		// Try PKCS8
@@ -113,38 +135,50 @@ func (s *WalletProviderService) loadKeys() error {
 	}
 	s.jwtSigner = jwtSigner
 
-	// Load certificate
-	certPEM, err := os.ReadFile(s.cfg.WalletProvider.CertificatePath)
+	// Load certificate chain using proper PEM parsing
+	s.certChain, err = parsePEMCertChain(s.cfg.WalletProvider.CertificatePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load certificate: %w", err)
 	}
-
-	// Extract the base64 content from the certificate
-	certStr := string(certPEM)
-	certStr = strings.ReplaceAll(certStr, "-----BEGIN CERTIFICATE-----", "")
-	certStr = strings.ReplaceAll(certStr, "-----END CERTIFICATE-----", "")
-	certStr = strings.ReplaceAll(certStr, "\n", "")
-	certStr = strings.TrimSpace(certStr)
-
-	s.certChain = []string{certStr}
 
 	// Optionally load CA cert for the chain
 	if s.cfg.WalletProvider.CACertPath != "" {
-		caPEM, err := os.ReadFile(s.cfg.WalletProvider.CACertPath)
-		if err == nil {
-			caStr := string(caPEM)
-			caStr = strings.ReplaceAll(caStr, "-----BEGIN CERTIFICATE-----", "")
-			caStr = strings.ReplaceAll(caStr, "-----END CERTIFICATE-----", "")
-			caStr = strings.ReplaceAll(caStr, "\n", "")
-			caStr = strings.TrimSpace(caStr)
-			if caStr != "" {
-				s.certChain = append(s.certChain, caStr)
-			}
+		caCerts, err := parsePEMCertChain(s.cfg.WalletProvider.CACertPath)
+		if err != nil {
+			s.logger.Warn("Failed to load CA certificate", zap.Error(err))
+		} else {
+			s.certChain = append(s.certChain, caCerts...)
 		}
 	}
 
 	s.logger.Info("Loaded wallet provider keys")
 	return nil
+}
+
+// parsePEMCertChain reads a PEM file and returns base64-encoded DER certificates
+// suitable for the x5c JWT header. Uses proper PEM parsing instead of string
+// manipulation.
+func parsePEMCertChain(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var chain []string
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			chain = append(chain, base64.StdEncoding.EncodeToString(block.Bytes))
+		}
+		data = rest
+	}
+	if len(chain) == 0 {
+		return nil, errors.New("no CERTIFICATE PEM blocks found")
+	}
+	return chain, nil
 }
 
 // IsSupported returns true if key attestation is supported
@@ -165,11 +199,15 @@ type SecurityProperties struct {
 	Certification interface{} `json:"certification"`
 }
 
-// GenerateKeyAttestation generates a key attestation JWT
-func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string, secProps *SecurityProperties) (string, error) {
+// GenerateKeyAttestation generates a key attestation JWT.
+// The walletInstanceID is the JWK Thumbprint from the WIA (binds KA to wallet instance).
+// The audience is the credential endpoint URL of the target issuer.
+func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks []map[string]interface{}, nonce string, secProps *SecurityProperties, walletInstanceID string, audience string) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrKeyAttestationNotSupported
 	}
+	start := time.Now()
+	defer func() { kaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
 	// Clone each JWK map to avoid mutating the caller's data.
 	attested := make([]map[string]interface{}, len(jwks))
@@ -189,10 +227,21 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	}
 	claims := jwt.MapClaims{
 		"iss":           s.cfg.Server.BaseURL,
+		"jti":           uuid.New().String(),
 		"attested_keys": attested,
 		"nonce":         nonce,
 		"iat":           now.Unix(),
 		"exp":           now.Add(kaExpiry).Unix(),
+	}
+
+	// Bind KA to the wallet instance (CS-04 §7.1.3)
+	if walletInstanceID != "" {
+		claims["sub"] = walletInstanceID
+	}
+
+	// Scope KA to the target issuer (prevents cross-issuer replay)
+	if audience != "" {
+		claims["aud"] = audience
 	}
 
 	// Security properties are top-level KA claims (Annex C §C.3.1)
@@ -210,11 +259,12 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 
 	// key_storage_status: KA revocation via Token Status List (CS-04 §7.1.3)
 	if s.cfg.WalletProvider.Attestation.StatusListMode == "always" && s.cfg.WalletProvider.Attestation.StatusListURL != "" {
+		idx := statusIndexCounter.Add(1)
 		ksStatus := map[string]interface{}{
 			"status": map[string]interface{}{
 				"status_list": map[string]interface{}{
 					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": 0, // TODO: assign from status list allocator
+					"idx": idx,
 				},
 			},
 		}
