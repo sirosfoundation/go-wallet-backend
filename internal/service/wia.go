@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -22,9 +23,10 @@ import (
 )
 
 var (
-	ErrWIANotSupported     = errors.New("WIA not supported: keys not configured")
-	ErrWIAChallengeExpired = errors.New("WIA challenge expired or invalid")
-	ErrWIAPopInvalid       = errors.New("WIA-PoP validation failed")
+	ErrWIANotSupported         = errors.New("WIA not supported: keys not configured")
+	ErrWIAChallengeExpired     = errors.New("WIA challenge expired or invalid")
+	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
+	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -141,9 +143,9 @@ type WIAService struct {
 	challenges *challengeStore
 
 	// stopCh signals the cleanup goroutine to exit.
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	started  bool
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	startOnce sync.Once
 }
 
 // NewWIAService creates a new WIA service.
@@ -199,7 +201,7 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 	if !s.challenges.put(c) {
 		challengeCapacityExceeded.Inc()
-		return "", time.Time{}, fmt.Errorf("challenge capacity exceeded")
+		return "", time.Time{}, ErrWIAChallengeCapacityMax
 	}
 
 	challengeCreatedTotal.Inc()
@@ -238,6 +240,8 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	if !s.IsSupported() {
 		return "", ErrWIANotSupported
 	}
+	start := time.Now()
+	defer func() { wiaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
 	// Step 1: Consume challenge (single-use, atomic).
 	// Must happen before PoP validation to prevent concurrent crypto amplification
@@ -392,6 +396,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 
 	claims := jwt.MapClaims{
 		"sub": jkt, // wallet instance identifier (JWK Thumbprint)
+		"jti": uuid.New().String(),
 		"cnf": map[string]interface{}{
 			"jwk": cnfJWK,
 			"jkt": jkt,
@@ -423,7 +428,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 			"status": map[string]interface{}{
 				"status_list": map[string]interface{}{
 					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": 0, // TODO: assign from status list allocator
+					"idx": statusIndexCounter.Add(1),
 				},
 			},
 		}
@@ -437,11 +442,15 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		// "auto" or unset: omit (same as "never" for now)
 	}
 
+	// Configurable iss claim. Default is omitted per TS03 §2.2.1 (identity
+	// derived from x5c chain), but some national profiles expect it.
+	if s.cfg.WalletProvider.WIA.Issuer != "" {
+		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
+	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
 	token.Header["x5c"] = s.certChain
-
-	// Per EC TS03 §2.2.1: no `iss` claim — identity derived from x5c chain
 
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
@@ -450,7 +459,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		return "", err
 	}
 
-	wiaGeneratedTotal.Inc()
+	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 	return tokenString, nil
 }
@@ -571,22 +580,17 @@ func (s *WIAService) CleanupExpiredChallenges() {
 // Start begins the periodic challenge cleanup goroutine.
 // Safe to call multiple times; only the first call starts the worker.
 func (s *WIAService) Start() {
-	if s.started {
-		return
-	}
-	s.started = true
-	s.stopCh = make(chan struct{})
-	s.stopOnce = sync.Once{}
-	go s.cleanupLoop()
-	s.logger.Info("WIA challenge cleanup worker started")
+	s.startOnce.Do(func() {
+		s.stopCh = make(chan struct{})
+		s.stopOnce = sync.Once{}
+		go s.cleanupLoop()
+		s.logger.Info("WIA challenge cleanup worker started")
+	})
 }
 
 // Stop signals the cleanup goroutine to exit.
 // Safe to call multiple times; only the first call closes the channel.
 func (s *WIAService) Stop() {
-	if !s.started {
-		return
-	}
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})

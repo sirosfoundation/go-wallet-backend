@@ -471,5 +471,10 @@ func validatePlayIntegrityVerdict(verdict *PlayIntegrityVerdict, expectedNonce s
 		return fmt.Errorf("device integrity not met: %v", verdict.DeviceIntegrity.DeviceRecognitionVerdict)
 	}
 
+	// Require app recognition — reject sideloaded/tampered apps
+	if verdict.AppIntegrity.AppRecognitionVerdict != "PLAY_RECOGNIZED" {
+		return fmt.Errorf("app not recognized by Play Store: %q", verdict.AppIntegrity.AppRecognitionVerdict)
+	}
+
 	return nil
 }

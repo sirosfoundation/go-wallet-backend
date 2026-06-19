@@ -23,6 +23,13 @@ func (h *Handlers) WIAChallenge(c *gin.Context) {
 
 	challenge, expiresAt, err := h.services.WIA.CreateChallenge(c.Request.Context())
 	if err != nil {
+		if errors.Is(err, service.ErrWIAChallengeCapacityMax) {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":   "RATE_LIMIT_EXCEEDED",
+				"message": "Too many pending challenges, please retry later",
+			})
+			return
+		}
 		h.logger.Error("Failed to create WIA challenge", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "CHALLENGE_CREATION_FAILED",
