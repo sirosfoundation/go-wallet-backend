@@ -1,6 +1,9 @@
 package service
 
 import (
+	"context"
+
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -42,7 +45,20 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// WIA shares the same signing key as the wallet provider
 	var wiaSvc *WIAService
 	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain)
+		var challengeStore WIAChallengeStore
+		// Use MongoDB-backed challenge store if the underlying storage is MongoDB.
+		type databaseProvider interface {
+			Database() *mongo.Database
+		}
+		if dbp, ok := store.(databaseProvider); ok {
+			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges)
+			if err != nil {
+				logger.Warn("Failed to create MongoDB WIA challenge store, falling back to memory", zap.Error(err))
+			} else {
+				challengeStore = cs
+			}
+		}
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), nil, challengeStore)
 	}
 
 	return &Services{

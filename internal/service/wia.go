@@ -18,6 +18,10 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -137,10 +141,11 @@ type WIAService struct {
 	jwtSigner    *signing.CryptoSignerES256
 	certChain    []string
 	nativeAttSvc *NativeAttestationService
+	instances    storage.WalletInstanceStore
+	audit        *audit.Emitter
 
-	// In-memory challenge store (single-use nonces).
-	// Production: replace with storage.Store for multi-instance.
-	challenges *challengeStore
+	// Challenge store for single-use nonces (memory or MongoDB).
+	challenges WIAChallengeStore
 
 	// stopCh signals the cleanup goroutine to exit.
 	stopCh    chan struct{}
@@ -150,13 +155,18 @@ type WIAService struct {
 
 // NewWIAService creates a new WIA service.
 // It shares the same signing key as the WalletProviderService (same x5c chain).
-func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string) *WIAService {
+func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
+	if challengeStore == nil {
+		challengeStore = newMemoryWIAChallengeStore(maxChallenges)
+	}
 	svc := &WIAService{
 		cfg:        cfg,
 		logger:     logger.Named("wia-service"),
 		jwtSigner:  jwtSigner,
 		certChain:  certChain,
-		challenges: newChallengeStore(maxChallenges),
+		instances:  instances,
+		audit:      auditor,
+		challenges: challengeStore,
 	}
 
 	// Wire native attestation if configured
@@ -195,11 +205,11 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 	expiresAt := time.Now().Add(ttl)
 
-	c := &WIAChallenge{
-		Challenge: challenge,
-		ExpiresAt: expiresAt,
+	ok, err := s.challenges.Put(ctx, challenge, expiresAt)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("store challenge: %w", err)
 	}
-	if !s.challenges.put(c) {
+	if !ok {
 		challengeCapacityExceeded.Inc()
 		return "", time.Time{}, ErrWIAChallengeCapacityMax
 	}
@@ -210,8 +220,12 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 }
 
 // consumeChallenge validates and removes a challenge (single-use).
-func (s *WIAService) consumeChallenge(challenge string) error {
-	if _, ok := s.challenges.consume(challenge); !ok {
+func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) error {
+	ok, err := s.challenges.Consume(ctx, challenge)
+	if err != nil {
+		return fmt.Errorf("consume challenge: %w", err)
+	}
+	if !ok {
 		challengeExpiredTotal.Inc()
 		return ErrWIAChallengeExpired
 	}
@@ -247,7 +261,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
 	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
-	if err := s.consumeChallenge(req.Challenge); err != nil {
+	if err := s.consumeChallenge(ctx, req.Challenge); err != nil {
 		return "", err
 	}
 
@@ -461,6 +475,32 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 
 	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
+
+	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
+	if s.instances != nil {
+		now := time.Now().UTC()
+		instance := &domain.WalletInstance{
+			ID:                jkt,
+			TenantID:          domain.DefaultTenantID,
+			Status:            domain.InstanceStatusActive,
+			WSCDType:          wscdTypeFromAttestation(attestationSource),
+			AttestationSource: attestationSource,
+			LastAttestedAt:    now,
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		}
+		if err := s.instances.Upsert(context.Background(), instance); err != nil {
+			s.logger.Warn("failed to record wallet instance", zap.Error(err), zap.String("jkt", jkt[:8]+"..."))
+		}
+	}
+
+	// Emit audit event
+	if s.audit != nil {
+		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, map[string]any{
+			"attestation_source": attestationSource,
+		})
+	}
+
 	return tokenString, nil
 }
 
@@ -570,11 +610,15 @@ func ellipticCurveForName(name string) elliptic.Curve {
 	}
 }
 
-// CleanupExpiredChallenges removes expired challenges from the in-memory store.
+// CleanupExpiredChallenges removes expired challenges from the store.
+// For MongoDB, this is a no-op (TTL indexes handle expiry).
+// For in-memory, this evicts expired entries.
 func (s *WIAService) CleanupExpiredChallenges() {
-	s.challenges.mu.Lock()
-	s.challenges.evictExpired()
-	s.challenges.mu.Unlock()
+	if m, ok := s.challenges.(*memoryWIAChallengeStore); ok {
+		m.store.mu.Lock()
+		m.store.evictExpired()
+		m.store.mu.Unlock()
+	}
 }
 
 // Start begins the periodic challenge cleanup goroutine.
@@ -606,5 +650,18 @@ func (s *WIAService) cleanupLoop() {
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// wscdTypeFromAttestation maps attestation source to WSCD type.
+func wscdTypeFromAttestation(source string) domain.WSCDType {
+	switch source {
+	case "ios_app_attest":
+		return domain.WSCDTypeNativeIOS
+	case "android_play_integrity":
+		return domain.WSCDTypeNativeAndroid
+	default:
+		// Backend-attested instances from web frontend use Web Crypto.
+		return domain.WSCDTypeWebCrypto
 	}
 }

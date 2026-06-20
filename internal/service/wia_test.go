@@ -56,7 +56,7 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64})
+	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil)
 
 	return svc, privKey
 }
@@ -272,10 +272,11 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
-	// Manually expire the challenge
-	svc.challenges.mu.Lock()
-	svc.challenges.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
-	svc.challenges.mu.Unlock()
+	// Manually expire the challenge (test-only: access in-memory store directly)
+	memStore := svc.challenges.(*memoryWIAChallengeStore)
+	memStore.store.mu.Lock()
+	memStore.store.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
+	memStore.store.mu.Unlock()
 
 	pop, _ := createTestPop(t, challenge)
 
@@ -371,19 +372,21 @@ func TestEllipticCurveForName(t *testing.T) {
 
 func TestChallengeStoreLen(t *testing.T) {
 	svc, _ := newTestWIAService(t)
+	ctx := context.Background()
 
-	if svc.challenges.len() != 0 {
-		t.Errorf("initial len = %d, want 0", svc.challenges.len())
+	n, _ := svc.challenges.Len(ctx)
+	if n != 0 {
+		t.Errorf("initial len = %d, want 0", n)
 	}
 
 	// Create a challenge
-	ctx := context.Background()
 	_, _, err := svc.CreateChallenge(ctx)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
-	if svc.challenges.len() != 1 {
-		t.Errorf("after create len = %d, want 1", svc.challenges.len())
+	n, _ = svc.challenges.Len(ctx)
+	if n != 1 {
+		t.Errorf("after create len = %d, want 1", n)
 	}
 }
 
@@ -398,8 +401,9 @@ func TestCleanupExpiredChallenges(t *testing.T) {
 	}
 
 	svc.CleanupExpiredChallenges()
-	if svc.challenges.len() != 1 {
-		t.Errorf("non-expired challenge removed; len = %d", svc.challenges.len())
+	n, _ := svc.challenges.Len(ctx)
+	if n != 1 {
+		t.Errorf("non-expired challenge removed; len = %d", n)
 	}
 }
 
@@ -511,13 +515,13 @@ func TestWIAGenerateDuplicateChallenge(t *testing.T) {
 	}
 
 	// First consume should succeed (via internal consume)
-	_, ok := svc.challenges.consume(challenge)
+	ok, _ := svc.challenges.Consume(ctx, challenge)
 	if !ok {
 		t.Fatal("first consume should succeed")
 	}
 
 	// Second consume should fail
-	_, ok = svc.challenges.consume(challenge)
+	ok, _ = svc.challenges.Consume(ctx, challenge)
 	if ok {
 		t.Fatal("expected failure on second consume")
 	}
@@ -1007,14 +1011,16 @@ func TestWIAService_StartStop(t *testing.T) {
 
 	// Create a challenge and manually expire it
 	challenge, _, _ := svc.CreateChallenge(context.Background())
-	svc.challenges.mu.Lock()
-	svc.challenges.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
-	svc.challenges.mu.Unlock()
+	memStore := svc.challenges.(*memoryWIAChallengeStore)
+	memStore.store.mu.Lock()
+	memStore.store.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
+	memStore.store.mu.Unlock()
 
 	// Manually trigger cleanup (the ticker will also do this, but we verify the method)
 	svc.CleanupExpiredChallenges()
-	if svc.challenges.len() != 0 {
-		t.Errorf("expired challenge should be cleaned up, len = %d", svc.challenges.len())
+	n, _ := svc.challenges.Len(context.Background())
+	if n != 0 {
+		t.Errorf("expired challenge should be cleaned up, len = %d", n)
 	}
 
 	// Stop should not panic

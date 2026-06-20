@@ -335,10 +335,11 @@ func (m *mockBackend) Credentials() storage.CredentialStore { return nil }
 func (m *mockBackend) Presentations() storage.PresentationStore {
 	return nil
 }
-func (m *mockBackend) Challenges() storage.ChallengeStore { return nil }
-func (m *mockBackend) Issuers() storage.IssuerStore       { return nil }
-func (m *mockBackend) Verifiers() storage.VerifierStore   { return nil }
-func (m *mockBackend) Invites() storage.InviteStore       { return nil }
+func (m *mockBackend) Challenges() storage.ChallengeStore           { return nil }
+func (m *mockBackend) Issuers() storage.IssuerStore                 { return nil }
+func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil }
+func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
+func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
