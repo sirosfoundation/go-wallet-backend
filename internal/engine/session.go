@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -39,6 +40,9 @@ const (
 	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
 	// and the connection is considered dead.
 	wsPongTimeout = 10 * time.Second
+
+	// maxConnections is the maximum concurrent WebSocket sessions allowed.
+	maxConnections = 10000
 )
 
 // Session represents an authenticated WebSocket session
@@ -106,10 +110,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make configurable for production
-				return true
-			},
+			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
 		sessions:       make(map[string]*Session),
 		userIndex:      make(map[string]*Session),
@@ -146,6 +147,15 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Enforce global session limit
+	m.sessionsMu.RLock()
+	count := len(m.sessions)
+	m.sessionsMu.RUnlock()
+	if count >= maxConnections {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
 	responseHeader := http.Header{}
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader.Set("X-Served-By", servedBy)

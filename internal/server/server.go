@@ -375,6 +375,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
+	router.Use(middleware.BodySizeLimitMiddleware(middleware.MaxBodySize))
 	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))
 	router.Use(middleware.Logger(m.logger, "/status", "/health", "/healthz", "/readyz"))
 	if m.cfg.ServedByHeader != "" {
@@ -439,7 +440,7 @@ func (m *Manager) startAdminServer() error {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
 		m.logger.Debug("Generated admin API token (development mode)",
-			zap.String("token", token))
+			zap.String("token_prefix", token[:8]+"..."))
 		m.logger.Warn("Auto-generated admin token — this is disabled in production")
 	}
 

@@ -17,9 +17,11 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // =============================================================================
@@ -328,6 +330,7 @@ type BackendProvider struct {
 	cfg              *config.Config
 	authzenHandler   *api.AuthZENProxyHandler
 	metadataResolver *issuermetadata.Resolver
+	auditor          *audit.Emitter
 	logger           *zap.Logger
 }
 
@@ -386,6 +389,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		cfg:              cfg,
 		authzenHandler:   authzenHandler,
 		metadataResolver: metadataResolver,
+		auditor:          newAuditEmitter(cfg, logger),
 		logger:           logger,
 	}, nil
 }
@@ -447,7 +451,7 @@ func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor, newR2PSClient(p.cfg))
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -458,8 +462,10 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store  backend.Backend
-	logger *zap.Logger
+	store   backend.Backend
+	auditor *audit.Emitter
+	cfg     *config.Config
+	logger  *zap.Logger
 }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -480,8 +486,10 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
 	return &AdminProvider{
-		store:  store,
-		logger: logger,
+		store:   store,
+		auditor: newAuditEmitter(cfg, logger),
+		cfg:     cfg,
+		logger:  logger,
 	}, nil
 }
 
@@ -511,7 +519,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor, newR2PSClient(p.cfg))
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -705,4 +713,28 @@ func (p *WalletProviderProvider) Services() *service.Services { return p.service
 func (p *WalletProviderProvider) Close() error {
 	p.services.Stop()
 	return p.store.Close()
+}
+
+// newAuditEmitter creates a SET audit emitter from config.
+// Returns nil if audit is not enabled (audit is then a no-op).
+func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
+	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
+		return nil
+	}
+	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
+	if err != nil {
+		logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
+		return nil
+	}
+	logger.Info("SET audit emitter initialized", zap.String("issuer", cfg.Audit.Issuer))
+	return emitter
+}
+
+// newR2PSClient creates an R2PS admin client from config.
+// Returns nil if R2PS admin is not configured.
+func newR2PSClient(cfg *config.Config) *r2ps.Client {
+	if cfg.R2PSAdmin.BaseURL == "" {
+		return nil
+	}
+	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL)
 }

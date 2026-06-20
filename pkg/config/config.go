@@ -29,6 +29,8 @@ type Config struct {
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
+	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+	R2PSAdmin      R2PSAdminConfig      `yaml:"r2ps_admin" envconfig:"R2PS_ADMIN"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -1086,6 +1088,9 @@ func (c *Config) Validate() error {
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required")
 	}
+	if len(c.JWT.Secret) < 32 {
+		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
+	}
 
 	// Validate StatusListMode if set
 	switch c.WalletProvider.Attestation.StatusListMode {
@@ -1159,4 +1164,22 @@ func (c *ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// AuditConfig configures the SET (Security Event Token) audit trail emitter.
+type AuditConfig struct {
+	// Enabled enables SET audit event emission.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org").
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	// KeyPath is the path to a PEM-encoded EC private key for signing SET records.
+	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
+	// KeyID is the kid used in SET JWS headers.
+	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
+}
+
+// R2PSAdminConfig configures the R2PS admin API client for WSCD/WSCA status queries.
+type R2PSAdminConfig struct {
+	// BaseURL is the R2PS admin endpoint (e.g. "http://r2ps-admin:8444").
+	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
 }
