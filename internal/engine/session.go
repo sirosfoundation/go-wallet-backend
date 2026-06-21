@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -89,10 +92,11 @@ type Manager struct {
 	flowHandlers map[Protocol]FlowHandlerFactory
 	handlersMu   sync.RWMutex
 
-	trustService   *TrustService
-	registryClient *RegistryClient
-	verifierStore  storage.VerifierStore
-	trustCache     *TrustCache
+	trustService    *TrustService
+	registryClient  *RegistryClient
+	verifierStore   storage.VerifierStore
+	credentialStore storage.CredentialStore
+	trustCache      *TrustCache
 
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
@@ -135,6 +139,11 @@ func (m *Manager) SessionStore() SessionStore {
 // SetVerifierStore sets the verifier store for trust caching
 func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 	m.verifierStore = store
+}
+
+// SetCredentialStore sets the credential store for notification lookups
+func (m *Manager) SetCredentialStore(store storage.CredentialStore) {
+	m.credentialStore = store
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -377,6 +386,14 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(matchMsg.FlowID, StepMatchCredentials, ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
 
+		case TypeCredentialNotification:
+			var notifMsg CredentialNotificationMessage
+			if err := json.Unmarshal(message, &notifMsg); err != nil {
+				session.logger.Warn("Invalid credential_notification", zap.Error(err))
+				continue
+			}
+			go m.handleCredentialNotification(session, &notifMsg)
+
 		default:
 			session.logger.Warn("Unknown message type", zap.String("type", string(msg.Type)))
 		}
@@ -466,6 +483,87 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 	logger.Info("Flow completed")
+}
+
+// handleCredentialNotification handles a credential_notification message from the frontend.
+// It looks up the credential's notification info and forwards the event to the issuer.
+func (m *Manager) handleCredentialNotification(session *Session, msg *CredentialNotificationMessage) {
+	logger := session.logger.With(
+		zap.String("credential_id", msg.CredentialIdentifier),
+		zap.String("event", msg.Event))
+
+	if msg.CredentialIdentifier == "" || msg.Event == "" {
+		logger.Warn("Invalid credential_notification: missing required fields")
+		return
+	}
+
+	// Validate event type
+	switch NotificationEvent(msg.Event) {
+	case NotificationEventAccepted, NotificationEventFailure, NotificationEventDeleted:
+		// valid
+	default:
+		logger.Warn("Invalid credential notification event", zap.String("event", msg.Event))
+		return
+	}
+
+	if m.credentialStore == nil {
+		logger.Warn("Credential store not configured, cannot send notification")
+		return
+	}
+
+	// Look up the credential to get notification_id and notification_endpoint
+	cred, err := m.credentialStore.GetByIdentifier(
+		context.Background(),
+		domain.TenantID(session.TenantID),
+		session.UserID,
+		msg.CredentialIdentifier,
+	)
+	if err != nil {
+		logger.Warn("Failed to look up credential for notification", zap.Error(err))
+		return
+	}
+
+	if cred.NotificationID == "" || cred.NotificationEndpoint == "" {
+		logger.Debug("Credential has no notification info, skipping")
+		return
+	}
+
+	// Send notification to the issuer
+	body := notificationRequest{
+		NotificationID:   cred.NotificationID,
+		Event:            msg.Event,
+		EventDescription: msg.EventDescription,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		logger.Warn("Failed to marshal notification request", zap.Error(err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cred.NotificationEndpoint, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		logger.Warn("Failed to create notification request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logger.Warn("Failed to send credential notification to issuer", zap.Error(err))
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		logger.Info("Credential notification sent to issuer")
+	} else {
+		logger.Warn("Credential notification returned non-success",
+			zap.Int("status", resp.StatusCode))
+	}
 }
 
 func (m *Manager) registerSession(session *Session) {

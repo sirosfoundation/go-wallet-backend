@@ -216,7 +216,12 @@ func main() {
 		if backendProvider != nil {
 			issuerLookup = backendProvider.Store().Issuers()
 		}
-		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, sharedResolver, issuerLookup)
+		// Share credential store for notification forwarding
+		var credStore storage.CredentialStore
+		if backendProvider != nil {
+			credStore = backendProvider.Store().Credentials()
+		}
+		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, credStore, sharedResolver, issuerLookup)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}

@@ -162,6 +162,8 @@ type IssuerMetadata struct {
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	// Notification endpoint for credential lifecycle events (OID4VCI §10)
+	NotificationEndpoint string `json:"notification_endpoint,omitempty"`
 	// Credential response encryption configuration
 	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
 	// Batch credential issuance configuration (OID4VCI §E.1)
@@ -719,12 +721,24 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		}
 
 		// Complete with the issued credential
-		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust, metadata)
+
+		// Send credential_accepted notification to issuer (best-effort, OID4VCI §10)
+		if deferredResp.NotificationID != "" {
+			h.sendNotification(ctx, metadata, token, deferredResp.NotificationID, NotificationEventAccepted, "")
+		}
+
 		return h.Complete(results, "")
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
-	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust, metadata)
+
+	// Send credential_accepted notification to issuer (best-effort, OID4VCI §10)
+	if credential.NotificationID != "" {
+		h.sendNotification(ctx, metadata, token, credential.NotificationID, NotificationEventAccepted, "")
+	}
+
 	return h.Complete(results, "")
 }
 
@@ -1917,7 +1931,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
 }
 
-func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
+func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata) []CredentialResult {
 	var results []CredentialResult
 
 	// Fetch VCTM for display metadata embedding
@@ -1943,10 +1957,12 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 			credStr = string(bytes)
 		}
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:               config.Format,
+			Credential:           credStr,
+			VCT:                  config.VCT,
+			TypeMetadata:         typeMetadata,
+			NotificationID:       resp.NotificationID,
+			NotificationEndpoint: metadata.NotificationEndpoint,
 		})
 	}
 
@@ -1968,12 +1984,86 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		}
 
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:               config.Format,
+			Credential:           credStr,
+			VCT:                  config.VCT,
+			TypeMetadata:         typeMetadata,
+			NotificationID:       resp.NotificationID,
+			NotificationEndpoint: metadata.NotificationEndpoint,
 		})
 	}
 
 	return results
+}
+
+// NotificationEvent represents an OID4VCI credential lifecycle event (OID4VCI §10.1).
+type NotificationEvent string
+
+const (
+	NotificationEventAccepted NotificationEvent = "credential_accepted"
+	NotificationEventFailure  NotificationEvent = "credential_failure"
+	NotificationEventDeleted  NotificationEvent = "credential_deleted"
+)
+
+// notificationRequest is the JSON body sent to the issuer's notification endpoint (OID4VCI §10.1).
+type notificationRequest struct {
+	NotificationID   string `json:"notification_id"`
+	Event            string `json:"event"`
+	EventDescription string `json:"event_description,omitempty"`
+}
+
+// sendNotification sends a credential lifecycle notification to the issuer (OID4VCI §10).
+// It is best-effort: errors are logged but do not fail the flow.
+func (h *OID4VCIHandler) sendNotification(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, notificationID string, event NotificationEvent, description string) {
+	if metadata.NotificationEndpoint == "" || notificationID == "" {
+		return
+	}
+
+	body := notificationRequest{
+		NotificationID:   notificationID,
+		Event:            string(event),
+		EventDescription: description,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		h.Logger.Warn("failed to marshal notification request", zap.Error(err))
+		return
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, metadata.NotificationEndpoint, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		h.Logger.Warn("failed to create notification request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	h.setAuthorizationHeader(req, token)
+	if dpopErr := h.setDPoPHeader(req, metadata.NotificationEndpoint, token.AccessToken); dpopErr != nil {
+		h.Logger.Warn("failed to set DPoP header for notification", zap.Error(dpopErr))
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.Logger.Warn("failed to send credential notification",
+			zap.String("notification_id", notificationID),
+			zap.String("event", string(event)),
+			zap.Error(err))
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	// Consume and discard body to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	h.updateDPoPNonce(resp)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.Logger.Warn("credential notification returned non-success status",
+			zap.String("notification_id", notificationID),
+			zap.String("event", string(event)),
+			zap.Int("status", resp.StatusCode))
+		return
+	}
+
+	h.Logger.Info("credential notification sent",
+		zap.String("notification_id", notificationID),
+		zap.String("event", string(event)))
 }

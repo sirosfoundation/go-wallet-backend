@@ -25,11 +25,12 @@ type MessageType string
 
 const (
 	// Client → Server
-	TypeHandshake     MessageType = "handshake"
-	TypeFlowStart     MessageType = "flow_start"
-	TypeFlowAction    MessageType = "flow_action"
-	TypeSignResponse  MessageType = "sign_response"
-	TypeMatchResponse MessageType = "match_response"
+	TypeHandshake              MessageType = "handshake"
+	TypeFlowStart              MessageType = "flow_start"
+	TypeFlowAction             MessageType = "flow_action"
+	TypeSignResponse           MessageType = "sign_response"
+	TypeMatchResponse          MessageType = "match_response"
+	TypeCredentialNotification MessageType = "credential_notification"
 
 	// Server → Client
 	TypeHandshakeComplete MessageType = "handshake_complete"
@@ -325,15 +326,28 @@ type ErrorMessage struct {
 
 // CredentialResult represents an issued credential
 type CredentialResult struct {
-	Format       string          `json:"format"`
-	Credential   string          `json:"credential"`
-	VCT          string          `json:"vct,omitempty"`
-	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
+	Format               string          `json:"format"`
+	Credential           string          `json:"credential"`
+	VCT                  string          `json:"vct,omitempty"`
+	TypeMetadata         json.RawMessage `json:"type_metadata,omitempty"`
+	NotificationID       string          `json:"notification_id,omitempty"`
+	NotificationEndpoint string          `json:"notification_endpoint,omitempty"`
 }
 
 // TrustInfo contains trust evaluation results.
 // Deprecated: Use trust.TrustInfo directly when writing new code.
 type TrustInfo = trust.TrustInfo
+
+// CredentialNotificationMessage is sent by the client to request a credential
+// lifecycle notification be sent to the issuer (OID4VCI §10).
+// Used for credential_deleted and credential_failure events; credential_accepted
+// is sent automatically by the backend after successful issuance.
+type CredentialNotificationMessage struct {
+	Message
+	CredentialIdentifier string `json:"credential_identifier"`
+	Event                string `json:"event"`
+	EventDescription     string `json:"event_description,omitempty"`
+}
 
 // VerifierInfo contains verifier metadata
 type VerifierInfo struct {

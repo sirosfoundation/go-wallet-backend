@@ -52,6 +52,8 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		CredentialIssuerIdentifier: req.CredentialIssuerIdentifier,
 		InstanceID:                 req.InstanceID,
 		SigCount:                   0,
+		NotificationID:             req.NotificationID,
+		NotificationEndpoint:       req.NotificationEndpoint,
 	}
 
 	if err := s.store.Credentials().Create(ctx, credential); err != nil {

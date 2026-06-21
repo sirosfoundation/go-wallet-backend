@@ -212,18 +212,24 @@ type EngineProvider struct {
 
 // NewEngineProvider creates a new WebSocket engine route provider.
 // If store is non-nil, the engine will cache verifier trust evaluations.
+// If credStore is non-nil, the engine can forward credential lifecycle notifications.
 // If sharedResolver is non-nil, it is used for issuer metadata resolution so
 // the TTL cache is shared with the HTTP /v1/resolve handler; otherwise a new
 // resolver is created from the config.
 // If issuerLookup is non-nil, the OID4VCI handler will enrich fetchMetadata results
 // with the registered-issuer record from backend storage (same data as /v1/resolve).
-func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore, sharedResolver *issuermetadata.Resolver, issuerLookup wsengine.CredentialIssuerLookup) (*EngineProvider, error) {
+func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore, credStore storage.CredentialStore, sharedResolver *issuermetadata.Resolver, issuerLookup wsengine.CredentialIssuerLookup) (*EngineProvider, error) {
 	// Create WebSocket manager
 	manager := wsengine.NewManager(cfg, logger)
 
 	// Wire verifier store for trust caching
 	if store != nil {
 		manager.SetVerifierStore(store)
+	}
+
+	// Wire credential store for notification lookups
+	if credStore != nil {
+		manager.SetCredentialStore(credStore)
 	}
 
 	// Configure session store based on config

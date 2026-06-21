@@ -27,6 +27,8 @@ type VerifiableCredential struct {
 	CredentialIssuerIdentifier string           `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"not null"`
 	InstanceID                 int              `json:"instanceId" bson:"instance_id" gorm:"default:0"`
 	SigCount                   int              `json:"sigCount" bson:"sig_count" gorm:"default:0"`
+	NotificationID             string           `json:"notificationId,omitempty" bson:"notification_id,omitempty" gorm:"default:''"`
+	NotificationEndpoint       string           `json:"notificationEndpoint,omitempty" bson:"notification_endpoint,omitempty" gorm:"default:''"`
 	CreatedAt                  time.Time        `json:"createdAt,omitempty" bson:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt                  time.Time        `json:"updatedAt,omitempty" bson:"updated_at" gorm:"autoUpdateTime"`
 }
@@ -45,6 +47,8 @@ type StoreCredentialRequest struct {
 	CredentialConfigurationID  string           `json:"credentialConfigurationId"`
 	CredentialIssuerIdentifier string           `json:"credentialIssuerIdentifier"`
 	InstanceID                 int              `json:"instanceId"`
+	NotificationID             string           `json:"notificationId,omitempty"`
+	NotificationEndpoint       string           `json:"notificationEndpoint,omitempty"`
 }
 
 // UpdateCredentialRequest represents a request to update a credential
