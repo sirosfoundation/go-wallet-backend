@@ -140,7 +140,8 @@ func TestHandleCredentialNotification_Success(t *testing.T) {
 
 	logger := zap.NewNop()
 	cfg := &config.Config{
-		JWT: config.JWTConfig{Secret: "test-secret"},
+		JWT:        config.JWTConfig{Secret: "test-secret"},
+		HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true},
 	}
 	m := NewManager(cfg, logger)
 
@@ -203,6 +204,28 @@ func TestHandleCredentialNotification_InvalidEvent(t *testing.T) {
 	}
 
 	// Should not panic
+	m.handleCredentialNotification(session, msg)
+}
+
+func TestHandleCredentialNotification_RejectsAccepted(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret"},
+	}
+	m := NewManager(cfg, logger)
+
+	session := &Session{
+		UserID:   "user-123",
+		TenantID: "default",
+		logger:   logger,
+	}
+
+	msg := &CredentialNotificationMessage{
+		CredentialIdentifier: "cred-abc",
+		Event:                "credential_accepted",
+	}
+
+	// Should not panic — credential_accepted is rejected from frontend
 	m.handleCredentialNotification(session, msg)
 }
 

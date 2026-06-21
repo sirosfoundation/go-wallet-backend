@@ -96,6 +96,7 @@ type Manager struct {
 	registryClient  *RegistryClient
 	verifierStore   storage.VerifierStore
 	credentialStore storage.CredentialStore
+	httpClient      *http.Client // configured HTTP client with SSRF protections
 	trustCache      *TrustCache
 
 	// Persistent session store (optional, for horizontal scaling)
@@ -120,6 +121,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		flowHandlers:   make(map[Protocol]FlowHandlerFactory),
 		trustService:   NewTrustService(cfg, logger),
 		registryClient: NewRegistryClient(cfg, logger),
+		httpClient:     cfg.HTTPClient.NewHTTPClient(0),
 		trustCache:     NewTrustCache(1 * time.Hour),
 		sessionStore:   NewMemorySessionStore(logger), // Default to memory
 	}
@@ -392,7 +394,8 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid credential_notification", zap.Error(err))
 				continue
 			}
-			go m.handleCredentialNotification(session, &notifMsg)
+			// Handle synchronously to provide natural backpressure (one at a time per session)
+			m.handleCredentialNotification(session, &notifMsg)
 
 		default:
 			session.logger.Warn("Unknown message type", zap.String("type", string(msg.Type)))
@@ -497,10 +500,14 @@ func (m *Manager) handleCredentialNotification(session *Session, msg *Credential
 		return
 	}
 
-	// Validate event type
+	// Validate event type — credential_accepted is only sent by the backend
+	// after issuance, never by the frontend (prevents spoofed acceptance notifications).
 	switch NotificationEvent(msg.Event) {
-	case NotificationEventAccepted, NotificationEventFailure, NotificationEventDeleted:
-		// valid
+	case NotificationEventFailure, NotificationEventDeleted:
+		// valid for frontend-initiated notifications
+	case NotificationEventAccepted:
+		logger.Warn("credential_accepted cannot be sent by the frontend")
+		return
 	default:
 		logger.Warn("Invalid credential notification event", zap.String("event", msg.Event))
 		return
@@ -550,7 +557,9 @@ func (m *Manager) handleCredentialNotification(session *Session, msg *Credential
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use the configured HTTP client which includes SSRF protections
+	// (blocks private/loopback IPs when configured)
+	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		logger.Warn("Failed to send credential notification to issuer", zap.Error(err))
 		return

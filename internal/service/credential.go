@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"net/url"
 
 	"go.uber.org/zap"
 
@@ -42,6 +43,17 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		return nil, errors.New("format is required")
 	}
 
+	// Validate notification_endpoint if provided — must be HTTPS to prevent SSRF
+	notificationEndpoint := req.NotificationEndpoint
+	if notificationEndpoint != "" {
+		u, err := url.Parse(notificationEndpoint)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			s.logger.Warn("Ignoring invalid notification_endpoint",
+				zap.String("endpoint", notificationEndpoint))
+			notificationEndpoint = ""
+		}
+	}
+
 	credential := &domain.VerifiableCredential{
 		TenantID:                   tenantID,
 		HolderDID:                  req.HolderDID,
@@ -53,7 +65,7 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		InstanceID:                 req.InstanceID,
 		SigCount:                   0,
 		NotificationID:             req.NotificationID,
-		NotificationEndpoint:       req.NotificationEndpoint,
+		NotificationEndpoint:       notificationEndpoint,
 	}
 
 	if err := s.store.Credentials().Create(ctx, credential); err != nil {
