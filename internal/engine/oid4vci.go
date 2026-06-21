@@ -159,6 +159,7 @@ type IssuerMetadata struct {
 	CredentialEndpoint                string                      `json:"credential_endpoint"`
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
 	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
+	NotificationEndpoint              string                      `json:"notification_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
@@ -720,12 +721,38 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		h.registerNotificationContext(metadata, token, deferredResp)
 		return h.Complete(results, "")
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	h.registerNotificationContext(metadata, token, credential)
 	return h.Complete(results, "")
+}
+
+// registerNotificationContext captures the ephemeral state needed to forward an
+// OID4VCI §10 notification for this credential, keyed by flow ID. It is a no-op
+// unless the issuer advertised a notification endpoint and returned a
+// notification_id. The stored context is short-lived, in-memory, and one-shot;
+// no credential data is retained.
+func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
+	if metadata == nil || token == nil || resp == nil {
+		return
+	}
+	if metadata.NotificationEndpoint == "" || resp.NotificationID == "" {
+		return
+	}
+	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
+		return
+	}
+	h.Flow.Session.notifications.put(h.Flow.ID, &notificationContext{
+		endpoint:    metadata.NotificationEndpoint,
+		accessToken: token.AccessToken,
+		tokenType:   token.TokenType,
+		dpopKey:     h.dpopKey,
+		dpopNonce:   h.dpopNonce,
+	})
 }
 
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
@@ -1943,10 +1970,11 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 			credStr = string(bytes)
 		}
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:         config.Format,
+			Credential:     credStr,
+			VCT:            config.VCT,
+			TypeMetadata:   typeMetadata,
+			NotificationID: resp.NotificationID,
 		})
 	}
 
@@ -1968,10 +1996,11 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		}
 
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:         config.Format,
+			Credential:     credStr,
+			VCT:            config.VCT,
+			TypeMetadata:   typeMetadata,
+			NotificationID: resp.NotificationID,
 		})
 	}
 
