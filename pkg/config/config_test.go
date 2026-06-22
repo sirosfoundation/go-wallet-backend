@@ -17,7 +17,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -46,7 +46,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -66,7 +66,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -85,7 +85,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -104,7 +104,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -186,7 +186,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -207,7 +207,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -243,7 +243,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -264,7 +264,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -330,7 +330,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -344,8 +344,8 @@ jwt:
 	if cfg.Server.Port != 8080 {
 		t.Errorf("Expected port 8080, got %d", cfg.Server.Port)
 	}
-	if cfg.JWT.Secret != "test-secret" {
-		t.Errorf("Expected JWT secret 'test-secret', got %q", cfg.JWT.Secret)
+	if cfg.JWT.Secret != "test-secret-that-is-at-least-32-bytes-long" {
+		t.Errorf("Expected JWT secret 'test-secret-that-is-at-least-32-bytes-long', got %q", cfg.JWT.Secret)
 	}
 }
 
@@ -381,7 +381,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -416,7 +416,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
   expiry_hours: 48
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
@@ -714,7 +714,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -742,7 +742,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -761,7 +761,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 		}
 	}
 
@@ -822,7 +822,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
@@ -860,7 +860,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
