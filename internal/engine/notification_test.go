@@ -68,6 +68,33 @@ func TestNotificationContextStore_Put_PrunesExpired(t *testing.T) {
 	assert.False(t, oldExists, "expired entry should be pruned")
 }
 
+func TestNotificationContextStore_HasValid(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("flow-1", &notificationContext{
+		endpoint:       "https://issuer.example.com/notify",
+		notificationID: "notif-1",
+	})
+
+	// Matching id on a live context.
+	assert.True(t, s.hasValid("flow-1", "notif-1"))
+	// Wrong id must not validate.
+	assert.False(t, s.hasValid("flow-1", "other"))
+	// Unknown flow must not validate.
+	assert.False(t, s.hasValid("nope", "notif-1"))
+	// hasValid must not consume the context.
+	assert.NotNil(t, s.take("flow-1"))
+}
+
+func TestNotificationContextStore_HasValid_Expired(t *testing.T) {
+	s := newNotificationContextStore()
+	s.ctx["flow-1"] = &notificationContext{
+		endpoint:       "https://issuer.example.com/notify",
+		notificationID: "notif-1",
+		expiresAt:      time.Now().Add(-time.Minute),
+	}
+	assert.False(t, s.hasValid("flow-1", "notif-1"))
+}
+
 // ===== isValidNotificationEvent tests =====
 
 func TestIsValidNotificationEvent(t *testing.T) {
@@ -193,13 +220,14 @@ func TestSendNotification_ErrorStatus(t *testing.T) {
 	require.Error(t, err)
 }
 
-// ===== handleCredentialNotification tests =====
+// ===== dispatchCredentialNotification tests =====
 
 // notifTestManager builds a Manager whose HTTP client targets the given issuer.
 func notifTestManager() *Manager {
 	return &Manager{
-		cfg:    testConfig(),
-		logger: zap.NewNop(),
+		cfg:             testConfig(),
+		logger:          zap.NewNop(),
+		notificationSem: make(chan struct{}, maxConcurrentNotifications),
 	}
 }
 
@@ -232,13 +260,14 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 
 	session := notifTestSession(conn)
 	session.notifications.put("flow-9", &notificationContext{
-		endpoint:    issuer.URL,
-		accessToken: "tok",
-		tokenType:   "Bearer",
+		endpoint:       issuer.URL,
+		accessToken:    "tok",
+		tokenType:      "Bearer",
+		notificationID: "notif-9",
 	})
 
 	m := notifTestManager()
-	m.handleCredentialNotification(session, &CredentialNotificationMessage{
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
 		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-9"},
 		NotificationID: "notif-9",
 		Event:          notificationEventAccepted,
@@ -269,10 +298,10 @@ func TestHandleCredentialNotification_RejectsUnsupportedEvent(t *testing.T) {
 
 	session := notifTestSession(conn)
 	// Even with a valid context present, credential_deleted must be rejected.
-	session.notifications.put("flow-1", &notificationContext{endpoint: "https://issuer.example.com/notify"})
+	session.notifications.put("flow-1", &notificationContext{endpoint: "https://issuer.example.com/notify", notificationID: "notif-1"})
 
 	m := notifTestManager()
-	m.handleCredentialNotification(session, &CredentialNotificationMessage{
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
 		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
 		NotificationID: "notif-1",
 		Event:          "credential_deleted",
@@ -299,7 +328,7 @@ func TestHandleCredentialNotification_RejectsMissingNotificationID(t *testing.T)
 
 	session := notifTestSession(conn)
 	m := notifTestManager()
-	m.handleCredentialNotification(session, &CredentialNotificationMessage{
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
 		Message: Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
 		Event:   notificationEventAccepted,
 	})
@@ -325,7 +354,7 @@ func TestHandleCredentialNotification_RejectsMissingContext(t *testing.T) {
 
 	session := notifTestSession(conn)
 	m := notifTestManager()
-	m.handleCredentialNotification(session, &CredentialNotificationMessage{
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
 		Message:        Message{Type: TypeCredentialNotification, FlowID: "unknown-flow"},
 		NotificationID: "notif-1",
 		Event:          notificationEventAccepted,
@@ -335,6 +364,90 @@ func TestHandleCredentialNotification_RejectsMissingContext(t *testing.T) {
 	require.NoError(t, conn.ReadJSON(&ack))
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "notification context unavailable")
+}
+
+func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
+	var issuerCalls int32
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&issuerCalls, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer issuer.Close()
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var ack map[string]interface{}
+		_ = json.Unmarshal(data, &ack)
+		_ = srvConn.WriteJSON(ack)
+	})
+	defer cleanup()
+
+	session := notifTestSession(conn)
+	session.notifications.put("flow-7", &notificationContext{
+		endpoint:       issuer.URL,
+		accessToken:    "tok",
+		tokenType:      "Bearer",
+		notificationID: "issued-id",
+	})
+
+	m := notifTestManager()
+	// Client supplies a notification_id that does not match the issued one.
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
+		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-7"},
+		NotificationID: "attacker-id",
+		Event:          notificationEventAccepted,
+	})
+
+	var ack NotificationAckMessage
+	require.NoError(t, conn.ReadJSON(&ack))
+	assert.Equal(t, "rejected", ack.Status)
+	assert.Contains(t, ack.Error, "notification context unavailable")
+	// No request must reach the issuer, and the context must remain (not consumed).
+	assert.Equal(t, int32(0), atomic.LoadInt32(&issuerCalls))
+	assert.NotNil(t, session.notifications.take("flow-7"))
+}
+
+func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var ack map[string]interface{}
+		_ = json.Unmarshal(data, &ack)
+		_ = srvConn.WriteJSON(ack)
+	})
+	defer cleanup()
+
+	session := notifTestSession(conn)
+	session.notifications.put("flow-cap", &notificationContext{
+		endpoint:       "https://issuer.example.com/notify",
+		notificationID: "notif-cap",
+	})
+
+	m := notifTestManager()
+	// Saturate the semaphore so no worker slot is available.
+	for i := 0; i < cap(m.notificationSem); i++ {
+		m.notificationSem <- struct{}{}
+	}
+
+	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
+		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-cap"},
+		NotificationID: "notif-cap",
+		Event:          notificationEventAccepted,
+	})
+
+	var ack NotificationAckMessage
+	require.NoError(t, conn.ReadJSON(&ack))
+	assert.Equal(t, "rejected", ack.Status)
+	assert.Contains(t, ack.Error, "server busy")
+	// Context must remain since the request never entered the forwarding path.
+	assert.NotNil(t, session.notifications.take("flow-cap"))
 }
 
 // ===== message serialization tests =====
@@ -373,4 +486,63 @@ func TestCredentialResult_OmitsEmptyNotificationID(t *testing.T) {
 	data, err := json.Marshal(r)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "notification_id")
+}
+
+// ===== credentialToString tests =====
+
+func TestCredentialToString(t *testing.T) {
+	// Raw string credential is returned verbatim.
+	assert.Equal(t, "eyJ.raw", credentialToString("eyJ.raw"))
+
+	// Wrapped object with inner "credential" string.
+	assert.Equal(t, "eyJ.inner", credentialToString(map[string]interface{}{
+		"credential": "eyJ.inner",
+	}))
+
+	// Wrapped object without a string "credential" falls back to JSON.
+	got := credentialToString(map[string]interface{}{"foo": "bar"})
+	assert.JSONEq(t, `{"foo":"bar"}`, got)
+
+	// Non-string, non-map value is JSON-serialized.
+	assert.Equal(t, "42", credentialToString(42))
+}
+
+// ===== buildCredentialResults tests =====
+
+func TestBuildCredentialResults_SingleAndBatch(t *testing.T) {
+	h := &OID4VCIHandler{}
+	cfg := &CredentialConfig{Format: "dc+sd-jwt"} // empty VCT skips registry
+
+	// Single credential with a top-level notification_id (per OID4VCI §8.3 the
+	// id covers the whole response).
+	single := h.buildCredentialResults(context.Background(), &CredentialResponse{
+		Credential:     "eyJ.single",
+		NotificationID: "notif-single",
+	}, cfg, nil)
+	require.Len(t, single, 1)
+	assert.Equal(t, "eyJ.single", single[0].Credential)
+	assert.Equal(t, "dc+sd-jwt", single[0].Format)
+	assert.Equal(t, "notif-single", single[0].NotificationID)
+
+	// Batch response: the single notification_id applies to every credential.
+	batch := h.buildCredentialResults(context.Background(), &CredentialResponse{
+		Credentials:    []interface{}{"eyJ.a", map[string]interface{}{"credential": "eyJ.b"}},
+		NotificationID: "notif-batch",
+	}, cfg, nil)
+	require.Len(t, batch, 2)
+	assert.Equal(t, "eyJ.a", batch[0].Credential)
+	assert.Equal(t, "eyJ.b", batch[1].Credential)
+	assert.Equal(t, "notif-batch", batch[0].NotificationID)
+	assert.Equal(t, "notif-batch", batch[1].NotificationID)
+}
+
+func TestBuildCredentialResults_OmitsNotificationIDWhenAbsent(t *testing.T) {
+	h := &OID4VCIHandler{}
+	cfg := &CredentialConfig{Format: "dc+sd-jwt"}
+
+	results := h.buildCredentialResults(context.Background(), &CredentialResponse{
+		Credential: "eyJ.x",
+	}, cfg, nil)
+	require.Len(t, results, 1)
+	assert.Empty(t, results[0].NotificationID)
 }

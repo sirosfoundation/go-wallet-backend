@@ -22,6 +22,12 @@ import (
 // issuance access token is still valid. The context is never persisted.
 const notificationContextTTL = 5 * time.Minute
 
+// maxConcurrentNotifications bounds how many credential notifications may be
+// forwarded to issuers concurrently across all sessions. It provides
+// backpressure so a client cannot spawn an unbounded number of outbound HTTP
+// requests by flooding credential_notification messages.
+const maxConcurrentNotifications = 32
+
 // Valid OID4VCI §10 notification events that the client may report to the
 // backend for forwarding. credential_deleted is intentionally unsupported:
 // it occurs long after issuance, when the access token has expired and the
@@ -42,7 +48,12 @@ type notificationContext struct {
 	tokenType   string
 	dpopKey     *ecdsa.PrivateKey
 	dpopNonce   string
-	expiresAt   time.Time
+	// notificationID is the value the issuer returned for this Credential
+	// Response. Per OID4VCI §8.3/§11 there is exactly one notification_id per
+	// response (covering one or more credentials), so the client-supplied ID
+	// is validated against this value before any notification is forwarded.
+	notificationID string
+	expiresAt      time.Time
 }
 
 // notificationContextStore is an in-memory, TTL-bounded registry of
@@ -83,6 +94,22 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 		return nil
 	}
 	return nc
+}
+
+// hasValid reports whether a non-expired notification context exists for the
+// given flow ID whose stored notification_id matches the supplied value. It
+// does not consume the context. An empty stored notificationID matches any
+// supplied value (issuer returned a notification endpoint but no id), which is
+// effectively unreachable because put requires a non-empty endpoint and the
+// caller only registers a context when an id was present.
+func (s *notificationContextStore) hasValid(flowID, notificationID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nc, ok := s.ctx[flowID]
+	if !ok || time.Now().After(nc.expiresAt) {
+		return false
+	}
+	return nc.notificationID == "" || nc.notificationID == notificationID
 }
 
 // pruneLocked removes expired entries. Caller must hold s.mu.
