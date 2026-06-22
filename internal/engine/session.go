@@ -62,6 +62,12 @@ type Session struct {
 	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
 
+	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
+	// contexts keyed by flow ID. It lets the backend forward a client-reported
+	// credential lifecycle event to the issuer using the issuance access token,
+	// without persisting anything.
+	notifications *notificationContextStore
+
 	// stopPing signals the ping goroutine to exit.
 	stopPing chan struct{}
 }
@@ -98,6 +104,11 @@ type Manager struct {
 	verifierStore  storage.VerifierStore
 	trustCache     *TrustCache
 
+	// notificationSem bounds the number of concurrent OID4VCI §10 notification
+	// forwards across all sessions, providing backpressure against a client
+	// flooding credential_notification messages.
+	notificationSem chan struct{}
+
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
 }
@@ -112,13 +123,14 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 			WriteBufferSize: 4096,
 			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
-		sessions:       make(map[string]*Session),
-		userIndex:      make(map[string]*Session),
-		flowHandlers:   make(map[Protocol]FlowHandlerFactory),
-		trustService:   NewTrustService(cfg, logger),
-		registryClient: NewRegistryClient(cfg, logger),
-		trustCache:     NewTrustCache(1 * time.Hour),
-		sessionStore:   NewMemorySessionStore(logger), // Default to memory
+		sessions:        make(map[string]*Session),
+		userIndex:       make(map[string]*Session),
+		flowHandlers:    make(map[Protocol]FlowHandlerFactory),
+		trustService:    NewTrustService(cfg, logger),
+		registryClient:  NewRegistryClient(cfg, logger),
+		trustCache:      NewTrustCache(1 * time.Hour),
+		notificationSem: make(chan struct{}, maxConcurrentNotifications),
+		sessionStore:    NewMemorySessionStore(logger), // Default to memory
 	}
 	return m
 }
@@ -227,17 +239,18 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 
 	// Create session
 	session := &Session{
-		ID:       uuid.New().String(),
-		UserID:   userID,
-		TenantID: tenantID,
-		conn:     conn,
-		flows:    make(map[string]*Flow),
-		logger:   m.logger.With(zap.String("session", userID[:8])),
-		actionCh: make(chan *FlowActionMessage, 50),
-		signCh:   make(chan *SignResponseMessage, 20),
-		matchCh:  make(chan *MatchResponseMessage, 20),
-		closeCh:  make(chan struct{}, 1), // Buffered to prevent deadlock
-		stopPing: make(chan struct{}),
+		ID:            uuid.New().String(),
+		UserID:        userID,
+		TenantID:      tenantID,
+		conn:          conn,
+		flows:         make(map[string]*Flow),
+		logger:        m.logger.With(zap.String("session", userID[:8])),
+		actionCh:      make(chan *FlowActionMessage, 50),
+		signCh:        make(chan *SignResponseMessage, 20),
+		matchCh:       make(chan *MatchResponseMessage, 20),
+		closeCh:       make(chan struct{}, 1), // Buffered to prevent deadlock
+		stopPing:      make(chan struct{}),
+		notifications: newNotificationContextStore(),
 	}
 
 	// Register session
@@ -386,6 +399,18 @@ func (m *Manager) handleSession(session *Session) {
 					zap.String("message_id", matchMsg.MessageID))
 				_ = session.SendFlowError(matchMsg.FlowID, StepMatchCredentials, ErrCodeTooManyRequests, "Server overloaded, please retry")
 			}
+
+		case TypeCredentialNotification:
+			var notifMsg CredentialNotificationMessage
+			if err := json.Unmarshal(message, &notifMsg); err != nil {
+				session.logger.Warn("Invalid credential_notification", zap.Error(err))
+				continue
+			}
+			// Validate synchronously so malformed/unsupported requests are
+			// rejected inline and never enter the bounded async forwarding
+			// path. Only well-formed requests with a live notification context
+			// spawn a goroutine (capped by m.notificationSem).
+			m.dispatchCredentialNotification(session, &notifMsg)
 
 		default:
 			session.logger.Warn("Unknown message type", zap.String("type", string(msg.Type)))
@@ -718,6 +743,115 @@ func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, me
 		},
 	}
 	return s.Send(&msg)
+}
+
+// SendNotificationAck sends an acknowledgement for a credential_notification.
+func (s *Session) SendNotificationAck(flowID, notificationID, status, errMsg string) error {
+	msg := NotificationAckMessage{
+		Message: Message{
+			Type:      TypeNotificationAck,
+			FlowID:    flowID,
+			Timestamp: Now(),
+		},
+		NotificationID: notificationID,
+		Status:         status,
+		Error:          errMsg,
+	}
+	return s.Send(&msg)
+}
+
+// dispatchCredentialNotification validates a client-reported OID4VCI §10
+// credential lifecycle event synchronously, then forwards it to the issuer on a
+// bounded background worker. Validation (missing notification_id, unsupported
+// event, absent/expired context, or a notification_id that does not match the
+// one issued for the flow) is performed inline so that malformed or
+// unauthorized requests are rejected immediately and never consume a worker
+// slot. Only well-formed, authorized requests enter the async forwarding path,
+// which is capped by m.notificationSem to provide backpressure.
+//
+// The notification_id is validated against the value the issuer returned at
+// issuance (OID4VCI §8.3/§11 define exactly one notification_id per Credential
+// Response). This prevents a client from using the still-valid issuance token
+// to post an arbitrary notification_id to the issuer.
+func (m *Manager) dispatchCredentialNotification(session *Session, msg *CredentialNotificationMessage) {
+	logger := session.logger.With(zap.String("flow_id", msg.FlowID), zap.String("event", msg.Event))
+
+	if msg.NotificationID == "" {
+		_ = session.SendNotificationAck(msg.FlowID, "", "rejected", "missing notification_id")
+		return
+	}
+	if !isValidNotificationEvent(msg.Event) {
+		// credential_deleted and any other event are not forwardable.
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "unsupported event")
+		return
+	}
+	// Reject (without consuming) when there is no live context for the flow or
+	// the supplied notification_id does not match the issued one. This keeps
+	// invalid requests out of the bounded async path.
+	if !session.notifications.hasValid(msg.FlowID, msg.NotificationID) {
+		logger.Debug("no matching notification context for flow (absent, expired, or id mismatch)")
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "notification context unavailable")
+		return
+	}
+
+	// Acquire a worker slot without blocking the session read loop. If the
+	// backend is already forwarding the maximum number of notifications, shed
+	// load by rejecting; the client may retry (§10 notifications are idempotent
+	// and best-effort).
+	select {
+	case m.notificationSem <- struct{}{}:
+	default:
+		logger.Warn("notification forwarding at capacity, rejecting")
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "server busy, please retry")
+		return
+	}
+
+	go func() {
+		defer func() { <-m.notificationSem }()
+		m.forwardCredentialNotification(session, msg, logger)
+	}()
+}
+
+// forwardCredentialNotification consumes the ephemeral issuance context and
+// performs the authenticated POST to the issuer's notification endpoint. It is
+// invoked only after dispatchCredentialNotification has validated the request.
+// No credential data is stored or looked up; the backend remains zero-knowledge
+// about credential contents.
+func (m *Manager) forwardCredentialNotification(session *Session, msg *CredentialNotificationMessage, logger *zap.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in credential notification handler", zap.Any("panic", r))
+		}
+	}()
+
+	nc := session.notifications.take(msg.FlowID)
+	if nc == nil {
+		// Raced with TTL expiry or another in-flight notification for the same
+		// flow consumed the one-shot context.
+		logger.Debug("notification context no longer available at forward time")
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "notification context unavailable")
+		return
+	}
+	// Defence in depth: re-check the id match after consuming, in case the
+	// stored context changed between the inline check and here.
+	if nc.notificationID != "" && nc.notificationID != msg.NotificationID {
+		logger.Warn("notification_id mismatch at forward time")
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "notification_id mismatch")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	httpClient := m.cfg.HTTPClient.NewHTTPClient(0)
+	if err := sendNotification(ctx, httpClient, nc, msg.NotificationID, msg.Event, msg.EventDescription, logger); err != nil {
+		logger.Warn("failed to forward credential notification to issuer", zap.Error(err))
+		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "forwarding failed")
+		return
+	}
+
+	logger.Debug("credential notification forwarded to issuer")
+	_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "forwarded", "")
 }
 
 // RequestSign sends a signing request and waits for response
