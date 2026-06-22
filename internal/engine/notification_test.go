@@ -412,6 +412,60 @@ func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
 	assert.NotNil(t, session.notifications.take("flow-cap"))
 }
 
+// TestForwardCredentialNotification_ForwardingFailureAcks covers the path where
+// the request passes inline validation and enters the async worker, but the
+// issuer's notification endpoint rejects it. The backend must consume the
+// one-shot context and ack the client with "rejected"/"forwarding failed".
+func TestForwardCredentialNotification_ForwardingFailureAcks(t *testing.T) {
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer issuer.Close()
+
+	conn, cleanup := wsAckEchoServer(t)
+	defer cleanup()
+
+	session := notifTestSession(conn)
+	session.notifications.put("flow-fail", &notificationContext{
+		endpoint:       issuer.URL,
+		accessToken:    "tok",
+		tokenType:      "Bearer",
+		notificationID: "notif-fail",
+	})
+
+	notifTestManager().dispatchCredentialNotification(session, &CredentialNotificationMessage{
+		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-fail"},
+		NotificationID: "notif-fail",
+		Event:          notificationEventAccepted,
+	})
+
+	ack := readNotificationAck(t, conn)
+	assert.Equal(t, "rejected", ack.Status)
+	assert.Contains(t, ack.Error, "forwarding failed")
+	// The one-shot context must have been consumed even though forwarding failed.
+	assert.Nil(t, session.notifications.take("flow-fail"))
+}
+
+func TestSendNotification_TransportError(t *testing.T) {
+	// Point at a server that is immediately closed so Do() fails at the
+	// transport layer (connection refused), exercising the request-error path.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint := srv.URL
+	client := srv.Client()
+	srv.Close()
+
+	nc := &notificationContext{
+		endpoint:    endpoint,
+		accessToken: "tok",
+		tokenType:   "Bearer",
+		expiresAt:   time.Now().Add(time.Minute),
+	}
+
+	err := sendNotification(context.Background(), client, nc,
+		"notif-x", notificationEventAccepted, "", zap.NewNop())
+	require.Error(t, err)
+}
+
 // ===== message serialization tests =====
 
 func TestCredentialNotificationMessage_Roundtrip(t *testing.T) {
