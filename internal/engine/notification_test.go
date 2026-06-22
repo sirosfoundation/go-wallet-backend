@@ -466,6 +466,70 @@ func TestSendNotification_TransportError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// ===== registerNotificationContext tests =====
+
+// newRegisterTestHandler builds an OID4VCIHandler bound to a flow whose session
+// has an initialized notification store, for exercising registerNotificationContext.
+func newRegisterTestHandler(flowID string) (*OID4VCIHandler, *Session) {
+	session := &Session{
+		logger:        zap.NewNop(),
+		notifications: newNotificationContextStore(),
+	}
+	flow := &Flow{ID: flowID, Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	return h, session
+}
+
+func TestRegisterNotificationContext_StoresWhenEndpointAndIDPresent(t *testing.T) {
+	h, session := newRegisterTestHandler("flow-reg")
+
+	h.registerNotificationContext(
+		&IssuerMetadata{NotificationEndpoint: "https://issuer.example.com/notify"},
+		&TokenResponse{AccessToken: "tok", TokenType: "Bearer"},
+		&CredentialResponse{NotificationID: "notif-reg"},
+	)
+
+	nc := session.notifications.take("flow-reg")
+	require.NotNil(t, nc)
+	assert.Equal(t, "https://issuer.example.com/notify", nc.endpoint)
+	assert.Equal(t, "tok", nc.accessToken)
+	assert.Equal(t, "Bearer", nc.tokenType)
+	assert.Equal(t, "notif-reg", nc.notificationID)
+}
+
+// TestRegisterNotificationContext_NoOpCases covers every guard that makes
+// registration a no-op: nil arguments, an issuer that advertised no notification
+// endpoint, and a response without a notification_id. None must register a
+// context.
+func TestRegisterNotificationContext_NoOpCases(t *testing.T) {
+	endpoint := &IssuerMetadata{NotificationEndpoint: "https://issuer.example.com/notify"}
+	token := &TokenResponse{AccessToken: "tok", TokenType: "Bearer"}
+	withID := &CredentialResponse{NotificationID: "notif-reg"}
+
+	tests := []struct {
+		name  string
+		meta  *IssuerMetadata
+		token *TokenResponse
+		resp  *CredentialResponse
+	}{
+		{"nil metadata", nil, token, withID},
+		{"nil token", endpoint, nil, withID},
+		{"nil response", endpoint, token, nil},
+		{"empty endpoint", &IssuerMetadata{}, token, withID},
+		{"empty notification_id", endpoint, token, &CredentialResponse{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, session := newRegisterTestHandler("flow-noop")
+			h.registerNotificationContext(tc.meta, tc.token, tc.resp)
+			assert.Nil(t, session.notifications.take("flow-noop"),
+				"no context should be registered for a no-op case")
+		})
+	}
+}
+
 // ===== message serialization tests =====
 
 func TestCredentialNotificationMessage_Roundtrip(t *testing.T) {
