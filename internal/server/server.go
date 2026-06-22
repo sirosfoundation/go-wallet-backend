@@ -34,6 +34,8 @@ const (
 	TransportHTTP Transport = "http"
 	// TransportWebSocket is for persistent WebSocket connections
 	TransportWebSocket Transport = "websocket"
+	// TransportWalletProvider is for wallet-provider isolation on a separate port
+	TransportWalletProvider Transport = "wallet-provider"
 )
 
 // RouteProvider allows modes to register their routes on a shared router.
@@ -84,6 +86,11 @@ type ServerConfig struct {
 	WSAddress string
 	WSPort    int
 
+	// Wallet-provider server settings (for PKCS#11 isolation)
+	// When WPPort > 0, wallet-provider routes run on a separate HTTP server.
+	WPAddress string
+	WPPort    int
+
 	// Admin server settings
 	AdminPort  int
 	AdminToken string
@@ -128,10 +135,12 @@ type Manager struct {
 
 	httpServer  *http.Server
 	wsServer    *http.Server // Only used if WSSeparate
+	wpServer    *http.Server // Wallet-provider isolation server
 	adminServer *http.Server
 
 	httpRouter *gin.Engine
 	wsRouter   *gin.Engine // Only used if WSSeparate
+	wpRouter   *gin.Engine // Wallet-provider isolation router
 
 	// Readiness management for /readyz endpoint
 	readiness *health.ReadinessManager
@@ -194,12 +203,15 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Build HTTP router with common middleware
 	m.httpRouter = m.buildRouter()
 
-	// Separate WebSocket providers if configured
-	var httpProviders, wsProviders []RouteProvider
+	// Separate WebSocket and wallet-provider providers if configured
+	var httpProviders, wsProviders, wpProviders []RouteProvider
 	for _, p := range m.providers {
-		if p.Transport() == TransportWebSocket {
+		switch p.Transport() {
+		case TransportWebSocket:
 			wsProviders = append(wsProviders, p)
-		} else {
+		case TransportWalletProvider:
+			wpProviders = append(wpProviders, p)
+		default:
 			httpProviders = append(httpProviders, p)
 		}
 	}
@@ -208,6 +220,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	for _, p := range httpProviders {
 		m.logger.Info("Registering HTTP routes", zap.String("mode", p.Name()))
 		p.RegisterRoutes(m.httpRouter)
+	}
+
+	// Co-host wallet-provider routes on main HTTP server when no separate port
+	if len(wpProviders) > 0 && m.cfg.WPPort == 0 {
+		for _, p := range wpProviders {
+			m.logger.Info("Registering wallet-provider routes (co-hosted)", zap.String("mode", p.Name()))
+			p.RegisterRoutes(m.httpRouter)
+		}
 	}
 
 	// Handle WebSocket providers - always on separate port (different protocol)
@@ -261,6 +281,32 @@ func (m *Manager) Start(ctx context.Context) error {
 		}()
 	}
 
+	// Start wallet-provider server if providers registered on separate port
+	if len(wpProviders) > 0 && m.cfg.WPPort > 0 {
+		m.wpRouter = m.buildRouter()
+		for _, p := range wpProviders {
+			m.logger.Info("Registering wallet-provider routes (isolated)", zap.String("mode", p.Name()))
+			p.RegisterRoutes(m.wpRouter)
+		}
+		m.addStatusEndpoints(m.wpRouter)
+
+		wpAddr := fmt.Sprintf("%s:%d", m.cfg.WPAddress, m.cfg.WPPort)
+		m.wpServer = &http.Server{
+			Addr:         wpAddr,
+			Handler:      m.wpRouter,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+
+		go func() {
+			m.logger.Info("Wallet-provider server listening (PKCS#11 isolated)", zap.String("address", wpAddr))
+			if err := m.cfg.TLS.ListenAndServe(m.wpServer); err != nil && err != http.ErrServerClosed {
+				m.logger.Error("Wallet-provider server error", zap.Error(err))
+			}
+		}()
+	}
+
 	// Start admin server if configured
 	if m.cfg.AdminPort > 0 {
 		if err := m.startAdminServer(); err != nil {
@@ -307,6 +353,12 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	if m.wpServer != nil {
+		if err := m.wpServer.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("wallet-provider server shutdown: %w", err))
+		}
+	}
+
 	if m.adminServer != nil {
 		if err := m.adminServer.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("admin server shutdown: %w", err))
@@ -323,6 +375,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
+	router.Use(middleware.BodySizeLimitMiddleware(middleware.MaxBodySize))
 	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))
 	router.Use(middleware.Logger(m.logger, "/status", "/health", "/healthz", "/readyz"))
 	if m.cfg.ServedByHeader != "" {
@@ -387,7 +440,7 @@ func (m *Manager) startAdminServer() error {
 			return fmt.Errorf("failed to generate admin token: %w", err)
 		}
 		m.logger.Debug("Generated admin API token (development mode)",
-			zap.String("token", token))
+			zap.String("token_prefix", token[:8]+"..."))
 		m.logger.Warn("Auto-generated admin token — this is disabled in production")
 	}
 

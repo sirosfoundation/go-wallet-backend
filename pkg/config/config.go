@@ -29,6 +29,8 @@ type Config struct {
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
+	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+	R2PSAdmin      R2PSAdminConfig      `yaml:"r2ps_admin" envconfig:"R2PS_ADMIN"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -125,6 +127,8 @@ type ServerConfig struct {
 	EnginePort     int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`           // WebSocket engine port (defaults to Port if 0)
 	RegistryHost   string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
 	RegistryPort   int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	WPHost         string `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
+	WPPort         int    `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
 	AdminToken     string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
 	AdminTokenPath string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
 	RPID           string `yaml:"rp_id" envconfig:"RP_ID"`
@@ -354,6 +358,94 @@ type WalletProviderConfig struct {
 	PrivateKeyPath  string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
 	CertificatePath string `yaml:"certificate_path" envconfig:"CERTIFICATE_PATH"`
 	CACertPath      string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
+
+	// PKCS11 enables HSM-backed signing (takes precedence over file-based key)
+	PKCS11 *PKCS11SigningConfig `yaml:"pkcs11,omitempty" envconfig:"PKCS11"`
+
+	// WIA (Wallet Instance Attestation) configuration
+	WIA WIAConfig `yaml:"wia" envconfig:"WIA"`
+
+	// Attestation controls attestation behavior for both WIA and KA
+	Attestation AttestationConfig `yaml:"attestation" envconfig:"ATTESTATION"`
+}
+
+// PKCS11SigningConfig holds PKCS#11 HSM configuration for the wallet provider signer.
+type PKCS11SigningConfig struct {
+	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
+	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
+	PIN        string `yaml:"pin" envconfig:"PIN"`
+	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN)
+	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
+	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
+}
+
+// AttestationConfig controls attestation lifecycle behavior.
+type AttestationConfig struct {
+	// LifetimeSeconds is the global attestation lifetime (WIA + KA).
+	// CS-04 requires < 24h (86400). Default: 3600 (1 hour).
+	LifetimeSeconds int `yaml:"lifetime_seconds" envconfig:"LIFETIME_SECONDS"`
+
+	// KAExpirySeconds is the key attestation JWT expiry.
+	// Short-lived by default (15s) for single-use credential issuance.
+	KAExpirySeconds int `yaml:"ka_expiry_seconds" envconfig:"KA_EXPIRY_SECONDS"`
+
+	// StatusListMode controls whether attestations include a status_list entry.
+	// Values: "always" (always include), "never" (omit for short-lived),
+	// "auto" (include only if lifetime > threshold). Default: "never".
+	StatusListMode string `yaml:"status_list_mode" envconfig:"STATUS_LIST_MODE"`
+
+	// StatusListURL is the base URL for the Token Status List endpoint.
+	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
+
+	// StatusListExpiry is the lifetime (seconds) of a status list entry.
+	// When > 0, the client_status object includes an "exp" field (Annex C §C.3.2).
+	StatusListExpiry int `yaml:"status_list_expiry" envconfig:"STATUS_LIST_EXPIRY"`
+
+	// NativeAttestation controls platform attestation verification.
+	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
+}
+
+// NativeAttestationConfig controls platform-specific attestation verification.
+type NativeAttestationConfig struct {
+	// Enabled controls whether native platform attestation is required.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// AppleAppAttestEnvironment: "production" or "development"
+	AppleAppAttestEnvironment string `yaml:"apple_app_attest_environment" envconfig:"APPLE_APP_ATTEST_ENVIRONMENT"`
+	// AppleAppID is the full App ID (TeamID.BundleID) for Apple App Attest.
+	AppleAppID string `yaml:"apple_app_id" envconfig:"APPLE_APP_ID"`
+
+	// GooglePackageName is the Android package name for Play Integrity.
+	GooglePackageName string `yaml:"google_package_name" envconfig:"GOOGLE_PACKAGE_NAME"`
+	// GooglePlayIntegrityDecryptionKey is the base64-encoded decryption key.
+	GooglePlayIntegrityDecryptionKey string `yaml:"google_play_integrity_decryption_key" envconfig:"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY"`
+	// GooglePlayIntegrityVerificationKey is the base64-encoded verification key.
+	GooglePlayIntegrityVerificationKey string `yaml:"google_play_integrity_verification_key" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY"`
+}
+
+// WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
+type WIAConfig struct {
+	// Enabled controls whether WIA endpoints are registered
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// Issuer is the optional `iss` claim in WIA JWTs.
+	// Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain).
+	// Some national profiles require an explicit iss for interop.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
+	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
+	// WalletName is the wallet_name claim in WIA JWT
+	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME"`
+	// WalletVersion is the wallet_version claim
+	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
+	// WalletLink is the wallet download/info URI
+	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
+	// CertificationInfo is the wallet_solution_certification_information claim.
+	// Free-form map included as-is in the WIA JWT (Annex C §C.3.2).
+	CertificationInfo map[string]interface{} `yaml:"certification_info,omitempty"`
+	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
+	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
+	// ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds
+	ChallengeTTLSeconds int `yaml:"challenge_ttl_seconds" envconfig:"CHALLENGE_TTL_SECONDS"`
 }
 
 // FlowTrustConfig contains per-flow trust evaluation overrides.
@@ -788,6 +880,14 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
+	// Load PKCS#11 PIN from file
+	if c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.PINPath != "" {
+		c.WalletProvider.PKCS11.PIN, err = readSecretFile(c.WalletProvider.PKCS11.PINPath)
+		if err != nil {
+			return fmt.Errorf("wallet_provider.pkcs11.pin_path: %w", err)
+		}
+	}
+
 	// Load MongoDB password from file and inject into URI
 	if c.Storage.MongoDB.PasswordPath != "" {
 		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
@@ -900,6 +1000,19 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
+		WalletProvider: WalletProviderConfig{
+			WIA: WIAConfig{
+				Enabled:             true,
+				WalletName:          "SIROS ID",
+				MaxExpirySeconds:    86400,
+				ChallengeTTLSeconds: 300,
+			},
+			Attestation: AttestationConfig{
+				LifetimeSeconds: 3600,
+				KAExpirySeconds: 15,
+				StatusListMode:  "never",
+			},
+		},
 	}
 }
 
@@ -907,6 +1020,19 @@ func defaultConfig() *Config {
 func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
+	}
+
+	// Validate wallet-provider port when explicitly configured
+	if c.Server.WPPort != 0 && (c.Server.WPPort < 1 || c.Server.WPPort > 65535) {
+		return fmt.Errorf("invalid wallet-provider port: %d", c.Server.WPPort)
+	}
+	// WPHost defaults to Host when empty, so treat empty as equivalent
+	effectiveWPHost := c.Server.WPHost
+	if effectiveWPHost == "" {
+		effectiveWPHost = c.Server.Host
+	}
+	if c.Server.WPPort != 0 && c.Server.WPPort == c.Server.Port && effectiveWPHost == c.Server.Host {
+		return fmt.Errorf("wallet-provider port %d conflicts with main server port on the same host", c.Server.WPPort)
 	}
 
 	if c.Server.RPID == "" {
@@ -961,6 +1087,17 @@ func (c *Config) Validate() error {
 
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required")
+	}
+	if len(c.JWT.Secret) < 32 {
+		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
+	}
+
+	// Validate StatusListMode if set
+	switch c.WalletProvider.Attestation.StatusListMode {
+	case "", "always", "never", "auto":
+		// valid values
+	default:
+		return fmt.Errorf("invalid wallet_provider.attestation.status_list_mode: %q (must be always, never, or auto)", c.WalletProvider.Attestation.StatusListMode)
 	}
 
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
@@ -1027,4 +1164,22 @@ func (c *ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// AuditConfig configures the SET (Security Event Token) audit trail emitter.
+type AuditConfig struct {
+	// Enabled enables SET audit event emission.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org").
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	// KeyPath is the path to a PEM-encoded EC private key for signing SET records.
+	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
+	// KeyID is the kid used in SET JWS headers.
+	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
+}
+
+// R2PSAdminConfig configures the R2PS admin API client for WSCD/WSCA status queries.
+type R2PSAdminConfig struct {
+	// BaseURL is the R2PS admin endpoint (e.g. "http://r2ps-admin:8444").
+	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
 }

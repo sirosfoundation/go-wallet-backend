@@ -42,9 +42,9 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend, engine, and admin roles)
+	// Load backend configuration (needed for backend, engine, admin, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleWalletProvider) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
@@ -157,6 +157,15 @@ func main() {
 		serverCfg.LoggingLevel = backendCfg.Logging.Level
 		serverCfg.TLS = backendCfg.Server.TLS
 		serverCfg.AdminTLS = backendCfg.Server.AdminTLS
+
+		// Wallet-provider isolation port
+		if backendCfg.Server.WPPort > 0 {
+			serverCfg.WPAddress = backendCfg.Server.WPHost
+			if serverCfg.WPAddress == "" {
+				serverCfg.WPAddress = backendCfg.Server.Host
+			}
+			serverCfg.WPPort = backendCfg.Server.WPPort
+		}
 	} else if registryCfg != nil {
 		// Registry-only mode - use registry server config
 		serverCfg.HTTPAddress = registryCfg.Server.Host
@@ -237,6 +246,23 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
+	}
+
+	// Wallet-provider isolation mode: runs wallet-provider endpoints on a
+	// separate server for PKCS#11 operational isolation.
+	// When co-deployed with backend (no --mode=wallet-provider), routes are
+	// served from the shared HTTP server as usual.
+	if roles.Has(modes.RoleWalletProvider) && !roles.Has(modes.RoleBackend) {
+		provider, err := server.NewWalletProviderProvider(backendCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to create wallet-provider provider", zap.Error(err))
+		}
+		mgr.AddProvider(provider)
+		resources = append(resources, provider)
+
+		logger.Info("Wallet-provider running in isolated mode",
+			zap.Int("port", backendCfg.Server.WPPort),
+			zap.Bool("pkcs11", backendCfg.WalletProvider.PKCS11 != nil))
 	}
 
 	// Set up signal handling
