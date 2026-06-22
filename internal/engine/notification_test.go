@@ -151,18 +151,9 @@ func TestSendNotification_DPoPSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
+	nc := dpopNotifContext(t, srv.URL)
 
-	nc := &notificationContext{
-		endpoint:    srv.URL,
-		accessToken: "tok-dpop",
-		tokenType:   "DPoP",
-		dpopKey:     key,
-		expiresAt:   time.Now().Add(time.Minute),
-	}
-
-	err = sendNotification(context.Background(), srv.Client(), nc,
+	err := sendNotification(context.Background(), srv.Client(), nc,
 		"notif-2", notificationEventFailure, "", zap.NewNop())
 	require.NoError(t, err)
 
@@ -185,18 +176,9 @@ func TestSendNotification_DPoPNonceRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
+	nc := dpopNotifContext(t, srv.URL)
 
-	nc := &notificationContext{
-		endpoint:    srv.URL,
-		accessToken: "tok-dpop",
-		tokenType:   "DPoP",
-		dpopKey:     key,
-		expiresAt:   time.Now().Add(time.Minute),
-	}
-
-	err = sendNotification(context.Background(), srv.Client(), nc,
+	err := sendNotification(context.Background(), srv.Client(), nc,
 		"notif-3", notificationEventAccepted, "", zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), atomic.LoadInt32(&calls), "should retry once after DPoP nonce challenge")
@@ -277,28 +259,50 @@ func newCountingIssuer(t *testing.T) (*httptest.Server, *int32) {
 	return issuer, &calls
 }
 
-func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
-	issuer, issuerCalls := newCountingIssuer(t)
+// dpopNotifContext builds a DPoP-bound notification context pointing at endpoint,
+// generating a fresh P-256 key for the proof.
+func dpopNotifContext(t *testing.T, endpoint string) *notificationContext {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	return &notificationContext{
+		endpoint:    endpoint,
+		accessToken: "tok-dpop",
+		tokenType:   "DPoP",
+		dpopKey:     key,
+		expiresAt:   time.Now().Add(time.Minute),
+	}
+}
 
+// seedBearerAndDispatch seeds a Bearer notification context for flowID/issuedID,
+// dispatches a credential_notification carrying msgID, and returns the session,
+// the issuer call counter, and the resulting ack.
+func seedBearerAndDispatch(t *testing.T, flowID, issuedID, msgID string) (*Session, *int32, NotificationAckMessage) {
+	t.Helper()
+	issuer, issuerCalls := newCountingIssuer(t)
 	conn, cleanup := wsAckEchoServer(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	session := notifTestSession(conn)
-	session.notifications.put("flow-9", &notificationContext{
+	session.notifications.put(flowID, &notificationContext{
 		endpoint:       issuer.URL,
 		accessToken:    "tok",
 		tokenType:      "Bearer",
-		notificationID: "notif-9",
+		notificationID: issuedID,
 	})
 
-	m := notifTestManager()
-	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
-		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-9"},
-		NotificationID: "notif-9",
+	notifTestManager().dispatchCredentialNotification(session, &CredentialNotificationMessage{
+		Message:        Message{Type: TypeCredentialNotification, FlowID: flowID},
+		NotificationID: msgID,
 		Event:          notificationEventAccepted,
 	})
 
-	ack := readNotificationAck(t, conn)
+	return session, issuerCalls, readNotificationAck(t, conn)
+}
+
+func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
+	session, issuerCalls, ack := seedBearerAndDispatch(t, "flow-9", "notif-9", "notif-9")
+
 	assert.Equal(t, "forwarded", ack.Status)
 	assert.Equal(t, "notif-9", ack.NotificationID)
 	assert.Equal(t, int32(1), atomic.LoadInt32(issuerCalls))
@@ -369,28 +373,9 @@ func TestHandleCredentialNotification_Rejects(t *testing.T) {
 }
 
 func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
-	issuer, issuerCalls := newCountingIssuer(t)
-
-	conn, cleanup := wsAckEchoServer(t)
-	defer cleanup()
-
-	session := notifTestSession(conn)
-	session.notifications.put("flow-7", &notificationContext{
-		endpoint:       issuer.URL,
-		accessToken:    "tok",
-		tokenType:      "Bearer",
-		notificationID: "issued-id",
-	})
-
-	m := notifTestManager()
 	// Client supplies a notification_id that does not match the issued one.
-	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
-		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-7"},
-		NotificationID: "attacker-id",
-		Event:          notificationEventAccepted,
-	})
+	session, issuerCalls, ack := seedBearerAndDispatch(t, "flow-7", "issued-id", "attacker-id")
 
-	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "notification context unavailable")
 	// No request must reach the issuer, and the context must remain (not consumed).
