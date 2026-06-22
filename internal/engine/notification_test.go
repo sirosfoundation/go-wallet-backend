@@ -263,13 +263,22 @@ func readNotificationAck(t *testing.T, conn *websocket.Conn) NotificationAckMess
 	return ack
 }
 
-func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
-	var issuerCalls int32
+// newCountingIssuer starts an issuer notification endpoint that returns 204 and
+// counts the requests it receives. The returned counter is read with
+// atomic.LoadInt32.
+func newCountingIssuer(t *testing.T) (*httptest.Server, *int32) {
+	t.Helper()
+	var calls int32
 	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&issuerCalls, 1)
+		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	defer issuer.Close()
+	t.Cleanup(issuer.Close)
+	return issuer, &calls
+}
+
+func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
+	issuer, issuerCalls := newCountingIssuer(t)
 
 	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
@@ -292,72 +301,75 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "forwarded", ack.Status)
 	assert.Equal(t, "notif-9", ack.NotificationID)
-	assert.Equal(t, int32(1), atomic.LoadInt32(&issuerCalls))
+	assert.Equal(t, int32(1), atomic.LoadInt32(issuerCalls))
 
 	// Context must be consumed (one-shot).
 	assert.Nil(t, session.notifications.take("flow-9"))
 }
 
-func TestHandleCredentialNotification_RejectsUnsupportedEvent(t *testing.T) {
-	conn, cleanup := wsAckEchoServer(t)
-	defer cleanup()
+// TestHandleCredentialNotification_Rejects covers the validation paths that
+// reject a notification before any request reaches the issuer. Each case sets
+// up an optional notification context, dispatches a message, and asserts the
+// resulting ack is "rejected" with a matching error substring.
+func TestHandleCredentialNotification_Rejects(t *testing.T) {
+	tests := []struct {
+		name      string
+		ctxFlowID string // when set, a context is seeded for this flow id
+		ctx       *notificationContext
+		msg       *CredentialNotificationMessage
+		wantError string
+	}{
+		{
+			name:      "unsupported event",
+			ctxFlowID: "flow-1",
+			ctx:       &notificationContext{endpoint: "https://issuer.example.com/notify", notificationID: "notif-1"},
+			msg: &CredentialNotificationMessage{
+				Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
+				NotificationID: "notif-1",
+				Event:          "credential_deleted",
+			},
+			wantError: "unsupported event",
+		},
+		{
+			name: "missing notification_id",
+			msg: &CredentialNotificationMessage{
+				Message: Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
+				Event:   notificationEventAccepted,
+			},
+			wantError: "missing notification_id",
+		},
+		{
+			name: "missing context",
+			msg: &CredentialNotificationMessage{
+				Message:        Message{Type: TypeCredentialNotification, FlowID: "unknown-flow"},
+				NotificationID: "notif-1",
+				Event:          notificationEventAccepted,
+			},
+			wantError: "notification context unavailable",
+		},
+	}
 
-	session := notifTestSession(conn)
-	// Even with a valid context present, credential_deleted must be rejected.
-	session.notifications.put("flow-1", &notificationContext{endpoint: "https://issuer.example.com/notify", notificationID: "notif-1"})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, cleanup := wsAckEchoServer(t)
+			defer cleanup()
 
-	m := notifTestManager()
-	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
-		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
-		NotificationID: "notif-1",
-		Event:          "credential_deleted",
-	})
+			session := notifTestSession(conn)
+			if tc.ctxFlowID != "" {
+				session.notifications.put(tc.ctxFlowID, tc.ctx)
+			}
 
-	ack := readNotificationAck(t, conn)
-	assert.Equal(t, "rejected", ack.Status)
-	assert.Contains(t, ack.Error, "unsupported event")
-}
+			notifTestManager().dispatchCredentialNotification(session, tc.msg)
 
-func TestHandleCredentialNotification_RejectsMissingNotificationID(t *testing.T) {
-	conn, cleanup := wsAckEchoServer(t)
-	defer cleanup()
-
-	session := notifTestSession(conn)
-	m := notifTestManager()
-	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
-		Message: Message{Type: TypeCredentialNotification, FlowID: "flow-1"},
-		Event:   notificationEventAccepted,
-	})
-
-	ack := readNotificationAck(t, conn)
-	assert.Equal(t, "rejected", ack.Status)
-	assert.Contains(t, ack.Error, "missing notification_id")
-}
-
-func TestHandleCredentialNotification_RejectsMissingContext(t *testing.T) {
-	conn, cleanup := wsAckEchoServer(t)
-	defer cleanup()
-
-	session := notifTestSession(conn)
-	m := notifTestManager()
-	m.dispatchCredentialNotification(session, &CredentialNotificationMessage{
-		Message:        Message{Type: TypeCredentialNotification, FlowID: "unknown-flow"},
-		NotificationID: "notif-1",
-		Event:          notificationEventAccepted,
-	})
-
-	ack := readNotificationAck(t, conn)
-	assert.Equal(t, "rejected", ack.Status)
-	assert.Contains(t, ack.Error, "notification context unavailable")
+			ack := readNotificationAck(t, conn)
+			assert.Equal(t, "rejected", ack.Status)
+			assert.Contains(t, ack.Error, tc.wantError)
+		})
+	}
 }
 
 func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
-	var issuerCalls int32
-	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&issuerCalls, 1)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer issuer.Close()
+	issuer, issuerCalls := newCountingIssuer(t)
 
 	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
@@ -382,7 +394,7 @@ func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "notification context unavailable")
 	// No request must reach the issuer, and the context must remain (not consumed).
-	assert.Equal(t, int32(0), atomic.LoadInt32(&issuerCalls))
+	assert.Equal(t, int32(0), atomic.LoadInt32(issuerCalls))
 	assert.NotNil(t, session.notifications.take("flow-7"))
 }
 
