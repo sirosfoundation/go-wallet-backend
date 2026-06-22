@@ -10,20 +10,29 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
-	store  storage.Store
-	logger *zap.Logger
+	store       storage.Store
+	userService *service.UserService
+	logger      *zap.Logger
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
 func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
+	return NewAdminHandlersWithUserService(store, service.NewUserService(store, &config.Config{}, logger), logger)
+}
+
+// NewAdminHandlersWithUserService creates a new AdminHandlers instance with a custom user service.
+func NewAdminHandlersWithUserService(store storage.Store, userService *service.UserService, logger *zap.Logger) *AdminHandlers {
 	return &AdminHandlers{
-		store:  store,
-		logger: logger,
+		store:       store,
+		userService: userService,
+		logger:      logger,
 	}
 }
 
@@ -524,6 +533,164 @@ func (h *AdminHandlers) GetTenantUsers(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"users": users})
+}
+
+type AdminCredentialResponse struct {
+	ID                 string     `json:"id"`
+	Nickname           *string    `json:"nickname,omitempty"`
+	Status             string     `json:"status"`
+	CreateTime         time.Time  `json:"createTime"`
+	LastUseTime        *time.Time `json:"lastUseTime,omitempty"`
+	PRFCapable         bool       `json:"prfCapable"`
+	DeactivatedAt      *time.Time `json:"deactivatedAt,omitempty"`
+	DeactivatedBy      string     `json:"deactivatedBy,omitempty"`
+	DeactivationReason string     `json:"deactivationReason,omitempty"`
+}
+
+type DeactivateCredentialRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ListUserCredentials returns passkeys for a user.
+// GET /admin/tenants/:id/users/:user_id/credentials
+func (h *AdminHandlers) ListUserCredentials(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	userID := domain.UserIDFromString(c.Param("user_id"))
+
+	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error("Failed to check tenant membership", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+		return
+	}
+
+	user, err := h.store.Users().GetByID(c.Request.Context(), userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		h.logger.Error("Failed to get user", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user"})
+		return
+	}
+
+	resp := make([]AdminCredentialResponse, 0, len(user.WebauthnCredentials))
+	for _, cred := range user.WebauthnCredentials {
+		credTenant := cred.TenantID
+		if credTenant == "" {
+			credTenant = domain.DefaultTenantID
+		}
+		if credTenant != tenantID {
+			continue
+		}
+		resp = append(resp, AdminCredentialResponse{
+			ID:                 cred.ID,
+			Nickname:           cred.Nickname,
+			Status:             cred.NormalizedStatus(),
+			CreateTime:         cred.CreatedAt,
+			LastUseTime:        cred.LastUseTime,
+			PRFCapable:         cred.PRFCapable,
+			DeactivatedAt:      cred.DeactivatedAt,
+			DeactivatedBy:      cred.DeactivatedBy,
+			DeactivationReason: cred.DeactivationReason,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"credentials": resp})
+}
+
+// DeactivateUserCredential deactivates one credential for a user.
+// POST /admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate
+func (h *AdminHandlers) DeactivateUserCredential(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	userID := domain.UserIDFromString(c.Param("user_id"))
+	credID := c.Param("cred_id")
+	if credID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Credential ID required"})
+		return
+	}
+
+	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error("Failed to check tenant membership", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+		return
+	}
+
+	var req DeactivateCredentialRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req = DeactivateCredentialRequest{}
+	}
+
+	cred, err := h.userService.DeactivateWebAuthnCredentialByProvider(c.Request.Context(), userID, credID, req.Reason)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
+		case errors.Is(err, service.ErrCredentialAlreadyDeactivated):
+			c.JSON(http.StatusConflict, gin.H{"error": "Credential already deactivated"})
+		default:
+			h.logger.Error("Failed to deactivate user credential", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deactivate credential"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, AdminCredentialResponse{
+		ID:                 cred.ID,
+		Nickname:           cred.Nickname,
+		Status:             cred.NormalizedStatus(),
+		CreateTime:         cred.CreatedAt,
+		LastUseTime:        cred.LastUseTime,
+		PRFCapable:         cred.PRFCapable,
+		DeactivatedAt:      cred.DeactivatedAt,
+		DeactivatedBy:      cred.DeactivatedBy,
+		DeactivationReason: cred.DeactivationReason,
+	})
+}
+
+// DeactivateAllUserCredentials deactivates all active credentials for a user.
+// POST /admin/tenants/:id/users/:user_id/credentials/deactivate-all
+func (h *AdminHandlers) DeactivateAllUserCredentials(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
+	userID := domain.UserIDFromString(c.Param("user_id"))
+
+	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error("Failed to check tenant membership", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
+		return
+	}
+	if !isMember {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+		return
+	}
+
+	var req DeactivateCredentialRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		req = DeactivateCredentialRequest{}
+	}
+
+	if err := h.userService.DeactivateAllWebAuthnCredentialsByProvider(c.Request.Context(), userID, req.Reason); err != nil {
+		if errors.Is(err, service.ErrNoActiveWebAuthnCredentials) {
+			c.JSON(http.StatusConflict, gin.H{"error": "No active credentials"})
+			return
+		}
+		h.logger.Error("Failed to deactivate all user credentials", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deactivate credentials"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "All credentials deactivated"})
 }
 
 // AdminStatus returns the admin server status
@@ -1040,6 +1207,9 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/users", h.GetTenantUsers)
 		tenants.POST("/:id/users", h.AddUserToTenant)
 		tenants.DELETE("/:id/users/:user_id", h.RemoveUserFromTenant)
+		tenants.GET("/:id/users/:user_id/credentials", h.ListUserCredentials)
+		tenants.POST("/:id/users/:user_id/credentials/:cred_id/deactivate", h.DeactivateUserCredential)
+		tenants.POST("/:id/users/:user_id/credentials/deactivate-all", h.DeactivateAllUserCredentials)
 
 		// Issuer management
 		tenants.GET("/:id/issuers", h.ListIssuers)
