@@ -238,15 +238,12 @@ func notifTestSession(conn *websocket.Conn) *Session {
 	return s
 }
 
-func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
-	var issuerCalls int32
-	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&issuerCalls, 1)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer issuer.Close()
-
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+// wsAckEchoServer starts a websocket test server that reads a single message
+// and echoes it straight back as JSON. dispatchCredentialNotification writes the
+// ack on the session connection, so the echo lets the test read it back.
+func wsAckEchoServer(t *testing.T) (*websocket.Conn, func()) {
+	t.Helper()
+	return wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
 		_, data, err := srvConn.ReadMessage()
 		if err != nil {
@@ -256,6 +253,25 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 		_ = json.Unmarshal(data, &ack)
 		_ = srvConn.WriteJSON(ack)
 	})
+}
+
+// readNotificationAck reads a single NotificationAckMessage from conn.
+func readNotificationAck(t *testing.T, conn *websocket.Conn) NotificationAckMessage {
+	t.Helper()
+	var ack NotificationAckMessage
+	require.NoError(t, conn.ReadJSON(&ack))
+	return ack
+}
+
+func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
+	var issuerCalls int32
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&issuerCalls, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer issuer.Close()
+
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -273,8 +289,7 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 		Event:          notificationEventAccepted,
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "forwarded", ack.Status)
 	assert.Equal(t, "notif-9", ack.NotificationID)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&issuerCalls))
@@ -284,16 +299,7 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 }
 
 func TestHandleCredentialNotification_RejectsUnsupportedEvent(t *testing.T) {
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		defer srvConn.Close()
-		_, data, err := srvConn.ReadMessage()
-		if err != nil {
-			return
-		}
-		var ack map[string]interface{}
-		_ = json.Unmarshal(data, &ack)
-		_ = srvConn.WriteJSON(ack)
-	})
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -307,23 +313,13 @@ func TestHandleCredentialNotification_RejectsUnsupportedEvent(t *testing.T) {
 		Event:          "credential_deleted",
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "unsupported event")
 }
 
 func TestHandleCredentialNotification_RejectsMissingNotificationID(t *testing.T) {
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		defer srvConn.Close()
-		_, data, err := srvConn.ReadMessage()
-		if err != nil {
-			return
-		}
-		var ack map[string]interface{}
-		_ = json.Unmarshal(data, &ack)
-		_ = srvConn.WriteJSON(ack)
-	})
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -333,23 +329,13 @@ func TestHandleCredentialNotification_RejectsMissingNotificationID(t *testing.T)
 		Event:   notificationEventAccepted,
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "missing notification_id")
 }
 
 func TestHandleCredentialNotification_RejectsMissingContext(t *testing.T) {
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		defer srvConn.Close()
-		_, data, err := srvConn.ReadMessage()
-		if err != nil {
-			return
-		}
-		var ack map[string]interface{}
-		_ = json.Unmarshal(data, &ack)
-		_ = srvConn.WriteJSON(ack)
-	})
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -360,8 +346,7 @@ func TestHandleCredentialNotification_RejectsMissingContext(t *testing.T) {
 		Event:          notificationEventAccepted,
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "notification context unavailable")
 }
@@ -374,16 +359,7 @@ func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
 	}))
 	defer issuer.Close()
 
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		defer srvConn.Close()
-		_, data, err := srvConn.ReadMessage()
-		if err != nil {
-			return
-		}
-		var ack map[string]interface{}
-		_ = json.Unmarshal(data, &ack)
-		_ = srvConn.WriteJSON(ack)
-	})
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -402,8 +378,7 @@ func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
 		Event:          notificationEventAccepted,
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "notification context unavailable")
 	// No request must reach the issuer, and the context must remain (not consumed).
@@ -412,16 +387,7 @@ func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
 }
 
 func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		defer srvConn.Close()
-		_, data, err := srvConn.ReadMessage()
-		if err != nil {
-			return
-		}
-		var ack map[string]interface{}
-		_ = json.Unmarshal(data, &ack)
-		_ = srvConn.WriteJSON(ack)
-	})
+	conn, cleanup := wsAckEchoServer(t)
 	defer cleanup()
 
 	session := notifTestSession(conn)
@@ -442,8 +408,7 @@ func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
 		Event:          notificationEventAccepted,
 	})
 
-	var ack NotificationAckMessage
-	require.NoError(t, conn.ReadJSON(&ack))
+	ack := readNotificationAck(t, conn)
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "server busy")
 	// Context must remain since the request never entered the forwarding path.
