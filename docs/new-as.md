@@ -22,7 +22,7 @@ Legacy clients use this access token JWT directly just as today.
 Modern clients ignore any JWT returned in the authentiation flow and instead request access tokens when they are needed to call APIs on behalf of the user. This is covered in the next section:
 
 ## Token format
-
+```json
 {
     # standard claims
     jti: <id>,
@@ -37,6 +37,7 @@ Modern clients ignore any JWT returned in the authentiation flow and instead req
     tac: <rwlidka>, # cf below,
     rev: <revocation reason>
 }
+``
 
 ### sub
 
