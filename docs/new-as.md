@@ -37,7 +37,7 @@ Modern clients ignore any JWT returned in the authentiation flow and instead req
     tac: <rwlidka>, # cf below,
     rev: <revocation reason>
 }
-``
+```
 
 ### sub
 
