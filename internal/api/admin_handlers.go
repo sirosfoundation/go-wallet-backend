@@ -11,12 +11,14 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
 	store  storage.Store
 	logger *zap.Logger
+	audit  *audit.Logger
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
@@ -24,6 +26,7 @@ func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
 	return &AdminHandlers{
 		store:  store,
 		logger: logger,
+		audit:  audit.New(logger),
 	}
 }
 
@@ -322,10 +325,24 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 
 	if err := h.store.Tenants().Create(c.Request.Context(), tenant); err != nil {
 		h.logger.Error("Failed to create tenant", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "tenant.create",
+			ResourceType: "tenant",
+			ResourceID:   string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "tenant.create",
+		ResourceType: "tenant",
+		ResourceID:   string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Tenant created", zap.String("tenant_id", string(tenantID)))
 	c.JSON(http.StatusCreated, tenantToResponse(tenant))
 }
@@ -380,10 +397,24 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 
 	if err := h.store.Tenants().Update(c.Request.Context(), tenant); err != nil {
 		h.logger.Error("Failed to update tenant", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "tenant.update",
+			ResourceType: "tenant",
+			ResourceID:   string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update tenant"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "tenant.update",
+		ResourceType: "tenant",
+		ResourceID:   string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Tenant updated", zap.String("tenant_id", string(tenantID)))
 	c.JSON(http.StatusOK, tenantToResponse(tenant))
 }
@@ -413,10 +444,24 @@ func (h *AdminHandlers) DeleteTenant(c *gin.Context) {
 
 	if err := h.store.Tenants().Delete(c.Request.Context(), tenantID); err != nil {
 		h.logger.Error("Failed to delete tenant", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "tenant.delete",
+			ResourceType: "tenant",
+			ResourceID:   string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete tenant"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "tenant.delete",
+		ResourceType: "tenant",
+		ResourceID:   string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Tenant deleted", zap.String("tenant_id", string(tenantID)))
 	c.JSON(http.StatusOK, gin.H{"message": "Tenant deleted"})
 }
@@ -462,10 +507,26 @@ func (h *AdminHandlers) AddUserToTenant(c *gin.Context) {
 
 	if err := h.store.UserTenants().AddMembership(c.Request.Context(), membership); err != nil {
 		h.logger.Error("Failed to add user to tenant", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "user_membership.add",
+			ResourceType: "user_membership",
+			ResourceID:   userID.String(),
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add user to tenant"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "user_membership.add",
+		ResourceType: "user_membership",
+		ResourceID:   userID.String(),
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("User added to tenant",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("user_id", req.UserID),
@@ -482,10 +543,26 @@ func (h *AdminHandlers) RemoveUserFromTenant(c *gin.Context) {
 
 	if err := h.store.UserTenants().RemoveMembership(c.Request.Context(), userID, tenantID); err != nil {
 		h.logger.Error("Failed to remove user from tenant", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "user_membership.remove",
+			ResourceType: "user_membership",
+			ResourceID:   userID.String(),
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove user from tenant"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "user_membership.remove",
+		ResourceType: "user_membership",
+		ResourceID:   userID.String(),
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("User removed from tenant",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("user_id", userID.String()),
@@ -681,10 +758,26 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 
 	if err := h.store.Issuers().Create(c.Request.Context(), issuer); err != nil {
 		h.logger.Error("Failed to create issuer", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "issuer.create",
+			ResourceType: "issuer",
+			ResourceID:   req.CredentialIssuerIdentifier,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create issuer"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "issuer.create",
+		ResourceType: "issuer",
+		ResourceID:   req.CredentialIssuerIdentifier,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Issuer created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("identifier", req.CredentialIssuerIdentifier))
@@ -733,10 +826,26 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 
 	if err := h.store.Issuers().Update(c.Request.Context(), issuer); err != nil {
 		h.logger.Error("Failed to update issuer", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "issuer.update",
+			ResourceType: "issuer",
+			ResourceID:   issuer.CredentialIssuerIdentifier,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update issuer"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "issuer.update",
+		ResourceType: "issuer",
+		ResourceID:   issuer.CredentialIssuerIdentifier,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Issuer updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
@@ -756,7 +865,7 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 	}
 
 	// Check if issuer exists
-	_, err := h.store.Issuers().GetByID(c.Request.Context(), tenantID, issuerID)
+	issuer, err := h.store.Issuers().GetByID(c.Request.Context(), tenantID, issuerID)
 	if err != nil {
 		if err == storage.ErrNotFound {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Issuer not found"})
@@ -769,10 +878,26 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 
 	if err := h.store.Issuers().Delete(c.Request.Context(), tenantID, issuerID); err != nil {
 		h.logger.Error("Failed to delete issuer", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "issuer.delete",
+			ResourceType: "issuer",
+			ResourceID:   issuer.CredentialIssuerIdentifier,
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete issuer"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "issuer.delete",
+		ResourceType: "issuer",
+		ResourceID:   issuer.CredentialIssuerIdentifier,
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Issuer deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
@@ -909,14 +1034,36 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 
 	if err := h.store.Verifiers().Create(c.Request.Context(), verifier); err != nil {
 		if errors.Is(err, storage.ErrAlreadyExists) {
+			h.audit.Log(audit.Event{
+				Operation:    "verifier.create",
+				ResourceType: "verifier",
+				TenantID:     string(tenantID),
+				OperatorIP:   c.ClientIP(),
+				Result:       audit.ResultFailure,
+			})
 			c.JSON(http.StatusConflict, gin.H{"error": "Verifier with this URL already exists in tenant"})
 			return
 		}
 		h.logger.Error("Failed to create verifier", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "verifier.create",
+			ResourceType: "verifier",
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create verifier"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "verifier.create",
+		ResourceType: "verifier",
+		ResourceID:   fmt.Sprintf("%d", verifier.ID),
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Verifier created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("name", req.Name))
@@ -979,10 +1126,26 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 
 	if err := h.store.Verifiers().Update(c.Request.Context(), verifier); err != nil {
 		h.logger.Error("Failed to update verifier", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "verifier.update",
+			ResourceType: "verifier",
+			ResourceID:   fmt.Sprintf("%d", verifierID),
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update verifier"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "verifier.update",
+		ResourceType: "verifier",
+		ResourceID:   fmt.Sprintf("%d", verifierID),
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Verifier updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
@@ -1015,10 +1178,26 @@ func (h *AdminHandlers) DeleteVerifier(c *gin.Context) {
 
 	if err := h.store.Verifiers().Delete(c.Request.Context(), tenantID, verifierID); err != nil {
 		h.logger.Error("Failed to delete verifier", zap.Error(err))
+		h.audit.Log(audit.Event{
+			Operation:    "verifier.delete",
+			ResourceType: "verifier",
+			ResourceID:   fmt.Sprintf("%d", verifierID),
+			TenantID:     string(tenantID),
+			OperatorIP:   c.ClientIP(),
+			Result:       audit.ResultFailure,
+		})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete verifier"})
 		return
 	}
 
+	h.audit.Log(audit.Event{
+		Operation:    "verifier.delete",
+		ResourceType: "verifier",
+		ResourceID:   fmt.Sprintf("%d", verifierID),
+		TenantID:     string(tenantID),
+		OperatorIP:   c.ClientIP(),
+		Result:       audit.ResultSuccess,
+	})
 	h.logger.Info("Verifier deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
