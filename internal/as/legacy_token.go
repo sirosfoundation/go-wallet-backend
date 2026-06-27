@@ -100,13 +100,21 @@ func (lti *LegacyTokenIssuer) IssueRefresh(userID, did, tenantID, rpID string, r
 }
 
 // Validate parses and validates a legacy HMAC token, returning the claims.
-func (lti *LegacyTokenIssuer) Validate(raw string) (*LegacyTokenClaims, error) {
+func (lti *LegacyTokenIssuer) Validate(raw string, audiences ...string) (*LegacyTokenClaims, error) {
+	opts := []jwt.ParserOption{
+		jwt.WithLeeway(5 * time.Second),
+		jwt.WithIssuer(lti.issuer),
+	}
+	for _, aud := range audiences {
+		opts = append(opts, jwt.WithAudience(aud))
+	}
+
 	token, err := jwt.ParseWithClaims(raw, &LegacyTokenClaims{}, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return lti.secret, nil
-	}, jwt.WithLeeway(5*time.Second))
+	}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("as: legacy token validation failed: %w", err)
 	}

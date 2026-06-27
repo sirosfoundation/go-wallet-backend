@@ -56,7 +56,7 @@ func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenI
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) int { return 120 }, logger)
+	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, logger)
 
 	return router, store, issuer
 }
@@ -182,7 +182,7 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) int { return 120 }, logger)
+	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, logger)
 
 	sess := &Session{
 		JTI:       "sess-deny",
@@ -255,3 +255,83 @@ type denyAllPolicy struct{}
 
 func (denyAllPolicy) Evaluate(_ string) (bool, error) { return false, nil }
 func (denyAllPolicy) RuleCount() int                  { return 0 }
+
+func TestTokenEndpoint_EmptyMaxTAC(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	// Session with empty MaxTAC — should deny all token requests.
+	sess := &Session{
+		JTI:       "sess-no-perms",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC(""),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-no-perms"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for empty MaxTAC, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_InvalidTAC(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-invalid-tac",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwlx"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Request with invalid character 'x' — should fail validation.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-invalid-tac"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid TAC, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_EmptyAudience(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-no-aud",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-no-aud"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty audience, got %d: %s", w.Code, w.Body.String())
+	}
+}

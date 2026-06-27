@@ -2,6 +2,7 @@ package as
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -21,7 +22,7 @@ func TokenEndpointHandler(
 	store SessionStore,
 	issuer *TokenIssuer,
 	policy PolicyEngine,
-	ttlFunc func(string) int,
+	ttlFunc func(string) time.Duration,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -45,6 +46,12 @@ func TokenEndpointHandler(
 			return
 		}
 
+		// Audience is required per spec.
+		if req.Audience == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "aud is required"})
+			return
+		}
+
 		// 3. Build candidate claims, merging request with session defaults.
 		tenantID := req.TenantID
 		if tenantID == "" {
@@ -56,8 +63,16 @@ func TokenEndpointHandler(
 			tac = session.MaxTAC
 		}
 
+		// An empty MaxTAC means the session grants no permissions.
+		if session.MaxTAC == "" {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "session has no granted permissions",
+			})
+			return
+		}
+
 		// Validate requested TAC is a subset of session MaxTAC.
-		if session.MaxTAC != "" && !tac.IsSubsetOf(session.MaxTAC) {
+		if !tac.IsSubsetOf(session.MaxTAC) {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error": "requested permissions exceed session maximum",
 			})
@@ -102,12 +117,12 @@ func TokenEndpointHandler(
 			return
 		}
 
-		expiresIn := ttlFunc(req.Audience)
+		ttl := ttlFunc(req.Audience)
 
 		c.JSON(http.StatusOK, TokenResponse{
 			AccessToken: tokenStr,
 			TokenType:   "Bearer",
-			ExpiresIn:   expiresIn,
+			ExpiresIn:   int(ttl.Seconds()),
 		})
 	}
 }
@@ -118,7 +133,7 @@ func RegisterTokenEndpoint(
 	store SessionStore,
 	issuer *TokenIssuer,
 	policy PolicyEngine,
-	ttlFunc func(string) int,
+	ttlFunc func(string) time.Duration,
 	logger *zap.Logger,
 ) {
 	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, logger))

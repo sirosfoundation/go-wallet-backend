@@ -107,7 +107,7 @@ func UnifiedAuthMiddleware(
 			return
 		}
 
-		claims, err := legacyIssuer.Validate(bearerToken)
+		claims, err := legacyIssuer.Validate(bearerToken, audiences...)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": "invalid token",
