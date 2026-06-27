@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 func TestExchangeCode_Success(t *testing.T) {
@@ -116,14 +118,32 @@ func TestHasAdminClaim(t *testing.T) {
 	}
 }
 
-func TestBuildRedirectURI(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "https://auth.example.com/auth/oidc/callback", nil)
-	req.Host = "auth.example.com"
-	req.Header.Set("X-Forwarded-Proto", "https")
-
-	uri := buildRedirectURI(req)
+func TestRedirectURI(t *testing.T) {
+	h := &OIDCHandlers{
+		cfg: &config.ASConfig{
+			ExternalURL: "https://auth.example.com",
+		},
+	}
 	expected := "https://auth.example.com/auth/oidc/callback"
-	if uri != expected {
-		t.Errorf("expected %s, got %s", expected, uri)
+	if got := h.redirectURI(); got != expected {
+		t.Errorf("expected %s, got %s", expected, got)
+	}
+
+	// Trailing slash in config should be stripped.
+	h.cfg.ExternalURL = "https://auth.example.com/"
+	if got := h.redirectURI(); got != expected {
+		t.Errorf("expected %s, got %s (trailing slash)", expected, got)
+	}
+}
+
+func TestHashNonce(t *testing.T) {
+	nonce := "test-nonce-value"
+	hash1 := hashNonce(nonce)
+	hash2 := hashNonce(nonce)
+	if hash1 != hash2 {
+		t.Error("hashNonce should be deterministic")
+	}
+	if hashNonce("different") == hash1 {
+		t.Error("different nonces should produce different hashes")
 	}
 }

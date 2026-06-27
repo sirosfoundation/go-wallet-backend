@@ -2,9 +2,10 @@ package as
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -78,10 +79,22 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 		return
 	}
 
+	// Generate nonce for ID token replay protection.
+	nonce, err := generateOIDCState()
+	if err != nil {
+		h.logger.Error("failed to generate OIDC nonce", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	// Store the nonce hash for validation — we don't need to recover the raw nonce.
+	nonceHash := hashNonce(nonce)
+
 	// Store state as a challenge for validation on callback.
+	// The nonce hash is stored in the UserID field (unused for OIDC flows).
 	challenge := &domain.WebauthnChallenge{
 		ID:        state,
 		TenantID:  tenantID,
+		UserID:    nonceHash,
 		Challenge: state,
 		Action:    oidcChallengeAction,
 		ExpiresAt: time.Now().Add(10 * time.Minute),
@@ -102,16 +115,19 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 		return
 	}
 
-	redirectURI := buildRedirectURI(c.Request)
+	redirectURI := h.redirectURI()
 	scopes := op.EffectiveScopes()
 
-	authURL := fmt.Sprintf("%s?response_type=code&client_id=%s&redirect_uri=%s&scope=%s&state=%s",
-		disc.AuthorizationEndpoint,
-		op.ClientID,
-		redirectURI,
-		strings.ReplaceAll(scopes, " ", "+"),
-		state,
-	)
+	// Build auth URL with properly encoded parameters.
+	params := url.Values{
+		"response_type": {"code"},
+		"client_id":     {op.ClientID},
+		"redirect_uri":  {redirectURI},
+		"scope":         {scopes},
+		"state":         {state},
+		"nonce":         {nonce},
+	}
+	authURL := disc.AuthorizationEndpoint + "?" + params.Encode()
 
 	c.Redirect(http.StatusFound, authURL)
 }
@@ -184,7 +200,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		return
 	}
 
-	redirectURI := buildRedirectURI(c.Request)
+	redirectURI := h.redirectURI()
 	tokenResp, err := exchangeCode(c.Request.Context(), disc.TokenEndpoint, code, op.ClientID, redirectURI)
 	if err != nil {
 		h.logger.Error("OIDC token exchange failed", zap.Error(err))
@@ -204,6 +220,22 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		h.logger.Warn("OIDC ID token validation failed", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid ID token"})
 		return
+	}
+
+	// Validate nonce: the ID token's nonce claim must match the stored hash.
+	expectedNonceHash := challenge.UserID // stored nonce hash
+	if expectedNonceHash != "" {
+		if nonceClaim, ok := result.Claims["nonce"].(string); ok {
+			if hashNonce(nonceClaim) != expectedNonceHash {
+				h.logger.Warn("OIDC nonce mismatch")
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "nonce mismatch"})
+				return
+			}
+		} else {
+			h.logger.Warn("OIDC ID token missing nonce claim")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing nonce in ID token"})
+			return
+		}
 	}
 
 	// Map claims to session.
@@ -281,12 +313,15 @@ func generateOIDCState() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func buildRedirectURI(r *http.Request) string {
-	scheme := "https"
-	if r.TLS == nil {
-		if fwd := r.Header.Get("X-Forwarded-Proto"); fwd != "" {
-			scheme = fwd
-		}
-	}
-	return fmt.Sprintf("%s://%s/auth/oidc/callback", scheme, r.Host)
+// redirectURI returns the OIDC callback URI from config.
+// Using a configured value prevents Host header injection attacks.
+func (h *OIDCHandlers) redirectURI() string {
+	return strings.TrimRight(h.cfg.ExternalURL, "/") + "/auth/oidc/callback"
+}
+
+// hashNonce returns a base64url-encoded SHA-256 hash of the nonce.
+// We store the hash rather than the raw nonce to avoid leaking it from the store.
+func hashNonce(nonce string) string {
+	h := sha256.Sum256([]byte(nonce))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }

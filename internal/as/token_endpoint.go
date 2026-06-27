@@ -29,7 +29,6 @@ func TokenEndpointHandler(
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 2. Parse request.
 		var req TokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})

@@ -71,6 +71,10 @@ type ASConfig struct {
 
 	// Legacy contains configuration for legacy (HMAC) token compatibility.
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
+
+	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
+	// Used to construct OIDC redirect URIs. Required when OIDC is used.
+	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 }
 
 // ASLegacyConfig controls the legacy all-in-one HMAC token sunset.
