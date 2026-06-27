@@ -60,6 +60,15 @@ type ASConfig struct {
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
 	RulesDir string `yaml:"rules_dir" envconfig:"RULES_DIR"`
 
+	// SessionTTL is the maximum session lifetime before re-authentication.
+	// Default: 24h
+	SessionTTL time.Duration `yaml:"session_ttl" envconfig:"SESSION_TTL"`
+
+	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
+	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
+	// Default: "rwl" (read, write, list)
+	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
+
 	// Legacy contains configuration for legacy (HMAC) token compatibility.
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 }
@@ -83,6 +92,12 @@ type ASLegacyConfig struct {
 func (c *ASConfig) SetDefaults() {
 	if c.DefaultTokenTTL == 0 {
 		c.DefaultTokenTTL = 2 * time.Minute
+	}
+	if c.SessionTTL == 0 {
+		c.SessionTTL = 24 * time.Hour
+	}
+	if c.DefaultMaxTAC == "" {
+		c.DefaultMaxTAC = "rwl"
 	}
 }
 
