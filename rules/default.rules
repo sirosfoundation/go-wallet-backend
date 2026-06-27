@@ -1,0 +1,18 @@
+; Default SPOCP policy rules for the SIROS Authorization Server.
+;
+; These rules define the baseline access control policy for token issuance.
+; Additional rules can be added per-deployment by placing .spocp files in
+; the configured rules directory.
+;
+; Rule format: (token (claim value) ...)
+; A query matches if it is "less permissive" than at least one rule.
+
+; Read-only access (r, l) is always allowed for any authenticated user.
+; This matches any token request that only asks for read/list permissions.
+(5:token (3:tac 1:r))
+(5:token (3:tac 1:l))
+(5:token (3:tac 2:rl))
+
+; Users can get tokens scoped to their own tenant with any valid tac.
+; The wildcard (*) in the sub position means any authenticated subject.
+(5:token (3:sub (*)) (9:tenant_id (*)))
