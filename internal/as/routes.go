@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"go.uber.org/zap"
 )
@@ -19,6 +20,7 @@ type ASModule struct {
 	Sessions       SessionStore
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
+	OIDCHandler    *OIDCHandlers
 	Logger         *zap.Logger
 	Config         *config.ASConfig
 }
@@ -29,6 +31,7 @@ func NewASModule(
 	cfg *config.ASConfig,
 	jwtCfg *config.JWTConfig,
 	webauthnSvc *service.WebAuthnService,
+	store storage.Store,
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
@@ -75,6 +78,9 @@ func NewASModule(
 	// Passkey handlers.
 	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, legacyIssuer, cfg, logger)
 
+	// OIDC handlers.
+	oidcHandler := NewOIDCHandlers(store, sessions, cfg, logger)
+
 	return &ASModule{
 		KeyManager:     km,
 		TokenIssuer:    tokenIssuer,
@@ -82,6 +88,7 @@ func NewASModule(
 		Sessions:       sessions,
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
+		OIDCHandler:    oidcHandler,
 		Logger:         logger,
 		Config:         cfg,
 	}, nil
@@ -100,6 +107,13 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 		passkey.POST("/login/finish", m.PasskeyHandler.LoginFinish)
 		passkey.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 		passkey.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
+	}
+
+	// OIDC authentication (public, no auth — redirects to IdP).
+	oidcGroup := auth.Group("/oidc")
+	{
+		oidcGroup.GET("/login", m.OIDCHandler.Login)
+		oidcGroup.GET("/callback", m.OIDCHandler.Callback)
 	}
 
 	// Token endpoint (requires session cookie).
