@@ -59,6 +59,17 @@ func (t TAC) IsSubsetOf(other TAC) bool {
 	return true
 }
 
+// Without returns a new TAC with all occurrences of the given permission removed.
+func (t TAC) Without(perm byte) TAC {
+	var result []byte
+	for i := range t {
+		if t[i] != perm {
+			result = append(result, t[i])
+		}
+	}
+	return TAC(result)
+}
+
 // Validate returns an error if the TAC contains invalid characters.
 func (t TAC) Validate() error {
 	for i := range t {

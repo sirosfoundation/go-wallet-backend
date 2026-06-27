@@ -335,3 +335,181 @@ func TestTokenEndpoint_EmptyAudience(t *testing.T) {
 		t.Errorf("expected 400 for empty audience, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// --- Delegation tests ---
+
+func TestTokenEndpoint_Delegation_Success(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Issue a parent token with 'k' (delegate) permission.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request a delegation token with downscoped TAC.
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "rl"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	// Verify the delegated token is properly downscoped.
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"downstream-api"})
+	if err != nil {
+		t.Fatalf("parse delegated token: %v", err)
+	}
+	if claims.TenantID != "tenant-1" {
+		t.Errorf("expected tenant_id tenant-1, got %s", claims.TenantID)
+	}
+	if claims.TAC != TAC("rl") {
+		t.Errorf("expected tac rl, got %s", claims.TAC)
+	}
+	if claims.Subject != "user-1" {
+		t.Errorf("expected subject user-1, got %s", claims.Subject)
+	}
+}
+
+func TestTokenEndpoint_Delegation_DefaultTACStripsK(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request with no TAC — should default to parent's TAC minus 'k'.
+	body, _ := json.Marshal(TokenRequest{Audience: "api"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"api"})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if claims.TAC.Has(TACDelegate) {
+		t.Error("default delegated token should not have 'k' permission")
+	}
+	if claims.TAC != TAC("rwl") {
+		t.Errorf("expected tac rwl, got %s", claims.TAC)
+	}
+}
+
+func TestTokenEndpoint_Delegation_NoKPermission(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent token without 'k' — delegation should be denied.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwl"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_TACExceedsParent(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent has rwlk, request asks for 'i' which parent doesn't have.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "ri"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_CrossTenantDenied(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to delegate to a different tenant.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "tenant-2", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant delegation, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent has 'k' — explicitly request 'k' in delegated token (re-delegation).
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "rk"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for re-delegation, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"api"})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if !claims.TAC.Has(TACDelegate) {
+		t.Error("re-delegated token should have 'k' permission")
+	}
+}

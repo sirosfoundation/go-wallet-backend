@@ -46,6 +46,14 @@ func TestTAC_Validate(t *testing.T) {
 	assert.Error(t, TAC("r1").Validate())
 }
 
+func TestTAC_Without(t *testing.T) {
+	assert.Equal(t, TAC("rwl"), TAC("rwlk").Without(TACDelegate))
+	assert.Equal(t, TAC("r"), TAC("rk").Without(TACDelegate))
+	assert.Equal(t, TAC(""), TAC("k").Without(TACDelegate))
+	assert.Equal(t, TAC("rwl"), TAC("rwl").Without(TACDelegate))
+	assert.Equal(t, TAC(""), TAC("").Without(TACDelegate))
+}
+
 func testKeyManager(t *testing.T) *KeyManager {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
