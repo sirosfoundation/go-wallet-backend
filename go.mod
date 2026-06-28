@@ -12,10 +12,10 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/prometheus/client_golang v1.23.2
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/redis/go-redis/v9 v9.21.0
 	github.com/sirosfoundation/go-cryptoutil v0.5.0
 	github.com/sirosfoundation/go-spocp v0.1.0
-	github.com/sirosfoundation/go-trust v0.6.0
+	github.com/sirosfoundation/go-trust v0.6.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	go.mongodb.org/mongo-driver v1.17.9
