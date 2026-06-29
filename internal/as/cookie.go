@@ -28,6 +28,9 @@ func DefaultCookieOptions() CookieOptions {
 
 // SetSessionCookie sets the session cookie on the response.
 // Path is always "/" to comply with the __Host- prefix requirements.
+// SameSite=Strict is used (not Lax) because the AS session cookie is never
+// needed on cross-site navigations — login/register are same-origin API calls,
+// and OIDC callbacks use a separate state parameter for CSRF protection.
 func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     SessionCookieName,

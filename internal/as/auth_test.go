@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
@@ -269,4 +271,107 @@ func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for session/token user mismatch, got %d", w.Code)
 	}
+}
+
+func TestUnifiedAuth_TenantMismatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokenIssuer, _, store := setupUnifiedAuth(t)
+	logger := zap.NewNop()
+
+	sess := &Session{
+		JTI:       "session-tenant1",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		ACR:       "urn:siros:acr:passkey",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Create(context.Background(), sess))
+
+	// Issue token for same user but different tenant.
+	accessToken, err := tokenIssuer.Issue("user-1", "test-audience", "tenant-2", TAC("r"), "urn:siros:acr:passkey")
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-tenant1"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "tenant does not match")
+}
+
+func TestUnifiedAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokenIssuer, _, store := setupUnifiedAuth(t)
+	logger := zap.NewNop()
+
+	// Session with cross-tenant scope.
+	sess := &Session{
+		JTI:       "session-cross",
+		UserID:    "admin-1",
+		TenantID:  "*",
+		ACR:       "urn:siros:acr:passkey",
+		MaxTAC:    TAC("rwlka"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Create(context.Background(), sess))
+
+	// Token narrowed to specific tenant — should be allowed.
+	accessToken, err := tokenIssuer.Issue("admin-1", "test-audience", "tenant-3", TAC("r"), "urn:siros:acr:passkey")
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-cross"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestUnifiedAuth_TACExceedsSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokenIssuer, _, store := setupUnifiedAuth(t)
+	logger := zap.NewNop()
+
+	// Session with limited TAC.
+	sess := &Session{
+		JTI:       "session-limited",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		ACR:       "urn:siros:acr:passkey",
+		MaxTAC:    TAC("rl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Create(context.Background(), sess))
+
+	// Token with write permission exceeding session's MaxTAC.
+	accessToken, err := tokenIssuer.Issue("user-1", "test-audience", "tenant-1", TAC("rw"), "urn:siros:acr:passkey")
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-limited"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "exceeds session permissions")
 }

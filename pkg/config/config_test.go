@@ -1444,3 +1444,54 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 		t.Errorf("expected AS issuer to fall back to JWT issuer, got %q", cfg.AS.Issuer)
 	}
 }
+
+func TestConfig_Validate_AS_NegativeSessionTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.SessionTTL = -1 * time.Hour
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative session_ttl")
+	}
+	if !strings.Contains(err.Error(), "session_ttl must be positive") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_InvalidAudienceTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.AudienceTTLs = map[string]time.Duration{
+		"good": 5 * time.Minute,
+		"bad":  -1 * time.Second,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for non-positive audience TTL")
+	}
+	if !strings.Contains(err.Error(), "audience_ttls") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_InvalidMaxTACChars(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.DefaultMaxTAC = "rwx" // 'x' is invalid
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid TAC character")
+	}
+	if !strings.Contains(err.Error(), "invalid character") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}

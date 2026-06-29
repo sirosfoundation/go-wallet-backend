@@ -194,18 +194,25 @@ func TestTokenIssuer_Issue_InvalidTAC(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid tac")
 }
 
-func TestTokenIssuer_ParseAndVerify_InvalidTACInToken(t *testing.T) {
+func TestTokenIssuer_ParseAndVerify_ValidTAC(t *testing.T) {
 	km := testKeyManager(t)
 	ti := NewTokenIssuer(km, "https://as.example.com", func(string) time.Duration { return time.Minute })
 
-	// Manually create a token with an invalid TAC by issuing with valid TAC first,
-	// then testing that the validator catches malformed TAC. Since Issue now validates,
-	// we need to bypass it — test via ParseAndVerify with a forged token.
-	// The simplest approach: issue with valid TAC and verify ParseAndVerify accepts it.
+	// Issue with valid TAC and verify ParseAndVerify accepts it.
 	token, err := ti.Issue("user", "api", "tenant", TAC("rwl"), "")
 	require.NoError(t, err)
 
 	claims, err := ti.ParseAndVerify(token, []string{"api"})
 	require.NoError(t, err)
 	assert.Equal(t, TAC("rwl"), claims.TAC)
+}
+
+func TestTokenIssuer_Issue_RejectsInvalidTAC(t *testing.T) {
+	km := testKeyManager(t)
+	ti := NewTokenIssuer(km, "https://as.example.com", func(string) time.Duration { return time.Minute })
+
+	// Issue with invalid TAC character — should be rejected.
+	_, err := ti.Issue("user", "api", "tenant", TAC("rxz"), "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid tac")
 }

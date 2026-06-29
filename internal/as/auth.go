@@ -83,6 +83,22 @@ func UnifiedAuthMiddleware(
 				return
 			}
 
+			// Verify the token's tenant matches the session (unless session is cross-tenant).
+			if session.TenantID != "*" && claims.TenantID != session.TenantID {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error": "access token tenant does not match session",
+				})
+				return
+			}
+
+			// Verify the token's TAC is a subset of the session's MaxTAC.
+			if !claims.TAC.IsSubsetOf(session.MaxTAC) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error": "access token exceeds session permissions",
+				})
+				return
+			}
+
 			c.Set(authContextKey, &AuthContext{
 				UserID:   claims.Subject,
 				TenantID: claims.TenantID,

@@ -1078,6 +1078,25 @@ func (c *Config) Validate() error {
 		if c.AS.DefaultTokenTTL < 0 {
 			return fmt.Errorf("as: default_token_ttl must be positive")
 		}
+		if c.AS.SessionTTL < 0 {
+			return fmt.Errorf("as: session_ttl must be positive")
+		}
+		for aud, ttl := range c.AS.AudienceTTLs {
+			if ttl <= 0 {
+				return fmt.Errorf("as: audience_ttls[%q] must be positive", aud)
+			}
+		}
+		if c.AS.DefaultMaxTAC != "" {
+			for i := range c.AS.DefaultMaxTAC {
+				ch := c.AS.DefaultMaxTAC[i]
+				switch ch {
+				case 'r', 'w', 'l', 'i', 'd', 'k', 'a':
+					// valid
+				default:
+					return fmt.Errorf("as: default_max_tac contains invalid character %q", ch)
+				}
+			}
+		}
 		c.AS.SetDefaults()
 		// Default issuer to JWT.Issuer if not explicitly set.
 		if c.AS.Issuer == "" {

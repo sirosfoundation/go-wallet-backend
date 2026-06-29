@@ -142,7 +142,8 @@ func handleDelegationTokenRequest(
 	if tenantID == "" {
 		tenantID = parentClaims.TenantID
 	}
-	// Delegated token must have the same tenant_id (no cross-tenant delegation).
+	// Delegated token must have the same tenant_id, unless the parent has
+	// cross-tenant scope ("*"), in which case it may be narrowed to a specific tenant.
 	if parentClaims.TenantID != "*" && tenantID != parentClaims.TenantID {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": "delegation cannot change tenant",
