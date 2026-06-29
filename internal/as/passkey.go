@@ -1,6 +1,7 @@
 package as
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -10,12 +11,21 @@ import (
 	"go.uber.org/zap"
 )
 
+// WebAuthnProvider is the interface for WebAuthn operations needed by the AS.
+// This abstraction allows testing with mocks.
+type WebAuthnProvider interface {
+	BeginLogin(ctx context.Context) (*service.BeginLoginResponse, error)
+	FinishLogin(ctx context.Context, req *service.FinishLoginRequest) (*service.FinishLoginResponse, error)
+	BeginRegistration(ctx context.Context, req *service.BeginRegistrationRequest) (*service.BeginRegistrationResponse, error)
+	FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error)
+}
+
 // PasskeyHandlers provides the new AS wrappers around the existing WebAuthnService.
 // On successful authentication, they create an AS session and set the session cookie.
 // For legacy clients (no X-Token-Mode: session header), the existing response format
 // is preserved.
 type PasskeyHandlers struct {
-	webauthn     *service.WebAuthnService
+	webauthn     WebAuthnProvider
 	sessions     SessionStore
 	legacyIssuer *LegacyTokenIssuer
 	cfg          *config.ASConfig
@@ -24,7 +34,7 @@ type PasskeyHandlers struct {
 
 // NewPasskeyHandlers creates passkey auth handlers for the AS.
 func NewPasskeyHandlers(
-	webauthn *service.WebAuthnService,
+	webauthn WebAuthnProvider,
 	sessions SessionStore,
 	legacyIssuer *LegacyTokenIssuer,
 	cfg *config.ASConfig,
