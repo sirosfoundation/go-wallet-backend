@@ -119,6 +119,10 @@ func NewTokenIssuer(km *KeyManager, issuer string, ttlFunc func(audience string)
 
 // Issue creates and signs an access token with the given claims.
 func (ti *TokenIssuer) Issue(sub, audience, tenantID string, tac TAC, acr string) (string, error) {
+	if err := tac.Validate(); err != nil {
+		return "", fmt.Errorf("as: invalid tac: %w", err)
+	}
+
 	sk := ti.km.ActiveKey()
 	if sk == nil {
 		return "", fmt.Errorf("as: no active signing key")
@@ -186,6 +190,11 @@ func (ti *TokenIssuer) ParseAndVerify(raw string, audiences []string) (*AccessTo
 
 	if err := claims.ValidateWithLeeway(expected, 5*time.Second); err != nil {
 		return nil, fmt.Errorf("as: token validation failed: %w", err)
+	}
+
+	// Validate the custom TAC claim.
+	if err := claims.TAC.Validate(); err != nil {
+		return nil, fmt.Errorf("as: token has invalid tac claim: %w", err)
 	}
 
 	return &claims, nil

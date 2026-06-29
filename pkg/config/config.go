@@ -37,7 +37,7 @@ type ASConfig struct {
 	// Enabled controls whether the new AS is active.
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
-	// SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256 or Ed25519)
+	// SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519)
 	// used to sign access tokens. Mutually exclusive with SigningKeyPKCS11.
 	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
 
@@ -1069,7 +1069,23 @@ func (c *Config) Validate() error {
 		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != "" {
 			return fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
 		}
+		if c.AS.SigningKeyPKCS11 != "" {
+			return fmt.Errorf("as: signing_key_pkcs11 is not yet implemented; use signing_key_path")
+		}
+		if c.AS.RulesDir == "" {
+			return fmt.Errorf("as: rules_dir is required when AS is enabled (AllowAll is not safe for production)")
+		}
+		if c.AS.DefaultTokenTTL < 0 {
+			return fmt.Errorf("as: default_token_ttl must be positive")
+		}
 		c.AS.SetDefaults()
+		// Default issuer to JWT.Issuer if not explicitly set.
+		if c.AS.Issuer == "" {
+			c.AS.Issuer = c.JWT.Issuer
+		}
+		if c.AS.Issuer == "" {
+			return fmt.Errorf("as: issuer is required (set as.issuer or jwt.issuer)")
+		}
 	}
 
 	return nil

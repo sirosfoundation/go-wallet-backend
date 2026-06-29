@@ -26,8 +26,10 @@ type ASModule struct {
 }
 
 // NewASModule creates and initializes the AS module.
+// The ctx parameter controls the lifecycle of background goroutines (session cleanup).
 // Returns an error if the signing key cannot be loaded.
 func NewASModule(
+	ctx context.Context,
 	cfg *config.ASConfig,
 	jwtCfg *config.JWTConfig,
 	webauthnSvc *service.WebAuthnService,
@@ -61,7 +63,7 @@ func NewASModule(
 
 	// Session store.
 	sessions := NewMemorySessionStore()
-	sessions.StartCleanup(context.Background(), 5*time.Minute)
+	sessions.StartCleanup(ctx, 5*time.Minute)
 
 	// Policy engine.
 	var policy PolicyEngine

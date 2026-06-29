@@ -513,3 +513,57 @@ func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
 		t.Error("re-delegated token should have 'k' permission")
 	}
 }
+
+func TestTokenEndpoint_CrossTenantDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Try to request a token for a different tenant.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "tenant-other", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-tenant"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant session token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_CrossTenantAllowedForWildcard(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	// Cross-tenant session (admin) can issue tokens for any tenant.
+	sess := &Session{
+		JTI:       "sess-admin",
+		UserID:    "admin-1",
+		TenantID:  "*",
+		MaxTAC:    TAC("rwlida"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "any-tenant", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-admin"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for wildcard session, got %d: %s", w.Code, w.Body.String())
+	}
+}

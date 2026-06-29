@@ -137,8 +137,6 @@ func TestCookie_SetAndGet(t *testing.T) {
 	r := gin.New()
 	r.GET("/set", func(c *gin.Context) {
 		SetSessionCookie(c, "test-jti", CookieOptions{
-			Secure: true,
-			Path:   "/",
 			MaxAge: 3600,
 		})
 		c.Status(http.StatusOK)

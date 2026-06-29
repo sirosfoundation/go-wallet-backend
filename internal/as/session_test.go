@@ -149,3 +149,29 @@ func TestGenerateSessionID(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, id1, id2) // Unique
 }
+
+func TestStartCleanup_RemovesExpired(t *testing.T) {
+	store := NewMemorySessionStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Add an expired session.
+	_ = store.Create(ctx, &Session{
+		JTI:       "expired-1",
+		UserID:    "user-1",
+		TenantID:  "t",
+		ExpiresAt: time.Now().Add(-time.Hour),
+	})
+
+	// Start cleanup with a very short interval.
+	store.StartCleanup(ctx, 10*time.Millisecond)
+
+	// Wait for at least one cleanup cycle.
+	time.Sleep(50 * time.Millisecond)
+
+	got, _ := store.Get(ctx, "expired-1")
+	assert.Nil(t, got, "expired session should be cleaned up")
+
+	// Cancel stops the goroutine (no leak).
+	cancel()
+}

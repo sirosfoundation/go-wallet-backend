@@ -58,10 +58,17 @@ func (km *KeyManager) ActiveKey() *SigningKey {
 }
 
 // JWKS returns the cached JSON Web Key Set containing all public keys.
+// Returns a defensive copy to prevent callers from mutating internal state.
 func (km *KeyManager) JWKS() jose.JSONWebKeySet {
 	km.mu.RLock()
 	defer km.mu.RUnlock()
-	return km.jwksSet
+	copy := jose.JSONWebKeySet{
+		Keys: make([]jose.JSONWebKey, len(km.jwksSet.Keys)),
+	}
+	for i, k := range km.jwksSet.Keys {
+		copy.Keys[i] = k
+	}
+	return copy
 }
 
 // AddKey adds a signing key. If activate is true, it becomes the active key.
@@ -87,7 +94,8 @@ func (km *KeyManager) RemoveKey(kid string) error {
 	return nil
 }
 
-// rebuildJWKS rebuilds the cached JWKS. Must be called with mu held.
+// rebuildJWKS rebuilds the cached JWKS.
+// Must be called with mu held (write lock), or during construction before sharing.
 func (km *KeyManager) rebuildJWKS() {
 	var keys []jose.JSONWebKey
 	for _, sk := range km.keys {
@@ -103,7 +111,7 @@ func (km *KeyManager) rebuildJWKS() {
 }
 
 // loadSigningKeyFromFile reads a PEM-encoded private key and returns a SigningKey.
-// Supported key types: ECDSA P-256, Ed25519.
+// Supported key types: ECDSA P-256, ECDSA P-384, Ed25519.
 func loadSigningKeyFromFile(path string) (*SigningKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

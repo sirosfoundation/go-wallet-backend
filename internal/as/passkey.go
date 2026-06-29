@@ -1,7 +1,6 @@
 package as
 
 import (
-	"context"
 	"net/http"
 	"time"
 
@@ -96,8 +95,6 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 
 	// Set session cookie.
 	SetSessionCookie(c, sessionID, CookieOptions{
-		Secure: true,
-		Path:   "/",
 		MaxAge: int(h.cfg.SessionTTL.Seconds()),
 	})
 
@@ -174,15 +171,13 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 		ExpiresAt: now.Add(h.cfg.SessionTTL),
 	}
 
-	if err := h.sessions.Create(context.Background(), session); err != nil {
+	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
 		h.logger.Error("failed to create session", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
 	SetSessionCookie(c, sessionID, CookieOptions{
-		Secure: true,
-		Path:   "/",
 		MaxAge: int(h.cfg.SessionTTL.Seconds()),
 	})
 

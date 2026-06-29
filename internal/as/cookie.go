@@ -14,12 +14,6 @@ const (
 
 // CookieOptions configures session cookie behavior.
 type CookieOptions struct {
-	// Secure sets the Secure flag. Should be true in production (HTTPS).
-	Secure bool
-
-	// Path is the cookie path. Defaults to "/".
-	Path string
-
 	// MaxAge is the cookie max-age in seconds. 0 means session cookie (browser closes).
 	// Should match the session TTL.
 	MaxAge int
@@ -28,43 +22,33 @@ type CookieOptions struct {
 // DefaultCookieOptions returns production-safe cookie defaults.
 func DefaultCookieOptions() CookieOptions {
 	return CookieOptions{
-		Secure: true,
-		Path:   "/",
 		MaxAge: 0, // session cookie
 	}
 }
 
 // SetSessionCookie sets the session cookie on the response.
+// Path is always "/" to comply with the __Host- prefix requirements.
 func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
-	path := opts.Path
-	if path == "" {
-		path = "/"
-	}
-
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    jti,
-		Path:     path,
+		Path:     "/",
 		MaxAge:   opts.MaxAge,
-		Secure:   opts.Secure,
+		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
 }
 
 // ClearSessionCookie removes the session cookie.
+// Path is always "/" to comply with the __Host- prefix requirements.
 func ClearSessionCookie(c *gin.Context, opts CookieOptions) {
-	path := opts.Path
-	if path == "" {
-		path = "/"
-	}
-
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    "",
-		Path:     path,
+		Path:     "/",
 		MaxAge:   -1,
-		Secure:   opts.Secure,
+		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})

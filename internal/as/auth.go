@@ -75,6 +75,14 @@ func UnifiedAuthMiddleware(
 				return
 			}
 
+			// Verify the access token belongs to this session's user.
+			if claims.Subject != session.UserID {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error": "access token does not match session",
+				})
+				return
+			}
+
 			c.Set(authContextKey, &AuthContext{
 				UserID:   claims.Subject,
 				TenantID: claims.TenantID,

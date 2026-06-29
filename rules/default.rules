@@ -1,7 +1,7 @@
 ; Default SPOCP policy rules for the SIROS Authorization Server.
 ;
 ; These rules define the baseline access control policy for token issuance.
-; Additional rules can be added per-deployment by placing .spocp files in
+; Additional rules can be added per-deployment by placing .rules files in
 ; the configured rules directory.
 ;
 ; Rule format: (token (claim value) ...)
@@ -14,5 +14,7 @@
 (5:token (3:tac 2:rl))
 
 ; Users can get tokens scoped to their own tenant with any valid tac.
-; The wildcard (*) in the sub position means any authenticated subject.
+; Tenant scoping is enforced at the code level (session.TenantID must match
+; unless the session is cross-tenant). The wildcard here permits the policy
+; evaluation to pass once code-level tenant enforcement is satisfied.
 (5:token (3:sub (*)) (9:tenant_id (*)))

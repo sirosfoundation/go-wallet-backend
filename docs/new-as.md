@@ -578,4 +578,52 @@ Phases 8–9 follow once the shared library is adopted.
 - **go-spocp** (`github.com/sirosfoundation/go-spocp`): Already in `go.mod`, unused. Provides `AdaptiveEngine` for policy evaluation.
 - **go-cryptoutil** (`github.com/sirosfoundation/go-cryptoutil`): PKCS#11 key loading if HSM-backed signing is needed.
 - **go-tokenauth** (`github.com/sirosfoundation/go-tokenauth`): New shared library. All backend services import this for token validation.
+
+---
+
+## Implementation Status
+
+### Completed (PR #229)
+
+| Phase | Status | Tests |
+|-------|--------|-------|
+| Phase 1: Core token infrastructure | ✅ Done | Key loading, JWKS, token issue/verify, TAC |
+| Phase 2: Session management | ✅ Done | In-memory store, cookie, cleanup |
+| Phase 3: Legacy compatibility | ✅ Done | HMAC tokens, deprecation headers, compat mode |
+| Phase 4: SPOCP policy authorization | ✅ Done | Policy evaluation, deny paths, query endpoint |
+| Phase 5: Authentication endpoints | ✅ Done | Middleware, OIDC RP, passkey scaffolding |
+| Phase 6: Delegation | ✅ Done | Downscope, re-delegation, cross-tenant denial |
+
+**97 tests**, 62% statement coverage.
+
+### Security hardening applied
+
+- **Session/token binding**: `UnifiedAuthMiddleware` verifies the Bearer token's `sub` matches the session's `UserID` (prevents token/session mixing attacks).
+- **Tenant enforcement**: Session-based token issuance rejects cross-tenant requests unless the session is cross-tenant (`TenantID == "*"`).
+- **OIDC security**: Uses `cfg.ExternalURL` (not `Host` header) for redirect URIs; nonce is SHA-256 hashed in the OIDC state; all params use `url.Values` encoding.
+- **Cookie security**: `__Host-` prefix with hardcoded `Secure=true`, `Path=/`, `HttpOnly`, `SameSite=Strict`.
+- **HTTP client timeout**: OIDC token exchange uses 30s timeout.
+- **TAC validation**: `TokenIssuer.Issue()` and `ParseAndVerify()` both validate TAC characters.
+- **JWKS defensive copy**: `KeyManager.JWKS()` returns a copy of the key slice to prevent caller mutation.
+- **Lifecycle management**: Session cleanup goroutine is tied to a cancellable context (not `context.Background()`).
+
+### Phase 7: go-tokenauth (separate repo)
+
+Status: ✅ Complete — `github.com/sirosfoundation/go-tokenauth` published with:
+- JWKS fetcher with background refresh
+- Dual-mode validator (HMAC legacy + asymmetric new-style)
+- Gin middleware (`TokenAuth`, `MustHaveTAC`, `GetResult`)
+- Revocation checker interface
+- 19 tests passing
+- Full CI/CD scaffolding (lint, security, CodeQL, SBOM, Scorecard, SonarCloud)
+
+### Remaining work
+
+| Phase | Task | Notes |
+|-------|------|-------|
+| 7.2 | Adopt go-tokenauth in go-wallet-backend | Replace `pkg/middleware/auth.go` |
+| 7.3 | Adopt go-tokenauth in facetec-api | Replace `jwtTenantAuth()` |
+| 7.4 | Adopt go-tokenauth in vc | Wire into httphelpers |
+| 8 | Revocation + rate limiting | Revocation store, Redis checker, rate limits |
+| 9 | RouteProvider integration | Mode-based routing, frontend coordination |
 - **go-ztts** (discontinued): Reference patterns for SPOCP query construction, revocation store, replay guard, and per-profile key management.

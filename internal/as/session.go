@@ -135,18 +135,20 @@ func (s *MemorySessionStore) Cleanup() int {
 }
 
 // StartCleanup runs periodic cleanup in a background goroutine.
-// Stops when the context is cancelled.
+// Stops when the context is cancelled. Returns immediately.
 func (s *MemorySessionStore) StartCleanup(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			s.Cleanup()
-		case <-ctx.Done():
-			return
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.Cleanup()
+			case <-ctx.Done():
+				return
+			}
 		}
-	}
+	}()
 }
 
 // GenerateSessionID creates a cryptographically random session identifier.

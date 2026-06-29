@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // oidcTokenResponse is the response from the OIDC token endpoint.
@@ -37,7 +38,7 @@ func exchangeCode(ctx context.Context, tokenEndpoint, code, clientID, redirectUR
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("as: token exchange request failed: %w", err)

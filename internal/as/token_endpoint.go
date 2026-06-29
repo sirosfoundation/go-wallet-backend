@@ -73,6 +73,15 @@ func handleSessionTokenRequest(
 		tenantID = session.TenantID
 	}
 
+	// Enforce tenant scoping: session-based tokens cannot target a different tenant
+	// unless the session itself is cross-tenant (TenantID == "*").
+	if session.TenantID != "*" && tenantID != session.TenantID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "cannot issue token for a different tenant",
+		})
+		return
+	}
+
 	tac := TAC(req.TAC)
 	if tac == "" {
 		tac = session.MaxTAC

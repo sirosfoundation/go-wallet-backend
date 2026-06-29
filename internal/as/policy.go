@@ -34,7 +34,7 @@ func NewSPOCPEngine(logger *zap.Logger) *SPOCPEngine {
 	}
 }
 
-// LoadRulesFromDir loads all .spocp files from the given directory.
+// LoadRulesFromDir loads all .rules files from the given directory.
 func (pe *SPOCPEngine) LoadRulesFromDir(dir string) error {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()

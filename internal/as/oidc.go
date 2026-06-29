@@ -271,8 +271,6 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	SetSessionCookie(c, sessionID, CookieOptions{
-		Secure: true,
-		Path:   "/",
 		MaxAge: int(h.cfg.SessionTTL.Seconds()),
 	})
 

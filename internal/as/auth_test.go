@@ -228,3 +228,45 @@ func TestUnifiedAuth_LegacyDisabled(t *testing.T) {
 		t.Errorf("expected 401, got %d", w.Code)
 	}
 }
+
+func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokenIssuer, _, store := setupUnifiedAuth(t)
+	logger := zap.NewNop()
+
+	// Create a session for user-1.
+	sess := &Session{
+		JTI:       "session-user1",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		ACR:       "urn:siros:acr:passkey",
+		MaxTAC:    TAC("rw"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.Create(context.Background(), sess); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Issue a valid access token for a DIFFERENT user.
+	accessToken, err := tokenIssuer.Issue("user-2", "test-audience", "tenant-1", TAC("r"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+
+	router := gin.New()
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.GET("/test", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-user1"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for session/token user mismatch, got %d", w.Code)
+	}
+}
