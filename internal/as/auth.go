@@ -21,6 +21,10 @@ type AuthContext struct {
 
 const authContextKey = "as_auth_context"
 
+// errInternalError is the generic error message returned for internal server errors.
+// Using a constant avoids duplicated string literals across handlers.
+const errInternalError = "internal error"
+
 // GetAuthContext retrieves the AuthContext from a gin request context.
 // Returns nil if no authentication was performed.
 func GetAuthContext(c *gin.Context) *AuthContext {
@@ -30,6 +34,55 @@ func GetAuthContext(c *gin.Context) *AuthContext {
 	}
 	ac, _ := v.(*AuthContext)
 	return ac
+}
+
+// authenticateSession validates a session cookie and its associated access token.
+// Returns the AuthContext on success, or an error string for the JSON response.
+func authenticateSession(
+	c *gin.Context,
+	store SessionStore,
+	tokenIssuer *TokenIssuer,
+	audiences []string,
+) (*AuthContext, string) {
+	sessionID := GetSessionCookie(c)
+	if sessionID == "" {
+		return nil, ""
+	}
+
+	session, err := store.Get(c.Request.Context(), sessionID)
+	if err != nil || session == nil || !session.IsValid() {
+		return nil, "invalid or expired session"
+	}
+
+	bearerToken := extractBearerToken(c)
+	if bearerToken == "" {
+		return nil, "missing access token"
+	}
+
+	claims, err := tokenIssuer.ParseAndVerify(bearerToken, audiences)
+	if err != nil {
+		return nil, "invalid access token"
+	}
+
+	if claims.Subject != session.UserID {
+		return nil, "access token does not match session"
+	}
+
+	if session.TenantID != "*" && claims.TenantID != session.TenantID {
+		return nil, "access token tenant does not match session"
+	}
+
+	if !claims.TAC.IsSubsetOf(session.MaxTAC) {
+		return nil, "access token exceeds session permissions"
+	}
+
+	return &AuthContext{
+		UserID:   claims.Subject,
+		TenantID: claims.TenantID,
+		TAC:      claims.TAC,
+		ACR:      claims.ACR,
+		Mode:     ClientModeSession,
+	}, ""
 }
 
 // UnifiedAuthMiddleware validates both legacy bearer tokens and new-style
@@ -48,68 +101,17 @@ func UnifiedAuthMiddleware(
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Path 1: Session cookie present → new-style auth
-		sessionID := GetSessionCookie(c)
-		if sessionID != "" {
-			session, err := store.Get(c.Request.Context(), sessionID)
-			if err != nil || session == nil || !session.IsValid() {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "invalid or expired session",
-				})
-				return
-			}
-
-			// For new-style clients, require a Bearer access token signed by AS
-			bearerToken := extractBearerToken(c)
-			if bearerToken == "" {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "missing access token",
-				})
-				return
-			}
-
-			claims, err := tokenIssuer.ParseAndVerify(bearerToken, audiences)
-			if err != nil {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "invalid access token",
-				})
-				return
-			}
-
-			// Verify the access token belongs to this session's user.
-			if claims.Subject != session.UserID {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "access token does not match session",
-				})
-				return
-			}
-
-			// Verify the token's tenant matches the session (unless session is cross-tenant).
-			if session.TenantID != "*" && claims.TenantID != session.TenantID {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "access token tenant does not match session",
-				})
-				return
-			}
-
-			// Verify the token's TAC is a subset of the session's MaxTAC.
-			if !claims.TAC.IsSubsetOf(session.MaxTAC) {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": "access token exceeds session permissions",
-				})
-				return
-			}
-
-			c.Set(authContextKey, &AuthContext{
-				UserID:   claims.Subject,
-				TenantID: claims.TenantID,
-				TAC:      claims.TAC,
-				ACR:      claims.ACR,
-				Mode:     ClientModeSession,
-			})
+		authCtx, errMsg := authenticateSession(c, store, tokenIssuer, audiences)
+		if errMsg != "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errMsg})
+			return
+		}
+		if authCtx != nil {
+			c.Set(authContextKey, authCtx)
 			c.Set(ContextKeyClientMode, ClientModeSession)
 			logger.Debug("new-style auth",
-				zap.String("user_id", claims.Subject),
-				zap.String("tenant_id", claims.TenantID),
+				zap.String("user_id", authCtx.UserID),
+				zap.String("tenant_id", authCtx.TenantID),
 			)
 			c.Next()
 			return

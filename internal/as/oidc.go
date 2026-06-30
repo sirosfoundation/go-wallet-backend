@@ -75,7 +75,7 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 	state, err := generateOIDCState()
 	if err != nil {
 		h.logger.Error("failed to generate OIDC state", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -83,7 +83,7 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 	nonce, err := generateOIDCState()
 	if err != nil {
 		h.logger.Error("failed to generate OIDC nonce", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 	// Store the nonce hash for validation — we don't need to recover the raw nonce.
@@ -102,7 +102,7 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 	}
 	if err := h.store.Challenges().Create(c.Request.Context(), challenge); err != nil {
 		h.logger.Error("failed to store OIDC state", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -250,7 +250,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 
 	sessionID, err := GenerateSessionID()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -266,7 +266,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 

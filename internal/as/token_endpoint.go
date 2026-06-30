@@ -8,6 +8,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// tokenDeps groups the shared dependencies for token issuance handlers.
+type tokenDeps struct {
+	issuer  *TokenIssuer
+	policy  PolicyEngine
+	ttlFunc func(string) time.Duration
+	logger  *zap.Logger
+}
+
 // TokenResponse is the response body for POST /auth/token.
 type TokenResponse struct {
 	AccessToken string `json:"access_token"`
@@ -28,6 +36,7 @@ func TokenEndpointHandler(
 	ttlFunc func(string) time.Duration,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
+	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger}
 	return func(c *gin.Context) {
 		var req TokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -44,9 +53,9 @@ func TokenEndpointHandler(
 		// Determine auth path: session cookie or Bearer delegation.
 		sessionID := GetSessionCookie(c)
 		if sessionID != "" {
-			handleSessionTokenRequest(c, store, issuer, policy, ttlFunc, logger, sessionID, &req)
+			handleSessionTokenRequest(c, store, deps, sessionID, &req)
 		} else {
-			handleDelegationTokenRequest(c, issuer, policy, ttlFunc, logger, &req)
+			handleDelegationTokenRequest(c, deps, &req)
 		}
 	}
 }
@@ -55,10 +64,7 @@ func TokenEndpointHandler(
 func handleSessionTokenRequest(
 	c *gin.Context,
 	store SessionStore,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	logger *zap.Logger,
+	deps *tokenDeps,
 	sessionID string,
 	req *TokenRequest,
 ) {
@@ -103,17 +109,14 @@ func handleSessionTokenRequest(
 		return
 	}
 
-	issueToken(c, issuer, policy, ttlFunc, logger, session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
 // that contains the 'k' (delegate) permission.
 func handleDelegationTokenRequest(
 	c *gin.Context,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	logger *zap.Logger,
+	deps *tokenDeps,
 	req *TokenRequest,
 ) {
 	bearerToken := extractBearerToken(c)
@@ -123,7 +126,7 @@ func handleDelegationTokenRequest(
 	}
 
 	// Parse the delegating token without audience restriction — we need its claims.
-	parentClaims, err := issuer.ParseAndVerify(bearerToken, nil)
+	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, nil)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid delegating token"})
 		return
@@ -167,16 +170,13 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, issuer, policy, ttlFunc, logger, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // issueToken is the common path for both session and delegation flows.
 func issueToken(
 	c *gin.Context,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	logger *zap.Logger,
+	deps *tokenDeps,
 	sub, audience, tenantID string,
 	tac TAC,
 	acr string,
@@ -190,9 +190,9 @@ func issueToken(
 	// Build SPOCP query and evaluate.
 	query := BuildTokenQuery(sub, audience, tenantID, tac, acr)
 
-	allowed, err := policy.Evaluate(query)
+	allowed, err := deps.policy.Evaluate(query)
 	if err != nil {
-		logger.Error("SPOCP evaluation error",
+		deps.logger.Error("SPOCP evaluation error",
 			zap.Error(err),
 			zap.String("query", query),
 		)
@@ -201,7 +201,7 @@ func issueToken(
 	}
 
 	if !allowed {
-		logger.Info("token request denied by policy",
+		deps.logger.Info("token request denied by policy",
 			zap.String("user_id", sub),
 			zap.String("audience", audience),
 			zap.String("tenant_id", tenantID),
@@ -212,14 +212,14 @@ func issueToken(
 	}
 
 	// Issue signed access token.
-	tokenStr, err := issuer.Issue(sub, audience, tenantID, tac, acr)
+	tokenStr, err := deps.issuer.Issue(sub, audience, tenantID, tac, acr)
 	if err != nil {
-		logger.Error("token issuance failed", zap.Error(err))
+		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})
 		return
 	}
 
-	ttl := ttlFunc(audience)
+	ttl := deps.ttlFunc(audience)
 
 	c.JSON(http.StatusOK, TokenResponse{
 		AccessToken: tokenStr,

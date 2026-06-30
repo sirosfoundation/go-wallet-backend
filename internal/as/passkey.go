@@ -81,7 +81,7 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	sessionID, err := GenerateSessionID()
 	if err != nil {
 		h.logger.Error("failed to generate session ID", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -99,7 +99,7 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
 		h.logger.Error("failed to create session", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -166,7 +166,7 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	sessionID, err := GenerateSessionID()
 	if err != nil {
 		h.logger.Error("failed to generate session ID", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
@@ -183,7 +183,7 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
 		h.logger.Error("failed to create session", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
 		return
 	}
 
