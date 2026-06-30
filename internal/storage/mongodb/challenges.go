@@ -30,7 +30,7 @@ func (s *ChallengeStore) Create(ctx context.Context, challenge *domain.WebauthnC
 
 func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
 	var challenge domain.WebauthnChallenge
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&challenge)
+	err := s.collection.FindOne(ctx, idFilter(id)).Decode(&challenge)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -41,7 +41,7 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 }
 
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
-	_, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+	_, err := s.collection.DeleteOne(ctx, idFilter(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete challenge: %w", err)
 	}

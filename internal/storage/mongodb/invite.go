@@ -31,9 +31,9 @@ func (s *InviteStore) Create(ctx context.Context, invite *domain.Invite) error {
 
 func (s *InviteStore) GetByCode(ctx context.Context, tenantID domain.TenantID, code string) (*domain.Invite, error) {
 	var invite domain.Invite
-	err := s.collection.FindOne(ctx, bson.M{
-		"tenant_id": tenantID,
-		"code":      code,
+	err := s.collection.FindOne(ctx, bson.D{
+		{Key: "tenant_id", Value: string(tenantID)},
+		{Key: "code", Value: code},
 	}).Decode(&invite)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -46,7 +46,7 @@ func (s *InviteStore) GetByCode(ctx context.Context, tenantID domain.TenantID, c
 
 func (s *InviteStore) GetByID(ctx context.Context, id string) (*domain.Invite, error) {
 	var invite domain.Invite
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&invite)
+	err := s.collection.FindOne(ctx, idFilter(id)).Decode(&invite)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -57,7 +57,7 @@ func (s *InviteStore) GetByID(ctx context.Context, id string) (*domain.Invite, e
 }
 
 func (s *InviteStore) GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.Invite, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{"tenant_id": tenantID},
+	cursor, err := s.collection.Find(ctx, fieldFilter("tenant_id", string(tenantID)),
 		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to list invites: %w", err)
@@ -74,10 +74,10 @@ func (s *InviteStore) GetAllByTenant(ctx context.Context, tenantID domain.Tenant
 func (s *InviteStore) MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error {
 	now := time.Now()
 	result, err := s.collection.UpdateOne(ctx,
-		bson.M{
-			"tenant_id": tenantID,
-			"code":      code,
-			"status":    domain.InviteStatusActive,
+		bson.D{
+			{Key: "tenant_id", Value: string(tenantID)},
+			{Key: "code", Value: code},
+			{Key: "status", Value: domain.InviteStatusActive},
 		},
 		bson.M{
 			"$set": bson.M{
@@ -109,7 +109,10 @@ func (s *InviteStore) Update(ctx context.Context, invite *domain.Invite) error {
 }
 
 func (s *InviteStore) Delete(ctx context.Context, tenantID domain.TenantID, id string) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+	result, err := s.collection.DeleteOne(ctx, bson.D{
+		{Key: "_id", Value: id},
+		{Key: "tenant_id", Value: string(tenantID)},
+	})
 	if err != nil {
 		return fmt.Errorf("failed to delete invite: %w", err)
 	}

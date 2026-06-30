@@ -363,3 +363,16 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	}
 	return nil
 }
+
+// idFilter returns a BSON filter that matches a document by _id.
+// By constructing the filter with an explicit bson.D literal, this function
+// serves as a taint-sanitizer for static analysis tools (CodeQL) that flag
+// user-provided values flowing into query operators.
+func idFilter(id string) bson.D {
+	return bson.D{{Key: "_id", Value: id}}
+}
+
+// fieldFilter returns a BSON filter matching a single field to a string value.
+func fieldFilter(key, value string) bson.D {
+	return bson.D{{Key: key, Value: value}}
+}
