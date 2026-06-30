@@ -59,7 +59,7 @@ func (s *ChallengeStore) DeleteExpired(ctx context.Context) error {
 }
 
 func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) error {
-	_, err := s.collection.DeleteMany(ctx, bson.M{"user_id": userID})
+	_, err := s.collection.DeleteMany(ctx, fieldFilter("user_id", userID))
 	if err != nil {
 		return fmt.Errorf("failed to delete challenges for user: %w", err)
 	}
