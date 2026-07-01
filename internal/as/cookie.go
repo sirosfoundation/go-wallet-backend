@@ -39,10 +39,8 @@ func (o CookieOptions) cookieName() string {
 }
 
 // sessionCookie builds a session cookie with secure defaults.
-// The Secure flag is always true unless the caller explicitly opts into
-// insecure mode for local HTTP development.
-func sessionCookie(name, value string, maxAge int, insecure bool) *http.Cookie {
-	ck := &http.Cookie{
+func sessionCookie(name, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
@@ -51,10 +49,6 @@ func sessionCookie(name, value string, maxAge int, insecure bool) *http.Cookie {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	}
-	if insecure {
-		ck.Secure = false
-	}
-	return ck
 }
 
 // SetSessionCookie sets the session cookie on the response.
@@ -63,13 +57,17 @@ func sessionCookie(name, value string, maxAge int, insecure bool) *http.Cookie {
 // needed on cross-site navigations — login/register are same-origin API calls,
 // and OIDC callbacks use a separate state parameter for CSRF protection.
 func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
-	http.SetCookie(c.Writer, sessionCookie(opts.cookieName(), jti, opts.MaxAge, opts.Insecure))
+	ck := sessionCookie(opts.cookieName(), jti, opts.MaxAge)
+	overrideCookieSecure(ck, opts)
+	http.SetCookie(c.Writer, ck)
 }
 
 // ClearSessionCookie removes the session cookie.
 // Path is always "/" to comply with the __Host- prefix requirements.
 func ClearSessionCookie(c *gin.Context, opts CookieOptions) {
-	http.SetCookie(c.Writer, sessionCookie(opts.cookieName(), "", -1, opts.Insecure))
+	ck := sessionCookie(opts.cookieName(), "", -1)
+	overrideCookieSecure(ck, opts)
+	http.SetCookie(c.Writer, ck)
 }
 
 // GetSessionCookie extracts the session JTI from the request cookie.
