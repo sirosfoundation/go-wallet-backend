@@ -5,6 +5,7 @@
 package middleware
 
 import (
+	"context"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +17,11 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
+
+// TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
+type TenantLookup interface {
+	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
+}
 
 // TokenAuthMiddleware validates Bearer tokens using a go-tokenauth validator
 // and populates the Gin context with the same keys that legacy AuthMiddleware
@@ -30,7 +36,7 @@ import (
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants storage.TenantStore, logger *zap.Logger) gin.HandlerFunc {
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
