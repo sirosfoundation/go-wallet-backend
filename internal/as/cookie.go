@@ -49,7 +49,7 @@ func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
 		Value:    jti,
 		Path:     "/",
 		MaxAge:   opts.MaxAge,
-		Secure:   !opts.Insecure,
+		Secure:   !opts.Insecure, //NOSONAR — intentional: Insecure mode is for local HTTP dev only
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -63,7 +63,7 @@ func ClearSessionCookie(c *gin.Context, opts CookieOptions) {
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
-		Secure:   !opts.Insecure,
+		Secure:   !opts.Insecure, //NOSONAR — intentional: Insecure mode is for local HTTP dev only
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
