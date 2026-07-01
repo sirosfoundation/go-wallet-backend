@@ -31,12 +31,13 @@ import (
 
 // AuthProvider provides authentication routes (WebAuthn, login, register)
 type AuthProvider struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    backend.Backend
-	services *service.Services
-	handlers *api.Handlers
-	roles    []string
+	cfg            *config.Config
+	logger         *zap.Logger
+	store          backend.Backend
+	services       *service.Services
+	handlers       *api.Handlers
+	roles          []string
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewAuthProvider creates a new auth route provider
@@ -105,7 +106,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 
 	// Protected auth routes (session management)
 	protected := router.Group("/")
-	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	protected.Use(p.authMiddleware())
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -159,16 +160,26 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	}
 }
 
+// authMiddleware returns the appropriate auth middleware: go-tokenauth when
+// a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
+func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+}
+
 // =============================================================================
 // Storage Provider - handles encrypted data storage routes only
 // =============================================================================
 
 // StorageProvider provides encrypted storage routes
 type StorageProvider struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    backend.Backend
-	handlers *api.Handlers
+	cfg            *config.Config
+	logger         *zap.Logger
+	store          backend.Backend
+	handlers       *api.Handlers
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewStorageProvider creates a new storage route provider
@@ -189,7 +200,7 @@ func (p *StorageProvider) Name() string         { return "storage" }
 func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Protected storage routes
 	protected := router.Group("/storage")
-	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	protected.Use(p.authMiddleware())
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -200,6 +211,14 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 			protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
 		}
 	}
+}
+
+// authMiddleware returns the appropriate auth middleware for storage routes.
+func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
 
 // =============================================================================
@@ -279,6 +298,12 @@ func (p *EngineProvider) Name() string         { return "engine" }
 // SessionStore returns the engine's session store for cross-provider wiring.
 func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
+}
+
+// SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
+// so it can validate both new-style and legacy tokens during the handshake.
+func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
+	p.manager.SetTokenValidator(v)
 }
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
@@ -400,8 +425,9 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		}
 		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL: jwksURL,
-			Issuer:  issuer,
+			JWKSURL:   jwksURL,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
 			Legacy: tokenvalidator.LegacyConfig{
 				Enabled:    cfg.AS.Legacy.Enabled,
 				HMACSecret: []byte(cfg.JWT.Secret),
@@ -410,12 +436,18 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
+			zap.Strings("audiences", cfg.AS.Audiences),
 		)
 	}
 
+	authProvider := NewAuthProvider(cfg, store, logger, roles)
+	authProvider.tokenValidator = tv
+	storageProvider := NewStorageProvider(cfg, store, logger, roles)
+	storageProvider.tokenValidator = tv
+
 	return &BackendProvider{
-		auth:             NewAuthProvider(cfg, store, logger, roles),
-		storage:          NewStorageProvider(cfg, store, logger, roles),
+		auth:             authProvider,
+		storage:          storageProvider,
 		store:            store,
 		cfg:              cfg,
 		authzenHandler:   authzenHandler,
@@ -445,13 +477,21 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// Register AuthZEN proxy routes if enabled
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
-		protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+		protected.Use(p.authMiddleware())
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", p.authzenHandler.Evaluate)
 			v1.POST("/resolve", p.authzenHandler.Resolve)
 		}
 	}
+}
+
+// authMiddleware returns the appropriate auth middleware for backend routes.
+func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
 
 // Close shuts down the backend provider

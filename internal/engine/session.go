@@ -13,6 +13,8 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -96,6 +98,10 @@ type Manager struct {
 
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
+
+	// tokenValidator validates access tokens via go-tokenauth (optional).
+	// When set, validateToken uses it instead of direct HMAC parsing.
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewManager creates a new session manager
@@ -135,6 +141,11 @@ func (m *Manager) SessionStore() SessionStore {
 // SetVerifierStore sets the verifier store for trust caching
 func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 	m.verifierStore = store
+}
+
+// SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
+func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
+	m.tokenValidator = v
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -519,6 +530,19 @@ func (m *Manager) unregisterSession(session *Session) {
 }
 
 func (m *Manager) validateToken(tokenString string) (userID, tenantID string, err error) {
+	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
+	if m.tokenValidator != nil {
+		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
+		if err != nil {
+			return "", "", err
+		}
+		if result.UserID == "" {
+			return "", "", errors.New("invalid token claims: missing user_id")
+		}
+		return result.UserID, result.TenantID, nil
+	}
+
+	// Legacy path: direct HMAC validation
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")

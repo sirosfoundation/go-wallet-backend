@@ -57,6 +57,12 @@ type ASConfig struct {
 	// Keys are audience strings, values are durations.
 	AudienceTTLs map[string]time.Duration `yaml:"audience_ttls" envconfig:"AUDIENCE_TTLS"`
 
+	// Audiences lists the accepted audience values for token validation.
+	// Tokens must contain at least one of these in their "aud" claim.
+	// When empty, audience validation is skipped.
+	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
+	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
+
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
 	RulesDir string `yaml:"rules_dir" envconfig:"RULES_DIR"`
 
