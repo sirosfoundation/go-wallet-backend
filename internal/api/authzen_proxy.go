@@ -18,13 +18,14 @@ import (
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/authzenclient"
 	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
-	"go.uber.org/zap"
 )
 
 // IssuerMetadataResolver resolves OpenID4VCI issuer metadata from a credential issuer URL.

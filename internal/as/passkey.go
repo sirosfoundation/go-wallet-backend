@@ -6,9 +6,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"go.uber.org/zap"
 )
 
 // WebAuthnProvider is the interface for WebAuthn operations needed by the AS.

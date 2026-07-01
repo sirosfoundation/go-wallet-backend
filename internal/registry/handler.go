@@ -5,9 +5,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 )
 
 // Handler handles HTTP requests for the registry

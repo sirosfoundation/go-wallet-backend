@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"go.uber.org/zap"
 )
 
 // mockWebAuthn implements WebAuthnProvider for testing.
@@ -45,8 +46,8 @@ func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore)
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
 	cfg := &config.ASConfig{
-		DefaultMaxTAC:  "rwl",
-		SessionTTL:     24 * time.Hour,
+		DefaultMaxTAC:   "rwl",
+		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
 	}
 	logger := zap.NewNop()
