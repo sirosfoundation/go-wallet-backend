@@ -363,3 +363,16 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	}
 	return nil
 }
+
+// idFilter returns a BSON filter that matches a document by _id.
+// Go typed strings in bson.D Value fields are always encoded as BSON strings
+// by the driver — never as documents or query operators — so this is safe
+// from NoSQL injection. CodeQL alerts on these are dismissed as false positives.
+func idFilter(id string) bson.D {
+	return bson.D{{Key: "_id", Value: id}}
+}
+
+// fieldFilter returns a BSON filter matching a single field to a string value.
+func fieldFilter(key, value string) bson.D {
+	return bson.D{{Key: key, Value: value}}
+}

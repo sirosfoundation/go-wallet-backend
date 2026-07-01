@@ -29,6 +29,7 @@ require (
 require (
 	github.com/getkin/kin-openapi v0.140.0
 	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/sirosfoundation/go-tokenauth v0.1.0
 )
 
 require (
@@ -98,4 +99,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/descope/virtualwebauthn => github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61
+replace github.com/descope/virtualwebauthn => github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5

@@ -4,9 +4,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// validBaseConfig returns a minimal valid Config for testing.
+func validBaseConfig() *Config {
+	return &Config{
+		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		Storage: StorageConfig{Type: "memory"},
+		JWT:     JWTConfig{Secret: "test-secret"},
+	}
+}
 
 func TestConfig_Validate(t *testing.T) {
 	cfg := &Config{
@@ -1281,5 +1291,207 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 	}
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("AllowedHeaders should have default value")
+	}
+}
+func TestASConfig_SetDefaults(t *testing.T) {
+	cfg := &ASConfig{}
+	cfg.SetDefaults()
+
+	if cfg.DefaultTokenTTL != 2*time.Minute {
+		t.Errorf("expected DefaultTokenTTL 2m, got %v", cfg.DefaultTokenTTL)
+	}
+	if cfg.SessionTTL != 24*time.Hour {
+		t.Errorf("expected SessionTTL 24h, got %v", cfg.SessionTTL)
+	}
+	if cfg.DefaultMaxTAC != "rwl" {
+		t.Errorf("expected DefaultMaxTAC 'rwl', got %q", cfg.DefaultMaxTAC)
+	}
+}
+
+func TestASConfig_SetDefaults_NoOverwrite(t *testing.T) {
+	cfg := &ASConfig{
+		DefaultTokenTTL: 5 * time.Minute,
+		SessionTTL:      1 * time.Hour,
+		DefaultMaxTAC:   "rwlid",
+	}
+	cfg.SetDefaults()
+
+	if cfg.DefaultTokenTTL != 5*time.Minute {
+		t.Error("SetDefaults should not overwrite existing DefaultTokenTTL")
+	}
+	if cfg.SessionTTL != 1*time.Hour {
+		t.Error("SetDefaults should not overwrite existing SessionTTL")
+	}
+	if cfg.DefaultMaxTAC != "rwlid" {
+		t.Error("SetDefaults should not overwrite existing DefaultMaxTAC")
+	}
+}
+
+func TestASConfig_GetTokenTTL(t *testing.T) {
+	cfg := &ASConfig{
+		DefaultTokenTTL: 2 * time.Minute,
+		AudienceTTLs: map[string]time.Duration{
+			"wallet-backend": 5 * time.Minute,
+		},
+	}
+
+	if got := cfg.GetTokenTTL("wallet-backend"); got != 5*time.Minute {
+		t.Errorf("expected 5m for wallet-backend, got %v", got)
+	}
+	if got := cfg.GetTokenTTL("unknown"); got != 2*time.Minute {
+		t.Errorf("expected 2m for unknown, got %v", got)
+	}
+}
+
+func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.RulesDir = "/tmp/rules"
+	// No SigningKeyPath or SigningKeyPKCS11 set.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing signing key")
+	}
+	if !strings.Contains(err.Error(), "signing_key_path or signing_key_pkcs11 is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
+	cfg.AS.RulesDir = "/tmp/rules"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for mutually exclusive keys")
+	}
+	if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_PKCS11NotImplemented(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
+	cfg.AS.RulesDir = "/tmp/rules"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for PKCS11 not implemented")
+	}
+	if !strings.Contains(err.Error(), "not yet implemented") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_MissingRulesDir(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	// No RulesDir set.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing rules_dir")
+	}
+	if !strings.Contains(err.Error(), "rules_dir is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_NegativeTokenTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.AS.DefaultTokenTTL = -1 * time.Second
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative token TTL")
+	}
+	if !strings.Contains(err.Error(), "must be positive") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_MissingIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "" // No JWT issuer fallback.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing issuer")
+	}
+	if !strings.Contains(err.Error(), "issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	err := cfg.Validate()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AS.Issuer != "https://example.com" {
+		t.Errorf("expected AS issuer to fall back to JWT issuer, got %q", cfg.AS.Issuer)
+	}
+}
+
+func TestConfig_Validate_AS_NegativeSessionTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.SessionTTL = -1 * time.Hour
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for negative session_ttl")
+	}
+	if !strings.Contains(err.Error(), "session_ttl must be positive") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_InvalidAudienceTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.AudienceTTLs = map[string]time.Duration{
+		"good": 5 * time.Minute,
+		"bad":  -1 * time.Second,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for non-positive audience TTL")
+	}
+	if !strings.Contains(err.Error(), "audience_ttls") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_AS_InvalidMaxTACChars(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	cfg.AS.DefaultMaxTAC = "rwx" // 'x' is invalid
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for invalid TAC character")
+	}
+	if !strings.Contains(err.Error(), "invalid character") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }

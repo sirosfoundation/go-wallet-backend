@@ -12,6 +12,7 @@ import (
 
 	"github.com/sirosfoundation/go-trust/pkg/registry/static"
 	"github.com/sirosfoundation/go-trust/pkg/testserver"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )

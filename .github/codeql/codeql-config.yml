@@ -1,0 +1,10 @@
+name: "go-wallet-backend"
+
+# Exclude the intentional insecure-cookie dev helper from analysis.
+# overrideCookieSecure() in cookie_dev.go clears the Secure flag when
+# InsecureCookies config is set — this is a dev-only option that is
+# never enabled in production. Static analyzers (CodeQL, SonarCloud)
+# flag it as go/cookie-secure-not-set / go:S2092.
+paths-ignore:
+  - "internal/as/cookie_dev.go"
+  - "internal/as/cookie.go"

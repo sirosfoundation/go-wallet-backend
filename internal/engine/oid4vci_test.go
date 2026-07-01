@@ -19,10 +19,11 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 func TestGenerateCodeVerifier(t *testing.T) {

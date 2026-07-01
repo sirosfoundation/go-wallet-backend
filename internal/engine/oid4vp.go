@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/go-jose/go-jose/v4"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
