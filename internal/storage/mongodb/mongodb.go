@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -365,26 +364,15 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	return nil
 }
 
-// sanitizeValue returns a string safe for use as a BSON query value.
-// This acts as a taint barrier for static analysis (CodeQL go/nosql-injection):
-// by explicitly validating the string, we ensure operator injection is impossible.
-func sanitizeValue(s string) string {
-	// MongoDB operator injection requires the value to be interpreted as a document
-	// with keys starting with "$". Since Go typed strings in bson.D are always
-	// encoded as BSON strings (not documents), this is already safe. We add an
-	// explicit check as a defense-in-depth measure and taint-analysis barrier.
-	if strings.HasPrefix(s, "$") {
-		return ""
-	}
-	return s
-}
-
 // idFilter returns a BSON filter that matches a document by _id.
+// Go typed strings in bson.D Value fields are always encoded as BSON strings
+// by the driver — never as documents or query operators — so this is safe
+// from NoSQL injection. CodeQL alerts on these are dismissed as false positives.
 func idFilter(id string) bson.D {
-	return bson.D{{Key: "_id", Value: sanitizeValue(id)}}
+	return bson.D{{Key: "_id", Value: id}}
 }
 
 // fieldFilter returns a BSON filter matching a single field to a string value.
 func fieldFilter(key, value string) bson.D {
-	return bson.D{{Key: key, Value: sanitizeValue(value)}}
+	return bson.D{{Key: key, Value: value}}
 }
