@@ -96,9 +96,10 @@ type AccessTokenClaims struct {
 
 // TokenRequest represents a client's request for an access token.
 type TokenRequest struct {
-	Audience string `json:"aud"`
-	TenantID string `json:"tenant_id,omitempty"`
-	TAC      string `json:"tac,omitempty"`
+	Audience  string `json:"aud"`
+	TenantID  string `json:"tenant_id,omitempty"`
+	TAC       string `json:"tac,omitempty"`
+	Anonymous bool   `json:"anonymous,omitempty"`
 }
 
 // TokenIssuer issues signed access tokens.

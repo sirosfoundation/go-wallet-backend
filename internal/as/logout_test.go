@@ -27,11 +27,11 @@ func TestLogoutHandler_Success(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-logout"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-logout"})
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNoContent {
@@ -51,7 +51,7 @@ func TestLogoutHandler_Success(t *testing.T) {
 	cookies := w.Result().Cookies()
 	found := false
 	for _, c := range cookies {
-		if c.Name == SessionCookieName && c.MaxAge < 0 {
+		if c.Name == sessionCookieInsecure && c.MaxAge < 0 {
 			found = true
 		}
 	}
@@ -66,7 +66,7 @@ func TestLogoutHandler_NoSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -83,11 +83,11 @@ func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "nonexistent"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "nonexistent"})
 	router.ServeHTTP(w, req)
 
 	// Should still clear the cookie and return 204 (graceful).

@@ -45,8 +45,9 @@ func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore)
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
 	cfg := &config.ASConfig{
-		DefaultMaxTAC: "rwl",
-		SessionTTL:    24 * time.Hour,
+		DefaultMaxTAC:  "rwl",
+		SessionTTL:     24 * time.Hour,
+		InsecureCookies: true,
 	}
 	logger := zap.NewNop()
 
@@ -125,7 +126,7 @@ func TestPasskeyLoginFinish_Success(t *testing.T) {
 	cookies := w.Result().Cookies()
 	found := false
 	for _, c := range cookies {
-		if c.Name == SessionCookieName {
+		if c.Name == sessionCookieInsecure {
 			found = true
 			// Verify session exists in store.
 			sess, _ := store.Get(context.Background(), c.Value)
@@ -270,7 +271,7 @@ func TestPasskeyRegisterFinish_Success(t *testing.T) {
 	// Verify session was created (auto-login).
 	cookies := w.Result().Cookies()
 	for _, c := range cookies {
-		if c.Name == SessionCookieName {
+		if c.Name == sessionCookieInsecure {
 			sess, _ := store.Get(context.Background(), c.Value)
 			if sess == nil {
 				t.Error("session not found after registration")

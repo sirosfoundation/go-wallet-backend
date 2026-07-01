@@ -141,6 +141,8 @@ github.com/sirosfoundation/go-cryptoutil v0.5.0 h1:ByKuNjHSdlvkOzGeElh0QAku36iuy
 github.com/sirosfoundation/go-cryptoutil v0.5.0/go.mod h1:OZi673Xmf5o2LzF/QMceptIpiB2GKYAYBfEa75ocBss=
 github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G1ihb9FCPs=
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
+github.com/sirosfoundation/go-tokenauth v0.1.0 h1:lGmDHHeAd391GAJIrE+QVYdZnGZpbYYY4SApXby5kB0=
+github.com/sirosfoundation/go-tokenauth v0.1.0/go.mod h1:ilGfeU+3zCvbcMvxUU4eADw/dFSakmYI9zBjpLRtGxQ=
 github.com/sirosfoundation/go-trust v0.6.0 h1:ZYOlT9czQoy/Zt7O4eb77G28qr6XK7LqC6ZdcJ5+zB4=
 github.com/sirosfoundation/go-trust v0.6.0/go.mod h1:6YV/uDNkTzGMZoVAH4/xDyUpDxDbyOCcp1AlxvMOUn8=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260114072326-01133d1ade61 h1:1XMBGQ57pLEZRkazk8AN7mhNu63czErGg9+I3stWSS0=

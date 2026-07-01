@@ -105,7 +105,8 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 
 	// Set session cookie.
 	SetSessionCookie(c, sessionID, CookieOptions{
-		MaxAge: int(h.cfg.SessionTTL.Seconds()),
+		MaxAge:   int(h.cfg.SessionTTL.Seconds()),
+		Insecure: h.cfg.InsecureCookies,
 	})
 
 	// Determine response format based on client mode.
@@ -188,7 +189,8 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	}
 
 	SetSessionCookie(c, sessionID, CookieOptions{
-		MaxAge: int(h.cfg.SessionTTL.Seconds()),
+		MaxAge:   int(h.cfg.SessionTTL.Seconds()),
+		Insecure: h.cfg.InsecureCookies,
 	})
 
 	mode := DetectClientMode(c)

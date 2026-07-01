@@ -75,6 +75,10 @@ type ASConfig struct {
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
 	// Used to construct OIDC redirect URIs. Required when OIDC is used.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
+
+	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
+	// Required for local development over HTTP. NEVER enable in production.
+	InsecureCookies bool `yaml:"insecure_cookies" envconfig:"INSECURE_COOKIES"`
 }
 
 // ASLegacyConfig controls the legacy all-in-one HMAC token sunset.

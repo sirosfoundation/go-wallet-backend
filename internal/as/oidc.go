@@ -271,7 +271,8 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	SetSessionCookie(c, sessionID, CookieOptions{
-		MaxAge: int(h.cfg.SessionTTL.Seconds()),
+		MaxAge:   int(h.cfg.SessionTTL.Seconds()),
+		Insecure: h.cfg.InsecureCookies,
 	})
 
 	h.logger.Info("OIDC login success",

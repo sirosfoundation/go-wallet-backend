@@ -36,7 +36,7 @@ func BuildTokenQuery(sub, aud, tenantID string, tac TAC, acr string) string {
 	sort.Strings(keys)
 
 	var sb strings.Builder
-	sb.WriteString("(token")
+	sb.WriteString("(5:token")
 	for _, k := range keys {
 		v := claims[k]
 		fmt.Fprintf(&sb, " (%d:%s %d:%s)", len(k), k, len(v), v)

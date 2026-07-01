@@ -56,7 +56,7 @@ func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenI
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, logger)
+	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
 
 	return router, store, issuer
 }
@@ -78,7 +78,7 @@ func TestTokenEndpoint_Success(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "backend-api", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-1"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-1"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -134,7 +134,7 @@ func TestTokenEndpoint_TACExceedsSession(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "w"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-2"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-2"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -182,7 +182,7 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, logger)
+	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
 
 	sess := &Session{
 		JTI:       "sess-deny",
@@ -197,7 +197,7 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-deny"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-deny"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -225,7 +225,7 @@ func TestTokenEndpoint_DefaultsTenantAndTAC(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-defaults"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-defaults"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -273,7 +273,7 @@ func TestTokenEndpoint_EmptyMaxTAC(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-no-perms"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-no-perms"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -300,7 +300,7 @@ func TestTokenEndpoint_InvalidTAC(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "x"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-invalid-tac"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-invalid-tac"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -326,7 +326,7 @@ func TestTokenEndpoint_EmptyAudience(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-no-aud"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-no-aud"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -531,7 +531,7 @@ func TestTokenEndpoint_CrossTenantDenied(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "tenant-other", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-tenant"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-tenant"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -558,7 +558,7 @@ func TestTokenEndpoint_CrossTenantAllowedForWildcard(t *testing.T) {
 	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "any-tenant", TAC: "r"})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "sess-admin"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-admin"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

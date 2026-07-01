@@ -121,9 +121,10 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// Token endpoint (requires session cookie).
 	RegisterTokenEndpoint(auth, m.Sessions, m.TokenIssuer, m.Policy,
 		func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
+		m.Config.InsecureCookies,
 		m.Logger,
 	)
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Config.InsecureCookies, m.Logger))
 }

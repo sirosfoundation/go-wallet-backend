@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
+	"github.com/sirosfoundation/go-wallet-backend/internal/as"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
@@ -20,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 )
 
 // =============================================================================
@@ -317,6 +319,8 @@ type BackendProvider struct {
 	cfg              *config.Config
 	authzenHandler   *api.AuthZENProxyHandler
 	metadataResolver *issuermetadata.Resolver
+	asModule         *as.ASModule
+	tokenValidator   *tokenvalidator.Validator
 	logger           *zap.Logger
 }
 
@@ -368,6 +372,46 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
+	// Initialize AS module when enabled.
+	var asModule *as.ASModule
+	var tv *tokenvalidator.Validator
+	if cfg.AS.Enabled {
+		services := service.NewServices(store, cfg, logger)
+		asModule, err = as.NewASModule(
+			context.Background(),
+			&cfg.AS,
+			&cfg.JWT,
+			services.WebAuthn,
+			store,
+			logger,
+		)
+		if err != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				logger.Error("Failed to close store after AS module initialization failure", zap.Error(closeErr))
+			}
+			return nil, fmt.Errorf("failed to initialize AS module: %w", err)
+		}
+
+		// Create go-tokenauth validator for protecting resource endpoints.
+		issuer := cfg.AS.Issuer
+		if issuer == "" {
+			issuer = cfg.JWT.Issuer
+		}
+		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+		tv = tokenvalidator.New(tokenvalidator.Config{
+			JWKSURL: jwksURL,
+			Issuer:  issuer,
+			Legacy: tokenvalidator.LegacyConfig{
+				Enabled:    cfg.AS.Legacy.Enabled,
+				HMACSecret: []byte(cfg.JWT.Secret),
+			},
+		})
+		tv.Start(context.Background())
+		logger.Info("Authorization Server module initialized",
+			zap.String("jwks_url", jwksURL),
+		)
+	}
+
 	return &BackendProvider{
 		auth:             NewAuthProvider(cfg, store, logger, roles),
 		storage:          NewStorageProvider(cfg, store, logger, roles),
@@ -375,6 +419,8 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		cfg:              cfg,
 		authzenHandler:   authzenHandler,
 		metadataResolver: metadataResolver,
+		asModule:         asModule,
+		tokenValidator:   tv,
 		logger:           logger,
 	}, nil
 }
@@ -390,6 +436,11 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	p.auth.RegisterRoutes(router)
 	p.storage.RegisterRoutes(router)
 
+	// Register AS routes when enabled
+	if p.asModule != nil {
+		p.asModule.RegisterRoutes(router.Group("/auth"))
+	}
+
 	// Register AuthZEN proxy routes if enabled
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
@@ -404,6 +455,9 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 
 // Close shuts down the backend provider
 func (p *BackendProvider) Close() error {
+	if p.tokenValidator != nil {
+		p.tokenValidator.Stop()
+	}
 	if p.store != nil {
 		return p.store.Close()
 	}
@@ -432,6 +486,16 @@ func (p *BackendProvider) Store() backend.Backend {
 // share the TTL cache with the HTTP /v1/resolve handler.
 func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 	return p.metadataResolver
+}
+
+// ASModule returns the AS module, or nil if AS is not enabled.
+func (p *BackendProvider) ASModule() *as.ASModule {
+	return p.asModule
+}
+
+// TokenValidator returns the go-tokenauth validator, or nil if AS is not enabled.
+func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
+	return p.tokenValidator
 }
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.

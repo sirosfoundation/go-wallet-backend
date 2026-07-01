@@ -34,8 +34,10 @@ func TokenEndpointHandler(
 	issuer *TokenIssuer,
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
+	insecureCookies bool,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
+	opts := CookieOptions{Insecure: insecureCookies}
 	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger}
 	return func(c *gin.Context) {
 		var req TokenRequest
@@ -50,10 +52,12 @@ func TokenEndpointHandler(
 			return
 		}
 
-		// Determine auth path: session cookie or Bearer delegation.
-		sessionID := GetSessionCookie(c)
+		// Determine auth path: session cookie, Bearer delegation, or anonymous.
+		sessionID := GetSessionCookie(c, opts)
 		if sessionID != "" {
 			handleSessionTokenRequest(c, store, deps, sessionID, &req)
+		} else if req.Anonymous {
+			handleAnonymousTokenRequest(c, deps, &req)
 		} else {
 			handleDelegationTokenRequest(c, deps, &req)
 		}
@@ -110,6 +114,22 @@ func handleSessionTokenRequest(
 	}
 
 	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
+}
+
+// handleAnonymousTokenRequest issues a user-less token.
+// The token has no subject ("sub") claim. TAC defaults to read-only.
+// Policy rules must explicitly allow anonymous tokens.
+func handleAnonymousTokenRequest(
+	c *gin.Context,
+	deps *tokenDeps,
+	req *TokenRequest,
+) {
+	tac := TAC(req.TAC)
+	if tac == "" {
+		tac = TAC("r") // anonymous tokens default to read-only
+	}
+
+	issueToken(c, deps, "", req.Audience, req.TenantID, tac, "")
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -235,7 +255,8 @@ func RegisterTokenEndpoint(
 	issuer *TokenIssuer,
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
+	insecureCookies bool,
 	logger *zap.Logger,
 ) {
-	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, logger))
+	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, insecureCookies, logger))
 }

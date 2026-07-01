@@ -43,8 +43,9 @@ func authenticateSession(
 	store SessionStore,
 	tokenIssuer *TokenIssuer,
 	audiences []string,
+	insecureCookies bool,
 ) (*AuthContext, string) {
-	sessionID := GetSessionCookie(c)
+	sessionID := GetSessionCookie(c, CookieOptions{Insecure: insecureCookies})
 	if sessionID == "" {
 		return nil, ""
 	}
@@ -97,11 +98,12 @@ func UnifiedAuthMiddleware(
 	tokenIssuer *TokenIssuer,
 	legacyIssuer *LegacyTokenIssuer,
 	audiences []string,
+	insecureCookies bool,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Path 1: Session cookie present → new-style auth
-		authCtx, errMsg := authenticateSession(c, store, tokenIssuer, audiences)
+		authCtx, errMsg := authenticateSession(c, store, tokenIssuer, audiences, insecureCookies)
 		if errMsg != "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errMsg})
 			return

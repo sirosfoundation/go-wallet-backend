@@ -20,7 +20,7 @@ func setupMiddlewareTest(t *testing.T) (*MemorySessionStore, *gin.Engine) {
 	logger := zap.NewNop()
 
 	r := gin.New()
-	r.Use(SessionMiddleware(store, logger))
+	r.Use(SessionMiddleware(store, true, logger))
 	r.GET("/protected", RequireSession(), func(c *gin.Context) {
 		session := GetSession(c)
 		c.JSON(http.StatusOK, gin.H{
@@ -74,7 +74,7 @@ func TestMiddleware_ValidSession(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/protected", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "valid-session-id"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "valid-session-id"})
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
@@ -94,7 +94,7 @@ func TestMiddleware_ExpiredSession(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/protected", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "expired-session"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "expired-session"})
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -114,7 +114,7 @@ func TestMiddleware_RevokedSession(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/protected", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "revoked-session"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "revoked-session"})
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -125,7 +125,7 @@ func TestMiddleware_UnknownSession(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/protected", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "does-not-exist"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "does-not-exist"})
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
@@ -148,7 +148,7 @@ func TestCookie_SetAndGet(t *testing.T) {
 
 	cookies := w.Result().Cookies()
 	require.Len(t, cookies, 1)
-	assert.Equal(t, SessionCookieName, cookies[0].Name)
+	assert.Equal(t, sessionCookieSecure, cookies[0].Name)
 	assert.Equal(t, "test-jti", cookies[0].Value)
 	assert.True(t, cookies[0].HttpOnly)
 	assert.True(t, cookies[0].Secure)
@@ -171,7 +171,7 @@ func TestCookie_Clear(t *testing.T) {
 
 	cookies := w.Result().Cookies()
 	require.Len(t, cookies, 1)
-	assert.Equal(t, SessionCookieName, cookies[0].Name)
+	assert.Equal(t, sessionCookieSecure, cookies[0].Name)
 	assert.Equal(t, "", cookies[0].Value)
 	assert.Equal(t, -1, cookies[0].MaxAge)
 }

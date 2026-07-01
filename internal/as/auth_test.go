@@ -85,7 +85,7 @@ func TestUnifiedAuth_NewStyleClient(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		ac := GetAuthContext(c)
 		if ac == nil {
@@ -104,7 +104,7 @@ func TestUnifiedAuth_NewStyleClient(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-id-123"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-id-123"})
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
@@ -128,7 +128,7 @@ func TestUnifiedAuth_LegacyClient(t *testing.T) {
 	tokenIssuer, _, _ := setupUnifiedAuth(t)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"rp-1"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"rp-1"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		ac := GetAuthContext(c)
 		if ac == nil {
@@ -161,7 +161,7 @@ func TestUnifiedAuth_NoAuth(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"aud"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -191,14 +191,14 @@ func TestUnifiedAuth_SessionButNoAccessToken(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-no-at"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-no-at"})
 	// No Authorization header.
 	router.ServeHTTP(w, req)
 
@@ -216,7 +216,7 @@ func TestUnifiedAuth_LegacyDisabled(t *testing.T) {
 	token, _ := legacyIssuer.Issue("user-1", "", "tenant-1", "rp-1")
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -257,14 +257,14 @@ func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-user1"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-user1"})
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
@@ -294,12 +294,12 @@ func TestUnifiedAuth_TenantMismatch(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-tenant1"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-tenant1"})
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
@@ -329,12 +329,12 @@ func TestUnifiedAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-cross"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-cross"})
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
@@ -363,12 +363,12 @@ func TestUnifiedAuth_TACExceedsSession(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, logger))
+	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: "session-limited"})
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "session-limited"})
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 

@@ -9,9 +9,10 @@ import (
 
 // LogoutHandler handles DELETE /auth/session.
 // It revokes the session and clears the session cookie.
-func LogoutHandler(store SessionStore, logger *zap.Logger) gin.HandlerFunc {
+func LogoutHandler(store SessionStore, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
-		sessionID := GetSessionCookie(c)
+		sessionID := GetSessionCookie(c, opts)
 		if sessionID == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "no session"})
 			return
@@ -25,7 +26,7 @@ func LogoutHandler(store SessionStore, logger *zap.Logger) gin.HandlerFunc {
 			// Don't expose internal errors — clear cookie regardless.
 		}
 
-		ClearSessionCookie(c, DefaultCookieOptions())
+		ClearSessionCookie(c, opts)
 		c.Status(http.StatusNoContent)
 	}
 }

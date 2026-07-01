@@ -7,9 +7,10 @@ import (
 )
 
 const (
-	// SessionCookieName is the name of the session cookie.
-	// The __Host- prefix enforces: Secure, no Domain, Path=/.
-	SessionCookieName = "__Host-session"
+	// sessionCookieSecure is the session cookie name with __Host- prefix (production).
+	sessionCookieSecure = "__Host-session"
+	// sessionCookieInsecure is the session cookie name without prefix (dev over HTTP).
+	sessionCookieInsecure = "session"
 )
 
 // CookieOptions configures session cookie behavior.
@@ -17,13 +18,24 @@ type CookieOptions struct {
 	// MaxAge is the cookie max-age in seconds. 0 means session cookie (browser closes).
 	// Should match the session TTL.
 	MaxAge int
+	// Insecure disables __Host- prefix and Secure flag for local HTTP development.
+	Insecure bool
 }
 
 // DefaultCookieOptions returns production-safe cookie defaults.
 func DefaultCookieOptions() CookieOptions {
 	return CookieOptions{
-		MaxAge: 0, // session cookie
+		MaxAge:   0, // session cookie
+		Insecure: false,
 	}
+}
+
+// cookieName returns the appropriate cookie name based on Insecure flag.
+func (o CookieOptions) cookieName() string {
+	if o.Insecure {
+		return sessionCookieInsecure
+	}
+	return sessionCookieSecure
 }
 
 // SetSessionCookie sets the session cookie on the response.
@@ -33,11 +45,11 @@ func DefaultCookieOptions() CookieOptions {
 // and OIDC callbacks use a separate state parameter for CSRF protection.
 func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
 	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     opts.cookieName(),
 		Value:    jti,
 		Path:     "/",
 		MaxAge:   opts.MaxAge,
-		Secure:   true,
+		Secure:   !opts.Insecure,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -47,11 +59,11 @@ func SetSessionCookie(c *gin.Context, jti string, opts CookieOptions) {
 // Path is always "/" to comply with the __Host- prefix requirements.
 func ClearSessionCookie(c *gin.Context, opts CookieOptions) {
 	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     opts.cookieName(),
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
-		Secure:   true,
+		Secure:   !opts.Insecure,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -59,8 +71,8 @@ func ClearSessionCookie(c *gin.Context, opts CookieOptions) {
 
 // GetSessionCookie extracts the session JTI from the request cookie.
 // Returns empty string if the cookie is not present.
-func GetSessionCookie(c *gin.Context) string {
-	cookie, err := c.Request.Cookie(SessionCookieName)
+func GetSessionCookie(c *gin.Context, opts CookieOptions) string {
+	cookie, err := c.Request.Cookie(opts.cookieName())
 	if err != nil {
 		return ""
 	}

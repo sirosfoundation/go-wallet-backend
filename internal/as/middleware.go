@@ -24,9 +24,10 @@ const (
 // SessionMiddleware validates the session cookie and sets the session in context.
 // If the session cookie is not present, it does NOT abort — downstream handlers
 // or the legacy middleware path may handle the request.
-func SessionMiddleware(store SessionStore, logger *zap.Logger) gin.HandlerFunc {
+func SessionMiddleware(store SessionStore, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
-		jti := GetSessionCookie(c)
+		jti := GetSessionCookie(c, opts)
 		if jti == "" {
 			// No session cookie — mark as legacy mode and continue.
 			c.Set(ContextKeyClientMode, ClientModeLegacy)
