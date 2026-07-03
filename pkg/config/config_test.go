@@ -14,7 +14,7 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 }
 

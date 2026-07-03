@@ -84,8 +84,11 @@ func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.sto
 func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
 func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
-func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
-func (b *memoryBackend) Close() error                             { return b.store.Close() }
+func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
+	return b.store.WalletInstances()
+}
+func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
 func newTestMemoryBackend(t *testing.T) backend.Backend {
 	t.Helper()
