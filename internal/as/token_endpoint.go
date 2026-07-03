@@ -52,12 +52,12 @@ func TokenEndpointHandler(
 			return
 		}
 
-		// Determine auth path: session cookie, Bearer delegation, or anonymous.
-		sessionID := GetSessionCookie(c, opts)
-		if sessionID != "" {
-			handleSessionTokenRequest(c, store, deps, sessionID, &req)
-		} else if req.Anonymous {
+		// Determine auth path: anonymous (explicit flag), session cookie, or Bearer delegation.
+		// Anonymous is checked first so it is honored even when a session cookie is present.
+		if req.Anonymous {
 			handleAnonymousTokenRequest(c, deps, &req)
+		} else if sessionID := GetSessionCookie(c, opts); sessionID != "" {
+			handleSessionTokenRequest(c, store, deps, sessionID, &req)
 		} else {
 			handleDelegationTokenRequest(c, deps, &req)
 		}
@@ -129,7 +129,12 @@ func handleAnonymousTokenRequest(
 		tac = TAC("r") // anonymous tokens default to read-only
 	}
 
-	issueToken(c, deps, "", req.Audience, req.TenantID, tac, "")
+	tenantID := req.TenantID
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	issueToken(c, deps, "", req.Audience, tenantID, tac, "")
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token

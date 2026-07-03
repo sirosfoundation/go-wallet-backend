@@ -567,3 +567,73 @@ func TestTokenEndpoint_CrossTenantAllowedForWildcard(t *testing.T) {
 		t.Fatalf("expected 200 for wildcard session, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestTokenEndpoint_AnonymousPriorityOverSession(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	// Create a session so a session cookie is present.
+	sess := &Session{
+		JTI:       "sess-anon-priority",
+		UserID:    "user-123",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rw"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Request with Anonymous=true AND a valid session cookie.
+	// Anonymous flag must take priority.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-priority"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for anonymous with session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Parse the issued token and verify it has no subject (anonymous).
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Subject != "" {
+		t.Errorf("expected empty subject for anonymous token, got %q", claims.Subject)
+	}
+}
+
+func TestTokenEndpoint_AnonymousDefaultTenantID(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Anonymous request without explicit tenant_id should get "default".
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.TenantID != "default" {
+		t.Errorf("expected tenant_id %q, got %q", "default", claims.TenantID)
+	}
+}

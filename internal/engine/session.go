@@ -227,13 +227,18 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	})
 
 	// Create session
+	sessionID := uuid.New().String()
+	logLabel := sessionID[:8]
+	if userID != "" {
+		logLabel = userID[:8]
+	}
 	session := &Session{
-		ID:       uuid.New().String(),
+		ID:       sessionID,
 		UserID:   userID,
 		TenantID: tenantID,
 		conn:     conn,
 		flows:    make(map[string]*Flow),
-		logger:   m.logger.With(zap.String("session", userID[:8])),
+		logger:   m.logger.With(zap.String("session", logLabel)),
 		actionCh: make(chan *FlowActionMessage, 50),
 		signCh:   make(chan *SignResponseMessage, 20),
 		matchCh:  make(chan *MatchResponseMessage, 20),
@@ -483,19 +488,23 @@ func (m *Manager) registerSession(session *Session) {
 	m.sessionsMu.Lock()
 	defer m.sessionsMu.Unlock()
 
-	// Close existing session for this user
-	if existing, ok := m.userIndex[session.UserID]; ok {
-		m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
-		_ = existing.conn.Close()
-		delete(m.sessions, existing.ID)
-		// Also remove from persistent store
-		if m.sessionStore != nil {
-			_ = m.sessionStore.DeleteByUser(context.Background(), session.UserID)
+	// Close existing session for this user (skip for anonymous sessions)
+	if session.UserID != "" {
+		if existing, ok := m.userIndex[session.UserID]; ok {
+			m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
+			_ = existing.conn.Close()
+			delete(m.sessions, existing.ID)
+			// Also remove from persistent store
+			if m.sessionStore != nil {
+				_ = m.sessionStore.DeleteByUser(context.Background(), session.UserID)
+			}
 		}
 	}
 
 	m.sessions[session.ID] = session
-	m.userIndex[session.UserID] = session
+	if session.UserID != "" {
+		m.userIndex[session.UserID] = session
+	}
 
 	// Persist to store
 	if m.sessionStore != nil {
@@ -517,8 +526,10 @@ func (m *Manager) unregisterSession(session *Session) {
 	defer m.sessionsMu.Unlock()
 
 	delete(m.sessions, session.ID)
-	if current, ok := m.userIndex[session.UserID]; ok && current == session {
-		delete(m.userIndex, session.UserID)
+	if session.UserID != "" {
+		if current, ok := m.userIndex[session.UserID]; ok && current == session {
+			delete(m.userIndex, session.UserID)
+		}
 	}
 
 	// Remove from persistent store
@@ -536,9 +547,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 		if err != nil {
 			return "", "", err
 		}
-		if result.UserID == "" {
-			return "", "", errors.New("invalid token claims: missing user_id")
-		}
+		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, nil
 	}
 
