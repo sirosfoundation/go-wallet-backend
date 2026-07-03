@@ -80,7 +80,7 @@ require (
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/sirosfoundation/g119612 v0.5.0 // indirect
-	github.com/sirosfoundation/go-siros-set v0.0.0
+	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
