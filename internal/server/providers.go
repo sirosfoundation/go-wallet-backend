@@ -74,7 +74,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 
 		// Registration routes (with OIDC registration gate)
 		registration := userBase.Group("")
-		registration.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger))
+		registration.Use(
+			middleware.NoCacheMiddleware(),
+			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
+		)
 		{
 			registration.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
 			registration.POST("/register-webauthn-finish", p.handlers.FinishWebAuthnRegistration)
@@ -82,7 +85,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 
 		// Login routes (with OIDC login gate)
 		login := userBase.Group("")
-		login.Use(middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger))
+		login.Use(
+			middleware.NoCacheMiddleware(),
+			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
+		)
 		{
 			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
 			login.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
@@ -106,7 +112,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 
 	// Protected auth routes (session management)
 	protected := router.Group("/")
-	protected.Use(p.authMiddleware())
+	protected.Use(
+		middleware.NoCacheMiddleware(),
+		p.authMiddleware(),
+	)
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -200,7 +209,10 @@ func (p *StorageProvider) Name() string         { return "storage" }
 func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Protected storage routes
 	protected := router.Group("/storage")
-	protected.Use(p.authMiddleware())
+	protected.Use(
+		middleware.NoCacheMiddleware(),
+		p.authMiddleware(),
+	)
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -471,7 +483,9 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 
 	// Register AS routes when enabled
 	if p.asModule != nil {
-		p.asModule.RegisterRoutes(router.Group("/auth"))
+		authGroup := router.Group("/auth")
+		authGroup.Use(middleware.NoCacheMiddleware())
+		p.asModule.RegisterRoutes(authGroup)
 	}
 
 	// Register AuthZEN proxy routes if enabled

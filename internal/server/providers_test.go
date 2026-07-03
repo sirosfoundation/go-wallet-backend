@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -15,8 +16,10 @@ import (
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 func init() {
@@ -66,6 +69,43 @@ func hasRoute(routes gin.RoutesInfo, method, path string) bool {
 		}
 	}
 	return false
+}
+
+type memoryBackend struct {
+	store *memory.Store
+}
+
+func (b *memoryBackend) Users() storage.UserStore                 { return b.store.Users() }
+func (b *memoryBackend) Tenants() storage.TenantStore             { return b.store.Tenants() }
+func (b *memoryBackend) UserTenants() storage.UserTenantStore     { return b.store.UserTenants() }
+func (b *memoryBackend) Credentials() storage.CredentialStore     { return b.store.Credentials() }
+func (b *memoryBackend) Presentations() storage.PresentationStore { return b.store.Presentations() }
+func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.store.Challenges() }
+func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
+func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
+func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
+func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
+func (b *memoryBackend) Close() error                             { return b.store.Close() }
+
+func newTestMemoryBackend(t *testing.T) backend.Backend {
+	t.Helper()
+
+	store := memory.NewStore()
+	return &memoryBackend{store: store}
+}
+
+func assertNoCacheHeaders(t *testing.T, headers http.Header) {
+	t.Helper()
+
+	if got := headers.Get("Cache-Control"); got != middleware.NoCacheControlValue {
+		t.Errorf("Cache-Control = %q", got)
+	}
+	if got := headers.Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q", got)
+	}
+	if got := headers.Get("Expires"); got != "0" {
+		t.Errorf("Expires = %q", got)
+	}
 }
 
 // =============================================================================
@@ -378,4 +418,69 @@ func TestBackendProvider_RegisterRoutes_WithoutAuthZENHandler(t *testing.T) {
 	if hasRoute(routes, http.MethodPost, "/v1/resolve") {
 		t.Error("expected POST /v1/resolve NOT to be registered when authzenHandler is nil")
 	}
+}
+
+func TestAuthProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	t.Run("login route", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/user/login-webauthn-begin", nil)
+		router.ServeHTTP(w, req)
+
+		if w.Code == http.StatusNotFound {
+			t.Fatal("expected login route to be registered")
+		}
+		assertNoCacheHeaders(t, w.Header())
+	})
+
+	t.Run("session route", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/user/session/account-info", nil)
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+		}
+		assertNoCacheHeaders(t, w.Header())
+	})
+
+	t.Run("public tenant config route", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/tenant/default/config", nil)
+		router.ServeHTTP(w, req)
+
+		if w.Code == http.StatusNotFound {
+			t.Fatal("expected tenant config route to be registered")
+		}
+		if got := w.Header().Get("Cache-Control"); got != "" {
+			t.Fatalf("Cache-Control = %q, want empty for public route", got)
+		}
+	})
+}
+
+func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.Features.CredentialStorageEnabled = true
+	store := newTestMemoryBackend(t)
+
+	provider := NewStorageProvider(cfg, store, logger, nil)
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+	assertNoCacheHeaders(t, w.Header())
 }
