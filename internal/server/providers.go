@@ -11,7 +11,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
+	"github.com/sirosfoundation/go-wallet-backend/internal/as"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
@@ -28,12 +31,13 @@ import (
 
 // AuthProvider provides authentication routes (WebAuthn, login, register)
 type AuthProvider struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    backend.Backend
-	services *service.Services
-	handlers *api.Handlers
-	roles    []string
+	cfg            *config.Config
+	logger         *zap.Logger
+	store          backend.Backend
+	services       *service.Services
+	handlers       *api.Handlers
+	roles          []string
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewAuthProvider creates a new auth route provider
@@ -102,7 +106,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 
 	// Protected auth routes (session management)
 	protected := router.Group("/")
-	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	protected.Use(p.authMiddleware())
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -156,16 +160,26 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	}
 }
 
+// authMiddleware returns the appropriate auth middleware: go-tokenauth when
+// a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
+func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+}
+
 // =============================================================================
 // Storage Provider - handles encrypted data storage routes only
 // =============================================================================
 
 // StorageProvider provides encrypted storage routes
 type StorageProvider struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    backend.Backend
-	handlers *api.Handlers
+	cfg            *config.Config
+	logger         *zap.Logger
+	store          backend.Backend
+	handlers       *api.Handlers
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewStorageProvider creates a new storage route provider
@@ -186,7 +200,7 @@ func (p *StorageProvider) Name() string         { return "storage" }
 func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Protected storage routes
 	protected := router.Group("/storage")
-	protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	protected.Use(p.authMiddleware())
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -197,6 +211,14 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 			protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
 		}
 	}
+}
+
+// authMiddleware returns the appropriate auth middleware for storage routes.
+func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
 
 // =============================================================================
@@ -278,6 +300,12 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
+// SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
+// so it can validate both new-style and legacy tokens during the handshake.
+func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
+	p.manager.SetTokenValidator(v)
+}
+
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
@@ -317,6 +345,8 @@ type BackendProvider struct {
 	cfg              *config.Config
 	authzenHandler   *api.AuthZENProxyHandler
 	metadataResolver *issuermetadata.Resolver
+	asModule         *as.ASModule
+	tokenValidator   *tokenvalidator.Validator
 	logger           *zap.Logger
 }
 
@@ -368,13 +398,62 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
+	// Initialize AS module when enabled.
+	var asModule *as.ASModule
+	var tv *tokenvalidator.Validator
+	if cfg.AS.Enabled {
+		services := service.NewServices(store, cfg, logger)
+		asModule, err = as.NewASModule(
+			context.Background(),
+			&cfg.AS,
+			&cfg.JWT,
+			services.WebAuthn,
+			store,
+			logger,
+		)
+		if err != nil {
+			if closeErr := store.Close(); closeErr != nil {
+				logger.Error("Failed to close store after AS module initialization failure", zap.Error(closeErr))
+			}
+			return nil, fmt.Errorf("failed to initialize AS module: %w", err)
+		}
+
+		// Create go-tokenauth validator for protecting resource endpoints.
+		issuer := cfg.AS.Issuer
+		if issuer == "" {
+			issuer = cfg.JWT.Issuer
+		}
+		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+		tv = tokenvalidator.New(tokenvalidator.Config{
+			JWKSURL:   jwksURL,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy: tokenvalidator.LegacyConfig{
+				Enabled:    cfg.AS.Legacy.Enabled,
+				HMACSecret: []byte(cfg.JWT.Secret),
+			},
+		})
+		tv.Start(context.Background())
+		logger.Info("Authorization Server module initialized",
+			zap.String("jwks_url", jwksURL),
+			zap.Strings("audiences", cfg.AS.Audiences),
+		)
+	}
+
+	authProvider := NewAuthProvider(cfg, store, logger, roles)
+	authProvider.tokenValidator = tv
+	storageProvider := NewStorageProvider(cfg, store, logger, roles)
+	storageProvider.tokenValidator = tv
+
 	return &BackendProvider{
-		auth:             NewAuthProvider(cfg, store, logger, roles),
-		storage:          NewStorageProvider(cfg, store, logger, roles),
+		auth:             authProvider,
+		storage:          storageProvider,
 		store:            store,
 		cfg:              cfg,
 		authzenHandler:   authzenHandler,
 		metadataResolver: metadataResolver,
+		asModule:         asModule,
+		tokenValidator:   tv,
 		logger:           logger,
 	}, nil
 }
@@ -390,10 +469,15 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	p.auth.RegisterRoutes(router)
 	p.storage.RegisterRoutes(router)
 
+	// Register AS routes when enabled
+	if p.asModule != nil {
+		p.asModule.RegisterRoutes(router.Group("/auth"))
+	}
+
 	// Register AuthZEN proxy routes if enabled
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
-		protected.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+		protected.Use(p.authMiddleware())
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", p.authzenHandler.Evaluate)
@@ -402,8 +486,19 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	}
 }
 
+// authMiddleware returns the appropriate auth middleware for backend routes.
+func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+}
+
 // Close shuts down the backend provider
 func (p *BackendProvider) Close() error {
+	if p.tokenValidator != nil {
+		p.tokenValidator.Stop()
+	}
 	if p.store != nil {
 		return p.store.Close()
 	}
@@ -432,6 +527,16 @@ func (p *BackendProvider) Store() backend.Backend {
 // share the TTL cache with the HTTP /v1/resolve handler.
 func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 	return p.metadataResolver
+}
+
+// ASModule returns the AS module, or nil if AS is not enabled.
+func (p *BackendProvider) ASModule() *as.ASModule {
+	return p.asModule
+}
+
+// TokenValidator returns the go-tokenauth validator, or nil if AS is not enabled.
+func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
+	return p.tokenValidator
 }
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.

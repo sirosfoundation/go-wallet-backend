@@ -22,6 +22,7 @@ type Config struct {
 	Storage        StorageConfig        `yaml:"storage" envconfig:"STORAGE"`
 	Logging        LoggingConfig        `yaml:"logging" envconfig:"LOGGING"`
 	JWT            JWTConfig            `yaml:"jwt" envconfig:"JWT"`
+	AS             ASConfig             `yaml:"as" envconfig:"AS"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
 	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
@@ -29,6 +30,97 @@ type Config struct {
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
+}
+
+// ASConfig contains the new Authorization Server configuration.
+type ASConfig struct {
+	// Enabled controls whether the new AS is active.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519)
+	// used to sign access tokens. Mutually exclusive with SigningKeyPKCS11.
+	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
+
+	// SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing.
+	// Mutually exclusive with SigningKeyPath.
+	SigningKeyPKCS11 string `yaml:"signing_key_pkcs11" envconfig:"SIGNING_KEY_PKCS11"`
+
+	// Issuer is the value of the "iss" claim in issued access tokens.
+	// Defaults to JWT.Issuer if not set.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+
+	// DefaultTokenTTL is the default access token lifetime.
+	// Default: 2m
+	DefaultTokenTTL time.Duration `yaml:"default_token_ttl" envconfig:"DEFAULT_TOKEN_TTL"`
+
+	// AudienceTTLs allows per-audience TTL overrides.
+	// Keys are audience strings, values are durations.
+	AudienceTTLs map[string]time.Duration `yaml:"audience_ttls" envconfig:"AUDIENCE_TTLS"`
+
+	// Audiences lists the accepted audience values for token validation.
+	// Tokens must contain at least one of these in their "aud" claim.
+	// When empty, audience validation is skipped.
+	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
+	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
+
+	// RulesDir is the path to a directory containing SPOCP policy rule files.
+	RulesDir string `yaml:"rules_dir" envconfig:"RULES_DIR"`
+
+	// SessionTTL is the maximum session lifetime before re-authentication.
+	// Default: 24h
+	SessionTTL time.Duration `yaml:"session_ttl" envconfig:"SESSION_TTL"`
+
+	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
+	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
+	// Default: "rwl" (read, write, list)
+	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
+
+	// Legacy contains configuration for legacy (HMAC) token compatibility.
+	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
+
+	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
+	// Used to construct OIDC redirect URIs. Required when OIDC is used.
+	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
+
+	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
+	// Required for local development over HTTP. NEVER enable in production.
+	InsecureCookies bool `yaml:"insecure_cookies" envconfig:"INSECURE_COOKIES"`
+}
+
+// ASLegacyConfig controls the legacy all-in-one HMAC token sunset.
+type ASLegacyConfig struct {
+	// Enabled controls whether legacy HMAC tokens are accepted.
+	// Default: true (for backward compatibility)
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// DeprecationHeader controls whether Deprecation + Sunset headers
+	// are sent on legacy token responses.
+	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
+
+	// SunsetDate is the date after which legacy tokens will no longer be supported.
+	// Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
+	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
+}
+
+// SetDefaults sets default values for AS configuration.
+func (c *ASConfig) SetDefaults() {
+	if c.DefaultTokenTTL == 0 {
+		c.DefaultTokenTTL = 2 * time.Minute
+	}
+	if c.SessionTTL == 0 {
+		c.SessionTTL = 24 * time.Hour
+	}
+	if c.DefaultMaxTAC == "" {
+		c.DefaultMaxTAC = "rwl"
+	}
+}
+
+// GetTokenTTL returns the TTL for a given audience, falling back to the default.
+func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
+	if ttl, ok := c.AudienceTTLs[audience]; ok {
+		return ttl
+	}
+	return c.DefaultTokenTTL
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -900,6 +992,13 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
+		AS: ASConfig{
+			DefaultTokenTTL: 2 * time.Minute,
+			Legacy: ASLegacyConfig{
+				Enabled:           true,  // Legacy tokens accepted by default
+				DeprecationHeader: false, // No deprecation headers until explicitly enabled
+			},
+		},
 	}
 }
 
@@ -969,6 +1068,52 @@ func (c *Config) Validate() error {
 			if origin == "*" {
 				return fmt.Errorf("CORS: allow_credentials cannot be true when allowed_origins contains '*'")
 			}
+		}
+	}
+
+	// Validate AS configuration
+	if c.AS.Enabled {
+		if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
+			return fmt.Errorf("as: signing_key_path or signing_key_pkcs11 is required when AS is enabled")
+		}
+		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != "" {
+			return fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
+		}
+		if c.AS.SigningKeyPKCS11 != "" {
+			return fmt.Errorf("as: signing_key_pkcs11 is not yet implemented; use signing_key_path")
+		}
+		if c.AS.RulesDir == "" {
+			return fmt.Errorf("as: rules_dir is required when AS is enabled (AllowAll is not safe for production)")
+		}
+		if c.AS.DefaultTokenTTL < 0 {
+			return fmt.Errorf("as: default_token_ttl must be positive")
+		}
+		if c.AS.SessionTTL < 0 {
+			return fmt.Errorf("as: session_ttl must be positive")
+		}
+		for aud, ttl := range c.AS.AudienceTTLs {
+			if ttl <= 0 {
+				return fmt.Errorf("as: audience_ttls[%q] must be positive", aud)
+			}
+		}
+		if c.AS.DefaultMaxTAC != "" {
+			for i := range c.AS.DefaultMaxTAC {
+				ch := c.AS.DefaultMaxTAC[i]
+				switch ch {
+				case 'r', 'w', 'l', 'i', 'd', 'k', 'a':
+					// valid
+				default:
+					return fmt.Errorf("as: default_max_tac contains invalid character %q", ch)
+				}
+			}
+		}
+		c.AS.SetDefaults()
+		// Default issuer to JWT.Issuer if not explicitly set.
+		if c.AS.Issuer == "" {
+			c.AS.Issuer = c.JWT.Issuer
+		}
+		if c.AS.Issuer == "" {
+			return fmt.Errorf("as: issuer is required (set as.issuer or jwt.issuer)")
 		}
 	}
 

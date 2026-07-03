@@ -42,8 +42,9 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 )
 
 // supportedSignatureAlgorithms is the set of JWS algorithms accepted for

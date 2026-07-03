@@ -33,7 +33,7 @@ func (s *TenantStore) Create(ctx context.Context, tenant *domain.Tenant) error {
 
 func (s *TenantStore) GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error) {
 	var tenant domain.Tenant
-	err := s.collection.FindOne(ctx, bson.M{"_id": string(id)}).Decode(&tenant)
+	err := s.collection.FindOne(ctx, idFilter(string(id))).Decode(&tenant)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -73,7 +73,7 @@ func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, erro
 
 func (s *TenantStore) Update(ctx context.Context, tenant *domain.Tenant) error {
 	tenant.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id": string(tenant.ID)}, tenant)
+	result, err := s.collection.ReplaceOne(ctx, idFilter(string(tenant.ID)), tenant)
 	if err != nil {
 		return fmt.Errorf("failed to update tenant: %w", err)
 	}
@@ -84,7 +84,7 @@ func (s *TenantStore) Update(ctx context.Context, tenant *domain.Tenant) error {
 }
 
 func (s *TenantStore) Delete(ctx context.Context, id domain.TenantID) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": string(id)})
+	result, err := s.collection.DeleteOne(ctx, idFilter(string(id)))
 	if err != nil {
 		return fmt.Errorf("failed to delete tenant: %w", err)
 	}

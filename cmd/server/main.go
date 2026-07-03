@@ -220,6 +220,10 @@ func main() {
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
+		// Wire token validator for WebSocket handshake auth
+		if backendProvider != nil && backendProvider.TokenValidator() != nil {
+			provider.SetTokenValidator(backendProvider.TokenValidator())
+		}
 		mgr.AddProvider(provider)
 
 		// Wire session store into UserService so DeleteUser purges active sessions

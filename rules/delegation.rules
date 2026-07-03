@@ -1,0 +1,16 @@
+; Delegation SPOCP policy rules.
+;
+; Delegation tokens are always downscoped: the delegated token's tac
+; must be a subset of the delegating token's tac, and tenant_id must
+; match (or narrow from "*" to a specific tenant). These constraints
+; are enforced at the code level before SPOCP evaluation. The rules
+; below control which delegation-issued tokens the policy engine will
+; permit.
+
+; Allow delegation-issued tokens with read/list permissions.
+(5:token (3:tac 1:r))
+(5:token (3:tac 1:l))
+(5:token (3:tac 2:rl))
+
+; Allow delegation-issued tokens scoped to the delegating user's tenant.
+(5:token (3:sub (*)) (9:tenant_id (*)))

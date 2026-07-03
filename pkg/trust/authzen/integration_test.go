@@ -7,6 +7,7 @@ import (
 
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/testserver"
+
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 

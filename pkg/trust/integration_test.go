@@ -10,6 +10,7 @@ import (
 
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/testserver"
+
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 	authzenevaluator "github.com/sirosfoundation/go-wallet-backend/pkg/trust/authzen"

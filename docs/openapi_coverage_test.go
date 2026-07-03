@@ -12,9 +12,10 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/gin-gonic/gin"
 
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"go.uber.org/zap"
 )
 
 // TestAdminOpenAPIRouteCoverage verifies that every route registered on the admin
