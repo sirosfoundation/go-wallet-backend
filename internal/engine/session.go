@@ -279,15 +279,20 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 // pingLoop sends WebSocket ping frames at wsPingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
+	wst, ok := s.transport.(*wsTransport)
+	if !ok {
+		return // non-WebSocket transports don't need ping/pong
+	}
+
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			s.sendMu.Lock()
-			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
-			s.sendMu.Unlock()
+			wst.sendMu.Lock()
+			err := wst.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
+			wst.sendMu.Unlock()
 			if err != nil {
 				return // connection is dead; ReadMessage will surface the error
 			}
