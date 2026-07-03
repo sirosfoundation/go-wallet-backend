@@ -115,9 +115,10 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	if mode == ClientModeSession {
 		// New-style client: no token in body.
 		c.JSON(http.StatusOK, gin.H{
-			"uuid":        resp.UUID,
-			"displayName": resp.DisplayName,
-			"tenantId":    resp.TenantID,
+			"uuid":              resp.UUID,
+			"displayName":       resp.DisplayName,
+			"tenantId":          resp.TenantID,
+			"tenantDisplayName": resp.TenantDisplayName,
 		})
 	} else {
 		// Legacy client: return existing response format (appToken included).
@@ -197,9 +198,10 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	mode := DetectClientMode(c)
 	if mode == ClientModeSession {
 		c.JSON(http.StatusOK, gin.H{
-			"uuid":        resp.UUID,
-			"displayName": resp.DisplayName,
-			"tenantId":    resp.TenantID,
+			"uuid":              resp.UUID,
+			"displayName":       resp.DisplayName,
+			"tenantId":          resp.TenantID,
+			"tenantDisplayName": resp.TenantDisplayName,
 		})
 	} else {
 		c.JSON(http.StatusOK, resp)

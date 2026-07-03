@@ -98,9 +98,10 @@ func TestPasskeyLoginBegin_Error(t *testing.T) {
 func TestPasskeyLoginFinish_Success(t *testing.T) {
 	mock := &mockWebAuthn{
 		finishLoginResp: &service.FinishLoginResponse{
-			UUID:        "user-123",
-			DisplayName: "Test User",
-			TenantID:    "tenant-1",
+			UUID:              "user-123",
+			DisplayName:       "Test User",
+			TenantID:          "tenant-1",
+			TenantDisplayName: "Tenant One",
 		},
 	}
 	router, store := setupPasskeyHandlers(mock)
@@ -121,6 +122,9 @@ func TestPasskeyLoginFinish_Success(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if resp["uuid"] != "user-123" {
 		t.Errorf("expected uuid user-123, got %v", resp["uuid"])
+	}
+	if resp["tenantDisplayName"] != "Tenant One" {
+		t.Errorf("expected tenantDisplayName 'Tenant One', got %v", resp["tenantDisplayName"])
 	}
 
 	// Verify cookie was set.
@@ -251,9 +255,10 @@ func TestPasskeyRegisterBegin_Error(t *testing.T) {
 func TestPasskeyRegisterFinish_Success(t *testing.T) {
 	mock := &mockWebAuthn{
 		finishRegResp: &service.FinishRegistrationResponse{
-			UUID:        "new-user-1",
-			DisplayName: "New User",
-			TenantID:    "tenant-reg",
+			UUID:              "new-user-1",
+			DisplayName:       "New User",
+			TenantID:          "tenant-reg",
+			TenantDisplayName: "Tenant Reg",
 		},
 	}
 	router, store := setupPasskeyHandlers(mock)
