@@ -1,6 +1,7 @@
 package signing
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/x509"
@@ -69,6 +70,9 @@ func loadFromFile(cfg *KeyConfig) (*KeyMaterial, error) {
 		return nil, fmt.Errorf("read private key: %w", err)
 	}
 
+	// Strip \r so CRLF line endings don't break PEM decoding.
+	keyPEM = bytes.ReplaceAll(keyPEM, []byte("\r"), nil)
+
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
 		return nil, errors.New("failed to decode PEM block")
@@ -122,6 +126,9 @@ func parsePEMCerts(path string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read certificate %s: %w", path, err)
 	}
+
+	// Strip \r so CRLF line endings don't break PEM decoding.
+	data = bytes.ReplaceAll(data, []byte("\r"), nil)
 
 	var certs []string
 	for {
