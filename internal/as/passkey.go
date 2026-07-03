@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -74,6 +75,12 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
+		if errors.Is(err, service.ErrCredentialDeactivated) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "credential_deactivated",
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		return
 	}
