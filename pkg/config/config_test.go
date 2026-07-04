@@ -1495,3 +1495,113 @@ func TestConfig_Validate_AS_InvalidMaxTACChars(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestReadSecretFile_Success(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(path, []byte("  my-secret-value  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := readSecretFile(path)
+	if err != nil {
+		t.Fatalf("readSecretFile: %v", err)
+	}
+	if val != "my-secret-value" {
+		t.Errorf("expected trimmed secret, got %q", val)
+	}
+}
+
+func TestReadSecretFile_NotFound(t *testing.T) {
+	_, err := readSecretFile("/nonexistent/path/secret.txt")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestReadSecretFile_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, []byte("  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := readSecretFile(path)
+	if err == nil {
+		t.Fatal("expected error for empty file")
+	}
+	if !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_AdminToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "admin-token")
+	if err := os.WriteFile(tokenPath, []byte("test-admin-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = tokenPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Server.AdminToken != "test-admin-token" {
+		t.Errorf("admin token = %q, want test-admin-token", cfg.Server.AdminToken)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecret(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "jwt-secret")
+	if err := os.WriteFile(secretPath, []byte("jwt-secret-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = secretPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.JWT.Secret != "jwt-secret-value" {
+		t.Errorf("jwt secret = %q, want jwt-secret-value", cfg.JWT.Secret)
+	}
+}
+
+func TestLoadSecretsFromFiles_MongoPassword(t *testing.T) {
+	dir := t.TempDir()
+	passPath := filepath.Join(dir, "mongo-pass")
+	if err := os.WriteFile(passPath, []byte("s3cret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Storage.MongoDB.PasswordPath = passPath
+	cfg.Storage.MongoDB.URI = "mongodb://user:%PASSWORD%@localhost:27017"
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Storage.MongoDB.URI != "mongodb://user:s3cret@localhost:27017" {
+		t.Errorf("uri = %q, want password replaced", cfg.Storage.MongoDB.URI)
+	}
+}
+
+func TestLoadSecretsFromFiles_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = "/nonexistent/token"
+
+	if err := cfg.loadSecretsFromFiles(); err == nil {
+		t.Fatal("expected error for bad admin token path")
+	}
+}
+
+func TestLoadSecretsFromFiles_NoPaths(t *testing.T) {
+	cfg := defaultConfig()
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles with no paths: %v", err)
+	}
+}
