@@ -1,6 +1,9 @@
 package api
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,11 +11,26 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-jose/go-jose/v4"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
+
+func testAuditEmitter(t *testing.T) *audit.Emitter {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	return audit.New("test-issuer", signer, nil)
+}
 
 func seedInstance(t *testing.T, h *AdminHandlers, id string, tenantID domain.TenantID, userID *domain.UserID) {
 	t.Helper()
@@ -268,5 +286,87 @@ func TestListWalletInstancesByUser_WithData(t *testing.T) {
 	}
 	if len(instances) != 2 {
 		t.Errorf("expected 2 instances for user-1, got %d", len(instances))
+	}
+}
+
+func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	auditor := testAuditEmitter(t)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "audit-inst", "acme", nil)
+
+	body := `{"status":"revoked","reason":"policy violation"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/audit-inst/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateWalletInstanceStatus_WithAudit_Suspended(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	auditor := testAuditEmitter(t)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "suspend-inst", "acme", nil)
+
+	body := `{"status":"suspended","reason":"under review"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/suspend-inst/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	auditor := testAuditEmitter(t)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "reactivate-inst", "acme", nil)
+
+	body := `{"status":"active"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/reactivate-inst/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteWalletInstance_WithAudit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	auditor := testAuditEmitter(t)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	seedInstance(t, h, "del-audit", "acme", nil)
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/del-audit", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
 	}
 }
