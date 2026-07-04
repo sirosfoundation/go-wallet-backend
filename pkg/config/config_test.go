@@ -1605,3 +1605,47 @@ func TestLoadSecretsFromFiles_NoPaths(t *testing.T) {
 		t.Fatalf("loadSecretsFromFiles with no paths: %v", err)
 	}
 }
+
+func TestLoadSecretsFromFiles_PKCS11PIN(t *testing.T) {
+	dir := t.TempDir()
+	pinPath := filepath.Join(dir, "hsm-pin")
+	if err := os.WriteFile(pinPath, []byte("1234"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: pinPath}
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.WalletProvider.PKCS11.PIN != "1234" {
+		t.Errorf("pin = %q, want 1234", cfg.WalletProvider.PKCS11.PIN)
+	}
+}
+
+func TestLoadSecretsFromFiles_PKCS11PIN_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: "/nonexistent/pin"}
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad PKCS11 PIN path")
+	}
+	if !strings.Contains(err.Error(), "pkcs11") {
+		t.Errorf("error should mention pkcs11: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecretBadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = "/nonexistent/jwt-secret"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad JWT secret path")
+	}
+	if !strings.Contains(err.Error(), "jwt") {
+		t.Errorf("error should mention jwt: %v", err)
+	}
+}
