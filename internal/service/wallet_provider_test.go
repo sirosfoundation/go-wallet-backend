@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"math/big"
+	"os"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -292,5 +294,247 @@ func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
 
 	if _, ok := claims["key_storage_status"]; ok {
 		t.Error("key_storage_status should not be present when StatusListMode=never")
+	}
+}
+
+func TestParsePEMCertChain_Valid(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+	}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+
+	tmpDir := t.TempDir()
+	certPath := tmpDir + "/cert.pem"
+	f, _ := os.Create(certPath)
+	_ = pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	f.Close()
+
+	chain, err := parsePEMCertChain(certPath)
+	if err != nil {
+		t.Fatalf("parsePEMCertChain: %v", err)
+	}
+	if len(chain) != 1 {
+		t.Errorf("expected 1 cert, got %d", len(chain))
+	}
+}
+
+func TestParsePEMCertChain_MultipleCerts(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	tmpDir := t.TempDir()
+	certPath := tmpDir + "/chain.pem"
+	f, _ := os.Create(certPath)
+	for i := 0; i < 3; i++ {
+		template := &x509.Certificate{SerialNumber: big.NewInt(int64(i + 1))}
+		certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+		_ = pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	}
+	f.Close()
+
+	chain, err := parsePEMCertChain(certPath)
+	if err != nil {
+		t.Fatalf("parsePEMCertChain: %v", err)
+	}
+	if len(chain) != 3 {
+		t.Errorf("expected 3 certs, got %d", len(chain))
+	}
+}
+
+func TestParsePEMCertChain_NoCerts(t *testing.T) {
+	tmpDir := t.TempDir()
+	certPath := tmpDir + "/empty.pem"
+	_ = os.WriteFile(certPath, []byte("not a pem file"), 0600)
+
+	_, err := parsePEMCertChain(certPath)
+	if err == nil {
+		t.Fatal("expected error for file with no certs")
+	}
+}
+
+func TestParsePEMCertChain_FileNotFound(t *testing.T) {
+	_, err := parsePEMCertChain("/nonexistent/path/cert.pem")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestLoadKeys_ValidECKey(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err != nil {
+		t.Fatalf("loadKeys: %v", err)
+	}
+	if svc.signer == nil {
+		t.Error("signer should be set")
+	}
+	if svc.jwtSigner == nil {
+		t.Error("jwtSigner should be set")
+	}
+	if len(svc.certChain) == 0 {
+		t.Error("certChain should be set")
+	}
+}
+
+func TestLoadKeys_PKCS8Key(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err != nil {
+		t.Fatalf("loadKeys: %v", err)
+	}
+	if svc.signer == nil {
+		t.Error("signer should be set")
+	}
+}
+
+func TestLoadKeys_InvalidPEM(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/key.pem"
+	_ = os.WriteFile(keyPath, []byte("not a pem file"), 0600)
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err == nil {
+		t.Fatal("expected error for invalid PEM")
+	}
+}
+
+func TestLoadKeys_BadPEMType(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("fake")})
+	kf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	err := svc.loadKeys()
+	if err == nil {
+		t.Fatal("expected error for wrong PEM type")
+	}
+}
+
+func TestLoadKeys_WithCACert(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(2), IsCA: true}
+	caDER, _ := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &key.PublicKey, key)
+	caPath := tmpDir + "/ca.pem"
+	caf, _ := os.Create(caPath)
+	_ = pem.Encode(caf, &pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	caf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.CACertPath = caPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err != nil {
+		t.Fatalf("loadKeys: %v", err)
+	}
+	if len(svc.certChain) != 2 {
+		t.Errorf("expected 2 certs in chain, got %d", len(svc.certChain))
+	}
+}
+
+func TestLoadKeys_MissingKeyFile(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/nonexistent/key.pem"
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err == nil {
+		t.Fatal("expected error for missing key file")
+	}
+}
+
+func TestNewWalletProviderService_FileKeys(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+
+	svc := NewWalletProviderService(cfg, zap.NewNop())
+	if !svc.IsSupported() {
+		t.Error("service should be supported with valid keys")
+	}
+}
+
+func TestNewWalletProviderService_NoKeys(t *testing.T) {
+	cfg := &config.Config{}
+	svc := NewWalletProviderService(cfg, zap.NewNop())
+	if svc.IsSupported() {
+		t.Error("service should not be supported without keys")
 	}
 }
