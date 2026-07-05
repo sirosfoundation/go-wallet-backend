@@ -60,6 +60,13 @@ const resumptionTokenTTL = 10 * time.Minute
 // maxFlowIDLength limits client-supplied flow IDs to prevent memory abuse.
 const maxFlowIDLength = 128
 
+// defaultFlowTimeout is the server-side default when the client does not
+// supply a timeout in wmp.flow.start.
+const defaultFlowTimeout = 5 * time.Minute
+
+// maxSessionTTL caps the TTL a client may request for a session.
+const maxSessionTTL = 24 * time.Hour
+
 // wmpSession associates a wmp.Peer with its channel transport and engine session.
 type wmpSession struct {
 	peer         *wmp.Peer
@@ -67,6 +74,9 @@ type wmpSession struct {
 	session      *Session
 	cancel       context.CancelFunc
 	lastActivity time.Time
+	capabilities wmp.Capabilities // negotiated capabilities for resume echo
+	security     wmp.SecurityMode // negotiated security mode for resume echo
+	expiresAt    time.Time        // absolute session deadline from TTL
 }
 
 // NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
@@ -113,17 +123,19 @@ func (a *WMPAdapter) cleanupExpired() {
 		}
 	}
 
-	// Collect idle sessions to close (avoid calling CloseSession under lock).
-	var idleSessions []string
+	// Collect idle or TTL-expired sessions to close.
+	var expiredSessions []string
 	for sid, ws := range a.peers {
 		if now.Sub(ws.lastActivity) > wmpSessionIdleTimeout {
-			idleSessions = append(idleSessions, sid)
+			expiredSessions = append(expiredSessions, sid)
+		} else if !ws.expiresAt.IsZero() && now.After(ws.expiresAt) {
+			expiredSessions = append(expiredSessions, sid)
 		}
 	}
 	a.mu.Unlock()
 
-	for _, sid := range idleSessions {
-		a.logger.Info("Closing idle WMP session", zap.String("session_id", sid[:8]))
+	for _, sid := range expiredSessions {
+		a.logger.Info("Closing expired/idle WMP session", zap.String("session_id", sid[:8]))
 		a.CloseSession(sid)
 	}
 }
@@ -277,6 +289,16 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 
 	sessionID := uuid.New().String()
 
+	// Compute session expiry from client TTL (capped).
+	var expiresAt time.Time
+	if params.TTL > 0 {
+		ttl := time.Duration(params.TTL) * time.Second
+		if ttl > maxSessionTTL {
+			ttl = maxSessionTTL
+		}
+		expiresAt = time.Now().Add(ttl)
+	}
+
 	// Create the channel transport for this session.
 	ct := wmp.NewChannelTransport(50, 200)
 
@@ -335,13 +357,8 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 	}()
 
 	// Build response with capability negotiation.
-	// The server advertises the capabilities it supports. If the client
-	// sent capabilities_offered, the result is the intersection; otherwise
-	// the server returns all its capabilities (per spec §4.2.1).
-	serverCaps := wmp.Capabilities{
-		"flows": json.RawMessage(`{"max_concurrent": 5}`),
-		"sign":  json.RawMessage(`{"proof_types": ["jwt"]}`),
-	}
+	// Derive server capabilities from registered flow handlers (spec §4.2.1).
+	serverCaps := a.serverCapabilities()
 	negotiated := serverCaps
 	if len(params.CapabilitiesOffered) > 0 {
 		negotiated = make(wmp.Capabilities)
@@ -351,6 +368,11 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 			}
 		}
 	}
+
+	// Store negotiated state for resume echo.
+	ws.capabilities = negotiated
+	ws.security = params.Security
+	ws.expiresAt = expiresAt
 
 	result := wmp.SessionCreateResult{
 		WMP: wmp.Metadata{
@@ -385,6 +407,57 @@ func (a *WMPAdapter) generateResumptionToken(sessionID string) string {
 	a.mu.Unlock()
 
 	return token
+}
+
+// serverCapabilities builds the capability map from registered flow handlers.
+// This avoids hardcoding and ensures the advertised capabilities reflect the
+// actual server configuration (spec §4.2.1).
+func (a *WMPAdapter) serverCapabilities() wmp.Capabilities {
+	caps := wmp.Capabilities{
+		"sign": json.RawMessage(`{"proof_types": ["jwt"]}`),
+	}
+	// Derive supported flow types from registered handlers.
+	a.manager.handlersMu.RLock()
+	flowTypes := make([]string, 0, len(a.manager.flowHandlers))
+	for p := range a.manager.flowHandlers {
+		flowTypes = append(flowTypes, string(p))
+	}
+	a.manager.handlersMu.RUnlock()
+
+	flowsJSON, _ := json.Marshal(map[string]interface{}{
+		"max_concurrent": MaxPendingFlowsPerSession,
+		"supported":      flowTypes,
+	})
+	caps["flows"] = json.RawMessage(flowsJSON)
+	return caps
+}
+
+// replayActiveFlowProgress re-sends the latest flow.progress for each active
+// flow after a session resume, allowing the client to recover UI state.
+func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) {
+	a.mu.RLock()
+	ws, ok := a.peers[sessionID]
+	a.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	ws.session.flowsMu.RLock()
+	defer ws.session.flowsMu.RUnlock()
+
+	for _, flow := range ws.session.flows {
+		if flow.State == "" {
+			continue
+		}
+		_ = peer.Notify(context.Background(), wmp.MethodFlowProgress, &wmp.FlowProgressParams{
+			WMP: wmp.Metadata{
+				Version:   wmp.Version,
+				SessionID: sessionID,
+			},
+			FlowID: flow.ID,
+			Step:   string(flow.State),
+		})
+	}
 }
 
 // handleSessionResume validates a resumption token, rotates it, and reconnects
@@ -482,6 +555,8 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 	// Issue a new rotated token.
 	newToken := a.generateResumptionToken(params.SessionID)
 
+	// Echo the negotiated capabilities and security from the original session
+	// per spec §4.5.1 / §4.5.3.
 	result := wmp.SessionResumeResult{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
@@ -489,9 +564,14 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 		},
 		Resumed:         true,
 		ResumptionToken: newToken,
-		MissedMessages:  0, // TODO: implement message replay via last_received_id
-		Security:        wmp.SecurityMode{Mode: "tls"},
+		MissedMessages:  0, // full message replay not yet implemented
+		Capabilities:    ws.capabilities,
+		Security:        ws.security,
 	}
+
+	// Per spec §6.2.1, re-send the latest flow.progress for each active flow
+	// so the client can recover flow state after reconnection.
+	go a.replayActiveFlowProgress(params.SessionID, peer)
 
 	return wmpResponseBytes(req.ID, result)
 }
@@ -548,7 +628,14 @@ func (h *wmpEngineHandler) popChildFlow(childFlowID string) (*childFlowInfo, boo
 }
 
 // SessionClose cleans up when the client closes the session.
-func (h *wmpEngineHandler) SessionClose(_ context.Context, _ *wmp.SessionCloseParams) {
+func (h *wmpEngineHandler) SessionClose(_ context.Context, params *wmp.SessionCloseParams) {
+	reason := "unknown"
+	if params != nil && params.Reason != "" {
+		reason = params.Reason
+	}
+	h.adapter.logger.Info("WMP session closed by client",
+		zap.String("session_id", h.sessionID),
+		zap.String("reason", reason))
 	h.adapter.CloseSession(h.sessionID)
 }
 
@@ -629,6 +716,15 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}
 	flow.Handler = handler
 
+	// Determine flow timeout: client-supplied (spec §6.2) or server default.
+	flowTimeout := defaultFlowTimeout
+	if params.Timeout > 0 {
+		clientTimeout := time.Duration(params.Timeout) * time.Second
+		if clientTimeout < flowTimeout {
+			flowTimeout = clientTimeout
+		}
+	}
+
 	// Launch the engine flow goroutine. The engine handler calls
 	// Session.SendProgress, Session.RequestSign, etc., which go through
 	// the wmpSessionTransport and are converted to WMP notifications.
@@ -643,7 +739,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 			h.session.flowsMu.Unlock()
 		}()
 
-		flowCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		flowCtx, cancel := context.WithTimeout(context.Background(), flowTimeout)
 		defer cancel()
 
 		logger.Info("Starting WMP flow")
@@ -780,13 +876,16 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 }
 
 // FlowCancel handles wmp.flow.cancel — cancels an active engine flow.
+// Per spec §6.2, returns -31006 with reason "already_terminal" if the flow
+// has already completed.
 func (h *wmpEngineHandler) FlowCancel(_ context.Context, params *wmp.FlowCancelParams) (*wmp.FlowCancelResult, error) {
 	h.session.flowsMu.RLock()
 	flow, exists := h.session.flows[params.FlowID]
 	h.session.flowsMu.RUnlock()
 	if !exists {
+		// Flow not in map — already reached a terminal state.
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{
-			"reason": "flow not found",
+			"reason": "already_terminal",
 		})
 	}
 	if flow.Handler != nil {
@@ -864,12 +963,21 @@ func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessio
 // SendJSON intercepts engine message structs and translates them to WMP
 // JSON-RPC notifications. The peer writes to the ChannelTransport, which
 // feeds the SSE event stream.
+// wmpMeta returns a Metadata with version and session ID pre-filled.
+func (t *wmpSessionTransport) wmpMeta() wmp.Metadata {
+	return wmp.Metadata{
+		Version:   wmp.Version,
+		SessionID: t.handler.sessionID,
+	}
+}
+
 func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 	ctx := context.Background()
 
 	switch m := msg.(type) {
 	case *FlowProgressMessage:
 		return t.peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
+			WMP:     t.wmpMeta(),
 			FlowID:  m.FlowID,
 			Step:    string(m.Step),
 			Payload: m.Payload,
@@ -881,12 +989,14 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 			return err
 		}
 		return t.peer.Notify(ctx, wmp.MethodFlowComplete, &wmp.FlowCompleteParams{
+			WMP:    t.wmpMeta(),
 			FlowID: m.FlowID,
 			Result: result,
 		})
 
 	case *FlowErrorMessage:
 		return t.peer.Notify(ctx, wmp.MethodFlowError, &wmp.FlowErrorParams{
+			WMP:     t.wmpMeta(),
 			FlowID:  m.FlowID,
 			Code:    mapErrorCode(m.Error.Code),
 			Message: m.Error.Message,
@@ -912,6 +1022,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		}
 		var startResult wmp.FlowStartResult
 		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+			WMP:      t.wmpMeta(),
 			FlowType: wmp.FlowTypeSign,
 			FlowID:   childFlowID,
 			Params:   paramsJSON,
@@ -933,6 +1044,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		}
 		var startResult wmp.FlowStartResult
 		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+			WMP:      t.wmpMeta(),
 			FlowType: "match",
 			FlowID:   childFlowID,
 			Params:   paramsJSON,
