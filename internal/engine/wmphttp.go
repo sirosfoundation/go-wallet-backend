@@ -8,6 +8,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// maxWMPRPCBodyBytes is the maximum allowed body size for WMP JSON-RPC requests.
+// JSON-RPC messages are small; 256KB is generous for any flow action payload.
+const maxWMPRPCBodyBytes = 256 * 1024
+
 // HandleWMPRPC handles POST /wmp/rpc — a single JSON-RPC request/response.
 func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -22,14 +26,15 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, _, err := a.manager.validateToken(token); err != nil {
+	userID, tenantID, err := a.manager.validateToken(token)
+	if err != nil {
 		a.logger.Warn("WMP HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 		return
 	}
 
-	// Read body (bounded).
-	body, err := io.ReadAll(io.LimitReader(r.Body, MaxHTTPResponseBodyBytes))
+	// Read body (bounded to RPC-appropriate size).
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxWMPRPCBodyBytes))
 	if err != nil {
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
@@ -37,6 +42,14 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 
 	// Session ID from header (empty for session.create).
 	sessionID := r.Header.Get("Wmp-Session-Id")
+
+	// For methods that target an existing session, verify ownership.
+	if sessionID != "" {
+		if !a.verifySessionOwnership(sessionID, userID, tenantID) {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+	}
 
 	// Dispatch.
 	resp, err := a.HandleRPC(r.Context(), sessionID, body)
@@ -68,7 +81,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
-	if _, _, err := a.manager.validateToken(token); err != nil {
+	userID, tenantID, err := a.manager.validateToken(token)
+	if err != nil {
 		a.logger.Warn("WMP SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
 		return
@@ -77,6 +91,12 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
 		http.Error(w, "missing session_id query parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the session belongs to the authenticated user.
+	if !a.verifySessionOwnership(sessionID, userID, tenantID) {
+		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
 
@@ -98,8 +118,6 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx
 	flusher.Flush()
-
-	// TODO: handle Last-Event-ID for replay
 
 	ctx := r.Context()
 	eventID := 0

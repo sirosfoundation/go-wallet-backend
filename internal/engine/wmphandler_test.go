@@ -24,6 +24,12 @@ func testWMPAdapter() (*WMPAdapter, *Manager) {
 	return a, m
 }
 
+// cleanupWMP shuts down both the adapter and manager.
+func cleanupWMP(a *WMPAdapter, m *Manager) {
+	a.Close()
+	m.Close()
+}
+
 // wmpRequest builds a JSON-RPC request body.
 func wmpRequest(id string, method string, params interface{}) []byte {
 	p, _ := json.Marshal(params)
@@ -41,7 +47,7 @@ func wmpRequest(id string, method string, params interface{}) []byte {
 
 func TestWMP_SessionCreate_Success(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
 		WMP:      wmp.Metadata{Version: wmp.Version},
@@ -64,7 +70,7 @@ func TestWMP_SessionCreate_Success(t *testing.T) {
 
 func TestWMP_SessionCreate_NoAuth(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
 		WMP:      wmp.Metadata{Version: wmp.Version},
@@ -82,7 +88,7 @@ func TestWMP_SessionCreate_NoAuth(t *testing.T) {
 
 func TestWMP_SessionCreate_ExpiredToken(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
 		WMP:      wmp.Metadata{Version: wmp.Version},
@@ -101,7 +107,7 @@ func TestWMP_SessionCreate_ExpiredToken(t *testing.T) {
 
 func TestWMP_SessionCreate_EmptyToken(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
 		WMP:      wmp.Metadata{Version: wmp.Version},
@@ -122,7 +128,7 @@ func TestWMP_SessionCreate_EmptyToken(t *testing.T) {
 
 func TestWMP_HandleRPC_MissingSession(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.flow.start", map[string]string{"flow_type": "test"})
 	resp, err := a.HandleRPC(context.Background(), "", body)
@@ -136,7 +142,7 @@ func TestWMP_HandleRPC_MissingSession(t *testing.T) {
 
 func TestWMP_HandleRPC_UnknownSession(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.flow.start", map[string]string{"flow_type": "test"})
 	resp, err := a.HandleRPC(context.Background(), "nonexistent-session", body)
@@ -152,7 +158,7 @@ func TestWMP_HandleRPC_UnknownSession(t *testing.T) {
 
 func TestWMP_FlowStart_UnknownProtocol(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	sessionID := createWMPSession(t, a)
 
@@ -173,7 +179,7 @@ func TestWMP_FlowStart_UnknownProtocol(t *testing.T) {
 
 func TestWMP_FlowStart_WithMockHandler(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	// Register a mock flow handler that sends progress + completes.
 	progressSent := make(chan struct{})
@@ -236,7 +242,7 @@ func TestWMP_FlowStart_WithMockHandler(t *testing.T) {
 
 func TestWMP_FlowAction_SignResponse(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	// Register a handler that requests signing.
 	signReceived := make(chan *SignResponseMessage, 1)
@@ -262,62 +268,85 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 	require.NoError(t, json.Unmarshal(resp, &startResp))
 	assert.Nil(t, startResp.Error)
 
-	// Read the sign_request notification from the SSE channel to get message_id.
+	// Read the sign sub-flow start request from the SSE channel.
+	// The WMP adapter translates RequestSign into a Peer.Call(wmp.flow.start)
+	// which appears on the events channel as a JSON-RPC request.
 	eventsCh, err := a.Events(sessionID)
 	require.NoError(t, err)
 
-	var messageID string
+	var childFlowID string
+	var rpcRequestID json.RawMessage
 	timeout := time.After(2 * time.Second)
-	for messageID == "" {
+	for childFlowID == "" {
 		select {
 		case msg := <-eventsCh:
-			// Parse JSON-RPC notification to find sign_request progress.
-			var notif struct {
-				Method string `json:"method"`
-				Params struct {
-					Step    string          `json:"step"`
-					Payload json.RawMessage `json:"payload"`
+			var parsed struct {
+				JSONRPC string          `json:"jsonrpc"`
+				Method  string          `json:"method"`
+				ID      json.RawMessage `json:"id"`
+				Params  struct {
+					FlowType string          `json:"flow_type"`
+					FlowID   string          `json:"flow_id"`
+					Params   json.RawMessage `json:"params"`
 				} `json:"params"`
 			}
-			if err := json.Unmarshal(msg, &notif); err != nil {
+			if err := json.Unmarshal(msg, &parsed); err != nil {
 				continue
 			}
-			if notif.Method == "wmp.flow.progress" && notif.Params.Step == "sign_request" {
-				var signReq struct {
-					MessageID string `json:"message_id"`
-				}
-				_ = json.Unmarshal(notif.Params.Payload, &signReq)
-				messageID = signReq.MessageID
+			if parsed.Method == wmp.MethodFlowStart && parsed.Params.FlowType == wmp.FlowTypeSign {
+				childFlowID = parsed.Params.FlowID
+				rpcRequestID = parsed.ID
 			}
 		case <-timeout:
-			t.Fatal("timeout waiting for sign_request notification")
+			t.Fatal("timeout waiting for sign sub-flow start")
 		}
 	}
+	require.NotEmpty(t, childFlowID)
+	require.NotNil(t, rpcRequestID)
 
-	// Send sign response via flow.action with the correct message_id.
-	signParams, _ := json.Marshal(SignResponseMessage{
-		Message:  Message{MessageID: messageID},
-		ProofJWT: "eyJ.test.proof",
-	})
-	body = wmpRequest("3", "wmp.flow.action", wmp.FlowActionParams{
-		WMP:    wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
-		FlowID: "flow-sign",
-		Action: "sign_response",
-		Params: signParams,
+	// Simulate client responding to the sub-flow start request with a result,
+	// then sending flow.complete for the child flow.
+	// First, respond to the JSON-RPC Call with a FlowStartResult.
+	startResult := wmp.FlowStartResult{
+		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
+		FlowID:   childFlowID,
+		FlowType: wmp.FlowTypeSign,
+	}
+	resultJSON, _ := json.Marshal(startResult)
+	rpcResponse, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      rpcRequestID,
+		"result":  json.RawMessage(resultJSON),
 	})
 
-	resp, err = a.HandleRPC(context.Background(), sessionID, body)
+	// Feed the response back through the channel transport so Peer.Call unblocks.
+	a.mu.RLock()
+	ws := a.peers[sessionID]
+	a.mu.RUnlock()
+	err = ws.transport.Push(rpcResponse)
 	require.NoError(t, err)
 
-	var actionResp wmp.Response
-	require.NoError(t, json.Unmarshal(resp, &actionResp))
-	assert.Nil(t, actionResp.Error)
+	// Small delay for Peer.Call to unblock and RequestSign to start waiting on signCh.
+	time.Sleep(100 * time.Millisecond)
 
-	var actionResult wmp.FlowActionResult
-	require.NoError(t, json.Unmarshal(actionResp.Result, &actionResult))
-	assert.Equal(t, "accepted", actionResult.Status)
+	// Now send flow.complete for the child sign sub-flow as a JSON-RPC notification.
+	// The Peer's Serve loop will receive this and call FlowComplete on the handler,
+	// which routes the result to signCh with the correct messageID.
+	completeResult, _ := json.Marshal(map[string]string{
+		"proof_jwt": "eyJ.test.proof",
+	})
+	completeNotification, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  wmp.MethodFlowComplete,
+		"params": wmp.FlowCompleteParams{
+			FlowID: childFlowID,
+			Result: completeResult,
+		},
+	})
+	err = ws.transport.Push(completeNotification)
+	require.NoError(t, err)
 
-	// Verify the sign response was received by the handler.
+	// Wait for the handler to receive the sign response.
 	select {
 	case sr := <-signReceived:
 		assert.Equal(t, "eyJ.test.proof", sr.ProofJWT)
@@ -328,7 +357,7 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 
 func TestWMP_FlowAction_GenericAction(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	actionReceived := make(chan *FlowActionMessage, 1)
 	m.RegisterFlowHandler("action_test", func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
@@ -378,7 +407,7 @@ func TestWMP_FlowAction_GenericAction(t *testing.T) {
 
 func TestWMP_FlowAction_UnknownFlow(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	sessionID := createWMPSession(t, a)
 
@@ -401,7 +430,7 @@ func TestWMP_FlowAction_UnknownFlow(t *testing.T) {
 
 func TestWMP_SessionClose(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	sessionID := createWMPSession(t, a)
 
@@ -421,7 +450,7 @@ func TestWMP_SessionClose(t *testing.T) {
 
 func TestWMP_HTTPEndpoint_RPC(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
 		WMP:      wmp.Metadata{Version: wmp.Version},
@@ -445,7 +474,7 @@ func TestWMP_HTTPEndpoint_RPC(t *testing.T) {
 
 func TestWMP_HTTPEndpoint_RPC_NoAuth(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.session.create", map[string]string{})
 	req := httptest.NewRequest(http.MethodPost, "/wmp/rpc", bytes.NewReader(body))
@@ -458,7 +487,7 @@ func TestWMP_HTTPEndpoint_RPC_NoAuth(t *testing.T) {
 
 func TestWMP_HTTPEndpoint_RPC_MethodNotAllowed(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	req := httptest.NewRequest(http.MethodGet, "/wmp/rpc", nil)
 	w := httptest.NewRecorder()
@@ -470,7 +499,7 @@ func TestWMP_HTTPEndpoint_RPC_MethodNotAllowed(t *testing.T) {
 
 func TestWMP_HTTPEndpoint_Events_NoSession(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	req := httptest.NewRequest(http.MethodGet, "/wmp/events?session_id=nonexistent", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken("user-1", ""))
@@ -483,7 +512,7 @@ func TestWMP_HTTPEndpoint_Events_NoSession(t *testing.T) {
 
 func TestWMP_HTTPEndpoint_Events_MissingSessionID(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	req := httptest.NewRequest(http.MethodGet, "/wmp/events", nil)
 	req.Header.Set("Authorization", "Bearer "+testToken("user-1", ""))
@@ -498,7 +527,7 @@ func TestWMP_HTTPEndpoint_Events_MissingSessionID(t *testing.T) {
 
 func TestWMP_MessageTranslation_Progress(t *testing.T) {
 	a, m := testWMPAdapter()
-	defer m.Close()
+	defer cleanupWMP(a, m)
 
 	progressSent := make(chan struct{})
 	m.RegisterFlowHandler("translate_test", func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {

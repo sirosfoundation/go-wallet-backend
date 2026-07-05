@@ -45,13 +45,14 @@ const (
 
 // Session represents an authenticated session (WebSocket or HTTP+SSE)
 type Session struct {
-	ID        string
-	UserID    string
-	TenantID  string
-	transport SessionTransport
-	flows     map[string]*Flow
-	flowsMu   sync.RWMutex
-	logger    *zap.Logger
+	ID          string
+	UserID      string
+	TenantID    string
+	transport   SessionTransport
+	transportMu sync.RWMutex // guards transport reassignment during session resume
+	flows       map[string]*Flow
+	flowsMu     sync.RWMutex
+	logger      *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -304,7 +305,9 @@ func (s *Session) pingLoop() {
 
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
-		close(session.stopPing) // stop the ping goroutine
+		if session.stopPing != nil {
+			close(session.stopPing) // stop the ping goroutine (WebSocket only)
+		}
 		close(session.closeCh)
 		// Cancel all active flows
 		session.flowsMu.Lock()
@@ -677,7 +680,10 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 func (s *Session) Send(msg interface{}) error {
-	return s.transport.SendJSON(msg)
+	s.transportMu.RLock()
+	t := s.transport
+	s.transportMu.RUnlock()
+	return t.SendJSON(msg)
 }
 
 // SendProgress sends a flow progress message

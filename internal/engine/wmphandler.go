@@ -36,26 +36,123 @@ type WMPAdapter struct {
 	logger  *zap.Logger
 
 	mu               sync.RWMutex
-	peers            map[string]*wmpSession // keyed by WMP session ID
-	resumptionTokens map[string]string      // token -> session ID
+	peers            map[string]*wmpSession      // keyed by WMP session ID
+	resumptionTokens map[string]*resumptionEntry // token -> entry with session ID and expiry
+
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
+
+// resumptionEntry holds a resumption token's session binding and expiry.
+type resumptionEntry struct {
+	sessionID string
+	expiresAt time.Time
+}
+
+// wmpSessionIdleTimeout is the maximum time a WMP session can be idle
+// (no RPC activity) before being automatically closed.
+const wmpSessionIdleTimeout = 10 * time.Minute
+
+// resumptionTokenTTL is the lifetime of a resumption token. After this
+// duration the token is invalid and the client must create a new session.
+const resumptionTokenTTL = 10 * time.Minute
+
+// maxFlowIDLength limits client-supplied flow IDs to prevent memory abuse.
+const maxFlowIDLength = 128
 
 // wmpSession associates a wmp.Peer with its channel transport and engine session.
 type wmpSession struct {
-	peer      *wmp.Peer
-	transport *wmp.ChannelTransport
-	session   *Session
-	cancel    context.CancelFunc
+	peer         *wmp.Peer
+	transport    *wmp.ChannelTransport
+	session      *Session
+	cancel       context.CancelFunc
+	lastActivity time.Time
 }
 
 // NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
 func NewWMPAdapter(manager *Manager, logger *zap.Logger) *WMPAdapter {
-	return &WMPAdapter{
+	a := &WMPAdapter{
 		manager:          manager,
 		logger:           logger.Named("wmp"),
 		peers:            make(map[string]*wmpSession),
-		resumptionTokens: make(map[string]string),
+		resumptionTokens: make(map[string]*resumptionEntry),
+		stopCh:           make(chan struct{}),
 	}
+	go a.cleanupLoop()
+	return a
+}
+
+// Close stops the cleanup loop.
+func (a *WMPAdapter) Close() {
+	a.stopOnce.Do(func() { close(a.stopCh) })
+}
+
+// cleanupLoop periodically removes expired resumption tokens and idle sessions.
+func (a *WMPAdapter) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			a.cleanupExpired()
+		case <-a.stopCh:
+			return
+		}
+	}
+}
+
+// cleanupExpired removes expired resumption tokens and closes idle sessions.
+func (a *WMPAdapter) cleanupExpired() {
+	now := time.Now()
+
+	a.mu.Lock()
+	// Remove expired resumption tokens.
+	for token, entry := range a.resumptionTokens {
+		if now.After(entry.expiresAt) {
+			delete(a.resumptionTokens, token)
+		}
+	}
+
+	// Collect idle sessions to close (avoid calling CloseSession under lock).
+	var idleSessions []string
+	for sid, ws := range a.peers {
+		if now.Sub(ws.lastActivity) > wmpSessionIdleTimeout {
+			idleSessions = append(idleSessions, sid)
+		}
+	}
+	a.mu.Unlock()
+
+	for _, sid := range idleSessions {
+		a.logger.Info("Closing idle WMP session", zap.String("session_id", sid[:8]))
+		a.CloseSession(sid)
+	}
+}
+
+// verifySessionOwnership checks that the session belongs to the authenticated user.
+// Returns false if the session doesn't exist or the user/tenant don't match.
+func (a *WMPAdapter) verifySessionOwnership(sessionID, userID, tenantID string) bool {
+	a.mu.RLock()
+	ws, ok := a.peers[sessionID]
+	a.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if ws.session.UserID != userID {
+		return false
+	}
+	if tenantID != "" && ws.session.TenantID != tenantID {
+		return false
+	}
+	return true
+}
+
+// touchSession updates the last activity timestamp for idle timeout tracking.
+func (a *WMPAdapter) touchSession(sessionID string) {
+	a.mu.Lock()
+	if ws, ok := a.peers[sessionID]; ok {
+		ws.lastActivity = time.Now()
+	}
+	a.mu.Unlock()
 }
 
 // HandleRPC handles a single JSON-RPC request (from HTTP POST /wmp/rpc).
@@ -91,6 +188,9 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID string, body []byt
 		return wmpErrorBytes(nil, wmp.ErrSessionNotFound, nil)
 	}
 
+	// Update activity timestamp for idle timeout tracking.
+	a.touchSession(sessionID)
+
 	return ws.peer.HandleRequestSync(ctx, body)
 }
 
@@ -114,8 +214,8 @@ func (a *WMPAdapter) CloseSession(sessionID string) {
 		delete(a.peers, sessionID)
 	}
 	// Clean up any resumption tokens for this session.
-	for token, sid := range a.resumptionTokens {
-		if sid == sessionID {
+	for token, entry := range a.resumptionTokens {
+		if entry.sessionID == sessionID {
 			delete(a.resumptionTokens, token)
 		}
 	}
@@ -216,10 +316,11 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 	// Store the WMP session.
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	ws := &wmpSession{
-		peer:      peer,
-		transport: ct,
-		session:   session,
-		cancel:    cancel,
+		peer:         peer,
+		transport:    ct,
+		session:      session,
+		cancel:       cancel,
+		lastActivity: time.Now(),
 	}
 
 	a.mu.Lock()
@@ -277,7 +378,10 @@ func (a *WMPAdapter) generateResumptionToken(sessionID string) string {
 	token := base64.RawURLEncoding.EncodeToString(b)
 
 	a.mu.Lock()
-	a.resumptionTokens[token] = sessionID
+	a.resumptionTokens[token] = &resumptionEntry{
+		sessionID: sessionID,
+		expiresAt: time.Now().Add(resumptionTokenTTL),
+	}
 	a.mu.Unlock()
 
 	return token
@@ -308,16 +412,20 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 		})
 	}
 
-	// Validate resumption token — one-time use, must match session.
+	// Validate resumption token — one-time use, must match session, must not be expired.
 	a.mu.Lock()
-	tokenSessionID, validToken := a.resumptionTokens[params.ResumptionToken]
+	entry, validToken := a.resumptionTokens[params.ResumptionToken]
 	if validToken {
 		// Consume the token (one-time use per spec §4.5.2).
 		delete(a.resumptionTokens, params.ResumptionToken)
+		// Check expiry.
+		if time.Now().After(entry.expiresAt) {
+			validToken = false
+		}
 	}
 	a.mu.Unlock()
 
-	if !validToken || tokenSessionID != params.SessionID {
+	if !validToken || entry == nil || entry.sessionID != params.SessionID {
 		return wmpErrorBytes(req.ID, wmp.ErrSessionNotFound, map[string]string{
 			"reason": "invalid or expired resumption token",
 		})
@@ -348,15 +456,18 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 	// Rewire the engine session's transport to use the new peer/channel.
 	wmpTransport := newWMPSessionTransport(peer, ct)
 	wmpTransport.handler = handler
+	oldWS.session.transportMu.Lock()
 	oldWS.session.transport = wmpTransport
+	oldWS.session.transportMu.Unlock()
 
 	// Replace the old wmpSession entry.
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	ws := &wmpSession{
-		peer:      peer,
-		transport: ct,
-		session:   oldWS.session,
-		cancel:    cancel,
+		peer:         peer,
+		transport:    ct,
+		session:      oldWS.session,
+		cancel:       cancel,
+		lastActivity: time.Now(),
 	}
 
 	a.mu.Lock()
@@ -448,6 +559,11 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	if flowID == "" {
 		flowID = uuid.New().String()
 	}
+	if len(flowID) > maxFlowIDLength {
+		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
+			"reason": "flow_id exceeds maximum length",
+		})
+	}
 
 	logger := h.adapter.logger.With(
 		zap.String("flow_id", flowID[:min(8, len(flowID))]),
@@ -460,7 +576,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	h.adapter.manager.handlersMu.RUnlock()
 	if !ok {
 		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
-			"reason": "unknown protocol: " + string(protocol),
+			"reason": "unsupported flow type",
 		})
 	}
 
@@ -882,11 +998,4 @@ func wmpResponseBytes(id json.RawMessage, result interface{}) ([]byte, error) {
 		return wmpErrorBytes(id, wmp.ErrInternalError, nil)
 	}
 	return json.Marshal(resp)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
