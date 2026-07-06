@@ -160,6 +160,7 @@ type IssuerMetadata struct {
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
 	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
+	AuthorizationServers              []string                    `json:"authorization_servers,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
@@ -174,6 +175,17 @@ type IssuerMetadata struct {
 	JWKS json.RawMessage `json:"jwks,omitempty"`
 	// JWKS URI for issuer keys
 	JWKsURI string `json:"jwks_uri,omitempty"`
+}
+
+// authorizationServer returns the authorization server URL, preferring
+// authorization_servers (array, OID4VCI 1.0 Final) over authorization_server (singular, deprecated).
+func (m *IssuerMetadata) authorizationServer() string {
+	for _, s := range m.AuthorizationServers {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return m.AuthorizationServer
 }
 
 // BatchCredentialIssuance contains batch credential issuance configuration from issuer metadata.
@@ -594,7 +606,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Determine AS issuer URL for private_key_jwt aud claim (RFC 7523 §2.2)
-	h.authServerIssuer = metadata.AuthorizationServer
+	h.authServerIssuer = metadata.authorizationServer()
 	if h.authServerIssuer == "" {
 		h.authServerIssuer = metadata.CredentialIssuer
 	}
@@ -1254,10 +1266,13 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
 // Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
 func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
-	authServer := metadata.AuthorizationServer
+	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
+
+	// RFC 8414 §2: the issuer identifier MUST NOT include a trailing '/'
+	authServer = strings.TrimRight(authServer, "/")
 
 	// RFC 8615 well-known URI construction for OAuth AS metadata
 	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
@@ -1287,7 +1302,7 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 }
 
 func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
-	authServer := metadata.AuthorizationServer
+	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}

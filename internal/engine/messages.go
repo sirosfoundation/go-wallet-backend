@@ -380,7 +380,7 @@ type MatchedCredential struct {
 type ConsentSelection struct {
 	CredentialQueryID string   `json:"credential_query_id,omitempty"`
 	CredentialID      string   `json:"credential_id"`
-	DisclosedClaims   []string `json:"disclosed_claims"`
+	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
 }
 
 // SubjectType constants for trust evaluation
