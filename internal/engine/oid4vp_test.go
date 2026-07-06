@@ -771,3 +771,297 @@ func makeJWKS(keys ...jose.JSONWebKey) json.RawMessage {
 	out, _ := json.Marshal(map[string]any{"keys": rawKeys})
 	return out
 }
+
+// --- Tests for validateAuthorizationRequest and extracted helpers ---
+
+func TestValidateAuthorizationRequest_MissingNonce(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nonce")
+}
+
+func TestValidateAuthorizationRequest_RedirectURIForbidden(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		RedirectURI:    "https://evil.example.com/redirect",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect_uri must not be present")
+}
+
+func TestValidateAuthorizationRequest_RedirectURIForbiddenJWT(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPostJWT,
+		ResponseURI:    "https://verifier.example.com/response",
+		RedirectURI:    "https://evil.example.com/redirect",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect_uri must not be present")
+}
+
+func TestValidateAuthorizationRequest_UnsupportedClientIDScheme(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: "unknown_scheme",
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported client_id_scheme")
+}
+
+func TestValidateAuthorizationRequest_MissingResponseURI(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "response_uri is required")
+}
+
+func TestValidateAuthorizationRequest_DefaultResponseMode(t *testing.T) {
+	h := &OID4VPHandler{}
+	// Empty ResponseMode should default to direct_post, which requires response_uri.
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   "", // defaults to direct_post
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "response_uri is required")
+}
+
+func TestValidateAuthorizationRequest_ValidMinimal(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+func TestValidateClientIDMatch_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ClientID:   "https://real-verifier.example.com",
+		RequestJWT: "dummy.jwt.token",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "openid4vp://authorize?client_id=https%3A%2F%2Fother.example.com&request_uri=https%3A%2F%2Freal-verifier.example.com%2Frequest",
+	}
+	err := validateClientIDMatch(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "client_id mismatch")
+}
+
+func TestValidateClientIDMatch_Matching(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ClientID:   "https://verifier.example.com",
+		RequestJWT: "dummy.jwt.token",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request?client_id=https%3A%2F%2Fverifier.example.com",
+	}
+	err := validateClientIDMatch(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateClientIDMatch_NilMsg(t *testing.T) {
+	authReq := &AuthorizationRequest{ClientID: "x", RequestJWT: "y"}
+	assert.NoError(t, validateClientIDMatch(authReq, nil))
+}
+
+func TestValidateClientIDMatch_NoRequestURI(t *testing.T) {
+	authReq := &AuthorizationRequest{ClientID: "x", RequestJWT: "y"}
+	msg := &FlowStartMessage{}
+	assert.NoError(t, validateClientIDMatch(authReq, msg))
+}
+
+func TestValidateClientIDMatch_NoJWT(t *testing.T) {
+	authReq := &AuthorizationRequest{ClientID: "x"}
+	msg := &FlowStartMessage{RequestURI: "https://example.com?client_id=other"}
+	assert.NoError(t, validateClientIDMatch(authReq, msg))
+}
+
+func TestValidateResponseURIOrigin_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI: "https://evil.example.com/response",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
+}
+
+func TestValidateResponseURIOrigin_Match(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI: "https://verifier.example.com/response",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_OpenID4VPScheme(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI: "https://verifier.example.com/response",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "openid4vp://authorize?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_NoResponseURI(t *testing.T) {
+	authReq := &AuthorizationRequest{}
+	msg := &FlowStartMessage{RequestURI: "https://verifier.example.com/request"}
+	assert.NoError(t, validateResponseURIOrigin(authReq, msg))
+}
+
+func TestValidateResponseURIOrigin_NilMsg(t *testing.T) {
+	authReq := &AuthorizationRequest{ResponseURI: "https://verifier.example.com"}
+	assert.NoError(t, validateResponseURIOrigin(authReq, nil))
+}
+
+func TestValidateTransactionData_Empty(t *testing.T) {
+	authReq := &AuthorizationRequest{}
+	assert.NoError(t, validateTransactionData(authReq))
+}
+
+func TestValidateTransactionData_Valid(t *testing.T) {
+	td := TransactionData{Type: "owf_payment_initiation"}
+	tdJSON, _ := json.Marshal(td)
+	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
+	raw, _ := json.Marshal([]string{encoded})
+
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	err := validateTransactionData(authReq)
+	assert.NoError(t, err)
+	require.Len(t, authReq.TransactionData, 1)
+	assert.Equal(t, "owf_payment_initiation", authReq.TransactionData[0].Type)
+}
+
+func TestValidateTransactionData_InvalidBase64(t *testing.T) {
+	raw, _ := json.Marshal([]string{"not-valid-base64!!!"})
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	err := validateTransactionData(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid base64url encoding")
+}
+
+func TestValidateTransactionData_InvalidJSON(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte("{bad json"))
+	raw, _ := json.Marshal([]string{encoded})
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	err := validateTransactionData(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid JSON")
+}
+
+func TestValidateTransactionData_UnsupportedType(t *testing.T) {
+	td := TransactionData{Type: "unsupported_type"}
+	tdJSON, _ := json.Marshal(td)
+	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
+	raw, _ := json.Marshal([]string{encoded})
+
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	err := validateTransactionData(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported transaction_data type")
+}
+
+func TestValidateTransactionData_NotStringArray(t *testing.T) {
+	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[123, 456]`)}
+	err := validateTransactionData(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected array of base64url strings")
+}
+
+func TestBuildDCQLVPToken_SingleCredential(t *testing.T) {
+	selected := []ConsentSelection{
+		{CredentialQueryID: "query1"},
+	}
+	result, err := buildDCQLVPToken("token1", selected)
+	require.NoError(t, err)
+
+	var obj map[string][]string
+	require.NoError(t, json.Unmarshal([]byte(result), &obj))
+	assert.Equal(t, []string{"token1"}, obj["query1"])
+}
+
+func TestBuildDCQLVPToken_MultipleCredentials(t *testing.T) {
+	selected := []ConsentSelection{
+		{CredentialQueryID: "query1"},
+		{CredentialQueryID: "query2"},
+	}
+	result, err := buildDCQLVPToken("token1\ntoken2", selected)
+	require.NoError(t, err)
+
+	var obj map[string][]string
+	require.NoError(t, json.Unmarshal([]byte(result), &obj))
+	assert.Equal(t, []string{"token1"}, obj["query1"])
+	assert.Equal(t, []string{"token2"}, obj["query2"])
+}
+
+func TestBuildDCQLVPToken_SameQueryID(t *testing.T) {
+	selected := []ConsentSelection{
+		{CredentialQueryID: "query1"},
+		{CredentialQueryID: "query1"},
+	}
+	result, err := buildDCQLVPToken("tokenA\ntokenB", selected)
+	require.NoError(t, err)
+
+	var obj map[string][]string
+	require.NoError(t, json.Unmarshal([]byte(result), &obj))
+	assert.Equal(t, []string{"tokenA", "tokenB"}, obj["query1"])
+}
+
+func TestBuildDCQLVPToken_EmptyQueryID(t *testing.T) {
+	selected := []ConsentSelection{
+		{CredentialQueryID: ""},
+		{CredentialQueryID: "query1"},
+	}
+	result, err := buildDCQLVPToken("token0\ntoken1", selected)
+	require.NoError(t, err)
+
+	var obj map[string][]string
+	require.NoError(t, json.Unmarshal([]byte(result), &obj))
+	_, hasEmpty := obj[""]
+	assert.False(t, hasEmpty, "empty query ID should be skipped")
+	assert.Equal(t, []string{"token1"}, obj["query1"])
+}
