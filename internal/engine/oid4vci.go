@@ -180,8 +180,10 @@ type IssuerMetadata struct {
 // authorizationServer returns the authorization server URL, preferring
 // authorization_servers (array, OID4VCI 1.0 Final) over authorization_server (singular, deprecated).
 func (m *IssuerMetadata) authorizationServer() string {
-	if len(m.AuthorizationServers) > 0 {
-		return m.AuthorizationServers[0]
+	for _, s := range m.AuthorizationServers {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
 	}
 	return m.AuthorizationServer
 }

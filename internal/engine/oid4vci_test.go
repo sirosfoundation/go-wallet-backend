@@ -2625,3 +2625,19 @@ func TestFetchMetadata_ValidatedFlag(t *testing.T) {
 	assert.True(t, meta.Validated, "signed metadata should have Validated=true")
 	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
 }
+
+func TestAuthorizationServer_SkipsEmptyEntries(t *testing.T) {
+	m := &IssuerMetadata{
+		AuthorizationServers: []string{"", "  ", "https://auth.example.com"},
+		AuthorizationServer:  "https://fallback.example.com",
+	}
+	assert.Equal(t, "https://auth.example.com", m.authorizationServer())
+}
+
+func TestAuthorizationServer_FallsBackWhenAllEmpty(t *testing.T) {
+	m := &IssuerMetadata{
+		AuthorizationServers: []string{"", "  "},
+		AuthorizationServer:  "https://fallback.example.com",
+	}
+	assert.Equal(t, "https://fallback.example.com", m.authorizationServer())
+}

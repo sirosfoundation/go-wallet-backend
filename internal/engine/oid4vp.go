@@ -156,7 +156,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// OID4VP §5 / §6: Validate request parameters before proceeding
 	if err := h.validateAuthorizationRequest(authReq, msg); err != nil {
 		h.Logger.Debug("authorization request validation failed", zap.Error(err))
-		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
+		_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
 		return err
 	}
 
@@ -830,11 +830,19 @@ func (h *OID4VPHandler) computeVerifierJWKThumbprint(authReq *AuthorizationReque
 
 // buildDCQLVPToken restructures a newline-separated vp_token into a JSON object
 // keyed by credential query ID per OID4VP 1.0 Final §8.1.
+// If vpToken is already a valid JSON object, it is returned as-is.
 func buildDCQLVPToken(vpToken string, selected []ConsentSelection) (string, error) {
+	// If the frontend already returned a JSON object, pass it through.
+	if strings.HasPrefix(strings.TrimSpace(vpToken), "{") && json.Valid([]byte(vpToken)) {
+		return vpToken, nil
+	}
 	tokens := strings.Split(vpToken, "\n")
+	if len(tokens) != len(selected) {
+		return "", fmt.Errorf("DCQL vp_token has %d tokens but %d credentials selected", len(tokens), len(selected))
+	}
 	vpObj := make(map[string][]string, len(selected))
 	for i, s := range selected {
-		if i < len(tokens) && s.CredentialQueryID != "" {
+		if s.CredentialQueryID != "" {
 			vpObj[s.CredentialQueryID] = append(vpObj[s.CredentialQueryID], tokens[i])
 		}
 	}
@@ -1105,7 +1113,11 @@ func validateClientIDMatch(authReq *AuthorizationRequest, msg *FlowStartMessage)
 }
 
 // validateResponseURIOrigin checks that response_uri origin matches request_uri origin.
+// This check only applies to x509_san_dns with direct_post/direct_post.jwt per OID4VP §5.
 func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMessage) error {
+	if authReq.ClientIDScheme != ClientIDSchemeX509SANDNS {
+		return nil
+	}
 	if authReq.ResponseURI == "" || msg == nil || msg.RequestURI == "" {
 		return nil
 	}
@@ -1119,8 +1131,12 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	reqURL, err1 := url.Parse(requestURL)
+	if err1 != nil || reqURL.Scheme == "" || reqURL.Host == "" {
+		// Not a proper URL (e.g. raw query string) — skip origin check.
+		return nil
+	}
 	respURL, err2 := url.Parse(authReq.ResponseURI)
-	if err1 != nil || err2 != nil {
+	if err2 != nil {
 		return nil
 	}
 	reqOrigin := reqURL.Scheme + "://" + reqURL.Host
@@ -1135,6 +1151,10 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 func validateTransactionData(authReq *AuthorizationRequest) error {
 	if len(authReq.TransactionDataRaw) == 0 {
 		return nil
+	}
+	// Reject JSON null — transaction_data must be an array if present.
+	if string(authReq.TransactionDataRaw) == "null" {
+		return errors.New("invalid transaction_data: must be an array, not null")
 	}
 	var rawStrings []string
 	if err := json.Unmarshal(authReq.TransactionDataRaw, &rawStrings); err != nil {

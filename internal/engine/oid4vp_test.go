@@ -915,7 +915,8 @@ func TestValidateClientIDMatch_NoJWT(t *testing.T) {
 
 func TestValidateResponseURIOrigin_Mismatch(t *testing.T) {
 	authReq := &AuthorizationRequest{
-		ResponseURI: "https://evil.example.com/response",
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "https://verifier.example.com/request",
@@ -927,7 +928,8 @@ func TestValidateResponseURIOrigin_Mismatch(t *testing.T) {
 
 func TestValidateResponseURIOrigin_Match(t *testing.T) {
 	authReq := &AuthorizationRequest{
-		ResponseURI: "https://verifier.example.com/response",
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "https://verifier.example.com/request",
@@ -938,10 +940,37 @@ func TestValidateResponseURIOrigin_Match(t *testing.T) {
 
 func TestValidateResponseURIOrigin_OpenID4VPScheme(t *testing.T) {
 	authReq := &AuthorizationRequest{
-		ResponseURI: "https://verifier.example.com/response",
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "openid4vp://authorize?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_SkipsNonX509Scheme(t *testing.T) {
+	// Origin check should be skipped for non-x509_san_dns schemes.
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_RawQueryString(t *testing.T) {
+	// When RequestURI is a raw query string (no scheme/host), skip origin check.
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "client_id=foo&request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
 	}
 	err := validateResponseURIOrigin(authReq, msg)
 	assert.NoError(t, err)
@@ -1012,6 +1041,13 @@ func TestValidateTransactionData_NotStringArray(t *testing.T) {
 	assert.Contains(t, err.Error(), "expected array of base64url strings")
 }
 
+func TestValidateTransactionData_Null(t *testing.T) {
+	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`null`)}
+	err := validateTransactionData(authReq)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be an array, not null")
+}
+
 func TestBuildDCQLVPToken_SingleCredential(t *testing.T) {
 	selected := []ConsentSelection{
 		{CredentialQueryID: "query1"},
@@ -1064,4 +1100,22 @@ func TestBuildDCQLVPToken_EmptyQueryID(t *testing.T) {
 	_, hasEmpty := obj[""]
 	assert.False(t, hasEmpty, "empty query ID should be skipped")
 	assert.Equal(t, []string{"token1"}, obj["query1"])
+}
+
+func TestBuildDCQLVPToken_JSONObjectPassThrough(t *testing.T) {
+	jsonObj := `{"query1":["token1"],"query2":["token2"]}`
+	selected := []ConsentSelection{{CredentialQueryID: "query1"}}
+	result, err := buildDCQLVPToken(jsonObj, selected)
+	require.NoError(t, err)
+	assert.Equal(t, jsonObj, result)
+}
+
+func TestBuildDCQLVPToken_TokenCountMismatch(t *testing.T) {
+	selected := []ConsentSelection{
+		{CredentialQueryID: "query1"},
+		{CredentialQueryID: "query2"},
+	}
+	_, err := buildDCQLVPToken("only-one-token", selected)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "1 tokens but 2 credentials")
 }
