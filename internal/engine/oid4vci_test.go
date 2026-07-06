@@ -2088,6 +2088,53 @@ func TestFetchOAuthMetadata_FallbackToCredentialIssuer(t *testing.T) {
 	assert.Equal(t, "/.well-known/oauth-authorization-server", requestedURL)
 }
 
+func TestFetchOAuthMetadata_UsesAuthorizationServersArray(t *testing.T) {
+	var requestedURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedURL = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"authorization_endpoint": "https://as.example.com/authorize",
+			"token_endpoint":         "https://as.example.com/token",
+		})
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer:     "https://issuer.example.com",
+		AuthorizationServers: []string{server.URL},
+	})
+	require.NotNil(t, meta)
+	assert.Equal(t, "/.well-known/oauth-authorization-server", requestedURL)
+}
+
+func TestFetchOAuthMetadata_StripsTrailingSlash(t *testing.T) {
+	var requestedURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedURL = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_endpoint": "https://example.com/token",
+		})
+	}))
+	defer server.Close()
+
+	h := &OID4VCIHandler{httpClient: server.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	// Simulate conformance suite: authorization_servers has trailing slash
+	meta := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{
+		CredentialIssuer:     server.URL + "/test/a/alias/",
+		AuthorizationServers: []string{server.URL + "/test/a/alias/"},
+	})
+	require.NotNil(t, meta)
+	// RFC 8414 §2: trailing slash must be stripped
+	assert.Equal(t, "/.well-known/oauth-authorization-server/test/a/alias", requestedURL)
+}
+
 func TestFetchOAuthMetadata_404ReturnsNil(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
