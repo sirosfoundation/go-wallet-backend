@@ -22,6 +22,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestInferClientIDScheme(t *testing.T) {
@@ -1118,4 +1119,405 @@ func TestBuildDCQLVPToken_TokenCountMismatch(t *testing.T) {
 	_, err := buildDCQLVPToken("only-one-token", selected)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "1 tokens but 2 credentials")
+}
+
+// --- Tests for x509_san_dns JWT verification in validateAuthorizationRequest ---
+
+// makeSignedJWTWithX5C creates a properly signed JWT with an x5c header for testing.
+func makeSignedJWTWithX5C(t *testing.T) (string, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-verifier"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"verifier.example.com"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+
+	// Build JWT header with x5c
+	headerJSON, _ := json.Marshal(map[string]interface{}{
+		"alg": "ES256",
+		"typ": "JWT",
+		"x5c": []string{certB64},
+	})
+	header := base64.RawURLEncoding.EncodeToString(headerJSON)
+
+	// Build JWT payload
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"iss": "verifier.example.com",
+		"aud": "https://wallet.example.com",
+		"iat": time.Now().Unix(),
+	})
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	// Sign
+	signingInput := header + "." + payload
+	token := jwt.New(jwt.SigningMethodES256)
+	sigBytes, err := token.Method.Sign(signingInput, key)
+	require.NoError(t, err)
+
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sigBytes), key
+}
+
+func TestValidateAuthorizationRequest_X509SANDNS_ValidJWT(t *testing.T) {
+	jwtToken, _ := makeSignedJWTWithX5C(t)
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		RequestJWT:     jwtToken,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+func TestValidateAuthorizationRequest_X509SANDNS_InvalidJWT(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		RequestJWT:     "invalid.jwt.token",
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JWT signature verification failed")
+}
+
+func TestValidateAuthorizationRequest_X509SANDNS_JWKHeaderRejected(t *testing.T) {
+	// Create a JWT with jwk header instead of x5c — should be rejected for x509_san_dns
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	jwkMap := map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(key.PublicKey.X.Bytes()),
+		"y":   base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.Bytes()),
+	}
+	headerJSON, _ := json.Marshal(map[string]interface{}{
+		"alg": "ES256",
+		"typ": "JWT",
+		"jwk": jwkMap,
+	})
+	header := base64.RawURLEncoding.EncodeToString(headerJSON)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{"iss": "test"})
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	signingInput := header + "." + payload
+	token := jwt.New(jwt.SigningMethodES256)
+	sigBytes, err := token.Method.Sign(signingInput, key)
+	require.NoError(t, err)
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		RequestJWT:     signingInput + "." + base64.RawURLEncoding.EncodeToString(sigBytes),
+	}
+	err = h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires x5c")
+}
+
+func TestValidateAuthorizationRequest_X509SANDNS_NoJWTSkipsCheck(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		// No RequestJWT — the JWT verification step should be skipped
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+// --- Tests for inferClientIDScheme new branches ---
+
+func TestInferClientIDScheme_ColonPrefix(t *testing.T) {
+	// A colon-separated prefix that doesn't look like a domain should be returned raw
+	got := inferClientIDScheme("custom_scheme:some-value")
+	assert.Equal(t, "custom_scheme", got)
+}
+
+func TestInferClientIDScheme_ColonPrefixWithDots(t *testing.T) {
+	// A prefix with dots looks like a domain — should default to redirect_uri
+	got := inferClientIDScheme("example.com:8080")
+	assert.Equal(t, ClientIDSchemeRedirectURI, got)
+}
+
+func TestInferClientIDScheme_ColonPrefixWithSlash(t *testing.T) {
+	// A prefix with slashes looks like a path — should default to redirect_uri
+	got := inferClientIDScheme("path/to:something")
+	assert.Equal(t, ClientIDSchemeRedirectURI, got)
+}
+
+func TestInferClientIDScheme_X509SANDNS(t *testing.T) {
+	got := inferClientIDScheme("x509_san_dns:verifier.example.com")
+	assert.Equal(t, ClientIDSchemeX509SANDNS, got)
+}
+
+func TestInferClientIDScheme_X509SANURI(t *testing.T) {
+	got := inferClientIDScheme("x509_san_uri:https://verifier.example.com")
+	assert.Equal(t, ClientIDSchemeX509SANURI, got)
+}
+
+func TestInferClientIDScheme_VerifierAttestation(t *testing.T) {
+	got := inferClientIDScheme("verifier_attestation:eyJ...")
+	assert.Equal(t, ClientIDSchemeVerifierAttestation, got)
+}
+
+// --- Tests for computeVerifierJWKThumbprint ---
+
+func TestComputeVerifierJWKThumbprint_NonJWTMode(t *testing.T) {
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	authReq := &AuthorizationRequest{
+		ResponseMode: ResponseModeDirectPost,
+	}
+	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+}
+
+func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
+	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	jwksBytes := makeJWKS(jose.JSONWebKey{
+		Key:   &encKey.PublicKey,
+		KeyID: "enc-key-1",
+		Use:   "enc",
+	})
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	authReq := &AuthorizationRequest{
+		ResponseMode: ResponseModeDirectPostJWT,
+		ClientMetadata: &ClientMetadata{
+			JWKS: jwksBytes,
+		},
+	}
+	result := h.computeVerifierJWKThumbprint(authReq)
+	assert.NotEmpty(t, result, "should return a non-empty thumbprint")
+}
+
+func TestComputeVerifierJWKThumbprint_JWTModeNoKeys(t *testing.T) {
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	authReq := &AuthorizationRequest{
+		ResponseMode: ResponseModeDirectPostJWT,
+		// No client metadata — should warn and return empty
+	}
+	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+}
+
+// --- Test for validateAuthorizationRequest with all known schemes ---
+
+func TestValidateAuthorizationRequest_AllKnownSchemes(t *testing.T) {
+	schemes := []string{
+		ClientIDSchemeRedirectURI,
+		ClientIDSchemeDID,
+		ClientIDSchemeX509SANDNS,
+		ClientIDSchemeX509SANURI,
+		ClientIDSchemeVerifierAttestation,
+	}
+	h := &OID4VPHandler{}
+	for _, scheme := range schemes {
+		t.Run(scheme, func(t *testing.T) {
+			authReq := &AuthorizationRequest{
+				Nonce:          "abc",
+				ResponseMode:   ResponseModeDirectPost,
+				ResponseURI:    "https://verifier.example.com/response",
+				ClientID:       "https://verifier.example.com",
+				ClientIDScheme: scheme,
+			}
+			err := h.validateAuthorizationRequest(authReq, nil)
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// --- Test for validateAuthorizationRequest with isDirectPost false ---
+
+func TestValidateAuthorizationRequest_NonDirectPostMode(t *testing.T) {
+	h := &OID4VPHandler{}
+	// fragment response mode doesn't require response_uri
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   "fragment",
+		ClientID:       "https://verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+// --- Tests for validateAuthorizationRequest calling through helpers ---
+
+func TestValidateAuthorizationRequest_ClientIDMismatchViaMsg(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+		RequestJWT:     "some.jwt.token",
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request?client_id=other-verifier",
+	}
+	err := h.validateAuthorizationRequest(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "client_id mismatch")
+}
+
+func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://evil.example.com/response",
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "https://verifier.example.com/request",
+	}
+	err := h.validateAuthorizationRequest(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
+}
+
+func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
+	td := TransactionData{Type: "owf_payment_initiation"}
+	tdJSON, _ := json.Marshal(td)
+	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
+	raw, _ := json.Marshal([]string{encoded})
+
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:              "abc",
+		ResponseMode:       ResponseModeDirectPost,
+		ResponseURI:        "https://verifier.example.com/response",
+		ClientID:           "https://verifier.example.com",
+		ClientIDScheme:     ClientIDSchemeRedirectURI,
+		TransactionDataRaw: raw,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+	require.Len(t, authReq.TransactionData, 1)
+}
+
+// --- Tests for submitErrorResponse ---
+
+func TestSubmitErrorResponse_PostsToResponseURI(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(body)
+		receivedBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	h.httpClient = srv.Client()
+
+	authReq := &AuthorizationRequest{
+		ResponseURI: srv.URL + "/response",
+		State:       "test-state",
+	}
+	h.submitErrorResponse(context.Background(), authReq, "invalid_request", "bad nonce")
+
+	assert.Contains(t, receivedBody, "error=invalid_request")
+	assert.Contains(t, receivedBody, "error_description=bad+nonce")
+	assert.Contains(t, receivedBody, "state=test-state")
+}
+
+func TestSubmitErrorResponse_NilAuthReq(t *testing.T) {
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	// Should not panic
+	h.submitErrorResponse(context.Background(), nil, "error", "desc")
+}
+
+func TestSubmitErrorResponse_EmptyResponseURI(t *testing.T) {
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	authReq := &AuthorizationRequest{}
+	// Should not panic
+	h.submitErrorResponse(context.Background(), authReq, "error", "desc")
+}
+
+func TestSubmitErrorResponse_NoState(t *testing.T) {
+	var receivedBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(body)
+		receivedBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+	h.httpClient = srv.Client()
+
+	authReq := &AuthorizationRequest{
+		ResponseURI: srv.URL + "/response",
+	}
+	h.submitErrorResponse(context.Background(), authReq, "invalid_request", "")
+	assert.Contains(t, receivedBody, "error=invalid_request")
+	assert.NotContains(t, receivedBody, "state=")
+}
+
+// --- Tests for submitResponse via direct mode functions ---
+
+func TestSubmitDirectPost_WithConstants(t *testing.T) {
+	// Verify the Content-Type constant is used correctly
+	var receivedContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	h := &OID4VPHandler{httpClient: srv.Client()}
+	authReq := &AuthorizationRequest{State: "s1"}
+
+	_, err := h.submitDirectPost(context.Background(), srv.URL, authReq, "vp-token")
+	require.NoError(t, err)
+	assert.Equal(t, mimeFormURLEncoded, receivedContentType)
+}
+
+// --- Edge case tests for validateResponseURIOrigin ---
+
+func TestValidateResponseURIOrigin_OpenID4VPNoRequestURI(t *testing.T) {
+	// openid4vp:// scheme but no request_uri query param → requestURL becomes empty → skip
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "openid4vp://authorize?client_id=foo",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
 }
