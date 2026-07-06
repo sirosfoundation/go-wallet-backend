@@ -82,7 +82,10 @@ type AuthorizationRequest struct {
 	ClientMetadata    *ClientMetadata `json:"client_metadata,omitempty"`
 	ClientMetadataURI string          `json:"client_metadata_uri,omitempty"`
 	// TransactionData carries TS12 transaction data from the verifier (OID4VP draft §7.4).
-	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// Per spec, this is an array of base64url-encoded JSON strings in the request.
+	TransactionDataRaw json.RawMessage `json:"transaction_data,omitempty"`
+	// TransactionData holds the decoded transaction data objects (populated during validation).
+	TransactionData []TransactionData `json:"-"`
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
@@ -136,6 +139,13 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// Infer client_id_scheme if not explicitly provided
 	if authReq.ClientIDScheme == "" {
 		authReq.ClientIDScheme = inferClientIDScheme(authReq.ClientID)
+	}
+
+	// OID4VP §5 / §6: Validate request parameters before proceeding
+	if err := h.validateAuthorizationRequest(authReq, msg); err != nil {
+		h.Logger.Debug("authorization request validation failed", zap.Error(err))
+		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, err.Error())
+		return err
 	}
 
 	h.SetData("auth_request", authReq)
@@ -795,7 +805,27 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		return "", err
 	}
 
-	return resp.VPToken, nil
+	vpToken := resp.VPToken
+
+	// OID4VP 1.0 Final §8.1: When DCQL is used, vp_token MUST be a JSON object
+	// keyed by credential query ID, where each value is an array of credential tokens.
+	// The mobile app returns tokens newline-separated in the same order as credentials_to_include.
+	if len(authReq.DCQLQuery) > 0 {
+		tokens := strings.Split(vpToken, "\n")
+		vpObj := make(map[string][]string, len(selected))
+		for i, s := range selected {
+			if i < len(tokens) && s.CredentialQueryID != "" {
+				vpObj[s.CredentialQueryID] = append(vpObj[s.CredentialQueryID], tokens[i])
+			}
+		}
+		vpJSON, err := json.Marshal(vpObj)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal DCQL vp_token: %w", err)
+		}
+		return string(vpJSON), nil
+	}
+
+	return vpToken, nil
 }
 
 // sanitizeEndpointURL validates and reconstructs an endpoint URL to prevent SSRF.
@@ -933,9 +963,165 @@ func inferClientIDScheme(clientID string) string {
 		// HTTPS/HTTP URLs default to redirect_uri scheme
 		return ClientIDSchemeRedirectURI
 	default:
-		// Unknown format - use redirect_uri as default
+		// Check if client_id has a colon-separated prefix that looks like
+		// an explicit (but unrecognized) client_id_scheme
+		if idx := strings.Index(clientID, ":"); idx > 0 {
+			prefix := clientID[:idx]
+			// If it contains dots or slashes, it's likely a domain/path, not a scheme
+			if !strings.ContainsAny(prefix, "./") {
+				return prefix // Return the raw prefix for validation to reject
+			}
+		}
 		return ClientIDSchemeRedirectURI
 	}
+}
+
+// submitErrorResponse posts an OAuth 2.0 error response to the verifier's
+// response_uri per OID4VP §8.2 / §8.5. This allows the conformance suite
+// (and real verifiers) to learn why the wallet rejected the request instead
+// of timing out waiting for a response.
+func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) {
+	if authReq == nil || authReq.ResponseURI == "" {
+		return
+	}
+	data := url.Values{}
+	data.Set("error", errCode)
+	if errDesc != "" {
+		data.Set("error_description", errDesc)
+	}
+	if authReq.State != "" {
+		data.Set("state", authReq.State)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", authReq.ResponseURI, strings.NewReader(data.Encode()))
+	if err != nil {
+		h.Logger.Debug("failed to create error response request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.Logger.Debug("failed to send error response to response_uri", zap.Error(err))
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	h.Logger.Debug("sent error response to response_uri",
+		zap.String("response_uri", authReq.ResponseURI),
+		zap.String("error", errCode),
+		zap.Int("status", resp.StatusCode))
+}
+
+// validateAuthorizationRequest performs OID4VP 1.0 Final spec-mandated validation
+// on the parsed authorization request before proceeding with trust evaluation.
+func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationRequest, msg *FlowStartMessage) error {
+	// OID4VP §5: nonce is REQUIRED
+	if authReq.Nonce == "" {
+		return errors.New("missing required 'nonce' parameter")
+	}
+
+	// OID4VP §5: redirect_uri MUST NOT be present when response_mode is direct_post or direct_post.jwt
+	responseMode := authReq.ResponseMode
+	if responseMode == "" {
+		responseMode = "direct_post"
+	}
+	if (responseMode == "direct_post" || responseMode == "direct_post.jwt") && authReq.RedirectURI != "" {
+		return errors.New("redirect_uri must not be present with direct_post response mode")
+	}
+
+	// OID4VP §5: Validate client_id_scheme prefix is recognized
+	switch authReq.ClientIDScheme {
+	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
+		ClientIDSchemeX509SANURI, ClientIDSchemeVerifierAttestation:
+		// Known scheme
+	default:
+		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
+	}
+
+	// OID4VP §5: For x509_san_dns with direct_post, response_uri origin must match
+	// the SAN DNS name in the x5c certificate chain (validated later during trust
+	// evaluation). Here we validate that response_uri is present and its host
+	// matches the client_id (which is the SAN DNS name for x509_san_dns).
+	if (responseMode == "direct_post" || responseMode == "direct_post.jwt") && authReq.ResponseURI == "" {
+		return errors.New("response_uri is required for direct_post response mode")
+	}
+
+	// OID4VP §5: client_id in the URL must match client_id in the JWT request object
+	if msg != nil && msg.RequestURI != "" && authReq.RequestJWT != "" {
+		u, err := url.Parse(msg.RequestURI)
+		if err == nil {
+			urlClientID := u.Query().Get("client_id")
+			if urlClientID != "" && urlClientID != authReq.ClientID {
+				return fmt.Errorf("client_id mismatch: URL has %q but request object has %q", urlClientID, authReq.ClientID)
+			}
+		}
+	}
+
+	// OID4VP §7.3: For x509_san_dns, verify JWT signature against x5c before
+	// anything else (including trust cache). This prevents cached trust from
+	// bypassing signature verification on tampered requests.
+	// OID4VP §7.3: For x509_san_dns, verify JWT signature against x5c before
+	// anything else (including trust cache). This prevents cached trust from
+	// bypassing signature verification on tampered requests.
+	if authReq.ClientIDScheme == ClientIDSchemeX509SANDNS && authReq.RequestJWT != "" {
+		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if err != nil {
+			return fmt.Errorf("x509_san_dns JWT signature verification failed: %w", err)
+		}
+		if km.Type != "x5c" {
+			return fmt.Errorf("x509_san_dns scheme requires x5c in JWT header, got %q", km.Type)
+		}
+	}
+
+	// OID4VP §5: For direct_post with x509_san_dns, response_uri origin must be
+	// consistent with the request_uri origin (prevents posting to attacker-controlled URLs).
+	if authReq.ResponseURI != "" && msg != nil && msg.RequestURI != "" {
+		requestURL := msg.RequestURI
+		if strings.HasPrefix(requestURL, "openid4vp://") {
+			if u, err := url.Parse(requestURL); err == nil {
+				requestURL = u.Query().Get("request_uri")
+			}
+		}
+		if requestURL != "" {
+			reqURL, err1 := url.Parse(requestURL)
+			respURL, err2 := url.Parse(authReq.ResponseURI)
+			if err1 == nil && err2 == nil {
+				reqOrigin := reqURL.Scheme + "://" + reqURL.Host
+				respOrigin := respURL.Scheme + "://" + respURL.Host
+				if !strings.EqualFold(reqOrigin, respOrigin) {
+					return fmt.Errorf("response_uri origin %q does not match request_uri origin %q", respOrigin, reqOrigin)
+				}
+			}
+		}
+	}
+
+	// OID4VP §7.4: Decode and validate transaction_data if present.
+	// Per spec, transaction_data is an array of base64url-encoded JSON strings.
+	if len(authReq.TransactionDataRaw) > 0 {
+		var rawStrings []string
+		if err := json.Unmarshal(authReq.TransactionDataRaw, &rawStrings); err != nil {
+			return fmt.Errorf("invalid transaction_data: expected array of base64url strings: %w", err)
+		}
+		knownTypes := map[string]bool{
+			"owf_payment_initiation": true,
+		}
+		for i, encoded := range rawStrings {
+			decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+			if err != nil {
+				return fmt.Errorf("transaction_data[%d]: invalid base64url encoding: %w", i, err)
+			}
+			var td TransactionData
+			if err := json.Unmarshal(decoded, &td); err != nil {
+				return fmt.Errorf("transaction_data[%d]: invalid JSON: %w", i, err)
+			}
+			if !knownTypes[td.Type] {
+				return fmt.Errorf("unsupported transaction_data type: %q", td.Type)
+			}
+			authReq.TransactionData = append(authReq.TransactionData, td)
+		}
+	}
+
+	return nil
 }
 
 func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {

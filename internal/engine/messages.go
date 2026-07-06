@@ -273,7 +273,7 @@ type SignRequestParams struct {
 type CredentialRef struct {
 	CredentialQueryID string   `json:"credential_query_id,omitempty"`
 	CredentialID      string   `json:"credential_id"`
-	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
+	DisclosedClaims   []string `json:"disclosed_claims"`
 }
 
 // ProofObject represents a single OID4VCI credential proof.
