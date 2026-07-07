@@ -159,6 +159,7 @@ type IssuerMetadata struct {
 	CredentialEndpoint                string                      `json:"credential_endpoint"`
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
 	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
+	NotificationEndpoint              string                      `json:"notification_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
 	AuthorizationServers              []string                    `json:"authorization_servers,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
@@ -732,12 +733,39 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		h.registerNotificationContext(metadata, token, deferredResp)
 		return h.Complete(results, "")
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	h.registerNotificationContext(metadata, token, credential)
 	return h.Complete(results, "")
+}
+
+// registerNotificationContext captures the ephemeral state needed to forward an
+// OID4VCI §10 notification for this credential, keyed by flow ID. It is a no-op
+// unless the issuer advertised a notification endpoint and returned a
+// notification_id. The stored context is short-lived, in-memory, and one-shot;
+// no credential data is retained.
+func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
+	if metadata == nil || token == nil || resp == nil {
+		return
+	}
+	if metadata.NotificationEndpoint == "" || resp.NotificationID == "" {
+		return
+	}
+	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
+		return
+	}
+	h.Flow.Session.notifications.put(h.Flow.ID, &notificationContext{
+		endpoint:       metadata.NotificationEndpoint,
+		accessToken:    token.AccessToken,
+		tokenType:      token.TokenType,
+		dpopKey:        h.dpopKey,
+		dpopNonce:      h.dpopNonce,
+		notificationID: resp.NotificationID,
+	})
 }
 
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
@@ -1941,54 +1969,46 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
 	}
 
-	if resp.Credential != nil {
-		credStr := ""
-		switch v := resp.Credential.(type) {
-		case string:
-			credStr = v
-		case map[string]interface{}:
-			if innerCred, ok := v["credential"].(string); ok {
-				credStr = innerCred
-			} else {
-				bytes, _ := json.Marshal(v)
-				credStr = string(bytes)
-			}
-		default:
-			bytes, _ := json.Marshal(v)
-			credStr = string(bytes)
-		}
+	// appendResult builds a CredentialResult for a single credential value
+	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
+	// §8.3/§11 there is a single notification_id per Credential Response, so the
+	// same resp.NotificationID applies to every credential in the response.
+	appendResult := func(cred interface{}) {
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:         config.Format,
+			Credential:     credentialToString(cred),
+			VCT:            config.VCT,
+			TypeMetadata:   typeMetadata,
+			NotificationID: resp.NotificationID,
 		})
 	}
 
+	if resp.Credential != nil {
+		appendResult(resp.Credential)
+	}
 	for _, cred := range resp.Credentials {
-		credStr := ""
-		switch v := cred.(type) {
-		case string:
-			credStr = v
-		case map[string]interface{}:
-			if innerCred, ok := v["credential"].(string); ok {
-				credStr = innerCred
-			} else {
-				bytes, _ := json.Marshal(v)
-				credStr = string(bytes)
-			}
-		default:
-			bytes, _ := json.Marshal(v)
-			credStr = string(bytes)
-		}
-
-		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
-		})
+		appendResult(cred)
 	}
 
 	return results
+}
+
+// credentialToString normalizes an issuer-returned credential value into the
+// string form carried to the client. The value may be a raw string, a wrapped
+// object containing a "credential" string, or some other JSON value (which is
+// re-serialized as a fallback).
+func credentialToString(cred interface{}) string {
+	switch v := cred.(type) {
+	case string:
+		return v
+	case map[string]interface{}:
+		if innerCred, ok := v["credential"].(string); ok {
+			return innerCred
+		}
+		b, _ := json.Marshal(v)
+		return string(b)
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
 }

@@ -557,6 +557,17 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
 	adminHandlers.RegisterRoutes(adminGroup)
+
+	// Cache management endpoint — useful in test environments where the
+	// conformance suite serves different issuer metadata per test module
+	// at the same URL.
+	adminGroup.DELETE("/cache/metadata", func(c *gin.Context) {
+		if p.metadataResolver != nil {
+			p.metadataResolver.ClearCache()
+			p.logger.Info("Issuer metadata cache cleared via admin API")
+		}
+		c.Status(http.StatusNoContent)
+	})
 }
 
 // =============================================================================

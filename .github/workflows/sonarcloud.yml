@@ -24,8 +24,12 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests with coverage
-        run: go test ./... -coverprofile=coverage.out -covermode=atomic
+      - name: Generate Go coverage
+        # Produce a coverage profile for Sonar. Test correctness is gated by the
+        # dedicated "test" job (Go CI workflow); here we only need the profile,
+        # so a flaky/failing test must not abort the analysis. The coverage file
+        # is still written for the packages whose tests ran.
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./... || true
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v8
@@ -35,3 +39,5 @@ jobs:
           args: >
             -Dsonar.organization=${{ github.repository_owner }}
             -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.coverage.exclusions=**/*_test.go,**/cmd/**,**/mocks/**,**/*.pb.go
