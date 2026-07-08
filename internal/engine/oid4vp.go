@@ -1242,7 +1242,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 			zap.String("verifier", authReq.ClientID))
 	}
 	if encEnc == "" {
-		encEnc = "A128GCM"
+		encEnc = "A128CBC-HS256"
 	}
 
 	// Extract verifier's public key for encryption

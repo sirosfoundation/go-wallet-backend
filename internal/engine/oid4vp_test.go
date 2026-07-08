@@ -623,8 +623,10 @@ func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
 	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
 }
 
-func TestSubmitDirectPostJWT_DefaultEncIsA128GCM(t *testing.T) {
-	// When authorization_encrypted_response_enc is absent, default should be A128GCM.
+func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
+	// When authorization_encrypted_response_enc is absent, default should be
+	// A128CBC-HS256 (preserved for backward compatibility with existing verifiers
+	// that omit enc but expect the original default).
 	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
