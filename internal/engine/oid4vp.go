@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -1215,12 +1217,32 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 		encEnc = authReq.ClientMetadata.AuthorizationEncryptedResponseEnc
 	}
 
-	// Per spec: if encryption alg is specified, encrypt. Default enc is A128CBC-HS256.
+	// Per spec, authorization_encrypted_response_alg is required for direct_post.jwt.
+	// When absent (e.g. x509_san_dns verifiers that omit client_metadata), infer a
+	// sensible default from the available public key material rather than failing hard:
+	//   EC key  → ECDH-ES  (RFC 7518 §4.6)
+	//   RSA key → RSA-OAEP (RFC 7518 §4.3)
+	// This allows interoperability with verifiers that embed their key in the request
+	// JWT x5c header but do not explicitly declare JARM encryption parameters.
 	if encAlg == "" {
-		return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata")
+		inferredKey, _, keyErr := h.extractVerifierEncryptionKey(authReq)
+		if keyErr != nil {
+			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
+		}
+		switch inferredKey.(type) {
+		case *ecdsa.PublicKey:
+			encAlg = "ECDH-ES"
+		case *rsa.PublicKey:
+			encAlg = "RSA-OAEP"
+		default:
+			return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
+		}
+		h.Logger.Info("direct_post.jwt: inferred encryption algorithm from key material",
+			zap.String("alg", encAlg),
+			zap.String("verifier", authReq.ClientID))
 	}
 	if encEnc == "" {
-		encEnc = "A128CBC-HS256"
+		encEnc = "A128GCM"
 	}
 
 	// Extract verifier's public key for encryption
