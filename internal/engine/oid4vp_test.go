@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -495,11 +496,84 @@ func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
 	assert.Equal(t, 5, parts, "JWE should have 5 parts, got %d", parts)
 }
 
-func TestSubmitDirectPostJWT_MissingEncAlg(t *testing.T) {
-	h := &OID4VPHandler{httpClient: http.DefaultClient}
+func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromECKey(t *testing.T) {
+	// When authorization_encrypted_response_alg is absent but an EC key is
+	// available in client_metadata.jwks, the algorithm should be inferred as
+	// ECDH-ES (EC key → ECDH-ES, RFC 7518 §4.6).
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	encJWK := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
+		"use": "enc", "kid": "ec-enc-key",
+	}
+	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		// No AuthorizationEncryptedResponseAlg — should be inferred as ECDH-ES
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should succeed by inferring ECDH-ES from EC key")
+
+	response := receivedForm.Get("response")
+	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
+	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+}
+
+func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromRSAKey(t *testing.T) {
+	// When authorization_encrypted_response_alg is absent but an RSA key is
+	// available in client_metadata.jwks, the algorithm should be inferred as
+	// RSA-OAEP (RSA key → RSA-OAEP, RFC 7518 §4.3).
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	jwksBytes := makeJWKS(jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "rsa-enc", Use: "enc"})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
 	authReq := &AuthorizationRequest{
 		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{},
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should succeed by inferring RSA-OAEP from RSA key")
+
+	response := receivedForm.Get("response")
+	assert.NotEmpty(t, response)
+	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+}
+
+func TestSubmitDirectPostJWT_MissingEncAlgAndNoKey_Errors(t *testing.T) {
+	// When neither authorization_encrypted_response_alg nor any key material is
+	// available, the call must fail with a clear error.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: http.DefaultClient}
+	authReq := &AuthorizationRequest{
+		ClientID:       "https://verifier.example.com",
+		ClientMetadata: &ClientMetadata{}, // no JWKS, no alg
 	}
 
 	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
@@ -507,16 +581,85 @@ func TestSubmitDirectPostJWT_MissingEncAlg(t *testing.T) {
 	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
 }
 
-func TestSubmitDirectPostJWT_NilClientMetadata(t *testing.T) {
-	h := &OID4VPHandler{httpClient: http.DefaultClient}
+func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
+	// When client_metadata is nil but the request JWT carries an x5c, the algorithm
+	// should be inferred from the x5c leaf cert's public key.
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "verifier"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &leafKey.PublicKey, leafKey)
+	require.NoError(t, err)
+	certB64 := base64.StdEncoding.EncodeToString(der)
+
+	requestJWT := buildMinimalJWT(t, leafKey, certB64)
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
 	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: nil,
+		ClientID:   "x509_san_dns:verifier.example.com",
+		RequestJWT: requestJWT,
+		// No client_metadata — algorithm inferred from x5c leaf
 	}
 
-	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should succeed by inferring ECDH-ES from x5c EC key")
+
+	response := receivedForm.Get("response")
+	assert.NotEmpty(t, response)
+	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+}
+
+func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
+	// When authorization_encrypted_response_enc is absent, default should be
+	// A128CBC-HS256 (preserved for backward compatibility with existing verifiers
+	// that omit enc but expect the original default).
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	encJWK := map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
+		"use": "enc",
+	}
+	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		ClientMetadata: &ClientMetadata{
+			JWKS:                              jwksBytes,
+			AuthorizationEncryptedResponseAlg: "ECDH-ES",
+			// No enc — should default to A128GCM
+		},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "vp-token")
+	require.NoError(t, err, "should succeed with default A128GCM enc")
+	assert.Equal(t, 5, len(splitDots(receivedForm.Get("response"))))
 }
 
 func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {
@@ -1520,4 +1663,23 @@ func TestValidateResponseURIOrigin_OpenID4VPNoRequestURI(t *testing.T) {
 	}
 	err := validateResponseURIOrigin(authReq, msg)
 	assert.NoError(t, err)
+}
+
+// buildMinimalJWT constructs a bare compact JWT with an x5c header containing certB64,
+// signed with key. The payload is a minimal valid JSON object. Used by tests that
+// need a request JWT carrying an embedded certificate.
+func buildMinimalJWT(t *testing.T, key *ecdsa.PrivateKey, certB64 string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","x5c":["` + certB64 + `"]}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"https://verifier.example.com","nonce":"test"}`))
+	signingInput := header + "." + payload
+	h := crypto.SHA256.New()
+	h.Write([]byte(signingInput))
+	r, s, err := ecdsa.Sign(rand.Reader, key, h.Sum(nil))
+	require.NoError(t, err)
+	n := (key.Curve.Params().BitSize + 7) / 8
+	sig := make([]byte, 2*n)
+	r.FillBytes(sig[:n])
+	s.FillBytes(sig[n:])
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
