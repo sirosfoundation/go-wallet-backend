@@ -222,6 +222,24 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Add common status endpoints to HTTP router
 	m.addStatusEndpoints(m.httpRouter)
 
+	// Wallet client configuration discovery endpoint.
+	// Clients call this once to discover engine WS URL, auth URL, etc.
+	// instead of hardcoding topology-specific ports.
+	m.httpRouter.GET("/.well-known/wallet-configuration", func(c *gin.Context) {
+		engineURL := ""
+		if m.cfg.WSPort > 0 && m.cfg.WSPort != m.cfg.HTTPPort {
+			scheme := "ws"
+			if m.cfg.TLS.Enabled {
+				scheme = "wss"
+			}
+			engineURL = fmt.Sprintf("%s://localhost:%d", scheme, m.cfg.WSPort)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"engine_url": engineURL,
+			"auth_url":   "/auth",
+		})
+	})
+
 	// Start HTTP server
 	httpAddr := fmt.Sprintf("%s:%d", m.cfg.HTTPAddress, m.cfg.HTTPPort)
 	m.httpServer = &http.Server{
