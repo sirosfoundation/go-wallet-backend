@@ -590,4 +590,58 @@ func TestExtractVerifierAttestation(t *testing.T) {
 			t.Error("expected error for missing cnf")
 		}
 	})
+
+	t.Run("missing iss claim", func(t *testing.T) {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+			"sub": "verifier.example",
+			"cnf": map[string]interface{}{"jwk": verifierJWK},
+		})
+		token.Header["typ"] = "verifier-attestation+jwt"
+		attestStr, _ := token.SignedString(issuerKey)
+
+		reqToken := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "test"})
+		reqToken.Header["jwt"] = attestStr
+		reqStr, _ := reqToken.SignedString(verifierKey)
+
+		_, err := ExtractVerifierAttestation(reqStr)
+		if err == nil {
+			t.Error("expected error for missing iss")
+		}
+	})
+
+	t.Run("missing sub claim", func(t *testing.T) {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+			"iss": "https://issuer.example",
+			"cnf": map[string]interface{}{"jwk": verifierJWK},
+		})
+		token.Header["typ"] = "verifier-attestation+jwt"
+		attestStr, _ := token.SignedString(issuerKey)
+
+		reqToken := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "test"})
+		reqToken.Header["jwt"] = attestStr
+		reqStr, _ := reqToken.SignedString(verifierKey)
+
+		_, err := ExtractVerifierAttestation(reqStr)
+		if err == nil {
+			t.Error("expected error for missing sub")
+		}
+	})
+
+	t.Run("malformed attestation JWT (2 parts only)", func(t *testing.T) {
+		reqToken := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "test"})
+		reqToken.Header["jwt"] = "header.payload" // only 2 parts, no signature
+		reqStr, _ := reqToken.SignedString(verifierKey)
+
+		_, err := ExtractVerifierAttestation(reqStr)
+		if err == nil {
+			t.Error("expected error for 2-part attestation JWT")
+		}
+	})
+
+	t.Run("invalid request JWT format", func(t *testing.T) {
+		_, err := ExtractVerifierAttestation("not-a-jwt")
+		if err == nil {
+			t.Error("expected error for invalid request JWT")
+		}
+	})
 }
