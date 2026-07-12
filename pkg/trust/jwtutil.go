@@ -63,6 +63,139 @@ func ExtractKeyMaterialFromJWT(jwtStr string) *KeyMaterial {
 	return nil
 }
 
+// VerifierAttestation holds the parsed content of a Verifier Attestation JWT
+// as defined in OID4VP §12.
+type VerifierAttestation struct {
+	// Issuer is the attestation issuer (iss claim)
+	Issuer string
+	// Subject is the verifier's client_id (sub claim)
+	Subject string
+	// CNF contains the verifier's confirmation key (cnf.jwk)
+	CNF map[string]interface{}
+	// AttestationKeyMaterial is the key material from the attestation JWT's own header
+	AttestationKeyMaterial *KeyMaterial
+	// RedirectURIs is the optional list of allowed redirect URIs
+	RedirectURIs []string
+}
+
+// ExtractVerifierAttestation extracts and validates the verifier attestation JWT
+// from the request JWT's "jwt" JOSE header parameter (OID4VP §5.9.3.4 / §12).
+//
+// It parses the attestation JWT, extracts the verifier's cnf key, and verifies
+// the request JWT's signature against that key. Returns the parsed attestation
+// and the attestation's own key material (for trust evaluation of the issuer).
+//
+// Returns nil if no "jwt" header parameter is present.
+func ExtractVerifierAttestation(requestJWT string) (*VerifierAttestation, error) {
+	parts := strings.Split(requestJWT, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("invalid request JWT format")
+	}
+
+	// Parse request JWT header to get the "jwt" parameter
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode request JWT header: %w", err)
+	}
+
+	var reqHeader struct {
+		Alg string `json:"alg"`
+		JWT string `json:"jwt"`
+	}
+	if err := json.Unmarshal(headerBytes, &reqHeader); err != nil {
+		return nil, fmt.Errorf("failed to parse request JWT header: %w", err)
+	}
+
+	if reqHeader.JWT == "" {
+		return nil, nil // no attestation present
+	}
+
+	// Parse the attestation JWT header to extract its key material
+	attestKM := ExtractKeyMaterialFromJWT(reqHeader.JWT)
+
+	// Parse the attestation JWT payload (without verification — trust evaluation
+	// of the attestation issuer is delegated to go-trust PDP)
+	attestParts := strings.Split(reqHeader.JWT, ".")
+	if len(attestParts) < 2 {
+		return nil, errors.New("invalid verifier attestation JWT format")
+	}
+
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(attestParts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode attestation payload: %w", err)
+	}
+
+	var attestPayload struct {
+		Iss          string    `json:"iss"`
+		Sub          string    `json:"sub"`
+		Exp          float64   `json:"exp"`
+		CNF          *cnfClaim `json:"cnf"`
+		RedirectURIs []string  `json:"redirect_uris"`
+	}
+	if err := json.Unmarshal(payloadBytes, &attestPayload); err != nil {
+		return nil, fmt.Errorf("failed to parse attestation payload: %w", err)
+	}
+
+	if attestPayload.Iss == "" {
+		return nil, errors.New("attestation JWT missing iss claim")
+	}
+	if attestPayload.Sub == "" {
+		return nil, errors.New("attestation JWT missing sub claim")
+	}
+	if attestPayload.CNF == nil || attestPayload.CNF.JWK == nil {
+		return nil, errors.New("attestation JWT missing cnf.jwk claim")
+	}
+
+	// Verify the request JWT signature against the cnf key from the attestation
+	cnfKey := attestPayload.CNF.JWK
+	matchedJWK, err := VerifyJWTWithResolvedKeys(requestJWT, []interface{}{cnfKey})
+	if err != nil {
+		return nil, fmt.Errorf("request JWT signature does not match attestation cnf key: %w", err)
+	}
+	_ = matchedJWK
+
+	return &VerifierAttestation{
+		Issuer:                 attestPayload.Iss,
+		Subject:                attestPayload.Sub,
+		CNF:                    cnfKey,
+		AttestationKeyMaterial: attestKM,
+		RedirectURIs:           attestPayload.RedirectURIs,
+	}, nil
+}
+
+// cnfClaim represents the confirmation claim (RFC 7800).
+type cnfClaim struct {
+	JWK map[string]interface{} `json:"jwk"`
+}
+
+// ExtractTrustChainFromJWT extracts the "trust_chain" header parameter from a JWT.
+// Per OID4VP §5.9.3.6, a verifier operating under OpenID Federation may include
+// a trust_chain array in the JWT header. Returns nil if not present.
+func ExtractTrustChainFromJWT(jwtStr string) []string {
+	parts := strings.Split(jwtStr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil
+	}
+
+	var header struct {
+		TrustChain []string `json:"trust_chain"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil
+	}
+
+	if len(header.TrustChain) == 0 {
+		return nil
+	}
+
+	return header.TrustChain
+}
+
 // ErrNoEmbeddedKey is returned by VerifyJWTWithEmbeddedKey when the JWT header
 // contains neither an x5c certificate chain nor an embedded JWK.
 var ErrNoEmbeddedKey = errors.New("JWT header contains neither x5c nor jwk")
@@ -261,6 +394,82 @@ func parseCertificateDER(der []byte, ext ...*cryptoutil.Extensions) (*x509.Certi
 		return ext[0].ParseCertificate(der)
 	}
 	return x509.ParseCertificate(der)
+}
+
+// VerifyJWTWithResolvedKeys verifies a JWT's signature against a set of
+// externally resolved JWK keys (e.g., from a DID Document). It tries each
+// key until one succeeds. Returns the matching JWK on success.
+//
+// The keys parameter should be a slice of JWK maps ([]interface{} of
+// map[string]interface{}), as returned by NormalizeJWKS or DID resolution.
+func VerifyJWTWithResolvedKeys(jwtStr string, keys []interface{}) (map[string]interface{}, error) {
+	parts := strings.Split(jwtStr, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("invalid JWT format: expected 3 parts")
+	}
+
+	// Parse header for algorithm
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode JWT header: %w", err)
+	}
+
+	var header struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("failed to parse JWT header: %w", err)
+	}
+
+	signingMethod := jwt.GetSigningMethod(header.Alg)
+	if signingMethod == nil {
+		return nil, fmt.Errorf("unsupported JWT algorithm: %s", header.Alg)
+	}
+
+	signingInput := parts[0] + "." + parts[1]
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode JWT signature: %w", err)
+	}
+
+	// If kid is present, try matching key first
+	if header.Kid != "" {
+		for _, k := range keys {
+			jwkMap, ok := k.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			kid, _ := jwkMap["kid"].(string)
+			if kid != header.Kid {
+				continue
+			}
+			pubKey, err := jwkToPublicKey(jwkMap)
+			if err != nil {
+				continue
+			}
+			if err := signingMethod.Verify(signingInput, sig, pubKey); err == nil {
+				return jwkMap, nil
+			}
+		}
+	}
+
+	// Try all keys
+	for _, k := range keys {
+		jwkMap, ok := k.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pubKey, err := jwkToPublicKey(jwkMap)
+		if err != nil {
+			continue
+		}
+		if err := signingMethod.Verify(signingInput, sig, pubKey); err == nil {
+			return jwkMap, nil
+		}
+	}
+
+	return nil, errors.New("JWT signature does not match any resolved key")
 }
 
 // FetchJWKS fetches a JWKS from a URI using the given HTTP client.
