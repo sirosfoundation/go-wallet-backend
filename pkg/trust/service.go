@@ -348,7 +348,8 @@ type Resolver interface {
 
 // ResolveDID resolves a DID via the verifier trust endpoint and returns the
 // verification method JWKs from the resolved DID Document.
-// Returns nil keys if the evaluator doesn't support resolution or no keys found.
+// Returns an error if no evaluator is configured, the evaluator doesn't support
+// resolution, or the DID cannot be resolved.
 func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint string) ([]interface{}, error) {
 	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
 	eval, err := s.GetEvaluator(endpoint)

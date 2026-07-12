@@ -183,11 +183,13 @@ wallet fully validates it.
 
 1. **go-wallet-backend** (`internal/engine/oid4vp.go`):
    - In `evaluateVerifierTrust()`, when scheme is `did`:
-     - Extract the request JWT from the authorization request
-     - Send `requires_resolution: true` to frontend with the DID as subject_id
-     - Frontend calls `/v1/resolve` → go-trust resolves DID Document
-     - Verify JWT signature against resolved DID verification methods
-     - Proceed with trust evaluation using resolved keys
+     - Call `trust.Service.ResolveDID()` which sends a resolution-only request
+       to go-trust PDP, receives the DID Document in `TrustMetadata`
+     - Extract verification method JWKs from the DID Document
+     - Verify JAR JWT signature against resolved keys using
+       `VerifyJWTWithResolvedKeys()`
+     - Send the verified JWK as `keyMaterial` to frontend for trust evaluation
+       (same path as x509 — no frontend-side DID resolution needed)
    - Support both `did:web` and `did:webvh` (version-history DIDs provide
      cryptographic audit trail of key rotations)
 
@@ -195,11 +197,12 @@ wallet fully validates it.
    - `did:web` resolution already implemented
    - Add `did:webvh` support: resolve version history, verify hash chain,
      return current verification methods
-   - Return key material in AuthZEN response `context.keys` for JWT verification
+   - Return DID Document in AuthZEN response `trust_metadata` for key extraction
 
 3. **wallet-frontend** and **native SDKs** (primary), **wallet-companion** (nice-to-have):
-   - Handle `requires_resolution` progress step
-   - Call `/v1/resolve` and relay keys back to engine
+   - No DID-specific changes needed — DID resolution and JWT verification
+     happen server-side in go-wallet-backend
+   - Frontend/SDKs receive JWK key material (same as x509 flow)
    - Display DID-based verifier identity in consent UI
 
 **did:webvh advantage**: Unlike `did:web` (which relies on current DNS/HTTPS
@@ -268,14 +271,16 @@ frameworks that issue attestation JWTs rather than X.509 certs.
 1. **go-wallet-backend**:
    - Parse `verifier_attestation` JWT from the `jwt` header parameter of the
      request object (per OID4VP §5.9.3.4)
-   - Extract verifier public key from the attestation JWT payload
+   - Extract verifier public key from the attestation JWT payload (`cnf.jwk`)
    - Verify request JWT signature against that key
-   - Send attestation issuer + verifier identity to go-trust for evaluation
+   - Forward the raw attestation JWT, attestation issuer identity, and
+     attestation key material to go-trust via the evaluation context
 
 2. **go-trust**:
-   - New registry type for verifier attestation issuers
-   - Validate attestation JWT signature against registered attestation issuer keys
-   - Check attestation claims (expiry, scope, verifier_id binding)
+   - Verify the attestation JWT signature against the attestation issuer's keys
+   - Validate attestation claims (expiry, scope, verifier_id binding)
+   - Existing registries (ETSI, OIDF, static) can validate the attestation
+     issuer's key material — no new registry type needed for most deployments
 
 3. **SUNET/vc** (verifier role):
    - No change needed — SUNET/vc uses `x509_san_dns` as its own scheme

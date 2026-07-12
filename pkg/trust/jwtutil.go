@@ -74,6 +74,9 @@ type VerifierAttestation struct {
 	CNF map[string]interface{}
 	// AttestationKeyMaterial is the key material from the attestation JWT's own header
 	AttestationKeyMaterial *KeyMaterial
+	// RawJWT is the raw attestation JWT string for forwarding to the PDP
+	// so it can verify the attestation signature and validate claims.
+	RawJWT string
 	// RedirectURIs is the optional list of allowed redirect URIs
 	RedirectURIs []string
 }
@@ -113,11 +116,10 @@ func ExtractVerifierAttestation(requestJWT string) (*VerifierAttestation, error)
 	// Parse the attestation JWT header to extract its key material
 	attestKM := ExtractKeyMaterialFromJWT(reqHeader.JWT)
 
-	// Parse the attestation JWT payload (without verification — trust evaluation
-	// of the attestation issuer is delegated to go-trust PDP)
+	// Parse the attestation JWT payload
 	attestParts := strings.Split(reqHeader.JWT, ".")
-	if len(attestParts) < 2 {
-		return nil, errors.New("invalid verifier attestation JWT format")
+	if len(attestParts) != 3 {
+		return nil, errors.New("invalid verifier attestation JWT format: expected 3 parts")
 	}
 
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(attestParts[1])
@@ -159,6 +161,7 @@ func ExtractVerifierAttestation(requestJWT string) (*VerifierAttestation, error)
 		Subject:                attestPayload.Sub,
 		CNF:                    cnfKey,
 		AttestationKeyMaterial: attestKM,
+		RawJWT:                 reqHeader.JWT,
 		RedirectURIs:           attestPayload.RedirectURIs,
 	}, nil
 }

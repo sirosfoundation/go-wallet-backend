@@ -535,6 +535,9 @@ func TestExtractVerifierAttestation(t *testing.T) {
 		if att.AttestationKeyMaterial == nil || att.AttestationKeyMaterial.Type != "jwk" {
 			t.Error("expected attestation key material with type jwk")
 		}
+		if att.RawJWT == "" {
+			t.Error("expected RawJWT to be non-empty")
+		}
 	})
 
 	t.Run("no jwt header", func(t *testing.T) {

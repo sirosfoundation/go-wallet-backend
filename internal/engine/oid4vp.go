@@ -398,10 +398,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	// Scheme-aware key material extraction and JWT verification
-	// For DID schemes, key resolution is delegated to frontend via /v1/resolve
 	var keyMaterial *KeyMaterial
 	var requiresResolution bool
 	var requestJWT string
+	var attestationContext map[string]interface{}
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID:
@@ -480,10 +480,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		// Validate that attestation sub matches client_id (without the scheme prefix)
-		expectedSub := authReq.ClientID
-		if strings.HasPrefix(expectedSub, "verifier_attestation:") {
-			expectedSub = strings.TrimPrefix(expectedSub, "verifier_attestation:")
-		}
+		expectedSub := strings.TrimPrefix(authReq.ClientID, "verifier_attestation:")
 		if attestation.Subject != expectedSub {
 			return nil, fmt.Errorf("attestation sub %q does not match client_id %q", attestation.Subject, expectedSub)
 		}
@@ -492,8 +489,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			zap.String("attestation_issuer", attestation.Issuer),
 			zap.String("verifier_sub", attestation.Subject))
 
-		// Use the attestation issuer's key material for trust evaluation
-		// (go-trust PDP validates whether the attestation issuer is trusted)
+		// Use the attestation issuer's key material for trust evaluation.
+		// The PDP validates whether the attestation issuer is trusted.
+		// We also forward the attestation issuer identity and the raw
+		// attestation JWT so the PDP has full context.
 		if attestation.AttestationKeyMaterial != nil {
 			keyMaterial = attestation.AttestationKeyMaterial
 		} else {
@@ -502,6 +501,14 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 				Type: "jwk",
 				JWK:  attestation.CNF,
 			}
+		}
+		// Store attestation context for the trust evaluation request.
+		// The raw JWT is forwarded so the PDP can verify the attestation
+		// signature and validate claims (exp, aud, scope).
+		attestationContext = map[string]interface{}{
+			"attestation_issuer":  attestation.Issuer,
+			"attestation_subject": attestation.Subject,
+			"attestation_jwt":     attestation.RawJWT,
 		}
 
 	default:
@@ -554,7 +561,12 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
-	// Convert key material for frontend (nil for DID schemes - frontend resolves)
+	// Forward attestation context if present (verifier_attestation scheme)
+	for k, v := range attestationContext {
+		trustReq.Context[k] = v
+	}
+
+	// Convert key material for frontend
 	if keyMaterial != nil {
 		trustReq.KeyMaterial = &TrustKeyMaterial{
 			Type: keyMaterial.Type,
