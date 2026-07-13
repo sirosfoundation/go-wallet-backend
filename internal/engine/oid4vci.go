@@ -911,6 +911,66 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
 	}
 
+	// Try server-side direct evaluation first (preferred path).
+	// The backend calls go-trust PDP directly — no frontend round-trip needed.
+	// This only activates when an issuer PDP URL is configured.
+	trustEndpoint := h.Config.Trust.GetIssuerPDPURL()
+	if trustEndpoint != "" {
+		evalCtx := ctx
+		if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+			evalCtx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
+		}
+		directResult, err := h.TrustSvc.EvaluateIssuer(evalCtx, issuer, trustEndpoint, keyMaterial)
+		if err != nil {
+			h.Logger.Warn("Server-side issuer trust evaluation failed, falling back to frontend",
+				zap.Error(err))
+		} else if directResult != nil {
+			info := &TrustInfo{
+				Trusted:      directResult.Trusted,
+				Framework:    directResult.Framework,
+				Reason:       directResult.Reason,
+				Certificates: directResult.Certificates,
+			}
+
+			h.Logger.Info("Server-side issuer trust evaluation",
+				zap.String("issuer", issuer),
+				zap.Bool("trusted", info.Trusted),
+				zap.String("framework", info.Framework))
+
+			// Send result to frontend/SDK as informational progress
+			_ = h.Progress(StepTrustEvaluated, map[string]interface{}{
+				"issuer_trust_evaluated": true,
+				"issuer":                 issuer,
+				"trusted":                info.Trusted,
+				"framework":              info.Framework,
+				"reason":                 info.Reason,
+				"certificates":           info.Certificates,
+			})
+
+			if !info.Trusted {
+				reason := info.Reason
+				if reason == "" {
+					reason = "issuer not trusted"
+				}
+				h.Logger.Warn("Blocking untrusted issuer",
+					zap.String("issuer", issuer),
+					zap.String("reason", reason))
+				return info, fmt.Errorf("untrusted issuer %s: %s", issuer, reason)
+			}
+			return info, nil
+		}
+	}
+
+	// Fallback: frontend-mediated trust evaluation (legacy path).
+	// Used when no issuer PDP is configured or server-side evaluation failed.
+	return h.evaluateTrustViaFrontend(ctx, issuer, metadata, metadataValidated, keyMaterial)
+}
+
+// evaluateTrustViaFrontend delegates trust evaluation to the frontend/SDK.
+// This is the legacy path: the engine sends a trust_evaluation_required progress,
+// the frontend calls /v1/evaluate, and sends back a trust_result action.
+func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool, keyMaterial *KeyMaterial) (*TrustInfo, error) {
+
 	// Check if issuer is a DID - requires resolution via /v1/resolve
 	requiresResolution := strings.HasPrefix(issuer, "did:")
 
