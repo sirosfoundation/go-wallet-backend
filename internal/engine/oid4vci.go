@@ -914,25 +914,22 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	// Try server-side direct evaluation first (preferred path).
 	// The backend calls go-trust PDP directly — no frontend round-trip needed.
 	// This only activates when an issuer PDP URL is configured.
-	tenantID := ""
-	if h.Flow != nil && h.Flow.Session != nil {
-		tenantID = h.Flow.Session.TenantID
-	}
-	trustEndpoint := ""
-	if h.Flow != nil && h.Flow.Session != nil {
-		trustEndpoint = h.Config.Trust.GetIssuerPDPURL()
-	}
+	trustEndpoint := h.Config.Trust.GetIssuerPDPURL()
 	if trustEndpoint != "" {
-		evalCtx := trust.ContextWithTenant(ctx, tenantID)
+		evalCtx := ctx
+		if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+			evalCtx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
+		}
 		directResult, err := h.TrustSvc.EvaluateIssuer(evalCtx, issuer, trustEndpoint, keyMaterial)
 		if err != nil {
 			h.Logger.Warn("Server-side issuer trust evaluation failed, falling back to frontend",
 				zap.Error(err))
 		} else if directResult != nil {
 			info := &TrustInfo{
-				Trusted:   directResult.Trusted,
-				Framework: directResult.Framework,
-				Reason:    directResult.Reason,
+				Trusted:      directResult.Trusted,
+				Framework:    directResult.Framework,
+				Reason:       directResult.Reason,
+				Certificates: directResult.Certificates,
 			}
 
 			h.Logger.Info("Server-side issuer trust evaluation",
@@ -947,6 +944,7 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 				"trusted":                info.Trusted,
 				"framework":              info.Framework,
 				"reason":                 info.Reason,
+				"certificates":           info.Certificates,
 			})
 
 			if !info.Trusted {
