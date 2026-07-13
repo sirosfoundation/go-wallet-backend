@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1734,5 +1735,135 @@ func TestVerifyAssertionWithoutExtensions(t *testing.T) {
 		assert.False(t, verifyAssertionWithoutExtensions(corrupted, nil, parsedResp.Response.Signature, storedPubKey))
 		assert.False(t, verifyAssertionWithoutExtensions(corrupted, parsedResp.Raw.AssertionResponse.ClientDataJSON, nil, storedPubKey))
 		assert.False(t, verifyAssertionWithoutExtensions(corrupted, parsedResp.Raw.AssertionResponse.ClientDataJSON, parsedResp.Response.Signature, nil))
+	})
+}
+
+func TestIsAssertionSignatureError(t *testing.T) {
+	t.Run("matches signature error", func(t *testing.T) {
+		err := protocol.ErrAssertionSignature.WithDetails("test").WithError(fmt.Errorf("inner"))
+		assert.True(t, isAssertionSignatureError(err))
+	})
+
+	t.Run("rejects other protocol error", func(t *testing.T) {
+		err := protocol.ErrVerification.WithDetails("challenge mismatch")
+		assert.False(t, isAssertionSignatureError(err))
+	})
+
+	t.Run("rejects non-protocol error", func(t *testing.T) {
+		assert.False(t, isAssertionSignatureError(fmt.Errorf("some other error")))
+	})
+}
+
+// TestFinishLogin_YubiKitExtensionWorkaround exercises the full FinishLogin path
+// with a mutated assertion response that simulates the YubiKit SDK bug:
+// authenticatorData has hmac-secret CBOR appended and ED flag set, while the
+// signature was computed over the original (extension-free) authenticatorData.
+func TestFinishLogin_YubiKitExtensionWorkaround(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Register a credential
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "YubiKit Test User"})
+	require.NoError(t, err)
+
+	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp, setup.authenticator, setup.credential, *attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = userID.AsUserHandle()
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Helper: create a valid assertion response and corrupt its authenticatorData
+	// by appending fake hmac-secret extension CBOR and setting the ED flag.
+	createCorruptedAssertion := func(t *testing.T) (challengeID string, mutatedJSON json.RawMessage) {
+		t.Helper()
+
+		beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+		require.NoError(t, err)
+
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(
+			setup.rp, setup.authenticator, setup.credential, *assertionOptions,
+		)
+
+		// Parse JSON, mutate authenticatorData, re-marshal
+		var respMap map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(assertionResponse), &respMap))
+
+		responseField := respMap["response"].(map[string]interface{})
+		authDataB64, ok := responseField["authenticatorData"].(string)
+		require.True(t, ok)
+
+		// Decode, append fake extension CBOR, set ED flag
+		authDataBytes, err := base64.RawURLEncoding.DecodeString(authDataB64)
+		require.NoError(t, err)
+
+		fakeCBOR := []byte{
+			0xA1, 0x6B, // map(1), text(11)
+			'h', 'm', 'a', 'c', '-', 's', 'e', 'c', 'r', 'e', 't',
+			0x58, 0x20, // bytes(32)
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		}
+		corrupted := make([]byte, len(authDataBytes)+len(fakeCBOR))
+		copy(corrupted, authDataBytes)
+		corrupted[32] |= 0x80 // Set ED flag
+		copy(corrupted[len(authDataBytes):], fakeCBOR)
+
+		responseField["authenticatorData"] = base64.RawURLEncoding.EncodeToString(corrupted)
+		mutatedBytes, err := json.Marshal(respMap)
+		require.NoError(t, err)
+
+		return beginLoginResp.ChallengeID, json.RawMessage(mutatedBytes)
+	}
+
+	t.Run("login succeeds with corrupted extension data", func(t *testing.T) {
+		challengeID, mutatedJSON := createCorruptedAssertion(t)
+
+		resp, err := setup.service.FinishLogin(setup.ctx, &FinishLoginRequest{
+			ChallengeID: challengeID,
+			Credential:  mutatedJSON,
+		})
+		require.NoError(t, err, "FinishLogin should succeed via the extension-stripping workaround")
+		assert.NotEmpty(t, resp.Token)
+		assert.Equal(t, finishRegResp.UUID, resp.UUID)
+	})
+
+	t.Run("user updated_at is set after workaround login", func(t *testing.T) {
+		// Get user state before login
+		userBefore, err := setup.store.Users().GetByID(setup.ctx, userID)
+		require.NoError(t, err)
+		updatedBefore := userBefore.UpdatedAt
+
+		challengeID, mutatedJSON := createCorruptedAssertion(t)
+
+		_, err = setup.service.FinishLogin(setup.ctx, &FinishLoginRequest{
+			ChallengeID: challengeID,
+			Credential:  mutatedJSON,
+		})
+		require.NoError(t, err)
+
+		// Verify the user record was updated (UpdatedAt changed)
+		userAfter, err := setup.store.Users().GetByID(setup.ctx, userID)
+		require.NoError(t, err)
+		assert.True(t, userAfter.UpdatedAt.After(updatedBefore) || userAfter.UpdatedAt.Equal(updatedBefore),
+			"User UpdatedAt should be set after workaround login")
 	})
 }

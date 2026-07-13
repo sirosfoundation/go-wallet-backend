@@ -1032,8 +1032,13 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// has already signed the data without extensions. This causes signature verification
 		// to fail when the ED (Extension Data) flag is set. Retry verification with
 		// extension data stripped if the ED flag is present.
+		//
+		// SECURITY: Only apply the workaround for signature verification errors.
+		// Other errors (challenge mismatch, origin mismatch, user verification, etc.)
+		// must NOT be bypassed — they are validated by the library before the
+		// signature check and would indicate a genuine protocol violation.
 		rawAuthData := parsedResponse.Raw.AssertionResponse.AuthenticatorData
-		if len(rawAuthData) > 37 && rawAuthData[32]&0x80 != 0 {
+		if isAssertionSignatureError(err) && len(rawAuthData) > 37 && rawAuthData[32]&0x80 != 0 {
 			if verifyAssertionWithoutExtensions(
 				rawAuthData,
 				parsedResponse.Raw.AssertionResponse.ClientDataJSON,
@@ -1664,6 +1669,18 @@ func sha256Hex(data []byte) string {
 
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h[:])
+}
+
+// isAssertionSignatureError returns true if the error is specifically a WebAuthn
+// assertion signature verification failure (Type "invalid_signature"). This
+// distinguishes signature errors from other validation failures (challenge,
+// origin, user verification, etc.) that must not be bypassed.
+func isAssertionSignatureError(err error) bool {
+	var protocolErr *protocol.Error
+	if errors.As(err, &protocolErr) {
+		return protocolErr.Type == "invalid_signature"
+	}
+	return false
 }
 
 // verifyAssertionWithoutExtensions performs manual signature verification after
