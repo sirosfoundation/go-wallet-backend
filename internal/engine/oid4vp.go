@@ -398,24 +398,53 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	}
 
 	// Scheme-aware key material extraction and JWT verification
-	// For DID schemes, key resolution is delegated to frontend via /v1/resolve
 	var keyMaterial *KeyMaterial
 	var requiresResolution bool
 	var requestJWT string
+	var attestationContext map[string]interface{}
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID:
 		// DID scheme: request MUST be JWT-secured
-		// Key resolution and JWT verification is delegated to frontend
+		// Resolve DID document server-side via go-trust, then verify JWT
 		if !strings.HasPrefix(authReq.ClientID, "did:") {
 			return nil, errors.New("client_id_scheme=did but client_id is not a DID")
 		}
 		if authReq.RequestJWT == "" {
 			return nil, errors.New("client_id_scheme=did requires a signed request JWT")
 		}
-		// Don't verify JWT server-side - frontend will resolve DID and verify
-		requiresResolution = true
-		requestJWT = authReq.RequestJWT
+
+		// Resolve DID document to get verification method keys
+		tenantID := ""
+		if h.Flow != nil && h.Flow.Session != nil {
+			tenantID = h.Flow.Session.TenantID
+		}
+		resolvedKeys, err := h.TrustSvc.ResolveDID(
+			trust.ContextWithTenant(ctx, tenantID),
+			authReq.ClientID,
+			"", // use default verifier PDP endpoint
+		)
+		if err != nil {
+			return nil, fmt.Errorf("DID resolution failed for %s: %w", authReq.ClientID, err)
+		}
+		if len(resolvedKeys) == 0 {
+			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", authReq.ClientID)
+		}
+
+		// Verify JWT signature against resolved DID keys
+		matchedJWK, err := trust.VerifyJWTWithResolvedKeys(authReq.RequestJWT, resolvedKeys)
+		if err != nil {
+			return nil, fmt.Errorf("DID request JWT verification failed: %w", err)
+		}
+
+		h.Logger.Debug("DID request JWT verified",
+			zap.String("did", authReq.ClientID),
+			zap.Any("matched_kid", matchedJWK["kid"]))
+
+		keyMaterial = &KeyMaterial{
+			Type: "jwk",
+			JWK:  matchedJWK,
+		}
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
@@ -431,6 +460,56 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+
+	case ClientIDSchemeVerifierAttestation:
+		// Verifier attestation scheme (OID4VP §5.9.3.4 / §12):
+		// 1. Extract attestation JWT from "jwt" header parameter
+		// 2. Extract verifier's cnf key from attestation
+		// 3. Verify request JWT signature against cnf key
+		// 4. Send attestation issuer's key material for trust evaluation
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("verifier_attestation scheme requires a signed request JWT")
+		}
+
+		attestation, err := trust.ExtractVerifierAttestation(authReq.RequestJWT)
+		if err != nil {
+			return nil, fmt.Errorf("verifier attestation extraction failed: %w", err)
+		}
+		if attestation == nil {
+			return nil, errors.New("verifier_attestation scheme requires jwt header parameter with attestation")
+		}
+
+		// Validate that attestation sub matches client_id (without the scheme prefix)
+		expectedSub := strings.TrimPrefix(authReq.ClientID, "verifier_attestation:")
+		if attestation.Subject != expectedSub {
+			return nil, fmt.Errorf("attestation sub %q does not match client_id %q", attestation.Subject, expectedSub)
+		}
+
+		h.Logger.Debug("Verifier attestation validated",
+			zap.String("attestation_issuer", attestation.Issuer),
+			zap.String("verifier_sub", attestation.Subject))
+
+		// Use the attestation issuer's key material for trust evaluation.
+		// The PDP validates whether the attestation issuer is trusted.
+		// We also forward the attestation issuer identity and the raw
+		// attestation JWT so the PDP has full context.
+		if attestation.AttestationKeyMaterial != nil {
+			keyMaterial = attestation.AttestationKeyMaterial
+		} else {
+			// Attestation has no embedded key — send the cnf JWK for resolution
+			keyMaterial = &KeyMaterial{
+				Type: "jwk",
+				JWK:  attestation.CNF,
+			}
+		}
+		// Store attestation context for the trust evaluation request.
+		// The raw JWT is forwarded so the PDP can verify the attestation
+		// signature and validate claims (exp, aud, scope).
+		attestationContext = map[string]interface{}{
+			"attestation_issuer":  attestation.Issuer,
+			"attestation_subject": attestation.Subject,
+			"attestation_jwt":     attestation.RawJWT,
+		}
 
 	default:
 		// redirect_uri and other schemes: extract key material best-effort
@@ -470,7 +549,24 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		trustReq.Context["redirect_uri"] = authReq.RedirectURI
 	}
 
-	// Convert key material for frontend (nil for DID schemes - frontend resolves)
+	// Extract and forward trust_chain from JAR header (OID4VP §5.9.3.6)
+	// This allows go-trust to validate a pre-supplied OIDF trust chain
+	// instead of resolving it from scratch.
+	if authReq.RequestJWT != "" {
+		if trustChain := trust.ExtractTrustChainFromJWT(authReq.RequestJWT); len(trustChain) > 0 {
+			trustReq.Context["trust_chain"] = trustChain
+			h.Logger.Debug("Forwarding trust_chain from JAR header",
+				zap.String("verifier", authReq.ClientID),
+				zap.Int("chain_length", len(trustChain)))
+		}
+	}
+
+	// Forward attestation context if present (verifier_attestation scheme)
+	for k, v := range attestationContext {
+		trustReq.Context[k] = v
+	}
+
+	// Convert key material for frontend
 	if keyMaterial != nil {
 		trustReq.KeyMaterial = &TrustKeyMaterial{
 			Type: keyMaterial.Type,

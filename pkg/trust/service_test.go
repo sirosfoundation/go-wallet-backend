@@ -18,6 +18,8 @@ type testMockEvaluator struct {
 	decision  bool
 	reason    string
 	returnErr error
+	// For Resolver interface
+	resolveMetadata interface{}
 }
 
 func (m *testMockEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest) (*EvaluationResponse, error) {
@@ -27,6 +29,18 @@ func (m *testMockEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest) (*
 	return &EvaluationResponse{
 		Decision: m.decision,
 		Reason:   m.reason,
+	}, nil
+}
+
+// Resolve implements the Resolver interface for DID resolution tests.
+func (m *testMockEvaluator) Resolve(_ context.Context, _ string) (*EvaluationResponse, error) {
+	if m.returnErr != nil {
+		return nil, m.returnErr
+	}
+	return &EvaluationResponse{
+		Decision:      m.decision,
+		Reason:        m.reason,
+		TrustMetadata: m.resolveMetadata,
 	}, nil
 }
 
@@ -578,3 +592,140 @@ func TestService_Evaluate_KeyMaterialInferenceJWK(t *testing.T) {
 		t.Error("EvaluateIssuer() with inferred JWK failed")
 	}
 }
+
+func TestResolveDID(t *testing.T) {
+	didDoc := map[string]interface{}{
+		"id": "did:web:example.com",
+		"verificationMethod": []interface{}{
+			map[string]interface{}{
+				"id":         "did:web:example.com#key-1",
+				"type":       "JsonWebKey2020",
+				"controller": "did:web:example.com",
+				"publicKeyJwk": map[string]interface{}{
+					"kty": "EC",
+					"crv": "P-256",
+					"x":   "test-x",
+					"y":   "test-y",
+				},
+			},
+		},
+	}
+
+	t.Run("successful resolution", func(t *testing.T) {
+		mock := &testMockEvaluator{
+			decision:        true,
+			resolveMetadata: didDoc,
+		}
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = "http://pdp.test"
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return mock, nil
+		})
+
+		keys, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+		if err != nil {
+			t.Fatalf("ResolveDID() error = %v", err)
+		}
+		if len(keys) != 1 {
+			t.Fatalf("expected 1 key, got %d", len(keys))
+		}
+		jwk, ok := keys[0].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected map[string]interface{}")
+		}
+		if jwk["kid"] != "did:web:example.com#key-1" {
+			t.Errorf("expected kid from verification method id, got %v", jwk["kid"])
+		}
+	})
+
+	t.Run("no evaluator configured", func(t *testing.T) {
+		cfg := &config.Config{}
+		// No PDP URL configured
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return nil, nil
+		})
+
+		_, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+		if err == nil {
+			t.Error("expected error when no evaluator configured")
+		}
+	})
+
+	t.Run("resolution denied", func(t *testing.T) {
+		mock := &testMockEvaluator{
+			decision: false,
+			reason:   "not in trust list",
+		}
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = "http://pdp.test"
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return mock, nil
+		})
+
+		_, err := svc.ResolveDID(context.Background(), "did:web:untrusted.com", "")
+		if err == nil {
+			t.Error("expected error when resolution denied")
+		}
+	})
+
+	t.Run("resolution error", func(t *testing.T) {
+		mock := &testMockEvaluator{
+			returnErr: errors.New("network timeout"),
+		}
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = "http://pdp.test"
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return mock, nil
+		})
+
+		_, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+		if err == nil {
+			t.Error("expected error on resolution failure")
+		}
+	})
+
+	t.Run("no keys in DID document", func(t *testing.T) {
+		mock := &testMockEvaluator{
+			decision:        true,
+			resolveMetadata: map[string]interface{}{"id": "did:web:example.com"},
+		}
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = "http://pdp.test"
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return mock, nil
+		})
+
+		keys, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+		if err != nil {
+			t.Fatalf("ResolveDID() error = %v", err)
+		}
+		if keys != nil {
+			t.Errorf("expected nil keys, got %v", keys)
+		}
+	})
+
+	t.Run("evaluator does not support resolution", func(t *testing.T) {
+		// Use a non-resolver evaluator
+		nonResolver := &nonResolvingEvaluator{}
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = "http://pdp.test"
+		svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+			return nonResolver, nil
+		})
+
+		_, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+		if err == nil {
+			t.Error("expected error when evaluator doesn't support resolution")
+		}
+	})
+}
+
+// nonResolvingEvaluator implements TrustEvaluator but NOT Resolver.
+type nonResolvingEvaluator struct{}
+
+func (n *nonResolvingEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest) (*EvaluationResponse, error) {
+	return &EvaluationResponse{Decision: true}, nil
+}
+func (n *nonResolvingEvaluator) Name() string                           { return "non-resolver" }
+func (n *nonResolvingEvaluator) SupportedResourceTypes() []ResourceType { return nil }
+func (n *nonResolvingEvaluator) Healthy() bool                          { return true }
