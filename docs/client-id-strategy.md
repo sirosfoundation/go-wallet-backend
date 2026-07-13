@@ -2,14 +2,53 @@
 
 ## Status
 
-Proposed — July 2026
+**Implemented** — July 2026 (Phases 1–4, 6–8 complete)
 
 ## Summary
 
 This document describes how client identifiers (`client_id`) are used across the
 SIROS wallet ecosystem for both verifier (OID4VP) and issuer (OID4VCI) interactions,
-and proposes a plan to eliminate dynamic/pre-registered client IDs in favor of
+and the implemented plan to eliminate dynamic/pre-registered client IDs in favor of
 attestation-rooted identity.
+
+## Implementation Status
+
+| Phase | Scope | Status | PRs |
+|-------|-------|--------|-----|
+| 1 | DID verifier identity (did:web, did:webvh) | **Merged** | go-wallet-backend #238 |
+| 2 | OpenID Federation trust eval backend | **Merged** | go-wallet-backend #238, go-trust #102 |
+| 3 | Verifier attestation scheme | **Merged** | go-wallet-backend #238 |
+| 3a | SUNET/vc federation entity config | In progress | SUNET/vc (separate session) |
+| 3b | SUNET/vc DID-based identity | In progress | SUNET/vc (separate session) |
+| 3c | SUNET/vc eliminate static client map | In progress | SUNET/vc (separate session) |
+| 4 | Server-side issuer trust evaluation | **Merged** | go-wallet-backend #239 |
+| 5 | Deprecate pre-registration | Operational | go-trust config change only |
+| 6 | Native SDK typed TrustResult | **Merged** | Kotlin #46, Swift #44 |
+| 7 | ClientIdScheme parsing + audience validation | **Merged** | Kotlin #47/#48, Swift #45/#46 |
+| 8 | Trust cache for degraded-mode | **Merged** | Kotlin #49, Swift #47 |
+
+## Key Architecture Decisions (Implemented)
+
+1. **Trust evaluation is server-side** — go-wallet-backend calls go-trust PDP
+   directly. The frontend-mediated path (`trust_evaluation_required`) is legacy;
+   new flows (issuer trust) use direct `TrustSvc` calls with informational
+   progress to frontends/SDKs.
+
+2. **OpenID Federation is NOT a `client_id_scheme`** — it's a trust evaluation
+   mechanism inside go-trust. Verifiers use `x509_san_dns` or `did` on the wire;
+   go-trust evaluates trust via OIDF internally when a `trust_chain` is provided
+   or the entity is federation-discoverable.
+
+3. **No feature flags for trust policy** — activation is controlled by go-trust
+   PDP configuration. Deploy without PDP = no trust check (existing behavior).
+   Deploy with allow-all registry = exercises plumbing. Deploy with real
+   registries = production hardening.
+
+4. **go-wallet-backend is a client of go-trust** — it never does OIDF/DID
+   discovery itself. It sends identifier + key material; go-trust decides.
+
+5. **Backward compatibility via additive changes** — new progress steps are
+   informational (clients ignore unknown steps). No protocol breaking changes.
 
 ---
 
