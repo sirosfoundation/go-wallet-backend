@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/descope/virtualwebauthn"
 	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1603,4 +1605,134 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	require.NoError(t, err, "Login should succeed when OIDC binding matches stored identity")
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
+}
+
+func TestVerifyAssertionWithoutExtensions(t *testing.T) {
+	// Use the existing test setup infrastructure to get a real credential
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Register the credential via the standard flow
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "ExtTest User"})
+	require.NoError(t, err)
+
+	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp, setup.authenticator, setup.credential, *attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+	})
+	require.NoError(t, err)
+
+	// Set up authenticator with user handle for assertion
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = userID.AsUserHandle()
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Do a login to get a valid assertion
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp, setup.authenticator, setup.credential, *assertionOptions,
+	)
+
+	// Parse the assertion to get the raw components
+	parsedResp, err := protocol.ParseCredentialRequestResponseBody(
+		strings.NewReader(assertionResponse),
+	)
+	require.NoError(t, err)
+
+	rawAuthData := parsedResp.Raw.AssertionResponse.AuthenticatorData
+	require.True(t, len(rawAuthData) >= 37)
+
+	// Look up the stored credential public key
+	user, err := setup.store.Users().GetByID(setup.ctx, userID)
+	require.NoError(t, err)
+	require.NotEmpty(t, user.WebauthnCredentials)
+	storedPubKey := user.WebauthnCredentials[0].PublicKey
+	require.NotEmpty(t, storedPubKey)
+
+	t.Run("verify_with_stripped_extensions_succeeds", func(t *testing.T) {
+		// Simulate YubiKit bug: append fake extension CBOR and set ED flag
+		fakeCBOR := []byte{
+			0xA1,                                                  // map(1)
+			0x6B,                                                  // text(11)
+			'h', 'm', 'a', 'c', '-', 's', 'e', 'c', 'r', 'e', 't', // "hmac-secret"
+			0x58, 0x20, // bytes(32)
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		}
+		corruptedAuthData := make([]byte, len(rawAuthData)+len(fakeCBOR))
+		copy(corruptedAuthData, rawAuthData)
+		corruptedAuthData[32] |= 0x80 // Set ED flag
+		copy(corruptedAuthData[len(rawAuthData):], fakeCBOR)
+
+		result := verifyAssertionWithoutExtensions(
+			corruptedAuthData,
+			parsedResp.Raw.AssertionResponse.ClientDataJSON,
+			parsedResp.Response.Signature,
+			storedPubKey,
+		)
+		assert.True(t, result, "Should verify successfully after stripping extensions")
+	})
+
+	t.Run("verify_with_extensions_present_fails", func(t *testing.T) {
+		// Build corrupted authData (same as above)
+		fakeCBOR := []byte{
+			0xA1, 0x6B,
+			'h', 'm', 'a', 'c', '-', 's', 'e', 'c', 'r', 'e', 't',
+			0x58, 0x20,
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+			0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+			0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+			0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+		}
+		corruptedAuthData := make([]byte, len(rawAuthData)+len(fakeCBOR))
+		copy(corruptedAuthData, rawAuthData)
+		corruptedAuthData[32] |= 0x80
+		copy(corruptedAuthData[len(rawAuthData):], fakeCBOR)
+
+		// Signature should NOT verify over the corrupted authData
+		clientDataHash := sha256.Sum256(parsedResp.Raw.AssertionResponse.ClientDataJSON)
+		sigData := append(corruptedAuthData, clientDataHash[:]...) //nolint:gocritic
+		key, err := webauthncose.ParsePublicKey(storedPubKey)
+		require.NoError(t, err)
+		valid, _ := webauthncose.VerifySignature(key, sigData, parsedResp.Response.Signature)
+		assert.False(t, valid, "Signature should NOT verify with extension-appended authData")
+	})
+
+	t.Run("reject_short_authdata", func(t *testing.T) {
+		result := verifyAssertionWithoutExtensions(
+			[]byte{0x01, 0x02, 0x03},
+			parsedResp.Raw.AssertionResponse.ClientDataJSON,
+			parsedResp.Response.Signature,
+			storedPubKey,
+		)
+		assert.False(t, result, "Should reject authData shorter than 37 bytes")
+	})
+
+	t.Run("reject_empty_inputs", func(t *testing.T) {
+		corrupted := make([]byte, 38)
+		copy(corrupted, rawAuthData[:37])
+		corrupted[32] |= 0x80
+		corrupted[37] = 0xA0 // empty CBOR map
+
+		assert.False(t, verifyAssertionWithoutExtensions(corrupted, nil, parsedResp.Response.Signature, storedPubKey))
+		assert.False(t, verifyAssertionWithoutExtensions(corrupted, parsedResp.Raw.AssertionResponse.ClientDataJSON, nil, storedPubKey))
+		assert.False(t, verifyAssertionWithoutExtensions(corrupted, parsedResp.Raw.AssertionResponse.ClientDataJSON, parsedResp.Response.Signature, nil))
+	})
 }

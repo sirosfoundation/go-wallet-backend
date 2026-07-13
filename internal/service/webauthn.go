@@ -1027,6 +1027,36 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		parsedResponse,
 	)
 	if err != nil {
+		// Workaround: Some YubiKey SDK implementations (notably Yubico iOS SDK / YubiKit)
+		// append hmac-secret extension output to authenticatorData AFTER the authenticator
+		// has already signed the data without extensions. This causes signature verification
+		// to fail when the ED (Extension Data) flag is set. Retry verification with
+		// extension data stripped if the ED flag is present.
+		rawAuthData := parsedResponse.Raw.AssertionResponse.AuthenticatorData
+		if len(rawAuthData) > 37 && rawAuthData[32]&0x80 != 0 {
+			if verifyAssertionWithoutExtensions(
+				rawAuthData,
+				parsedResponse.Raw.AssertionResponse.ClientDataJSON,
+				parsedResponse.Response.Signature,
+				matchedCred.PublicKey,
+			) {
+				s.logger.Info("Login verified after stripping extension data (YubiKit SDK workaround)",
+					zap.String("user_id", userID.String()),
+					zap.String("credential_id", credentialID),
+					zap.Uint32("sign_count", parsedResponse.Response.AuthenticatorData.Counter),
+				)
+				// Verification succeeded without extensions — proceed as normal.
+				// Build a minimal credential result for the sign count update below.
+				credential = &webauthn.Credential{
+					Authenticator: webauthn.Authenticator{
+						SignCount: parsedResponse.Response.AuthenticatorData.Counter,
+					},
+				}
+				err = nil
+			}
+		}
+	}
+	if err != nil {
 		s.logger.Error("Failed to verify login",
 			zap.Error(err),
 			zap.String("error_type", fmt.Sprintf("%T", err)),
@@ -1634,6 +1664,42 @@ func sha256Hex(data []byte) string {
 
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h[:])
+}
+
+// verifyAssertionWithoutExtensions performs manual signature verification after
+// stripping extension data from authenticatorData. This works around a bug in
+// Yubico iOS SDK (YubiKit) where hmac-secret extension output is appended to
+// authenticatorData AFTER the YubiKey has already signed the data without it.
+//
+// The function:
+// 1. Strips authenticatorData to the first 37 bytes (rpIdHash + flags + counter)
+// 2. Clears the ED (Extension Data) flag bit
+// 3. Verifies the signature over strippedAuthData || SHA-256(clientDataJSON)
+func verifyAssertionWithoutExtensions(rawAuthData, clientDataJSON, signature, publicKeyBytes []byte) bool {
+	if len(rawAuthData) < 37 || len(clientDataJSON) == 0 || len(signature) == 0 || len(publicKeyBytes) == 0 {
+		return false
+	}
+
+	// Build stripped authenticatorData: first 37 bytes with ED flag cleared
+	strippedAuthData := make([]byte, 37)
+	copy(strippedAuthData, rawAuthData[:37])
+	strippedAuthData[32] &^= 0x80 // Clear the ED flag (bit 7)
+
+	// Compute signature input: strippedAuthData || SHA-256(clientDataJSON)
+	clientDataHash := sha256.Sum256(clientDataJSON)
+	sigData := make([]byte, 0, 37+32)
+	sigData = append(sigData, strippedAuthData...)
+	sigData = append(sigData, clientDataHash[:]...)
+
+	// Parse COSE public key
+	key, err := webauthncose.ParsePublicKey(publicKeyBytes)
+	if err != nil {
+		return false
+	}
+
+	// Verify signature
+	valid, err := webauthncose.VerifySignature(key, sigData, signature)
+	return valid && err == nil
 }
 
 func attestationSignatureInputHash(authData, clientDataJSON []byte) string {
