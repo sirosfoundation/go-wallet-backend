@@ -415,8 +415,15 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 			"jwk": cnfJWK,
 			"jkt": jkt,
 		},
-		"iat":                now.Unix(),
-		"exp":                now.Add(lifetime).Unix(),
+		"iat": now.Unix(),
+		"exp": now.Add(lifetime).Unix(),
+		// attestation_source: SIROS extension (WP4 CS-05 Annex C).
+		// Indicates the attestation tier:
+		//   "backend_attested"         — Tier 3: server-side attestation only
+		//   "ios_app_attest"           — Tier 4/5: Apple App Attest verified
+		//   "android_play_integrity"   — Tier 4/5: Google Play Integrity verified
+		// Third-party wallet providers may omit this claim; issuers must handle
+		// both present and absent cases (absent = unknown tier).
 		"attestation_source": attestationSource,
 	}
 
@@ -456,10 +463,18 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		// "auto" or unset: omit (same as "never" for now)
 	}
 
-	// Configurable iss claim. Default is omitted per TS03 §2.2.1 (identity
-	// derived from x5c chain), but some national profiles expect it.
-	if s.cfg.WalletProvider.WIA.Issuer != "" {
-		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
+	// iss claim: identifies the wallet provider.
+	// Per TS03 §2.2.1, identity is derived from the x5c chain. However, the IETF
+	// draft-ietf-oauth-attestation-based-client-auth §3.1 specifies iss as the
+	// wallet provider identifier. We include both: x5c for EU/EUDI compliance,
+	// iss for efficient PDP routing and non-EU interop.
+	// Falls back to WalletProviderURI if Issuer not explicitly configured.
+	issuer := s.cfg.WalletProvider.WIA.Issuer
+	if issuer == "" {
+		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
+	}
+	if issuer != "" {
+		claims["iss"] = issuer
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
