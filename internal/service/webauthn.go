@@ -1038,13 +1038,30 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		// must NOT be bypassed — they are validated by the library before the
 		// signature check and would indicate a genuine protocol violation.
 		rawAuthData := parsedResponse.Raw.AssertionResponse.AuthenticatorData
-		if isAssertionSignatureError(err) && len(rawAuthData) > 37 && rawAuthData[32]&0x80 != 0 {
-			if verifyAssertionWithoutExtensions(
+		isSigErr := isAssertionSignatureError(err)
+		hasED := len(rawAuthData) > 37 && rawAuthData[32]&0x80 != 0
+		s.logger.Debug("Extension workaround evaluation",
+			zap.Bool("is_signature_error", isSigErr),
+			zap.Bool("has_ed_flag", hasED),
+			zap.Int("auth_data_len", len(rawAuthData)),
+			zap.String("error_type", fmt.Sprintf("%T", err)),
+			zap.Error(err),
+		)
+		if isSigErr && hasED {
+			stripped := verifyAssertionWithoutExtensions(
 				rawAuthData,
 				parsedResponse.Raw.AssertionResponse.ClientDataJSON,
 				parsedResponse.Response.Signature,
 				matchedCred.PublicKey,
-			) {
+			)
+			s.logger.Debug("Extension workaround strip result",
+				zap.Bool("verify_succeeded", stripped),
+				zap.String("credential_id", credentialID),
+				zap.Uint32("sign_count", parsedResponse.Response.AuthenticatorData.Counter),
+				zap.Int("stored_public_key_len", len(matchedCred.PublicKey)),
+				zap.String("stripped_auth_data_sha256", sha256Hex(rawAuthData[:37])),
+			)
+			if stripped {
 				s.logger.Info("Login verified after stripping extension data (YubiKit SDK workaround)",
 					zap.String("user_id", userID.String()),
 					zap.String("credential_id", credentialID),
