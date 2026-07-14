@@ -27,9 +27,8 @@ var (
 
 // statusIndexCounter is a process-scoped monotonic counter for status list indices.
 // Each attestation (WIA or KA) gets a unique index. In a multi-instance deployment,
-// each instance maintains its own counter range — uniqueness across instances must
-// be ensured by configuring non-overlapping StatusListIndexOffset values or by
-// using an external allocator behind the StatusListURL endpoint.
+// each instance maintains its own counter range — uniqueness across instances is
+// achieved via the process-scoped starting offset (derived from instance startup time).
 var statusIndexCounter atomic.Uint64
 
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
