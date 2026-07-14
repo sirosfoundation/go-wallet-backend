@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // InstanceStatus represents the lifecycle state of a wallet instance.
 type InstanceStatus string
@@ -10,6 +13,31 @@ const (
 	InstanceStatusSuspended InstanceStatus = "suspended"
 	InstanceStatusRevoked   InstanceStatus = "revoked"
 )
+
+// ErrInvalidStatusTransition is returned when a status transition is not allowed.
+var ErrInvalidStatusTransition = errors.New("invalid status transition")
+
+// ValidateStatusTransition checks whether transitioning from current to target
+// is a legal state change. Revocation is terminal; suspended instances may be
+// reactivated or revoked; active instances may be suspended or revoked.
+func ValidateStatusTransition(current, target InstanceStatus) error {
+	if current == target {
+		return nil // no-op
+	}
+	switch current {
+	case InstanceStatusRevoked:
+		return ErrInvalidStatusTransition // revocation is terminal
+	case InstanceStatusSuspended:
+		if target == InstanceStatusActive || target == InstanceStatusRevoked {
+			return nil
+		}
+	case InstanceStatusActive:
+		if target == InstanceStatusSuspended || target == InstanceStatusRevoked {
+			return nil
+		}
+	}
+	return ErrInvalidStatusTransition
+}
 
 // WSCDType identifies the type of WSCD backing this wallet instance.
 type WSCDType string

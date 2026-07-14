@@ -133,8 +133,8 @@ func TestWIAGenerate_ExpiredChallenge(t *testing.T) {
 
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["error"] != "CHALLENGE_EXPIRED" {
-		t.Errorf("expected CHALLENGE_EXPIRED error, got %v", resp["error"])
+	if resp["error"] != "CHALLENGE_INVALID" {
+		t.Errorf("expected CHALLENGE_INVALID error, got %v", resp["error"])
 	}
 }
 

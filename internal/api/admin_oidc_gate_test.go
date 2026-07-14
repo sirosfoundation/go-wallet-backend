@@ -17,7 +17,7 @@ import (
 func TestCreateTenant_WithOIDCGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants", h.CreateTenant)
 
@@ -92,7 +92,7 @@ func TestCreateTenant_WithOIDCGate(t *testing.T) {
 func TestCreateTenant_OIDCGate_InvalidMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants", h.CreateTenant)
 
@@ -114,7 +114,7 @@ func TestCreateTenant_OIDCGate_InvalidMode(t *testing.T) {
 func TestCreateTenant_OIDCGate_BindIdentityLoginOnly(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants", h.CreateTenant)
 
@@ -145,7 +145,7 @@ func TestCreateTenant_OIDCGate_BindIdentityLoginOnly(t *testing.T) {
 func TestUpdateTenant_WithOIDCGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id", h.UpdateTenant)
 
@@ -187,7 +187,7 @@ func TestUpdateTenant_WithOIDCGate(t *testing.T) {
 func TestGetTenant_WithOIDCGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants", h.CreateTenant)
 	router.GET("/admin/tenants/:id", h.GetTenant)

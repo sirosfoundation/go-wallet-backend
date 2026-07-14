@@ -25,7 +25,7 @@ func seedTenant(t *testing.T, store *memory.Store, id string) {
 func TestCreateInvite_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	seedTenant(t, store, "acme")
@@ -59,7 +59,7 @@ func TestCreateInvite_Success(t *testing.T) {
 func TestCreateInvite_WithCustomCode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	seedTenant(t, store, "acme")
@@ -84,7 +84,7 @@ func TestCreateInvite_WithCustomCode(t *testing.T) {
 func TestCreateInvite_EmptyBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	seedTenant(t, store, "acme")
@@ -101,7 +101,7 @@ func TestCreateInvite_EmptyBody(t *testing.T) {
 func TestCreateInvite_TenantNotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 
@@ -117,7 +117,7 @@ func TestCreateInvite_TenantNotFound(t *testing.T) {
 func TestListInvites_Empty(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/invites", h.ListInvites)
 	seedTenant(t, store, "acme")
@@ -141,7 +141,7 @@ func TestListInvites_Empty(t *testing.T) {
 func TestListInvites_TenantNotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/invites", h.ListInvites)
 
@@ -157,7 +157,7 @@ func TestListInvites_TenantNotFound(t *testing.T) {
 func TestListInvites_WithData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.GET("/admin/tenants/:id/invites", h.ListInvites)
@@ -192,7 +192,7 @@ func TestListInvites_WithData(t *testing.T) {
 func TestGetInvite_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/invites/:invite_id", h.GetInvite)
 
@@ -208,7 +208,7 @@ func TestGetInvite_NotFound(t *testing.T) {
 func TestGetInvite_WrongTenant(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.GET("/admin/tenants/:id/invites/:invite_id", h.GetInvite)
@@ -236,7 +236,7 @@ func TestGetInvite_WrongTenant(t *testing.T) {
 func TestUpdateInvite_Revoke(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.PUT("/admin/tenants/:id/invites/:invite_id", h.UpdateInvite)
@@ -271,7 +271,7 @@ func TestUpdateInvite_Revoke(t *testing.T) {
 func TestUpdateInvite_Renew(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.PUT("/admin/tenants/:id/invites/:invite_id", h.UpdateInvite)
@@ -306,7 +306,7 @@ func TestUpdateInvite_Renew(t *testing.T) {
 func TestUpdateInvite_InvalidAction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.PUT("/admin/tenants/:id/invites/:invite_id", h.UpdateInvite)
@@ -333,7 +333,7 @@ func TestUpdateInvite_InvalidAction(t *testing.T) {
 func TestUpdateInvite_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/invites/:invite_id", h.UpdateInvite)
 
@@ -351,7 +351,7 @@ func TestUpdateInvite_NotFound(t *testing.T) {
 func TestUpdateInvite_MissingAction(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/invites/:invite_id", h.UpdateInvite)
 
@@ -369,7 +369,7 @@ func TestUpdateInvite_MissingAction(t *testing.T) {
 func TestDeleteInvite_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.DELETE("/admin/tenants/:id/invites/:invite_id", h.DeleteInvite)
@@ -396,7 +396,7 @@ func TestDeleteInvite_Success(t *testing.T) {
 func TestDeleteInvite_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/invites/:invite_id", h.DeleteInvite)
 
@@ -412,7 +412,7 @@ func TestDeleteInvite_NotFound(t *testing.T) {
 func TestDeleteInvite_WrongTenant(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/invites", h.CreateInvite)
 	router.DELETE("/admin/tenants/:id/invites/:invite_id", h.DeleteInvite)

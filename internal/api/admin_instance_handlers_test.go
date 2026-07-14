@@ -48,7 +48,7 @@ func seedInstance(t *testing.T, h *AdminHandlers, id string, tenantID domain.Ten
 func TestListWalletInstances_Empty(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/instances", h.ListWalletInstances)
 
@@ -67,7 +67,7 @@ func TestListWalletInstances_Empty(t *testing.T) {
 func TestListWalletInstances_WithData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/instances", h.ListWalletInstances)
 
@@ -94,7 +94,7 @@ func TestListWalletInstances_WithData(t *testing.T) {
 func TestGetWalletInstance_Found(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/instances/:instance_id", h.GetWalletInstance)
 
@@ -119,7 +119,7 @@ func TestGetWalletInstance_Found(t *testing.T) {
 func TestGetWalletInstance_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/instances/:instance_id", h.GetWalletInstance)
 
@@ -135,7 +135,7 @@ func TestGetWalletInstance_NotFound(t *testing.T) {
 func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -163,7 +163,7 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 func TestUpdateWalletInstanceStatus_InvalidStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -181,7 +181,7 @@ func TestUpdateWalletInstanceStatus_InvalidStatus(t *testing.T) {
 func TestUpdateWalletInstanceStatus_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -199,7 +199,7 @@ func TestUpdateWalletInstanceStatus_NotFound(t *testing.T) {
 func TestDeleteWalletInstance_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
 
@@ -227,7 +227,7 @@ func TestDeleteWalletInstance_Success(t *testing.T) {
 func TestDeleteWalletInstance_NotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
 
@@ -243,7 +243,7 @@ func TestDeleteWalletInstance_NotFound(t *testing.T) {
 func TestListWalletInstancesByUser_Empty(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
 
@@ -262,7 +262,7 @@ func TestListWalletInstancesByUser_Empty(t *testing.T) {
 func TestListWalletInstancesByUser_WithData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
 
@@ -293,7 +293,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -314,7 +314,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Suspended(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -335,7 +335,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor)
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -356,7 +356,7 @@ func TestDeleteWalletInstance_WithAudit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor, nil)
+	h := NewAdminHandlers(store, zap.NewNop(), auditor)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
 

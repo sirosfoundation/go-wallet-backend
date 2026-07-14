@@ -162,9 +162,8 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		Intermediates: intermediates,
 	})
 	if err != nil {
-		// In development environment, log warning but continue
 		if nativeCfg.AppleAppAttestEnvironment == "development" {
-			s.logger.Warn("App Attest x5c chain verification failed (development mode)", zap.Error(err))
+			s.logger.Warn("App Attest x5c chain verification failed (development mode — proceeding with reduced trust)", zap.Error(err))
 		} else {
 			return nil, fmt.Errorf("%w: x5c chain verification: %v", ErrNativeAttestationInvalid, err)
 		}
@@ -198,9 +197,8 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		}
 	}
 	if !expectedNonceFound {
-		// In development mode, log and continue
 		if nativeCfg.AppleAppAttestEnvironment == "development" {
-			s.logger.Warn("App Attest nonce mismatch (development mode)")
+			s.logger.Warn("App Attest nonce mismatch (development mode — proceeding with reduced trust)")
 		} else {
 			return nil, fmt.Errorf("%w: nonce mismatch in leaf certificate", ErrNativeAttestationInvalid)
 		}

@@ -21,7 +21,7 @@ func setupAdminTestHandlers(t *testing.T) (*AdminHandlers, *gin.Engine) {
 	t.Helper()
 	logger := zap.NewNop()
 	store := memory.NewStore()
-	handlers := NewAdminHandlers(store, logger, nil, nil)
+	handlers := NewAdminHandlers(store, logger, nil)
 
 	router := gin.New()
 	return handlers, router
@@ -31,7 +31,7 @@ func TestNewAdminHandlers(t *testing.T) {
 	logger := zap.NewNop()
 	store := memory.NewStore()
 
-	handlers := NewAdminHandlers(store, logger, nil, nil)
+	handlers := NewAdminHandlers(store, logger, nil)
 
 	if handlers == nil {
 		t.Fatal("Expected handlers to not be nil")

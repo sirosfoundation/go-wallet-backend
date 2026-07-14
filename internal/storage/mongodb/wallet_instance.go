@@ -96,6 +96,22 @@ func (s *WalletInstanceStore) GetByUser(ctx context.Context, tenantID domain.Ten
 
 func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
 	now := time.Now().UTC()
+
+	// Use a conditional filter to enforce valid state transitions atomically.
+	// Revoked instances cannot transition to any other state.
+	filter := bson.M{"_id": id}
+	switch status {
+	case domain.InstanceStatusActive:
+		// Only suspended → active is allowed (not revoked → active).
+		filter["status"] = domain.InstanceStatusSuspended
+	case domain.InstanceStatusSuspended:
+		// Only active → suspended is allowed.
+		filter["status"] = domain.InstanceStatusActive
+	case domain.InstanceStatusRevoked:
+		// active → revoked and suspended → revoked are both allowed.
+		filter["status"] = bson.M{"$in": []domain.InstanceStatus{domain.InstanceStatusActive, domain.InstanceStatusSuspended}}
+	}
+
 	update := bson.M{
 		"$set": bson.M{
 			"status":              status,
@@ -109,12 +125,17 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 		update["$unset"] = bson.M{"deactivated_at": "", "deactivation_reason": ""}
 	}
 
-	res, err := s.collection.UpdateByID(ctx, id, update)
+	res, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
 		return fmt.Errorf("%w: update wallet instance status: %v", storage.ErrDatabase, err)
 	}
 	if res.MatchedCount == 0 {
-		return storage.ErrNotFound
+		// Distinguish "not found" from "invalid transition" by checking existence.
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id})
+		if cerr != nil || count == 0 {
+			return storage.ErrNotFound
+		}
+		return domain.ErrInvalidStatusTransition
 	}
 	return nil
 }

@@ -33,6 +33,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 	} else {
 		instance.AttestationCount = 1
+		if instance.CreatedAt.IsZero() {
+			instance.CreatedAt = time.Now().UTC()
+		}
 		s.data[instance.ID] = instance
 	}
 	return nil
@@ -81,6 +84,10 @@ func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status 
 	instance, ok := s.data[id]
 	if !ok {
 		return storage.ErrNotFound
+	}
+
+	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
+		return err
 	}
 
 	instance.Status = status

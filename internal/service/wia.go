@@ -262,12 +262,14 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
 	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
 	if err := s.consumeChallenge(ctx, req.Challenge); err != nil {
+		s.emitAuditFailure("challenge_invalid", err)
 		return "", err
 	}
 
 	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
 	if err != nil {
+		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
@@ -398,7 +400,12 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	if maxExpiry <= 0 {
 		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
 	}
-	if lifetime > maxExpiry || lifetime == 0 {
+	if lifetime <= 0 {
+		lifetime = maxExpiry
+		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
+			zap.Duration("lifetime", lifetime))
+	}
+	if lifetime > maxExpiry {
 		lifetime = maxExpiry
 	}
 
@@ -592,8 +599,13 @@ func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, erro
 		return nil, fmt.Errorf("unsupported curve: %s", crv)
 	}
 
-	// Build uncompressed point encoding: 0x04 || x || y
+	// Validate coordinate lengths match the curve's field size.
 	byteLen := (curve.Params().BitSize + 7) / 8
+	if len(xBytes) > byteLen || len(yBytes) > byteLen {
+		return nil, fmt.Errorf("invalid %s coordinate length: x=%d y=%d (expected <= %d)", crv, len(xBytes), len(yBytes), byteLen)
+	}
+
+	// Build uncompressed point encoding: 0x04 || x || y
 	// Pad x and y to the correct length
 	for len(xBytes) < byteLen {
 		xBytes = append([]byte{0}, xBytes...)
@@ -628,12 +640,16 @@ func ellipticCurveForName(name string) elliptic.Curve {
 // CleanupExpiredChallenges removes expired challenges from the store.
 // For MongoDB, this is a no-op (TTL indexes handle expiry).
 // For in-memory, this evicts expired entries.
-func (s *WIAService) CleanupExpiredChallenges() {
+func (s *WIAService) CleanupExpiredChallenges() int {
 	if m, ok := s.challenges.(*memoryWIAChallengeStore); ok {
 		m.store.mu.Lock()
+		before := len(m.store.items)
 		m.store.evictExpired()
+		evicted := before - len(m.store.items)
 		m.store.mu.Unlock()
+		return evicted
 	}
+	return 0
 }
 
 // Start begins the periodic challenge cleanup goroutine.
@@ -661,10 +677,21 @@ func (s *WIAService) cleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.CleanupExpiredChallenges()
+			if n := s.CleanupExpiredChallenges(); n > 0 {
+				challengeEvictedTotal.Add(float64(n))
+			}
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// emitAuditFailure emits an audit event for a failed WIA generation attempt.
+func (s *WIAService) emitAuditFailure(reason string, err error) {
+	if s.audit != nil {
+		s.audit.EmitWithSubject(set.EventURI("urn:siros:audit:wia:issuance_failed"), reason, map[string]any{
+			"error": err.Error(),
+		})
 	}
 }
 

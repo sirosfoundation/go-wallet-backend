@@ -31,6 +31,12 @@ var (
 		Name:      "challenges_capacity_exceeded_total",
 		Help:      "Total number of challenge creation attempts rejected due to capacity.",
 	})
+	challengeEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "challenges_evicted_total",
+		Help:      "Total number of expired challenges evicted by the cleanup loop.",
+	})
 
 	// WIA generation metrics
 	wiaGeneratedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
