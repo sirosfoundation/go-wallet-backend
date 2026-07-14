@@ -9,21 +9,28 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
-	store  storage.Store
-	logger *zap.Logger
+	store      storage.Store
+	logger     *zap.Logger
+	audit      *audit.Emitter
+	r2psClient *r2ps.Client
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
-func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
+func NewAdminHandlers(store storage.Store, logger *zap.Logger, auditor *audit.Emitter, r2psClient *r2ps.Client) *AdminHandlers {
 	return &AdminHandlers{
-		store:  store,
-		logger: logger,
+		store:      store,
+		logger:     logger,
+		audit:      auditor,
+		r2psClient: r2psClient,
 	}
 }
 
@@ -327,6 +334,7 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant created", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantCreated, string(tenantID), map[string]any{"name": req.Name})
 	c.JSON(http.StatusCreated, tenantToResponse(tenant))
 }
 
@@ -385,6 +393,7 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant updated", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantUpdated, string(tenantID), nil)
 	c.JSON(http.StatusOK, tenantToResponse(tenant))
 }
 
@@ -418,6 +427,7 @@ func (h *AdminHandlers) DeleteTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant deleted", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantDeleted, string(tenantID), nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Tenant deleted"})
 }
 
@@ -471,6 +481,7 @@ func (h *AdminHandlers) AddUserToTenant(c *gin.Context) {
 		zap.String("user_id", req.UserID),
 		zap.String("role", role),
 	)
+	h.emitAudit(set.EventUserAdded, req.UserID, map[string]any{"tenant_id": string(tenantID), "role": role})
 	c.JSON(http.StatusOK, gin.H{"message": "User added to tenant"})
 }
 
@@ -490,6 +501,7 @@ func (h *AdminHandlers) RemoveUserFromTenant(c *gin.Context) {
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("user_id", userID.String()),
 	)
+	h.emitAudit(set.EventUserRemoved, userID.String(), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "User removed from tenant"})
 }
 
@@ -688,6 +700,7 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 	h.logger.Info("Issuer created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("identifier", req.CredentialIssuerIdentifier))
+	h.emitAudit(set.EventIssuerCreated, req.CredentialIssuerIdentifier, map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusCreated, issuerToResponse(issuer))
 }
 
@@ -740,6 +753,7 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 	h.logger.Info("Issuer updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
+	h.emitAudit(set.EventIssuerUpdated, fmt.Sprintf("%d", issuerID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, issuerToResponse(issuer))
 }
 
@@ -776,6 +790,7 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 	h.logger.Info("Issuer deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
+	h.emitAudit(set.EventIssuerDeleted, fmt.Sprintf("%d", issuerID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "Issuer deleted"})
 }
 
@@ -920,6 +935,7 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("name", req.Name))
+	h.emitAudit(set.EventVerifierCreated, req.Name, map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusCreated, verifierToResponse(verifier))
 }
 
@@ -986,6 +1002,7 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
+	h.emitAudit(set.EventVerifierUpdated, fmt.Sprintf("%d", verifierID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, verifierToResponse(verifier))
 }
 
@@ -1022,6 +1039,7 @@ func (h *AdminHandlers) DeleteVerifier(c *gin.Context) {
 	h.logger.Info("Verifier deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
+	h.emitAudit(set.EventVerifierDeleted, fmt.Sprintf("%d", verifierID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "Verifier deleted"})
 }
 
@@ -1061,5 +1079,37 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/invites/:invite_id", h.GetInvite)
 		tenants.PUT("/:id/invites/:invite_id", h.UpdateInvite)
 		tenants.DELETE("/:id/invites/:invite_id", h.DeleteInvite)
+
+		// Wallet instance management
+		tenants.GET("/:id/instances", h.ListWalletInstances)
+		tenants.GET("/:id/instances/:instance_id", h.GetWalletInstance)
+		tenants.PUT("/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+		tenants.DELETE("/:id/instances/:instance_id", h.DeleteWalletInstance)
+		tenants.GET("/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
+
+		// User detail
+		tenants.GET("/:id/users/:user_id/detail", h.GetUserDetail)
+
+		// Tenant statistics
+		tenants.GET("/:id/stats", h.GetTenantStats)
+	}
+
+	// R2PS WSCD proxy (only registered when R2PS client is configured)
+	if h.r2psClient != nil {
+		r2psGroup := adminGroup.Group("/r2ps")
+		{
+			r2psGroup.GET("/keys", h.R2PSListKeys)
+			r2psGroup.GET("/keys/:kid", h.R2PSGetKey)
+			r2psGroup.GET("/statuses/:category", h.R2PSListStatuses)
+			r2psGroup.GET("/status/:category/:idx", h.R2PSGetStatus)
+			r2psGroup.PUT("/status/:category/:idx", h.R2PSSetStatus)
+		}
+	}
+}
+
+// emitAudit is a nil-safe helper for emitting SET audit events.
+func (h *AdminHandlers) emitAudit(event set.EventURI, subject string, data map[string]any) {
+	if h.audit != nil {
+		h.audit.EmitWithSubject(event, subject, data)
 	}
 }

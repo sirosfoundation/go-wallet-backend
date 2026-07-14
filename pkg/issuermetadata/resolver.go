@@ -803,3 +803,14 @@ func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
 		signerKeyMaterial: result.signerKeyMaterial,
 	}
 }
+
+// ClearCache removes all cached metadata entries, forcing subsequent
+// Resolve calls to re-fetch from the issuer. This is useful in test
+// environments where the issuer's metadata changes between flows (e.g.
+// the OpenID conformance suite serves different metadata per test module
+// at the same URL).
+func (r *Resolver) ClearCache() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache = make(map[string]*cachedEntry)
+}

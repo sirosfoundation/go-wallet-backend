@@ -55,6 +55,11 @@ type OID4VCIHandler struct {
 	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 	clientKID        string            // key ID from client JWK (for JWT kid header)
 	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
+
+	// Client attestation provider for OAuth-Client-Attestation-based auth
+	// (draft-ietf-oauth-attestation-based-client-auth-04).
+	// When available, takes precedence over private_key_jwt.
+	attestationProvider ClientAttestationProvider
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -159,7 +164,9 @@ type IssuerMetadata struct {
 	CredentialEndpoint                string                      `json:"credential_endpoint"`
 	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
 	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
+	NotificationEndpoint              string                      `json:"notification_endpoint,omitempty"`
 	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
+	AuthorizationServers              []string                    `json:"authorization_servers,omitempty"`
 	Display                           []IssuerDisplay             `json:"display,omitempty"`
 	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
@@ -174,6 +181,17 @@ type IssuerMetadata struct {
 	JWKS json.RawMessage `json:"jwks,omitempty"`
 	// JWKS URI for issuer keys
 	JWKsURI string `json:"jwks_uri,omitempty"`
+}
+
+// authorizationServer returns the authorization server URL, preferring
+// authorization_servers (array, OID4VCI 1.0 Final) over authorization_server (singular, deprecated).
+func (m *IssuerMetadata) authorizationServer() string {
+	for _, s := range m.AuthorizationServers {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return m.AuthorizationServer
 }
 
 // BatchCredentialIssuance contains batch credential issuance configuration from issuer metadata.
@@ -482,10 +500,19 @@ func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string
 	return tok.SignedString(key)
 }
 
-// setClientAuth adds private_key_jwt client authentication parameters to the request data
-// if h.clientJWK is set. Always adds client_id.
+// setClientAuth adds client authentication parameters to the request form data.
+// Priority: attestation-based auth (§3.1) > private_key_jwt > client_id only.
+// When attestation is available, client_id is still set in form data (some AS require it)
+// but the actual auth is via HTTP headers set by setAttestationHeaders.
 func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_id", h.clientID)
+
+	// When attestation provider is available, form-body auth is not used;
+	// the attestation is sent via HTTP headers in setAttestationHeaders.
+	if h.attestationProvider != nil && h.attestationProvider.Available() {
+		return nil
+	}
+
 	if h.clientJWK == nil {
 		return nil
 	}
@@ -496,6 +523,16 @@ func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
 	data.Set("client_assertion", assertion)
 	return nil
+}
+
+// setAttestationHeaders sets OAuth-Client-Attestation and OAuth-Client-Attestation-PoP
+// HTTP headers on the request per draft-ietf-oauth-attestation-based-client-auth-04 §3.1.
+// No-op if attestation provider is not available.
+func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Request) error {
+	if h.attestationProvider == nil || !h.attestationProvider.Available() {
+		return nil
+	}
+	return h.attestationProvider.SetHeaders(ctx, req, h.authServerIssuer)
 }
 
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
@@ -594,9 +631,35 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Determine AS issuer URL for private_key_jwt aud claim (RFC 7523 §2.2)
-	h.authServerIssuer = metadata.AuthorizationServer
+	h.authServerIssuer = metadata.authorizationServer()
 	if h.authServerIssuer == "" {
 		h.authServerIssuer = metadata.CredentialIssuer
+	}
+
+	// Wire up client attestation provider for OAuth-Client-Attestation auth
+	// (draft-ietf-oauth-attestation-based-client-auth-04).
+	// Priority: transport-supplied WIA > private_key_jwt (already set above).
+	if msg.ClientAttestation != "" && h.dpopKey != nil {
+		// Use DPoP key as the instance key for PoP generation via PoPSigner.
+		// The transport-supplied WIA's cnf.jwk MUST match this key.
+		// Future: when WSCA manages the instance key, replace NewECDSAPoPSigner
+		// with a WSCA-backed signer that delegates to siros-wscd-manager.
+		signer := NewECDSAPoPSigner(h.dpopKey)
+		thumbprint, err := computeJWKThumbprint(signer.PublicKey())
+		if err != nil {
+			h.Logger.Error("failed to compute JWK thumbprint for attestation", zap.Error(err))
+			return err
+		}
+		h.attestationProvider = &PreSuppliedAttestation{
+			WIA:    msg.ClientAttestation,
+			Signer: signer,
+			ID:     thumbprint,
+		}
+		h.clientID = thumbprint
+		h.Logger.Info("using OAuth-Client-Attestation authentication",
+			zap.String("issuer", offer.CredentialIssuer),
+			zap.String("client_id", thumbprint),
+		)
 	}
 
 	// Step 3: Evaluate trust
@@ -720,12 +783,39 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		h.registerNotificationContext(metadata, token, deferredResp)
 		return h.Complete(results, "")
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	h.registerNotificationContext(metadata, token, credential)
 	return h.Complete(results, "")
+}
+
+// registerNotificationContext captures the ephemeral state needed to forward an
+// OID4VCI §10 notification for this credential, keyed by flow ID. It is a no-op
+// unless the issuer advertised a notification endpoint and returned a
+// notification_id. The stored context is short-lived, in-memory, and one-shot;
+// no credential data is retained.
+func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
+	if metadata == nil || token == nil || resp == nil {
+		return
+	}
+	if metadata.NotificationEndpoint == "" || resp.NotificationID == "" {
+		return
+	}
+	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
+		return
+	}
+	h.Flow.Session.notifications.put(h.Flow.ID, &notificationContext{
+		endpoint:       metadata.NotificationEndpoint,
+		accessToken:    token.AccessToken,
+		tokenType:      token.TokenType,
+		dpopKey:        h.dpopKey,
+		dpopNonce:      h.dpopNonce,
+		notificationID: resp.NotificationID,
+	})
 }
 
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
@@ -870,6 +960,66 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	if keyMaterial != nil && keyMaterial.CredentialType == "" {
 		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
 	}
+
+	// Try server-side direct evaluation first (preferred path).
+	// The backend calls go-trust PDP directly — no frontend round-trip needed.
+	// This only activates when an issuer PDP URL is configured.
+	trustEndpoint := h.Config.Trust.GetIssuerPDPURL()
+	if trustEndpoint != "" {
+		evalCtx := ctx
+		if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+			evalCtx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
+		}
+		directResult, err := h.TrustSvc.EvaluateIssuer(evalCtx, issuer, trustEndpoint, keyMaterial)
+		if err != nil {
+			h.Logger.Warn("Server-side issuer trust evaluation failed, falling back to frontend",
+				zap.Error(err))
+		} else if directResult != nil {
+			info := &TrustInfo{
+				Trusted:      directResult.Trusted,
+				Framework:    directResult.Framework,
+				Reason:       directResult.Reason,
+				Certificates: directResult.Certificates,
+			}
+
+			h.Logger.Info("Server-side issuer trust evaluation",
+				zap.String("issuer", issuer),
+				zap.Bool("trusted", info.Trusted),
+				zap.String("framework", info.Framework))
+
+			// Send result to frontend/SDK as informational progress
+			_ = h.Progress(StepTrustEvaluated, map[string]interface{}{
+				"issuer_trust_evaluated": true,
+				"issuer":                 issuer,
+				"trusted":                info.Trusted,
+				"framework":              info.Framework,
+				"reason":                 info.Reason,
+				"certificates":           info.Certificates,
+			})
+
+			if !info.Trusted {
+				reason := info.Reason
+				if reason == "" {
+					reason = "issuer not trusted"
+				}
+				h.Logger.Warn("Blocking untrusted issuer",
+					zap.String("issuer", issuer),
+					zap.String("reason", reason))
+				return info, fmt.Errorf("untrusted issuer %s: %s", issuer, reason)
+			}
+			return info, nil
+		}
+	}
+
+	// Fallback: frontend-mediated trust evaluation (legacy path).
+	// Used when no issuer PDP is configured or server-side evaluation failed.
+	return h.evaluateTrustViaFrontend(ctx, issuer, metadata, metadataValidated, keyMaterial)
+}
+
+// evaluateTrustViaFrontend delegates trust evaluation to the frontend/SDK.
+// This is the legacy path: the engine sends a trust_evaluation_required progress,
+// the frontend calls /v1/evaluate, and sends back a trust_result action.
+func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 
 	// Check if issuer is a DID - requires resolution via /v1/resolve
 	requiresResolution := strings.HasPrefix(issuer, "did:")
@@ -1254,10 +1404,13 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
 // Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
 func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
-	authServer := metadata.AuthorizationServer
+	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
+
+	// RFC 8414 §2: the issuer identifier MUST NOT include a trailing '/'
+	authServer = strings.TrimRight(authServer, "/")
 
 	// RFC 8615 well-known URI construction for OAuth AS metadata
 	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
@@ -1287,7 +1440,7 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 }
 
 func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
-	authServer := metadata.AuthorizationServer
+	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
@@ -1468,6 +1621,9 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		return "", fmt.Errorf("failed to create PAR request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if err := h.setAttestationHeaders(ctx, req); err != nil {
+		return "", fmt.Errorf("failed to set attestation headers: %w", err)
+	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
@@ -1523,6 +1679,9 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setAttestationHeaders(ctx, req); err != nil {
+			return nil, err
+		}
 		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
 			return nil, err
 		}
@@ -1926,54 +2085,46 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
 	}
 
-	if resp.Credential != nil {
-		credStr := ""
-		switch v := resp.Credential.(type) {
-		case string:
-			credStr = v
-		case map[string]interface{}:
-			if innerCred, ok := v["credential"].(string); ok {
-				credStr = innerCred
-			} else {
-				bytes, _ := json.Marshal(v)
-				credStr = string(bytes)
-			}
-		default:
-			bytes, _ := json.Marshal(v)
-			credStr = string(bytes)
-		}
+	// appendResult builds a CredentialResult for a single credential value
+	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
+	// §8.3/§11 there is a single notification_id per Credential Response, so the
+	// same resp.NotificationID applies to every credential in the response.
+	appendResult := func(cred interface{}) {
 		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
+			Format:         config.Format,
+			Credential:     credentialToString(cred),
+			VCT:            config.VCT,
+			TypeMetadata:   typeMetadata,
+			NotificationID: resp.NotificationID,
 		})
 	}
 
+	if resp.Credential != nil {
+		appendResult(resp.Credential)
+	}
 	for _, cred := range resp.Credentials {
-		credStr := ""
-		switch v := cred.(type) {
-		case string:
-			credStr = v
-		case map[string]interface{}:
-			if innerCred, ok := v["credential"].(string); ok {
-				credStr = innerCred
-			} else {
-				bytes, _ := json.Marshal(v)
-				credStr = string(bytes)
-			}
-		default:
-			bytes, _ := json.Marshal(v)
-			credStr = string(bytes)
-		}
-
-		results = append(results, CredentialResult{
-			Format:       config.Format,
-			Credential:   credStr,
-			VCT:          config.VCT,
-			TypeMetadata: typeMetadata,
-		})
+		appendResult(cred)
 	}
 
 	return results
+}
+
+// credentialToString normalizes an issuer-returned credential value into the
+// string form carried to the client. The value may be a raw string, a wrapped
+// object containing a "credential" string, or some other JSON value (which is
+// re-serialized as a fallback).
+func credentialToString(cred interface{}) string {
+	switch v := cred.(type) {
+	case string:
+		return v
+	case map[string]interface{}:
+		if innerCred, ok := v["credential"].(string); ok {
+			return innerCred
+		}
+		b, _ := json.Marshal(v)
+		return string(b)
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
 }

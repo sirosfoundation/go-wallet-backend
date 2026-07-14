@@ -6,6 +6,16 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'Git ref to build (branch, tag, or SHA)'
+        required: false
+        default: 'main'
+      image_tag:
+        description: 'Custom image tag (leave empty for standard policy)'
+        required: false
+        default: ''
 
 jobs:
   server:
@@ -17,6 +27,8 @@ jobs:
     with:
       image-name: sirosfoundation/go-wallet-backend
       dockerfile: ./Dockerfile
+      custom-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || '' }}
+      custom-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}
 
   registry:
     uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
@@ -27,6 +39,8 @@ jobs:
     with:
       image-name: sirosfoundation/go-wallet-registry
       dockerfile: ./Dockerfile.registry
+      custom-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || '' }}
+      custom-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}
 
   wallet-admin:
     uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
@@ -37,3 +51,5 @@ jobs:
     with:
       image-name: sirosfoundation/go-wallet-admin
       dockerfile: ./Dockerfile.wallet-admin
+      custom-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || '' }}
+      custom-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}

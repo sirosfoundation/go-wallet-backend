@@ -30,6 +30,11 @@ const (
 	TypeFlowAction    MessageType = "flow_action"
 	TypeSignResponse  MessageType = "sign_response"
 	TypeMatchResponse MessageType = "match_response"
+	// TypeCredentialNotification carries an OID4VCI §10 credential lifecycle
+	// event reported by the client for forwarding to the issuer. The client
+	// supplies the notification_id (obtained at issuance); the backend supplies
+	// the issuer endpoint and access token from ephemeral flow state.
+	TypeCredentialNotification MessageType = "credential_notification"
 
 	// Server → Client
 	TypeHandshakeComplete MessageType = "handshake_complete"
@@ -40,6 +45,7 @@ const (
 	TypeMatchRequest      MessageType = "match_request"
 	TypePush              MessageType = "push"
 	TypeError             MessageType = "error"
+	TypeNotificationAck   MessageType = "notification_ack"
 )
 
 // FlowStep identifies the current step in a flow
@@ -182,6 +188,14 @@ type FlowStartMessage struct {
 	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
 	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
 
+	// Client attestation for wallet-to-issuer authentication (transport-supplied).
+	// When present, the engine uses this WIA JWT for OAuth client authentication
+	// at the issuer's PAR/token endpoint per draft-ietf-oauth-attestation-based-client-auth.
+	// The client (frontend/SDK/WMP) obtains this via /wallet-provider/wia/generate.
+	// This is one of two paths for supplying attestation — the other is an injected
+	// ClientAttestationProvider on the handler (for server-side generation).
+	ClientAttestation string `json:"client_attestation,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -220,6 +234,37 @@ type FlowCompleteMessage struct {
 	TypeMetadata                      json.RawMessage    `json:"type_metadata,omitempty"`
 	CredentialIssuer                  string             `json:"credential_issuer,omitempty"`
 	SelectedCredentialConfigurationID string             `json:"selected_credential_configuration_id,omitempty"`
+}
+
+// CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
+// event from the client to the backend, which forwards it to the issuer's
+// notification endpoint. The client supplies notification_id (obtained at
+// issuance) and the event; the backend supplies the issuer endpoint and access
+// token from ephemeral, in-memory flow state. The backend never stores the
+// credential itself.
+type CredentialNotificationMessage struct {
+	Message
+	// NotificationID is the identifier the issuer returned at issuance time.
+	NotificationID string `json:"notification_id"`
+	// Event is one of credential_accepted or credential_failure. The
+	// credential_deleted event is not supported because it occurs after the
+	// issuance access token has expired and can no longer be authenticated.
+	Event string `json:"event"`
+	// EventDescription is an optional human-readable description.
+	EventDescription string `json:"event_description,omitempty"`
+}
+
+// NotificationAckMessage acknowledges that a credential_notification was
+// processed (forwarded to the issuer or rejected). It is informational; the
+// client is not required to act on it.
+type NotificationAckMessage struct {
+	Message
+	NotificationID string `json:"notification_id,omitempty"`
+	// Status is "forwarded" when the notification reached the issuer, or
+	// "rejected" when the backend declined to forward it.
+	Status string `json:"status"`
+	// Error contains a short reason when Status is "rejected".
+	Error string `json:"error,omitempty"`
 }
 
 // FlowErrorMessage indicates a flow error
@@ -329,6 +374,11 @@ type CredentialResult struct {
 	Credential   string          `json:"credential"`
 	VCT          string          `json:"vct,omitempty"`
 	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
+	// NotificationID is the OID4VCI §10 notification identifier returned by the
+	// issuer for this credential, if any. The client persists it (client-side,
+	// encrypted) and echoes it back in a credential_notification message when a
+	// lifecycle event occurs.
+	NotificationID string `json:"notification_id,omitempty"`
 }
 
 // TrustInfo contains trust evaluation results.
@@ -380,7 +430,7 @@ type MatchedCredential struct {
 type ConsentSelection struct {
 	CredentialQueryID string   `json:"credential_query_id,omitempty"`
 	CredentialID      string   `json:"credential_id"`
-	DisclosedClaims   []string `json:"disclosed_claims"`
+	DisclosedClaims   []string `json:"disclosed_claims,omitempty"`
 }
 
 // SubjectType constants for trust evaluation

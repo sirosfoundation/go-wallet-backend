@@ -23,15 +23,16 @@ type Store struct {
 	database *mongo.Database
 	cfg      *config.MongoDBConfig
 
-	users         *UserStore
-	tenants       *TenantStore
-	userTenants   *UserTenantStore
-	credentials   *CredentialStore
-	presentations *PresentationStore
-	challenges    *ChallengeStore
-	issuers       *IssuerStore
-	verifiers     *VerifierStore
-	invites       *InviteStore
+	users           *UserStore
+	tenants         *TenantStore
+	userTenants     *UserTenantStore
+	credentials     *CredentialStore
+	presentations   *PresentationStore
+	challenges      *ChallengeStore
+	issuers         *IssuerStore
+	verifiers       *VerifierStore
+	invites         *InviteStore
+	walletInstances *WalletInstanceStore
 }
 
 // NewStore creates a new MongoDB store
@@ -92,6 +93,7 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.issuers = &IssuerStore{collection: database.Collection("issuers"), counter: counters}
 	s.verifiers = &VerifierStore{collection: database.Collection("verifiers"), counter: counters}
 	s.invites = &InviteStore{collection: database.Collection("invites")}
+	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -201,6 +203,15 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create invite indexes: %w", err)
 	}
 
+	// Wallet instances collection indexes
+	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -230,15 +241,20 @@ func (s *Store) initializeDefaultTenant(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Users() storage.UserStore                 { return s.users }
-func (s *Store) Tenants() storage.TenantStore             { return s.tenants }
-func (s *Store) UserTenants() storage.UserTenantStore     { return s.userTenants }
-func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
-func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
-func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
-func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
-func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
-func (s *Store) Invites() storage.InviteStore             { return s.invites }
+func (s *Store) Users() storage.UserStore                     { return s.users }
+func (s *Store) Tenants() storage.TenantStore                 { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore         { return s.userTenants }
+func (s *Store) Credentials() storage.CredentialStore         { return s.credentials }
+func (s *Store) Presentations() storage.PresentationStore     { return s.presentations }
+func (s *Store) Challenges() storage.ChallengeStore           { return s.challenges }
+func (s *Store) Issuers() storage.IssuerStore                 { return s.issuers }
+func (s *Store) Verifiers() storage.VerifierStore             { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore                 { return s.invites }
+func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
+
+// Database returns the underlying MongoDB database for creating additional
+// collections (e.g., WIA challenge store with TTL indexes).
+func (s *Store) Database() *mongo.Database { return s.database }
 
 func (s *Store) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

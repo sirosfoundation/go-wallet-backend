@@ -630,11 +630,11 @@ func (h *Handlers) GetCertificate(c *gin.Context) {
 }
 
 // SecurityPropertiesRequest carries WSCD security metadata from native SDKs.
-// When provided, these values are included in the KA JWT per CS-04 §7.1.3.
+// These become top-level KA JWT claims per Annex C §C.3.1.
 type SecurityPropertiesRequest struct {
-	KeyStorage         string   `json:"key_storage"`
-	UserAuthentication []string `json:"user_authentication"`
-	Certification      string   `json:"certification"`
+	KeyStorage         []string    `json:"key_storage"`
+	UserAuthentication []string    `json:"user_authentication"`
+	Certification      interface{} `json:"certification,omitempty"`
 }
 
 func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
@@ -653,9 +653,11 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 	var req struct {
 		JWKS       []map[string]interface{} `json:"jwks"`
 		OpenID4VCI struct {
-			Nonce string `json:"nonce"`
+			Nonce            string `json:"nonce"`
+			CredentialIssuer string `json:"credential_issuer,omitempty"`
 		} `json:"openid4vci"`
 		SecurityProperties *SecurityPropertiesRequest `json:"security_properties,omitempty"`
+		WalletInstanceID   string                     `json:"wallet_instance_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{
@@ -669,6 +671,14 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		c.JSON(400, gin.H{
 			"error":   "INVALID_JWKS",
 			"message": "'jwks' JSON body parameter is missing or not type of 'array' or array is empty",
+		})
+		return
+	}
+
+	if len(req.JWKS) > service.MaxJWKSPerRequest {
+		c.JSON(400, gin.H{
+			"error":   "INVALID_JWKS",
+			"message": fmt.Sprintf("too many JWKs: %d exceeds maximum of %d", len(req.JWKS), service.MaxJWKSPerRequest),
 		})
 		return
 	}
@@ -699,7 +709,14 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
-	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(c.Request.Context(), req.JWKS, req.OpenID4VCI.Nonce, req.SecurityProperties.toService())
+	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
+		c.Request.Context(),
+		req.JWKS,
+		req.OpenID4VCI.Nonce,
+		req.SecurityProperties.toService(),
+		req.WalletInstanceID,
+		req.OpenID4VCI.CredentialIssuer,
+	)
 	if err != nil {
 		h.logger.Error("Failed to generate key attestation", zap.Error(err))
 		c.JSON(400, gin.H{
