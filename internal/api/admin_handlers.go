@@ -11,19 +11,22 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
-	store  storage.Store
-	logger *zap.Logger
+	store      storage.Store
+	logger     *zap.Logger
+	r2psClient *r2ps.Client
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
-func NewAdminHandlers(store storage.Store, logger *zap.Logger) *AdminHandlers {
+func NewAdminHandlers(store storage.Store, logger *zap.Logger, r2psClient *r2ps.Client) *AdminHandlers {
 	return &AdminHandlers{
-		store:  store,
-		logger: logger,
+		store:      store,
+		logger:     logger,
+		r2psClient: r2psClient,
 	}
 }
 
@@ -1061,5 +1064,17 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/invites/:invite_id", h.GetInvite)
 		tenants.PUT("/:id/invites/:invite_id", h.UpdateInvite)
 		tenants.DELETE("/:id/invites/:invite_id", h.DeleteInvite)
+	}
+
+	// R2PS WSCD proxy (only registered when R2PS client is configured)
+	if h.r2psClient != nil {
+		r2psGroup := adminGroup.Group("/r2ps")
+		{
+			r2psGroup.GET("/keys", h.R2PSListKeys)
+			r2psGroup.GET("/keys/:kid", h.R2PSGetKey)
+			r2psGroup.GET("/statuses/:category", h.R2PSListStatuses)
+			r2psGroup.GET("/status/:category/:idx", h.R2PSGetStatus)
+			r2psGroup.PUT("/status/:category/:idx", h.R2PSSetStatus)
+		}
 	}
 }
