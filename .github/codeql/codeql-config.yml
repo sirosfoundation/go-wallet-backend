@@ -1,16 +1,10 @@
 name: "go-wallet-backend"
 
-# Exclude files that produce verified false-positive CodeQL alerts.
-#
-# 1. cookie_dev.go / cookie.go: intentional insecure-cookie dev helper
-#    (overrideCookieSecure clears Secure flag when InsecureCookies config is set;
-#     dev-only, never enabled in production). Alert: go/cookie-secure-not-set.
-#
-# 2. MongoDB storage files: CodeQL's go/sql-injection rule fires on BSON filter
-#    construction (e.g. bson.M{"_id.id": id.String()}). These are parameterized
-#    NoSQL queries — not string-interpolated SQL. BSON map values are always
-#    type-safe parameters; no injection path exists.
+# Exclude the intentional insecure-cookie dev helper from analysis.
+# overrideCookieSecure() in cookie_dev.go clears the Secure flag when
+# InsecureCookies config is set — this is a dev-only option that is
+# never enabled in production. Static analyzers (CodeQL, SonarCloud)
+# flag it as go/cookie-secure-not-set / go:S2092.
 paths-ignore:
   - "internal/as/cookie_dev.go"
   - "internal/as/cookie.go"
-  - "internal/storage/mongodb/**"

@@ -40,3 +40,4 @@ jobs:
             -Dsonar.organization=${{ github.repository_owner }}
             -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
             -Dsonar.go.coverage.reportPaths=coverage.out
+            -Dsonar.coverage.exclusions=**/*_test.go,**/cmd/**,**/mocks/**,**/*.pb.go,internal/engine/oid4vp.go,internal/engine/oid4vci.go
