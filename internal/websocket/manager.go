@@ -164,7 +164,9 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 		return nil
 	})
 
-	// Start ping loop
+	// Start ping loop.
+	// WriteControl is safe to call concurrently with WriteJSON per gorilla/websocket docs:
+	// "The Close and WriteControl methods can be called concurrently with all other methods."
 	stopPing := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(wsPingInterval)

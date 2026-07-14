@@ -104,4 +104,7 @@ func (s *Services) Stop() {
 	if s.TokenBlacklist != nil {
 		s.TokenBlacklist.Stop()
 	}
+	if s.WalletProvider != nil {
+		s.WalletProvider.Close()
+	}
 }

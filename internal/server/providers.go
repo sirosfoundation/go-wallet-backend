@@ -525,6 +525,9 @@ func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 
 // Close shuts down the backend provider
 func (p *BackendProvider) Close() error {
+	if p.auth != nil {
+		_ = p.auth.Close()
+	}
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
 	}

@@ -30,6 +30,7 @@ func (h *AdminHandlers) ListWalletInstances(c *gin.Context) {
 
 // GetWalletInstance returns a specific wallet instance.
 func (h *AdminHandlers) GetWalletInstance(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
 	instanceID := c.Param("instance_id")
 
 	instance, err := h.store.WalletInstances().GetByID(c.Request.Context(), instanceID)
@@ -42,6 +43,11 @@ func (h *AdminHandlers) GetWalletInstance(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get wallet instance"})
 		return
 	}
+	// Enforce tenant ownership — prevent cross-tenant access
+	if instance.TenantID != tenantID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+		return
+	}
 	c.JSON(http.StatusOK, instance)
 }
 
@@ -52,11 +58,28 @@ type updateInstanceStatusRequest struct {
 
 // UpdateWalletInstanceStatus changes the lifecycle state of a wallet instance.
 func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
 	instanceID := c.Param("instance_id")
 
 	var req updateInstanceStatusRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: status must be active, suspended, or revoked"})
+		return
+	}
+
+	// Verify tenant ownership before allowing status change
+	instance, err := h.store.WalletInstances().GetByID(c.Request.Context(), instanceID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			return
+		}
+		h.logger.Error("failed to get wallet instance for tenant check", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+		return
+	}
+	if instance.TenantID != tenantID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
 		return
 	}
 
@@ -82,7 +105,24 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 
 // DeleteWalletInstance hard-deletes a wallet instance.
 func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
+	tenantID := domain.TenantID(c.Param("id"))
 	instanceID := c.Param("instance_id")
+
+	// Verify tenant ownership before allowing deletion
+	instance, err := h.store.WalletInstances().GetByID(c.Request.Context(), instanceID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			return
+		}
+		h.logger.Error("failed to get wallet instance for tenant check", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete wallet instance"})
+		return
+	}
+	if instance.TenantID != tenantID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+		return
+	}
 
 	if err := h.store.WalletInstances().Delete(c.Request.Context(), instanceID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {

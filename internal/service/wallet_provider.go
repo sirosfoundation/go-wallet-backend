@@ -185,6 +185,14 @@ func (s *WalletProviderService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
+// Close releases resources held by the service.
+// For PKCS#11 signers, this closes the token session pool.
+func (s *WalletProviderService) Close() {
+	if closer, ok := s.signer.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+}
+
 // SecurityProperties carries WSCD-reported security metadata for KA claims.
 // These become top-level KA JWT claims per Annex C §C.3.1.
 type SecurityProperties struct {
