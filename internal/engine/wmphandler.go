@@ -264,6 +264,14 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 		})
 	}
 
+	// Security mode validation: this server supports TLS only (no MLS layer).
+	// Reject requests for unsupported security modes per spec §2.1.
+	if params.Security.Mode == "mls" {
+		return wmpErrorBytes(req.ID, wmp.ErrInvalidParams, map[string]string{
+			"reason": "security mode 'mls' is not supported; use 'tls'",
+		})
+	}
+
 	// Extract bearer token from auth object.
 	var userID, tenantID string
 	if params.Auth != nil {
@@ -317,16 +325,17 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 	wmpTransport.handler = handler
 
 	session := &Session{
-		ID:        sessionID,
-		UserID:    userID,
-		TenantID:  tenantID,
-		transport: wmpTransport,
-		flows:     make(map[string]*Flow),
-		logger:    a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
-		actionCh:  make(chan *FlowActionMessage, 50),
-		signCh:    make(chan *SignResponseMessage, 20),
-		matchCh:   make(chan *MatchResponseMessage, 20),
-		closeCh:   make(chan struct{}, 1),
+		ID:            sessionID,
+		UserID:        userID,
+		TenantID:      tenantID,
+		transport:     wmpTransport,
+		flows:         make(map[string]*Flow),
+		logger:        a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
+		actionCh:      make(chan *FlowActionMessage, 50),
+		signCh:        make(chan *SignResponseMessage, 20),
+		matchCh:       make(chan *MatchResponseMessage, 20),
+		closeCh:       make(chan struct{}, 1),
+		notifications: newNotificationContextStore(),
 	}
 
 	// Store handler's session reference (needed for FlowStart/FlowAction).
@@ -940,6 +949,39 @@ func (h *wmpEngineHandler) FlowComplete(_ context.Context, params *wmp.FlowCompl
 				zap.String("child_flow_id", params.FlowID))
 		}
 	}
+}
+
+// CapabilityList returns the negotiated capabilities for this session.
+func (h *wmpEngineHandler) CapabilityList(_ context.Context, _ *wmp.CapabilityListParams) (*wmp.CapabilityListResult, error) {
+	h.adapter.mu.RLock()
+	ws, ok := h.adapter.peers[h.sessionID]
+	h.adapter.mu.RUnlock()
+	if !ok {
+		return nil, wmp.NewRPCError(wmp.ErrSessionNotFound, nil)
+	}
+	return &wmp.CapabilityListResult{
+		WMP: wmp.Metadata{
+			Version:   wmp.Version,
+			SessionID: h.sessionID,
+		},
+		Capabilities: ws.capabilities,
+		Security:     ws.security,
+	}, nil
+}
+
+// CredentialNotification handles wmp.credential.notification from the client.
+// It routes the OID4VCI §10 credential lifecycle event to the engine's
+// notification forwarding logic (same path as WebSocket credential_notification).
+func (h *wmpEngineHandler) CredentialNotification(_ context.Context, params *wmp.CredentialNotificationParams) {
+	msg := &CredentialNotificationMessage{
+		Message: Message{
+			Type:   TypeCredentialNotification,
+			FlowID: params.FlowID,
+		},
+		NotificationID: params.NotificationID,
+		Event:          params.Event,
+	}
+	h.adapter.manager.dispatchCredentialNotification(h.session, msg)
 }
 
 // ---------------------------------------------------------------------------

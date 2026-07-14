@@ -32,7 +32,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.1.0
-	github.com/sirosfoundation/go-wmp v0.1.1-0.20260514120457-49b4cb2f2707
+	github.com/sirosfoundation/go-wmp v0.1.1-0.20260707085754-21f4a1060e4e
 )
 
 require (
