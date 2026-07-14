@@ -532,7 +532,7 @@ func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Re
 	if h.attestationProvider == nil || !h.attestationProvider.Available() {
 		return nil
 	}
-	return h.attestationProvider.SetHeaders(ctx, req, h.authServerIssuer)
+	return h.attestationProvider.SetHeaders(ctx, req)
 }
 
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
@@ -638,27 +638,20 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 	// Wire up client attestation provider for OAuth-Client-Attestation auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
-	// Priority: transport-supplied WIA > private_key_jwt (already set above).
-	if msg.ClientAttestation != "" && h.dpopKey != nil {
-		// Use DPoP key as the instance key for PoP generation via PoPSigner.
-		// The transport-supplied WIA's cnf.jwk MUST match this key.
-		// Future: when WSCA manages the instance key, replace NewECDSAPoPSigner
-		// with a WSCA-backed signer that delegates to siros-wscd-manager.
-		signer := NewECDSAPoPSigner(h.dpopKey)
-		thumbprint, err := computeJWKThumbprint(signer.PublicKey())
-		if err != nil {
-			h.Logger.Error("failed to compute JWK thumbprint for attestation", zap.Error(err))
-			return err
+	// Priority: transport-supplied WIA+PoP > private_key_jwt (already set above).
+	//
+	// The instance key NEVER resides on the backend. The client (frontend/SDK)
+	// holds it in passkey-PRF-encrypted private data and signs the PoP locally.
+	// The backend simply forwards the client-supplied WIA + PoP as HTTP headers.
+	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
+		h.attestationProvider = &TransportSuppliedAttestation{
+			WIA: msg.ClientAttestation,
+			PoP: msg.ClientAttestationPoP,
+			ID:  h.clientID,
 		}
-		h.attestationProvider = &PreSuppliedAttestation{
-			WIA:    msg.ClientAttestation,
-			Signer: signer,
-			ID:     thumbprint,
-		}
-		h.clientID = thumbprint
-		h.Logger.Info("using OAuth-Client-Attestation authentication",
+		h.Logger.Info("using OAuth-Client-Attestation authentication (client-signed PoP)",
 			zap.String("issuer", offer.CredentialIssuer),
-			zap.String("client_id", thumbprint),
+			zap.String("client_id", h.clientID),
 		)
 	}
 
