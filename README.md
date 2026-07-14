@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/go-wallet-backend/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sirosfoundation/go-wallet-backend.svg)](https://pkg.go.dev/github.com/sirosfoundation/go-wallet-backend)
-[![Go Report Card](https://goreportcard.com/badge/github.com/sirosfoundation/go-wallet-backend)](https://goreportcard.com/report/github.com/sirosfoundation/go-wallet-backend)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/go-wallet-backend/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/go-wallet-backend)
 [![codecov](https://codecov.io/gh/sirosfoundation/go-wallet-backend/branch/main/graph/badge.svg)](https://codecov.io/gh/sirosfoundation/go-wallet-backend)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/sirosfoundation/go-wallet-backend)](https://go.dev/)
 [![GHCR](https://img.shields.io/badge/ghcr.io-sirosfoundation%2Fgo--wallet--backend-blue)](https://ghcr.io/sirosfoundation/go-wallet-backend)
