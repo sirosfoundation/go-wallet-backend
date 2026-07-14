@@ -8,6 +8,7 @@ package trust
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -337,4 +338,90 @@ func (s *Service) IsIssuerTrustEnabled() bool {
 // based on the current configuration.
 func (s *Service) IsVerifierTrustEnabled() bool {
 	return s.cfg.Trust.IsVerifierTrustEnabled()
+}
+
+// Resolver is an optional interface for evaluators that support resolution-only
+// requests (e.g., DID document resolution) without key validation.
+type Resolver interface {
+	Resolve(ctx context.Context, subjectID string) (*EvaluationResponse, error)
+}
+
+// ResolveDID resolves a DID via the verifier trust endpoint and returns the
+// verification method JWKs from the resolved DID Document.
+// Returns an error if no evaluator is configured, the evaluator doesn't support
+// resolution, or the DID cannot be resolved.
+func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint string) ([]interface{}, error) {
+	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
+	eval, err := s.GetEvaluator(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trust evaluator: %w", err)
+	}
+	if eval == nil {
+		return nil, fmt.Errorf("no trust evaluator configured for DID resolution")
+	}
+
+	resolver, ok := eval.(Resolver)
+	if !ok {
+		return nil, fmt.Errorf("trust evaluator does not support DID resolution")
+	}
+
+	resp, err := resolver.Resolve(ctx, did)
+	if err != nil {
+		return nil, fmt.Errorf("DID resolution failed: %w", err)
+	}
+
+	if !resp.Decision {
+		return nil, fmt.Errorf("DID resolution denied: %s", resp.Reason)
+	}
+
+	return extractKeysFromTrustMetadata(resp.TrustMetadata), nil
+}
+
+// extractKeysFromTrustMetadata extracts JWK keys from a DID Document returned
+// as trust_metadata in an AuthZEN response.
+func extractKeysFromTrustMetadata(metadata interface{}) []interface{} {
+	if metadata == nil {
+		return nil
+	}
+
+	doc, ok := metadata.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// DID Document verification methods are under "verificationMethod"
+	vmRaw, ok := doc["verificationMethod"]
+	if !ok {
+		return nil
+	}
+
+	vms, ok := vmRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var keys []interface{}
+	for _, vm := range vms {
+		vmMap, ok := vm.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if jwk, ok := vmMap["publicKeyJwk"].(map[string]interface{}); ok {
+			// Copy kid from verification method id if not set on the JWK
+			if _, hasKid := jwk["kid"]; !hasKid {
+				if id, ok := vmMap["id"].(string); ok {
+					jwkCopy := make(map[string]interface{}, len(jwk)+1)
+					for k, v := range jwk {
+						jwkCopy[k] = v
+					}
+					jwkCopy["kid"] = id
+					keys = append(keys, jwkCopy)
+					continue
+				}
+			}
+			keys = append(keys, jwk)
+		}
+	}
+
+	return keys
 }
