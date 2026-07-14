@@ -189,12 +189,11 @@ type FlowStartMessage struct {
 	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
 
 	// Client attestation for wallet-to-issuer authentication (transport-supplied).
-	// When present, the engine uses this WIA JWT for OAuth client authentication
-	// at the issuer's PAR/token endpoint per draft-ietf-oauth-attestation-based-client-auth.
-	// The client (frontend/SDK/WMP) obtains this via /wallet-provider/wia/generate.
-	// This is one of two paths for supplying attestation — the other is an injected
-	// ClientAttestationProvider on the handler (for server-side generation).
-	ClientAttestation string `json:"client_attestation,omitempty"`
+	// The client (frontend/SDK/WMP) obtains the WIA via /wallet-provider/wia/generate
+	// and signs the PoP with its instance key (held in passkey-PRF-encrypted private data).
+	// The backend forwards these as HTTP headers per draft-ietf-oauth-attestation-based-client-auth §3.1.
+	ClientAttestation    string `json:"client_attestation,omitempty"`
+	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
 
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
