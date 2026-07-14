@@ -645,7 +645,11 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Future: when WSCA manages the instance key, replace NewECDSAPoPSigner
 		// with a WSCA-backed signer that delegates to siros-wscd-manager.
 		signer := NewECDSAPoPSigner(h.dpopKey)
-		thumbprint, _ := computeJWKThumbprint(signer.PublicKey())
+		thumbprint, err := computeJWKThumbprint(signer.PublicKey())
+		if err != nil {
+			h.Logger.Error("failed to compute JWK thumbprint for attestation", zap.Error(err))
+			return err
+		}
 		h.attestationProvider = &PreSuppliedAttestation{
 			WIA:    msg.ClientAttestation,
 			Signer: signer,
