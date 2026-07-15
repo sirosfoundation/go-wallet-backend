@@ -384,11 +384,11 @@ type BackendProvider struct {
 	storage          *StorageProvider
 	store            backend.Backend
 	cfg              *config.Config
+	auditor          *audit.Emitter
 	authzenHandler   *api.AuthZENProxyHandler
 	metadataResolver *issuermetadata.Resolver
 	asModule         *as.ASModule
 	tokenValidator   *tokenvalidator.Validator
-	auditor          *audit.Emitter
 	logger           *zap.Logger
 }
 
@@ -492,11 +492,11 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		storage:          storageProvider,
 		store:            store,
 		cfg:              cfg,
+		auditor:          newAuditEmitter(cfg, logger),
 		authzenHandler:   authzenHandler,
 		metadataResolver: metadataResolver,
 		asModule:         asModule,
 		tokenValidator:   tv,
-		auditor:          newAuditEmitter(cfg, logger),
 		logger:           logger,
 	}, nil
 }
