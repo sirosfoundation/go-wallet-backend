@@ -20,6 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
@@ -355,6 +356,7 @@ type BackendProvider struct {
 	storage          *StorageProvider
 	store            backend.Backend
 	cfg              *config.Config
+	auditor          *audit.Emitter
 	authzenHandler   *api.AuthZENProxyHandler
 	metadataResolver *issuermetadata.Resolver
 	asModule         *as.ASModule
@@ -462,6 +464,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		storage:          storageProvider,
 		store:            store,
 		cfg:              cfg,
+		auditor:          newAuditEmitter(cfg, logger),
 		authzenHandler:   authzenHandler,
 		metadataResolver: metadataResolver,
 		asModule:         asModule,
@@ -555,7 +558,7 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -577,8 +580,9 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store  backend.Backend
-	logger *zap.Logger
+	store   backend.Backend
+	auditor *audit.Emitter
+	logger  *zap.Logger
 }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -599,8 +603,9 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
 	return &AdminProvider{
-		store:  store,
-		logger: logger,
+		store:   store,
+		auditor: newAuditEmitter(cfg, logger),
+		logger:  logger,
 	}, nil
 }
 
@@ -630,7 +635,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -759,4 +764,19 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 		return nil
 	}
 	return nil
+}
+
+// newAuditEmitter creates a SET audit emitter from config.
+// Returns nil if audit is not enabled (audit is then a no-op).
+func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
+	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
+		return nil
+	}
+	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
+	if err != nil {
+		logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
+		return nil
+	}
+	logger.Info("SET audit emitter initialized", zap.String("issuer", cfg.Audit.Issuer))
+	return emitter
 }

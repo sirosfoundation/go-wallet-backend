@@ -141,6 +141,8 @@ github.com/sirosfoundation/g119612 v0.5.0 h1:A7P7NWhmHfS/7yewPQqI/x/7qen/raj+u78
 github.com/sirosfoundation/g119612 v0.5.0/go.mod h1:jdXmmDpNoh19SLKuNXC1STHKU9f5BPUoCYCnZ1w+DOo=
 github.com/sirosfoundation/go-cryptoutil v0.6.0 h1:NmmHCZ/3ETuHlC1X4+0ce5QB6XI+IIKv2g4pymFQIr8=
 github.com/sirosfoundation/go-cryptoutil v0.6.0/go.mod h1:6JWcg/wLtALH2x6Hofa6VYX4b6XKiMNfXAVjp4yv9CA=
+github.com/sirosfoundation/go-siros-set v0.1.0 h1:MN9AM3DXD05h+siUeMiV5Gjjte4Rx1FzbVQhGusSoZg=
+github.com/sirosfoundation/go-siros-set v0.1.0/go.mod h1:HmgBclV01wp81itz2gYpn91L8lABWwxpbE38rkR1y20=
 github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G1ihb9FCPs=
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
 github.com/sirosfoundation/go-tokenauth v0.1.0 h1:lGmDHHeAd391GAJIrE+QVYdZnGZpbYYY4SApXby5kB0=
