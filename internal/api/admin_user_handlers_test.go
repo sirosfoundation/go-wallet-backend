@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func TestGetUserDetail_Success(t *testing.T) {
 
 	// Create tenant
 	tenant := &domain.Tenant{ID: "acme", Name: "Acme Corp"}
-	if err := store.Tenants().Create(nil, tenant); err != nil {
+	if err := store.Tenants().Create(context.Background(), tenant); err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
 
@@ -48,7 +49,7 @@ func TestGetUserDetail_Success(t *testing.T) {
 		DID:        "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
 		WalletType: "web",
 	}
-	if err := store.Users().Create(nil, user); err != nil {
+	if err := store.Users().Create(context.Background(), user); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
 
@@ -58,7 +59,7 @@ func TestGetUserDetail_Success(t *testing.T) {
 		TenantID: "acme",
 		Role:     "user",
 	}
-	if err := store.UserTenants().AddMembership(nil, membership); err != nil {
+	if err := store.UserTenants().AddMembership(context.Background(), membership); err != nil {
 		t.Fatalf("add membership: %v", err)
 	}
 

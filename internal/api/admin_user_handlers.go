@@ -26,6 +26,7 @@ type UserDetailResponse struct {
 }
 
 // PasskeyInfo is the admin-visible summary of a WebAuthn credential.
+// Only non-PII fields are exposed; user-provided text (e.g. nickname) is omitted.
 type PasskeyInfo struct {
 	ID              string     `json:"id"`
 	CredentialID    string     `json:"credential_id"` // base64url
@@ -34,7 +35,6 @@ type PasskeyInfo struct {
 	Transport       []string   `json:"transport,omitempty"`
 	PRFCapable      bool       `json:"prf_capable"`
 	SignCount       uint32     `json:"sign_count"`
-	Nickname        *string    `json:"nickname,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	LastUseTime     *time.Time `json:"last_use_time,omitempty"`
 }
@@ -44,6 +44,18 @@ type PasskeyInfo struct {
 func (h *AdminHandlers) GetUserDetail(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	userID := domain.UserIDFromString(c.Param("user_id"))
+
+	// Verify tenant exists
+	_, err := h.store.Tenants().GetByID(c.Request.Context(), tenantID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "tenant not found"})
+			return
+		}
+		h.logger.Error("failed to get tenant", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get tenant"})
+		return
+	}
 
 	// Verify user is a member of this tenant
 	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
@@ -94,7 +106,6 @@ func (h *AdminHandlers) GetUserDetail(c *gin.Context) {
 			Transport:       cred.Transport,
 			PRFCapable:      cred.PRFCapable,
 			SignCount:       cred.Authenticator.SignCount,
-			Nickname:        cred.Nickname,
 			CreatedAt:       cred.CreatedAt,
 			LastUseTime:     cred.LastUseTime,
 		})
