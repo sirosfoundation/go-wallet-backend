@@ -1061,5 +1061,11 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/invites/:invite_id", h.GetInvite)
 		tenants.PUT("/:id/invites/:invite_id", h.UpdateInvite)
 		tenants.DELETE("/:id/invites/:invite_id", h.DeleteInvite)
+
+		// User detail
+		tenants.GET("/:id/users/:user_id/detail", h.GetUserDetail)
+
+		// Tenant statistics
+		tenants.GET("/:id/stats", h.GetTenantStats)
 	}
 }
