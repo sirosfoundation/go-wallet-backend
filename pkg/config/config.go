@@ -1181,8 +1181,8 @@ type AuditConfig struct {
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 	// Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org").
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
-	// KeyPath is the path to a PEM-encoded EC private key for signing SET records.
-	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
+	// PrivateKeyPath is the path to a PEM-encoded EC private key for signing SET records.
+	PrivateKeyPath string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
 	// KeyID is the kid used in SET JWS headers.
 	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
 }

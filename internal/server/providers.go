@@ -769,10 +769,14 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 // newAuditEmitter creates a SET audit emitter from config.
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
-	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
+	if !cfg.Audit.Enabled || cfg.Audit.PrivateKeyPath == "" {
 		return nil
 	}
-	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
+	if cfg.Audit.Issuer == "" {
+		logger.Error("audit enabled but issuer is empty, audit disabled")
+		return nil
+	}
+	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.PrivateKeyPath, cfg.Audit.KeyID)
 	if err != nil {
 		logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
 		return nil
