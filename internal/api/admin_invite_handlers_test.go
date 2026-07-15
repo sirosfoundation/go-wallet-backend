@@ -75,7 +75,9 @@ func TestCreateInvite_WithCustomCode(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	if resp["code"] != "MY-CUSTOM-CODE" {
 		t.Errorf("expected custom code, got %v", resp["code"])
 	}
@@ -131,8 +133,13 @@ func TestListInvites_Empty(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	invites := resp["invites"].([]interface{})
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	invites, ok := resp["invites"].([]interface{})
+	if !ok {
+		t.Fatal("invites field missing or not an array")
+	}
 	if len(invites) != 0 {
 		t.Errorf("expected 0 invites, got %d", len(invites))
 	}
@@ -182,8 +189,13 @@ func TestListInvites_WithData(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	invites := resp["invites"].([]interface{})
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	invites, ok := resp["invites"].([]interface{})
+	if !ok {
+		t.Fatal("invites field missing or not an array")
+	}
 	if len(invites) != 2 {
 		t.Errorf("expected 2 invites, got %d", len(invites))
 	}
@@ -220,7 +232,9 @@ func TestGetInvite_WrongTenant(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	// Try to get it from "other" tenant
@@ -247,7 +261,9 @@ func TestUpdateInvite_Revoke(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	// Revoke it
@@ -262,7 +278,9 @@ func TestUpdateInvite_Revoke(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	if resp["status"] != "revoked" {
 		t.Errorf("expected status revoked, got %v", resp["status"])
 	}
@@ -282,7 +300,9 @@ func TestUpdateInvite_Renew(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	// Renew with custom expiry
@@ -297,7 +317,9 @@ func TestUpdateInvite_Renew(t *testing.T) {
 	}
 
 	var resp map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	if resp["status"] != "active" {
 		t.Errorf("expected status active, got %v", resp["status"])
 	}
@@ -316,7 +338,9 @@ func TestUpdateInvite_InvalidAction(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	body := `{"action": "invalid"}`
@@ -380,7 +404,9 @@ func TestDeleteInvite_Success(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	// Delete it
@@ -424,7 +450,9 @@ func TestDeleteInvite_WrongTenant(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	var created map[string]interface{}
-	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
 	inviteID := created["id"].(string)
 
 	// Try delete from other
