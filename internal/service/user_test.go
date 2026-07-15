@@ -931,3 +931,145 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 		}
 	})
 }
+
+func TestUserService_DeactivateWebAuthnCredential(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	user, err := svc.Register(ctx, &domain.RegisterRequest{
+		DisplayName: "Deactivate User",
+		WalletType:  domain.WalletTypeClient,
+		PrivateData: []byte(`{"encrypted":"data"}`),
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	user.WebauthnCredentials = []domain.WebauthnCredential{
+		{ID: "cred-1", Status: "active"},
+		{ID: "cred-2", Status: "active"},
+	}
+	if err := svc.UpdateUser(ctx, user); err != nil {
+		t.Fatalf("UpdateUser() error = %v", err)
+	}
+
+	mock := &mockSessionCleaner{}
+	svc.SetSessionCleaner(mock)
+
+	// Seed VC/VP for cascade validation on last active deactivation.
+	vc := &domain.VerifiableCredential{
+		TenantID:             domain.DefaultTenantID,
+		HolderDID:            user.DID,
+		CredentialIdentifier: "vc-1",
+		Credential:           "{}",
+	}
+	if err := store.Credentials().Create(ctx, vc); err != nil {
+		t.Fatalf("Create credential error = %v", err)
+	}
+	vp := &domain.VerifiablePresentation{
+		TenantID:               domain.DefaultTenantID,
+		HolderDID:              user.DID,
+		PresentationIdentifier: "vp-1",
+		Presentation:           "{}",
+	}
+	if err := store.Presentations().Create(ctx, vp); err != nil {
+		t.Fatalf("Create presentation error = %v", err)
+	}
+
+	t.Run("deactivate one credential without lockout", func(t *testing.T) {
+		cred, err := svc.DeactivateWebAuthnCredential(ctx, user.UUID, "cred-1")
+		if err != nil {
+			t.Fatalf("DeactivateWebAuthnCredential() error = %v", err)
+		}
+		if cred.Status != "deactivated" || cred.DeactivatedBy != "user" {
+			t.Fatalf("Unexpected deactivation state: %+v", cred)
+		}
+
+		updated, _ := svc.GetUserByID(ctx, user.UUID)
+		if len(updated.PrivateData) == 0 {
+			t.Fatal("PrivateData should not be cleared while active credentials remain")
+		}
+		if mock.called {
+			t.Fatal("Session cleaner should not run while active credentials remain")
+		}
+	})
+
+	t.Run("deactivate last active triggers lockout cascade", func(t *testing.T) {
+		_, err := svc.DeactivateWebAuthnCredential(ctx, user.UUID, "cred-2")
+		if err != nil {
+			t.Fatalf("DeactivateWebAuthnCredential() error = %v", err)
+		}
+
+		updated, _ := svc.GetUserByID(ctx, user.UUID)
+		if len(updated.PrivateData) != 0 || updated.PrivateDataETag != "" {
+			t.Fatal("Expected PrivateData and ETag to be cleared after last credential deactivation")
+		}
+		if !mock.called {
+			t.Fatal("Expected session cleaner to be called")
+		}
+
+		creds, _ := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+		if len(creds) != 0 {
+			t.Fatalf("Expected credentials to be deleted, got %d", len(creds))
+		}
+		pres, _ := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
+		if len(pres) != 0 {
+			t.Fatalf("Expected presentations to be deleted, got %d", len(pres))
+		}
+	})
+
+	t.Run("already deactivated returns conflict error", func(t *testing.T) {
+		_, err := svc.DeactivateWebAuthnCredential(ctx, user.UUID, "cred-1")
+		if err != ErrCredentialAlreadyDeactivated {
+			t.Fatalf("Expected ErrCredentialAlreadyDeactivated, got %v", err)
+		}
+	})
+}
+
+func TestUserService_DeactivateAllWebAuthnCredentials(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	user, err := svc.Register(ctx, &domain.RegisterRequest{
+		DisplayName: "Deactivate All User",
+		WalletType:  domain.WalletTypeClient,
+		PrivateData: []byte(`{"encrypted":"data"}`),
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	user.WebauthnCredentials = []domain.WebauthnCredential{
+		{ID: "cred-1"},
+		{ID: "cred-2", Status: "deactivated"},
+	}
+	if err := svc.UpdateUser(ctx, user); err != nil {
+		t.Fatalf("UpdateUser() error = %v", err)
+	}
+
+	err = svc.DeactivateAllWebAuthnCredentials(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("DeactivateAllWebAuthnCredentials() error = %v", err)
+	}
+
+	updated, _ := svc.GetUserByID(ctx, user.UUID)
+	for _, cred := range updated.WebauthnCredentials {
+		if cred.Status != "deactivated" {
+			t.Fatalf("Expected all credentials deactivated, got status %q", cred.Status)
+		}
+	}
+	if len(updated.PrivateData) != 0 {
+		t.Fatal("Expected PrivateData to be cleared")
+	}
+
+	err = svc.DeactivateAllWebAuthnCredentials(ctx, user.UUID)
+	if err != ErrNoActiveWebAuthnCredentials {
+		t.Fatalf("Expected ErrNoActiveWebAuthnCredentials, got %v", err)
+	}
+}

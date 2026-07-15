@@ -131,6 +131,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", p.handlers.DeleteWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/deactivate", p.handlers.DeactivateWebAuthnCredential)
+			session.POST("/webauthn/deactivate-all", p.handlers.DeactivateAllWebAuthnCredentials)
 		}
 		protected.DELETE("/user/session", p.handlers.DeleteUser)
 
@@ -555,7 +557,7 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlersWithUserService(p.store, p.Services().User, p.logger)
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -577,8 +579,9 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store  backend.Backend
-	logger *zap.Logger
+	store       backend.Backend
+	userService *service.UserService
+	logger      *zap.Logger
 }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -598,9 +601,12 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
+	userSvc := service.NewUserService(store, cfg, logger)
+
 	return &AdminProvider{
-		store:  store,
-		logger: logger,
+		store:       store,
+		userService: userSvc,
+		logger:      logger,
 	}, nil
 }
 
@@ -630,7 +636,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlersWithUserService(p.store, p.userService, p.logger)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
