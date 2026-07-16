@@ -84,8 +84,11 @@ func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.sto
 func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
 func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
-func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
-func (b *memoryBackend) Close() error                             { return b.store.Close() }
+func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
+	return b.store.WalletInstances()
+}
+func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
 func newTestMemoryBackend(t *testing.T) backend.Backend {
 	t.Helper()
@@ -335,10 +338,11 @@ func (m *mockBackend) Credentials() storage.CredentialStore { return nil }
 func (m *mockBackend) Presentations() storage.PresentationStore {
 	return nil
 }
-func (m *mockBackend) Challenges() storage.ChallengeStore { return nil }
-func (m *mockBackend) Issuers() storage.IssuerStore       { return nil }
-func (m *mockBackend) Verifiers() storage.VerifierStore   { return nil }
-func (m *mockBackend) Invites() storage.InviteStore       { return nil }
+func (m *mockBackend) Challenges() storage.ChallengeStore           { return nil }
+func (m *mockBackend) Issuers() storage.IssuerStore                 { return nil }
+func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil }
+func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
+func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)

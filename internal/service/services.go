@@ -1,6 +1,9 @@
 package service
 
 import (
+	"context"
+
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -20,6 +23,7 @@ type Services struct {
 	Proxy            *ProxyService
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
+	WIA              *WIAService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	AAGUIDValidator  *AAGUIDValidator
@@ -36,6 +40,27 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
+	wpSvc := NewWalletProviderService(cfg, logger)
+
+	// WIA shares the same signing key as the wallet provider
+	var wiaSvc *WIAService
+	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
+		var challengeStore WIAChallengeStore
+		// Use MongoDB-backed challenge store if the underlying storage is MongoDB.
+		type databaseProvider interface {
+			Database() *mongo.Database
+		}
+		if dbp, ok := store.(databaseProvider); ok {
+			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges)
+			if err != nil {
+				logger.Warn("Failed to create MongoDB WIA challenge store, falling back to memory", zap.Error(err))
+			} else {
+				challengeStore = cs
+			}
+		}
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), nil, challengeStore)
+	}
+
 	return &Services{
 		User:             NewUserService(store, cfg, logger),
 		Tenant:           NewTenantService(store, logger),
@@ -47,7 +72,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Keystore:         NewKeystoreService(store, cfg, logger),
 		Proxy:            NewProxyService(cfg, logger),
 		Helper:           NewHelperService(logger),
-		WalletProvider:   NewWalletProviderService(cfg, logger),
+		WalletProvider:   wpSvc,
+		WIA:              wiaSvc,
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
@@ -62,14 +88,23 @@ func (s *Services) Start() {
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Start()
 	}
+	if s.WIA != nil {
+		s.WIA.Start()
+	}
 }
 
 // Stop gracefully stops background workers
 func (s *Services) Stop() {
+	if s.WIA != nil {
+		s.WIA.Stop()
+	}
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Stop()
 	}
 	if s.TokenBlacklist != nil {
 		s.TokenBlacklist.Stop()
+	}
+	if s.WalletProvider != nil {
+		s.WalletProvider.Close()
 	}
 }

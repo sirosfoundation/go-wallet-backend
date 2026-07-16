@@ -55,6 +55,11 @@ type OID4VCIHandler struct {
 	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 	clientKID        string            // key ID from client JWK (for JWT kid header)
 	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
+
+	// Client attestation provider for OAuth-Client-Attestation-based auth
+	// (draft-ietf-oauth-attestation-based-client-auth-04).
+	// When available, takes precedence over private_key_jwt.
+	attestationProvider ClientAttestationProvider
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -495,10 +500,19 @@ func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string
 	return tok.SignedString(key)
 }
 
-// setClientAuth adds private_key_jwt client authentication parameters to the request data
-// if h.clientJWK is set. Always adds client_id.
+// setClientAuth adds client authentication parameters to the request form data.
+// Priority: attestation-based auth (§3.1) > private_key_jwt > client_id only.
+// When attestation is available, client_id is still set in form data (some AS require it)
+// but the actual auth is via HTTP headers set by setAttestationHeaders.
 func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_id", h.clientID)
+
+	// When attestation provider is available, form-body auth is not used;
+	// the attestation is sent via HTTP headers in setAttestationHeaders.
+	if h.attestationProvider != nil && h.attestationProvider.Available() {
+		return nil
+	}
+
 	if h.clientJWK == nil {
 		return nil
 	}
@@ -509,6 +523,16 @@ func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
 	data.Set("client_assertion", assertion)
 	return nil
+}
+
+// setAttestationHeaders sets OAuth-Client-Attestation and OAuth-Client-Attestation-PoP
+// HTTP headers on the request per draft-ietf-oauth-attestation-based-client-auth-04 §3.1.
+// No-op if attestation provider is not available.
+func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Request) error {
+	if h.attestationProvider == nil || !h.attestationProvider.Available() {
+		return nil
+	}
+	return h.attestationProvider.SetHeaders(ctx, req)
 }
 
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
@@ -610,6 +634,25 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.authServerIssuer = metadata.authorizationServer()
 	if h.authServerIssuer == "" {
 		h.authServerIssuer = metadata.CredentialIssuer
+	}
+
+	// Wire up client attestation provider for OAuth-Client-Attestation auth
+	// (draft-ietf-oauth-attestation-based-client-auth-04).
+	// Priority: transport-supplied WIA+PoP > private_key_jwt (already set above).
+	//
+	// The instance key NEVER resides on the backend. The client (frontend/SDK)
+	// holds it in passkey-PRF-encrypted private data and signs the PoP locally.
+	// The backend simply forwards the client-supplied WIA + PoP as HTTP headers.
+	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
+		h.attestationProvider = &TransportSuppliedAttestation{
+			WIA: msg.ClientAttestation,
+			PoP: msg.ClientAttestationPoP,
+			ID:  h.clientID,
+		}
+		h.Logger.Info("using OAuth-Client-Attestation authentication (client-signed PoP)",
+			zap.String("issuer", offer.CredentialIssuer),
+			zap.String("client_id", h.clientID),
+		)
 	}
 
 	// Step 3: Evaluate trust
@@ -1571,6 +1614,9 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		return "", fmt.Errorf("failed to create PAR request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if err := h.setAttestationHeaders(ctx, req); err != nil {
+		return "", fmt.Errorf("failed to set attestation headers: %w", err)
+	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
@@ -1626,6 +1672,9 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setAttestationHeaders(ctx, req); err != nil {
+			return nil, err
+		}
 		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
 			return nil, err
 		}

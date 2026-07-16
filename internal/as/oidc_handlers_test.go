@@ -24,17 +24,18 @@ type mockStore struct {
 	challenges *mockChallengeStore
 }
 
-func (m *mockStore) Users() storage.UserStore                 { return nil }
-func (m *mockStore) Tenants() storage.TenantStore             { return m.tenants }
-func (m *mockStore) UserTenants() storage.UserTenantStore     { return nil }
-func (m *mockStore) Credentials() storage.CredentialStore     { return nil }
-func (m *mockStore) Presentations() storage.PresentationStore { return nil }
-func (m *mockStore) Challenges() storage.ChallengeStore       { return m.challenges }
-func (m *mockStore) Issuers() storage.IssuerStore             { return nil }
-func (m *mockStore) Verifiers() storage.VerifierStore         { return nil }
-func (m *mockStore) Invites() storage.InviteStore             { return nil }
-func (m *mockStore) Close() error                             { return nil }
-func (m *mockStore) Ping(_ context.Context) error             { return nil }
+func (m *mockStore) Users() storage.UserStore                     { return nil }
+func (m *mockStore) Tenants() storage.TenantStore                 { return m.tenants }
+func (m *mockStore) UserTenants() storage.UserTenantStore         { return nil }
+func (m *mockStore) Credentials() storage.CredentialStore         { return nil }
+func (m *mockStore) Presentations() storage.PresentationStore     { return nil }
+func (m *mockStore) Challenges() storage.ChallengeStore           { return m.challenges }
+func (m *mockStore) Issuers() storage.IssuerStore                 { return nil }
+func (m *mockStore) Verifiers() storage.VerifierStore             { return nil }
+func (m *mockStore) Invites() storage.InviteStore                 { return nil }
+func (m *mockStore) WalletInstances() storage.WalletInstanceStore { return nil }
+func (m *mockStore) Close() error                                 { return nil }
+func (m *mockStore) Ping(_ context.Context) error                 { return nil }
 
 // mockTenantStore
 type mockTenantStore struct {

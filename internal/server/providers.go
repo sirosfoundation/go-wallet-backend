@@ -20,6 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
@@ -43,6 +44,7 @@ type AuthProvider struct {
 // NewAuthProvider creates a new auth route provider
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
 	services := service.NewServices(store, cfg, logger)
+	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
 		cfg:      cfg,
@@ -59,6 +61,12 @@ func (p *AuthProvider) Name() string         { return "auth" }
 
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
+
+// Close stops background workers in the auth provider.
+func (p *AuthProvider) Close() error {
+	p.services.Stop()
+	return nil
+}
 
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
@@ -165,6 +173,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+			if p.cfg.WalletProvider.WIA.Enabled {
+				walletProvider.POST("/wia/challenge", p.handlers.WIAChallenge)
+				walletProvider.POST("/wia/generate", p.handlers.WIAGenerate)
+			}
 		}
 	}
 }
@@ -359,6 +371,7 @@ type BackendProvider struct {
 	metadataResolver *issuermetadata.Resolver
 	asModule         *as.ASModule
 	tokenValidator   *tokenvalidator.Validator
+	auditor          *audit.Emitter
 	logger           *zap.Logger
 }
 
@@ -466,6 +479,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		metadataResolver: metadataResolver,
 		asModule:         asModule,
 		tokenValidator:   tv,
+		auditor:          newAuditEmitter(cfg, logger),
 		logger:           logger,
 	}, nil
 }
@@ -510,6 +524,9 @@ func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 
 // Close shuts down the backend provider
 func (p *BackendProvider) Close() error {
+	if p.auth != nil {
+		_ = p.auth.Close()
+	}
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
 	}
@@ -555,7 +572,7 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -577,8 +594,10 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store  backend.Backend
-	logger *zap.Logger
+	store   backend.Backend
+	auditor *audit.Emitter
+	cfg     *config.Config
+	logger  *zap.Logger
 }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -599,8 +618,10 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
 	return &AdminProvider{
-		store:  store,
-		logger: logger,
+		store:   store,
+		auditor: newAuditEmitter(cfg, logger),
+		cfg:     cfg,
+		logger:  logger,
 	}, nil
 }
 
@@ -630,7 +651,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -759,4 +780,84 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 		return nil
 	}
 	return nil
+}
+
+// =============================================================================
+// Wallet Provider (Isolated) - runs wallet-provider on a separate port
+// =============================================================================
+
+// WalletProviderProvider serves only the wallet-provider endpoints
+// (key attestation + WIA) on a dedicated HTTP server for PKCS#11 operational
+// isolation. When deployed separately, this process holds the HSM session
+// while the main backend runs without PKCS#11 access.
+type WalletProviderProvider struct {
+	cfg      *config.Config
+	logger   *zap.Logger
+	store    backend.Backend
+	handlers *api.Handlers
+	services *service.Services
+}
+
+// NewWalletProviderProvider creates a new isolated wallet-provider.
+func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletProviderProvider, error) {
+	store, err := backend.New(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create backend: %w", err)
+	}
+
+	services := service.NewServices(store, cfg, logger)
+	if services.WalletProvider == nil || !services.WalletProvider.IsSupported() {
+		return nil, fmt.Errorf("wallet-provider signing keys not configured or not supported")
+	}
+	services.Start()
+
+	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
+
+	return &WalletProviderProvider{
+		cfg:      cfg,
+		logger:   logger,
+		store:    store,
+		handlers: handlers,
+		services: services,
+	}, nil
+}
+
+func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
+func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
+
+func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
+	// Wallet-provider routes with auth middleware
+	wp := router.Group("/wallet-provider")
+	wp.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	{
+		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+		if p.cfg.WalletProvider.WIA.Enabled {
+			wp.POST("/wia/challenge", p.handlers.WIAChallenge)
+			wp.POST("/wia/generate", p.handlers.WIAGenerate)
+		}
+	}
+}
+
+// Services returns the service aggregate.
+func (p *WalletProviderProvider) Services() *service.Services { return p.services }
+
+// Close releases resources.
+func (p *WalletProviderProvider) Close() error {
+	p.services.Stop()
+	return p.store.Close()
+}
+
+// newAuditEmitter creates a SET audit emitter from config.
+// Returns nil if audit is not enabled (audit is then a no-op).
+func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
+	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
+		return nil
+	}
+	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
+	if err != nil {
+		logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
+		return nil
+	}
+	logger.Info("SET audit emitter initialized", zap.String("issuer", cfg.Audit.Issuer))
+	return emitter
 }
