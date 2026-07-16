@@ -30,6 +30,7 @@ type Config struct {
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
+	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 }
 
 // ASConfig contains the new Authorization Server configuration.
@@ -1172,4 +1173,16 @@ func (c *ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// AuditConfig configures the SET (Security Event Token) audit trail emitter.
+type AuditConfig struct {
+	// Enabled enables SET audit event emission.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org").
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	// PrivateKeyPath is the path to a PEM-encoded EC private key for signing SET records.
+	PrivateKeyPath string `yaml:"private_key_path" envconfig:"PRIVATE_KEY_PATH"`
+	// KeyID is the kid used in SET JWS headers.
+	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
 }
