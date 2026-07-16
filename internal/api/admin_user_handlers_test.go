@@ -14,12 +14,34 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
+func TestGetUserDetail_TenantNotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop())
+	router := gin.New()
+	router.GET("/admin/tenants/:id/users/:user_id/detail", h.GetUserDetail)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/nonexistent/users/some-user/detail", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestGetUserDetail_NotMember(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	h := NewAdminHandlers(store, zap.NewNop())
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/detail", h.GetUserDetail)
+
+	// Create tenant but don't add user as member
+	tenant := &domain.Tenant{ID: "acme", Name: "Acme Corp"}
+	if err := store.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/acme/users/nonexistent/detail", nil)
 	w := httptest.NewRecorder()
