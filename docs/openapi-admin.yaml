@@ -798,6 +798,68 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/tenants/{tenantId}/users/{userId}/detail:
+    get:
+      tags:
+        - Users
+      summary: Get user detail
+      description: |
+        Returns extended user details including passkey information, DID, and wallet type.
+        Only non-PII fields are exposed.
+      operationId: getUserDetail
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: User detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uuid:
+                    type: string
+                  did:
+                    type: string
+                  wallet_type:
+                    type: string
+                  passkeys:
+                    type: array
+                    items:
+                      type: object
+                  created_at:
+                    type: string
+                    format: date-time
+                  updated_at:
+                    type: string
+                    format: date-time
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/stats:
+    get:
+      tags:
+        - Tenants
+      summary: Get tenant statistics
+      description: Returns aggregated statistics for a tenant. Not yet implemented.
+      operationId: getTenantStats
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '501':
+          description: Not yet implemented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
   parameters:
     tenantId:
