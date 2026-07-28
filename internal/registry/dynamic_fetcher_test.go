@@ -357,6 +357,38 @@ func TestDynamicFetcher_Fetch_InvalidJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
+func TestDynamicFetcher_Fetch_RejectsNonObjectJSON(t *testing.T) {
+	// A credential type metadata document is always a JSON object. A
+	// top-level array or scalar is syntactically valid JSON but not a
+	// sensible document — it must be rejected, not cached as a blank entry.
+	for _, body := range []string{`[1, 2, 3]`, `"just a string"`, `42`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			config := &DynamicCacheConfig{
+				Enabled:      true,
+				DefaultTTL:   1 * time.Hour,
+				MaxTTL:       24 * time.Hour,
+				MinTTL:       5 * time.Minute,
+				Timeout:      30 * time.Second,
+				AllowedHosts: []string{},
+			}
+			require.NoError(t, config.Compile())
+
+			fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
+			fetcher.client = server.Client()
+
+			_, err := fetcher.Fetch(context.Background(), server.URL, nil)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "expected a JSON object")
+		})
+	}
+}
+
 func TestParseCacheControlMaxAge(t *testing.T) {
 	tests := []struct {
 		cacheControl string

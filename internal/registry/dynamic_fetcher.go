@@ -123,9 +123,12 @@ func (f *DynamicFetcher) Fetch(ctx context.Context, vctURL string, existingEntry
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Validate JSON
-	if !json.Valid(body) {
-		return nil, fmt.Errorf("invalid JSON response")
+	// Validate JSON. A credential type metadata document is always a JSON
+	// object; json.Valid alone would also accept top-level arrays/scalars,
+	// silently caching them as an entry with blank header fields.
+	var asObject map[string]json.RawMessage
+	if err := json.Unmarshal(body, &asObject); err != nil {
+		return nil, fmt.Errorf("invalid JSON response: expected a JSON object: %w", err)
 	}
 	header := parseDocumentHeader(body)
 
