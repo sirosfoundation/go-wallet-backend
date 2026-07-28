@@ -10,10 +10,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// LoadLocalOverrides reads VCTM JSON files from the configured paths and
-// inserts them into the store with IsLocal=true. Each path may be a regular
-// file or a directory; directories are scanned for *.json files (non-recursive).
-// The "vct" field in each JSON document is used as the store key.
+// LoadLocalOverrides reads credential type metadata JSON files (VCTM or
+// MDDL) from the configured paths and inserts them into the store with
+// IsLocal=true. Each path may be a regular file or a directory; directories
+// are scanned for *.json files (non-recursive). The "vct" field (sd-jwt) or
+// "doctype" field (mso_mdoc) in each JSON document is used as the store key.
 func LoadLocalOverrides(store *Store, paths []string, logger *zap.Logger) error {
 	var loaded int
 	for _, p := range paths {
@@ -64,8 +65,9 @@ func loadPath(store *Store, p string, logger *zap.Logger) (int, error) {
 	return count, nil
 }
 
-// loadFile reads a single VCTM JSON file, extracts the "vct" field, and puts
-// it into the store as a local override.
+// loadFile reads a single credential type metadata JSON file (VCTM or
+// MDDL), extracts its identifier ("vct" or "doctype"), and puts it into the
+// store as a local override.
 func loadFile(store *Store, path string, logger *zap.Logger) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -76,24 +78,16 @@ func loadFile(store *Store, path string, logger *zap.Logger) error {
 		return fmt.Errorf("invalid JSON")
 	}
 
-	// Extract the top-level "vct" and optional display fields.
-	var header struct {
-		VCT          string `json:"vct"`
-		Name         string `json:"name"`
-		Description  string `json:"description"`
-		Organization string `json:"organization"`
-	}
-	if err := json.Unmarshal(data, &header); err != nil {
-		return fmt.Errorf("unmarshal header: %w", err)
-	}
-	if header.VCT == "" {
-		return fmt.Errorf("missing or empty \"vct\" field")
+	header := parseDocumentHeader(data)
+	id := header.identifier()
+	if id == "" {
+		return fmt.Errorf("missing or empty \"vct\"/\"doctype\" field")
 	}
 
 	entry := &VCTMEntry{
-		VCT:          header.VCT,
-		Name:         header.Name,
-		Description:  header.Description,
+		VCT:          id,
+		Name:         header.displayName(),
+		Description:  header.displayDescription(),
 		Organization: header.Organization,
 		Metadata:     json.RawMessage(data),
 		FetchedAt:    time.Now(),
@@ -101,8 +95,8 @@ func loadFile(store *Store, path string, logger *zap.Logger) error {
 	}
 
 	store.Put(entry)
-	logger.Debug("Loaded local VCTM override",
-		zap.String("vct", header.VCT),
+	logger.Debug("Loaded local credential type override",
+		zap.String("id", id),
 		zap.String("path", path))
 	return nil
 }

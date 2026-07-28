@@ -124,20 +124,26 @@ func (f *DynamicFetcher) Fetch(ctx context.Context, vctURL string, existingEntry
 	}
 
 	// Validate JSON
-	var metadata map[string]interface{}
-	if err := json.Unmarshal(body, &metadata); err != nil {
-		return nil, fmt.Errorf("invalid JSON response: %w", err)
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("invalid JSON response")
 	}
+	header := parseDocumentHeader(body)
 
 	// Calculate cache TTL
 	expiresAt := f.calculateExpiresAt(resp.Header)
 
-	// Build entry
+	// Build entry. Dynamic entries are always keyed by the URL that was
+	// fetched (not by any "vct"/"doctype" embedded in the document), since
+	// that's the same string the caller will look it up by again later.
+	name := header.displayName()
+	if name == "" {
+		name = vctURL
+	}
 	entry := &VCTMEntry{
 		VCT:          vctURL,
-		Name:         extractStringField(metadata, "name", vctURL),
-		Description:  extractStringField(metadata, "description", ""),
-		Organization: extractStringField(metadata, "organization", ""),
+		Name:         name,
+		Description:  header.displayDescription(),
+		Organization: header.Organization,
 		Metadata:     body,
 		FetchedAt:    time.Now(),
 		IsDynamic:    true,
@@ -197,16 +203,6 @@ func parseCacheControlMaxAge(cacheControl string) time.Duration {
 		}
 	}
 	return 0
-}
-
-// extractStringField extracts a string field from a map with a default value
-func extractStringField(m map[string]interface{}, key, defaultValue string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return defaultValue
 }
 
 // IsURL checks if a string looks like a URL that could be fetched
