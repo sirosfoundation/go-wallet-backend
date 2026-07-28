@@ -1360,6 +1360,55 @@ func TestFetcher_FetchFromSource_RegistryFormat_FetchesAllFormats(t *testing.T) 
 	assert.Equal(t, "PID mdoc", mdocEntry.Name)
 }
 
+func TestFetcher_FetchFromSource_RegistryFormat_FilteredNotStubbed(t *testing.T) {
+	// A credential whose document was successfully fetched but excluded by
+	// the filter must not reappear as a stub keyed by schema ID — that would
+	// reintroduce something the filter was configured to exclude.
+	vctmContent := `{"vct":"urn:eudi:pid:1","name":"PID SD-JWT"}`
+
+	docServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer docServer.Close()
+
+	registryMux := http.NewServeMux()
+	registryMux.HandleFunc("/api/v1/schemas/pid-id.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TS11SchemaMeta{
+			ID:               "pid-id",
+			Version:          "1.0.0",
+			SupportedFormats: []string{"dc+sd-jwt"},
+			SchemaURIs: []TS11SchemaURI{
+				{FormatIdentifier: "dc+sd-jwt", URI: docServer.URL + "/pid.vctm.json"},
+			},
+		})
+	})
+	registryMux.HandleFunc("/api/v1/registry.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RegistryResponse{
+			Total: 1,
+			Credentials: []RegistryListEntry{
+				{ID: "pid-id", Version: "1.0.0", SupportedFormats: []string{"dc+sd-jwt"}},
+			},
+		})
+	})
+	registryServer := httptest.NewServer(registryMux)
+	defer registryServer.Close()
+
+	config := DefaultConfig()
+	config.Filter.ExcludePatterns = []string{"^urn:eudi:pid:"}
+	require.NoError(t, config.Filter.Compile())
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: registryServer.URL + "/api/v1/registry.json", Mode: APIModeRegistry}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+
+	// Neither the real (filtered) entry nor a schema-ID-keyed stub should be present.
+	assert.Empty(t, entries, "filtered-out credential must not reappear as a stub")
+}
+
 // TestConfig_Validate_InvalidMode verifies that invalid Mode values are rejected.
 func TestConfig_Validate_InvalidMode(t *testing.T) {
 	config := DefaultConfig()

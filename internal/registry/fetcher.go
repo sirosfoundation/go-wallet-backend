@@ -561,10 +561,17 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 				for _, su := range schema.SchemaURIs {
 					entry, fetchErr := f.fetchSchemaDocument(ctx, schema, su.URI)
 					if fetchErr != nil {
+						errorCount++
 						f.logger.Debug("failed to fetch schema document from detail",
 							zap.String("id", cred.ID), zap.String("format", su.FormatIdentifier), zap.Error(fetchErr))
 						continue
 					}
+					// The document was fetched successfully — this credential
+					// has real TS11 detail, whether or not the filter admits
+					// it. Set fetchedAny before the filter check so a
+					// filtered-out credential doesn't fall through to the
+					// stub fallback below and reappear keyed by schema ID.
+					fetchedAny = true
 					if !f.config.Filter.Matches(entry.VCT) {
 						filteredCount++
 						continue
@@ -572,7 +579,6 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 					entries[entry.VCT] = entry
 					fetchedCount++
 					detailCount++
-					fetchedAny = true
 				}
 			}
 		}
@@ -580,10 +586,10 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 			continue
 		}
 
-		// Detail not available (non-TS11) or every format's fetch failed.
-		// Create a stub entry with the metadata we have from the registry list.
-		// Use the schema ID as a placeholder identifier (the real vct/doctype
-		// is unknown without the document).
+		// No TS11 detail available (non-TS11 entry) or every format's fetch
+		// failed outright. Create a stub entry with the metadata we have
+		// from the registry list. Use the schema ID as a placeholder
+		// identifier (the real vct/doctype is unknown without the document).
 		vct := cred.ID
 		if !f.config.Filter.Matches(vct) {
 			filteredCount++
