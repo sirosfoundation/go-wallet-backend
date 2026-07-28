@@ -175,6 +175,47 @@ func TestDynamicFetcher_Fetch_Success(t *testing.T) {
 	assert.False(t, entry.ExpiresAt.IsZero())
 }
 
+func TestDynamicFetcher_Fetch_MDocDocument(t *testing.T) {
+	// An MDDL (mso_mdoc) document has no top-level name/description at all —
+	// they live under display[]. The entry is still keyed by the fetch URL,
+	// matching sd-jwt dynamic-fetch behavior, but Name/Description must come
+	// from display[0] rather than being left blank.
+	mddlJSON := []byte(`{
+		"format": "mso_mdoc",
+		"doctype": "org.iso.18013.5.1.mDL",
+		"display": [{"locale": "en-US", "name": "mDL", "description": "Mobile Driving Licence"}]
+	}`)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(mddlJSON)
+	}))
+	defer server.Close()
+
+	config := &DynamicCacheConfig{
+		Enabled:      true,
+		DefaultTTL:   1 * time.Hour,
+		MaxTTL:       24 * time.Hour,
+		MinTTL:       5 * time.Minute,
+		Timeout:      30 * time.Second,
+		AllowedHosts: []string{},
+	}
+	require.NoError(t, config.Compile())
+
+	fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
+	fetcher.client = server.Client()
+
+	result, err := fetcher.Fetch(context.Background(), server.URL, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	entry := result.Entry
+	require.NotNil(t, entry)
+	assert.Equal(t, server.URL, entry.VCT, "dynamic entries are keyed by the fetch URL, not the doctype")
+	assert.Equal(t, "mDL", entry.Name)
+	assert.Equal(t, "Mobile Driving Licence", entry.Description)
+}
+
 func TestDynamicFetcher_Fetch_304NotModified(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check for conditional request headers
@@ -316,6 +357,38 @@ func TestDynamicFetcher_Fetch_InvalidJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
+func TestDynamicFetcher_Fetch_RejectsNonObjectJSON(t *testing.T) {
+	// A credential type metadata document is always a JSON object. A
+	// top-level array or scalar is syntactically valid JSON but not a
+	// sensible document — it must be rejected, not cached as a blank entry.
+	for _, body := range []string{`[1, 2, 3]`, `"just a string"`, `42`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			config := &DynamicCacheConfig{
+				Enabled:      true,
+				DefaultTTL:   1 * time.Hour,
+				MaxTTL:       24 * time.Hour,
+				MinTTL:       5 * time.Minute,
+				Timeout:      30 * time.Second,
+				AllowedHosts: []string{},
+			}
+			require.NoError(t, config.Compile())
+
+			fetcher := NewDynamicFetcher(config, testDynamicLogger(), nil)
+			fetcher.client = server.Client()
+
+			_, err := fetcher.Fetch(context.Background(), server.URL, nil)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "expected a JSON object")
+		})
+	}
+}
+
 func TestParseCacheControlMaxAge(t *testing.T) {
 	tests := []struct {
 		cacheControl string
@@ -436,17 +509,4 @@ func TestVCTMEntry_IsExpired(t *testing.T) {
 		}
 		assert.False(t, entry.IsExpired())
 	})
-}
-
-func TestExtractStringField(t *testing.T) {
-	m := map[string]interface{}{
-		"name":   "Test Name",
-		"count":  42,
-		"active": true,
-	}
-
-	assert.Equal(t, "Test Name", extractStringField(m, "name", "default"))
-	assert.Equal(t, "default", extractStringField(m, "missing", "default"))
-	assert.Equal(t, "default", extractStringField(m, "count", "default"))  // Non-string
-	assert.Equal(t, "default", extractStringField(m, "active", "default")) // Non-string
 }
