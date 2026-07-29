@@ -531,6 +531,43 @@ func TestNewWalletProviderService_FileKeys(t *testing.T) {
 	}
 }
 
+// TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys is a
+// regression test: when PKCS#11 is configured but fails to load (here,
+// because the test binary isn't built with -tags pkcs11, so
+// signing.LoadKeyMaterial always errors), the service must still fall back
+// to a configured file-based key instead of ending up unsupported. Before
+// this fix, the if/else-if structure meant the file-key branch was never
+// even attempted once the PKCS#11 branch was entered.
+func TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.PKCS11 = &config.PKCS11SigningConfig{
+		ModulePath: "/nonexistent/pkcs11.so", // fails to load regardless of build tags
+	}
+
+	svc := NewWalletProviderService(cfg, zap.NewNop())
+	if !svc.IsSupported() {
+		t.Error("service should fall back to file-based keys when PKCS#11 fails to load")
+	}
+}
+
 func TestNewWalletProviderService_NoKeys(t *testing.T) {
 	cfg := &config.Config{}
 	svc := NewWalletProviderService(cfg, zap.NewNop())

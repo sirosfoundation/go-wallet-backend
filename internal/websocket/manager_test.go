@@ -147,6 +147,57 @@ func TestManager_WebSocketInvalidToken(t *testing.T) {
 	assert.Equal(t, "auth_failed", response.MessageID)
 }
 
+// TestManager_ConnectionLimit_CountsUnhandshakedConnections is a regression
+// test: an upgraded connection that never sends a handshake must still count
+// against the connection limit. Before this fix, the limit only counted
+// len(m.clients), which is populated post-handshake — letting an attacker
+// open unlimited unauthenticated connections without ever being counted.
+func TestManager_ConnectionLimit_CountsUnhandshakedConnections(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer func() { _ = ws.Close() }()
+
+	// Never send a handshake message. Give the server a moment to register
+	// the upgraded connection.
+	require.Eventually(t, func() bool {
+		return m.activeConnections.Load() == 1
+	}, time.Second, 10*time.Millisecond, "unhandshaked connection was not counted")
+
+	// The old (buggy) check would have seen this as zero load.
+	assert.Empty(t, m.clients, "connection never handshaked, so it must not appear in clients")
+
+	require.NoError(t, ws.Close())
+	require.Eventually(t, func() bool {
+		return m.activeConnections.Load() == 0
+	}, time.Second, 10*time.Millisecond, "connection count did not decrement after close")
+}
+
+// TestManager_ConnectionLimit_RejectsAtCapacity is a regression test: once
+// activeConnections is at capacity, new connection attempts are rejected with
+// 503 even if m.clients is empty (i.e. even if nobody has handshaked yet).
+func TestManager_ConnectionLimit_RejectsAtCapacity(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.activeConnections.Store(maxConnections)
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Empty(t, m.clients, "rejection must not depend on clients being non-empty")
+}
+
 func TestSignatureAction_Constants(t *testing.T) {
 	assert.Equal(t, SignatureAction("generateOpenid4vciProof"), ActionGenerateOpenid4vciProof)
 	assert.Equal(t, SignatureAction("signJwtPresentation"), ActionSignJwtPresentation)

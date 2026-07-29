@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -40,7 +41,7 @@ func seedInstance(t *testing.T, h *AdminHandlers, id string, tenantID domain.Ten
 		UserID:   userID,
 		Status:   domain.InstanceStatusActive,
 	}
-	if err := h.store.WalletInstances().Upsert(nil, inst); err != nil {
+	if err := h.store.WalletInstances().Upsert(context.Background(), inst); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 }

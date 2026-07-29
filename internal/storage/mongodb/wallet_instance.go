@@ -114,6 +114,11 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 	case domain.InstanceStatusRevoked:
 		// active → revoked and suspended → revoked are both allowed.
 		filter["status"] = bson.M{"$in": []domain.InstanceStatus{domain.InstanceStatusActive, domain.InstanceStatusSuspended}}
+	default:
+		// Reject anything other than the three known statuses — otherwise the
+		// filter above stays unconstrained ({_id: id} only) and this would
+		// write an arbitrary status with no transition check at all.
+		return fmt.Errorf("%w: unknown wallet instance status %q", domain.ErrInvalidStatusTransition, status)
 	}
 
 	update := bson.M{

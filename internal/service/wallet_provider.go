@@ -72,7 +72,14 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletPro
 		logger: logger.Named("wallet-provider-service"),
 	}
 
-	// Try PKCS#11 first, then fall back to file-based key loading
+	// Try PKCS#11 first, then fall back to file-based key loading if PKCS#11
+	// wasn't configured OR failed to load. These are deliberately independent
+	// checks (not if/else-if) — an else-if would mean a configured file-key
+	// fallback is never even attempted when PKCS#11 is configured but fails
+	// at runtime (HSM unreachable, wrong PIN, built without -tags pkcs11),
+	// leaving the service with no signing key at all instead of the working
+	// fallback the operator configured.
+	pkcs11Loaded := false
 	if cfg.WalletProvider.PKCS11 != nil && cfg.WalletProvider.PKCS11.ModulePath != "" {
 		keyCfg := &signing.KeyConfig{
 			CertificatePath: cfg.WalletProvider.CertificatePath,
@@ -103,9 +110,11 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletPro
 			} else {
 				svc.jwtSigner = jwtSigner
 				svc.logger.Info("Loaded wallet provider keys from PKCS#11")
+				pkcs11Loaded = true
 			}
 		}
-	} else if cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
+	}
+	if !pkcs11Loaded && cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
 		if err := svc.loadKeys(); err != nil {
 			svc.logger.Warn("Failed to load wallet provider keys", zap.Error(err))
 		}

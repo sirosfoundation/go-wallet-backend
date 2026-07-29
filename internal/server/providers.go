@@ -814,6 +814,7 @@ type WalletProviderProvider struct {
 	handlers       *api.Handlers
 	services       *service.Services
 	wiaRateLimiter *middleware.AuthRateLimiter
+	tokenValidator *tokenvalidator.Validator
 }
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
@@ -831,6 +832,29 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
+	// Build a go-tokenauth validator when AS is enabled, matching the
+	// co-hosted AuthProvider path (see authMiddleware()). Without this,
+	// isolated wallet-provider deployments would reject valid AS-issued
+	// access tokens — only legacy HMAC JWTs would work.
+	var tv *tokenvalidator.Validator
+	if cfg.AS.Enabled {
+		issuer := cfg.AS.Issuer
+		if issuer == "" {
+			issuer = cfg.JWT.Issuer
+		}
+		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+		tv = tokenvalidator.New(tokenvalidator.Config{
+			JWKSURL:   jwksURL,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy: tokenvalidator.LegacyConfig{
+				Enabled:    cfg.AS.Legacy.Enabled,
+				HMACSecret: []byte(cfg.JWT.Secret),
+			},
+		})
+		tv.Start(context.Background())
+	}
+
 	return &WalletProviderProvider{
 		cfg:            cfg,
 		logger:         logger,
@@ -838,16 +862,27 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		handlers:       handlers,
 		services:       services,
 		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
+		tokenValidator: tv,
 	}, nil
 }
 
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
 
+// authMiddleware returns the appropriate auth middleware: go-tokenauth when a
+// validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise —
+// mirrors AuthProvider.authMiddleware().
+func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
+	if p.tokenValidator != nil {
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+	}
+	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+}
+
 func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Wallet-provider routes with auth middleware
 	wp := router.Group("/wallet-provider")
-	wp.Use(middleware.AuthMiddleware(p.cfg, p.store, p.logger))
+	wp.Use(p.authMiddleware())
 	{
 		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
 		if p.cfg.WalletProvider.WIA.Enabled {
@@ -863,6 +898,9 @@ func (p *WalletProviderProvider) Services() *service.Services { return p.service
 
 // Close releases resources.
 func (p *WalletProviderProvider) Close() error {
+	if p.tokenValidator != nil {
+		p.tokenValidator.Stop()
+	}
 	p.services.Stop()
 	return p.store.Close()
 }

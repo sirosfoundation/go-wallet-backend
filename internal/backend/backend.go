@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"go.mongodb.org/mongo-driver/mongo"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/mongodb"
@@ -87,6 +89,14 @@ func (b *mongoBackend) WalletInstances() storage.WalletInstanceStore {
 }
 func (b *mongoBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *mongoBackend) Close() error                   { return b.store.Close() }
+
+// Database exposes the underlying MongoDB database so callers that need to
+// create additional collections (e.g. the WIA challenge store's TTL index)
+// can detect a MongoDB-backed deployment via a type assertion. Without this,
+// `store.(databaseProvider)` in service.NewServices always fails for
+// mongoBackend, silently falling back to the in-memory challenge store even
+// when running against MongoDB.
+func (b *mongoBackend) Database() *mongo.Database { return b.store.Database() }
 
 // New creates a storage backend based on the configuration
 func New(ctx context.Context, cfg *config.Config) (Backend, error) {

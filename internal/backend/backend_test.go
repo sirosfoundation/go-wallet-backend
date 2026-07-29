@@ -4,6 +4,10 @@ import (
 	"context"
 	"testing"
 
+	"go.mongodb.org/mongo-driver/mongo"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/mongodb"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -178,5 +182,39 @@ func TestBackendTypes(t *testing.T) {
 	}
 	if TypeMongoDB != "mongodb" {
 		t.Errorf("TypeMongoDB = %q, want %q", TypeMongoDB, "mongodb")
+	}
+}
+
+// TestMongoBackend_ImplementsDatabaseProvider is a regression test: services.go
+// detects a MongoDB-backed deployment via `store.(interface{ Database() *mongo.Database })`
+// to select the horizontally-scalable WIA challenge store (see issue #224). Without
+// mongoBackend forwarding Database() from its wrapped *mongodb.Store, that type
+// assertion always failed and every MongoDB deployment silently fell back to the
+// in-memory (single-instance-only) challenge store.
+func TestMongoBackend_ImplementsDatabaseProvider(t *testing.T) {
+	var b Backend = &mongoBackend{store: &mongodb.Store{}}
+
+	type databaseProvider interface {
+		Database() *mongo.Database
+	}
+
+	if _, ok := b.(databaseProvider); !ok {
+		t.Fatal("mongoBackend does not implement databaseProvider — MongoDB WIA challenge store will never be selected")
+	}
+}
+
+// TestMemoryBackend_DoesNotImplementDatabaseProvider documents the expected
+// counterpart: memoryBackend has no MongoDB database, so it correctly does
+// NOT satisfy databaseProvider, and callers must fall back to the in-memory
+// challenge store for memory-backed deployments.
+func TestMemoryBackend_DoesNotImplementDatabaseProvider(t *testing.T) {
+	var b Backend = &memoryBackend{store: memory.NewStore()}
+
+	type databaseProvider interface {
+		Database() *mongo.Database
+	}
+
+	if _, ok := b.(databaseProvider); ok {
+		t.Fatal("memoryBackend unexpectedly implements databaseProvider")
 	}
 }

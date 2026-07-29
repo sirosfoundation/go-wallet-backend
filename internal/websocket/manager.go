@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -102,6 +103,13 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(clients):
+	// clients are only added post-handshake, so counting only clients lets an
+	// attacker open unlimited unauthenticated connections that never complete
+	// the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new WebSocket manager
@@ -120,11 +128,10 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Enforce global connection limit
-	m.clientsMu.RLock()
-	count := len(m.clients)
-	m.clientsMu.RUnlock()
-	if count >= maxConnections {
+	// Enforce global connection limit against ALL upgraded connections, not
+	// just handshaked ones (see activeConnections doc comment).
+	if m.activeConnections.Load() >= maxConnections {
+		m.logger.Warn("Rejecting WebSocket connection", zap.Error(ErrTooManyConnections))
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -139,6 +146,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
+	m.activeConnections.Add(1)
 
 	// Clear the write deadline inherited from net/http's WriteTimeout.
 	// After upgrade, the WebSocket connection manages its own deadlines;
@@ -152,6 +160,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleClient(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
 	// Limit message size to 64KB to prevent memory exhaustion attacks

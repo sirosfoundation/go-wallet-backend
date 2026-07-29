@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -117,6 +118,13 @@ type Manager struct {
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(sessions):
+	// sessions are only registered post-handshake, so counting only sessions
+	// lets an attacker open unlimited unauthenticated connections that never
+	// complete the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new session manager
@@ -170,11 +178,9 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Enforce global session limit
-	m.sessionsMu.RLock()
-	count := len(m.sessions)
-	m.sessionsMu.RUnlock()
-	if count >= maxConnections {
+	// Enforce global session limit against ALL upgraded connections, not just
+	// handshaked ones (see activeConnections doc comment).
+	if m.activeConnections.Load() >= maxConnections {
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -188,6 +194,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
+	m.activeConnections.Add(1)
 
 	// Clear the write deadline inherited from net/http's WriteTimeout.
 	// After upgrade, the WebSocket connection manages its own deadlines;
@@ -199,6 +206,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleNewConnection(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
 	// Wait for handshake message

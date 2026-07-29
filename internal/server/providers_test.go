@@ -2,9 +2,17 @@ package server
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -487,6 +495,106 @@ func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 	assertNoCacheHeaders(t, w.Header())
+}
+
+// writeTestECKeyAndCert generates an EC P-256 key + self-signed cert and
+// writes them as PEM files in dir, returning (keyPath, certPath).
+func writeTestECKeyAndCert(t *testing.T, dir, prefix string) (string, string) {
+	t.Helper()
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyPath := filepath.Join(dir, prefix+"-key.pem")
+	certPath := filepath.Join(dir, prefix+"-cert.pem")
+	writePEM := func(path, blockType string, der []byte) {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: der}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePEM(keyPath, "EC PRIVATE KEY", keyDER)
+	writePEM(certPath, "CERTIFICATE", certDER)
+	return keyPath, certPath
+}
+
+// TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled is a
+// regression test: isolated wallet-provider deployments must accept
+// AS-issued access tokens, the same as the co-hosted AuthProvider path.
+// Before this fix, RegisterRoutes hardcoded the legacy HMAC-only
+// AuthMiddleware regardless of cfg.AS.Enabled, so AS-issued tokens were
+// always rejected in isolated mode.
+func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:     true,
+			ExternalURL: "https://as.example.com",
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.tokenValidator == nil {
+		t.Fatal("expected tokenValidator to be set when cfg.AS.Enabled is true")
+	}
+}
+
+// TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
+// counterpart: without AS enabled, isolated wallet-provider mode falls back
+// to legacy HMAC auth, matching AuthProvider's default behavior.
+func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.tokenValidator != nil {
+		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
+	}
 }
 
 func TestWIACallerIdentifier(t *testing.T) {
