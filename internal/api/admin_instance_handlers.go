@@ -67,14 +67,15 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 		return
 	}
 
-	// Verify tenant ownership before allowing status change
+	// Fetch once: used both to verify tenant ownership and to validate the
+	// state transition before persisting.
 	instance, err := h.store.WalletInstances().GetByID(c.Request.Context(), instanceID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
 			return
 		}
-		h.logger.Error("failed to get wallet instance for tenant check", zap.Error(err))
+		h.logger.Error("failed to get wallet instance", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
 		return
 	}
@@ -84,20 +85,8 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 	}
 
 	status := domain.InstanceStatus(req.Status)
-
-	// Validate the state transition before persisting.
-	current, err := h.store.WalletInstances().GetByID(c.Request.Context(), instanceID)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
-			return
-		}
-		h.logger.Error("failed to get wallet instance for status transition", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
-		return
-	}
-	if err := domain.ValidateStatusTransition(current.Status, status); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition", "current": string(current.Status), "target": string(status)})
+	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition", "current": string(instance.Status), "target": string(status)})
 		return
 	}
 

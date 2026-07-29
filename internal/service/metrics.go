@@ -95,4 +95,10 @@ var (
 		Name:      "native_attestation_errors_total",
 		Help:      "Total number of failed native attestation verifications.",
 	})
+	nativeAttestationDevChainBypass = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "native_attestation_dev_chain_bypass_total",
+		Help:      "Total number of App Attest verifications that proceeded despite a failed x5c chain check because apple_app_attest_environment=development. Should be zero in production.",
+	})
 )

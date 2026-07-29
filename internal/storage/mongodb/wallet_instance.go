@@ -23,13 +23,17 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	update := bson.M{
 		"$set": bson.M{
 			"tenant_id":          instance.TenantID,
-			"status":             instance.Status,
 			"attestation_source": instance.AttestationSource,
 			"last_attested_at":   instance.LastAttestedAt,
 			"updated_at":         instance.UpdatedAt,
 		},
+		// Status is only ever set here for a brand-new document (via $setOnInsert).
+		// An existing instance's status must only change through UpdateStatus —
+		// otherwise a routine re-attestation would silently reactivate a
+		// suspended/revoked instance.
 		"$setOnInsert": bson.M{
 			"created_at": instance.CreatedAt,
+			"status":     instance.Status,
 		},
 		"$inc": bson.M{
 			"attestation_count": 1,

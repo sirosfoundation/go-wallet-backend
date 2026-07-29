@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -58,7 +59,10 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 				challengeStore = cs
 			}
 		}
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), nil, challengeStore)
+		// Use the shared SET audit emitter constructor so WIA issuance events are
+		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
+		wiaAuditor := audit.NewFromConfig(cfg, logger)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
 	}
 
 	return &Services{

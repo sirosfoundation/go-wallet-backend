@@ -1649,3 +1649,62 @@ func TestLoadSecretsFromFiles_JWTSecretBadPath(t *testing.T) {
 		t.Errorf("error should mention jwt: %v", err)
 	}
 }
+
+func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T) {
+	// WIA.Enabled defaults to true, but with no signing keys configured WIA is
+	// inert (no endpoints registered) — the zero-config default must not fail
+	// validation just because wallet_provider_uri wasn't set.
+	cfg := defaultConfig()
+	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
+	cfg.Storage = StorageConfig{Type: "memory"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error on zero-config default: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWhenKeysConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// WalletProviderURI intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with signing keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWithPKCS11(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with PKCS11 keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

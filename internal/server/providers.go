@@ -39,6 +39,7 @@ type AuthProvider struct {
 	handlers       *api.Handlers
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
+	wiaRateLimiter *middleware.AuthRateLimiter
 }
 
 // NewAuthProvider creates a new auth route provider
@@ -47,12 +48,13 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
-		cfg:      cfg,
-		logger:   logger,
-		store:    store,
-		services: services,
-		handlers: handlers,
-		roles:    roles,
+		cfg:            cfg,
+		logger:         logger,
+		store:          store,
+		services:       services,
+		handlers:       handlers,
+		roles:          roles,
+		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 	}
 }
 
@@ -174,11 +176,26 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		{
 			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
 			if p.cfg.WalletProvider.WIA.Enabled {
-				walletProvider.POST("/wia/challenge", p.handlers.WIAChallenge)
-				walletProvider.POST("/wia/generate", p.handlers.WIAGenerate)
+				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
+				walletProvider.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
+				walletProvider.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
 			}
 		}
 	}
+}
+
+// wiaCallerIdentifier extracts the authenticated caller's identity (set by the
+// auth middleware) to key the WIA per-caller rate limiter. Falls back to the
+// tenant, then to the shared anonymous bucket, matching AuthRateLimiter's
+// existing privacy-preserving default.
+func wiaCallerIdentifier(c *gin.Context) string {
+	if userID := c.GetString("user_id"); userID != "" {
+		return userID
+	}
+	if tenantID := c.GetString("tenant_id"); tenantID != "" {
+		return tenantID
+	}
+	return ""
 }
 
 // authMiddleware returns the appropriate auth middleware: go-tokenauth when
@@ -791,11 +808,12 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 // isolation. When deployed separately, this process holds the HSM session
 // while the main backend runs without PKCS#11 access.
 type WalletProviderProvider struct {
-	cfg      *config.Config
-	logger   *zap.Logger
-	store    backend.Backend
-	handlers *api.Handlers
-	services *service.Services
+	cfg            *config.Config
+	logger         *zap.Logger
+	store          backend.Backend
+	handlers       *api.Handlers
+	services       *service.Services
+	wiaRateLimiter *middleware.AuthRateLimiter
 }
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
@@ -814,11 +832,12 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
 	return &WalletProviderProvider{
-		cfg:      cfg,
-		logger:   logger,
-		store:    store,
-		handlers: handlers,
-		services: services,
+		cfg:            cfg,
+		logger:         logger,
+		store:          store,
+		handlers:       handlers,
+		services:       services,
+		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 	}, nil
 }
 
@@ -832,8 +851,9 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	{
 		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
 		if p.cfg.WalletProvider.WIA.Enabled {
-			wp.POST("/wia/challenge", p.handlers.WIAChallenge)
-			wp.POST("/wia/generate", p.handlers.WIAGenerate)
+			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
+			wp.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
+			wp.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
 		}
 	}
 }
@@ -850,14 +870,5 @@ func (p *WalletProviderProvider) Close() error {
 // newAuditEmitter creates a SET audit emitter from config.
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
-	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
-		return nil
-	}
-	emitter, err := audit.NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
-	if err != nil {
-		logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
-		return nil
-	}
-	logger.Info("SET audit emitter initialized", zap.String("issuer", cfg.Audit.Issuer))
-	return emitter
+	return audit.NewFromConfig(cfg, logger)
 }

@@ -10,9 +10,11 @@ import (
 	"os"
 
 	"github.com/go-jose/go-jose/v4"
+	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-siros-set/emit"
 	"github.com/sirosfoundation/go-siros-set/set"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // Emitter wraps the SET emit.Emitter for audit trail generation.
@@ -73,6 +75,29 @@ func NewFromFile(issuer, keyPath, keyID string) (*Emitter, error) {
 	}
 
 	return New(issuer, joseSigner, nil), nil
+}
+
+// NewFromConfig builds an Emitter from AuditConfig, or returns nil (audit
+// disabled) if audit isn't enabled or no key is configured. Every place that
+// needs a SET audit emitter (admin API, WIA issuance, ...) should go through
+// this constructor so they all observe the same enabled/disabled decision —
+// a component that builds its own emitter, or is handed a hardcoded nil,
+// silently loses its audit trail even when audit is enabled globally.
+func NewFromConfig(cfg *config.Config, logger *zap.Logger) *Emitter {
+	if !cfg.Audit.Enabled || cfg.Audit.KeyPath == "" {
+		return nil
+	}
+	emitter, err := NewFromFile(cfg.Audit.Issuer, cfg.Audit.KeyPath, cfg.Audit.KeyID)
+	if err != nil {
+		if logger != nil {
+			logger.Error("failed to create audit emitter, audit disabled", zap.Error(err))
+		}
+		return nil
+	}
+	if logger != nil {
+		logger.Info("SET audit emitter initialized", zap.String("issuer", cfg.Audit.Issuer))
+	}
+	return emitter
 }
 
 // Emit emits an audit event.

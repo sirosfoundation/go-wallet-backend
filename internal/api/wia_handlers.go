@@ -74,7 +74,8 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		return
 	}
 
-	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), &service.WIARequest{
+	tenantID, _ := h.getTenantID(c)
+	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), tenantID, &service.WIARequest{
 		Pop:               req.Pop,
 		Challenge:         req.Challenge,
 		NativeAttestation: req.NativeAttestation,
@@ -91,6 +92,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
+			})
+		case errors.Is(err, service.ErrWIAInstanceDeactivated):
+			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "INSTANCE_DEACTIVATED",
+				"message": "This wallet instance has been suspended or revoked",
 			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))

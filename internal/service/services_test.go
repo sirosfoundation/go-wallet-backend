@@ -1,7 +1,16 @@
 package service
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -94,5 +103,100 @@ func TestNewServices_InvalidWebAuthnConfig(t *testing.T) {
 	// Other services should still be available
 	if services.User == nil {
 		t.Error("expected User service to be initialized")
+	}
+}
+
+// writeECKeyAndCert generates an EC P-256 key + self-signed cert and writes
+// them as PEM files in dir, returning (keyPath, certPath).
+func writeECKeyAndCert(t *testing.T, dir, prefix string) (string, string) {
+	t.Helper()
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(dir, prefix+"-key.pem")
+	certPath := filepath.Join(dir, prefix+"-cert.pem")
+
+	if err := writePEMFile(keyPath, "EC PRIVATE KEY", keyDER); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePEMFile(certPath, "CERTIFICATE", certDER); err != nil {
+		t.Fatal(err)
+	}
+	return keyPath, certPath
+}
+
+func writePEMFile(path, blockType string, der []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: blockType, Bytes: der})
+}
+
+// TestNewServices_WiresAuditEmitterIntoWIA is a regression test: WIAService
+// must receive a real audit emitter whenever cfg.Audit is enabled, so WIA
+// issuance/failure SET events actually get emitted (previously NewServices
+// hardcoded nil regardless of the Audit config).
+func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
+	dir := t.TempDir()
+	wpKeyPath, wpCertPath := writeECKeyAndCert(t, dir, "wallet-provider")
+	auditKeyPath, _ := writeECKeyAndCert(t, dir, "audit")
+
+	store := memory.NewStore()
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host:     "localhost",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			RPName:   "Test Wallet",
+		},
+		JWT: config.JWTConfig{
+			Secret:      "test-secret-that-is-at-least-32-bytes-long",
+			ExpiryHours: 24,
+			Issuer:      "test-wallet",
+		},
+		Audit: config.AuditConfig{
+			Enabled: true,
+			Issuer:  "https://wallet.example.com",
+			KeyPath: auditKeyPath,
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = wpKeyPath
+	cfg.WalletProvider.CertificatePath = wpCertPath
+	cfg.WalletProvider.WIA = config.WIAConfig{
+		Enabled:             true,
+		MaxExpirySeconds:    86400,
+		ChallengeTTLSeconds: 300,
+	}
+	cfg.WalletProvider.Attestation = config.AttestationConfig{
+		LifetimeSeconds: 3600,
+		StatusListMode:  "never",
+	}
+
+	logger := zap.NewNop()
+	services := NewServices(store, cfg, logger)
+
+	if services.WIA == nil {
+		t.Fatal("expected WIA service to be initialized")
+	}
+	if services.WIA.audit == nil {
+		t.Error("expected WIA service to receive a real audit emitter when cfg.Audit.Enabled is true")
 	}
 }

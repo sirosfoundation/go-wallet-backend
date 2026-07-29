@@ -46,7 +46,9 @@ func TestWalletInstanceStore_Upsert_Existing(t *testing.T) {
 		t.Fatalf("Upsert first: %v", err)
 	}
 
-	// Upsert again with updated fields
+	// Upsert again with updated fields. Status is deliberately set to Suspended
+	// here to verify Upsert does NOT apply it — lifecycle changes only happen
+	// through UpdateStatus (see TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated).
 	uid := domain.UserIDFromString("user-1")
 	inst2 := &domain.WalletInstance{
 		ID:                "inst-up",
@@ -67,14 +69,55 @@ func TestWalletInstanceStore_Upsert_Existing(t *testing.T) {
 	if got.AttestationCount != 2 {
 		t.Errorf("attestation_count = %d, want 2", got.AttestationCount)
 	}
-	if got.Status != domain.InstanceStatusSuspended {
-		t.Errorf("status = %s, want suspended", got.Status)
+	if got.Status != domain.InstanceStatusActive {
+		t.Errorf("status = %s, want active (Upsert must not change status of an existing instance)", got.Status)
 	}
 	if got.UserID == nil || *got.UserID != uid {
 		t.Errorf("user_id not updated")
 	}
 	if got.DeviceInfo == nil || got.DeviceInfo.Platform != "web" {
 		t.Errorf("device_info not updated")
+	}
+}
+
+// TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated is a regression test:
+// a suspended/revoked instance must stay that way across subsequent Upsert calls
+// (i.e. subsequent WIA re-attestations), since Upsert is what WIAService.signWIA
+// calls on every successful attestation.
+func TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	inst := &domain.WalletInstance{
+		ID:       "inst-revoked",
+		TenantID: "acme",
+		Status:   domain.InstanceStatusActive,
+	}
+	if err := wis.Upsert(ctx, inst); err != nil {
+		t.Fatalf("Upsert first: %v", err)
+	}
+	if err := wis.UpdateStatus(ctx, "inst-revoked", domain.InstanceStatusRevoked, "compromised"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	// Simulate a subsequent successful WIA re-attestation for the same instance key.
+	reattest := &domain.WalletInstance{
+		ID:                "inst-revoked",
+		TenantID:          "acme",
+		Status:            domain.InstanceStatusActive,
+		AttestationSource: "backend_attested",
+	}
+	if err := wis.Upsert(ctx, reattest); err != nil {
+		t.Fatalf("Upsert re-attestation: %v", err)
+	}
+
+	got, err := wis.GetByID(ctx, "inst-revoked")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, want revoked (Upsert must not reactivate a revoked instance)", got.Status)
 	}
 }
 

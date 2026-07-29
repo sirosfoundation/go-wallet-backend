@@ -537,6 +537,10 @@ type WIAConfig struct {
 	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
 	// ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds
 	ChallengeTTLSeconds int `yaml:"challenge_ttl_seconds" envconfig:"CHALLENGE_TTL_SECONDS"`
+	// RateLimit caps how many challenges a single authenticated caller may
+	// request per window. Without this, one caller can exhaust the shared
+	// challenge capacity (maxChallenges) and 503 out every other tenant/user.
+	RateLimit AuthRateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
 }
 
 // FlowTrustConfig contains per-flow trust evaluation overrides.
@@ -1104,6 +1108,12 @@ func defaultConfig() *Config {
 				WalletName:          "SIROS ID",
 				MaxExpirySeconds:    86400,
 				ChallengeTTLSeconds: 300,
+				RateLimit: AuthRateLimitConfig{
+					Enabled:        true,
+					MaxAttempts:    30,
+					WindowSeconds:  60,
+					LockoutSeconds: 60,
+				},
 			},
 			Attestation: AttestationConfig{
 				LifetimeSeconds: 3600,
@@ -1265,6 +1275,17 @@ func (c *Config) Validate() error {
 		}
 		if c.WalletProvider.Attestation.LifetimeSeconds > 86400 {
 			return fmt.Errorf("wallet_provider.attestation.lifetime_seconds exceeds 24h (86400), CS-04 requires < 24h")
+		}
+
+		// wallet_provider_uri is what binds the WIA-PoP's aud claim to this
+		// wallet provider; validatePop silently skips that check when it's
+		// unset. Only require it once WIA is actually operational (signing keys
+		// configured) — not on the zero-config default, where WIA.Enabled is
+		// true but no keys are present and no endpoints get registered.
+		walletProviderKeysConfigured := (c.WalletProvider.PrivateKeyPath != "" && c.WalletProvider.CertificatePath != "") ||
+			(c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != "")
+		if walletProviderKeysConfigured && c.WalletProvider.WIA.WalletProviderURI == "" {
+			return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
 		}
 	}
 

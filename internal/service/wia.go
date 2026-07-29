@@ -31,6 +31,7 @@ var (
 	ErrWIAChallengeExpired     = errors.New("WIA challenge expired or invalid")
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
+	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -250,7 +251,9 @@ type WIAPopClaims struct {
 }
 
 // GenerateWIA validates the WIA-PoP and generates a WIA JWT.
-func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, error) {
+// tenantID is the tenant of the authenticated caller (from the request context),
+// recorded against the wallet instance so admin views/ownership checks work correctly.
+func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, req *WIARequest) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrWIANotSupported
 	}
@@ -271,6 +274,31 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	if err != nil {
 		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+
+	jkt, err := computeJKT(cnfJWK)
+	if err != nil {
+		s.emitAuditFailure("jkt_compute_failed", err)
+		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+
+	// Step 2.5: Reject issuance for instances an admin has suspended or revoked.
+	// Without this check, a wallet that still holds its instance key could simply
+	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
+	// bypassing revocation.
+	if s.instances != nil {
+		existing, err := s.instances.GetByID(ctx, jkt)
+		switch {
+		case err == nil:
+			if existing.Status != domain.InstanceStatusActive {
+				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
+				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
+			}
+		case errors.Is(err, storage.ErrNotFound):
+			// First attestation for this instance key — nothing to check yet.
+		default:
+			return "", fmt.Errorf("check wallet instance status: %w", err)
+		}
 	}
 
 	// Step 3: Determine attestation source
@@ -294,7 +322,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, attestationSource)
+	return s.signWIA(cnfJWK, jkt, tenantID, attestationSource)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -391,7 +419,9 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 }
 
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource string) (string, error) {
+// jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
+// so it can also be used for the instance-status guard before signing.
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, attestationSource string) (string, error) {
 	now := time.Now()
 
 	// Use global attestation lifetime, capped by WIA max expiry
@@ -407,12 +437,6 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	}
 	if lifetime > maxExpiry {
 		lifetime = maxExpiry
-	}
-
-	// Build cnf claim with JWK thumbprint and full key
-	jkt, err := computeJKT(cnfJWK)
-	if err != nil {
-		return "", fmt.Errorf("compute jkt: %w", err)
 	}
 
 	claims := jwt.MapClaims{
@@ -499,11 +523,15 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
+	// Status is only ever set here for a brand-new instance (defaults to Active on
+	// insert); Upsert must not overwrite the status of an existing instance — that
+	// would silently undo an admin suspend/revoke the next time this instance
+	// successfully re-attests. See the guard in GenerateWIA above.
 	if s.instances != nil {
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
 			ID:                jkt,
-			TenantID:          domain.DefaultTenantID,
+			TenantID:          tenantID,
 			Status:            domain.InstanceStatusActive,
 			WSCDType:          wscdTypeFromAttestation(attestationSource),
 			AttestationSource: attestationSource,

@@ -538,3 +538,30 @@ func TestNewWalletProviderService_NoKeys(t *testing.T) {
 		t.Error("service should not be supported without keys")
 	}
 }
+
+// TestRandomStatusIndexSeed_NotZeroAndVaries is a regression test: the seed
+// used to initialize statusIndexCounter must be randomized per process, not a
+// constant zero. Without this, every replica in a horizontally-scaled
+// deployment (and every restart of the same replica) would hand out colliding
+// status_list indices once wallet_provider.attestation.status_list_mode is "always".
+func TestRandomStatusIndexSeed_NotZeroAndVaries(t *testing.T) {
+	a := randomStatusIndexSeed()
+	b := randomStatusIndexSeed()
+
+	// Probability of either being exactly 0, or the two colliding, is 2^-64 —
+	// this is a meaningful regression check, not a flaky test.
+	if a == 0 {
+		t.Error("randomStatusIndexSeed returned 0 — counter would start unseeded")
+	}
+	if a == b {
+		t.Error("randomStatusIndexSeed returned the same value twice — not actually randomized")
+	}
+}
+
+// TestStatusIndexCounter_SeededAtInit verifies the package-level counter itself
+// was actually initialized from randomStatusIndexSeed (not left at its zero value).
+func TestStatusIndexCounter_SeededAtInit(t *testing.T) {
+	if statusIndexCounter.Load() == 0 {
+		t.Error("statusIndexCounter was not seeded at init — starts at 0, which will collide across replicas/restarts")
+	}
+}

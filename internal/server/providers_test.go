@@ -488,3 +488,81 @@ func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	}
 	assertNoCacheHeaders(t, w.Header())
 }
+
+func TestWIACallerIdentifier(t *testing.T) {
+	newCtx := func(setup func(*gin.Context)) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		if setup != nil {
+			setup(c)
+		}
+		return c
+	}
+
+	t.Run("prefers user_id", func(t *testing.T) {
+		c := newCtx(func(c *gin.Context) {
+			c.Set("user_id", "user-123")
+			c.Set("tenant_id", "acme")
+		})
+		if got := wiaCallerIdentifier(c); got != "user-123" {
+			t.Errorf("wiaCallerIdentifier() = %q, want user-123", got)
+		}
+	})
+
+	t.Run("falls back to tenant_id", func(t *testing.T) {
+		c := newCtx(func(c *gin.Context) {
+			c.Set("tenant_id", "acme")
+		})
+		if got := wiaCallerIdentifier(c); got != "acme" {
+			t.Errorf("wiaCallerIdentifier() = %q, want acme", got)
+		}
+	})
+
+	t.Run("falls back to empty (anonymous bucket)", func(t *testing.T) {
+		c := newCtx(nil)
+		if got := wiaCallerIdentifier(c); got != "" {
+			t.Errorf("wiaCallerIdentifier() = %q, want empty string", got)
+		}
+	})
+}
+
+// TestWIARateLimiter_TripsAfterMaxAttempts is a regression test for the missing
+// per-caller rate limit on the WIA challenge endpoint: without it, a single
+// caller could exhaust the shared in-memory challenge capacity and deny
+// service to every other tenant/user. This exercises the exact identifier
+// extractor + AuthRateLimiter wiring used by AuthProvider/WalletProviderProvider,
+// without needing a full JWT-authenticated HTTP round trip.
+func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
+	cfg := config.AuthRateLimitConfig{Enabled: true, MaxAttempts: 3, WindowSeconds: 60, LockoutSeconds: 60}
+	rl := middleware.NewAuthRateLimiter(cfg, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("user_id", "user-abc") })
+	router.POST("/wia/challenge", middleware.AuthRateLimitMiddlewareWithIdentifier(rl, wiaCallerIdentifier), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	var lastCode int
+	for i := 0; i < 10; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+		router.ServeHTTP(w, req)
+		lastCode = w.Code
+	}
+
+	if lastCode != http.StatusTooManyRequests {
+		t.Errorf("after exceeding max_attempts, status = %d, want %d", lastCode, http.StatusTooManyRequests)
+	}
+
+	// A different caller must not be affected by the first caller's lockout.
+	router2 := gin.New()
+	router2.Use(func(c *gin.Context) { c.Set("user_id", "user-xyz") })
+	router2.POST("/wia/challenge", middleware.AuthRateLimitMiddlewareWithIdentifier(rl, wiaCallerIdentifier), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+	router2.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("different caller: status = %d, want %d (must not share the exhausted caller's lockout)", w.Code, http.StatusOK)
+	}
+}

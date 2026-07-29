@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -27,9 +29,28 @@ var (
 
 // statusIndexCounter is a process-scoped monotonic counter for status list indices.
 // Each attestation (WIA or KA) gets a unique index. In a multi-instance deployment,
-// each instance maintains its own counter range — uniqueness across instances is
-// achieved via the process-scoped starting offset (derived from instance startup time).
+// uniqueness across instances is achieved by seeding each process with a random
+// starting offset (see init() below) rather than starting from zero — otherwise
+// every replica (and every restart of the same replica) would hand out colliding
+// indices on the same status_list URI once wallet_provider.attestation.status_list_mode
+// is "always".
 var statusIndexCounter atomic.Uint64
+
+func init() {
+	statusIndexCounter.Store(randomStatusIndexSeed())
+}
+
+// randomStatusIndexSeed returns a random 64-bit starting offset for
+// statusIndexCounter. Extracted for direct unit testing.
+func randomStatusIndexSeed() uint64 {
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		// Should never happen on any real platform; falling back to 0 is no
+		// worse than the counter's behavior before this fix.
+		return 0
+	}
+	return binary.BigEndian.Uint64(seed[:])
+}
 
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
 // Prevents DoS via expensive JWT signing with excessively large arrays.

@@ -8,9 +8,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"testing"
 	"time"
 
@@ -316,17 +318,10 @@ func TestAppleAppAttestRootCAs_NotEmpty(t *testing.T) {
 	}
 }
 
-func TestExtractAppAttestNonce(t *testing.T) {
-	// Test with a well-formed ASN.1 extension value
-	// SEQUENCE { SEQUENCE { [0] EXPLICIT OCTET STRING { 32 bytes of nonce } } }
-	expectedNonce := make([]byte, 32)
-	for i := range expectedNonce {
-		expectedNonce[i] = byte(i)
-	}
-
-	// Build the ASN.1 structure manually
-	// Inner: context-specific [0] EXPLICIT wrapping OCTET STRING
-	innerOctetStr, _ := asn1.Marshal(expectedNonce)
+// buildAppAttestNonceExtension builds the ASN.1 extension value that
+// extractAppAttestNonce parses: SEQUENCE { SEQUENCE { [0] EXPLICIT OCTET STRING { nonce } } }.
+func buildAppAttestNonceExtension(nonce []byte) []byte {
+	innerOctetStr, _ := asn1.Marshal(nonce)
 	tagged := asn1.RawValue{
 		Class:      asn1.ClassContextSpecific,
 		Tag:        0,
@@ -335,7 +330,6 @@ func TestExtractAppAttestNonce(t *testing.T) {
 	}
 	taggedBytes, _ := asn1.Marshal(tagged)
 
-	// Inner SEQUENCE
 	innerSeq := asn1.RawValue{
 		Class:      asn1.ClassUniversal,
 		Tag:        asn1.TagSequence,
@@ -344,7 +338,6 @@ func TestExtractAppAttestNonce(t *testing.T) {
 	}
 	innerSeqBytes, _ := asn1.Marshal(innerSeq)
 
-	// Outer SEQUENCE
 	outerSeq := asn1.RawValue{
 		Class:      asn1.ClassUniversal,
 		Tag:        asn1.TagSequence,
@@ -352,6 +345,17 @@ func TestExtractAppAttestNonce(t *testing.T) {
 		Bytes:      innerSeqBytes,
 	}
 	extValue, _ := asn1.Marshal(outerSeq)
+	return extValue
+}
+
+func TestExtractAppAttestNonce(t *testing.T) {
+	// Test with a well-formed ASN.1 extension value
+	// SEQUENCE { SEQUENCE { [0] EXPLICIT OCTET STRING { 32 bytes of nonce } } }
+	expectedNonce := make([]byte, 32)
+	for i := range expectedNonce {
+		expectedNonce[i] = byte(i)
+	}
+	extValue := buildAppAttestNonceExtension(expectedNonce)
 
 	got, err := extractAppAttestNonce(extValue)
 	if err != nil {
@@ -366,6 +370,125 @@ func TestExtractAppAttestNonce(t *testing.T) {
 	if err == nil {
 		t.Error("extractAppAttestNonce(invalid) should have returned error")
 	}
+}
+
+// buildTestAppAttestAttestation builds a self-signed (i.e. non-Apple-chained)
+// App Attest attestation object with the given nonce embedded in the credCert
+// extension, for exercising the full verifyAppleAppAttest path in development
+// mode (where x5c chain verification is bypassed but nonce verification is not).
+func buildTestAppAttestAttestation(t *testing.T, appID string, embeddedNonce [32]byte) string {
+	t.Helper()
+
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:    asn1.ObjectIdentifier{1, 2, 840, 113635, 100, 8, 2},
+				Value: buildAppAttestNonceExtension(embeddedNonce[:]),
+			},
+		},
+	}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &certKey.PublicKey, certKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A second (self-signed, not actually Apple-issued) cert to satisfy the
+	// "at least 2 certs" x5c length check. Chain verification against the real
+	// Apple root will fail regardless — that's expected and exercised via the
+	// development-mode bypass this test targets.
+	intermediateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediateDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, &x509.Certificate{SerialNumber: big.NewInt(2)}, &intermediateKey.PublicKey, intermediateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rpIDHash := sha256.Sum256([]byte(appID))
+	authData := make([]byte, 37)
+	copy(authData[:32], rpIDHash[:])
+	authData[32] = 0x40 // attested credential data present
+
+	obj := appleAppAttestAttestation{
+		Fmt:      "apple-appattest",
+		AttStmt:  appleAppAttestAttestStatement{X5C: [][]byte{certDER, intermediateDER}},
+		AuthData: authData,
+	}
+	cborBytes, err := cbor.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(cborBytes)
+}
+
+// TestNativeAttestationService_AppAttest_DevModeStillEnforcesNonce is a
+// regression test: development mode may bypass x5c chain verification (no
+// real Apple hardware in test), but must NEVER bypass the nonce check —
+// otherwise a forged attestation with an arbitrary nonce would be accepted.
+func TestNativeAttestationService_AppAttest_DevModeStillEnforcesNonce(t *testing.T) {
+	cfg := testNativeAttestationConfig(true) // AppleAppAttestEnvironment: "development"
+	svc := NewNativeAttestationService(cfg, zap.NewNop())
+	appID := cfg.WalletProvider.Attestation.NativeAttestation.AppleAppID
+	challenge := "test-challenge"
+
+	// Wrong nonce (e.g. attestation computed for a different challenge) must
+	// be rejected even though the environment is "development".
+	var wrongNonce [32]byte
+	copy(wrongNonce[:], []byte("this-is-not-the-right-nonce...."))
+	token := buildTestAppAttestAttestation(t, appID, wrongNonce)
+
+	_, err := svc.Verify(context.Background(), &NativeAttestationRequest{
+		Type:      NativeAttestationAppleAppAttest,
+		Token:     token,
+		KeyID:     "test-key",
+		Challenge: challenge,
+	})
+	if err == nil {
+		t.Fatal("expected nonce mismatch to be rejected even in development mode")
+	}
+
+	// Correct nonce succeeds (chain bypass still applies in development).
+	clientDataHash := sha256.Sum256([]byte(challenge))
+	composite := append(append([]byte{}, authDataForAppID(appID)...), clientDataHash[:]...)
+	correctNonce := sha256.Sum256(composite)
+	token = buildTestAppAttestAttestation(t, appID, correctNonce)
+
+	result, err := svc.Verify(context.Background(), &NativeAttestationRequest{
+		Type:      NativeAttestationAppleAppAttest,
+		Token:     token,
+		KeyID:     "test-key",
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("expected success with correct nonce, got error: %v", err)
+	}
+	if !result.Verified {
+		t.Error("expected Verified = true")
+	}
+	if result.AttestationSource != "development_attested" {
+		t.Errorf("AttestationSource = %q, want development_attested", result.AttestationSource)
+	}
+}
+
+// authDataForAppID reconstructs the authData bytes buildTestAppAttestAttestation
+// uses, so the test can compute the matching nonce independently.
+func authDataForAppID(appID string) []byte {
+	rpIDHash := sha256.Sum256([]byte(appID))
+	authData := make([]byte, 37)
+	copy(authData[:32], rpIDHash[:])
+	authData[32] = 0x40
+	return authData
 }
 
 func TestParsePlayIntegrityVerdict(t *testing.T) {
