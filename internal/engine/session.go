@@ -178,9 +178,14 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Enforce global session limit against ALL upgraded connections, not just
-	// handshaked ones (see activeConnections doc comment).
-	if m.activeConnections.Load() >= maxConnections {
+	// Reserve a slot atomically before checking the limit. Checking
+	// Load() >= maxConnections and only then incrementing is racy: multiple
+	// concurrent requests can all pass the check before any of them
+	// increments, overshooting maxConnections under load. Add(1) returns the
+	// post-increment value, so only requests that actually push the counter
+	// over the limit roll back.
+	if m.activeConnections.Add(1) > maxConnections {
+		m.activeConnections.Add(-1)
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -191,10 +196,10 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
-	m.activeConnections.Add(1)
 
 	// Clear the write deadline inherited from net/http's WriteTimeout.
 	// After upgrade, the WebSocket connection manages its own deadlines;

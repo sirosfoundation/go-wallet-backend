@@ -253,7 +253,9 @@ type WIAPopClaims struct {
 // GenerateWIA validates the WIA-PoP and generates a WIA JWT.
 // tenantID is the tenant of the authenticated caller (from the request context),
 // recorded against the wallet instance so admin views/ownership checks work correctly.
-func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, req *WIARequest) (string, error) {
+// userID is the authenticated caller's user ID, if known (may be nil) — recorded
+// against the instance so GetByUser / ListWalletInstancesByUser can find it.
+func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, req *WIARequest) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrWIANotSupported
 	}
@@ -322,7 +324,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, attestationSource)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -421,7 +423,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, attestationSource string) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string) (string, error) {
 	now := time.Now()
 
 	// Use global attestation lifetime, capped by WIA max expiry
@@ -532,6 +534,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		instance := &domain.WalletInstance{
 			ID:                jkt,
 			TenantID:          tenantID,
+			UserID:            userID,
 			Status:            domain.InstanceStatusActive,
 			WSCDType:          wscdTypeFromAttestation(attestationSource),
 			AttestationSource: attestationSource,

@@ -641,7 +641,9 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Priority: transport-supplied WIA+PoP > private_key_jwt (already set above).
 	//
 	// The instance key NEVER resides on the backend. The client (frontend/SDK)
-	// holds it in passkey-PRF-encrypted private data and signs the PoP locally.
+	// holds it wherever its WSCD type keeps instance keys (browser passkey
+	// PRF-encrypted storage, iOS Secure Enclave, Android StrongBox/TEE, or a
+	// remote HSM via R2PS — see domain.WSCDType) and signs the PoP locally.
 	// The backend simply forwards the client-supplied WIA + PoP as HTTP headers.
 	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
 		h.attestationProvider = &TransportSuppliedAttestation{

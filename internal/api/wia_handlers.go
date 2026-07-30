@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 )
 
@@ -75,7 +76,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 	}
 
 	tenantID, _ := h.getTenantID(c)
-	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), tenantID, &service.WIARequest{
+	var userID *domain.UserID
+	if uid := c.GetString("user_id"); uid != "" {
+		id := domain.UserIDFromString(uid)
+		userID = &id
+	}
+	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), tenantID, userID, &service.WIARequest{
 		Pop:               req.Pop,
 		Challenge:         req.Challenge,
 		NativeAttestation: req.NativeAttestation,

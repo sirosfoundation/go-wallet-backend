@@ -183,7 +183,7 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	pop, _ := createTestPop(t, challenge)
 
 	// Generate WIA
-	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -242,6 +242,54 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	}
 }
 
+// TestWIAService_GenerateWIA_RecordsUserID is a regression test: the
+// WalletInstance.UserID field existed and was queryable via GetByUser /
+// the admin ListWalletInstancesByUser endpoint, but nothing in the WIA
+// issuance path ever populated it — so that endpoint always returned an
+// empty list in practice. GenerateWIA must now record the caller's user ID
+// on the resulting instance when the caller passes one.
+func TestWIAService_GenerateWIA_RecordsUserID(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	uid := domain.UserIDFromString("user-42")
+	wiaJWT, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse WIA: %v", err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	cnf := claims["cnf"].(map[string]interface{})
+	jkt := cnf["jkt"].(string)
+
+	got, err := instances.GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.UserID == nil || *got.UserID != uid {
+		t.Errorf("instance UserID = %v, want %v", got.UserID, uid)
+	}
+
+	byUser, err := instances.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil {
+		t.Fatalf("GetByUser: %v", err)
+	}
+	if len(byUser) != 1 || byUser[0].ID != jkt {
+		t.Errorf("GetByUser returned %v, want exactly the instance %q", byUser, jkt)
+	}
+}
+
 // TestWIAService_GenerateWIA_RefusesRevokedInstance is a regression test for the
 // bug where a revoked/suspended wallet instance could obtain a fresh, fully valid
 // WIA simply by requesting a new challenge/PoP with the same instance key —
@@ -256,7 +304,7 @@ func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
 	pop, instanceKey := createTestPop(t, challenge)
-	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
 		t.Fatalf("first GenerateWIA: %v", err)
 	}
 
@@ -304,7 +352,7 @@ func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {
 		t.Fatalf("sign pop2: %v", err)
 	}
 
-	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &WIARequest{Pop: pop2, Challenge: challenge2})
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop2, Challenge: challenge2})
 	if !errors.Is(err, ErrWIAInstanceDeactivated) {
 		t.Fatalf("GenerateWIA for revoked instance: got err=%v, want ErrWIAInstanceDeactivated", err)
 	}
@@ -329,7 +377,7 @@ func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 	pop, _ := createTestPop(t, challenge)
 
 	// First use should succeed
-	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -339,7 +387,7 @@ func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 
 	// Second use should fail (single-use)
 	pop2, _ := createTestPop(t, challenge)
-	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop2,
 		Challenge: challenge,
 	})
@@ -356,7 +404,7 @@ func TestWIAService_InvalidNonce(t *testing.T) {
 	// PoP with wrong nonce
 	pop, _ := createTestPop(t, "wrong-nonce")
 
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -400,7 +448,7 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 
 	pop, _ := createTestPop(t, challenge)
 
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -597,7 +645,7 @@ func TestWIAGenerateEndToEnd(t *testing.T) {
 	}
 
 	// 3) Generate WIA
-	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &WIARequest{
+	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       popString,
 		Challenge: challenge,
 	})
@@ -765,7 +813,7 @@ func TestValidatePop_MissingIat(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withoutIssuedAt().build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing iat")
 	}
@@ -779,7 +827,7 @@ func TestValidatePop_IatTooOld(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withIssuedAt(time.Now().Add(-15 * time.Minute)).build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for old iat")
 	}
@@ -790,7 +838,7 @@ func TestValidatePop_ExpTooFarFuture(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withExpiresAt(time.Now().Add(30 * time.Minute)).build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for exp too far in future")
 	}
@@ -801,7 +849,7 @@ func TestValidatePop_MissingExp(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withoutExpiresAt().build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing exp")
 	}
@@ -812,7 +860,7 @@ func TestValidatePop_MissingIssuer(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withoutIssuer().build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing issuer")
 	}
@@ -823,7 +871,7 @@ func TestValidatePop_InvalidTyp(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withTyp("wrong-typ").build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for wrong typ")
 	}
@@ -834,7 +882,7 @@ func TestValidatePop_MissingJWK(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 
 	pop := newTestPopBuilder(t, challenge).withoutJWK().build()
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing jwk header")
 	}
@@ -847,7 +895,7 @@ func TestValidatePop_AudValidation(t *testing.T) {
 	t.Run("missing aud when required", func(t *testing.T) {
 		challenge, _, _ := svc.CreateChallenge(context.Background())
 		pop := newTestPopBuilder(t, challenge).build() // no aud set
-		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err == nil {
 			t.Fatal("expected error for missing aud")
 		}
@@ -856,7 +904,7 @@ func TestValidatePop_AudValidation(t *testing.T) {
 	t.Run("wrong aud", func(t *testing.T) {
 		challenge, _, _ := svc.CreateChallenge(context.Background())
 		pop := newTestPopBuilder(t, challenge).withAudience("https://wrong.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err == nil {
 			t.Fatal("expected error for wrong aud")
 		}
@@ -865,7 +913,7 @@ func TestValidatePop_AudValidation(t *testing.T) {
 	t.Run("correct aud", func(t *testing.T) {
 		challenge, _, _ := svc.CreateChallenge(context.Background())
 		pop := newTestPopBuilder(t, challenge).withAudience("https://wallet.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err != nil {
 			t.Fatalf("should succeed with correct aud: %v", err)
 		}
@@ -874,7 +922,7 @@ func TestValidatePop_AudValidation(t *testing.T) {
 	t.Run("correct aud among multiple", func(t *testing.T) {
 		challenge, _, _ := svc.CreateChallenge(context.Background())
 		pop := newTestPopBuilder(t, challenge).withAudience("https://other.example.com", "https://wallet.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err != nil {
 			t.Fatalf("should succeed with correct aud in list: %v", err)
 		}
@@ -887,7 +935,7 @@ func TestValidatePop_AudSkippedWhenNotConfigured(t *testing.T) {
 
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop := newTestPopBuilder(t, challenge).build() // no aud
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("should succeed without aud when not configured: %v", err)
 	}
@@ -897,7 +945,7 @@ func TestGenerateWIA_NotSupported(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.jwtSigner = nil // make unsupported
 
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: "x", Challenge: "y"})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: "x", Challenge: "y"})
 	if !errors.Is(err, ErrWIANotSupported) {
 		t.Errorf("expected ErrWIANotSupported, got %v", err)
 	}
@@ -914,7 +962,7 @@ func TestGenerateWIA_NativeAttestationFailure(t *testing.T) {
 	pop, _ := createTestPop(t, challenge)
 
 	// Native attestation with invalid token should fail (not silently fallback)
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 		NativeAttestation: &NativeAttestationRequest{
@@ -937,7 +985,7 @@ func TestGenerateWIA_NativeAttestationChallengeMismatch(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 		NativeAttestation: &NativeAttestationRequest{
@@ -961,7 +1009,7 @@ func TestSignWIA_EmptyWalletNameVersion(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -994,7 +1042,7 @@ func TestSignWIA_CertificationInfo(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -1022,7 +1070,7 @@ func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -1044,7 +1092,7 @@ func TestSignWIA_StatusListAlways(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -1079,7 +1127,7 @@ func TestSignWIA_StatusListAlwaysWithExpiry(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -1105,7 +1153,7 @@ func TestSignWIA_MaxExpiryDefault(t *testing.T) {
 	challenge, _, _ := svc.CreateChallenge(context.Background())
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}

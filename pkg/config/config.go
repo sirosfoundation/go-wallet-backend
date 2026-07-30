@@ -509,9 +509,19 @@ type NativeAttestationConfig struct {
 	// GooglePackageName is the Android package name for Play Integrity.
 	GooglePackageName string `yaml:"google_package_name" envconfig:"GOOGLE_PACKAGE_NAME"`
 	// GooglePlayIntegrityDecryptionKey is the base64-encoded decryption key.
+	// Prefer GooglePlayIntegrityDecryptionKeyPath for production deployments.
 	GooglePlayIntegrityDecryptionKey string `yaml:"google_play_integrity_decryption_key" envconfig:"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY"`
+	// GooglePlayIntegrityDecryptionKeyPath is a path to a file containing the
+	// decryption key (preferred over the inline value — same pattern as
+	// PKCS11.PINPath / JWT.SecretPath, so this AES key material can be
+	// mounted from a secret store instead of living in plain env vars/YAML).
+	GooglePlayIntegrityDecryptionKeyPath string `yaml:"google_play_integrity_decryption_key_path" envconfig:"GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY_PATH"`
 	// GooglePlayIntegrityVerificationKey is the base64-encoded verification key.
+	// Prefer GooglePlayIntegrityVerificationKeyPath for production deployments.
 	GooglePlayIntegrityVerificationKey string `yaml:"google_play_integrity_verification_key" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY"`
+	// GooglePlayIntegrityVerificationKeyPath is a path to a file containing
+	// the verification key (preferred over the inline value).
+	GooglePlayIntegrityVerificationKeyPath string `yaml:"google_play_integrity_verification_key_path" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH"`
 }
 
 // WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
@@ -980,6 +990,21 @@ func (c *Config) loadSecretsFromFiles() error {
 		c.WalletProvider.PKCS11.PIN, err = readSecretFile(c.WalletProvider.PKCS11.PINPath)
 		if err != nil {
 			return fmt.Errorf("wallet_provider.pkcs11.pin_path: %w", err)
+		}
+	}
+
+	// Load Play Integrity decryption/verification keys from file
+	natCfg := &c.WalletProvider.Attestation.NativeAttestation
+	if natCfg.GooglePlayIntegrityDecryptionKeyPath != "" {
+		natCfg.GooglePlayIntegrityDecryptionKey, err = readSecretFile(natCfg.GooglePlayIntegrityDecryptionKeyPath)
+		if err != nil {
+			return fmt.Errorf("wallet_provider.attestation.native_attestation.google_play_integrity_decryption_key_path: %w", err)
+		}
+	}
+	if natCfg.GooglePlayIntegrityVerificationKeyPath != "" {
+		natCfg.GooglePlayIntegrityVerificationKey, err = readSecretFile(natCfg.GooglePlayIntegrityVerificationKeyPath)
+		if err != nil {
+			return fmt.Errorf("wallet_provider.attestation.native_attestation.google_play_integrity_verification_key_path: %w", err)
 		}
 	}
 

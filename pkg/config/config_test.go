@@ -1708,3 +1708,55 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestLoadSecretsFromFiles_PlayIntegrityKeys(t *testing.T) {
+	dir := t.TempDir()
+	decPath := filepath.Join(dir, "play-integrity-dec")
+	verPath := filepath.Join(dir, "play-integrity-ver")
+	if err := os.WriteFile(decPath, []byte("dec-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verPath, []byte("ver-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = decPath
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = verPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKey; got != "dec-key-b64" {
+		t.Errorf("decryption key = %q, want dec-key-b64", got)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKey; got != "ver-key-b64" {
+		t.Errorf("verification key = %q, want ver-key-b64", got)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityDecryptionKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = "/nonexistent/dec-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad decryption key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_decryption_key_path") {
+		t.Errorf("error should mention google_play_integrity_decryption_key_path: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityVerificationKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = "/nonexistent/ver-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad verification key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_verification_key_path") {
+		t.Errorf("error should mention google_play_integrity_verification_key_path: %v", err)
+	}
+}
