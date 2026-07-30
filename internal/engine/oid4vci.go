@@ -1355,6 +1355,9 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setAttestationHeaders(ctx, req); err != nil {
+			return nil, err
+		}
 		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
 			return nil, err
 		}
