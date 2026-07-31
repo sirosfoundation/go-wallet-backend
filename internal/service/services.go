@@ -52,7 +52,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 			Database() *mongo.Database
 		}
 		if dbp, ok := store.(databaseProvider); ok {
-			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges)
+			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges, maxChallengesPerTenant)
 			if err != nil {
 				logger.Warn("Failed to create MongoDB WIA challenge store, falling back to memory", zap.Error(err))
 			} else {

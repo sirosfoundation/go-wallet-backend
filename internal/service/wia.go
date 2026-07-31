@@ -37,6 +37,7 @@ var (
 // WIAChallenge is a single-use nonce for WIA generation.
 type WIAChallenge struct {
 	Challenge string
+	TenantID  domain.TenantID
 	ExpiresAt time.Time
 	// Linked list pointers for expiry-ordered eviction.
 	prev, next *WIAChallenge
@@ -44,22 +45,31 @@ type WIAChallenge struct {
 
 // challengeStore is a bounded, expiry-ordered map of challenges.
 // Expired entries are evicted in O(1) from the front of the list on insert.
+// Enforces both a global capacity and a per-tenant capacity (issue #224:
+// "bounded capacity per tenant to prevent abuse" — a global-only bound lets
+// a single tenant exhaust the shared pool and deny challenge creation for
+// everyone else).
 type challengeStore struct {
-	mu      sync.Mutex
-	items   map[string]*WIAChallenge
-	head    *WIAChallenge // oldest expiry
-	tail    *WIAChallenge // newest expiry
-	maxSize int
+	mu               sync.Mutex
+	items            map[string]*WIAChallenge
+	head             *WIAChallenge // oldest expiry
+	tail             *WIAChallenge // newest expiry
+	maxSize          int
+	maxSizePerTenant int
+	perTenant        map[domain.TenantID]int
 }
 
-func newChallengeStore(maxSize int) *challengeStore {
+func newChallengeStore(maxSize, maxSizePerTenant int) *challengeStore {
 	return &challengeStore{
-		items:   make(map[string]*WIAChallenge, maxSize),
-		maxSize: maxSize,
+		items:            make(map[string]*WIAChallenge, maxSize),
+		maxSize:          maxSize,
+		maxSizePerTenant: maxSizePerTenant,
+		perTenant:        make(map[domain.TenantID]int),
 	}
 }
 
-// put adds a challenge, evicting expired entries first. Returns false if at capacity.
+// put adds a challenge, evicting expired entries first. Returns false if
+// either the global or the per-tenant capacity is exceeded.
 func (cs *challengeStore) put(c *WIAChallenge) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -69,8 +79,12 @@ func (cs *challengeStore) put(c *WIAChallenge) bool {
 	if len(cs.items) >= cs.maxSize {
 		return false
 	}
+	if cs.maxSizePerTenant > 0 && cs.perTenant[c.TenantID] >= cs.maxSizePerTenant {
+		return false
+	}
 
 	cs.items[c.Challenge] = c
+	cs.perTenant[c.TenantID]++
 
 	// Append to tail (newest expiry)
 	c.prev = cs.tail
@@ -110,10 +124,16 @@ func (cs *challengeStore) evictExpired() {
 	}
 }
 
-// removeLocked removes a challenge from both the map and the linked list.
-// Must hold cs.mu.
+// removeLocked removes a challenge from both the map and the linked list,
+// and decrements its tenant's count. Must hold cs.mu.
 func (cs *challengeStore) removeLocked(c *WIAChallenge) {
 	delete(cs.items, c.Challenge)
+	if cs.perTenant[c.TenantID] > 0 {
+		cs.perTenant[c.TenantID]--
+		if cs.perTenant[c.TenantID] == 0 {
+			delete(cs.perTenant, c.TenantID)
+		}
+	}
 	if c.prev != nil {
 		c.prev.next = c.next
 	} else {
@@ -158,7 +178,7 @@ type WIAService struct {
 // It shares the same signing key as the WalletProviderService (same x5c chain).
 func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
 	if challengeStore == nil {
-		challengeStore = newMemoryWIAChallengeStore(maxChallenges)
+		challengeStore = newMemoryWIAChallengeStore(maxChallenges, maxChallengesPerTenant)
 	}
 	svc := &WIAService{
 		cfg:        cfg,
@@ -183,12 +203,18 @@ func (s *WIAService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
-// maxChallenges is the maximum number of concurrent pending challenges.
-// Prevents memory exhaustion from challenge endpoint abuse.
+// maxChallenges is the maximum number of concurrent pending challenges,
+// across all tenants. Prevents memory exhaustion from challenge endpoint abuse.
 const maxChallenges = 10000
 
-// CreateChallenge generates a new single-use challenge nonce.
-func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, error) {
+// maxChallengesPerTenant additionally bounds how many of those may belong to
+// a single tenant at once (issue #224: "bounded capacity per tenant to
+// prevent abuse") — without this, a single tenant can still exhaust the
+// entire global pool and deny challenge creation for every other tenant.
+const maxChallengesPerTenant = maxChallenges / 10
+
+// CreateChallenge generates a new single-use challenge nonce for tenantID.
+func (s *WIAService) CreateChallenge(ctx context.Context, tenantID domain.TenantID) (string, time.Time, error) {
 	if !s.IsSupported() {
 		return "", time.Time{}, ErrWIANotSupported
 	}
@@ -206,7 +232,7 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 	expiresAt := time.Now().Add(ttl)
 
-	ok, err := s.challenges.Put(ctx, challenge, expiresAt)
+	ok, err := s.challenges.Put(ctx, tenantID, challenge, expiresAt)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("store challenge: %w", err)
 	}

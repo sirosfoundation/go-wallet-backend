@@ -22,7 +22,8 @@ func (h *Handlers) WIAChallenge(c *gin.Context) {
 		return
 	}
 
-	challenge, expiresAt, err := h.services.WIA.CreateChallenge(c.Request.Context())
+	tenantID, _ := h.getTenantID(c)
+	challenge, expiresAt, err := h.services.WIA.CreateChallenge(c.Request.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, service.ErrWIAChallengeCapacityMax) {
 			c.JSON(http.StatusTooManyRequests, gin.H{

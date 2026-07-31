@@ -7,24 +7,28 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
 
 // mongoWIAChallengeStore implements WIAChallengeStore using MongoDB.
 // It uses a TTL index for automatic expiry of challenges and
 // FindOneAndDelete for atomic single-use consumption.
 type mongoWIAChallengeStore struct {
-	collection *mongo.Collection
-	maxSize    int
+	collection       *mongo.Collection
+	maxSize          int
+	maxSizePerTenant int
 }
 
 type wiaChallengeDoc struct {
-	Challenge string    `bson:"_id"`
-	ExpiresAt time.Time `bson:"expires_at"`
+	Challenge string          `bson:"_id"`
+	TenantID  domain.TenantID `bson:"tenant_id"`
+	ExpiresAt time.Time       `bson:"expires_at"`
 }
 
 // NewMongoWIAChallengeStore creates a MongoDB-backed WIA challenge store.
-// It creates the required TTL index on initialization.
-func NewMongoWIAChallengeStore(ctx context.Context, db *mongo.Database, maxSize int) (*mongoWIAChallengeStore, error) {
+// It creates the required TTL and tenant_id indexes on initialization.
+func NewMongoWIAChallengeStore(ctx context.Context, db *mongo.Database, maxSize, maxSizePerTenant int) (*mongoWIAChallengeStore, error) {
 	collection := db.Collection("wia_challenges")
 
 	// Create TTL index for automatic expiry (MongoDB background thread runs every 60s).
@@ -36,14 +40,24 @@ func NewMongoWIAChallengeStore(ctx context.Context, db *mongo.Database, maxSize 
 		return nil, err
 	}
 
+	// Index for efficient per-tenant capacity checks (issue #224: "bounded
+	// capacity per tenant to prevent abuse").
+	_, err = collection.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "tenant_id", Value: 1}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return &mongoWIAChallengeStore{
-		collection: collection,
-		maxSize:    maxSize,
+		collection:       collection,
+		maxSize:          maxSize,
+		maxSizePerTenant: maxSizePerTenant,
 	}, nil
 }
 
-func (s *mongoWIAChallengeStore) Put(ctx context.Context, challenge string, expiresAt time.Time) (bool, error) {
-	// Check capacity (estimated count is fast — O(1) via collection stats).
+func (s *mongoWIAChallengeStore) Put(ctx context.Context, tenantID domain.TenantID, challenge string, expiresAt time.Time) (bool, error) {
+	// Check global capacity (estimated count is fast — O(1) via collection stats).
 	count, err := s.collection.EstimatedDocumentCount(ctx)
 	if err != nil {
 		return false, err
@@ -52,8 +66,22 @@ func (s *mongoWIAChallengeStore) Put(ctx context.Context, challenge string, expi
 		return false, nil
 	}
 
+	// Check per-tenant capacity — without this, a single tenant can exhaust
+	// the entire global pool and deny challenge creation for every other
+	// tenant, even though horizontal scaling and global capacity are fine.
+	if s.maxSizePerTenant > 0 {
+		tenantCount, err := s.collection.CountDocuments(ctx, bson.M{"tenant_id": tenantID})
+		if err != nil {
+			return false, err
+		}
+		if tenantCount >= int64(s.maxSizePerTenant) {
+			return false, nil
+		}
+	}
+
 	doc := wiaChallengeDoc{
 		Challenge: challenge,
+		TenantID:  tenantID,
 		ExpiresAt: expiresAt,
 	}
 	_, err = s.collection.InsertOne(ctx, doc)
