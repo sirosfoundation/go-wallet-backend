@@ -20,6 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	jwkpkg "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -323,9 +324,9 @@ func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {
 		"x": base64.RawURLEncoding.EncodeToString(xBytes),
 		"y": base64.RawURLEncoding.EncodeToString(yBytes),
 	}
-	jkt, err := computeJKT(jwk)
+	jkt, err := jwkpkg.Thumbprint(jwk)
 	if err != nil {
-		t.Fatalf("computeJKT: %v", err)
+		t.Fatalf("jwk.Thumbprint: %v", err)
 	}
 	if err := instances.UpdateStatus(ctx, jkt, domain.InstanceStatusRevoked, "compromised device"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
@@ -494,86 +495,9 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 	}
 }
 
-func TestComputeJKT(t *testing.T) {
-	// Known test vector
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   "test-x-value",
-		"y":   "test-y-value",
-	}
-
-	jkt, err := computeJKT(jwk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if jkt == "" {
-		t.Fatal("JKT should not be empty")
-	}
-
-	// Verify deterministic
-	jkt2, _ := computeJKT(jwk)
-	if jkt != jkt2 {
-		t.Fatal("JKT should be deterministic")
-	}
-}
-
-func TestParseECPublicKeyFromJWK(t *testing.T) {
-	// Generate a key and round-trip through JWK
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	xBytes := key.PublicKey.X.Bytes()
-	yBytes := key.PublicKey.Y.Bytes()
-	for len(xBytes) < 32 {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < 32 {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
-		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
-	}
-
-	parsed, err := parseECPublicKeyFromJWK(jwk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if parsed.X.Cmp(key.PublicKey.X) != 0 || parsed.Y.Cmp(key.PublicKey.Y) != 0 {
-		t.Fatal("parsed key doesn't match original")
-	}
-}
-
-func TestEllipticCurveForName(t *testing.T) {
-	tests := []struct {
-		name  string
-		curve elliptic.Curve
-	}{
-		{"P-256", elliptic.P256()},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ellipticCurveForName(tt.name)
-			if got != tt.curve {
-				t.Errorf("ellipticCurveForName(%q) mismatch", tt.name)
-			}
-		})
-	}
-	// Unsupported curves should return nil
-	for _, name := range []string{"P-384", "P-521", "unsupported"} {
-		if c := ellipticCurveForName(name); c != nil {
-			t.Errorf("expected nil for %q curve", name)
-		}
-	}
-}
+// computeJKT/parseECPublicKeyFromJWK/ellipticCurveForName moved to pkg/jwk
+// (Thumbprint/ParseECPublicKey/CurveForName) — see pkg/jwk/jwk_test.go for
+// their unit tests.
 
 func TestChallengeStoreLen(t *testing.T) {
 	svc, _ := newTestWIAService(t)
@@ -729,41 +653,6 @@ func TestWIAGenerateDuplicateChallenge(t *testing.T) {
 	ok, _ = svc.challenges.Consume(ctx, challenge)
 	if ok {
 		t.Fatal("expected failure on second consume")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_InvalidCurve(t *testing.T) {
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-999",
-		"x":   base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3}),
-		"y":   base64.RawURLEncoding.EncodeToString([]byte{4, 5, 6}),
-	}
-	_, err := parseECPublicKeyFromJWK(jwk)
-	if err == nil {
-		t.Error("expected error for unsupported curve")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_MissingFields(t *testing.T) {
-	// Missing x
-	_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"y":   "AAAA",
-	})
-	if err == nil {
-		t.Error("expected error for missing x")
-	}
-
-	// Missing crv
-	_, err = parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "EC",
-		"x":   "AAAA",
-		"y":   "BBBB",
-	})
-	if err == nil {
-		t.Error("expected error for missing crv")
 	}
 }
 
@@ -1230,36 +1119,6 @@ func TestWIAService_StartStop(t *testing.T) {
 
 	// Stop should not panic
 	svc.Stop()
-}
-
-func TestComputeJKT_UnsupportedKeyType(t *testing.T) {
-	_, err := computeJKT(map[string]interface{}{
-		"kty": "RSA",
-		"n":   "test",
-	})
-	if err == nil {
-		t.Error("expected error for RSA key type")
-	}
-}
-
-func TestComputeJKT_IncompleteJWK(t *testing.T) {
-	_, err := computeJKT(map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		// missing x and y
-	})
-	if err == nil {
-		t.Error("expected error for incomplete EC JWK")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_WrongKeyType(t *testing.T) {
-	_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "RSA",
-	})
-	if err == nil {
-		t.Error("expected error for RSA key type")
-	}
 }
 
 func TestCreateChallenge_NotSupported(t *testing.T) {

@@ -2,13 +2,9 @@ package service
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,6 +19,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -304,7 +301,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	jkt, err := computeJKT(cnfJWK)
+	jkt, err := jwk.Thumbprint(cnfJWK)
 	if err != nil {
 		s.emitAuditFailure("jkt_compute_failed", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
@@ -381,7 +378,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 	}
 
 	// Parse the public key from JWK for signature verification
-	pubKey, err := parseECPublicKeyFromJWK(jwkMap)
+	pubKey, err := jwk.ParseECPublicKey(jwkMap)
 	if err != nil {
 		return nil, fmt.Errorf("parse pop jwk: %w", err)
 	}
@@ -581,117 +578,6 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	}
 
 	return tokenString, nil
-}
-
-// computeJKT computes the JWK Thumbprint (RFC 7638) for the given JWK.
-func computeJKT(jwk map[string]interface{}) (string, error) {
-	// For EC keys, thumbprint input is {"crv":"...","kty":"EC","x":"...","y":"..."}
-	kty, _ := jwk["kty"].(string)
-	if kty != "EC" {
-		return "", fmt.Errorf("unsupported key type for JKT: %s", kty)
-	}
-
-	crv, _ := jwk["crv"].(string)
-	x, _ := jwk["x"].(string)
-	y, _ := jwk["y"].(string)
-
-	if crv == "" || x == "" || y == "" {
-		return "", errors.New("incomplete EC JWK (missing crv, x, or y)")
-	}
-
-	// RFC 7638: JSON with lexicographic order of required members.
-	// Using a struct with ordered fields ensures deterministic serialization.
-	thumbprintInput := struct {
-		Crv string `json:"crv"`
-		Kty string `json:"kty"`
-		X   string `json:"x"`
-		Y   string `json:"y"`
-	}{
-		Crv: crv,
-		Kty: kty,
-		X:   x,
-		Y:   y,
-	}
-
-	data, err := json.Marshal(thumbprintInput)
-	if err != nil {
-		return "", fmt.Errorf("marshal JKT input: %w", err)
-	}
-
-	hash := sha256.Sum256(data)
-	return base64.RawURLEncoding.EncodeToString(hash[:]), nil
-}
-
-// parseECPublicKeyFromJWK parses an EC public key from a JWK map.
-// Only P-256 is accepted (consistent with ES256-only PoP validation).
-func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
-	kty, _ := jwk["kty"].(string)
-	if kty != "EC" {
-		return nil, fmt.Errorf("unsupported key type: %s", kty)
-	}
-
-	crv, _ := jwk["crv"].(string)
-	xB64, _ := jwk["x"].(string)
-	yB64, _ := jwk["y"].(string)
-
-	if crv == "" || xB64 == "" || yB64 == "" {
-		return nil, errors.New("incomplete EC JWK")
-	}
-
-	if crv != "P-256" {
-		return nil, fmt.Errorf("unsupported curve %q: only P-256 is accepted for WIA PoP", crv)
-	}
-
-	xBytes, err := base64.RawURLEncoding.DecodeString(xB64)
-	if err != nil {
-		return nil, fmt.Errorf("decode x: %w", err)
-	}
-	yBytes, err := base64.RawURLEncoding.DecodeString(yB64)
-	if err != nil {
-		return nil, fmt.Errorf("decode y: %w", err)
-	}
-
-	curve := ellipticCurveForName(crv)
-	if curve == nil {
-		return nil, fmt.Errorf("unsupported curve: %s", crv)
-	}
-
-	// Validate coordinate lengths match the curve's field size.
-	byteLen := (curve.Params().BitSize + 7) / 8
-	if len(xBytes) > byteLen || len(yBytes) > byteLen {
-		return nil, fmt.Errorf("invalid %s coordinate length: x=%d y=%d (expected <= %d)", crv, len(xBytes), len(yBytes), byteLen)
-	}
-
-	// Build uncompressed point encoding: 0x04 || x || y
-	// Pad x and y to the correct length
-	for len(xBytes) < byteLen {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < byteLen {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-	uncompressed := make([]byte, 1+2*byteLen)
-	uncompressed[0] = 0x04
-	copy(uncompressed[1:1+byteLen], xBytes)
-	copy(uncompressed[1+byteLen:], yBytes)
-
-	pubKey, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
-	if err != nil {
-		return nil, fmt.Errorf("invalid EC point: %w", err)
-	}
-
-	return pubKey, nil
-}
-
-// ellipticCurveForName returns the elliptic curve for the given JWK crv name.
-// Only P-256 is supported (consistent with ES256-only PoP validation).
-func ellipticCurveForName(name string) elliptic.Curve {
-	switch name {
-	case "P-256":
-		return elliptic.P256()
-	default:
-		return nil
-	}
 }
 
 // CleanupExpiredChallenges removes expired challenges from the store.
