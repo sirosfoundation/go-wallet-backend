@@ -52,6 +52,12 @@ type WIAGenerateRequest struct {
 	Pop string `json:"pop" binding:"required"`
 	// Challenge is the nonce from the challenge endpoint
 	Challenge string `json:"challenge" binding:"required"`
+	// ClientID is the OAuth client_id this wallet instance uses in OID4VCI/OID4VP
+	// flows (defaults to its redirect_uri, per OID4VCI's unregistered-client
+	// convention - see OID4VCIHandler.clientID). Embedded as the WIA JWT's
+	// `sub` claim: draft-ietf-oauth-attestation-based-client-auth-10 requires
+	// "the sub claim MUST specify client_id value of the OAuth Client".
+	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
@@ -85,6 +91,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), tenantID, userID, &service.WIARequest{
 		Pop:               req.Pop,
 		Challenge:         req.Challenge,
+		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
 	})
 	if err != nil {

@@ -242,6 +242,51 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	if claims["iss"] != nil {
 		t.Error("WIA should not have iss claim (identity from x5c)")
 	}
+
+	// sub falls back to the instance identifier (jkt) when no client_id is
+	// supplied - draft-ietf-oauth-attestation-based-client-auth-10 only
+	// requires sub=client_id when the WIA is actually used for OAuth client
+	// authentication (see TestWIAService_GenerateWIA_SubEqualsClientID).
+	jkt, _ := cnf["jkt"].(string)
+	if claims["sub"] != jkt {
+		t.Errorf("sub = %v, want jkt %v (no client_id supplied)", claims["sub"], jkt)
+	}
+}
+
+// draft-ietf-oauth-attestation-based-client-auth-10: "the sub claim MUST
+// specify client_id value of the OAuth Client" - when the caller (the OID4VCI
+// engine, via BackendApiClient.generateWIA) supplies its client_id, the WIA's
+// sub must reflect it instead of the instance identifier (jkt) - confirmed
+// against a real geneva2026.mdoc.online conformance run that flagged sub=jkt
+// as a FAIL ("must specify client_id value").
+func TestWIAService_GenerateWIA_SubEqualsClientID(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+		ClientID:  "siros-sample://callback",
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	if claims["sub"] != "siros-sample://callback" {
+		t.Errorf("sub = %v, want siros-sample://callback (the supplied client_id)", claims["sub"])
+	}
 }
 
 // TestWIAService_GenerateWIA_RecordsUserID is a regression test: the

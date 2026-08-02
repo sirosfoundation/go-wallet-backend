@@ -263,6 +263,8 @@ type WIARequest struct {
 	Pop string `json:"pop"`
 	// Challenge is the nonce from CreateChallenge
 	Challenge string `json:"challenge"`
+	// ClientID, when provided, is embedded as the WIA JWT's `sub` claim (see signWIA).
+	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
@@ -347,7 +349,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -446,7 +448,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
 	now := time.Now()
 
 	// Use global attestation lifetime, capped by WIA max expiry
@@ -464,8 +466,17 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		lifetime = maxExpiry
 	}
 
+	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
+	// claim MUST specify client_id value of the OAuth Client" - NOT the
+	// instance identifier (that's what cnf.jkt is for). Falls back to jkt
+	// when the caller doesn't supply a client_id (e.g. a WIA requested for
+	// something other than OID4VCI/OID4VP client authentication).
+	sub := clientID
+	if sub == "" {
+		sub = jkt
+	}
 	claims := jwt.MapClaims{
-		"sub": jkt, // wallet instance identifier (JWK Thumbprint)
+		"sub": sub,
 		"jti": uuid.New().String(),
 		"cnf": map[string]interface{}{
 			"jwk": cnfJWK,
