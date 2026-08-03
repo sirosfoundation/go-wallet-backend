@@ -3,6 +3,7 @@ package engine
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -383,6 +384,50 @@ func TestSSETransport_ServeSSE_ReplayAndStream(t *testing.T) {
 	}
 	require.GreaterOrEqual(t, len(ids), 1)
 	assert.Equal(t, "evt-2", ids[0])
+}
+
+// TestSSETransport_ServeSSE_RejectsConcurrentConnection is a regression test:
+// a second GET /events for the same session while a first is still
+// connected must not silently displace the first (which would orphan its
+// handler goroutine and split the event stream unpredictably).
+func TestSSETransport_ServeSSE_RejectsConcurrentConnection(t *testing.T) {
+	tr := newSSETransport(200)
+	defer func() { _ = tr.Close() }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tr.serveSSE(w, r)
+	}))
+	defer ts.Close()
+
+	// First connection: hold it open (no Last-Event-ID, blocks in the select).
+	req1, _ := http.NewRequest(http.MethodGet, ts.URL, nil)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	req1 = req1.WithContext(ctx1)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	defer resp1.Body.Close()
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+
+	// Give the handler a moment to register as the active writer.
+	require.Eventually(t, func() bool {
+		tr.sseMu.Lock()
+		defer tr.sseMu.Unlock()
+		return tr.sseW != nil
+	}, time.Second, 5*time.Millisecond)
+
+	// Second connection while the first is still active must be rejected.
+	resp2, err := http.Get(ts.URL) //nolint:noctx // test-only, simple GET
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp2.StatusCode)
+
+	// The first connection must remain registered (rejection must not have
+	// touched sseW/sseFl/sseCtx).
+	tr.sseMu.Lock()
+	stillRegistered := tr.sseW != nil
+	tr.sseMu.Unlock()
+	assert.True(t, stillRegistered, "first connection should remain registered")
 }
 
 // --- extractBearerToken tests ---

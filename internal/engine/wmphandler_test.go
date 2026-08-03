@@ -55,7 +55,7 @@ func TestWMP_SessionCreate_Success(t *testing.T) {
 		Auth:     &wmp.AuthObject{Type: "bearer", Token: testToken("user-1", "tenant-a")},
 	})
 
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -77,7 +77,7 @@ func TestWMP_SessionCreate_NoAuth(t *testing.T) {
 		Security: wmp.SecurityMode{Mode: "tls"},
 	})
 
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -96,7 +96,7 @@ func TestWMP_SessionCreate_ExpiredToken(t *testing.T) {
 		Auth:     &wmp.AuthObject{Type: "bearer", Token: expiredToken("user-1")},
 	})
 
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -115,13 +115,181 @@ func TestWMP_SessionCreate_EmptyToken(t *testing.T) {
 		Auth:     &wmp.AuthObject{Type: "bearer", Token: ""},
 	})
 
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
 	require.NoError(t, json.Unmarshal(resp, &rpcResp))
 	assert.NotNil(t, rpcResp.Error)
 	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
+}
+
+// --- HandleRPC: session.resume ---
+
+// createWMPSessionWithToken is like createWMPSession but also returns the
+// resumption token, needed by the resume tests below.
+func createWMPSessionWithToken(t *testing.T, a *WMPAdapter, userID, tenantID string) (sessionID, resumptionToken string) {
+	t.Helper()
+	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
+		WMP:      wmp.Metadata{Version: wmp.Version},
+		Security: wmp.SecurityMode{Mode: "tls"},
+		Auth:     &wmp.AuthObject{Type: "bearer", Token: testToken(userID, tenantID)},
+	})
+
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.Nil(t, rpcResp.Error, "session.create failed: %v", rpcResp.Error)
+
+	var result wmp.SessionCreateResult
+	require.NoError(t, json.Unmarshal(rpcResp.Result, &result))
+	return result.WMP.SessionID, result.ResumptionToken
+}
+
+func TestWMP_SessionResume_Success(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	sessionID, token := createWMPSessionWithToken(t, a, "user-1", "tenant-a")
+
+	body := wmpRequest("2", "wmp.session.resume", wmp.SessionResumeParams{
+		WMP:             wmp.Metadata{Version: wmp.Version},
+		SessionID:       sessionID,
+		ResumptionToken: token,
+	})
+
+	resp, err := a.HandleRPC(context.Background(), "", "user-1", "tenant-a", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.Nil(t, rpcResp.Error, "session.resume failed: %v", rpcResp.Error)
+
+	var result wmp.SessionResumeResult
+	require.NoError(t, json.Unmarshal(rpcResp.Result, &result))
+	assert.True(t, result.Resumed)
+	assert.NotEmpty(t, result.ResumptionToken)
+	assert.NotEqual(t, token, result.ResumptionToken, "resumption token should rotate")
+}
+
+// TestWMP_SessionResume_IdentityMismatch is a regression test for a session
+// hijack: possession of a valid resumption token alone must not be enough
+// to resume another user's session.
+func TestWMP_SessionResume_IdentityMismatch(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	sessionID, token := createWMPSessionWithToken(t, a, "user-1", "tenant-a")
+
+	body := wmpRequest("2", "wmp.session.resume", wmp.SessionResumeParams{
+		WMP:             wmp.Metadata{Version: wmp.Version},
+		SessionID:       sessionID,
+		ResumptionToken: token,
+	})
+
+	// Attacker: valid bearer token for a *different* user, but has somehow
+	// obtained user-1's resumption token and session ID.
+	resp, err := a.HandleRPC(context.Background(), "", "user-2", "tenant-a", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.NotNil(t, rpcResp.Error, "expected resume to be rejected")
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
+}
+
+func TestWMP_SessionResume_TenantMismatch(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	sessionID, token := createWMPSessionWithToken(t, a, "user-1", "tenant-a")
+
+	body := wmpRequest("2", "wmp.session.resume", wmp.SessionResumeParams{
+		WMP:             wmp.Metadata{Version: wmp.Version},
+		SessionID:       sessionID,
+		ResumptionToken: token,
+	})
+
+	// Same user ID, but a different tenant context — must still be rejected.
+	resp, err := a.HandleRPC(context.Background(), "", "user-1", "tenant-b", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.NotNil(t, rpcResp.Error, "expected resume to be rejected")
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
+}
+
+func TestWMP_SessionResume_InvalidToken(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	sessionID, _ := createWMPSessionWithToken(t, a, "user-1", "tenant-a")
+
+	body := wmpRequest("2", "wmp.session.resume", wmp.SessionResumeParams{
+		WMP:             wmp.Metadata{Version: wmp.Version},
+		SessionID:       sessionID,
+		ResumptionToken: "not-a-real-token",
+	})
+
+	resp, err := a.HandleRPC(context.Background(), "", "user-1", "tenant-a", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.NotNil(t, rpcResp.Error)
+	assert.Equal(t, wmp.ErrSessionNotFound, rpcResp.Error.Code)
+}
+
+// TestWMP_CloseSessionIfCurrent_SkipsSupersededSession is a regression test
+// for a race in resume: the peer.Serve goroutine started by
+// handleSessionCreate/handleSessionResume runs a's cleanup when Serve
+// returns, which happens whenever the *old* transport is closed — including
+// when a resume closes it deliberately to install a *new* wmpSession for the
+// same ID. The old goroutine's cleanup must be a no-op once superseded,
+// rather than deleting the new session out from under the client that just
+// resumed it.
+func TestWMP_CloseSessionIfCurrent_SkipsSupersededSession(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	const sessionID = "session-under-test"
+	session := &Session{ID: sessionID, UserID: "user-1", logger: zap.NewNop()}
+	m.registerSession(session)
+
+	staleWS := &wmpSession{
+		transport: wmp.NewChannelTransport(1, 1),
+		session:   session,
+		cancel:    func() {},
+	}
+	currentWS := &wmpSession{
+		transport: wmp.NewChannelTransport(1, 1),
+		session:   session,
+		cancel:    func() {},
+	}
+
+	a.mu.Lock()
+	a.peers[sessionID] = currentWS
+	a.mu.Unlock()
+
+	// Simulate the pre-resume goroutine's Serve() returning and running its
+	// deferred cleanup *after* a resume has already installed currentWS.
+	a.closeSessionIfCurrent(sessionID, staleWS)
+
+	a.mu.RLock()
+	got, ok := a.peers[sessionID]
+	a.mu.RUnlock()
+	require.True(t, ok, "resumed session must survive the superseded goroutine's cleanup")
+	assert.Same(t, currentWS, got)
+
+	// The current session's own cleanup must still work normally.
+	a.closeSessionIfCurrent(sessionID, currentWS)
+	a.mu.RLock()
+	_, ok = a.peers[sessionID]
+	a.mu.RUnlock()
+	assert.False(t, ok, "current session should be removed by its own cleanup")
 }
 
 // --- HandleRPC: missing session ---
@@ -131,7 +299,7 @@ func TestWMP_HandleRPC_MissingSession(t *testing.T) {
 	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.flow.start", map[string]string{"flow_type": "test"})
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -145,7 +313,7 @@ func TestWMP_HandleRPC_UnknownSession(t *testing.T) {
 	defer cleanupWMP(a, m)
 
 	body := wmpRequest("1", "wmp.flow.start", map[string]string{"flow_type": "test"})
-	resp, err := a.HandleRPC(context.Background(), "nonexistent-session", body)
+	resp, err := a.HandleRPC(context.Background(), "nonexistent-session", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -168,7 +336,7 @@ func TestWMP_FlowStart_UnknownProtocol(t *testing.T) {
 		FlowID:   "flow-1",
 	})
 
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -198,7 +366,7 @@ func TestWMP_FlowStart_WithMockHandler(t *testing.T) {
 		FlowID:   "flow-1",
 	})
 
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -261,7 +429,7 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 		FlowType: "sign_test",
 		FlowID:   "flow-sign",
 	})
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	var startResp wmp.Response
@@ -375,7 +543,7 @@ func TestWMP_FlowAction_GenericAction(t *testing.T) {
 		FlowType: "action_test",
 		FlowID:   "flow-action",
 	})
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	// Give the handler goroutine time to reach WaitForAction.
@@ -390,7 +558,7 @@ func TestWMP_FlowAction_GenericAction(t *testing.T) {
 		Params: consentPayload,
 	})
 
-	resp, err = a.HandleRPC(context.Background(), sessionID, body)
+	resp, err = a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	var actionResp wmp.Response
@@ -417,7 +585,7 @@ func TestWMP_FlowAction_UnknownFlow(t *testing.T) {
 		Action: "consent",
 	})
 
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response
@@ -545,7 +713,7 @@ func TestWMP_MessageTranslation_Progress(t *testing.T) {
 		FlowType: "translate_test",
 		FlowID:   "flow-translate",
 	})
-	resp, err := a.HandleRPC(context.Background(), sessionID, body)
+	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
 	var startResp wmp.Response
 	require.NoError(t, json.Unmarshal(resp, &startResp))
@@ -613,7 +781,7 @@ func createWMPSession(t *testing.T, a *WMPAdapter) string {
 		Auth:     &wmp.AuthObject{Type: "bearer", Token: testToken("user-1", "tenant-a")},
 	})
 
-	resp, err := a.HandleRPC(context.Background(), "", body)
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response

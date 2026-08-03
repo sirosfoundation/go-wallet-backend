@@ -170,7 +170,11 @@ func (a *WMPAdapter) touchSession(sessionID string) {
 // HandleRPC handles a single JSON-RPC request (from HTTP POST /wmp/rpc).
 // The sessionID is extracted from the request's Wmp-Session-Id header by the
 // HTTP handler and passed here; empty for session.create.
-func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID string, body []byte) ([]byte, error) {
+// userID and tenantID are the identity validated from the caller's bearer
+// token by the HTTP layer (HandleWMPRPC). They are required to authorize
+// wmp.session.resume against the session being resumed — see
+// handleSessionResume.
+func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID string, body []byte) ([]byte, error) {
 	// For session.create we don't have a peer yet — peek at the method.
 	var peek struct {
 		Method string `json:"method"`
@@ -183,7 +187,7 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID string, body []byt
 		return a.handleSessionCreate(ctx, body)
 	}
 	if peek.Method == wmp.MethodSessionResume {
-		return a.handleSessionResume(ctx, body)
+		return a.handleSessionResume(ctx, userID, tenantID, body)
 	}
 
 	// All other methods require an existing session.
@@ -237,6 +241,35 @@ func (a *WMPAdapter) CloseSession(sessionID string) {
 		_ = ws.transport.Close()
 		a.manager.unregisterSession(ws.session)
 	}
+}
+
+// closeSessionIfCurrent tears down sessionID's peer.Serve goroutine cleanup,
+// but only if ws is still the active wmpSession for that ID. It is used by
+// the deferred cleanup in the goroutine started by handleSessionCreate/
+// handleSessionResume: peer.Serve returning (e.g. because a resume closed
+// this peer's transport) does not by itself mean the session as a whole
+// should be torn down — a resume may have already installed a new
+// wmpSession for the same ID, and that replacement must not be destroyed by
+// the outgoing goroutine's own cleanup.
+func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
+	a.mu.Lock()
+	current, ok := a.peers[sessionID]
+	if !ok || current != ws {
+		// Superseded by a resume (or already removed) — nothing to do.
+		a.mu.Unlock()
+		return
+	}
+	delete(a.peers, sessionID)
+	for token, entry := range a.resumptionTokens {
+		if entry.sessionID == sessionID {
+			delete(a.resumptionTokens, token)
+		}
+	}
+	a.mu.Unlock()
+
+	ws.cancel()
+	_ = ws.transport.Close()
+	a.manager.unregisterSession(ws.session)
 }
 
 // handleSessionCreate creates a new engine session and wmp.Peer.
@@ -362,7 +395,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 	// to outbound Call() requests, if any).
 	go func() {
 		_ = peer.Serve(sessionCtx)
-		a.CloseSession(sessionID)
+		a.closeSessionIfCurrent(sessionID, ws)
 	}()
 
 	// Build response with capability negotiation.
@@ -471,7 +504,14 @@ func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) 
 
 // handleSessionResume validates a resumption token, rotates it, and reconnects
 // the client to the existing engine session with a new transport/peer.
-func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]byte, error) {
+//
+// userID/tenantID are the bearer-authenticated identity from the HTTP layer.
+// Possession of a resumption token alone is not sufficient to resume a
+// session — without also checking that the caller's identity matches the
+// session's owner, any authenticated user who obtains another user's
+// resumption token (e.g. via a leaked SSE reconnect URL) could take over
+// their session.
+func (a *WMPAdapter) handleSessionResume(ctx context.Context, userID, tenantID string, body []byte) ([]byte, error) {
 	var req struct {
 		JSONRPC string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
@@ -521,6 +561,15 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 		return wmpErrorBytes(req.ID, wmp.ErrSessionNotFound, nil)
 	}
 
+	// Reject resume attempts where the bearer-authenticated caller doesn't
+	// own the session — a valid resumption token is not sufficient on its
+	// own (see doc comment above).
+	if oldWS.session.UserID != userID || (tenantID != "" && oldWS.session.TenantID != tenantID) {
+		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
+			"reason": "resumption token does not belong to the authenticated caller",
+		})
+	}
+
 	// Close the old transport (SSE connection may have dropped) but keep the
 	// engine session alive.
 	oldWS.cancel()
@@ -558,7 +607,7 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, body []byte) ([]by
 
 	go func() {
 		_ = peer.Serve(sessionCtx)
-		a.CloseSession(params.SessionID)
+		a.closeSessionIfCurrent(params.SessionID, ws)
 	}()
 
 	// Issue a new rotated token.

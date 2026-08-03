@@ -102,15 +102,17 @@ func (t *sseTransport) SendJSON(msg interface{}) error {
 	}
 	t.bufMu.Unlock()
 
-	// Write to SSE stream if connected.
+	// Write to SSE stream if connected. sseMu is held for the whole
+	// write+flush, not just the pointer read: two SendJSON calls racing on
+	// the same connection (e.g. from concurrent engine goroutines) would
+	// otherwise interleave their Fprintf output and corrupt the SSE frame
+	// stream, since Fprintf+Flush together aren't atomic.
 	t.sseMu.Lock()
-	w, fl, ctx := t.sseW, t.sseFl, t.sseCtx
-	t.sseMu.Unlock()
-
-	if w != nil && ctx != nil && ctx.Err() == nil {
-		_, _ = fmt.Fprintf(w, "id: %s\nevent: message\ndata: %s\n\n", id, data)
-		fl.Flush()
+	if t.sseW != nil && t.sseCtx != nil && t.sseCtx.Err() == nil {
+		_, _ = fmt.Fprintf(t.sseW, "id: %s\nevent: message\ndata: %s\n\n", id, data)
+		t.sseFl.Flush()
 	}
+	t.sseMu.Unlock()
 
 	return nil
 }
@@ -153,12 +155,34 @@ func (t *sseTransport) serveSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check-and-register as the active SSE writer, and replay missed events,
+	// all under sseMu as one atomic section. This closes two races:
+	//   - Two connections both passing an earlier separate "already
+	//     connected?" check before either registers, each overwriting the
+	//     other's registration (only the last write survives, orphaning the
+	//     first connection's goroutine forever blocked on
+	//     <-r.Context().Done(), and splitting the event stream between them
+	//     unpredictably).
+	//   - A concurrent SendJSON interleaving its own sseMu-held write with
+	//     this replay's writes to the same http.ResponseWriter, corrupting
+	//     the SSE frame stream (Fprintf+Flush aren't atomic on their own).
+	//
+	// The reject check must run before anything is written: a flusher.Flush
+	// with no explicit WriteHeader call implicitly sends 200, and calling
+	// http.Error afterward can only log a "superfluous WriteHeader" warning
+	// and fail to actually change the response's status.
+	t.sseMu.Lock()
+	if t.sseW != nil && t.sseCtx != nil && t.sseCtx.Err() == nil {
+		t.sseMu.Unlock()
+		http.Error(w, "another connection is already streaming events for this session", http.StatusConflict)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
 
-	// Replay missed events.
 	lastEventID := r.Header.Get("Last-Event-ID")
 	if lastEventID != "" {
 		t.bufMu.Lock()
@@ -177,8 +201,6 @@ func (t *sseTransport) serveSSE(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// Register as active SSE writer.
-	t.sseMu.Lock()
 	t.sseW = w
 	t.sseFl = flusher
 	t.sseCtx = r.Context()

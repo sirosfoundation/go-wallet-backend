@@ -53,7 +53,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Dispatch.
-	resp, err := a.HandleRPC(r.Context(), sessionID, body)
+	resp, err := a.HandleRPC(r.Context(), sessionID, userID, tenantID, body)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
