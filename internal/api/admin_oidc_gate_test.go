@@ -119,7 +119,7 @@ func TestCreateTenant_OIDCGate_BindIdentityLoginOnly(t *testing.T) {
 	router.POST("/admin/tenants", h.CreateTenant)
 
 	bindTrue := true
-	body, _ := json.Marshal(TenantRequest{
+	body, err := json.Marshal(TenantRequest{
 		ID:   "bind-login",
 		Name: "Bind Login Tenant",
 		OIDCGate: &OIDCGateRequest{
@@ -131,6 +131,9 @@ func TestCreateTenant_OIDCGate_BindIdentityLoginOnly(t *testing.T) {
 			},
 		},
 	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
