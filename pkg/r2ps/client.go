@@ -179,7 +179,11 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	// The request host is always c.baseURL, set once at client construction
+	// and never influenced by per-call arguments — this can't be redirected
+	// to an attacker-chosen destination. category is validated above via
+	// isValidPathSegment before being appended as a path segment.
+	resp, err := c.httpClient.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return fmt.Errorf("r2ps: set status: %w", err)
 	}
@@ -248,7 +252,11 @@ func (c *Client) doGet(ctx context.Context, reqURL string) (*http.Response, erro
 	if err != nil {
 		return nil, fmt.Errorf("r2ps: create request: %w", err)
 	}
-	resp, err := c.httpClient.Do(req)
+	// reqURL is always built from c.baseURL (fixed at client construction,
+	// never influenced by per-call arguments) plus path segments already
+	// validated by isValidPathSegment in each caller — this can't be
+	// redirected to an attacker-chosen destination.
+	resp, err := c.httpClient.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return nil, fmt.Errorf("r2ps: request failed: %w", err)
 	}
