@@ -23,6 +23,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // =============================================================================
@@ -555,7 +556,7 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, newR2PSClient(p.cfg))
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -577,6 +578,7 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
+	cfg    *config.Config
 	store  backend.Backend
 	logger *zap.Logger
 }
@@ -599,6 +601,7 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
 
 	return &AdminProvider{
+		cfg:    cfg,
 		store:  store,
 		logger: logger,
 	}, nil
@@ -630,7 +633,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger)
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, newR2PSClient(p.cfg))
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -759,4 +762,13 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 		return nil
 	}
 	return nil
+}
+
+// newR2PSClient creates an R2PS admin client from config.
+// Returns nil if R2PS admin is not configured.
+func newR2PSClient(cfg *config.Config) *r2ps.Client {
+	if cfg.R2PSAdmin.BaseURL == "" {
+		return nil
+	}
+	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL)
 }

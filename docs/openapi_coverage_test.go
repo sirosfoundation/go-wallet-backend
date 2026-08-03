@@ -57,7 +57,7 @@ func TestAdminOpenAPIRouteCoverage(t *testing.T) {
 	adminGroup := router.Group("/admin")
 	store := memory.NewStore()
 	logger := zap.NewNop()
-	handlers := api.NewAdminHandlers(store, logger)
+	handlers := api.NewAdminHandlers(store, logger, nil)
 	handlers.RegisterRoutes(adminGroup)
 
 	// Add /admin/status which is registered separately in the server
