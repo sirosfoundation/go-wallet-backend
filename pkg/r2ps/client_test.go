@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestIsValidPathSegment(t *testing.T) {
@@ -389,9 +390,9 @@ func TestGetKey_DecodeError(t *testing.T) {
 }
 
 func TestWithTimeout(t *testing.T) {
-	c := NewClient("http://example.invalid", WithTimeout(5))
-	if c.httpClient.Timeout != 5 {
-		t.Errorf("expected timeout 5, got %v", c.httpClient.Timeout)
+	c := NewClient("http://example.invalid", WithTimeout(5*time.Second))
+	if c.httpClient.Timeout != 5*time.Second {
+		t.Errorf("expected timeout 5s, got %v", c.httpClient.Timeout)
 	}
 }
 

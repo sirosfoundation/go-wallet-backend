@@ -89,7 +89,10 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "statuses", category)
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "statuses", category)
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -119,7 +122,10 @@ func (c *Client) GetClientStatuses(ctx context.Context, clientID, category strin
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "clients", clientID, category)
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "clients", clientID, category)
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -144,7 +150,10 @@ func (c *Client) GetStatus(ctx context.Context, category string, idx int) (*Stat
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -170,7 +179,10 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 	if !isValidPathSegment(category) {
 		return fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
+	if err != nil {
+		return fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	body := fmt.Sprintf(`{"status":%d}`, status)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(body))
@@ -197,7 +209,10 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 
 // ListKeys returns all public keys, optionally filtered by client_id.
 func (c *Client) ListKeys(ctx context.Context, clientID string) ([]PublicKeyInfo, error) {
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "keys")
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "keys")
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	if clientID != "" {
 		reqURL += "?client_id=" + url.QueryEscape(clientID)
 	}
@@ -226,7 +241,10 @@ func (c *Client) GetKey(ctx context.Context, kid string) (*PublicKeyInfo, error)
 	if !isValidPathSegment(kid) {
 		return nil, fmt.Errorf("%w: invalid kid %q", ErrInvalidInput, kid)
 	}
-	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "keys", kid)
+	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "keys", kid)
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	}
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
