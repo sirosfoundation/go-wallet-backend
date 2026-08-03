@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -301,7 +302,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			h := &OID4VPHandler{httpClient: srv.Client()}
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
 
 			authReq, err := h.fetchRequestFromURI(context.Background(), srv.URL)
 			if tt.wantErr {
@@ -315,6 +316,100 @@ func TestFetchRequestFromURI(t *testing.T) {
 			assert.Equal(t, tt.wantClientID, authReq.ClientID)
 		})
 	}
+}
+
+func TestParseRequest(t *testing.T) {
+	// A minimal by-value authorization request served by a reference URL,
+	// reused by every "fetch" case below.
+	referencedRequest := `{"client_id":"did:web:verifier","response_type":"vp_token","nonce":"fetched-nonce"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, referencedRequest)
+	}))
+	defer srv.Close()
+
+	// parseRequest calls h.ProgressMessage() unconditionally, which needs a
+	// real Flow/Session/conn behind it (see testSession/wsTestServer in
+	// match_test.go) or it panics on a nil websocket connection.
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+	t.Run("openid4vp scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	t.Run("openid4vp scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	// HAIP (OpenID4VC High Assurance Interoperability Profile) uses the same
+	// wire shape as plain OID4VP under its own scheme - regression test for a
+	// bug where haip:// fell through to the "direct URL" branch instead of
+	// being recognized and unwrapped the same way as openid4vp://.
+	t.Run("haip scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	t.Run("haip scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	// Regression test for a bug where a bare reference URL with no query
+	// string (e.g. a QR/link that IS itself the request_uri, no
+	// openid4vp://...&request_uri= wrapper at all) was parsed as if the
+	// entire URL string were a raw query string - silently yielding every
+	// field empty instead of being fetched.
+	t.Run("bare https URL with no query is fetched as a reference", func(t *testing.T) {
+		msg := &FlowStartMessage{RequestURI: srv.URL}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	t.Run("bare https URL with inline query params is parsed directly", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "https://wallet.example.com/present?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	t.Run("no request provided", func(t *testing.T) {
+		msg := &FlowStartMessage{}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.Error(t, err)
+	})
 }
 
 // ===== DCQL query tests =====

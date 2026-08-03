@@ -201,12 +201,17 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
 	_ = h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
 
+	h.Logger.Debug("parsing authorization request", zap.String("request_uri", msg.RequestURI), zap.String("request_uri_ref", msg.RequestURIRef))
+
 	var authReq AuthorizationRequest
 
 	if msg.RequestURI != "" {
-		// Parse from openid4vp:// URL or direct URL
+		// Parse from openid4vp://, haip://, or a direct https:// URL. HAIP
+		// (OpenID4VC High Assurance Interoperability Profile) uses the same
+		// openid4vp://?client_id=...&request_uri=... wire shape as plain
+		// OID4VP, just under its own scheme - treat both identically.
 		requestStr := msg.RequestURI
-		if strings.HasPrefix(requestStr, "openid4vp://") {
+		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") {
 			u, err := url.Parse(requestStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid request URL: %w", err)
@@ -219,8 +224,23 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			// Parse inline parameters
 			return h.parseRequestFromURL(u)
 		}
-		// Direct URL
-		return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
+		// Direct https:// URL: either a by-value request with inline query
+		// parameters, or a bare reference URL (no query at all) that must be
+		// fetched to obtain the actual request object - e.g. a QR/link that
+		// itself IS the request_uri, with no openid4vp://... wrapper. A
+		// query-less URL can't carry inline params, so treating requestStr as
+		// a literal RawQuery in that case silently yields every field empty
+		// (this is exactly what broke: a bare https://.../haip-vp link with
+		// no "=" characters parsed to nonce="" and failed on "missing
+		// required 'nonce' parameter", never even attempting to fetch it).
+		u, err := url.Parse(requestStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request URL: %w", err)
+		}
+		if u.RawQuery == "" {
+			return h.fetchRequestFromURI(ctx, requestStr)
+		}
+		return h.parseRequestFromURL(u)
 	} else if msg.RequestURIRef != "" {
 		return h.fetchRequestFromURI(ctx, msg.RequestURIRef)
 	}
@@ -294,6 +314,7 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 }
 
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
+	h.Logger.Debug("fetching authorization request object", zap.String("uri", uri))
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, err
