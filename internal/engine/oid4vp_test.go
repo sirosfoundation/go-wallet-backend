@@ -396,6 +396,20 @@ func TestParseRequest(t *testing.T) {
 		assert.Equal(t, "fetched-nonce", authReq.Nonce)
 	})
 
+	// Regression test: a raw query string with no scheme/host at all (as
+	// validateResponseURIOrigin already anticipates) must be parsed as
+	// inline params, not misidentified as a reference URL to fetch - it has
+	// an empty RawQuery too (the whole string lands in url.URL.Path), so
+	// scheme/host presence, not RawQuery, has to be the discriminator.
+	t.Run("raw query string with no scheme is parsed directly", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "response_type=vp_token&client_id=https://verifier.example.com&nonce=raw-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "raw-nonce", authReq.Nonce)
+	})
+
 	t.Run("bare https URL with inline query params is parsed directly", func(t *testing.T) {
 		msg := &FlowStartMessage{
 			RequestURI: "https://wallet.example.com/present?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
@@ -410,6 +424,41 @@ func TestParseRequest(t *testing.T) {
 		_, err := h.parseRequest(context.Background(), msg)
 		require.Error(t, err)
 	})
+}
+
+func TestHasURLScheme(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"https://verifier.example.com", true},
+		{"http://127.0.0.1:8080", true},
+		{"openid4vp://?client_id=foo", true},
+		{"haip://?client_id=foo", true},
+		{"", false},
+		{"client_id=foo&nonce=bar", false},
+		{"response_type=vp_token&client_id=https://verifier.example.com", false},
+		{"://missing-scheme", false},
+		{"1https://bad-first-char", false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, hasURLScheme(tc.in), "hasURLScheme(%q)", tc.in)
+	}
+}
+
+func TestRedactURIForLogging(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"https://verifier.example.com/req?nonce=secret&client_id=foo", "https://verifier.example.com"},
+		{"client_id=foo&nonce=secret", "<non-url>"},
+		{"not a url at all", "<non-url>"},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, redactURIForLogging(tc.in), "redactURIForLogging(%q)", tc.in)
+	}
 }
 
 // ===== DCQL query tests =====

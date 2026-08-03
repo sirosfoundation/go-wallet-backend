@@ -201,7 +201,9 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
 	_ = h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
 
-	h.Logger.Debug("parsing authorization request", zap.String("request_uri", msg.RequestURI), zap.String("request_uri_ref", msg.RequestURIRef))
+	h.Logger.Debug("parsing authorization request",
+		zap.String("request_uri", redactURIForLogging(msg.RequestURI)),
+		zap.String("request_uri_ref", redactURIForLogging(msg.RequestURIRef)))
 
 	var authReq AuthorizationRequest
 
@@ -223,6 +225,19 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			}
 			// Parse inline parameters
 			return h.parseRequestFromURL(u)
+		}
+		// requestStr may be a raw query string with no scheme at all (e.g.
+		// "client_id=foo&nonce=bar", as validateResponseURIOrigin already
+		// anticipates) rather than a URL. Anything that doesn't itself start
+		// with a URL scheme is a raw query string - parse it as inline
+		// params directly, the same as before this fix. This check must
+		// come before ever calling url.Parse on requestStr: a raw query
+		// string can contain a "://" inside a parameter value (e.g.
+		// client_id=https://verifier...), which url.Parse rejects with
+		// "first path segment ... cannot contain colon" since the string
+		// itself has no leading scheme.
+		if !hasURLScheme(requestStr) {
+			return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
 		}
 		// Direct https:// URL: either a by-value request with inline query
 		// parameters, or a bare reference URL (no query at all) that must be
@@ -246,6 +261,48 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 	}
 
 	return &authReq, errors.New("no request provided")
+}
+
+// hasURLScheme reports whether s begins with a URL scheme ("scheme://...",
+// per RFC 3986: a letter followed by letters/digits/+/-/. up to "://").
+// Used to tell an actual URL apart from a raw query string that happens to
+// contain "://" inside a parameter value.
+func hasURLScheme(s string) bool {
+	idx := strings.Index(s, "://")
+	if idx <= 0 {
+		return false
+	}
+	scheme := s[:idx]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		isDigit := c >= '0' && c <= '9'
+		if !isLetter && !isDigit && c != '+' && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// redactURIForLogging returns a form of uri safe to log: scheme and host
+// only. The query string (and, for a bare raw-query value, the entire
+// string) may carry sensitive material - nonces, reference tokens, embedded
+// JWTs - so neither is ever included.
+func redactURIForLogging(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "<non-url>"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, error) {
@@ -314,7 +371,7 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 }
 
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
-	h.Logger.Debug("fetching authorization request object", zap.String("uri", uri))
+	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, err
