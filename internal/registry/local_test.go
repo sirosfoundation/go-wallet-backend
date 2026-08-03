@@ -120,6 +120,42 @@ func TestLoadLocalOverrides_MissingVCT(t *testing.T) {
 	}
 }
 
+func TestLoadLocalOverrides_MDocOnly(t *testing.T) {
+	// An mdoc-only override has no "vct" at all — "doctype" plus display[]
+	// name/description must still be recognized.
+	dir := t.TempDir()
+	mddl := []byte(`{
+		"format": "mso_mdoc",
+		"doctype": "org.iso.18013.5.1.mDL",
+		"display": [{"locale": "en-US", "name": "mDL", "description": "Mobile Driving Licence"}]
+	}`)
+	fp := filepath.Join(dir, "mdl.json")
+	if err := os.WriteFile(fp, mddl, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(filepath.Join(dir, "cache.json"))
+	logger := zap.NewNop()
+
+	if err := LoadLocalOverrides(store, []string{fp}, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entry, ok := store.Get("org.iso.18013.5.1.mDL")
+	if !ok {
+		t.Fatal("entry not found in store, keyed by doctype")
+	}
+	if !entry.IsLocal {
+		t.Error("expected IsLocal=true")
+	}
+	if entry.Name != "mDL" {
+		t.Errorf("Name = %q, want %q", entry.Name, "mDL")
+	}
+	if entry.Description != "Mobile Driving Licence" {
+		t.Errorf("Description = %q, want %q", entry.Description, "Mobile Driving Licence")
+	}
+}
+
 func TestLoadLocalOverrides_FileError(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "cache.json"))
 	logger := zap.NewNop()
