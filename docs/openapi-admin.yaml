@@ -349,6 +349,142 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/tenants/{tenantId}/users/{userId}/credentials:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/userId'
+
+    get:
+      tags:
+        - Users
+      summary: List a user's passkey credentials
+      description: |
+        Returns the WebAuthn/passkey credentials registered for the user
+        within this tenant, including deactivated ones.
+      operationId: listUserCredentials
+      responses:
+        '200':
+          description: List of credentials
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  credentials:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminCredentialResponse'
+        '404':
+          description: User not found in tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}/credentials/deactivate-all:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/userId'
+
+    post:
+      tags:
+        - Users
+      summary: Deactivate all of a user's passkey credentials
+      description: |
+        Deactivates every currently-active WebAuthn/passkey credential for
+        the user, e.g. in response to a suspected compromise. Deactivated
+        credentials can no longer be used to authenticate.
+      operationId: deactivateAllUserCredentials
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeactivateCredentialRequest'
+            example:
+              reason: "Suspected device compromise"
+      responses:
+        '200':
+          description: All credentials deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+        '404':
+          description: User not found in tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: No active credentials to deactivate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}/credentials/{credId}/deactivate:
+    parameters:
+      - $ref: '#/components/parameters/tenantId'
+      - $ref: '#/components/parameters/userId'
+      - name: credId
+        in: path
+        required: true
+        description: The ID of the credential to deactivate
+        schema:
+          type: string
+        example: "cred-abc123"
+
+    post:
+      tags:
+        - Users
+      summary: Deactivate a single passkey credential
+      description: |
+        Deactivates one WebAuthn/passkey credential for the user. Once
+        deactivated, the credential can no longer be used to authenticate.
+      operationId: deactivateUserCredential
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeactivateCredentialRequest'
+            example:
+              reason: "Lost device"
+      responses:
+        '200':
+          description: Credential deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCredentialResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: User not found in tenant, or credential not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Credential already deactivated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/tenants/{tenantId}/issuers:
     parameters:
       - $ref: '#/components/parameters/tenantId'
@@ -878,6 +1014,53 @@ components:
           description: Success message
       example:
         message: "Operation completed successfully"
+
+    AdminCredentialResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: The credential ID
+        nickname:
+          type: string
+          nullable: true
+          description: User-assigned name for the credential, if set
+        status:
+          type: string
+          enum: [active, deactivated]
+        createTime:
+          type: string
+          format: date-time
+        lastUseTime:
+          type: string
+          format: date-time
+          nullable: true
+        prfCapable:
+          type: boolean
+          description: Whether the credential supports the WebAuthn PRF extension
+        deactivatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        deactivatedBy:
+          type: string
+          description: Identifier of who/what deactivated the credential
+        deactivationReason:
+          type: string
+      example:
+        id: "cred-abc123"
+        status: active
+        createTime: "2026-01-15T10:00:00Z"
+        prfCapable: true
+
+    DeactivateCredentialRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Optional free-text reason for deactivation, recorded for audit purposes
+      example:
+        reason: "Lost device"
 
     TenantRequest:
       type: object
