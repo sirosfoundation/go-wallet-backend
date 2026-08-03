@@ -1298,7 +1298,7 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	requestURL := msg.RequestURI
-	if strings.HasPrefix(requestURL, "openid4vp://") {
+	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") {
 		if u, err := url.Parse(requestURL); err == nil {
 			requestURL = u.Query().Get("request_uri")
 		}

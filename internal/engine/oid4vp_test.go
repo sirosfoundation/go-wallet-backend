@@ -1238,6 +1238,36 @@ func TestValidateResponseURIOrigin_OpenID4VPScheme(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// Regression test: parseRequest treats haip:// the same as openid4vp://,
+// but validateResponseURIOrigin only unwrapped openid4vp:// to find the
+// embedded request_uri. A HAIP request_uri parsed to an empty host and was
+// silently treated as "not a proper URL", skipping the origin check
+// entirely instead of enforcing it.
+func TestValidateResponseURIOrigin_HAIPScheme(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_HAIPScheme_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
+}
+
 func TestValidateResponseURIOrigin_SkipsNonX509Scheme(t *testing.T) {
 	// Origin check should be skipped for non-x509_san_dns schemes.
 	authReq := &AuthorizationRequest{
