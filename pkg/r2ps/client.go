@@ -3,12 +3,19 @@ package r2ps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// ErrInvalidInput is returned (wrapped) when a caller-supplied argument fails
+// validation before any request is sent to the R2PS service. Callers can use
+// errors.Is(err, ErrInvalidInput) to distinguish client input errors (400)
+// from upstream/network failures (502).
+var ErrInvalidInput = errors.New("r2ps: invalid input")
 
 // Client is a Go HTTP client for the go-r2ps-service admin API.
 type Client struct {
@@ -64,8 +71,24 @@ type StatusListEntry struct {
 	Label  string `json:"label"`
 }
 
+// isValidPathSegment reports whether s is safe to use as a single URL path
+// segment when building an R2PS admin API request path. url.JoinPath
+// normalizes ".." components (and treats "/" within an element as an
+// additional separator), so an unvalidated caller-supplied value could
+// escape the intended "admin/store/..." prefix and reach an unrelated path
+// on the R2PS service. Rejecting anything but a plain segment closes that off.
+func isValidPathSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	return !strings.ContainsAny(s, "/\\")
+}
+
 // ListStatuses returns all status entries for a category.
 func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusListEntry, error) {
+	if !isValidPathSegment(category) {
+		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
+	}
 	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "statuses", category)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
@@ -90,6 +113,12 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 
 // GetClientStatuses returns all status list indices for a given client in a category.
 func (c *Client) GetClientStatuses(ctx context.Context, clientID, category string) ([]int, error) {
+	if !isValidPathSegment(clientID) {
+		return nil, fmt.Errorf("%w: invalid client_id %q", ErrInvalidInput, clientID)
+	}
+	if !isValidPathSegment(category) {
+		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
+	}
 	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "clients", clientID, category)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
@@ -112,6 +141,9 @@ func (c *Client) GetClientStatuses(ctx context.Context, clientID, category strin
 
 // GetStatus returns the status for a specific index.
 func (c *Client) GetStatus(ctx context.Context, category string, idx int) (*StatusEntry, error) {
+	if !isValidPathSegment(category) {
+		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
+	}
 	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
@@ -135,6 +167,9 @@ func (c *Client) GetStatus(ctx context.Context, category string, idx int) (*Stat
 
 // SetStatus sets the status for a specific index.
 func (c *Client) SetStatus(ctx context.Context, category string, idx int, status int) error {
+	if !isValidPathSegment(category) {
+		return fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
+	}
 	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
 	body := fmt.Sprintf(`{"status":%d}`, status)
 
@@ -184,6 +219,9 @@ func (c *Client) ListKeys(ctx context.Context, clientID string) ([]PublicKeyInfo
 
 // GetKey returns a single public key by kid.
 func (c *Client) GetKey(ctx context.Context, kid string) (*PublicKeyInfo, error) {
+	if !isValidPathSegment(kid) {
+		return nil, fmt.Errorf("%w: invalid kid %q", ErrInvalidInput, kid)
+	}
 	reqURL, _ := url.JoinPath(c.baseURL, "admin", "store", "keys", kid)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {

@@ -1,12 +1,29 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
+
+const errR2PSQueryFailed = "failed to query R2PS service"
+
+// r2psErrorResponse maps an error from the R2PS client to the appropriate
+// HTTP status/body: 400 for caller input rejected before any request was
+// sent (r2ps.ErrInvalidInput), fallbackMsg with 502 for upstream/network
+// failures.
+func r2psErrorResponse(c *gin.Context, err error, fallbackMsg string) {
+	if errors.Is(err, r2ps.ErrInvalidInput) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": fallbackMsg})
+}
 
 // R2PSListKeys lists all WSCD public keys, optionally filtered by client_id.
 // GET /admin/r2ps/keys?client_id=...
@@ -16,7 +33,7 @@ func (h *AdminHandlers) R2PSListKeys(c *gin.Context) {
 	keys, err := h.r2psClient.ListKeys(c.Request.Context(), clientID)
 	if err != nil {
 		h.logger.Error("failed to list R2PS keys", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to query R2PS service"})
+		r2psErrorResponse(c, err, errR2PSQueryFailed)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"count": len(keys), "keys": keys})
@@ -30,7 +47,7 @@ func (h *AdminHandlers) R2PSGetKey(c *gin.Context) {
 	key, err := h.r2psClient.GetKey(c.Request.Context(), kid)
 	if err != nil {
 		h.logger.Error("failed to get R2PS key", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to query R2PS service"})
+		r2psErrorResponse(c, err, errR2PSQueryFailed)
 		return
 	}
 	if key == nil {
@@ -48,7 +65,7 @@ func (h *AdminHandlers) R2PSListStatuses(c *gin.Context) {
 	entries, err := h.r2psClient.ListStatuses(c.Request.Context(), category)
 	if err != nil {
 		h.logger.Error("failed to list R2PS statuses", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to query R2PS service"})
+		r2psErrorResponse(c, err, errR2PSQueryFailed)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -71,7 +88,7 @@ func (h *AdminHandlers) R2PSGetStatus(c *gin.Context) {
 	entry, err := h.r2psClient.GetStatus(c.Request.Context(), category, idx)
 	if err != nil {
 		h.logger.Error("failed to get R2PS status", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to query R2PS service"})
+		r2psErrorResponse(c, err, errR2PSQueryFailed)
 		return
 	}
 	if entry == nil {
@@ -106,7 +123,7 @@ func (h *AdminHandlers) R2PSSetStatus(c *gin.Context) {
 
 	if err := h.r2psClient.SetStatus(c.Request.Context(), category, idx, *req.Status); err != nil {
 		h.logger.Error("failed to set R2PS status", zap.Error(err))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to update R2PS status"})
+		r2psErrorResponse(c, err, "failed to update R2PS status")
 		return
 	}
 
