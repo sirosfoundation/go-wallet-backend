@@ -551,20 +551,46 @@ type DeactivateCredentialRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// requireTenantMember checks that userID is a member of tenantID, writing
+// the appropriate error response and returning false if not (or if the
+// membership check itself fails). Callers should return immediately when
+// this returns false.
+func (h *AdminHandlers) requireTenantMember(c *gin.Context, tenantID domain.TenantID, userID domain.UserID) bool {
+	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error("Failed to check tenant membership", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
+		return false
+	}
+	if !isMember {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+		return false
+	}
+	return true
+}
+
+// credentialToAdminResponse converts a domain WebauthnCredential to its admin API representation.
+func credentialToAdminResponse(cred domain.WebauthnCredential) AdminCredentialResponse {
+	return AdminCredentialResponse{
+		ID:                 cred.ID,
+		Nickname:           cred.Nickname,
+		Status:             cred.NormalizedStatus(),
+		CreateTime:         cred.CreatedAt,
+		LastUseTime:        cred.LastUseTime,
+		PRFCapable:         cred.PRFCapable,
+		DeactivatedAt:      cred.DeactivatedAt,
+		DeactivatedBy:      cred.DeactivatedBy,
+		DeactivationReason: cred.DeactivationReason,
+	}
+}
+
 // ListUserCredentials returns passkeys for a user.
 // GET /admin/tenants/:id/users/:user_id/credentials
 func (h *AdminHandlers) ListUserCredentials(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	userID := domain.UserIDFromString(c.Param("user_id"))
 
-	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
-	if err != nil {
-		h.logger.Error("Failed to check tenant membership", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
-		return
-	}
-	if !isMember {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+	if !h.requireTenantMember(c, tenantID, userID) {
 		return
 	}
 
@@ -588,17 +614,7 @@ func (h *AdminHandlers) ListUserCredentials(c *gin.Context) {
 		if credTenant != tenantID {
 			continue
 		}
-		resp = append(resp, AdminCredentialResponse{
-			ID:                 cred.ID,
-			Nickname:           cred.Nickname,
-			Status:             cred.NormalizedStatus(),
-			CreateTime:         cred.CreatedAt,
-			LastUseTime:        cred.LastUseTime,
-			PRFCapable:         cred.PRFCapable,
-			DeactivatedAt:      cred.DeactivatedAt,
-			DeactivatedBy:      cred.DeactivatedBy,
-			DeactivationReason: cred.DeactivationReason,
-		})
+		resp = append(resp, credentialToAdminResponse(cred))
 	}
 
 	c.JSON(http.StatusOK, gin.H{"credentials": resp})
@@ -615,14 +631,7 @@ func (h *AdminHandlers) DeactivateUserCredential(c *gin.Context) {
 		return
 	}
 
-	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
-	if err != nil {
-		h.logger.Error("Failed to check tenant membership", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
-		return
-	}
-	if !isMember {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+	if !h.requireTenantMember(c, tenantID, userID) {
 		return
 	}
 
@@ -645,17 +654,7 @@ func (h *AdminHandlers) DeactivateUserCredential(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, AdminCredentialResponse{
-		ID:                 cred.ID,
-		Nickname:           cred.Nickname,
-		Status:             cred.NormalizedStatus(),
-		CreateTime:         cred.CreatedAt,
-		LastUseTime:        cred.LastUseTime,
-		PRFCapable:         cred.PRFCapable,
-		DeactivatedAt:      cred.DeactivatedAt,
-		DeactivatedBy:      cred.DeactivatedBy,
-		DeactivationReason: cred.DeactivationReason,
-	})
+	c.JSON(http.StatusOK, credentialToAdminResponse(*cred))
 }
 
 // DeactivateAllUserCredentials deactivates all active credentials for a user.
@@ -664,14 +663,7 @@ func (h *AdminHandlers) DeactivateAllUserCredentials(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	userID := domain.UserIDFromString(c.Param("user_id"))
 
-	isMember, err := h.store.UserTenants().IsMember(c.Request.Context(), userID, tenantID)
-	if err != nil {
-		h.logger.Error("Failed to check tenant membership", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check tenant membership"})
-		return
-	}
-	if !isMember {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found in tenant"})
+	if !h.requireTenantMember(c, tenantID, userID) {
 		return
 	}
 
