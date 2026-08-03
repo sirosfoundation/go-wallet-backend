@@ -253,7 +253,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	sessionID := uuid.New().String()
 	logLabel := sessionID[:8]
 	if userID != "" {
-		logLabel = userID[:8]
+		logLabel = userID[:min(8, len(userID))]
 	}
 	session := &Session{
 		ID:            sessionID,
