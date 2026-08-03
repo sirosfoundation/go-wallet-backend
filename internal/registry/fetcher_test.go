@@ -373,6 +373,64 @@ func TestFetcher_FetchFromSource_TS11_FallbackToFirstSchemaURI(t *testing.T) {
 	require.Len(t, entries, 1)
 }
 
+func TestFetcher_FetchFromSource_TS11_FetchesAllFormats(t *testing.T) {
+	// A schema offering both an sd-jwt (VCTM) and an mso_mdoc (MDDL) document
+	// for the same logical credential must cache both, each under its own
+	// identifier — not just the sd-jwt one.
+	vctmContent := `{"vct":"urn:eudi:pid:1","name":"PID SD-JWT"}`
+	mddlContent := `{"format":"mso_mdoc","doctype":"eu.europa.ec.eudi.pid.1","display":[{"locale":"en-US","name":"PID mdoc"}]}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/pid.vctm.json":
+			_, _ = w.Write([]byte(vctmContent))
+		case "/pid.mdoc.json":
+			_, _ = w.Write([]byte(mddlContent))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	schemas := TS11SchemasResponse{
+		Schemas: []TS11SchemaMeta{
+			{
+				ID:               "pid-id",
+				Version:          "1.0.0",
+				SupportedFormats: []string{"dc+sd-jwt", "mso_mdoc"},
+				SchemaURIs: []TS11SchemaURI{
+					{FormatIdentifier: "dc+sd-jwt", URI: server.URL + "/pid.vctm.json"},
+					{FormatIdentifier: "mso_mdoc", URI: server.URL + "/pid.mdoc.json"},
+				},
+			},
+		},
+	}
+
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(schemas)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	sdjwtEntry, ok := entries["urn:eudi:pid:1"]
+	require.True(t, ok, "sd-jwt entry should be keyed on its vct")
+	assert.Equal(t, "PID SD-JWT", sdjwtEntry.Name)
+
+	mdocEntry, ok := entries["eu.europa.ec.eudi.pid.1"]
+	require.True(t, ok, "mdoc entry should be keyed on its doctype")
+	assert.Equal(t, "PID mdoc", mdocEntry.Name)
+	assert.Equal(t, []string{"dc+sd-jwt", "mso_mdoc"}, mdocEntry.SupportedFormats)
+}
+
 func TestFetcher_FetchFromSource_TS11_SkipsSchemaWithNoURIs(t *testing.T) {
 	schemas := TS11SchemasResponse{
 		Schemas: []TS11SchemaMeta{
@@ -1239,6 +1297,116 @@ func TestFetcher_FetchFromSource_RegistryFormat(t *testing.T) {
 	require.True(t, ok, "non-TS11 entry should be keyed on schema ID")
 	assert.Equal(t, "iso_18045_moderate", nonTS11Entry.AttestationLoS)
 	assert.Equal(t, []string{"mso_mdoc", "dc+sd-jwt"}, nonTS11Entry.SupportedFormats)
+}
+
+func TestFetcher_FetchFromSource_RegistryFormat_FetchesAllFormats(t *testing.T) {
+	// Same as TestFetcher_FetchFromSource_RegistryFormat's TS11 detail path,
+	// but the detail schema offers both an sd-jwt and an mso_mdoc document —
+	// both must be cached, not just the sd-jwt one.
+	vctmContent := `{"vct":"urn:eudi:pid:1","name":"PID SD-JWT"}`
+	mddlContent := `{"format":"mso_mdoc","doctype":"eu.europa.ec.eudi.pid.1","display":[{"locale":"en-US","name":"PID mdoc"}]}`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pid.vctm.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	})
+	mux.HandleFunc("/pid.mdoc.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mddlContent))
+	})
+	docServer := httptest.NewServer(mux)
+	defer docServer.Close()
+
+	registryMux := http.NewServeMux()
+	registryMux.HandleFunc("/api/v1/schemas/pid-id.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TS11SchemaMeta{
+			ID:               "pid-id",
+			Version:          "1.0.0",
+			SupportedFormats: []string{"dc+sd-jwt", "mso_mdoc"},
+			SchemaURIs: []TS11SchemaURI{
+				{FormatIdentifier: "dc+sd-jwt", URI: docServer.URL + "/pid.vctm.json"},
+				{FormatIdentifier: "mso_mdoc", URI: docServer.URL + "/pid.mdoc.json"},
+			},
+		})
+	})
+	registryMux.HandleFunc("/api/v1/registry.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RegistryResponse{
+			Total: 1,
+			Credentials: []RegistryListEntry{
+				{ID: "pid-id", Version: "1.0.0", SupportedFormats: []string{"dc+sd-jwt", "mso_mdoc"}},
+			},
+		})
+	})
+	registryServer := httptest.NewServer(registryMux)
+	defer registryServer.Close()
+
+	config := DefaultConfig()
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: registryServer.URL + "/api/v1/registry.json", Mode: APIModeRegistry}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+
+	sdjwtEntry, ok := entries["urn:eudi:pid:1"]
+	require.True(t, ok, "sd-jwt entry should be keyed on its vct")
+	assert.Equal(t, "PID SD-JWT", sdjwtEntry.Name)
+
+	mdocEntry, ok := entries["eu.europa.ec.eudi.pid.1"]
+	require.True(t, ok, "mdoc entry should be keyed on its doctype")
+	assert.Equal(t, "PID mdoc", mdocEntry.Name)
+}
+
+func TestFetcher_FetchFromSource_RegistryFormat_FilteredNotStubbed(t *testing.T) {
+	// A credential whose document was successfully fetched but excluded by
+	// the filter must not reappear as a stub keyed by schema ID — that would
+	// reintroduce something the filter was configured to exclude.
+	vctmContent := `{"vct":"urn:eudi:pid:1","name":"PID SD-JWT"}`
+
+	docServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer docServer.Close()
+
+	registryMux := http.NewServeMux()
+	registryMux.HandleFunc("/api/v1/schemas/pid-id.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(TS11SchemaMeta{
+			ID:               "pid-id",
+			Version:          "1.0.0",
+			SupportedFormats: []string{"dc+sd-jwt"},
+			SchemaURIs: []TS11SchemaURI{
+				{FormatIdentifier: "dc+sd-jwt", URI: docServer.URL + "/pid.vctm.json"},
+			},
+		})
+	})
+	registryMux.HandleFunc("/api/v1/registry.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(RegistryResponse{
+			Total: 1,
+			Credentials: []RegistryListEntry{
+				{ID: "pid-id", Version: "1.0.0", SupportedFormats: []string{"dc+sd-jwt"}},
+			},
+		})
+	})
+	registryServer := httptest.NewServer(registryMux)
+	defer registryServer.Close()
+
+	config := DefaultConfig()
+	config.Filter.ExcludePatterns = []string{"^urn:eudi:pid:"}
+	require.NoError(t, config.Filter.Compile())
+	fetcher := NewFetcher(config, NewStore(""), testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: registryServer.URL + "/api/v1/registry.json", Mode: APIModeRegistry}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+
+	// Neither the real (filtered) entry nor a schema-ID-keyed stub should be present.
+	assert.Empty(t, entries, "filtered-out credential must not reappear as a stub")
 }
 
 // TestConfig_Validate_InvalidMode verifies that invalid Mode values are rejected.
