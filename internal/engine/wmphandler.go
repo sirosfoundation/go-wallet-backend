@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -38,9 +39,109 @@ type WMPAdapter struct {
 	mu               sync.RWMutex
 	peers            map[string]*wmpSession      // keyed by WMP session ID
 	resumptionTokens map[string]*resumptionEntry // token -> entry with session ID and expiry
+	eventBufs        map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+}
+
+// maxWMPBufferedEvents bounds how many past SSE events are retained per
+// session for Last-Event-ID replay on reconnect (including across a
+// wmp.session.resume, which installs a brand new ChannelTransport whose own
+// buffer starts empty).
+const maxWMPBufferedEvents = 200
+
+// wmpBufferedEvent is one retained SSE frame, tagged with a session-durable
+// sequence number (not reset per HTTP connection, unlike the previous
+// per-connection counter).
+type wmpBufferedEvent struct {
+	ID   int64
+	Data []byte
+}
+
+// wmpEventBuffer retains recent outbound SSE events for a session so a
+// reconnecting client (including after wmp.session.resume, or a plain SSE
+// drop during e.g. an OAuth redirect) can replay what it missed via
+// Last-Event-ID, instead of silently losing progress/sign_request/
+// flow_complete notifications emitted while disconnected.
+type wmpEventBuffer struct {
+	mu     sync.Mutex
+	events []wmpBufferedEvent
+	nextID int64
+
+	// activeCtx is the Context of the currently-connected SSE request, if
+	// any. A second concurrent GET /wmp/events for the same session would
+	// otherwise race to read from the same events channel as the first,
+	// silently splitting the notification stream between the two
+	// connections (each only seeing some of the events).
+	activeCtx context.Context
+}
+
+// tryAcquire claims this buffer for a new SSE connection with the given
+// request context, returning false if another connection is already active
+// (and not yet done). Callers must call release with the same ctx when the
+// connection ends.
+func (b *wmpEventBuffer) tryAcquire(ctx context.Context) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeCtx != nil && b.activeCtx.Err() == nil {
+		return false
+	}
+	b.activeCtx = ctx
+	return true
+}
+
+// release clears the active connection if ctx is still the one registered
+// (a stale release from an already-superseded connection must not clear a
+// newer one's registration).
+func (b *wmpEventBuffer) release(ctx context.Context) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.activeCtx == ctx {
+		b.activeCtx = nil
+	}
+}
+
+// append records data as a new event and returns its sequence ID.
+func (b *wmpEventBuffer) append(data []byte) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextID++
+	id := b.nextID
+	b.events = append(b.events, wmpBufferedEvent{ID: id, Data: data})
+	if len(b.events) > maxWMPBufferedEvents {
+		b.events = b.events[len(b.events)-maxWMPBufferedEvents:]
+	}
+	return id
+}
+
+// replaySince returns buffered events with an ID greater than lastEventID.
+// Returns nil if lastEventID doesn't parse (e.g. empty, or a stale ID from
+// before this buffer existed) — replay is best-effort, not required.
+func (b *wmpEventBuffer) replaySince(lastEventID string) []wmpBufferedEvent {
+	lastID, err := strconv.ParseInt(lastEventID, 10, 64)
+	if err != nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var replay []wmpBufferedEvent
+	for _, ev := range b.events {
+		if ev.ID > lastID {
+			replay = append(replay, ev)
+		}
+	}
+	return replay
+}
+
+// pendingCount returns the number of currently-buffered events, used to
+// report SessionResumeResult.MissedMessages honestly (rather than a
+// hardcoded 0) — these are the events a reconnecting SSE client can recover
+// via Last-Event-ID.
+func (b *wmpEventBuffer) pendingCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.events)
 }
 
 // resumptionEntry holds a resumption token's session binding and expiry.
@@ -67,6 +168,23 @@ const defaultFlowTimeout = 5 * time.Minute
 // maxSessionTTL caps the TTL a client may request for a session.
 const maxSessionTTL = 24 * time.Hour
 
+// flowActionSendWait bounds how long FlowAction blocks trying to enqueue a
+// response onto a full sign/match/action channel before rejecting with
+// ErrRateLimited. A legitimate single in-flight sign_response/match_response
+// (the common case: at most one outstanding request per flow) can land in a
+// momentarily-full channel and would otherwise have no way to recover short
+// of waiting out the engine's own server-side timeout; a brief wait here
+// gives room to drain without changing the channel's bounded depth.
+const flowActionSendWait = 3 * time.Second
+
+// childFlowStartTimeout bounds the wmp.flow.start Call() used to kick off a
+// nested sign/match sub-flow. This blocks the engine goroutine that
+// requested the signature/match until the client acks the child flow.start
+// (not until the actual result arrives, which comes later via
+// flow.complete) — an unresponsive client must not be able to stall it
+// indefinitely.
+const childFlowStartTimeout = 30 * time.Second
+
 // wmpSession associates a wmp.Peer with its channel transport and engine session.
 type wmpSession struct {
 	peer         *wmp.Peer
@@ -86,6 +204,7 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger) *WMPAdapter {
 		logger:           logger.Named("wmp"),
 		peers:            make(map[string]*wmpSession),
 		resumptionTokens: make(map[string]*resumptionEntry),
+		eventBufs:        make(map[string]*wmpEventBuffer),
 		stopCh:           make(chan struct{}),
 	}
 	go a.cleanupLoop()
@@ -222,6 +341,20 @@ func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	return ws.transport.Out(), nil
 }
 
+// getOrCreateEventBuffer returns the persistent SSE replay buffer for
+// sessionID, creating it if this is the first time it's requested. Unlike
+// wmpSession, this buffer is not replaced on resume.
+func (a *WMPAdapter) getOrCreateEventBuffer(sessionID string) *wmpEventBuffer {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	buf, ok := a.eventBufs[sessionID]
+	if !ok {
+		buf = &wmpEventBuffer{}
+		a.eventBufs[sessionID] = buf
+	}
+	return buf
+}
+
 // CloseSession closes a WMP session and its associated engine session.
 func (a *WMPAdapter) CloseSession(sessionID string) {
 	a.mu.Lock()
@@ -229,6 +362,7 @@ func (a *WMPAdapter) CloseSession(sessionID string) {
 	if ok {
 		delete(a.peers, sessionID)
 	}
+	delete(a.eventBufs, sessionID)
 	// Clean up any resumption tokens for this session.
 	for token, entry := range a.resumptionTokens {
 		if entry.sessionID == sessionID {
@@ -260,6 +394,7 @@ func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
 		return
 	}
 	delete(a.peers, sessionID)
+	delete(a.eventBufs, sessionID)
 	for token, entry := range a.resumptionTokens {
 		if entry.sessionID == sessionID {
 			delete(a.resumptionTokens, token)
@@ -307,15 +442,14 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 
 	// Extract bearer token from auth object.
 	var userID, tenantID string
-	if params.Auth != nil {
-		tokenStr := params.Auth.Token
-		if tokenStr == "" {
+	if params.Auth != nil && params.Auth.Token != "" {
+		if params.Auth.Type != "" && params.Auth.Type != "bearer" {
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
-				"reason": "missing auth token",
+				"reason": "unsupported auth type; only 'bearer' is supported",
 			})
 		}
 		var err error
-		userID, tenantID, err = a.manager.validateToken(tokenStr)
+		userID, tenantID, err = a.manager.validateToken(params.Auth.Token)
 		if err != nil {
 			a.logger.Warn("WMP auth failed", zap.Error(err))
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -614,7 +748,9 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, userID, tenantID s
 	newToken := a.generateResumptionToken(params.SessionID)
 
 	// Echo the negotiated capabilities and security from the original session
-	// per spec §4.5.1 / §4.5.3.
+	// per spec §4.5.1 / §4.5.3. MissedMessages reflects events actually
+	// recoverable via the SSE event buffer's Last-Event-ID replay (see
+	// wmpEventBuffer), not a hardcoded placeholder.
 	result := wmp.SessionResumeResult{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
@@ -622,7 +758,7 @@ func (a *WMPAdapter) handleSessionResume(ctx context.Context, userID, tenantID s
 		},
 		Resumed:         true,
 		ResumptionToken: newToken,
-		MissedMessages:  0, // full message replay not yet implemented
+		MissedMessages:  a.getOrCreateEventBuffer(params.SessionID).pendingCount(),
 		Capabilities:    ws.capabilities,
 		Security:        ws.security,
 	}
@@ -827,7 +963,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 //
 // This method converts WMP flow.action params into engine message types and
 // delivers them to the appropriate channel.
-func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
+func (h *wmpEngineHandler) FlowAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
 	flowID := params.FlowID
 
 	// Verify flow exists.
@@ -872,7 +1008,11 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 		}
 		select {
 		case h.session.signCh <- &signResp:
-		default:
+		case <-time.After(flowActionSendWait):
+			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
+				"reason": "server overloaded",
+			})
+		case <-ctx.Done():
 			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
 				"reason": "server overloaded",
 			})
@@ -898,7 +1038,11 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 		}
 		select {
 		case h.session.matchCh <- &matchResp:
-		default:
+		case <-time.After(flowActionSendWait):
+			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
+				"reason": "server overloaded",
+			})
+		case <-ctx.Done():
 			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
 				"reason": "server overloaded",
 			})
@@ -915,7 +1059,11 @@ func (h *wmpEngineHandler) FlowAction(_ context.Context, params *wmp.FlowActionP
 		}
 		select {
 		case h.session.actionCh <- actionMsg:
-		default:
+		case <-time.After(flowActionSendWait):
+			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
+				"reason": "server overloaded",
+			})
+		case <-ctx.Done():
 			return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
 				"reason": "server overloaded",
 			})
@@ -1111,8 +1259,10 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
+		callCtx, cancel := context.WithTimeout(ctx, childFlowStartTimeout)
+		defer cancel()
 		var startResult wmp.FlowStartResult
-		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
 			WMP:      t.wmpMeta(),
 			FlowType: wmp.FlowTypeSign,
 			FlowID:   childFlowID,
@@ -1133,8 +1283,10 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
+		callCtx, cancel := context.WithTimeout(ctx, childFlowStartTimeout)
+		defer cancel()
 		var startResult wmp.FlowStartResult
-		err = t.peer.Call(ctx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
 			WMP:      t.wmpMeta(),
 			FlowType: "match",
 			FlowID:   childFlowID,

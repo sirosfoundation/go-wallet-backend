@@ -209,10 +209,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	// Normalize trailing slash for consistent cache keys, but only when the
 	// path is empty or just "/". Issuers with meaningful paths (e.g.
 	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	parsed, _ := url.Parse(issuerURL) // already validated above
-	if parsed.Path == "" || parsed.Path == "/" {
-		issuerURL = strings.TrimRight(issuerURL, "/")
-	}
+	issuerURL = oidc.NormalizeIssuerURL(issuerURL)
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -231,7 +228,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 
 		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
 		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		metadataURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
+		if err != nil {
+			return nil, fmt.Errorf("building well-known URL: %w", err)
+		}
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
 		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)

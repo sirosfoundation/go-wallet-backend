@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"go.uber.org/zap"
 )
 
@@ -52,10 +53,24 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Dispatch.
+	// Dispatch. HandleRPC's own protocol-level errors are already returned as
+	// (bytes, nil) — a marshaled JSON-RPC error envelope. A non-nil err here
+	// means something failed before an envelope could even be built (e.g.
+	// ws.peer.HandleRequestSync's own internal parse failure); respond with
+	// a JSON-RPC error envelope here too rather than plain text, so the
+	// caller (a JSON-RPC client expecting a JSON-RPC response body) doesn't
+	// fail trying to parse it.
 	resp, err := a.HandleRPC(r.Context(), sessionID, userID, tenantID, body)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.logger.Error("WMP RPC dispatch failed", zap.Error(err))
+		errResp, marshalErr := wmpErrorBytes(nil, wmp.ErrInternalError, nil)
+		if marshalErr != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(errResp)
 		return
 	}
 
@@ -107,12 +122,24 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSE headers.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+
+	// Reject a second concurrent connection for this session rather than
+	// letting it race the first to read from the same events channel: only
+	// one of them would see any given notification, silently splitting the
+	// stream between them. Must run before any header is written — an
+	// implicit 200 from flusher.Flush() below can't be undone afterward.
+	ctx := r.Context()
+	buf := a.getOrCreateEventBuffer(sessionID)
+	if !buf.tryAcquire(ctx) {
+		http.Error(w, "another connection is already streaming events for this session", http.StatusConflict)
+		return
+	}
+	defer buf.release(ctx)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -120,8 +147,19 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // nginx
 	flusher.Flush()
 
-	ctx := r.Context()
-	eventID := 0
+	// Replay events the client missed while disconnected — e.g. a plain SSE
+	// drop, or reconnecting after a wmp.session.resume (which installs a new
+	// ChannelTransport whose own event channel starts empty; the session's
+	// event buffer is what actually survives resume). IDs are durable across
+	// reconnects, unlike a per-connection counter, so the client's
+	// automatically-resent Last-Event-ID header means something here.
+	if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
+		for _, ev := range buf.replaySince(lastEventID) {
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+		}
+		flusher.Flush()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,8 +168,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // channel closed
 			}
-			eventID++
-			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", eventID, data)
+			id := buf.append(data)
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", id, data)
 			flusher.Flush()
 		}
 	}

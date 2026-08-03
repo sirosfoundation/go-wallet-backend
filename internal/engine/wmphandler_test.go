@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -121,6 +121,28 @@ func TestWMP_SessionCreate_EmptyToken(t *testing.T) {
 	var rpcResp wmp.Response
 	require.NoError(t, json.Unmarshal(resp, &rpcResp))
 	assert.NotNil(t, rpcResp.Error)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
+}
+
+// TestWMP_SessionCreate_NonBearerAuthType is a regression test: a client
+// declaring an auth type other than "bearer" (e.g. "dpop") must not have its
+// token silently treated as a bearer token.
+func TestWMP_SessionCreate_NonBearerAuthType(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
+		WMP:      wmp.Metadata{Version: wmp.Version},
+		Security: wmp.SecurityMode{Mode: "tls"},
+		Auth:     &wmp.AuthObject{Type: "dpop", Token: testToken("user-1", "tenant-a")},
+	})
+
+	resp, err := a.HandleRPC(context.Background(), "", "", "", body)
+	require.NoError(t, err)
+
+	var rpcResp wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &rpcResp))
+	require.NotNil(t, rpcResp.Error)
 	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
 }
 
@@ -594,6 +616,43 @@ func TestWMP_FlowAction_UnknownFlow(t *testing.T) {
 	assert.Equal(t, wmp.ErrFlowError, rpcResp.Error.Code)
 }
 
+// TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly is a regression
+// test: a momentarily-full actionCh must not be rejected instantly. A brief
+// wait gives a legitimate single in-flight action somewhere to land once the
+// channel drains, instead of forcing the client to recover only via the
+// server-side timeout.
+func TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly(t *testing.T) {
+	session := &Session{
+		ID:       "sess-1",
+		flows:    map[string]*Flow{"flow-1": {ID: "flow-1"}},
+		actionCh: make(chan *FlowActionMessage, 1),
+		logger:   zap.NewNop(),
+	}
+	handler := &wmpEngineHandler{session: session, sessionID: session.ID}
+
+	// Fill the channel to capacity.
+	session.actionCh <- &FlowActionMessage{}
+
+	// Drain one slot shortly after FlowAction starts waiting — well within
+	// flowActionSendWait, so this must succeed rather than reject instantly.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		<-session.actionCh
+	}()
+
+	start := time.Now()
+	result, err := handler.FlowAction(context.Background(), &wmp.FlowActionParams{
+		FlowID: "flow-1",
+		Action: "consent",
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Less(t, elapsed, flowActionSendWait, "should succeed once the channel drains, not wait out the full timeout")
+	assert.GreaterOrEqual(t, elapsed, 40*time.Millisecond, "should have actually waited for the drain, not raced past it")
+}
+
 // --- Session close ---
 
 func TestWMP_SessionClose(t *testing.T) {
@@ -689,6 +748,72 @@ func TestWMP_HTTPEndpoint_Events_MissingSessionID(t *testing.T) {
 	a.HandleWMPEvents(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestWMP_HTTPEndpoint_Events_RejectsConcurrentConnection is a regression
+// test: a second GET /wmp/events for the same session while a first is
+// still connected must not race it to read from the same events channel
+// (which would silently split the notification stream between them).
+func TestWMP_HTTPEndpoint_Events_RejectsConcurrentConnection(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	sessionID := createWMPSession(t, a)
+	token := testToken("user-1", "tenant-a")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.HandleWMPEvents(w, r)
+	}))
+	defer ts.Close()
+
+	req1, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
+	req1.Header.Set("Authorization", "Bearer "+token)
+	resp1, err := http.DefaultClient.Do(req1)
+	require.NoError(t, err)
+	defer resp1.Body.Close()
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+
+	require.Eventually(t, func() bool {
+		buf := a.getOrCreateEventBuffer(sessionID)
+		return !buf.tryAcquire(context.Background()) // still held by req1 => can't acquire
+	}, time.Second, 5*time.Millisecond)
+
+	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
+	req2.Header.Set("Authorization", "Bearer "+token)
+	resp2, err := http.DefaultClient.Do(req2)
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp2.StatusCode)
+}
+
+// TestWMPEventBuffer_AppendReplayAndAcquire covers the wmpEventBuffer
+// mechanics directly: durable IDs across "reconnects" (append calls),
+// replay filtering by Last-Event-ID, and single-active-connection
+// enforcement — the building blocks behind message replay on resume.
+func TestWMPEventBuffer_AppendReplayAndAcquire(t *testing.T) {
+	buf := &wmpEventBuffer{}
+
+	id1 := buf.append([]byte(`{"n":1}`))
+	id2 := buf.append([]byte(`{"n":2}`))
+	id3 := buf.append([]byte(`{"n":3}`))
+	assert.Equal(t, []int64{1, 2, 3}, []int64{id1, id2, id3})
+	assert.Equal(t, 3, buf.pendingCount())
+
+	replay := buf.replaySince(strconv.FormatInt(id1, 10))
+	require.Len(t, replay, 2)
+	assert.Equal(t, id2, replay[0].ID)
+	assert.Equal(t, id3, replay[1].ID)
+
+	// Malformed/unknown Last-Event-ID: best-effort, no replay rather than an error.
+	assert.Nil(t, buf.replaySince("not-a-number"))
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	require.True(t, buf.tryAcquire(ctx1), "first connection should acquire")
+	assert.False(t, buf.tryAcquire(context.Background()), "second connection should be rejected while first is active")
+
+	cancel1()
+	buf.release(ctx1)
+	assert.True(t, buf.tryAcquire(context.Background()), "should be acquirable again after release")
 }
 
 // --- Message translation tests ---
@@ -858,6 +983,3 @@ func (h *actionFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) 
 }
 
 func (h *actionFlowHandler) Cancel() {}
-
-// silence unused import warnings
-var _ = io.ReadAll
