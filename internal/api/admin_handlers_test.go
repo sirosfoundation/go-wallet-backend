@@ -788,6 +788,44 @@ func TestListUserCredentials_GetUserFails(t *testing.T) {
 	}
 }
 
+func TestDeactivateUserCredential_UnexpectedServiceError(t *testing.T) {
+	realStore := memory.NewStore()
+	userID := domain.NewUserID()
+	if err := realStore.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{UserID: userID, TenantID: "t"}); err != nil {
+		t.Fatalf("add membership error: %v", err)
+	}
+
+	handlers := NewAdminHandlers(storeWithFailingUsers{realStore}, zap.NewNop())
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/t/users/"+userID.String()+"/credentials/cred-a/deactivate", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeactivateAllUserCredentials_UnexpectedServiceError(t *testing.T) {
+	realStore := memory.NewStore()
+	userID := domain.NewUserID()
+	if err := realStore.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{UserID: userID, TenantID: "t"}); err != nil {
+		t.Fatalf("add membership error: %v", err)
+	}
+
+	handlers := NewAdminHandlers(storeWithFailingUsers{realStore}, zap.NewNop())
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/deactivate-all", handlers.DeactivateAllUserCredentials)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/t/users/"+userID.String()+"/credentials/deactivate-all", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestDeactivateUserCredential_MissingCredID(t *testing.T) {
 	handlers, router := setupAdminTestHandlers(t)
 	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
