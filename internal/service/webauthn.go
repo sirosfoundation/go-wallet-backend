@@ -30,6 +30,7 @@ var (
 	ErrChallengeExpired        = errors.New("challenge expired")
 	ErrUserNotFound            = errors.New("user not found")
 	ErrCredentialNotFound      = errors.New("credential not found")
+	ErrCredentialDeactivated   = errors.New("credential deactivated")
 	ErrVerificationFailed      = errors.New("verification failed")
 	ErrTenantMismatch          = errors.New("tenant mismatch")
 	ErrTenantAccessDenied      = errors.New("tenant user must use tenant-scoped login endpoint")
@@ -650,6 +651,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 				},
 				Nickname:  &credNickname,
 				CreatedAt: now,
+				Status:    "active",
 			},
 		},
 		CreatedAt: now,
@@ -954,6 +956,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 
 	if matchedCred == nil {
 		return nil, ErrCredentialNotFound
+	}
+	if !matchedCred.IsActive() {
+		return nil, ErrCredentialDeactivated
 	}
 
 	// SECURITY: Validate tenant isolation
@@ -1578,6 +1583,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		},
 		Nickname:  &nickname,
 		CreatedAt: now,
+		Status:    "active",
 	}
 
 	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)

@@ -2,16 +2,64 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
+
+// failingUserTenantStore wraps a real UserTenantStore, forcing IsMember to
+// error — used to exercise the "membership check itself failed" branch of
+// requireTenantMember, which a real store can't be made to fail on demand.
+type failingUserTenantStore struct {
+	storage.UserTenantStore
+}
+
+func (f failingUserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+	return false, errors.New("simulated membership check failure")
+}
+
+// failingUserStore wraps a real UserStore, forcing GetByID to return a
+// non-NotFound error — used to exercise ListUserCredentials' generic
+// "failed to get user" branch (distinct from the ErrNotFound branch, which
+// is already covered by the non-member case).
+type failingUserStore struct {
+	storage.UserStore
+}
+
+func (f failingUserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
+	return nil, errors.New("simulated get user failure")
+}
+
+// storeWithFailingUserTenants wraps a real Store, substituting a
+// failingUserTenantStore for UserTenants().
+type storeWithFailingUserTenants struct {
+	storage.Store
+}
+
+func (s storeWithFailingUserTenants) UserTenants() storage.UserTenantStore {
+	return failingUserTenantStore{s.Store.UserTenants()}
+}
+
+// storeWithFailingUsers wraps a real Store, substituting a failingUserStore
+// for Users().
+type storeWithFailingUsers struct {
+	storage.Store
+}
+
+func (s storeWithFailingUsers) Users() storage.UserStore {
+	return failingUserStore{s.Store.Users()}
+}
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -535,6 +583,259 @@ func TestAdminHandlers_TenantUsers(t *testing.T) {
 			t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
 		}
 	})
+}
+
+func TestAdminHandlers_UserCredentials(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	router.POST("/admin/tenants", handlers.CreateTenant)
+	router.POST("/admin/tenants/:id/users", handlers.AddUserToTenant)
+	router.GET("/admin/tenants/:id/users/:user_id/credentials", handlers.ListUserCredentials)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/deactivate-all", handlers.DeactivateAllUserCredentials)
+
+	createTenantReq := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(`{"id":"cred-admin","name":"Cred Admin"}`))
+	createTenantReq.Header.Set("Content-Type", "application/json")
+	createTenantResp := httptest.NewRecorder()
+	router.ServeHTTP(createTenantResp, createTenantReq)
+	if createTenantResp.Code != http.StatusCreated {
+		t.Fatalf("Expected tenant create 201, got %d", createTenantResp.Code)
+	}
+
+	displayName := "Credential User"
+	user := &domain.User{
+		UUID:        domain.NewUserID(),
+		DID:         "did:key:admin-cred-user",
+		DisplayName: &displayName,
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-a", TenantID: "cred-admin", CreatedAt: time.Now(), PRFCapable: true},
+			{ID: "cred-b", TenantID: "cred-admin", CreatedAt: time.Now(), Status: "deactivated"},
+		},
+		PrivateData:     []byte(`{"encrypted":"data"}`),
+		PrivateDataETag: domain.ComputePrivateDataETag([]byte(`{"encrypted":"data"}`)),
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+	if err := handlers.store.Users().Create(context.Background(), user); err != nil {
+		t.Fatalf("create user error: %v", err)
+	}
+
+	addMemberReq := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users", bytes.NewBufferString(`{"user_id":"`+user.UUID.String()+`"}`))
+	addMemberReq.Header.Set("Content-Type", "application/json")
+	addMemberResp := httptest.NewRecorder()
+	router.ServeHTTP(addMemberResp, addMemberReq)
+	if addMemberResp.Code != http.StatusOK {
+		t.Fatalf("Expected add member 200, got %d", addMemberResp.Code)
+	}
+
+	t.Run("list credentials returns normalized statuses", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var body struct {
+			Credentials []AdminCredentialResponse `json:"credentials"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if len(body.Credentials) != 2 {
+			t.Fatalf("Expected 2 credentials, got %d", len(body.Credentials))
+		}
+		if body.Credentials[0].Status == "" || body.Credentials[1].Status == "" {
+			t.Fatal("Expected non-empty status for all credentials")
+		}
+	})
+
+	t.Run("deactivate single credential", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/cred-a/deactivate", bytes.NewBufferString(`{"reason":"lost device"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var body AdminCredentialResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal error: %v", err)
+		}
+		if body.DeactivatedBy != "provider" || body.Status != "deactivated" || body.DeactivationReason != "lost device" {
+			t.Fatalf("unexpected response: %+v", body)
+		}
+	})
+
+	t.Run("deactivate single credential again returns conflict", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/cred-a/deactivate", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("Expected status 409, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("deactivate unknown credential returns not found", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/does-not-exist/deactivate", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("deactivate credential for non-member user returns not found", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+domain.NewUserID().String()+"/credentials/cred-a/deactivate", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("list credentials for non-member user returns not found", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/admin/tenants/cred-admin/users/"+domain.NewUserID().String()+"/credentials", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("deactivate all for non-member user returns not found", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+domain.NewUserID().String()+"/credentials/deactivate-all", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("deactivate all credentials succeeds for remaining active credential", func(t *testing.T) {
+		displayName := "Second Credential User"
+		user2 := &domain.User{
+			UUID:        domain.NewUserID(),
+			DID:         "did:key:admin-cred-user-2",
+			DisplayName: &displayName,
+			WebauthnCredentials: []domain.WebauthnCredential{
+				{ID: "cred-c", TenantID: "cred-admin", CreatedAt: time.Now()},
+			},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if err := handlers.store.Users().Create(context.Background(), user2); err != nil {
+			t.Fatalf("create user error: %v", err)
+		}
+		addMemberReq := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users", bytes.NewBufferString(`{"user_id":"`+user2.UUID.String()+`"}`))
+		addMemberReq.Header.Set("Content-Type", "application/json")
+		addMemberResp := httptest.NewRecorder()
+		router.ServeHTTP(addMemberResp, addMemberReq)
+		if addMemberResp.Code != http.StatusOK {
+			t.Fatalf("Expected add member 200, got %d", addMemberResp.Code)
+		}
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user2.UUID.String()+"/credentials/deactivate-all", bytes.NewBufferString(`{"reason":"security incident"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("deactivate all credentials conflicts when none active", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cred-admin/users/"+user.UUID.String()+"/credentials/deactivate-all", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("Expected status 409, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+func TestListUserCredentials_MembershipCheckFails(t *testing.T) {
+	store := storeWithFailingUserTenants{memory.NewStore()}
+	handlers := NewAdminHandlers(store, zap.NewNop())
+	router := gin.New()
+	router.GET("/admin/tenants/:id/users/:user_id/credentials", handlers.ListUserCredentials)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/t/users/"+domain.NewUserID().String()+"/credentials", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListUserCredentials_GetUserFails(t *testing.T) {
+	realStore := memory.NewStore()
+	userID := domain.NewUserID()
+	if err := realStore.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{UserID: userID, TenantID: "t"}); err != nil {
+		t.Fatalf("add membership error: %v", err)
+	}
+
+	store := storeWithFailingUsers{realStore}
+	handlers := NewAdminHandlers(store, zap.NewNop())
+	router := gin.New()
+	router.GET("/admin/tenants/:id/users/:user_id/credentials", handlers.ListUserCredentials)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/t/users/"+userID.String()+"/credentials", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeactivateUserCredential_UnexpectedServiceError(t *testing.T) {
+	realStore := memory.NewStore()
+	userID := domain.NewUserID()
+	if err := realStore.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{UserID: userID, TenantID: "t"}); err != nil {
+		t.Fatalf("add membership error: %v", err)
+	}
+
+	handlers := NewAdminHandlers(storeWithFailingUsers{realStore}, zap.NewNop())
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/t/users/"+userID.String()+"/credentials/cred-a/deactivate", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeactivateAllUserCredentials_UnexpectedServiceError(t *testing.T) {
+	realStore := memory.NewStore()
+	userID := domain.NewUserID()
+	if err := realStore.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{UserID: userID, TenantID: "t"}); err != nil {
+		t.Fatalf("add membership error: %v", err)
+	}
+
+	handlers := NewAdminHandlers(storeWithFailingUsers{realStore}, zap.NewNop())
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/deactivate-all", handlers.DeactivateAllUserCredentials)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/t/users/"+userID.String()+"/credentials/deactivate-all", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeactivateUserCredential_MissingCredID(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/t/users/"+domain.NewUserID().String()+"/credentials//deactivate", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound && w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400 or gin 404 for empty cred_id, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestAdminHandlers_IssuerCRUD(t *testing.T) {

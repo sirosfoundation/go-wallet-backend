@@ -271,6 +271,8 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "User not found"})
 		case errors.Is(err, service.ErrCredentialNotFound):
 			c.JSON(404, gin.H{"error": "Credential not found"})
+		case errors.Is(err, service.ErrCredentialDeactivated):
+			c.JSON(403, gin.H{"error": "Wallet instance deactivated", "code": "credential_deactivated"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
 		case errors.Is(err, service.ErrTenantAccessDenied):
@@ -881,12 +883,16 @@ type AccountSettings struct {
 }
 
 type WebauthnCredentialInfo struct {
-	ID           string                   `json:"id"`
-	CredentialID taggedbinary.TaggedBytes `json:"credentialId"`
-	Nickname     *string                  `json:"nickname,omitempty"`
-	PRFCapable   bool                     `json:"prfCapable"`
-	CreateTime   time.Time                `json:"createTime"`
-	LastUseTime  *time.Time               `json:"lastUseTime,omitempty"`
+	ID                 string                   `json:"id"`
+	CredentialID       taggedbinary.TaggedBytes `json:"credentialId"`
+	Nickname           *string                  `json:"nickname,omitempty"`
+	PRFCapable         bool                     `json:"prfCapable"`
+	CreateTime         time.Time                `json:"createTime"`
+	LastUseTime        *time.Time               `json:"lastUseTime,omitempty"`
+	Status             string                   `json:"status"`
+	DeactivatedAt      *time.Time               `json:"deactivatedAt,omitempty"`
+	DeactivatedBy      string                   `json:"deactivatedBy,omitempty"`
+	DeactivationReason string                   `json:"deactivationReason,omitempty"`
 }
 
 // GetAccountInfo returns account information for the current user
@@ -912,12 +918,16 @@ func (h *Handlers) GetAccountInfo(c *gin.Context) {
 	credentials := make([]WebauthnCredentialInfo, 0, len(user.WebauthnCredentials))
 	for _, cred := range user.WebauthnCredentials {
 		credentials = append(credentials, WebauthnCredentialInfo{
-			ID:           cred.ID,
-			CredentialID: cred.CredentialID,
-			Nickname:     cred.Nickname,
-			PRFCapable:   cred.PRFCapable,
-			CreateTime:   cred.CreatedAt,
-			LastUseTime:  cred.LastUseTime,
+			ID:                 cred.ID,
+			CredentialID:       cred.CredentialID,
+			Nickname:           cred.Nickname,
+			PRFCapable:         cred.PRFCapable,
+			CreateTime:         cred.CreatedAt,
+			LastUseTime:        cred.LastUseTime,
+			Status:             cred.NormalizedStatus(),
+			DeactivatedAt:      cred.DeactivatedAt,
+			DeactivatedBy:      cred.DeactivatedBy,
+			DeactivationReason: cred.DeactivationReason,
 		})
 	}
 
@@ -1120,6 +1130,77 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 
 	c.Header("X-Private-Data-ETag", newEtag)
 	c.Status(204)
+}
+
+// DeactivateWebAuthnCredential deactivates a WebAuthn credential.
+func (h *Handlers) DeactivateWebAuthnCredential(c *gin.Context) {
+	credentialID := c.Param("id")
+	if credentialID == "" {
+		c.JSON(400, gin.H{"error": "Credential ID required"})
+		return
+	}
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	cred, err := h.services.User.DeactivateWebAuthnCredential(
+		c.Request.Context(),
+		domain.UserIDFromString(userID.(string)),
+		credentialID,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			c.JSON(404, gin.H{"error": "Credential not found"})
+		case errors.Is(err, service.ErrCredentialAlreadyDeactivated):
+			c.JSON(409, gin.H{"error": "Credential already deactivated"})
+		default:
+			h.logger.Error("Failed to deactivate WebAuthn credential", zap.Error(err))
+			c.JSON(500, gin.H{"error": "Failed to deactivate credential"})
+		}
+		return
+	}
+
+	c.JSON(200, WebauthnCredentialInfo{
+		ID:                 cred.ID,
+		CredentialID:       cred.CredentialID,
+		Nickname:           cred.Nickname,
+		PRFCapable:         cred.PRFCapable,
+		CreateTime:         cred.CreatedAt,
+		LastUseTime:        cred.LastUseTime,
+		Status:             cred.NormalizedStatus(),
+		DeactivatedAt:      cred.DeactivatedAt,
+		DeactivatedBy:      cred.DeactivatedBy,
+		DeactivationReason: cred.DeactivationReason,
+	})
+}
+
+// DeactivateAllWebAuthnCredentials deactivates all active WebAuthn credentials.
+func (h *Handlers) DeactivateAllWebAuthnCredentials(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	err := h.services.User.DeactivateAllWebAuthnCredentials(
+		c.Request.Context(),
+		domain.UserIDFromString(userID.(string)),
+	)
+	if err != nil {
+		if errors.Is(err, service.ErrNoActiveWebAuthnCredentials) {
+			c.JSON(409, gin.H{"error": "No active credentials"})
+			return
+		}
+		h.logger.Error("Failed to deactivate all WebAuthn credentials", zap.Error(err))
+		c.JSON(500, gin.H{"error": "Failed to deactivate credentials"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "All credentials deactivated"})
 }
 
 // RenameWebAuthnCredential renames a WebAuthn credential

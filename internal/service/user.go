@@ -18,10 +18,12 @@ import (
 )
 
 var (
-	ErrInvalidCredentials     = errors.New("invalid credentials")
-	ErrUserExists             = errors.New("user already exists")
-	ErrPrivateDataConflict    = errors.New("private data conflict")
-	ErrLastWebAuthnCredential = errors.New("cannot delete last webauthn credential")
+	ErrInvalidCredentials           = errors.New("invalid credentials")
+	ErrUserExists                   = errors.New("user already exists")
+	ErrPrivateDataConflict          = errors.New("private data conflict")
+	ErrLastWebAuthnCredential       = errors.New("cannot delete last webauthn credential")
+	ErrCredentialAlreadyDeactivated = errors.New("credential already deactivated")
+	ErrNoActiveWebAuthnCredentials  = errors.New("no active webauthn credentials")
 )
 
 // SessionCleaner can remove sessions for a user.
@@ -305,6 +307,158 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 	s.logger.Info("User deleted")
 	return nil
+}
+
+// DeactivateWebAuthnCredential deactivates one active WebAuthn credential for the user.
+func (s *UserService) DeactivateWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string) (*domain.WebauthnCredential, error) {
+	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "user", "")
+}
+
+// DeactivateAllWebAuthnCredentials deactivates all active WebAuthn credentials for the user.
+func (s *UserService) DeactivateAllWebAuthnCredentials(ctx context.Context, userID domain.UserID) error {
+	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "user", "")
+	return err
+}
+
+// DeactivateWebAuthnCredentialByProvider deactivates one active WebAuthn credential as provider action.
+func (s *UserService) DeactivateWebAuthnCredentialByProvider(ctx context.Context, userID domain.UserID, credentialID string, reason string) (*domain.WebauthnCredential, error) {
+	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "provider", reason)
+}
+
+// DeactivateAllWebAuthnCredentialsByProvider deactivates all active credentials as provider action.
+func (s *UserService) DeactivateAllWebAuthnCredentialsByProvider(ctx context.Context, userID domain.UserID, reason string) error {
+	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "provider", reason)
+	return err
+}
+
+func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, actor string, reason string) (*domain.WebauthnCredential, error) {
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var target *domain.WebauthnCredential
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].ID == credentialID {
+			target = &user.WebauthnCredentials[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, storage.ErrNotFound
+	}
+	if !target.IsActive() {
+		return nil, ErrCredentialAlreadyDeactivated
+	}
+
+	now := time.Now()
+	target.Status = "deactivated"
+	target.DeactivatedAt = &now
+	target.DeactivatedBy = actor
+	target.DeactivationReason = reason
+	user.UpdatedAt = now
+
+	activeLeft := 0
+	for _, cred := range user.WebauthnCredentials {
+		if cred.IsActive() {
+			activeLeft++
+		}
+	}
+	lockout := activeLeft == 0
+	if lockout {
+		s.cascadeWalletLockout(ctx, user)
+	}
+
+	if err := s.store.Users().Update(ctx, user); err != nil {
+		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+
+	if lockout {
+		s.runLockoutSideEffects(ctx, user)
+	}
+
+	out := *target
+	return &out, nil
+}
+
+func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, userID domain.UserID, actor string, reason string) (int, error) {
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+
+	now := time.Now()
+	updated := 0
+	for i := range user.WebauthnCredentials {
+		if !user.WebauthnCredentials[i].IsActive() {
+			continue
+		}
+		user.WebauthnCredentials[i].Status = "deactivated"
+		user.WebauthnCredentials[i].DeactivatedAt = &now
+		user.WebauthnCredentials[i].DeactivatedBy = actor
+		user.WebauthnCredentials[i].DeactivationReason = reason
+		updated++
+	}
+
+	if updated == 0 {
+		return 0, ErrNoActiveWebAuthnCredentials
+	}
+
+	s.cascadeWalletLockout(ctx, user)
+	user.UpdatedAt = now
+	if err := s.store.Users().Update(ctx, user); err != nil {
+		return 0, fmt.Errorf("failed to update user: %w", err)
+	}
+
+	s.runLockoutSideEffects(ctx, user)
+	return updated, nil
+}
+
+func (s *UserService) cascadeWalletLockout(ctx context.Context, user *domain.User) {
+	// Clear private data on the user object (persisted by caller)
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+}
+
+// runLockoutSideEffects performs non-critical side effects after a successful lockout persist.
+// These are best-effort; failures are logged but do not roll back the deactivation.
+func (s *UserService) runLockoutSideEffects(ctx context.Context, user *domain.User) {
+	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil {
+		s.logger.Warn("Failed to get user tenants for lockout cleanup", zap.Error(err))
+		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+	}
+	if len(tenantIDs) == 0 {
+		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+	}
+
+	for _, tenantID := range tenantIDs {
+		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, user.DID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to get credentials during lockout cleanup", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, cred := range credentials {
+			if err := s.store.Credentials().Delete(ctx, tenantID, user.DID, cred.CredentialIdentifier); err != nil {
+				s.logger.Warn("Failed to delete credential during lockout cleanup", zap.Error(err))
+			}
+		}
+
+		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, user.DID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to get presentations during lockout cleanup", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, pres := range presentations {
+			if err := s.store.Presentations().Delete(ctx, tenantID, user.DID, pres.PresentationIdentifier); err != nil {
+				s.logger.Warn("Failed to delete presentation during lockout cleanup", zap.Error(err))
+			}
+		}
+	}
+
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, user.UUID.String()); err != nil {
+			s.logger.Warn("Failed to delete sessions during lockout cleanup", zap.Error(err))
+		}
+	}
 }
 
 // DeleteWebAuthnCredential deletes a WebAuthn credential

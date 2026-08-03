@@ -126,18 +126,36 @@ func (u *User) AddEnterpriseIdentity(identity EnterpriseIdentity) {
 
 // WebauthnCredential represents a WebAuthn credential
 type WebauthnCredential struct {
-	ID              string        `json:"id" bson:"id"`
-	TenantID        TenantID      `json:"tenantId" bson:"tenant_id"`
-	CredentialID    []byte        `json:"credentialId" bson:"credential_id"`
-	PublicKey       []byte        `json:"public_key" bson:"public_key"`
-	AttestationType string        `json:"attestation_type" bson:"attestation_type"`
-	Transport       []string      `json:"transport" bson:"transport"`
-	Flags           uint8         `json:"flags" bson:"flags"`
-	Authenticator   Authenticator `json:"authenticator" bson:"authenticator"`
-	Nickname        *string       `json:"nickname,omitempty" bson:"nickname,omitempty"`
-	PRFCapable      bool          `json:"prfCapable" bson:"prf_capable"`
-	CreatedAt       time.Time     `json:"createTime" bson:"created_at"`
-	LastUseTime     *time.Time    `json:"lastUseTime,omitempty" bson:"last_use_time,omitempty"`
+	ID                 string        `json:"id" bson:"id"`
+	TenantID           TenantID      `json:"tenantId" bson:"tenant_id"`
+	CredentialID       []byte        `json:"credentialId" bson:"credential_id"`
+	PublicKey          []byte        `json:"public_key" bson:"public_key"`
+	AttestationType    string        `json:"attestation_type" bson:"attestation_type"`
+	Transport          []string      `json:"transport" bson:"transport"`
+	Flags              uint8         `json:"flags" bson:"flags"`
+	Authenticator      Authenticator `json:"authenticator" bson:"authenticator"`
+	Nickname           *string       `json:"nickname,omitempty" bson:"nickname,omitempty"`
+	PRFCapable         bool          `json:"prfCapable" bson:"prf_capable"`
+	CreatedAt          time.Time     `json:"createTime" bson:"created_at"`
+	LastUseTime        *time.Time    `json:"lastUseTime,omitempty" bson:"last_use_time,omitempty"`
+	Status             string        `json:"status" bson:"status"`
+	DeactivatedAt      *time.Time    `json:"deactivatedAt,omitempty" bson:"deactivated_at,omitempty"`
+	DeactivatedBy      string        `json:"deactivatedBy,omitempty" bson:"deactivated_by,omitempty"`
+	DeactivationReason string        `json:"deactivationReason,omitempty" bson:"deactivation_reason,omitempty"`
+}
+
+// IsActive returns true when the credential is active.
+// Empty status is treated as active for backward compatibility.
+func (c WebauthnCredential) IsActive() bool {
+	return c.Status == "" || c.Status == "active"
+}
+
+// NormalizedStatus returns an API-safe credential status value.
+func (c WebauthnCredential) NormalizedStatus() string {
+	if c.IsActive() {
+		return "active"
+	}
+	return "deactivated"
 }
 
 // Authenticator represents the authenticator data

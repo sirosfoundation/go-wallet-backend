@@ -798,6 +798,35 @@ func TestFullLoginFlow(t *testing.T) {
 		assert.Equal(t, "Login Test User", finishLoginResp.DisplayName)
 		assert.Equal(t, testRPID, finishLoginResp.WebauthnRpId)
 	})
+
+	t.Run("deactivated credential is rejected", func(t *testing.T) {
+		beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+		require.NoError(t, err)
+
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(
+			setup.rp,
+			setup.authenticator,
+			setup.credential,
+			*assertionOptions,
+		)
+
+		storedUser, err := setup.store.Users().GetByID(setup.ctx, userID)
+		require.NoError(t, err)
+		require.NotEmpty(t, storedUser.WebauthnCredentials)
+		storedUser.WebauthnCredentials[0].Status = "deactivated"
+		require.NoError(t, setup.store.Users().Update(setup.ctx, storedUser))
+
+		_, err = setup.service.FinishLogin(setup.ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.ErrorIs(t, err, ErrCredentialDeactivated)
+	})
 }
 
 // ============================================================================

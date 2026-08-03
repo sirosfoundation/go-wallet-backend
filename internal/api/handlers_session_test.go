@@ -247,6 +247,9 @@ func TestHandlers_GetAccountInfo_Success(t *testing.T) {
 	if !cred.PRFCapable {
 		t.Error("Expected credential to be PRF capable")
 	}
+	if cred.Status != "active" {
+		t.Errorf("Expected normalized status 'active', got %q", cred.Status)
+	}
 }
 
 func TestHandlers_GetAccountInfo_Unauthorized(t *testing.T) {
@@ -471,6 +474,69 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
+	}
+}
+
+func TestHandlers_DeactivateWebAuthnCredential_Success(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	// Add a second credential so deactivating one does not trigger lockout.
+	u, _ := handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: "cred-2", CreatedAt: time.Now()})
+	_ = handlers.services.User.UpdateUser(context.Background(), u)
+
+	router.POST("/webauthn/credential/:id/deactivate", authMiddlewareForUser(user), handlers.DeactivateWebAuthnCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-1/deactivate", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response WebauthnCredentialInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	if response.Status != "deactivated" || response.DeactivatedBy != "user" {
+		t.Fatalf("Unexpected response: %+v", response)
+	}
+}
+
+func TestHandlers_DeactivateWebAuthnCredential_AlreadyDeactivated(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	u, _ := handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: "cred-2", CreatedAt: time.Now()})
+	u.WebauthnCredentials[0].Status = "deactivated"
+	_ = handlers.services.User.UpdateUser(context.Background(), u)
+
+	router.POST("/webauthn/credential/:id/deactivate", authMiddlewareForUser(user), handlers.DeactivateWebAuthnCredential)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-1/deactivate", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusConflict, w.Code, w.Body.String())
+	}
+}
+
+func TestHandlers_DeactivateAllWebAuthnCredentials(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	router.POST("/webauthn/deactivate-all", authMiddlewareForUser(user), handlers.DeactivateAllWebAuthnCredentials)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/deactivate-all", nil)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/webauthn/deactivate-all", nil)
+	router.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusConflict, w2.Code, w2.Body.String())
 	}
 }
 
