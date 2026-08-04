@@ -1156,6 +1156,74 @@ func TestResolve_UnknownResourceTypeURL_Rejected(t *testing.T) {
 	}
 }
 
+// Regression test: resource_type="oauth-authorization-server" must actually
+// reach resolveAuthorizationServerMetadata, not get rejected by the
+// allowlist above it. Before the fix, this always 400ed, so
+// OpenID4VCIHelper.getAuthorizationServerMetadata (used by wallet-frontend
+// to decide whether to PAR a credential-issuance flow) could never see a
+// real issuer's pushed_authorization_request_endpoint - the wallet fell
+// back to an un-PARed authorize redirect even against a PAR-only AS.
+func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
+	asServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/oauth-authorization-server" {
+			t.Errorf("unexpected well-known path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"issuer":                                "https://as.example.com",
+			"token_endpoint":                        "https://as.example.com/token",
+			"pushed_authorization_request_endpoint": "https://as.example.com/par",
+			"require_pushed_authorization_requests": true,
+		})
+	}))
+	defer asServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: map[string]interface{}{}},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, asServer.Client(), asServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    asServer.URL,
+		"subject_type":  "url",
+		"resource_type": "oauth-authorization-server",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Context struct {
+			TrustMetadata map[string]interface{} `json:"trust_metadata"`
+		} `json:"context"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v: %s", err, w.Body.String())
+	}
+	if resp.Context.TrustMetadata["pushed_authorization_request_endpoint"] != "https://as.example.com/par" {
+		t.Errorf("expected pushed_authorization_request_endpoint in trust_metadata, got: %v", resp.Context.TrustMetadata)
+	}
+}
+
 // ============================================================================
 // Helper Function Tests
 // ============================================================================
