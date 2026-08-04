@@ -435,10 +435,21 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 			h.resolveCredentialOfferURI(c, ctx, req.SubjectID)
 			return
 		}
-		// Allowlist: only credential_issuer is valid beyond this point.
-		// An unknown resource_type would silently fall through to credential-issuer
-		// resolution, creating a policy-bypass surface if SPOCP rules are permissive.
-		if resourceType != "credential_issuer" {
+		// Allowlist: only credential_issuer and oauth-authorization-server are
+		// valid beyond this point. An unknown resource_type would silently
+		// fall through to credential-issuer resolution, creating a
+		// policy-bypass surface if SPOCP rules are permissive.
+		//
+		// oauth-authorization-server was added below (the switch case calling
+		// resolveAuthorizationServerMetadata) without updating this allowlist,
+		// making that case dead code - every oauth-authorization-server
+		// request 400ed here first. Confirmed live: OpenID4VCIHelper's
+		// getAuthorizationServerMetadata (used to decide whether to PAR a
+		// credential-issuance flow) always got this 400, so
+		// pushed_authorization_request_endpoint was never seen even when the
+		// issuer's real discovery document advertised one and required PAR -
+		// the wallet fell back to an un-PARed authorize redirect instead.
+		if resourceType != "credential_issuer" && resourceType != "oauth-authorization-server" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported resource_type for URL subjects: %s", resourceType)})
 			return
 		}
