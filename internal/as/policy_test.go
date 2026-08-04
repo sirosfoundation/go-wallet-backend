@@ -13,8 +13,12 @@ func TestSPOCPEngine_LoadAndEvaluate(t *testing.T) {
 	rulesFile := filepath.Join(dir, "test.rules")
 	// Rule: allow any token request with tac=r. Rules are loaded in
 	// go-spocp's advanced form, not canonical netstring form - see the
-	// comment on LoadRulesFromDir's opts.Format for why.
-	err := os.WriteFile(rulesFile, []byte("(token (tac r))\n"), 0600)
+	// comment on LoadRulesFromDir's opts.Format for why. The leading
+	// (aud (*)) matters, not just tac=r: BuildTokenQuery always emits aud
+	// as the (alphabetically) first field, and SPOCP compares rule vs
+	// query elements positionally, so a rule missing that leading field
+	// would silently never match a real query.
+	err := os.WriteFile(rulesFile, []byte("(token (aud (*)) (tac r))\n"), 0600)
 	if err != nil {
 		t.Fatalf("write rules: %v", err)
 	}
@@ -30,8 +34,10 @@ func TestSPOCPEngine_LoadAndEvaluate(t *testing.T) {
 
 	// Query is still evaluated in canonical form - only rule *files* use
 	// advanced form; BuildTokenQuery emits canonical form and that's what
-	// reaches Evaluate() in production.
-	allowed, err := pe.Evaluate("(5:token (3:tac 1:r))")
+	// reaches Evaluate() in production. Build it via BuildTokenQuery
+	// (rather than a hand-rolled netstring) so the query has the same
+	// aud-then-tac shape a real read-only request produces.
+	allowed, err := pe.Evaluate(BuildTokenQuery("", "wallet-backend", "", TAC("r"), ""))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -43,8 +49,9 @@ func TestSPOCPEngine_LoadAndEvaluate(t *testing.T) {
 func TestSPOCPEngine_Deny(t *testing.T) {
 	dir := t.TempDir()
 	rulesFile := filepath.Join(dir, "test.rules")
-	// Rule: only allow tac=r
-	err := os.WriteFile(rulesFile, []byte("(token (tac r))\n"), 0600)
+	// Rule: only allow tac=r. Leading (aud (*)) is required for the same
+	// positional-alignment reason as TestSPOCPEngine_LoadAndEvaluate.
+	err := os.WriteFile(rulesFile, []byte("(token (aud (*)) (tac r))\n"), 0600)
 	if err != nil {
 		t.Fatalf("write rules: %v", err)
 	}
@@ -55,7 +62,7 @@ func TestSPOCPEngine_Deny(t *testing.T) {
 	}
 
 	// Query asking for write — should be denied.
-	allowed, err := pe.Evaluate("(5:token (3:tac 1:w))")
+	allowed, err := pe.Evaluate(BuildTokenQuery("", "wallet-backend", "", TAC("w"), ""))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -136,7 +143,9 @@ func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
 func TestSPOCPEngine_WildcardsFromFileActuallyMatch(t *testing.T) {
 	dir := t.TempDir()
 	rulesFile := filepath.Join(dir, "wildcard.rules")
-	if err := os.WriteFile(rulesFile, []byte("(token (tac (*)))\n"), 0600); err != nil {
+	// Leading (aud (*)) matches the shape BuildTokenQuery actually emits;
+	// see the positional-alignment note in TestSPOCPEngine_LoadAndEvaluate.
+	if err := os.WriteFile(rulesFile, []byte("(token (aud (*)) (tac (*)))\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,7 +154,7 @@ func TestSPOCPEngine_WildcardsFromFileActuallyMatch(t *testing.T) {
 		t.Fatalf("LoadRulesFromDir: %v", err)
 	}
 
-	allowed, err := pe.Evaluate("(5:token (3:tac 2:rw))")
+	allowed, err := pe.Evaluate(BuildTokenQuery("", "wallet-backend", "", TAC("rw"), ""))
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
