@@ -41,6 +41,7 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/server /app/server
 COPY --from=builder /app/configs /app/configs
+COPY --from=builder /app/rules /app/rules
 
 USER 65532:65532
 

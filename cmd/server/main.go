@@ -42,12 +42,15 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend, engine, admin, and wallet-provider roles)
+	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleWalletProvider) {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
+		}
+		if roles.Has(modes.RoleAuth) {
+			backendCfg.EnableForRole()
 		}
 	}
 

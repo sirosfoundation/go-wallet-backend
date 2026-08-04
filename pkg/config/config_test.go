@@ -1343,6 +1343,77 @@ func TestASConfig_GetTokenTTL(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_FillsDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.JWT.Issuer = "https://issuer.example"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://issuer.example" {
+		t.Errorf("expected Issuer to fall back to JWT.Issuer, got %q", cfg.AS.Issuer)
+	}
+	// SetDefaults should still run (TTLs, DefaultMaxTAC etc.)
+	if cfg.AS.DefaultTokenTTL == 0 {
+		t.Error("expected EnableForRole to also apply ASConfig.SetDefaults defaults")
+	}
+}
+
+func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/custom/key.pem"
+	cfg.AS.RulesDir = "/custom/rules"
+	cfg.AS.Issuer = "https://custom-issuer.example"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "/custom/key.pem" {
+		t.Errorf("expected explicit SigningKeyPath to be preserved, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://custom-issuer.example" {
+		t.Errorf("expected explicit Issuer to be preserved, got %q", cfg.AS.Issuer)
+	}
+}
+
+func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_ExplicitRulesDirPreserved(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.RulesDir = "/custom/rules"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+}
+
 func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
