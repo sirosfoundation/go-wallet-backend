@@ -299,9 +299,13 @@ func redactURIForLogging(uri string) string {
 		return ""
 	}
 	u, err := url.Parse(uri)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" {
 		return "<non-url>"
 	}
+	// Host is legitimately empty for some valid, non-sensitive requests -
+	// e.g. "haip://?client_id=..." (no callback/authority segment) parses
+	// with an empty Host. Requiring a non-empty Host here would misclassify
+	// those as "<non-url>" instead of the more informative "haip://".
 	return u.Scheme + "://" + u.Host
 }
 

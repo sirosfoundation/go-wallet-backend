@@ -455,6 +455,11 @@ func TestRedactURIForLogging(t *testing.T) {
 		{"https://verifier.example.com/req?nonce=secret&client_id=foo", "https://verifier.example.com"},
 		{"client_id=foo&nonce=secret", "<non-url>"},
 		{"not a url at all", "<non-url>"},
+		// haip:// (and openid4vp://) requests with no callback/authority
+		// segment are common and not malformed - Host is legitimately
+		// empty. Must still report the scheme, not "<non-url>".
+		{"haip://?client_id=foo&nonce=secret", "haip://"},
+		{"openid4vp://?client_id=foo&nonce=secret", "openid4vp://"},
 	}
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, redactURIForLogging(tc.in), "redactURIForLogging(%q)", tc.in)
