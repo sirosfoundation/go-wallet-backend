@@ -63,7 +63,7 @@ func (pe *SPOCPEngine) LoadRulesFromDir(dir string) error {
 		// constructs real starform.Wildcard values.
 		opts.Format = persist.FormatAdvanced
 		if err := pe.engine.LoadRulesFromFileWithOptions(path, opts); err != nil {
-			return fmt.Errorf("as: failed to load rules from %s: %w", path, err)
+			return fmt.Errorf("as: failed to load rules from %s (expected advanced-form S-expression syntax, e.g. \"(tac (*))\", not canonical netstring form): %w", path, err)
 		}
 		loaded++
 		pe.logger.Info("loaded SPOCP rules",
