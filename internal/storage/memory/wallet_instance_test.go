@@ -191,6 +191,156 @@ func TestWalletInstanceStore_UpdateStatus_Suspend(t *testing.T) {
 	}
 }
 
+func TestWalletInstanceStore_GetAllByTenant(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	instances := []*domain.WalletInstance{
+		{ID: "acme-1", TenantID: "acme", Status: domain.InstanceStatusActive},
+		{ID: "acme-2", TenantID: "acme", Status: domain.InstanceStatusActive},
+		{ID: "globex-1", TenantID: "globex", Status: domain.InstanceStatusActive},
+	}
+	for _, inst := range instances {
+		if err := wis.Upsert(ctx, inst); err != nil {
+			t.Fatalf("Upsert %s: %v", inst.ID, err)
+		}
+	}
+
+	got, err := wis.GetAllByTenant(ctx, "acme")
+	if err != nil {
+		t.Fatalf("GetAllByTenant: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 instances for tenant acme, got %d", len(got))
+	}
+	for _, inst := range got {
+		if inst.TenantID != "acme" {
+			t.Errorf("unexpected tenant %q in result", inst.TenantID)
+		}
+	}
+}
+
+func TestWalletInstanceStore_GetAllByTenant_NoMatches(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	inst := &domain.WalletInstance{ID: "acme-1", TenantID: "acme", Status: domain.InstanceStatusActive}
+	if err := wis.Upsert(ctx, inst); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	got, err := wis.GetAllByTenant(ctx, "other-tenant")
+	if err != nil {
+		t.Fatalf("GetAllByTenant: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 instances, got %d", len(got))
+	}
+}
+
+func TestWalletInstanceStore_GetByUser(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	userA := domain.UserIDFromString("user-a")
+	userB := domain.UserIDFromString("user-b")
+
+	instances := []*domain.WalletInstance{
+		{ID: "inst-a1", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &userA},
+		{ID: "inst-a2", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &userA},
+		{ID: "inst-b1", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &userB},
+		{ID: "inst-none", TenantID: "acme", Status: domain.InstanceStatusActive},
+		{ID: "inst-other-tenant", TenantID: "globex", Status: domain.InstanceStatusActive, UserID: &userA},
+	}
+	for _, inst := range instances {
+		if err := wis.Upsert(ctx, inst); err != nil {
+			t.Fatalf("Upsert %s: %v", inst.ID, err)
+		}
+	}
+
+	got, err := wis.GetByUser(ctx, "acme", userA)
+	if err != nil {
+		t.Fatalf("GetByUser: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 instances for user-a in acme, got %d", len(got))
+	}
+	for _, inst := range got {
+		if inst.UserID == nil || *inst.UserID != userA {
+			t.Errorf("unexpected instance in result: %+v", inst)
+		}
+		if inst.TenantID != "acme" {
+			t.Errorf("unexpected tenant in result: %+v", inst)
+		}
+	}
+}
+
+func TestWalletInstanceStore_GetByUser_NoMatches(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	userA := domain.UserIDFromString("user-a")
+	inst := &domain.WalletInstance{ID: "inst-a1", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &userA}
+	if err := wis.Upsert(ctx, inst); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	userB := domain.UserIDFromString("user-b")
+	got, err := wis.GetByUser(ctx, "acme", userB)
+	if err != nil {
+		t.Fatalf("GetByUser: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 instances for user-b, got %d", len(got))
+	}
+}
+
+func TestWalletInstanceStore_GetByID_NotFound(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	_, err := wis.GetByID(ctx, "nonexistent")
+	if err != storage.ErrNotFound {
+		t.Errorf("GetByID = %v, want ErrNotFound", err)
+	}
+}
+
+func TestWalletInstanceStore_Delete(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	inst := &domain.WalletInstance{ID: "inst-del", TenantID: "acme", Status: domain.InstanceStatusActive}
+	if err := wis.Upsert(ctx, inst); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	if err := wis.Delete(ctx, "inst-del"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	_, err := wis.GetByID(ctx, "inst-del")
+	if err != storage.ErrNotFound {
+		t.Errorf("GetByID after Delete = %v, want ErrNotFound", err)
+	}
+}
+
+func TestWalletInstanceStore_Delete_NotFound(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	err := wis.Delete(ctx, "nonexistent")
+	if err != storage.ErrNotFound {
+		t.Errorf("Delete nonexistent = %v, want ErrNotFound", err)
+	}
+}
+
 func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()

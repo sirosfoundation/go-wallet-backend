@@ -2,15 +2,22 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 func init() {
@@ -25,6 +32,207 @@ func setupAdminTestHandlers(t *testing.T) (*AdminHandlers, *gin.Engine) {
 
 	router := gin.New()
 	return handlers, router
+}
+
+// errStore wraps a storage.Store so tests can inject failures on specific
+// sub-store methods that are otherwise unreachable through the in-memory
+// store (which never fails on its own). Only the sub-stores actually needed
+// by a given test are set; everything else delegates to the embedded real
+// store.
+type errStore struct {
+	storage.Store
+	tenants         *errTenantStore
+	userTenants     *errUserTenantStore
+	issuers         *errIssuerStore
+	verifiers       *errVerifierStore
+	walletInstances *errWalletInstanceStore
+	users           *errUserStore
+}
+
+func (s *errStore) Tenants() storage.TenantStore {
+	if s.tenants != nil {
+		return s.tenants
+	}
+	return s.Store.Tenants()
+}
+
+func (s *errStore) UserTenants() storage.UserTenantStore {
+	if s.userTenants != nil {
+		return s.userTenants
+	}
+	return s.Store.UserTenants()
+}
+
+func (s *errStore) Issuers() storage.IssuerStore {
+	if s.issuers != nil {
+		return s.issuers
+	}
+	return s.Store.Issuers()
+}
+
+func (s *errStore) Verifiers() storage.VerifierStore {
+	if s.verifiers != nil {
+		return s.verifiers
+	}
+	return s.Store.Verifiers()
+}
+
+func (s *errStore) WalletInstances() storage.WalletInstanceStore {
+	if s.walletInstances != nil {
+		return s.walletInstances
+	}
+	return s.Store.WalletInstances()
+}
+
+func (s *errStore) Users() storage.UserStore {
+	if s.users != nil {
+		return s.users
+	}
+	return s.Store.Users()
+}
+
+type errTenantStore struct {
+	storage.TenantStore
+	getAllErr  error
+	getByIDErr error
+	deleteErr  error
+}
+
+func (s *errTenantStore) GetAll(ctx context.Context) ([]*domain.Tenant, error) {
+	if s.getAllErr != nil {
+		return nil, s.getAllErr
+	}
+	return s.TenantStore.GetAll(ctx)
+}
+
+func (s *errTenantStore) GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error) {
+	if s.getByIDErr != nil {
+		return nil, s.getByIDErr
+	}
+	return s.TenantStore.GetByID(ctx, id)
+}
+
+func (s *errTenantStore) Delete(ctx context.Context, id domain.TenantID) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.TenantStore.Delete(ctx, id)
+}
+
+type errUserTenantStore struct {
+	storage.UserTenantStore
+	addErr      error
+	removeErr   error
+	getUsersErr error
+	isMemberErr error
+}
+
+func (s *errUserTenantStore) AddMembership(ctx context.Context, m *domain.UserTenantMembership) error {
+	if s.addErr != nil {
+		return s.addErr
+	}
+	return s.UserTenantStore.AddMembership(ctx, m)
+}
+
+func (s *errUserTenantStore) RemoveMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) error {
+	if s.removeErr != nil {
+		return s.removeErr
+	}
+	return s.UserTenantStore.RemoveMembership(ctx, userID, tenantID)
+}
+
+func (s *errUserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.TenantID) ([]domain.UserID, error) {
+	if s.getUsersErr != nil {
+		return nil, s.getUsersErr
+	}
+	return s.UserTenantStore.GetTenantUsers(ctx, tenantID)
+}
+
+func (s *errUserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+	if s.isMemberErr != nil {
+		return false, s.isMemberErr
+	}
+	return s.UserTenantStore.IsMember(ctx, userID, tenantID)
+}
+
+type errIssuerStore struct {
+	storage.IssuerStore
+	getAllErr error
+}
+
+func (s *errIssuerStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.CredentialIssuer, error) {
+	if s.getAllErr != nil {
+		return nil, s.getAllErr
+	}
+	return s.IssuerStore.GetAll(ctx, tenantID)
+}
+
+type errVerifierStore struct {
+	storage.VerifierStore
+	getAllErr error
+	createErr error
+}
+
+func (s *errVerifierStore) GetAll(ctx context.Context, tenantID domain.TenantID) ([]*domain.Verifier, error) {
+	if s.getAllErr != nil {
+		return nil, s.getAllErr
+	}
+	return s.VerifierStore.GetAll(ctx, tenantID)
+}
+
+func (s *errVerifierStore) Create(ctx context.Context, v *domain.Verifier) error {
+	if s.createErr != nil {
+		return s.createErr
+	}
+	return s.VerifierStore.Create(ctx, v)
+}
+
+type errWalletInstanceStore struct {
+	storage.WalletInstanceStore
+	getAllByTenantErr error
+	getByIDErr        error
+	getByUserErr      error
+	deleteErr         error
+}
+
+func (s *errWalletInstanceStore) GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.WalletInstance, error) {
+	if s.getAllByTenantErr != nil {
+		return nil, s.getAllByTenantErr
+	}
+	return s.WalletInstanceStore.GetAllByTenant(ctx, tenantID)
+}
+
+func (s *errWalletInstanceStore) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {
+	if s.getByIDErr != nil {
+		return nil, s.getByIDErr
+	}
+	return s.WalletInstanceStore.GetByID(ctx, id)
+}
+
+func (s *errWalletInstanceStore) GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	if s.getByUserErr != nil {
+		return nil, s.getByUserErr
+	}
+	return s.WalletInstanceStore.GetByUser(ctx, tenantID, userID)
+}
+
+func (s *errWalletInstanceStore) Delete(ctx context.Context, id string) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.WalletInstanceStore.Delete(ctx, id)
+}
+
+type errUserStore struct {
+	storage.UserStore
+	getByIDErr error
+}
+
+func (s *errUserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
+	if s.getByIDErr != nil {
+		return nil, s.getByIDErr
+	}
+	return s.UserStore.GetByID(ctx, id)
 }
 
 func TestNewAdminHandlers(t *testing.T) {
@@ -1005,4 +1213,317 @@ func TestTenantToResponse(t *testing.T) {
 	_ = handlers // Just to ensure setup works
 
 	// tenantToResponse is tested implicitly through the handlers
+}
+
+func TestAdminHandlers_RegisterRoutes(t *testing.T) {
+	t.Run("without r2ps client", func(t *testing.T) {
+		handlers, _ := setupAdminTestHandlers(t)
+		router := gin.New()
+		group := router.Group("/admin")
+		handlers.RegisterRoutes(group)
+
+		routeSet := make(map[string]bool)
+		for _, r := range router.Routes() {
+			routeSet[r.Method+" "+r.Path] = true
+		}
+
+		expected := []string{
+			"GET /admin/tenants",
+			"POST /admin/tenants",
+			"GET /admin/tenants/:id",
+			"PUT /admin/tenants/:id",
+			"DELETE /admin/tenants/:id",
+			"GET /admin/tenants/:id/users",
+			"POST /admin/tenants/:id/users",
+			"DELETE /admin/tenants/:id/users/:user_id",
+			"GET /admin/tenants/:id/issuers",
+			"POST /admin/tenants/:id/issuers",
+			"GET /admin/tenants/:id/issuers/:issuer_id",
+			"PUT /admin/tenants/:id/issuers/:issuer_id",
+			"DELETE /admin/tenants/:id/issuers/:issuer_id",
+			"GET /admin/tenants/:id/verifiers",
+			"POST /admin/tenants/:id/verifiers",
+			"GET /admin/tenants/:id/verifiers/:verifier_id",
+			"PUT /admin/tenants/:id/verifiers/:verifier_id",
+			"DELETE /admin/tenants/:id/verifiers/:verifier_id",
+			"GET /admin/tenants/:id/invites",
+			"POST /admin/tenants/:id/invites",
+			"GET /admin/tenants/:id/invites/:invite_id",
+			"PUT /admin/tenants/:id/invites/:invite_id",
+			"DELETE /admin/tenants/:id/invites/:invite_id",
+			"GET /admin/tenants/:id/instances",
+			"GET /admin/tenants/:id/instances/:instance_id",
+			"PUT /admin/tenants/:id/instances/:instance_id/status",
+			"DELETE /admin/tenants/:id/instances/:instance_id",
+			"GET /admin/tenants/:id/users/:user_id/instances",
+			"GET /admin/tenants/:id/users/:user_id/detail",
+			"GET /admin/tenants/:id/stats",
+		}
+		for _, e := range expected {
+			if !routeSet[e] {
+				t.Errorf("expected route %q to be registered", e)
+			}
+		}
+
+		for _, r := range router.Routes() {
+			if strings.HasPrefix(r.Path, "/admin/r2ps") {
+				t.Errorf("did not expect r2ps route %s to be registered when r2psClient is nil", r.Path)
+			}
+		}
+	})
+
+	t.Run("with r2ps client", func(t *testing.T) {
+		store := memory.NewStore()
+		handlers := NewAdminHandlers(store, zap.NewNop(), nil, r2ps.NewClient("https://r2ps.example.com"))
+		router := gin.New()
+		group := router.Group("/admin")
+		handlers.RegisterRoutes(group)
+
+		routeSet := make(map[string]bool)
+		for _, r := range router.Routes() {
+			routeSet[r.Method+" "+r.Path] = true
+		}
+
+		expected := []string{
+			"GET /admin/r2ps/keys",
+			"GET /admin/r2ps/keys/:kid",
+			"GET /admin/r2ps/statuses/:category",
+			"GET /admin/r2ps/status/:category/:idx",
+			"PUT /admin/r2ps/status/:category/:idx",
+		}
+		for _, e := range expected {
+			if !routeSet[e] {
+				t.Errorf("expected r2ps route %q to be registered when r2psClient is set", e)
+			}
+		}
+	})
+}
+
+func TestAdminHandlers_ListTenants_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	store := &errStore{
+		Store:   base,
+		tenants: &errTenantStore{TenantStore: base.Tenants(), getAllErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants", handlers.ListTenants)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_GetTenant_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	store := &errStore{
+		Store:   base,
+		tenants: &errTenantStore{TenantStore: base.Tenants(), getByIDErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id", handlers.GetTenant)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/whatever", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_DeleteTenant_DeleteError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "del-err-test", Name: "Del Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:   base,
+		tenants: &errTenantStore{TenantStore: base.Tenants(), deleteErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id", handlers.DeleteTenant)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/del-err-test", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_AddUserToTenant_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "add-err-test", Name: "Add Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:       base,
+		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), addErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users", handlers.AddUserToTenant)
+
+	body := `{"user_id": "u1"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/add-err-test/users", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_RemoveUserFromTenant_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	store := &errStore{
+		Store:       base,
+		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), removeErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/users/:user_id", handlers.RemoveUserFromTenant)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/rm-err-test/users/u1", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_GetTenantUsers_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "gtu-err-test", Name: "GTU Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:       base,
+		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), getUsersErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/users", handlers.GetTenantUsers)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/gtu-err-test/users", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestIssuerToResponse_WithTrustEvaluatedAt(t *testing.T) {
+	evaluatedAt := time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC)
+	issuer := &domain.CredentialIssuer{
+		ID:                         42,
+		TenantID:                   "acme",
+		CredentialIssuerIdentifier: "https://issuer.example.com",
+		ClientID:                   "client-1",
+		ClientJWK:                  `{"kty":"EC"}`,
+		Visible:                    true,
+		TrustStatus:                domain.TrustStatus("trusted"),
+		TrustFramework:             "eudi",
+		TrustEvaluatedAt:           &evaluatedAt,
+	}
+
+	resp := issuerToResponse(issuer)
+
+	if resp.TrustEvaluatedAt == nil {
+		t.Fatal("expected TrustEvaluatedAt to be set")
+	}
+	if *resp.TrustEvaluatedAt != evaluatedAt.Format(time.RFC3339) {
+		t.Errorf("expected %s, got %s", evaluatedAt.Format(time.RFC3339), *resp.TrustEvaluatedAt)
+	}
+	if !resp.HasClientJWK {
+		t.Error("expected HasClientJWK to be true when ClientJWK is set")
+	}
+	if resp.TrustStatus != "trusted" {
+		t.Errorf("expected trust_status 'trusted', got %q", resp.TrustStatus)
+	}
+}
+
+func TestAdminHandlers_ListIssuers_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "li-err-test", Name: "LI Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:   base,
+		issuers: &errIssuerStore{IssuerStore: base.Issuers(), getAllErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/issuers", handlers.ListIssuers)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/li-err-test/issuers", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_ListVerifiers_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "lv-err-test", Name: "LV Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:     base,
+		verifiers: &errVerifierStore{VerifierStore: base.Verifiers(), getAllErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/verifiers", handlers.ListVerifiers)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/lv-err-test/verifiers", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
+}
+
+func TestAdminHandlers_CreateVerifier_StoreError(t *testing.T) {
+	base := memory.NewStore()
+	tenant := &domain.Tenant{ID: "cv-err-test", Name: "CV Err"}
+	if err := base.Tenants().Create(context.Background(), tenant); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	store := &errStore{
+		Store:     base,
+		verifiers: &errVerifierStore{VerifierStore: base.Verifiers(), createErr: errors.New("boom")},
+	}
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.POST("/admin/tenants/:id/verifiers", handlers.CreateVerifier)
+
+	body := `{"name": "Test", "url": "https://verifier.example.com"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/cv-err-test/verifiers", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected %d, got %d: %s", http.StatusInternalServerError, w.Code, w.Body.String())
+	}
 }

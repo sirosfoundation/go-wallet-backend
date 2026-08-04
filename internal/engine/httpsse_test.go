@@ -454,3 +454,121 @@ func TestExtractBearerToken(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// HandleEvents: additional coverage for branches not exercised above
+// (wrong method, invalid/expired token, tenant mismatch, and a real
+// streamed message over HTTP).
+// ---------------------------------------------------------------------------
+
+func TestHandleEvents_WrongMethod(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/events", nil)
+	w := httptest.NewRecorder()
+
+	m.HandleEvents(w, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+}
+
+func TestHandleEvents_InvalidToken(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id=xxx", nil)
+	req.Header.Set("Authorization", "Bearer "+expiredToken("user-1"))
+	w := httptest.NewRecorder()
+
+	m.HandleEvents(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// TestHandleEvents_TenantMismatch is a regression test: a caller
+// authenticated as the session's own user but under a different tenant
+// context must still be rejected as if the session didn't exist.
+func TestHandleEvents_TenantMismatch(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	handshakeBody, _ := json.Marshal(Message{Type: TypeHandshake})
+	hReq := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/rpc", bytes.NewReader(handshakeBody))
+	hReq.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	hW := httptest.NewRecorder()
+	m.HandleRPC(hW, hReq)
+	require.Equal(t, http.StatusCreated, hW.Code)
+
+	var hResp HandshakeCompleteMessage
+	require.NoError(t, json.Unmarshal(hW.Body.Bytes(), &hResp))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+hResp.SessionID, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-b"))
+	w := httptest.NewRecorder()
+
+	m.HandleEvents(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestHandleEvents_StreamsMessage exercises the full success path of
+// HandleEvents over a real HTTP connection, verifying a message sent
+// through the session's transport is actually delivered as an SSE frame.
+func TestHandleEvents_StreamsMessage(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	handshakeBody, _ := json.Marshal(Message{Type: TypeHandshake})
+	hReq := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/rpc", bytes.NewReader(handshakeBody))
+	hReq.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	hW := httptest.NewRecorder()
+	m.HandleRPC(hW, hReq)
+	require.Equal(t, http.StatusCreated, hW.Code)
+
+	var hResp HandshakeCompleteMessage
+	require.NoError(t, json.Unmarshal(hW.Body.Bytes(), &hResp))
+	sessionID := hResp.SessionID
+
+	session, err := m.GetSession(sessionID)
+	require.NoError(t, err)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.HandleEvents(w, r)
+	}))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Mimic the engine's message loop pushing an outbound message once the
+	// SSE connection is live.
+	require.NoError(t, session.transport.SendJSON(map[string]string{"hello": "world"}))
+
+	found := make(chan string, 1)
+	go func() {
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "data: ") {
+				found <- strings.TrimPrefix(line, "data: ")
+				return
+			}
+		}
+	}()
+
+	select {
+	case data := <-found:
+		assert.JSONEq(t, `{"hello":"world"}`, data)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SSE data")
+	}
+}

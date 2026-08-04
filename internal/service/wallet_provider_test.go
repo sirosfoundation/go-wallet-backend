@@ -2,12 +2,16 @@ package service
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
 	"os"
 	"testing"
@@ -220,6 +224,127 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 	}
 	if _, ok := claims["exp"]; !ok {
 		t.Error("exp claim missing")
+	}
+}
+
+func TestGenerateKeyAttestation_WalletInstanceIDAndAudience(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "wallet-instance-123", "https://issuer.example.com/credential")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	if claims["sub"] != "wallet-instance-123" {
+		t.Errorf("sub = %v, want wallet-instance-123 (binds KA to wallet instance, CS-04 §7.1.3)", claims["sub"])
+	}
+	if claims["aud"] != "https://issuer.example.com/credential" {
+		t.Errorf("aud = %v, want https://issuer.example.com/credential (scopes KA to target issuer)", claims["aud"])
+	}
+}
+
+func TestGenerateKeyAttestation_NoWalletInstanceIDOrAudience(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	if _, ok := claims["sub"]; ok {
+		t.Error("sub claim should be absent when walletInstanceID is empty")
+	}
+	if _, ok := claims["aud"]; ok {
+		t.Error("aud claim should be absent when audience is empty")
+	}
+}
+
+func TestGenerateKeyAttestation_DefaultExpiryWhenUnset(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+	svc.cfg.WalletProvider.Attestation.KAExpirySeconds = 0 // triggers 15s default fallback
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
+	claims := token.Claims.(jwt.MapClaims)
+
+	iat, ok := claims["iat"].(float64)
+	if !ok {
+		t.Fatal("iat claim missing or not a number")
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		t.Fatal("exp claim missing or not a number")
+	}
+	if got := exp - iat; got != 15 {
+		t.Errorf("exp-iat = %v, want 15 (default KA expiry when KAExpirySeconds <= 0)", got)
+	}
+}
+
+// failingSigner is a crypto.Signer with a valid P-256 public key (so it
+// passes NewCryptoSignerES256 construction) but always fails to sign, used
+// to exercise GenerateKeyAttestation's signing-error path.
+type failingSigner struct {
+	pub *ecdsa.PublicKey
+}
+
+func (f *failingSigner) Public() crypto.PublicKey { return f.pub }
+
+func (f *failingSigner) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
+	return nil, errors.New("simulated signing failure")
+}
+
+func TestGenerateKeyAttestation_SignError(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwtSigner, err := signing.NewCryptoSignerES256(&failingSigner{pub: &key.PublicKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Server.BaseURL = "https://wp.example.com"
+	cfg.WalletProvider.Attestation = config.AttestationConfig{KAExpirySeconds: 15}
+	svc := &WalletProviderService{
+		cfg:       cfg,
+		logger:    zap.NewNop(),
+		jwtSigner: jwtSigner,
+		certChain: []string{"deadbeef"},
+	}
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+
+	_, err = svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
+	if err == nil {
+		t.Fatal("expected error when the underlying signer fails to sign")
 	}
 }
 
@@ -494,6 +619,139 @@ func TestLoadKeys_WithCACert(t *testing.T) {
 	}
 }
 
+func TestLoadKeys_UnparsableKey(t *testing.T) {
+	// A PEM block with an accepted type but bytes that are valid ASN.1 for
+	// neither SEC1 EC nor PKCS8 — both parse attempts fail and the original
+	// EC parse error should be returned.
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: []byte("not valid asn.1 der data at all")})
+	kf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err == nil {
+		t.Fatal("expected error when neither EC nor PKCS8 parsing succeeds")
+	}
+}
+
+func TestLoadKeys_PKCS8NonECDSAKey(t *testing.T) {
+	// A PKCS8-encoded RSA key should fail with "not an ECDSA private key"
+	// since the wallet provider only supports ES256.
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	err = svc.loadKeys()
+	if err == nil {
+		t.Fatal("expected error for non-ECDSA PKCS8 key")
+	}
+	if err.Error() != "not an ECDSA private key" {
+		t.Errorf("err = %q, want %q", err.Error(), "not an ECDSA private key")
+	}
+}
+
+func TestLoadKeys_WrongCurve(t *testing.T) {
+	// A valid SEC1 EC key on a non-P256 curve parses fine but must be
+	// rejected when building the ES256 JWT signer (wallet provider only
+	// supports ES256/P-256).
+	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err == nil {
+		t.Fatal("expected error for non-P256 curve key")
+	}
+}
+
+func TestLoadKeys_MissingCertificateFile(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = "/nonexistent/cert.pem"
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	err := svc.loadKeys()
+	if err == nil {
+		t.Fatal("expected error for missing certificate file")
+	}
+	if svc.jwtSigner == nil {
+		t.Error("jwtSigner should still be set from the key even though cert loading failed")
+	}
+}
+
+func TestLoadKeys_InvalidCACert_LogsWarningButSucceeds(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpDir := t.TempDir()
+
+	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyPath := tmpDir + "/key.pem"
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
+
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.CACertPath = "/nonexistent/ca.pem"
+	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
+
+	if err := svc.loadKeys(); err != nil {
+		t.Fatalf("loadKeys should succeed despite a bad CA cert path: %v", err)
+	}
+	if len(svc.certChain) != 1 {
+		t.Errorf("expected certChain to contain only the primary cert, got %d entries", len(svc.certChain))
+	}
+}
+
 func TestLoadKeys_MissingKeyFile(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.WalletProvider.PrivateKeyPath = "/nonexistent/key.pem"
@@ -536,5 +794,66 @@ func TestNewWalletProviderService_NoKeys(t *testing.T) {
 	svc := NewWalletProviderService(cfg, zap.NewNop())
 	if svc.IsSupported() {
 		t.Error("service should not be supported without keys")
+	}
+}
+
+func TestNewWalletProviderService_FileKeys_LoadFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Invalid key content, but paths are set so the file-based branch is taken
+	// and loadKeys() is expected to fail (exercises the constructor's warn
+	// path instead of loadKeys itself).
+	keyPath := tmpDir + "/key.pem"
+	if err := os.WriteFile(keyPath, []byte("not a pem file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+
+	svc := NewWalletProviderService(cfg, zap.NewNop())
+	if svc.IsSupported() {
+		t.Error("service should not be supported when key loading fails")
+	}
+}
+
+func TestNewWalletProviderService_PKCS11_LoadFailure(t *testing.T) {
+	// PKCS#11 support is only compiled in with the "pkcs11" build tag, so in
+	// the default test build LoadKeyMaterial always fails for a PKCS11
+	// config. The constructor must log a warning and fall back to an
+	// unsupported (no signer) service rather than erroring or panicking.
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	tmpDir := t.TempDir()
+	certPath := tmpDir + "/cert.pem"
+	cf, _ := os.Create(certPath)
+	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	cf.Close()
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.PKCS11 = &config.PKCS11SigningConfig{
+		ModulePath: "/usr/lib/softhsm/libsofthsm2.so",
+		SlotID:     0,
+		PIN:        "1234",
+		KeyLabel:   "wallet-provider",
+	}
+
+	svc := NewWalletProviderService(cfg, zap.NewNop())
+	if svc.IsSupported() {
+		t.Error("service should not be supported when PKCS#11 is not compiled in")
+	}
+	if svc.signer != nil {
+		t.Error("signer should remain nil when PKCS#11 load fails")
 	}
 }

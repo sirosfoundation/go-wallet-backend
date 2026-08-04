@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -349,6 +350,86 @@ func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListWalletInstances_StoreError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	store := &errStore{
+		Store:           base,
+		walletInstances: &errWalletInstanceStore{WalletInstanceStore: base.WalletInstances(), getAllByTenantErr: errors.New("boom")},
+	}
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/instances", h.ListWalletInstances)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/acme/instances", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetWalletInstance_StoreError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	store := &errStore{
+		Store:           base,
+		walletInstances: &errWalletInstanceStore{WalletInstanceStore: base.WalletInstances(), getByIDErr: errors.New("boom")},
+	}
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/instances/:instance_id", h.GetWalletInstance)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/acme/instances/inst-1", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteWalletInstance_StoreError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	store := &errStore{
+		Store:           base,
+		walletInstances: &errWalletInstanceStore{WalletInstanceStore: base.WalletInstances(), deleteErr: errors.New("boom")},
+	}
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/inst-1", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListWalletInstancesByUser_StoreError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	store := &errStore{
+		Store:           base,
+		walletInstances: &errWalletInstanceStore{WalletInstanceStore: base.WalletInstances(), getByUserErr: errors.New("boom")},
+	}
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/acme/users/user-1/instances", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
