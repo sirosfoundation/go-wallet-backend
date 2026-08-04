@@ -91,11 +91,11 @@ func TestSPOCPEngine_SkipsNonRuleFiles(t *testing.T) {
 }
 
 // The shipped default rules (rules/default.rules, rules/delegation.rules)
-// are what EnableForRole defaults AS.RulesDir to and what the Dockerfile
-// ships alongside the binary - nothing else ever loaded them from a real
-// checkout, so neither a plain syntax error nor a silently-inert wildcard
-// (see TestSPOCPEngine_WildcardsFromFileActuallyMatch) went undetected
-// until a real deploy started denying every token request.
+// are the baseline AS.RulesDir configuration ships and defaults to, and
+// what the Dockerfile ships alongside the binary - nothing else ever loaded
+// them from a real checkout, so neither a plain syntax error nor a
+// silently-inert wildcard (see TestSPOCPEngine_WildcardsFromFileActuallyMatch)
+// went undetected until a real deploy started denying every token request.
 func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
 	dir := shippedRulesDir(t)
 	pe := NewSPOCPEngine(zap.NewNop())
