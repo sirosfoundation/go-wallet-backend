@@ -23,6 +23,18 @@ var (
 	ErrFailedToReceive     = errors.New("failed to receive message")
 	ErrRemoteSigningFailed = errors.New("remote signing failed")
 	ErrTimeout             = errors.New("operation timed out")
+	ErrTooManyConnections  = errors.New("too many WebSocket connections")
+)
+
+const (
+	// wsPingInterval is how often the server sends a WebSocket ping to the client.
+	wsPingInterval = 30 * time.Second
+
+	// wsPongTimeout is how long the server waits for a pong after sending a ping.
+	wsPongTimeout = 10 * time.Second
+
+	// maxConnections is the maximum number of concurrent WebSocket connections.
+	maxConnections = 10000
 )
 
 // SignatureAction defines the type of signing operation
@@ -100,10 +112,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make configurable for production
-				return true
-			},
+			CheckOrigin:     CheckOriginFromConfig(cfg),
 		},
 		clients: make(map[string]*clientConnection),
 	}
@@ -111,6 +120,15 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Enforce global connection limit
+	m.clientsMu.RLock()
+	count := len(m.clients)
+	m.clientsMu.RUnlock()
+	if count >= maxConnections {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
 	var responseHeader http.Header
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader = http.Header{}
@@ -138,6 +156,31 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 
 	// Limit message size to 64KB to prevent memory exhaustion attacks
 	conn.SetReadLimit(64 * 1024)
+
+	// Configure ping/pong keepalive to detect dead connections.
+	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		return nil
+	})
+
+	// Start ping loop
+	stopPing := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout)); err != nil {
+					return
+				}
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	defer close(stopPing)
 
 	var client *clientConnection
 

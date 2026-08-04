@@ -55,7 +55,7 @@ func NewAdminTestHarness(t *testing.T) *AdminTestHarness {
 	}
 
 	// Create admin handlers
-	adminHandlers := api.NewAdminHandlers(h.Storage, logger)
+	adminHandlers := api.NewAdminHandlers(h.Storage, logger, nil, nil)
 
 	// Setup router
 	h.Router = gin.New()

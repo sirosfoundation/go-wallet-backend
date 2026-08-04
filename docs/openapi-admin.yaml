@@ -798,6 +798,191 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/tenants/{tenantId}/instances:
+    get:
+      tags:
+        - Wallet Instances
+      summary: List wallet instances
+      description: Returns all wallet instances registered under this tenant.
+      operationId: listWalletInstances
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: List of wallet instances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WalletInstance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/instances/{instanceId}:
+    get:
+      tags:
+        - Wallet Instances
+      summary: Get a wallet instance
+      description: Returns details of a specific wallet instance by its JWK thumbprint ID.
+      operationId: getWalletInstance
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/instanceId'
+      responses:
+        '200':
+          description: Wallet instance details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletInstance'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - Wallet Instances
+      summary: Delete a wallet instance
+      description: Hard-deletes a wallet instance. Emits an audit event.
+      operationId: deleteWalletInstance
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/instanceId'
+      responses:
+        '204':
+          description: Instance deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/instances/{instanceId}/status:
+    put:
+      tags:
+        - Wallet Instances
+      summary: Update wallet instance status
+      description: |
+        Changes the status of a wallet instance (active, suspended, or revoked).
+        Emits an audit event for the status transition.
+      operationId: updateWalletInstanceStatus
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/instanceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum: [active, suspended, revoked]
+                reason:
+                  type: string
+                  description: Optional reason for the status change
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+        '400':
+          description: Invalid status value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}/instances:
+    get:
+      tags:
+        - Wallet Instances
+      summary: List wallet instances by user
+      description: Returns all wallet instances belonging to a specific user within a tenant.
+      operationId: listWalletInstancesByUser
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: List of wallet instances
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WalletInstance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}/detail:
+    get:
+      tags:
+        - Users
+      summary: Get user detail
+      description: |
+        Returns extended user details including passkey information, DID, and wallet type.
+      operationId: getUserDetail
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: User detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/stats:
+    get:
+      tags:
+        - Tenants
+      summary: Get tenant statistics
+      description: Returns aggregated statistics for a tenant. Not yet implemented.
+      operationId: getTenantStats
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '501':
+          description: Not yet implemented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
   parameters:
     tenantId:
@@ -849,6 +1034,15 @@ components:
         type: string
         format: uuid
       example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    instanceId:
+      name: instanceId
+      in: path
+      required: true
+      description: The JWK thumbprint identifier of the wallet instance
+      schema:
+        type: string
+      example: "dGVzdC10aHVtYnByaW50"
 
   schemas:
     StatusResponse:
@@ -1291,6 +1485,103 @@ components:
           bind_identity:
             enum: [false]
             description: bind_identity must be false (or omitted) when mode is "login"
+
+    WalletInstance:
+      type: object
+      properties:
+        id:
+          type: string
+          description: JWK thumbprint identifier
+        tenant_id:
+          type: string
+        user_id:
+          type: string
+        status:
+          type: string
+          enum: [active, suspended, revoked]
+        wscd_type:
+          type: string
+          enum: [web_crypto, remote, native_ios, native_android]
+        credential_id:
+          type: string
+        r2ps_client_id:
+          type: string
+        device_info:
+          type: object
+          properties:
+            platform:
+              type: string
+            os:
+              type: string
+            model:
+              type: string
+            app_id:
+              type: string
+        attestation_source:
+          type: string
+        last_attested_at:
+          type: string
+          format: date-time
+        attestation_count:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deactivated_at:
+          type: string
+          format: date-time
+        deactivation_reason:
+          type: string
+
+    UserDetailResponse:
+      type: object
+      properties:
+        uuid:
+          type: string
+        did:
+          type: string
+        wallet_type:
+          type: string
+        passkeys:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              credential_id:
+                type: string
+              tenant_id:
+                type: string
+              attestation_type:
+                type: string
+              transport:
+                type: array
+                items:
+                  type: string
+              prf_capable:
+                type: boolean
+              sign_count:
+                type: integer
+                format: int32
+              nickname:
+                type: string
+              created_at:
+                type: string
+                format: date-time
+              last_use_time:
+                type: string
+                format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
 
   responses:
     BadRequest:

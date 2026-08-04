@@ -16,6 +16,7 @@ import (
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -41,18 +42,21 @@ const (
 	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
 	// and the connection is considered dead.
 	wsPongTimeout = 10 * time.Second
+
+	// maxConnections is the maximum concurrent WebSocket sessions allowed.
+	maxConnections = 10000
 )
 
-// Session represents an authenticated WebSocket session
+// Session represents an authenticated session (WebSocket or HTTP+SSE)
 type Session struct {
-	ID       string
-	UserID   string
-	TenantID string
-	conn     *websocket.Conn
-	sendMu   sync.Mutex
-	flows    map[string]*Flow
-	flowsMu  sync.RWMutex
-	logger   *zap.Logger
+	ID          string
+	UserID      string
+	TenantID    string
+	transport   SessionTransport
+	transportMu sync.RWMutex // guards transport reassignment during session resume
+	flows       map[string]*Flow
+	flowsMu     sync.RWMutex
+	logger      *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -123,10 +127,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make configurable for production
-				return true
-			},
+			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
 		sessions:        make(map[string]*Session),
 		userIndex:       make(map[string]*Session),
@@ -169,6 +170,15 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Enforce global session limit
+	m.sessionsMu.RLock()
+	count := len(m.sessions)
+	m.sessionsMu.RUnlock()
+	if count >= maxConnections {
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
 	responseHeader := http.Header{}
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader.Set("X-Served-By", servedBy)
@@ -189,7 +199,8 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleNewConnection(conn *websocket.Conn) {
-	defer func() { _ = conn.Close() }()
+	transport := newWSTransport(conn)
+	defer func() { _ = transport.Close() }()
 
 	// Wait for handshake message
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -242,13 +253,13 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	sessionID := uuid.New().String()
 	logLabel := sessionID[:8]
 	if userID != "" {
-		logLabel = userID[:8]
+		logLabel = userID[:min(8, len(userID))]
 	}
 	session := &Session{
 		ID:            sessionID,
 		UserID:        userID,
 		TenantID:      tenantID,
-		conn:          conn,
+		transport:     transport,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
 		actionCh:      make(chan *FlowActionMessage, 50),
@@ -292,15 +303,20 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 // pingLoop sends WebSocket ping frames at wsPingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
+	wst, ok := s.transport.(*wsTransport)
+	if !ok {
+		return // non-WebSocket transports don't need ping/pong
+	}
+
 	ticker := time.NewTicker(wsPingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			s.sendMu.Lock()
-			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
-			s.sendMu.Unlock()
+			wst.sendMu.Lock()
+			err := wst.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
+			wst.sendMu.Unlock()
 			if err != nil {
 				return // connection is dead; ReadMessage will surface the error
 			}
@@ -312,7 +328,9 @@ func (s *Session) pingLoop() {
 
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
-		close(session.stopPing) // stop the ping goroutine
+		if session.stopPing != nil {
+			close(session.stopPing) // stop the ping goroutine (WebSocket only)
+		}
 		close(session.closeCh)
 		// Cancel all active flows
 		session.flowsMu.Lock()
@@ -325,11 +343,9 @@ func (m *Manager) handleSession(session *Session) {
 	}()
 
 	for {
-		_, message, err := session.conn.ReadMessage()
+		message, err := session.transport.ReadMessage(context.Background())
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				session.logger.Error("Read error", zap.Error(err))
-			}
+			session.logger.Debug("Session read ended", zap.Error(err))
 			return
 		}
 
@@ -517,7 +533,7 @@ func (m *Manager) registerSession(session *Session) {
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.UserID]; ok {
 			m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
-			_ = existing.conn.Close()
+			_ = existing.transport.Close()
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
@@ -625,7 +641,11 @@ func (m *Manager) sendError(conn *websocket.Conn, flowID string, code ErrorCode,
 		Code:    code,
 		Details: message,
 	}
-	_ = conn.WriteJSON(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	_ = conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // GetSession returns a session by ID
@@ -672,7 +692,7 @@ func (m *Manager) Close() {
 	defer m.sessionsMu.Unlock()
 
 	for _, session := range m.sessions {
-		_ = session.conn.Close()
+		_ = session.transport.Close()
 	}
 	m.sessions = make(map[string]*Session)
 	m.userIndex = make(map[string]*Session)
@@ -695,9 +715,10 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 func (s *Session) Send(msg interface{}) error {
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return s.conn.WriteJSON(msg)
+	s.transportMu.RLock()
+	t := s.transport
+	s.transportMu.RUnlock()
+	return t.SendJSON(msg)
 }
 
 // SendProgress sends a flow progress message

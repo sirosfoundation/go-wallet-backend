@@ -11,29 +11,31 @@ import (
 
 // Store implements an in-memory storage
 type Store struct {
-	users         *UserStore
-	tenants       *TenantStore
-	userTenants   *UserTenantStore
-	credentials   *CredentialStore
-	presentations *PresentationStore
-	challenges    *ChallengeStore
-	issuers       *IssuerStore
-	verifiers     *VerifierStore
-	invites       *InviteStore
+	users           *UserStore
+	tenants         *TenantStore
+	userTenants     *UserTenantStore
+	credentials     *CredentialStore
+	presentations   *PresentationStore
+	challenges      *ChallengeStore
+	issuers         *IssuerStore
+	verifiers       *VerifierStore
+	invites         *InviteStore
+	walletInstances *WalletInstanceStore
 }
 
 // NewStore creates a new in-memory store
 func NewStore() *Store {
 	s := &Store{
-		users:         &UserStore{data: make(map[string]*domain.User)},
-		tenants:       &TenantStore{data: make(map[domain.TenantID]*domain.Tenant)},
-		userTenants:   &UserTenantStore{data: make(map[string]*domain.UserTenantMembership)},
-		credentials:   &CredentialStore{data: make(map[int64]*domain.VerifiableCredential)},
-		presentations: &PresentationStore{data: make(map[int64]*domain.VerifiablePresentation)},
-		challenges:    &ChallengeStore{data: make(map[string]*domain.WebauthnChallenge)},
-		issuers:       &IssuerStore{data: make(map[int64]*domain.CredentialIssuer)},
-		verifiers:     &VerifierStore{data: make(map[int64]*domain.Verifier)},
-		invites:       &InviteStore{data: make(map[string]*domain.Invite)},
+		users:           &UserStore{data: make(map[string]*domain.User)},
+		tenants:         &TenantStore{data: make(map[domain.TenantID]*domain.Tenant)},
+		userTenants:     &UserTenantStore{data: make(map[string]*domain.UserTenantMembership)},
+		credentials:     &CredentialStore{data: make(map[int64]*domain.VerifiableCredential)},
+		presentations:   &PresentationStore{data: make(map[int64]*domain.VerifiablePresentation)},
+		challenges:      &ChallengeStore{data: make(map[string]*domain.WebauthnChallenge)},
+		issuers:         &IssuerStore{data: make(map[int64]*domain.CredentialIssuer)},
+		verifiers:       &VerifierStore{data: make(map[int64]*domain.Verifier)},
+		invites:         &InviteStore{data: make(map[string]*domain.Invite)},
+		walletInstances: &WalletInstanceStore{data: make(map[string]*domain.WalletInstance)},
 	}
 
 	// Create default tenant
@@ -49,17 +51,18 @@ func NewStore() *Store {
 	return s
 }
 
-func (s *Store) Users() storage.UserStore                 { return s.users }
-func (s *Store) Tenants() storage.TenantStore             { return s.tenants }
-func (s *Store) UserTenants() storage.UserTenantStore     { return s.userTenants }
-func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
-func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
-func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
-func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
-func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
-func (s *Store) Invites() storage.InviteStore             { return s.invites }
-func (s *Store) Close() error                             { return nil }
-func (s *Store) Ping(ctx context.Context) error           { return nil }
+func (s *Store) Users() storage.UserStore                     { return s.users }
+func (s *Store) Tenants() storage.TenantStore                 { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore         { return s.userTenants }
+func (s *Store) Credentials() storage.CredentialStore         { return s.credentials }
+func (s *Store) Presentations() storage.PresentationStore     { return s.presentations }
+func (s *Store) Challenges() storage.ChallengeStore           { return s.challenges }
+func (s *Store) Issuers() storage.IssuerStore                 { return s.issuers }
+func (s *Store) Verifiers() storage.VerifierStore             { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore                 { return s.invites }
+func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
+func (s *Store) Close() error                                 { return nil }
+func (s *Store) Ping(ctx context.Context) error               { return nil }
 
 // TenantStore implements in-memory tenant storage
 type TenantStore struct {

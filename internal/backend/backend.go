@@ -40,6 +40,8 @@ type Backend interface {
 	Verifiers() storage.VerifierStore
 	// Invites returns the invite store
 	Invites() storage.InviteStore
+	// WalletInstances returns the wallet instance store
+	WalletInstances() storage.WalletInstanceStore
 	// Ping checks if the storage is alive
 	Ping(ctx context.Context) error
 	// Close closes the storage connection
@@ -60,8 +62,11 @@ func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.sto
 func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
 func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
-func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
-func (b *memoryBackend) Close() error                             { return nil }
+func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
+	return b.store.WalletInstances()
+}
+func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *memoryBackend) Close() error                   { return nil }
 
 // mongoBackend wraps the MongoDB store to implement Backend
 type mongoBackend struct {
@@ -77,8 +82,11 @@ func (b *mongoBackend) Challenges() storage.ChallengeStore       { return b.stor
 func (b *mongoBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *mongoBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
 func (b *mongoBackend) Invites() storage.InviteStore             { return b.store.Invites() }
-func (b *mongoBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
-func (b *mongoBackend) Close() error                             { return b.store.Close() }
+func (b *mongoBackend) WalletInstances() storage.WalletInstanceStore {
+	return b.store.WalletInstances()
+}
+func (b *mongoBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *mongoBackend) Close() error                   { return b.store.Close() }
 
 // New creates a storage backend based on the configuration
 func New(ctx context.Context, cfg *config.Config) (Backend, error) {
