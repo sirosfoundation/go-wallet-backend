@@ -83,6 +83,32 @@ func TestMongoWIAChallengeStore_GlobalCapacity(t *testing.T) {
 	require.False(t, ok, "should reject once the global cap is reached")
 }
 
+// TestMongoWIAChallengeStore_ExpiredDocsDontCountAgainstCapacity is a
+// regression test for a review finding: MongoDB's TTL monitor sweeps
+// expired documents only periodically (~every 60s), so counting all
+// documents (rather than filtering expires_at > now) let already-expired
+// challenges falsely exhaust both the global and per-tenant capacity.
+func TestMongoWIAChallengeStore_ExpiredDocsDontCountAgainstCapacity(t *testing.T) {
+	db := skipIfNoMongo(t)
+	ctx := context.Background()
+	store, err := NewMongoWIAChallengeStore(ctx, db, 1, 1)
+	require.NoError(t, err)
+
+	tenant := domain.TenantID("tenant-a")
+
+	// Insert a challenge that is already expired (simulates a document that
+	// hasn't been swept by Mongo's TTL monitor yet).
+	ok, err := store.Put(ctx, tenant, "expired-1", time.Now().Add(-time.Minute))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// Both global (1) and per-tenant (1) caps are nominally "full", but the
+	// only occupant is expired, so a new challenge must still be accepted.
+	ok, err = store.Put(ctx, tenant, "fresh-1", time.Now().Add(5*time.Minute))
+	require.NoError(t, err)
+	require.True(t, ok, "an expired-but-not-yet-swept document must not count against capacity")
+}
+
 // TestMongoWIAChallengeStore_PerTenantCapacity is a regression test for
 // issue #224's "bounded capacity per tenant to prevent abuse" acceptance
 // criterion: one tenant filling its own per-tenant cap must not be able to

@@ -57,8 +57,12 @@ func NewMongoWIAChallengeStore(ctx context.Context, db *mongo.Database, maxSize,
 }
 
 func (s *mongoWIAChallengeStore) Put(ctx context.Context, tenantID domain.TenantID, challenge string, expiresAt time.Time) (bool, error) {
-	// Check global capacity (estimated count is fast — O(1) via collection stats).
-	count, err := s.collection.EstimatedDocumentCount(ctx)
+	// Check global capacity. MongoDB's TTL monitor sweeps expired documents
+	// only periodically (~every 60s), so counting all documents would let
+	// already-expired-but-not-yet-swept challenges falsely exhaust capacity.
+	// Count only unexpired ones instead.
+	notExpired := bson.M{"expires_at": bson.M{"$gt": time.Now()}}
+	count, err := s.collection.CountDocuments(ctx, notExpired)
 	if err != nil {
 		return false, err
 	}
@@ -70,7 +74,8 @@ func (s *mongoWIAChallengeStore) Put(ctx context.Context, tenantID domain.Tenant
 	// the entire global pool and deny challenge creation for every other
 	// tenant, even though horizontal scaling and global capacity are fine.
 	if s.maxSizePerTenant > 0 {
-		tenantCount, err := s.collection.CountDocuments(ctx, bson.M{"tenant_id": tenantID})
+		tenantFilter := bson.M{"tenant_id": tenantID, "expires_at": bson.M{"$gt": time.Now()}}
+		tenantCount, err := s.collection.CountDocuments(ctx, tenantFilter)
 		if err != nil {
 			return false, err
 		}

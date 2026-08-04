@@ -1314,6 +1314,22 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate audit configuration — without this, cfg.Audit.Enabled=true
+	// with a missing issuer/key_path/key_id silently disables the SET audit
+	// emitter at startup (NewFromConfig just returns nil) instead of failing
+	// fast on the actual misconfiguration.
+	if c.Audit.Enabled {
+		if c.Audit.Issuer == "" {
+			return fmt.Errorf("audit.issuer is required when audit is enabled")
+		}
+		if c.Audit.KeyPath == "" {
+			return fmt.Errorf("audit.key_path is required when audit is enabled")
+		}
+		if c.Audit.KeyID == "" {
+			return fmt.Errorf("audit.key_id is required when audit is enabled")
+		}
+	}
+
 	return nil
 }
 

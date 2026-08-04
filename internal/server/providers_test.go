@@ -597,6 +597,70 @@ func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) 
 	}
 }
 
+// TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled is a
+// regression test for a review finding: in co-hosted (AuthProvider) mode,
+// WIA routes were registered purely based on cfg.WalletProvider.WIA.Enabled,
+// even when no wallet-provider signing key is configured and
+// services.WIA is therefore nil. That left dead routes that could only ever
+// return 503 WIA_NOT_SUPPORTED. RegisterRoutes must also require the WIA
+// service to have actually initialized.
+func TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.WIA.Enabled = true // no PrivateKeyPath/CertificatePath set, so WIA can't initialize
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	defer func() { _ = provider.Close() }()
+	if provider.services.WIA != nil {
+		t.Fatal("expected services.WIA to be nil without wallet-provider signing keys configured")
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wallet-provider/wia/challenge", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (route should not be registered when services.WIA is nil)", w.Code, http.StatusNotFound)
+	}
+}
+
+// TestAuthProvider_WIARoutes_RegisteredWhenServiceAvailable is the positive
+// counterpart: once a wallet-provider signing key is configured and WIA is
+// enabled, the routes must still be registered (not accidentally gated out).
+func TestAuthProvider_WIARoutes_RegisteredWhenServiceAvailable(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	defer func() { _ = provider.Close() }()
+	if provider.services.WIA == nil {
+		t.Fatal("expected services.WIA to be initialized with wallet-provider signing keys configured")
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wallet-provider/wia/challenge", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusNotFound {
+		t.Fatal("expected /wallet-provider/wia/challenge to be registered when services.WIA is available")
+	}
+}
+
 func TestWIACallerIdentifier(t *testing.T) {
 	newCtx := func(setup func(*gin.Context)) *gin.Context {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())

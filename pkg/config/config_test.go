@@ -1709,6 +1709,78 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_Audit_* are regression tests for a review finding:
+// Config.Validate() didn't check AuditConfig at all, so audit.enabled=true
+// with a missing issuer/key_path/key_id silently disabled the SET audit
+// emitter at startup (NewFromConfig just returns nil) instead of failing
+// fast on the misconfiguration.
+func TestConfig_Validate_Audit_RequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but issuer is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyPath(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_path is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_path is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyID(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_id is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_id is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_PassesWhenFullyConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_DisabledSkipsValidation(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = false
+	// issuer/key_path/key_id all left empty — must not fail when disabled.
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestLoadSecretsFromFiles_PlayIntegrityKeys(t *testing.T) {
 	dir := t.TempDir()
 	decPath := filepath.Join(dir, "play-integrity-dec")

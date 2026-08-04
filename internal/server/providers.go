@@ -175,7 +175,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
-			if p.cfg.WalletProvider.WIA.Enabled {
+			if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 				walletProvider.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
 				walletProvider.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
@@ -885,7 +885,7 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	wp.Use(p.authMiddleware())
 	{
 		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
-		if p.cfg.WalletProvider.WIA.Enabled {
+		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 			wp.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
 			wp.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
