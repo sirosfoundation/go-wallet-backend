@@ -11,8 +11,10 @@ import (
 func TestSPOCPEngine_LoadAndEvaluate(t *testing.T) {
 	dir := t.TempDir()
 	rulesFile := filepath.Join(dir, "test.rules")
-	// Rule: allow any token request with tac=r
-	err := os.WriteFile(rulesFile, []byte("(5:token (3:tac 1:r))\n"), 0600)
+	// Rule: allow any token request with tac=r. Rules are loaded in
+	// go-spocp's advanced form, not canonical netstring form - see the
+	// comment on LoadRulesFromDir's opts.Format for why.
+	err := os.WriteFile(rulesFile, []byte("(token (tac r))\n"), 0600)
 	if err != nil {
 		t.Fatalf("write rules: %v", err)
 	}
@@ -26,7 +28,9 @@ func TestSPOCPEngine_LoadAndEvaluate(t *testing.T) {
 		t.Fatalf("expected 1 rule, got %d", pe.RuleCount())
 	}
 
-	// Query that should match.
+	// Query is still evaluated in canonical form - only rule *files* use
+	// advanced form; BuildTokenQuery emits canonical form and that's what
+	// reaches Evaluate() in production.
 	allowed, err := pe.Evaluate("(5:token (3:tac 1:r))")
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
@@ -40,7 +44,7 @@ func TestSPOCPEngine_Deny(t *testing.T) {
 	dir := t.TempDir()
 	rulesFile := filepath.Join(dir, "test.rules")
 	// Rule: only allow tac=r
-	err := os.WriteFile(rulesFile, []byte("(5:token (3:tac 1:r))\n"), 0600)
+	err := os.WriteFile(rulesFile, []byte("(token (tac r))\n"), 0600)
 	if err != nil {
 		t.Fatalf("write rules: %v", err)
 	}
@@ -84,6 +88,82 @@ func TestSPOCPEngine_SkipsNonRuleFiles(t *testing.T) {
 	if pe.RuleCount() != 0 {
 		t.Errorf("expected 0 rules, got %d", pe.RuleCount())
 	}
+}
+
+// The shipped default rules (rules/default.rules, rules/delegation.rules)
+// are what EnableForRole defaults AS.RulesDir to and what the Dockerfile
+// ships alongside the binary - nothing else ever loaded them from a real
+// checkout, so neither a plain syntax error nor a silently-inert wildcard
+// (see TestSPOCPEngine_WildcardsFromFileActuallyMatch) went undetected
+// until a real deploy started denying every token request.
+func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
+	dir := shippedRulesDir(t)
+	pe := NewSPOCPEngine(zap.NewNop())
+	if err := pe.LoadRulesFromDir(dir); err != nil {
+		t.Fatalf("LoadRulesFromDir(%q): %v", dir, err)
+	}
+	if pe.RuleCount() == 0 {
+		t.Error("expected at least one rule loaded from the shipped rules directory")
+	}
+
+	// Exercise the shipped rules against realistic BuildTokenQuery shapes -
+	// RuleCount() alone can't catch a wildcard that parses but never matches.
+	for _, q := range []struct {
+		name  string
+		query string
+	}{
+		{"passkey session, read-only", BuildTokenQuery("user-1", "wallet-backend", "default", TAC("rl"), "urn:siros:acr:passkey")},
+		{"session, no acr, read-only", BuildTokenQuery("user-1", "wallet-backend", "default", TAC("r"), "")},
+		{"anonymous, read-only", BuildTokenQuery("", "wallet-backend", "default", TAC("r"), "")},
+	} {
+		allowed, err := pe.Evaluate(q.query)
+		if err != nil {
+			t.Fatalf("%s: Evaluate: %v", q.name, err)
+		}
+		if !allowed {
+			t.Errorf("%s: expected query %q to be allowed by shipped default rules", q.name, q.query)
+		}
+	}
+}
+
+// Regression test for a bug where rule files were loaded with go-spocp's
+// canonical (netstring) format, under which a literal "(1:*)" parses as an
+// ordinary empty list tagged "*" rather than a starform.Wildcard - so
+// IsStarForm() never returns true and the "wildcard" never matches anything,
+// even though the file loads without error and RuleCount() looks correct.
+// Only go-spocp's advanced-form parser (persist.FormatAdvanced) actually
+// constructs a real starform.Wildcard for a bare "(*)".
+func TestSPOCPEngine_WildcardsFromFileActuallyMatch(t *testing.T) {
+	dir := t.TempDir()
+	rulesFile := filepath.Join(dir, "wildcard.rules")
+	if err := os.WriteFile(rulesFile, []byte("(token (tac (*)))\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	pe := NewSPOCPEngine(zap.NewNop())
+	if err := pe.LoadRulesFromDir(dir); err != nil {
+		t.Fatalf("LoadRulesFromDir: %v", err)
+	}
+
+	allowed, err := pe.Evaluate("(5:token (3:tac 2:rw))")
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !allowed {
+		t.Error("expected a file-loaded wildcard rule to match any tac value")
+	}
+}
+
+func shippedRulesDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.Abs(filepath.Join("..", "..", "rules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("shipped rules directory not found at %s: %v", dir, err)
+	}
+	return dir
 }
 
 func TestAllowAllPolicy(t *testing.T) {

@@ -4,17 +4,37 @@
 ; Additional rules can be added per-deployment by placing .rules files in
 ; the configured rules directory.
 ;
-; Rule format: (token (claim value) ...)
-; A query matches if it is "less permissive" than at least one rule.
+; Rule format (advanced): (token (claim value) ...). A query matches if it
+; is "less permissive" than at least one rule.
+;
+; IMPORTANT - queries are matched positionally, not by field name: SPOCP
+; compares a rule's elements against the query's elements index-by-index (a
+; rule may have fewer elements than the query, in which case trailing query
+; fields are unconstrained, but it may not skip a leading field). Since
+; BuildTokenQuery emits claims sorted alphabetically (acr, aud, sub, tac,
+; tenant_id) and omits any claim that is empty, the set and order of fields
+; actually present varies by request shape. Rules below are therefore
+; duplicated per shape:
+;   - shape A: acr, aud, sub, tac, tenant_id  (passkey-authenticated session)
+;   - shape B: aud, sub, tac, tenant_id        (non-passkey session/delegation)
+;   - shape C: aud, tac, tenant_id             (anonymous, no sub)
 
-; Read-only access (r, l) is always allowed for any authenticated user.
-; This matches any token request that only asks for read/list permissions.
-(5:token (3:tac 1:r))
-(5:token (3:tac 1:l))
-(5:token (3:tac 2:rl))
+; --- Shape A: acr present ---
+(token (acr (*)) (aud (*)) (sub (*)) (tac r))
+(token (acr (*)) (aud (*)) (sub (*)) (tac l))
+(token (acr (*)) (aud (*)) (sub (*)) (tac rl))
+; Any tac for an authenticated user; tenant scoping is enforced at the code
+; level (session.TenantID must match unless cross-tenant).
+(token (acr (*)) (aud (*)) (sub (*)) (tac (*)) (tenant_id (*)))
 
-; Users can get tokens scoped to their own tenant with any valid tac.
-; Tenant scoping is enforced at the code level (session.TenantID must match
-; unless the session is cross-tenant). The wildcard here permits the policy
-; evaluation to pass once code-level tenant enforcement is satisfied.
-(5:token (3:sub (*)) (9:tenant_id (*)))
+; --- Shape B: no acr, sub present ---
+(token (aud (*)) (sub (*)) (tac r))
+(token (aud (*)) (sub (*)) (tac l))
+(token (aud (*)) (sub (*)) (tac rl))
+(token (aud (*)) (sub (*)) (tac (*)) (tenant_id (*)))
+
+; --- Shape C: anonymous (no acr, no sub) ---
+; Read-only access only - anonymous requests never get an unrestricted tac.
+(token (aud (*)) (tac r))
+(token (aud (*)) (tac l))
+(token (aud (*)) (tac rl))

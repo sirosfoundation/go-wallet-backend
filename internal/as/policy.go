@@ -55,7 +55,13 @@ func (pe *SPOCPEngine) LoadRulesFromDir(dir string) error {
 		}
 		path := filepath.Join(dir, entry.Name())
 		opts := persist.DefaultLoadOptions()
-		opts.Format = persist.FormatCanonical
+		// Advanced form ("(tac (*))") is required, not merely stylistic: the
+		// canonical netstring loader parses "(1:*)" as an ordinary empty list
+		// tagged "*", which never satisfies sexp.Element.IsStarForm() (only
+		// starform.Wildcard does) - so canonical-form wildcards silently never
+		// match anything. Only the advanced-form parser (advParseStarForm)
+		// constructs real starform.Wildcard values.
+		opts.Format = persist.FormatAdvanced
 		if err := pe.engine.LoadRulesFromFileWithOptions(path, opts); err != nil {
 			return fmt.Errorf("as: failed to load rules from %s: %w", path, err)
 		}
