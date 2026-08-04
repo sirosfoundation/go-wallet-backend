@@ -188,6 +188,15 @@ type FlowStartMessage struct {
 	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
 	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
 
+	// Client attestation for wallet-to-issuer authentication (transport-supplied).
+	// The client (frontend/SDK/WMP) obtains the WIA via /wallet-provider/wia/generate
+	// and signs the PoP with its instance key, wherever that key is held for this
+	// instance's WSCD type (see domain.WSCDType — browser passkey-PRF-encrypted
+	// storage, iOS Secure Enclave, Android StrongBox/TEE, or a remote HSM via R2PS).
+	// The backend forwards these as HTTP headers per draft-ietf-oauth-attestation-based-client-auth §3.1.
+	ClientAttestation    string `json:"client_attestation,omitempty"`
+	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)

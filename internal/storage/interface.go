@@ -200,6 +200,7 @@ type Store interface {
 	Issuers() IssuerStore
 	Verifiers() VerifierStore
 	Invites() InviteStore
+	WalletInstances() WalletInstanceStore
 
 	// Close closes the storage connection
 	Close() error
@@ -233,4 +234,28 @@ type InviteStore interface {
 
 	// ClearUsedBy removes the user reference from any invites consumed by the given user
 	ClearUsedBy(ctx context.Context, userID domain.UserID) error
+}
+
+// WalletInstanceStore defines the interface for wallet instance storage
+type WalletInstanceStore interface {
+	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	Upsert(ctx context.Context, instance *domain.WalletInstance) error
+
+	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.
+	GetByID(ctx context.Context, id string) (*domain.WalletInstance, error)
+
+	// GetAllByTenant retrieves all wallet instances for a tenant.
+	GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.WalletInstance, error)
+
+	// GetByUser retrieves all wallet instances belonging to a specific user.
+	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
+
+	// UpdateStatus updates the status of a wallet instance (activate, suspend, revoke).
+	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
+
+	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
+	IncrementAttestation(ctx context.Context, id string) error
+
+	// Delete hard-deletes a wallet instance.
+	Delete(ctx context.Context, id string) error
 }

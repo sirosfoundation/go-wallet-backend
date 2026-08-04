@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -16,6 +17,7 @@ import (
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -41,6 +43,9 @@ const (
 	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
 	// and the connection is considered dead.
 	wsPongTimeout = 10 * time.Second
+
+	// maxConnections is the maximum concurrent WebSocket sessions allowed.
+	maxConnections = 10000
 )
 
 // Session represents an authenticated WebSocket session
@@ -113,6 +118,13 @@ type Manager struct {
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(sessions):
+	// sessions are only registered post-handshake, so counting only sessions
+	// lets an attacker open unlimited unauthenticated connections that never
+	// complete the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new session manager
@@ -123,10 +135,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make configurable for production
-				return true
-			},
+			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
 		sessions:        make(map[string]*Session),
 		userIndex:       make(map[string]*Session),
@@ -169,12 +178,25 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Reserve a slot atomically before checking the limit. Checking
+	// Load() >= maxConnections and only then incrementing is racy: multiple
+	// concurrent requests can all pass the check before any of them
+	// increments, overshooting maxConnections under load. Add(1) returns the
+	// post-increment value, so only requests that actually push the counter
+	// over the limit roll back.
+	if m.activeConnections.Add(1) > maxConnections {
+		m.activeConnections.Add(-1)
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
 	responseHeader := http.Header{}
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader.Set("X-Served-By", servedBy)
 	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
@@ -189,6 +211,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleNewConnection(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
 	// Wait for handshake message

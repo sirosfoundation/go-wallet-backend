@@ -14,7 +14,7 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 }
 
@@ -27,7 +27,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -56,7 +56,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -76,7 +76,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -95,7 +95,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -114,7 +114,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -196,7 +196,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -217,7 +217,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -253,7 +253,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -274,7 +274,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -340,7 +340,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -354,8 +354,8 @@ jwt:
 	if cfg.Server.Port != 8080 {
 		t.Errorf("Expected port 8080, got %d", cfg.Server.Port)
 	}
-	if cfg.JWT.Secret != "test-secret" {
-		t.Errorf("Expected JWT secret 'test-secret', got %q", cfg.JWT.Secret)
+	if cfg.JWT.Secret != "test-secret-that-is-at-least-32-bytes-long" {
+		t.Errorf("Expected JWT secret 'test-secret-that-is-at-least-32-bytes-long', got %q", cfg.JWT.Secret)
 	}
 }
 
@@ -391,7 +391,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -426,7 +426,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
   expiry_hours: 48
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
@@ -724,7 +724,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -752,7 +752,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -771,7 +771,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 		}
 	}
 
@@ -832,7 +832,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
@@ -870,7 +870,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
@@ -1493,5 +1493,342 @@ func TestConfig_Validate_AS_InvalidMaxTACChars(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid character") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReadSecretFile_Success(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(path, []byte("  my-secret-value  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := readSecretFile(path)
+	if err != nil {
+		t.Fatalf("readSecretFile: %v", err)
+	}
+	if val != "my-secret-value" {
+		t.Errorf("expected trimmed secret, got %q", val)
+	}
+}
+
+func TestReadSecretFile_NotFound(t *testing.T) {
+	_, err := readSecretFile("/nonexistent/path/secret.txt")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestReadSecretFile_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, []byte("  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := readSecretFile(path)
+	if err == nil {
+		t.Fatal("expected error for empty file")
+	}
+	if !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_AdminToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "admin-token")
+	if err := os.WriteFile(tokenPath, []byte("test-admin-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = tokenPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Server.AdminToken != "test-admin-token" {
+		t.Errorf("admin token = %q, want test-admin-token", cfg.Server.AdminToken)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecret(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "jwt-secret")
+	if err := os.WriteFile(secretPath, []byte("jwt-secret-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = secretPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.JWT.Secret != "jwt-secret-value" {
+		t.Errorf("jwt secret = %q, want jwt-secret-value", cfg.JWT.Secret)
+	}
+}
+
+func TestLoadSecretsFromFiles_MongoPassword(t *testing.T) {
+	dir := t.TempDir()
+	passPath := filepath.Join(dir, "mongo-pass")
+	if err := os.WriteFile(passPath, []byte("s3cret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Storage.MongoDB.PasswordPath = passPath
+	cfg.Storage.MongoDB.URI = "mongodb://user:%PASSWORD%@localhost:27017"
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Storage.MongoDB.URI != "mongodb://user:s3cret@localhost:27017" {
+		t.Errorf("uri = %q, want password replaced", cfg.Storage.MongoDB.URI)
+	}
+}
+
+func TestLoadSecretsFromFiles_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = "/nonexistent/token"
+
+	if err := cfg.loadSecretsFromFiles(); err == nil {
+		t.Fatal("expected error for bad admin token path")
+	}
+}
+
+func TestLoadSecretsFromFiles_NoPaths(t *testing.T) {
+	cfg := defaultConfig()
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles with no paths: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PKCS11PIN(t *testing.T) {
+	dir := t.TempDir()
+	pinPath := filepath.Join(dir, "hsm-pin")
+	if err := os.WriteFile(pinPath, []byte("1234"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: pinPath}
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.WalletProvider.PKCS11.PIN != "1234" {
+		t.Errorf("pin = %q, want 1234", cfg.WalletProvider.PKCS11.PIN)
+	}
+}
+
+func TestLoadSecretsFromFiles_PKCS11PIN_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: "/nonexistent/pin"}
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad PKCS11 PIN path")
+	}
+	if !strings.Contains(err.Error(), "pkcs11") {
+		t.Errorf("error should mention pkcs11: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecretBadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = "/nonexistent/jwt-secret"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad JWT secret path")
+	}
+	if !strings.Contains(err.Error(), "jwt") {
+		t.Errorf("error should mention jwt: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T) {
+	// WIA.Enabled defaults to true, but with no signing keys configured WIA is
+	// inert (no endpoints registered) — the zero-config default must not fail
+	// validation just because wallet_provider_uri wasn't set.
+	cfg := defaultConfig()
+	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
+	cfg.Storage = StorageConfig{Type: "memory"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error on zero-config default: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWhenKeysConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// WalletProviderURI intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with signing keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWithPKCS11(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with PKCS11 keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestConfig_Validate_Audit_* are regression tests for a review finding:
+// Config.Validate() didn't check AuditConfig at all, so audit.enabled=true
+// with a missing issuer/key_path/key_id silently disabled the SET audit
+// emitter at startup (NewFromConfig just returns nil) instead of failing
+// fast on the misconfiguration.
+func TestConfig_Validate_Audit_RequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but issuer is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyPath(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_path is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_path is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyID(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_id is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_id is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_PassesWhenFullyConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_DisabledSkipsValidation(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = false
+	// issuer/key_path/key_id all left empty — must not fail when disabled.
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityKeys(t *testing.T) {
+	dir := t.TempDir()
+	decPath := filepath.Join(dir, "play-integrity-dec")
+	verPath := filepath.Join(dir, "play-integrity-ver")
+	if err := os.WriteFile(decPath, []byte("dec-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verPath, []byte("ver-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = decPath
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = verPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKey; got != "dec-key-b64" {
+		t.Errorf("decryption key = %q, want dec-key-b64", got)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKey; got != "ver-key-b64" {
+		t.Errorf("verification key = %q, want ver-key-b64", got)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityDecryptionKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = "/nonexistent/dec-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad decryption key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_decryption_key_path") {
+		t.Errorf("error should mention google_play_integrity_decryption_key_path: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityVerificationKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = "/nonexistent/ver-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad verification key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_verification_key_path") {
+		t.Errorf("error should mention google_play_integrity_verification_key_path: %v", err)
 	}
 }

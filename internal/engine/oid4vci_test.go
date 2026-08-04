@@ -743,6 +743,47 @@ func TestExchangePreAuthCode_SendsDPoP(t *testing.T) {
 	assert.Equal(t, "POST", claims["htm"])
 }
 
+// TestExchangePreAuthCode_SendsAttestationHeaders is a regression test:
+// exchangePreAuthCode (the pre-authorized_code flow — the most common
+// wallet-initiated issuance path) must send the OAuth-Client-Attestation /
+// OAuth-Client-Attestation-PoP headers when an attestation provider is
+// configured, the same as the PAR and authorization_code exchange paths.
+// Before this fix, setClientAuth correctly skipped form-based
+// private_key_jwt auth when attestation was available, but the actual
+// attestation headers were never attached here — so the token request went
+// out with no client authentication at all.
+func TestExchangePreAuthCode_SendsAttestationHeaders(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "test-token",
+			TokenType:   "Bearer",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	h.attestationProvider = &TransportSuppliedAttestation{
+		WIA: "wia.jwt.value",
+		PoP: "pop.jwt.value",
+		ID:  "client-thumbprint-123",
+	}
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "pre-auth-code", "")
+	require.NoError(t, err)
+	assert.Equal(t, "wia.jwt.value", receivedHeaders.Get("OAuth-Client-Attestation"))
+	assert.Equal(t, "pop.jwt.value", receivedHeaders.Get("OAuth-Client-Attestation-PoP"))
+}
+
 func TestExchangeAuthCode_SendsDPoP(t *testing.T) {
 	var receivedHeaders http.Header
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

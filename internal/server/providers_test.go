@@ -2,9 +2,17 @@ package server
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -84,8 +92,11 @@ func (b *memoryBackend) Challenges() storage.ChallengeStore       { return b.sto
 func (b *memoryBackend) Issuers() storage.IssuerStore             { return b.store.Issuers() }
 func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.store.Verifiers() }
 func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
-func (b *memoryBackend) Ping(ctx context.Context) error           { return b.store.Ping(ctx) }
-func (b *memoryBackend) Close() error                             { return b.store.Close() }
+func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
+	return b.store.WalletInstances()
+}
+func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
+func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
 func newTestMemoryBackend(t *testing.T) backend.Backend {
 	t.Helper()
@@ -335,10 +346,11 @@ func (m *mockBackend) Credentials() storage.CredentialStore { return nil }
 func (m *mockBackend) Presentations() storage.PresentationStore {
 	return nil
 }
-func (m *mockBackend) Challenges() storage.ChallengeStore { return nil }
-func (m *mockBackend) Issuers() storage.IssuerStore       { return nil }
-func (m *mockBackend) Verifiers() storage.VerifierStore   { return nil }
-func (m *mockBackend) Invites() storage.InviteStore       { return nil }
+func (m *mockBackend) Challenges() storage.ChallengeStore           { return nil }
+func (m *mockBackend) Issuers() storage.IssuerStore                 { return nil }
+func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil }
+func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
+func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
@@ -483,4 +495,246 @@ func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 		t.Fatalf("status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 	assertNoCacheHeaders(t, w.Header())
+}
+
+// writeTestECKeyAndCert generates an EC P-256 key + self-signed cert and
+// writes them as PEM files in dir, returning (keyPath, certPath).
+func writeTestECKeyAndCert(t *testing.T, dir, prefix string) (string, string) {
+	t.Helper()
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyPath := filepath.Join(dir, prefix+"-key.pem")
+	certPath := filepath.Join(dir, prefix+"-cert.pem")
+	writePEM := func(path, blockType string, der []byte) {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: der}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePEM(keyPath, "EC PRIVATE KEY", keyDER)
+	writePEM(certPath, "CERTIFICATE", certDER)
+	return keyPath, certPath
+}
+
+// TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled is a
+// regression test: isolated wallet-provider deployments must accept
+// AS-issued access tokens, the same as the co-hosted AuthProvider path.
+// Before this fix, RegisterRoutes hardcoded the legacy HMAC-only
+// AuthMiddleware regardless of cfg.AS.Enabled, so AS-issued tokens were
+// always rejected in isolated mode.
+func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:     true,
+			ExternalURL: "https://as.example.com",
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.tokenValidator == nil {
+		t.Fatal("expected tokenValidator to be set when cfg.AS.Enabled is true")
+	}
+}
+
+// TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
+// counterpart: without AS enabled, isolated wallet-provider mode falls back
+// to legacy HMAC auth, matching AuthProvider's default behavior.
+func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.tokenValidator != nil {
+		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
+	}
+}
+
+// TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled is a
+// regression test for a review finding: in co-hosted (AuthProvider) mode,
+// WIA routes were registered purely based on cfg.WalletProvider.WIA.Enabled,
+// even when no wallet-provider signing key is configured and
+// services.WIA is therefore nil. That left dead routes that could only ever
+// return 503 WIA_NOT_SUPPORTED. RegisterRoutes must also require the WIA
+// service to have actually initialized.
+func TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.WIA.Enabled = true // no PrivateKeyPath/CertificatePath set, so WIA can't initialize
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	defer func() { _ = provider.Close() }()
+	if provider.services.WIA != nil {
+		t.Fatal("expected services.WIA to be nil without wallet-provider signing keys configured")
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wallet-provider/wia/challenge", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (route should not be registered when services.WIA is nil)", w.Code, http.StatusNotFound)
+	}
+}
+
+// TestAuthProvider_WIARoutes_RegisteredWhenServiceAvailable is the positive
+// counterpart: once a wallet-provider signing key is configured and WIA is
+// enabled, the routes must still be registered (not accidentally gated out).
+func TestAuthProvider_WIARoutes_RegisteredWhenServiceAvailable(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	defer func() { _ = provider.Close() }()
+	if provider.services.WIA == nil {
+		t.Fatal("expected services.WIA to be initialized with wallet-provider signing keys configured")
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wallet-provider/wia/challenge", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusNotFound {
+		t.Fatal("expected /wallet-provider/wia/challenge to be registered when services.WIA is available")
+	}
+}
+
+func TestWIACallerIdentifier(t *testing.T) {
+	newCtx := func(setup func(*gin.Context)) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		if setup != nil {
+			setup(c)
+		}
+		return c
+	}
+
+	t.Run("prefers user_id", func(t *testing.T) {
+		c := newCtx(func(c *gin.Context) {
+			c.Set("user_id", "user-123")
+			c.Set("tenant_id", "acme")
+		})
+		if got := wiaCallerIdentifier(c); got != "user-123" {
+			t.Errorf("wiaCallerIdentifier() = %q, want user-123", got)
+		}
+	})
+
+	t.Run("falls back to tenant_id", func(t *testing.T) {
+		c := newCtx(func(c *gin.Context) {
+			c.Set("tenant_id", "acme")
+		})
+		if got := wiaCallerIdentifier(c); got != "acme" {
+			t.Errorf("wiaCallerIdentifier() = %q, want acme", got)
+		}
+	})
+
+	t.Run("falls back to empty (anonymous bucket)", func(t *testing.T) {
+		c := newCtx(nil)
+		if got := wiaCallerIdentifier(c); got != "" {
+			t.Errorf("wiaCallerIdentifier() = %q, want empty string", got)
+		}
+	})
+}
+
+// TestWIARateLimiter_TripsAfterMaxAttempts is a regression test for the missing
+// per-caller rate limit on the WIA challenge endpoint: without it, a single
+// caller could exhaust the shared in-memory challenge capacity and deny
+// service to every other tenant/user. This exercises the exact identifier
+// extractor + AuthRateLimiter wiring used by AuthProvider/WalletProviderProvider,
+// without needing a full JWT-authenticated HTTP round trip.
+func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
+	cfg := config.AuthRateLimitConfig{Enabled: true, MaxAttempts: 3, WindowSeconds: 60, LockoutSeconds: 60}
+	rl := middleware.NewAuthRateLimiter(cfg, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("user_id", "user-abc") })
+	router.POST("/wia/challenge", middleware.AuthRateLimitMiddlewareWithIdentifier(rl, wiaCallerIdentifier), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	var lastCode int
+	for i := 0; i < 10; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+		router.ServeHTTP(w, req)
+		lastCode = w.Code
+	}
+
+	if lastCode != http.StatusTooManyRequests {
+		t.Errorf("after exceeding max_attempts, status = %d, want %d", lastCode, http.StatusTooManyRequests)
+	}
+
+	// A different caller must not be affected by the first caller's lockout.
+	router2 := gin.New()
+	router2.Use(func(c *gin.Context) { c.Set("user_id", "user-xyz") })
+	router2.POST("/wia/challenge", middleware.AuthRateLimitMiddlewareWithIdentifier(rl, wiaCallerIdentifier), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wia/challenge", nil)
+	router2.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("different caller: status = %d, want %d (must not share the exhausted caller's lockout)", w.Code, http.StatusOK)
+	}
 }

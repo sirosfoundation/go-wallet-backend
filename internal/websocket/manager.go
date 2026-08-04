@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -23,6 +24,18 @@ var (
 	ErrFailedToReceive     = errors.New("failed to receive message")
 	ErrRemoteSigningFailed = errors.New("remote signing failed")
 	ErrTimeout             = errors.New("operation timed out")
+	ErrTooManyConnections  = errors.New("too many WebSocket connections")
+)
+
+const (
+	// wsPingInterval is how often the server sends a WebSocket ping to the client.
+	wsPingInterval = 30 * time.Second
+
+	// wsPongTimeout is how long the server waits for a pong after sending a ping.
+	wsPongTimeout = 10 * time.Second
+
+	// maxConnections is the maximum number of concurrent WebSocket connections.
+	maxConnections = 10000
 )
 
 // SignatureAction defines the type of signing operation
@@ -90,6 +103,13 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(clients):
+	// clients are only added post-handshake, so counting only clients lets an
+	// attacker open unlimited unauthenticated connections that never complete
+	// the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new WebSocket manager
@@ -100,10 +120,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make configurable for production
-				return true
-			},
+			CheckOrigin:     CheckOriginFromConfig(cfg),
 		},
 		clients: make(map[string]*clientConnection),
 	}
@@ -111,6 +128,19 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Reserve a slot atomically before checking the limit. Checking
+	// Load() >= maxConnections and only then incrementing is racy: multiple
+	// concurrent requests can all pass the check before any of them
+	// increments, overshooting maxConnections under load. Add(1) returns the
+	// post-increment value, so only requests that actually push the counter
+	// over the limit roll back.
+	if m.activeConnections.Add(1) > maxConnections {
+		m.activeConnections.Add(-1)
+		m.logger.Warn("Rejecting WebSocket connection", zap.Error(ErrTooManyConnections))
+		http.Error(w, "too many connections", http.StatusServiceUnavailable)
+		return
+	}
+
 	var responseHeader http.Header
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader = http.Header{}
@@ -118,6 +148,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
@@ -134,10 +165,38 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleClient(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
 	// Limit message size to 64KB to prevent memory exhaustion attacks
 	conn.SetReadLimit(64 * 1024)
+
+	// Configure ping/pong keepalive to detect dead connections.
+	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		return nil
+	})
+
+	// Start ping loop.
+	// WriteControl is safe to call concurrently with WriteJSON per gorilla/websocket docs:
+	// "The Close and WriteControl methods can be called concurrently with all other methods."
+	stopPing := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout)); err != nil {
+					return
+				}
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	defer close(stopPing)
 
 	var client *clientConnection
 
