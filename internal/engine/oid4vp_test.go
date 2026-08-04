@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -301,7 +302,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			h := &OID4VPHandler{httpClient: srv.Client()}
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
 
 			authReq, err := h.fetchRequestFromURI(context.Background(), srv.URL)
 			if tt.wantErr {
@@ -314,6 +315,154 @@ func TestFetchRequestFromURI(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantClientID, authReq.ClientID)
 		})
+	}
+}
+
+func TestParseRequest(t *testing.T) {
+	// A minimal by-value authorization request served by a reference URL,
+	// reused by every "fetch" case below.
+	referencedRequest := `{"client_id":"did:web:verifier","response_type":"vp_token","nonce":"fetched-nonce"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, referencedRequest)
+	}))
+	defer srv.Close()
+
+	// parseRequest calls h.ProgressMessage() unconditionally, which needs a
+	// real Flow/Session/conn behind it (see testSession/wsTestServer in
+	// match_test.go) or it panics on a nil websocket connection.
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+	t.Run("openid4vp scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	t.Run("openid4vp scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	// HAIP (OpenID4VC High Assurance Interoperability Profile) uses the same
+	// wire shape as plain OID4VP under its own scheme - regression test for a
+	// bug where haip:// fell through to the "direct URL" branch instead of
+	// being recognized and unwrapped the same way as openid4vp://.
+	t.Run("haip scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	t.Run("haip scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	// Regression test for a bug where a bare reference URL with no query
+	// string (e.g. a QR/link that IS itself the request_uri, no
+	// openid4vp://...&request_uri= wrapper at all) was parsed as if the
+	// entire URL string were a raw query string - silently yielding every
+	// field empty instead of being fetched.
+	t.Run("bare https URL with no query is fetched as a reference", func(t *testing.T) {
+		msg := &FlowStartMessage{RequestURI: srv.URL}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	// Regression test: a raw query string with no scheme/host at all (as
+	// validateResponseURIOrigin already anticipates) must be parsed as
+	// inline params, not misidentified as a reference URL to fetch - it has
+	// an empty RawQuery too (the whole string lands in url.URL.Path), so
+	// scheme/host presence, not RawQuery, has to be the discriminator.
+	t.Run("raw query string with no scheme is parsed directly", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "response_type=vp_token&client_id=https://verifier.example.com&nonce=raw-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "raw-nonce", authReq.Nonce)
+	})
+
+	t.Run("bare https URL with inline query params is parsed directly", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "https://wallet.example.com/present?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	t.Run("no request provided", func(t *testing.T) {
+		msg := &FlowStartMessage{}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.Error(t, err)
+	})
+}
+
+func TestHasURLScheme(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"https://verifier.example.com", true},
+		{"http://127.0.0.1:8080", true},
+		{"openid4vp://?client_id=foo", true},
+		{"haip://?client_id=foo", true},
+		{"", false},
+		{"client_id=foo&nonce=bar", false},
+		{"response_type=vp_token&client_id=https://verifier.example.com", false},
+		{"://missing-scheme", false},
+		{"1https://bad-first-char", false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, hasURLScheme(tc.in), "hasURLScheme(%q)", tc.in)
+	}
+}
+
+func TestRedactURIForLogging(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"https://verifier.example.com/req?nonce=secret&client_id=foo", "https://verifier.example.com"},
+		{"client_id=foo&nonce=secret", "<non-url>"},
+		{"not a url at all", "<non-url>"},
+		// haip:// (and openid4vp://) requests with no callback/authority
+		// segment are common and not malformed - Host is legitimately
+		// empty. Must still report the scheme, not "<non-url>".
+		{"haip://?client_id=foo&nonce=secret", "haip://"},
+		{"openid4vp://?client_id=foo&nonce=secret", "openid4vp://"},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, redactURIForLogging(tc.in), "redactURIForLogging(%q)", tc.in)
 	}
 }
 
@@ -1092,6 +1241,36 @@ func TestValidateResponseURIOrigin_OpenID4VPScheme(t *testing.T) {
 	}
 	err := validateResponseURIOrigin(authReq, msg)
 	assert.NoError(t, err)
+}
+
+// Regression test: parseRequest treats haip:// the same as openid4vp://,
+// but validateResponseURIOrigin only unwrapped openid4vp:// to find the
+// embedded request_uri. A HAIP request_uri parsed to an empty host and was
+// silently treated as "not a proper URL", skipping the origin check
+// entirely instead of enforcing it.
+func TestValidateResponseURIOrigin_HAIPScheme(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_HAIPScheme_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
 }
 
 func TestValidateResponseURIOrigin_SkipsNonX509Scheme(t *testing.T) {

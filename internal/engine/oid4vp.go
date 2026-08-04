@@ -201,12 +201,19 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
 	_ = h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
 
+	h.Logger.Debug("parsing authorization request",
+		zap.String("request_uri", redactURIForLogging(msg.RequestURI)),
+		zap.String("request_uri_ref", redactURIForLogging(msg.RequestURIRef)))
+
 	var authReq AuthorizationRequest
 
 	if msg.RequestURI != "" {
-		// Parse from openid4vp:// URL or direct URL
+		// Parse from openid4vp://, haip://, or a direct https:// URL. HAIP
+		// (OpenID4VC High Assurance Interoperability Profile) uses the same
+		// openid4vp://?client_id=...&request_uri=... wire shape as plain
+		// OID4VP, just under its own scheme - treat both identically.
 		requestStr := msg.RequestURI
-		if strings.HasPrefix(requestStr, "openid4vp://") {
+		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") {
 			u, err := url.Parse(requestStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid request URL: %w", err)
@@ -219,13 +226,87 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			// Parse inline parameters
 			return h.parseRequestFromURL(u)
 		}
-		// Direct URL
-		return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
+		// requestStr may be a raw query string with no scheme at all (e.g.
+		// "client_id=foo&nonce=bar", as validateResponseURIOrigin already
+		// anticipates) rather than a URL. Anything that doesn't itself start
+		// with a URL scheme is a raw query string - parse it as inline
+		// params directly, the same as before this fix. This check must
+		// come before ever calling url.Parse on requestStr: a raw query
+		// string can contain a "://" inside a parameter value (e.g.
+		// client_id=https://verifier...), which url.Parse rejects with
+		// "first path segment ... cannot contain colon" since the string
+		// itself has no leading scheme.
+		if !hasURLScheme(requestStr) {
+			return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
+		}
+		// Direct https:// URL: either a by-value request with inline query
+		// parameters, or a bare reference URL (no query at all) that must be
+		// fetched to obtain the actual request object - e.g. a QR/link that
+		// itself IS the request_uri, with no openid4vp://... wrapper. A
+		// query-less URL can't carry inline params, so treating requestStr as
+		// a literal RawQuery in that case silently yields every field empty
+		// (this is exactly what broke: a bare https://.../haip-vp link with
+		// no "=" characters parsed to nonce="" and failed on "missing
+		// required 'nonce' parameter", never even attempting to fetch it).
+		u, err := url.Parse(requestStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request URL: %w", err)
+		}
+		if u.RawQuery == "" {
+			return h.fetchRequestFromURI(ctx, requestStr)
+		}
+		return h.parseRequestFromURL(u)
 	} else if msg.RequestURIRef != "" {
 		return h.fetchRequestFromURI(ctx, msg.RequestURIRef)
 	}
 
 	return &authReq, errors.New("no request provided")
+}
+
+// hasURLScheme reports whether s begins with a URL scheme ("scheme://...",
+// per RFC 3986: a letter followed by letters/digits/+/-/. up to "://").
+// Used to tell an actual URL apart from a raw query string that happens to
+// contain "://" inside a parameter value.
+func hasURLScheme(s string) bool {
+	idx := strings.Index(s, "://")
+	if idx <= 0 {
+		return false
+	}
+	scheme := s[:idx]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		isDigit := c >= '0' && c <= '9'
+		if !isLetter && !isDigit && c != '+' && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// redactURIForLogging returns a form of uri safe to log: scheme and host
+// only. The query string (and, for a bare raw-query value, the entire
+// string) may carry sensitive material - nonces, reference tokens, embedded
+// JWTs - so neither is ever included.
+func redactURIForLogging(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme == "" {
+		return "<non-url>"
+	}
+	// Host is legitimately empty for some valid, non-sensitive requests -
+	// e.g. "haip://?client_id=..." (no callback/authority segment) parses
+	// with an empty Host. Requiring a non-empty Host here would misclassify
+	// those as "<non-url>" instead of the more informative "haip://".
+	return u.Scheme + "://" + u.Host
 }
 
 func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, error) {
@@ -294,6 +375,7 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 }
 
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
+	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, err
@@ -1220,7 +1302,7 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	requestURL := msg.RequestURI
-	if strings.HasPrefix(requestURL, "openid4vp://") {
+	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") {
 		if u, err := url.Parse(requestURL); err == nil {
 			requestURL = u.Query().Get("request_uri")
 		}
