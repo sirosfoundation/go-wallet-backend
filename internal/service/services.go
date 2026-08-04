@@ -41,7 +41,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
-	wpSvc := NewWalletProviderService(cfg, logger)
+	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances())
 
 	// WIA shares the same signing key as the wallet provider
 	var wiaSvc *WIAService

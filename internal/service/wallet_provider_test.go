@@ -15,6 +15,9 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -56,8 +59,31 @@ func newTestWalletProviderService(t *testing.T) *WalletProviderService {
 	}
 }
 
-func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
+// newTestWalletProviderServiceWithInstances is like newTestWalletProviderService
+// but wires a real (in-memory) wallet instance store, needed for tests that
+// exercise the security-properties trust gate in GenerateKeyAttestation.
+func newTestWalletProviderServiceWithInstances(t *testing.T) (*WalletProviderService, storage.WalletInstanceStore) {
+	t.Helper()
 	svc := newTestWalletProviderService(t)
+	instances := memory.NewStore().WalletInstances()
+	svc.instances = instances
+	return svc, instances
+}
+
+// TestGenerateKeyAttestation_TopLevelSecurityProperties exercises the
+// trusted path: the wallet instance already has a WIA proving native
+// platform integrity, so the client's security_properties claim is
+// honored (after normalization — already-prefixed iso_18045_* values pass
+// through unchanged).
+func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
+	svc, instances := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	jwks := []map[string]interface{}{
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
@@ -72,7 +98,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 		},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -158,6 +184,159 @@ func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
 	}
 	if cert != "none" {
 		t.Errorf("certification = %v, want \"none\"", cert)
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance is a
+// regression test for a review finding: without this, any caller could
+// self-assert an arbitrary key_storage/certification claim (e.g.
+// iso_18045_high) with no wallet_instance_id and no verification at all,
+// and have it signed straight into the KA JWT. With no walletInstanceID to
+// even attempt a lookup against, the claim must be clamped to the
+// software/K3 floor.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+	secProps := &SecurityProperties{
+		KeyStorage:         []string{"iso_18045_high"},
+		UserAuthentication: []string{"iso_18045_high"},
+		Certification: map[string]interface{}{
+			"scheme": "EUCC",
+		},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != "none" {
+		t.Errorf("certification = %v, want \"none\"", cert)
+	}
+	if _, ok := claims["user_authentication"]; ok {
+		t.Error("user_authentication should be clamped away, not passed through")
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInstance
+// covers the Tier 3 case: the wallet instance exists but its WIA was
+// backend-attested only (no native platform integrity proof), so an
+// elevated claim still must not be honored.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInstance(t *testing.T) {
+	svc, instances := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-backend-attested"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "backend_attested",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance
+// covers a wallet_instance_id that doesn't resolve to any known instance
+// (storage.ErrNotFound) — must fail closed (clamp), not fail open.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance(t *testing.T) {
+	svc, _ := newTestWalletProviderServiceWithInstances(t)
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "does-not-exist", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary is a
+// regression test for the other half of the same finding: the SDKs send
+// their raw internal WSCD vocabulary ("software"/"hardware"/
+// "trusted_execution"/"remote_hsm"), not the iso_18045_* enum the KA spec
+// requires, and nothing was mapping it before this fix — even for a
+// trusted (natively-attested) instance.
+func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *testing.T) {
+	svc, instances := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-2"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "android_play_integrity",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{
+		KeyStorage:         []string{"hardware"},
+		UserAuthentication: []string{"none"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_moderate")
+	// omitIfNone: a "none" user_authentication claim is dropped, not mapped
+	// to a placeholder value.
+	if _, ok := claims["user_authentication"]; ok {
+		t.Errorf("user_authentication = %v, want omitted for \"none\"", claims["user_authentication"])
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic
+// covers an unrecognized raw value (not already iso_18045_*, not a known
+// internal vocabulary word) — must default to the safe floor rather than
+// erroring or passing an invalid enum value through into the signed JWT.
+func TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic(t *testing.T) {
+	svc, instances := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-3"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"quantum_vault"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+}
+
+func parseKAClaims(t *testing.T, ka string) jwt.MapClaims {
+	t.Helper()
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token.Claims.(jwt.MapClaims)
+}
+
+func assertKeyStorage(t *testing.T, claims jwt.MapClaims, want string) {
+	t.Helper()
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != want {
+		t.Errorf("key_storage = %v, want [%s]", claims["key_storage"], want)
 	}
 }
 
@@ -525,7 +704,7 @@ func TestNewWalletProviderService_FileKeys(t *testing.T) {
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
 
-	svc := NewWalletProviderService(cfg, zap.NewNop())
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil)
 	if !svc.IsSupported() {
 		t.Error("service should be supported with valid keys")
 	}
@@ -562,7 +741,7 @@ func TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys(t *testing.T)
 		ModulePath: "/nonexistent/pkcs11.so", // fails to load regardless of build tags
 	}
 
-	svc := NewWalletProviderService(cfg, zap.NewNop())
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil)
 	if !svc.IsSupported() {
 		t.Error("service should fall back to file-based keys when PKCS#11 fails to load")
 	}
@@ -570,7 +749,7 @@ func TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys(t *testing.T)
 
 func TestNewWalletProviderService_NoKeys(t *testing.T) {
 	cfg := &config.Config{}
-	svc := NewWalletProviderService(cfg, zap.NewNop())
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil)
 	if svc.IsSupported() {
 		t.Error("service should not be supported without keys")
 	}
