@@ -223,6 +223,17 @@ func (s *WalletProviderService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
 }
 
+// PublicKey returns the wallet provider's signing public key, or nil if no
+// signing key is configured. Used to serve the wallet provider's own JWKS
+// (see RegisterWalletProviderJWKSRoute) for relying parties resolving trust
+// via an iss-based (WIA.OmitX5C) attestation instead of its x5c chain.
+func (s *WalletProviderService) PublicKey() crypto.PublicKey {
+	if s.signer == nil {
+		return nil
+	}
+	return s.signer.Public()
+}
+
 // Close releases resources held by the service.
 // For PKCS#11 signers, this closes the token session pool.
 func (s *WalletProviderService) Close() {

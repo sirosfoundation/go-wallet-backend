@@ -546,7 +546,9 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
-	token.Header["x5c"] = s.certChain
+	if !s.cfg.WalletProvider.WIA.OmitX5C {
+		token.Header["x5c"] = s.certChain
+	}
 
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {

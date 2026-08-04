@@ -565,6 +565,17 @@ type WIAConfig struct {
 	// Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain).
 	// Some national profiles require an explicit iss for interop.
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+	// OmitX5C skips attaching the wallet provider's certificate chain to the
+	// WIA JWT header, so relying parties resolve trust via the `iss` claim's
+	// JWKS (draft-ietf-oauth-attestation-based-client-auth, "iss-based IETF
+	// draft format") instead of TS03's x5c-derived identity. When x5c is
+	// present, consumers (e.g. SUNET/vc's parseAttestationIdentity) treat it
+	// as authoritative and iss as a secondary consistency check only — so
+	// this is the only way to actually exercise iss/JWKS-based trust when a
+	// certificate is configured. Requires Issuer to be set; the wallet
+	// provider's public key must be resolvable at
+	// "<issuer>/.well-known/jwks.json" (see RegisterWalletProviderJWKSRoute).
+	OmitX5C bool `yaml:"omit_x5c" envconfig:"OMIT_X5C"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
 	// WalletName is the wallet_name claim in WIA JWT
@@ -1344,6 +1355,15 @@ func (c *Config) Validate() error {
 			(c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != "")
 		if walletProviderKeysConfigured && c.WalletProvider.WIA.WalletProviderURI == "" {
 			return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
+		}
+
+		// OmitX5C means the iss claim (not the x5c chain) is the only way a
+		// relying party can identify the wallet provider and resolve its
+		// JWKS - falling back to wallet_provider_uri here (as signWIA does
+		// when issuer is unset) would silently repurpose an aud identifier
+		// as an iss/JWKS-discovery URL that was never configured for that.
+		if c.WalletProvider.WIA.OmitX5C && c.WalletProvider.WIA.Issuer == "" {
+			return fmt.Errorf("wallet_provider.wia.issuer is required when wallet_provider.wia.omit_x5c is set (relying parties need it to resolve the JWKS)")
 		}
 	}
 

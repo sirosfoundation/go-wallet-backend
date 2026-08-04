@@ -253,6 +253,45 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	}
 }
 
+// OmitX5C lets a deployment opt into the IETF-draft iss/JWKS identity format
+// instead of TS03's x5c-derived identity - needed when relying parties can't
+// resolve trust via a self-signed x5c chain but can fetch a JWKS from a real
+// iss URL (see RegisterWalletProviderJWKSRoute).
+func TestWIAService_GenerateWIA_OmitX5C(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.OmitX5C = true
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] != nil {
+		t.Error("x5c header should be omitted when OmitX5C is set")
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	if claims["iss"] != "https://wallet-provider.example" {
+		t.Errorf("iss = %v, want https://wallet-provider.example", claims["iss"])
+	}
+}
+
 // draft-ietf-oauth-attestation-based-client-auth-10: "the sub claim MUST
 // specify client_id value of the OAuth Client" - when the caller (the OID4VCI
 // engine, via BackendApiClient.generateWIA) supplies its client_id, the WIA's

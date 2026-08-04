@@ -1780,6 +1780,46 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_WIA_OmitX5CRequiresIssuer is a regression test: when
+// OmitX5C is set, the iss claim (not the x5c chain) is the only way a
+// relying party can identify the wallet provider and resolve its JWKS.
+// Without this check, an operator could enable OmitX5C without setting
+// Issuer and get a WIA with neither x5c nor a usable iss - an attestation
+// nobody can resolve trust for.
+func TestConfig_Validate_WIA_OmitX5CRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.OmitX5C = true
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// Issuer intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when omit_x5c is set without issuer")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider.wia.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_OmitX5CPassesWithIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.OmitX5C = true
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestConfig_Validate_Audit_* are regression tests for a review finding:
 // Config.Validate() didn't check AuditConfig at all, so audit.enabled=true
 // with a missing issuer/key_path/key_id silently disabled the SET audit

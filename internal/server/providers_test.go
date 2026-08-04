@@ -432,6 +432,66 @@ func TestBackendProvider_RegisterRoutes_WithoutAuthZENHandler(t *testing.T) {
 	}
 }
 
+// TestBackendProvider_RegisterRoutes_RegistersJWKS is a regression test:
+// co-hosted (BackendProvider) mode must expose /.well-known/jwks.json when a
+// wallet-provider signing key is configured, so relying parties resolving
+// trust via an iss-based WIA (WalletProvider.WIA.OmitX5C) can fetch it.
+func TestBackendProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	store := newTestMemoryBackend(t)
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+
+	provider := &BackendProvider{
+		auth:    authProvider,
+		storage: storageProvider,
+		store:   store,
+		cfg:     cfg,
+		logger:  logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if !hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected GET /.well-known/jwks.json to be registered when a wallet-provider signing key is configured")
+	}
+}
+
+// TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey documents the
+// no-op counterpart: without a configured wallet-provider signing key, the
+// route must not be registered at all.
+func TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	store := newTestMemoryBackend(t)
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+
+	provider := &BackendProvider{
+		auth:    authProvider,
+		storage: storageProvider,
+		store:   store,
+		cfg:     cfg,
+		logger:  logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected /.well-known/jwks.json NOT to be registered without a wallet-provider signing key")
+	}
+}
+
 func TestAuthProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := minimalTestConfig()
@@ -596,6 +656,48 @@ func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) 
 		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
 	}
 }
+
+// TestWalletProviderProvider_RegisterRoutes_RegistersJWKS is a regression
+// test: standalone wallet-provider mode (RoleWalletProvider without
+// RoleBackend) must expose the same /.well-known/jwks.json as the co-hosted
+// BackendProvider does, or relying parties resolving trust via an iss-based
+// WIA (WalletProvider.WIA.OmitX5C) have nowhere to fetch the key when this
+// role runs as its own standalone microservice.
+func TestWalletProviderProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	router := gin.New()
+	p.RegisterRoutes(router)
+
+	if !hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected GET /.well-known/jwks.json to be registered in standalone wallet-provider mode")
+	}
+}
+
+// Unlike BackendProvider (see TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey),
+// there's no "standalone wallet-provider without a signing key" case to test
+// here: NewWalletProviderProvider itself refuses to construct without a
+// supported signing key (see its "wallet-provider signing keys not
+// configured or not supported" error), so the no-op path in
+// RegisterWalletProviderJWKSRoute is unreachable through this provider and
+// is already covered directly at the service level (see
+// TestRegisterWalletProviderJWKSRoute_NoOpWhenNoSigningKey).
 
 // TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled is a
 // regression test for a review finding: in co-hosted (AuthProvider) mode,
