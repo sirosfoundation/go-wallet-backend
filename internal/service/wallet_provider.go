@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -63,13 +65,19 @@ type WalletProviderService struct {
 	signer    crypto.Signer
 	jwtSigner *signing.CryptoSignerES256
 	certChain []string
+	instances storage.WalletInstanceStore
 }
 
-// NewWalletProviderService creates a new WalletProviderService
-func NewWalletProviderService(cfg *config.Config, logger *zap.Logger) *WalletProviderService {
+// NewWalletProviderService creates a new WalletProviderService.
+// instances is used to corroborate a KA request's self-reported security
+// properties against a WIA that already proved native platform integrity
+// for the same wallet instance (see GenerateKeyAttestation) — may be nil in
+// tests that don't exercise that path.
+func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances storage.WalletInstanceStore) *WalletProviderService {
 	svc := &WalletProviderService{
-		cfg:    cfg,
-		logger: logger.Named("wallet-provider-service"),
+		cfg:       cfg,
+		logger:    logger.Named("wallet-provider-service"),
+		instances: instances,
 	}
 
 	// Try PKCS#11 first, then fall back to file-based key loading if PKCS#11
@@ -281,16 +289,25 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		claims["aud"] = audience
 	}
 
-	// Security properties are top-level KA claims (Annex C §C.3.1)
+	// Security properties are top-level KA claims (Annex C §C.3.1). These are
+	// self-reported by the client — trust them only when the same wallet
+	// instance already has a WIA proving native platform integrity
+	// (Tier 1: ios_app_attest / android_play_integrity). Otherwise clamp to
+	// the software/K3 floor: a client can always claim more than it can
+	// back up, and nothing here independently verifies a hardware or
+	// remote-HSM claim. See internal/service/wallet_provider_test.go for
+	// the regression tests this guards.
 	if secProps != nil {
-		if len(secProps.KeyStorage) > 0 {
-			claims["key_storage"] = secProps.KeyStorage
+		trusted := s.instanceHasNativeAttestation(ctx, walletInstanceID)
+		normalized := normalizeSecurityProperties(secProps, trusted)
+		if len(normalized.KeyStorage) > 0 {
+			claims["key_storage"] = normalized.KeyStorage
 		}
-		if len(secProps.UserAuthentication) > 0 {
-			claims["user_authentication"] = secProps.UserAuthentication
+		if len(normalized.UserAuthentication) > 0 {
+			claims["user_authentication"] = normalized.UserAuthentication
 		}
-		if secProps.Certification != nil {
-			claims["certification"] = secProps.Certification
+		if normalized.Certification != nil {
+			claims["certification"] = normalized.Certification
 		}
 	}
 
@@ -326,4 +343,102 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 
 	kaGeneratedTotal.Inc()
 	return tokenString, nil
+}
+
+// nativeAttestationSources are the WalletInstance.AttestationSource values
+// that indicate the wallet's Tier 1 WIA was backed by verified platform
+// attestation (iOS App Attest or Android Play Integrity) — i.e. an
+// independent signal that the instance's runtime integrity was checked,
+// which corroborates (though doesn't cryptographically prove) an elevated
+// key_storage/certification claim for that same instance.
+var nativeAttestationSources = map[string]bool{
+	"ios_app_attest":         true,
+	"android_play_integrity": true,
+}
+
+// instanceHasNativeAttestation reports whether walletInstanceID resolves to
+// a WalletInstance whose WIA was backed by verified native platform
+// attestation. Returns false on a missing ID, an unknown instance, a
+// lookup error, or a nil instance store (e.g. in tests that construct
+// WalletProviderService directly) — all of which mean there's no evidence
+// to corroborate an elevated claim, not that one should be granted.
+func (s *WalletProviderService) instanceHasNativeAttestation(ctx context.Context, walletInstanceID string) bool {
+	if s.instances == nil || walletInstanceID == "" {
+		return false
+	}
+	instance, err := s.instances.GetByID(ctx, walletInstanceID)
+	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
+		}
+		return false
+	}
+	return nativeAttestationSources[instance.AttestationSource]
+}
+
+// isoAttackPotential maps SIROS's internal WSCD key-storage/user-auth
+// vocabulary onto the OID4VCI Key Attestation JWT's registered
+// `iso_18045_*` attack-potential-resistance values. Mirrors the mapping
+// already used client-side in the Kotlin/Swift SDKs' self-signed fallback
+// path (WscdKeystoreAdapter.toIso18045AttackPotential) — kept in sync so
+// the same raw value maps the same way regardless of which side does it.
+// Mappings are necessarily approximate; conservative/lower tiers are
+// preferred over overclaiming resistance that hasn't been verified.
+func isoAttackPotential(raw string, omitIfNone bool) (string, bool) {
+	if strings.HasPrefix(raw, "iso_18045_") {
+		return raw, true // already spec-compliant, pass through
+	}
+	switch strings.ToLower(raw) {
+	case "none":
+		if omitIfNone {
+			return "", false
+		}
+		return "iso_18045_basic", true
+	case "software":
+		return "iso_18045_basic", true
+	case "hardware":
+		return "iso_18045_moderate", true
+	case "trusted_execution":
+		return "iso_18045_enhanced-basic", true
+	case "remote_hsm":
+		return "iso_18045_high", true
+	default:
+		return "iso_18045_basic", true
+	}
+}
+
+// normalizeSecurityProperties maps secProps onto the registered
+// `iso_18045_*` vocabulary and, when trusted is false, clamps every claim
+// down to the software/K3 floor regardless of what the client asserted.
+func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *SecurityProperties {
+	if !trusted {
+		return &SecurityProperties{
+			KeyStorage:    []string{"iso_18045_basic"},
+			Certification: "none",
+		}
+	}
+
+	out := &SecurityProperties{Certification: secProps.Certification}
+	out.KeyStorage = mapDistinct(secProps.KeyStorage, false)
+	if len(out.KeyStorage) == 0 {
+		out.KeyStorage = []string{"iso_18045_basic"}
+	}
+	out.UserAuthentication = mapDistinct(secProps.UserAuthentication, true)
+	return out
+}
+
+// mapDistinct applies isoAttackPotential to each value, dropping omitted
+// entries and de-duplicating (matching the Kotlin/Swift SDKs' .distinct()).
+func mapDistinct(raw []string, omitIfNone bool) []string {
+	seen := make(map[string]bool, len(raw))
+	var out []string
+	for _, v := range raw {
+		mapped, ok := isoAttackPotential(v, omitIfNone)
+		if !ok || seen[mapped] {
+			continue
+		}
+		seen[mapped] = true
+		out = append(out, mapped)
+	}
+	return out
 }
