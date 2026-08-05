@@ -77,11 +77,19 @@ type StatusListEntry struct {
 // additional separator), so an unvalidated caller-supplied value could
 // escape the intended "admin/store/..." prefix and reach an unrelated path
 // on the R2PS service. Rejecting anything but a plain segment closes that off.
+//
+// "%" is rejected outright rather than just "/" and "\": net/url's URL.Path
+// is the unescaped form, and it is impossible in general to tell a raw "/"
+// apart from a percent-encoded "%2f" (or "\" from "%5c") once decoded. A
+// value like "..%2fadmin" contains no literal slash so it would pass a
+// slash-only check, yet can still decode into a path-traversal segment
+// downstream. None of the legitimate identifiers accepted here (category,
+// client_id, kid) ever need a literal "%", so banning it entirely is safe.
 func isValidPathSegment(s string) bool {
 	if s == "" || s == "." || s == ".." {
 		return false
 	}
-	return !strings.ContainsAny(s, "/\\")
+	return !strings.ContainsAny(s, "/\\%")
 }
 
 // ListStatuses returns all status entries for a category.

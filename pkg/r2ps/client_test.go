@@ -21,7 +21,11 @@ func TestIsValidPathSegment(t *testing.T) {
 		{"foo.bar", true},
 		{"foo/bar", false},
 		{"foo\\bar", false},
-		{"..%2fadmin", true}, // percent-escaped, not a literal slash
+		{"..%2fadmin", false}, // percent-escaped slash: rejected too, since
+		// net/url unescapes URL.Path and cannot distinguish this from a
+		// literal "/" once decoded downstream.
+		{"..%5cadmin", false}, // same for percent-escaped backslash
+		{"100%", false},       // any literal "%" is rejected, not just traversal patterns
 	}
 	for _, tc := range cases {
 		if got := isValidPathSegment(tc.in); got != tc.want {
