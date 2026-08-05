@@ -154,13 +154,20 @@ func (c *Config) EnableForRole() {
 		return
 	}
 	c.AS.Enabled = true
-	// Auto-enable can only supply a signing key when the wallet provider
-	// itself is file-based (WalletProvider.PrivateKeyPath). A PKCS11-backed
-	// wallet provider has no equivalent here - AS's own PKCS11 signing is
-	// not implemented (see Validate()) - so this leaves SigningKeyPath
-	// empty and Validate() will reject with a clear, actionable error
-	// rather than silently limping along with AS enabled but unusable.
-	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
+	// Auto-enable can only inherit the wallet provider's signing key when
+	// the wallet provider is purely file-based - never when PKCS11 is
+	// configured for it, even if PrivateKeyPath is ALSO set as a runtime
+	// fallback (WalletProviderService tries PKCS11 first, independently of
+	// whether a file key is also configured). Inheriting the file path
+	// there would silently sign AS tokens with the weaker on-disk key while
+	// the wallet provider itself actually signs WIA/KA with the HSM key -
+	// a real, silent security downgrade, not just an unsupported
+	// configuration. AS's own PKCS11 signing is not implemented (see
+	// Validate()), so this deliberately leaves SigningKeyPath empty in that
+	// case; Validate() then rejects with a clear, actionable error rather
+	// than silently limping along with AS enabled on the wrong key.
+	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" && !walletProviderUsesPKCS11 {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
 	}
 	if c.AS.RulesDir == "" {

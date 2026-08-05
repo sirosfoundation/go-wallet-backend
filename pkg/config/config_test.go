@@ -1368,6 +1368,32 @@ func TestConfig_EnableForRole_FillsDefaults(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(t *testing.T) {
+	// Regression test for a real Copilot review finding: a wallet provider
+	// configured with PKCS11 (which WalletProviderService tries first,
+	// independently of whether a file key is ALSO configured as a runtime
+	// fallback) actually signs WIA/KA with the HSM key. If EnableForRole()
+	// still inherited PrivateKeyPath here, AS would silently sign its own
+	// tokens with the weaker on-disk key instead - a security downgrade,
+	// not just an unsupported configuration. SigningKeyPath must stay empty
+	// so Validate() rejects with an actionable error instead.
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/fallback-key.pem"
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "" {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
 func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
 	cfg := &Config{}
 	cfg.AS.Enabled = true
