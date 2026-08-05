@@ -778,3 +778,87 @@ func TestTokenEndpoint_Anonymous_WriteTACDenied(t *testing.T) {
 		t.Errorf("expected 403 for anonymous request with tac=w, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestTokenEndpoint_Anonymous_InvalidSessionDenied covers a session cookie
+// that doesn't resolve to a real session (expired/never existed) - distinct
+// from TestTokenEndpoint_Anonymous_NoSessionDenied, which covers no cookie
+// at all.
+func TestTokenEndpoint_Anonymous_InvalidSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-does-not-exist"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a session cookie that doesn't resolve, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_EmptyMaxTACDenied covers a session with no
+// granted permissions at all - mirrors the equivalent check on the
+// authenticated path.
+func TestTokenEndpoint_Anonymous_EmptyMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-empty-maxtac",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC(""),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-empty-maxtac"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session with no granted permissions, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied is distinct from
+// TestTokenEndpoint_Anonymous_WriteTACDenied: that test's requested tac
+// ("w") fails the read-only cap before session.MaxTAC is even consulted.
+// This one requests a tac that passes the read-only cap ("r", the default)
+// but still exceeds what this specific session's own MaxTAC ("l" only, no
+// "r") permits - a session with only list access can't be used to mint even
+// a read-only-scoped anonymous token.
+func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-list-only",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("l"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-list-only"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session whose MaxTAC (l) doesn't include the default anonymous tac (r), got %d: %s", w.Code, w.Body.String())
+	}
+}
