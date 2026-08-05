@@ -234,6 +234,18 @@ func (s *WalletProviderService) PublicKey() crypto.PublicKey {
 	return s.signer.Public()
 }
 
+// Issuer returns the value used as the WIA's iss claim (see WIAService's
+// GenerateWIA), so relying parties' RFC 8414 metadata discovery
+// (RegisterWalletProviderJWKSRoute) advertises the exact issuer the WIA
+// itself claims.
+func (s *WalletProviderService) Issuer() string {
+	issuer := s.cfg.WalletProvider.WIA.Issuer
+	if issuer == "" {
+		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
+	}
+	return issuer
+}
+
 // Close releases resources held by the service.
 // For PKCS#11 signers, this closes the token session pool.
 func (s *WalletProviderService) Close() {
