@@ -293,8 +293,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	// compares by equality. A string value can never be interpreted as a Mongo
 	// query operator (only "$"-prefixed map KEYS are), so untrusted input
 	// reaching this call site cannot inject query semantics.
-	// codeql[go/sql-injection]
-	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user)
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user) // codeql[go/sql-injection]
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound

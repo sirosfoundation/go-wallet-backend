@@ -171,11 +171,7 @@ func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, te
 	// strings and compared by equality. A string value can never be
 	// interpreted as a Mongo query operator (only "$"-prefixed map KEYS are),
 	// so untrusted input reaching this call site cannot inject query semantics.
-	// codeql[go/sql-injection]
-	count, err := s.collection.CountDocuments(ctx, bson.M{
-		"user_id":   userID.String(),
-		"tenant_id": string(tenantID),
-	})
+	count, err := s.collection.CountDocuments(ctx, bson.M{"user_id": userID.String(), "tenant_id": string(tenantID)}) // codeql[go/sql-injection]
 	if err != nil {
 		return false, fmt.Errorf("failed to check membership: %w", err)
 	}
