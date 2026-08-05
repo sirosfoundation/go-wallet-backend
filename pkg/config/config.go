@@ -116,37 +116,6 @@ func (c *ASConfig) SetDefaults() {
 	}
 }
 
-// EnableForRole turns on the AS (if not already explicitly configured) for
-// deployments that request the "auth" role (including via --mode=all).
-// There is no separate AS-specific key or policy to configure: it reuses the
-// wallet provider's own signing key, since every deployment already
-// configures one for WIA/Key Attestation, and defaults to an "allow all"
-// authorization policy (no RulesDir) rather than requiring one - a role flag
-// alone should be enough to turn AS on, matching how every other role works.
-//
-// A caller-supplied c.AS.Enabled (explicitly set false or true in config)
-// always wins - this only fills in what an unconfigured AS section would
-// otherwise leave empty.
-func (c *Config) EnableForRole() {
-	if c.AS.Enabled {
-		return
-	}
-	c.AS.Enabled = true
-	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
-		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
-	}
-	if c.AS.RulesDir == "" {
-		// Ships in the image alongside the binary (see Dockerfile) - the
-		// baseline policy (read-only always allowed, own-tenant access for
-		// any tac) every deployment gets unless it configures its own.
-		c.AS.RulesDir = "/app/rules"
-	}
-	c.AS.SetDefaults()
-	if c.AS.Issuer == "" {
-		c.AS.Issuer = c.JWT.Issuer
-	}
-}
-
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
 func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	if ttl, ok := c.AudienceTTLs[audience]; ok {
@@ -368,7 +337,7 @@ func (c *CORSConfig) SetDefaults() {
 	}
 	if len(c.AllowedHeaders) == 0 {
 		c.AllowedHeaders = []string{
-			"Authorization", "Content-Type", "X-Tenant-ID", "X-Token-Mode",
+			"Authorization", "Content-Type", "X-Tenant-ID",
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",

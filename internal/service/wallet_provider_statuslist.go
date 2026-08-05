@@ -46,7 +46,10 @@ func RegisterWalletProviderStatusListRoute(router gin.IRoutes, wp *WalletProvide
 				"lst":  lst,
 			},
 		}
+		// iss/sub are set consistently regardless of x5c/kid below, so a
+		// verifier can always identify and locate this wallet provider.
 		if wp.cfg.Server.BaseURL != "" {
+			claims["iss"] = wp.cfg.Server.BaseURL
 			claims["sub"] = wp.cfg.Server.BaseURL + "/wallet-provider/status-list"
 		}
 
@@ -54,6 +57,13 @@ func RegisterWalletProviderStatusListRoute(router gin.IRoutes, wp *WalletProvide
 		token.Header["typ"] = "statuslist+jwt"
 		if len(wp.certChain) > 0 {
 			token.Header["x5c"] = wp.certChain
+		} else {
+			// No x5c: without a kid, a verifier fetching
+			// /.well-known/jwks.json (RegisterWalletProviderJWKSRoute, which
+			// publishes this same key under KeyID "wallet-provider") would
+			// have no way to select this key. Matches the WIA's own ietf-mode
+			// kid handling in WIAService.signWIA.
+			token.Header["kid"] = "wallet-provider"
 		}
 
 		tokenString, err := wp.jwtSigner.SignToken(token)
