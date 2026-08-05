@@ -124,28 +124,34 @@ func (c *ASConfig) SetDefaults() {
 	}
 }
 
-// EnableForRole turns on the AS (if not already explicitly configured) for
-// deployments that request the "auth" role (including via --mode=all).
-// There is no separate AS-specific key or policy to configure: it reuses the
-// wallet provider's own signing key, since every deployment already
-// configures one for WIA/Key Attestation, and falls back to the baseline
-// policy bundled in the image (see rules/, copied to /app/rules by the
-// Dockerfile) rather than requiring a deployment-specific RulesDir - a role
-// flag alone should be enough to turn AS on, matching how every other role
-// works.
+// EnableForRole turns on the AS for deployments that request the "auth" role
+// (including via --mode=all), and fills in defaults for anything left
+// unconfigured. There is no separate AS-specific key or policy to configure:
+// it reuses the wallet provider's own signing key (when file-based - see the
+// PKCS11 note below), since every deployment already configures one for
+// WIA/Key Attestation, and falls back to the baseline policy bundled in the
+// image (see rules/, copied to /app/rules by the Dockerfile) rather than
+// requiring a deployment-specific RulesDir - a role flag alone should be
+// enough to turn AS on, matching how every other role works.
 //
-// A caller-supplied c.AS.Enabled (explicitly set false or true in config)
-// always wins - this only fills in what an unconfigured AS section would
-// otherwise leave empty. Relies on Config.asEnabledExplicit (set by Load())
-// rather than c.AS.Enabled itself, since a plain bool can't distinguish
-// "explicitly set to false" from "never configured" (both are the zero
-// value) - without that, an operator's explicit as.enabled: false would be
-// silently overridden to true here.
+// An operator's explicit as.enabled: false always wins and skips all of the
+// above - relies on Config.asEnabledExplicit (set by Load()) rather than
+// c.AS.Enabled itself, since a plain bool can't distinguish "explicitly set
+// to false" from "never configured" (both are the zero value). An explicit
+// as.enabled: true does NOT skip defaulting - it's treated the same as
+// "unconfigured" for the fields below, so `as: {enabled: true}` alone
+// (without also configuring signing_key_path/rules_dir) still works.
 func (c *Config) EnableForRole() {
-	if c.asEnabledExplicit {
+	if c.asEnabledExplicit && !c.AS.Enabled {
 		return
 	}
 	c.AS.Enabled = true
+	// Auto-enable can only supply a signing key when the wallet provider
+	// itself is file-based (WalletProvider.PrivateKeyPath). A PKCS11-backed
+	// wallet provider has no equivalent here - AS's own PKCS11 signing is
+	// not implemented (see Validate()) - so this leaves SigningKeyPath
+	// empty and Validate() will reject with a clear, actionable error
+	// rather than silently limping along with AS enabled but unusable.
 	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
 	}

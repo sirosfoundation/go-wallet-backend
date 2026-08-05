@@ -1451,6 +1451,41 @@ as:
 	}
 }
 
+func TestConfig_EnableForRole_FillsDefaultsWhenExplicitlyEnabledInYAML(t *testing.T) {
+	// Regression test for EnableForRole()'s own logic: an explicit
+	// as.enabled: true must still get defaults filled in for whatever
+	// fields are empty - only an explicit as.enabled: false should skip
+	// defaulting entirely. Before this fix, EnableForRole() treated ANY
+	// explicit as.enabled (true or false) identically ("fully configured,
+	// don't touch it").
+	//
+	// Constructs Config directly (asEnabledExplicit set as Load() would)
+	// rather than going through Load() itself: Load()'s own Validate() call
+	// requires as.signing_key_path/rules_dir whenever as.enabled: true is
+	// present in YAML, regardless of role - so a YAML fixture reproducing
+	// this scenario would fail at Load() before EnableForRole() ever runs.
+	// That's a separate, pre-existing validation-ordering property (AS
+	// config is validated unconditionally on AS.Enabled, not gated on
+	// whether the auth role was even requested) - out of scope for this fix,
+	// which is specifically about EnableForRole()'s own explicit-true-vs-
+	// false handling.
+	cfg := &Config{asEnabledExplicit: true}
+	cfg.AS.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled to stay true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+}
+
 func TestConfig_EnableForRole_FillsInWhenYAMLOmitsASEntirely(t *testing.T) {
 	// Contrast with the test above: when the `as:` section is absent
 	// entirely (not just enabled: false), EnableForRole should still turn

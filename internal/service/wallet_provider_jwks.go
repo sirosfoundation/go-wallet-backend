@@ -2,6 +2,7 @@ package service
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
@@ -47,8 +48,14 @@ func RegisterWalletProviderJWKSRoute(router gin.IRoutes, wp *WalletProviderServi
 	router.GET("/.well-known/oauth-authorization-server", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=300")
 		c.JSON(http.StatusOK, gin.H{
+			// issuer must be byte-identical to wp.Issuer() (the WIA's own iss
+			// claim) - relying parties (e.g. vc's JWKSKeyResolver) reject the
+			// metadata if this doesn't exactly match the issuer they looked
+			// it up by. jwks_uri has no such constraint, so trim there only,
+			// to avoid a double slash when issuer is configured with a
+			// trailing one.
 			"issuer":   issuer,
-			"jwks_uri": issuer + "/.well-known/jwks.json",
+			"jwks_uri": strings.TrimRight(issuer, "/") + "/.well-known/jwks.json",
 		})
 	})
 }

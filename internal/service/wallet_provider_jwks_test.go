@@ -83,6 +83,43 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata(t *testing.T) {
 	}
 }
 
+func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_TrailingSlashIssuer(t *testing.T) {
+	// Regression test: a configured issuer with a trailing slash must not
+	// produce a double slash in jwks_uri ("https://host//.well-known/..."),
+	// which strict metadata consumers reject. The issuer field itself must
+	// stay byte-identical to the configured value though - relying parties
+	// (e.g. vc's JWKSKeyResolver) match it exactly against the WIA's own iss
+	// claim, which also uses the untrimmed configured value.
+	svc := newTestWalletProviderService(t)
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com/"
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterWalletProviderJWKSRoute(r, svc)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var meta struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	if meta.Issuer != "https://wallet-provider.example.com/" {
+		t.Errorf("issuer = %q, want byte-identical to configured value %q", meta.Issuer, "https://wallet-provider.example.com/")
+	}
+	if meta.JWKSURI != "https://wallet-provider.example.com/.well-known/jwks.json" {
+		t.Errorf("jwks_uri = %q, want no double slash", meta.JWKSURI)
+	}
+}
+
 func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_FallsBackToWalletProviderURI(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://fallback.example.com"
