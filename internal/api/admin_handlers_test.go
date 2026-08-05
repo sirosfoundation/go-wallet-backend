@@ -754,6 +754,110 @@ func TestAdminHandlers_UserCredentials(t *testing.T) {
 	})
 }
 
+// TestAdminHandlers_CredentialDeactivation_TenantIsolation covers a user who is a member of
+// two tenants and holds a credential in each. An admin acting in tenant A must not be able to
+// deactivate (individually or via deactivate-all) a credential that belongs to tenant B, even
+// though the user is a member of both tenants and requireTenantMember would pass.
+func TestAdminHandlers_CredentialDeactivation_TenantIsolation(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	router.POST("/admin/tenants", handlers.CreateTenant)
+	router.POST("/admin/tenants/:id/users", handlers.AddUserToTenant)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/:cred_id/deactivate", handlers.DeactivateUserCredential)
+	router.POST("/admin/tenants/:id/users/:user_id/credentials/deactivate-all", handlers.DeactivateAllUserCredentials)
+
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(`{"id":"`+tenant+`","name":"`+tenant+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("Expected tenant create 201 for %s, got %d", tenant, w.Code)
+		}
+	}
+
+	displayName := "Multi Tenant User"
+	user := &domain.User{
+		UUID:        domain.NewUserID(),
+		DID:         "did:key:multi-tenant-user",
+		DisplayName: &displayName,
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-a", TenantID: "tenant-a", CreatedAt: time.Now()},
+			{ID: "cred-b", TenantID: "tenant-b", CreatedAt: time.Now()},
+		},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := handlers.store.Users().Create(context.Background(), user); err != nil {
+		t.Fatalf("create user error: %v", err)
+	}
+
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		addMemberReq := httptest.NewRequest(http.MethodPost, "/admin/tenants/"+tenant+"/users", bytes.NewBufferString(`{"user_id":"`+user.UUID.String()+`"}`))
+		addMemberReq.Header.Set("Content-Type", "application/json")
+		addMemberResp := httptest.NewRecorder()
+		router.ServeHTTP(addMemberResp, addMemberReq)
+		if addMemberResp.Code != http.StatusOK {
+			t.Fatalf("Expected add member 200 for %s, got %d", tenant, addMemberResp.Code)
+		}
+	}
+
+	t.Run("deactivating a credential of a different tenant returns not found", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/tenant-a/users/"+user.UUID.String()+"/credentials/cred-b/deactivate", nil)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("Expected status 404, got %d: %s", w.Code, w.Body.String())
+		}
+
+		got, err := handlers.store.Users().GetByID(context.Background(), user.UUID)
+		if err != nil {
+			t.Fatalf("get user error: %v", err)
+		}
+		for _, cred := range got.WebauthnCredentials {
+			if cred.ID == "cred-b" && !cred.IsActive() {
+				t.Fatal("tenant-b's credential must not be deactivated by a tenant-a admin")
+			}
+		}
+	})
+
+	t.Run("deactivate-all in one tenant only affects that tenant's credentials", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants/tenant-a/users/"+user.UUID.String()+"/credentials/deactivate-all", bytes.NewBufferString(`{"reason":"tenant-a incident"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		got, err := handlers.store.Users().GetByID(context.Background(), user.UUID)
+		if err != nil {
+			t.Fatalf("get user error: %v", err)
+		}
+		for _, cred := range got.WebauthnCredentials {
+			switch cred.ID {
+			case "cred-a":
+				if cred.IsActive() {
+					t.Fatal("cred-a (tenant-a) should have been deactivated")
+				}
+			case "cred-b":
+				if !cred.IsActive() {
+					t.Fatal("cred-b (tenant-b) must remain active after a tenant-a deactivate-all")
+				}
+			}
+		}
+
+		// tenant-b's credential is still active, so re-running deactivate-all for
+		// tenant-a (which now has none active) must return conflict, not silently
+		// reach into tenant-b's still-active credential.
+		w2 := httptest.NewRecorder()
+		req2 := httptest.NewRequest(http.MethodPost, "/admin/tenants/tenant-a/users/"+user.UUID.String()+"/credentials/deactivate-all", nil)
+		router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusConflict {
+			t.Fatalf("Expected status 409, got %d: %s", w2.Code, w2.Body.String())
+		}
+	})
+}
+
 func TestListUserCredentials_MembershipCheckFails(t *testing.T) {
 	store := storeWithFailingUserTenants{memory.NewStore()}
 	handlers := NewAdminHandlers(store, zap.NewNop())

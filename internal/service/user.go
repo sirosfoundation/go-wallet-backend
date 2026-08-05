@@ -311,27 +311,35 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 // DeactivateWebAuthnCredential deactivates one active WebAuthn credential for the user.
 func (s *UserService) DeactivateWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string) (*domain.WebauthnCredential, error) {
-	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "user", "")
+	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "user", "", nil)
 }
 
 // DeactivateAllWebAuthnCredentials deactivates all active WebAuthn credentials for the user.
 func (s *UserService) DeactivateAllWebAuthnCredentials(ctx context.Context, userID domain.UserID) error {
-	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "user", "")
+	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "user", "", nil)
 	return err
 }
 
-// DeactivateWebAuthnCredentialByProvider deactivates one active WebAuthn credential as provider action.
-func (s *UserService) DeactivateWebAuthnCredentialByProvider(ctx context.Context, userID domain.UserID, credentialID string, reason string) (*domain.WebauthnCredential, error) {
-	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "provider", reason)
+// DeactivateWebAuthnCredentialByProvider deactivates one active WebAuthn credential as a
+// tenant-scoped provider/admin action. Only a credential belonging to tenantID (empty
+// credential TenantID is treated as domain.DefaultTenantID) can be deactivated, so an
+// admin operating in one tenant cannot affect a multi-tenant user's credentials in another.
+func (s *UserService) DeactivateWebAuthnCredentialByProvider(ctx context.Context, userID domain.UserID, tenantID domain.TenantID, credentialID string, reason string) (*domain.WebauthnCredential, error) {
+	return s.deactivateWebAuthnCredential(ctx, userID, credentialID, "provider", reason, &tenantID)
 }
 
-// DeactivateAllWebAuthnCredentialsByProvider deactivates all active credentials as provider action.
-func (s *UserService) DeactivateAllWebAuthnCredentialsByProvider(ctx context.Context, userID domain.UserID, reason string) error {
-	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "provider", reason)
+// DeactivateAllWebAuthnCredentialsByProvider deactivates all active credentials belonging to
+// tenantID as a provider/admin action (empty credential TenantID is treated as
+// domain.DefaultTenantID). Credentials belonging to the user's other tenants are untouched.
+func (s *UserService) DeactivateAllWebAuthnCredentialsByProvider(ctx context.Context, userID domain.UserID, tenantID domain.TenantID, reason string) error {
+	_, err := s.deactivateAllWebAuthnCredentials(ctx, userID, "provider", reason, &tenantID)
 	return err
 }
 
-func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, actor string, reason string) (*domain.WebauthnCredential, error) {
+// deactivateWebAuthnCredential deactivates the named credential for the user. When tenantID is
+// non-nil, only a credential whose (default-normalized) TenantID matches is eligible; a nil
+// tenantID (self-service paths) preserves the prior cross-tenant behavior.
+func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, actor string, reason string, tenantID *domain.TenantID) (*domain.WebauthnCredential, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -339,10 +347,15 @@ func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID d
 
 	var target *domain.WebauthnCredential
 	for i := range user.WebauthnCredentials {
-		if user.WebauthnCredentials[i].ID == credentialID {
-			target = &user.WebauthnCredentials[i]
-			break
+		cred := &user.WebauthnCredentials[i]
+		if cred.ID != credentialID {
+			continue
 		}
+		if tenantID != nil && cred.TenantOrDefault() != *tenantID {
+			continue
+		}
+		target = cred
+		break
 	}
 	if target == nil {
 		return nil, storage.ErrNotFound
@@ -381,7 +394,11 @@ func (s *UserService) deactivateWebAuthnCredential(ctx context.Context, userID d
 	return &out, nil
 }
 
-func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, userID domain.UserID, actor string, reason string) (int, error) {
+// deactivateAllWebAuthnCredentials deactivates all active credentials for the user. When
+// tenantID is non-nil, only credentials whose (default-normalized) TenantID matches are
+// deactivated, and the wallet lockout cascade only fires if no active credentials remain in
+// ANY tenant; a nil tenantID (self-service paths) preserves the prior cross-tenant behavior.
+func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, userID domain.UserID, actor string, reason string, tenantID *domain.TenantID) (int, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return 0, err
@@ -390,13 +407,17 @@ func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, user
 	now := time.Now()
 	updated := 0
 	for i := range user.WebauthnCredentials {
-		if !user.WebauthnCredentials[i].IsActive() {
+		cred := &user.WebauthnCredentials[i]
+		if !cred.IsActive() {
 			continue
 		}
-		user.WebauthnCredentials[i].Status = "deactivated"
-		user.WebauthnCredentials[i].DeactivatedAt = &now
-		user.WebauthnCredentials[i].DeactivatedBy = actor
-		user.WebauthnCredentials[i].DeactivationReason = reason
+		if tenantID != nil && cred.TenantOrDefault() != *tenantID {
+			continue
+		}
+		cred.Status = "deactivated"
+		cred.DeactivatedAt = &now
+		cred.DeactivatedBy = actor
+		cred.DeactivationReason = reason
 		updated++
 	}
 
@@ -404,13 +425,25 @@ func (s *UserService) deactivateAllWebAuthnCredentials(ctx context.Context, user
 		return 0, ErrNoActiveWebAuthnCredentials
 	}
 
-	s.cascadeWalletLockout(ctx, user)
+	activeLeft := 0
+	for _, cred := range user.WebauthnCredentials {
+		if cred.IsActive() {
+			activeLeft++
+		}
+	}
+	lockout := activeLeft == 0
+	if lockout {
+		s.cascadeWalletLockout(ctx, user)
+	}
+
 	user.UpdatedAt = now
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		return 0, fmt.Errorf("failed to update user: %w", err)
 	}
 
-	s.runLockoutSideEffects(ctx, user)
+	if lockout {
+		s.runLockoutSideEffects(ctx, user)
+	}
 	return updated, nil
 }
 

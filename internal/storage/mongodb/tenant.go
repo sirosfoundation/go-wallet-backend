@@ -165,6 +165,11 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 }
 
 func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+	// codeql[go/sql-injection]
+	// False positive: userID.String() / string(tenantID) are used only as plain
+	// field VALUES against hardcoded keys "user_id"/"tenant_id". bson.M is a
+	// typed document builder, not a concatenated query string; only "$"-prefixed
+	// KEYS are interpreted as operators, and no key here is user-controlled.
 	count, err := s.collection.CountDocuments(ctx, bson.M{
 		"user_id":   userID.String(),
 		"tenant_id": string(tenantID),

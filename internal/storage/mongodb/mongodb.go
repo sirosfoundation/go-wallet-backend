@@ -271,6 +271,11 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
 	var user domain.User
+	// codeql[go/sql-injection]
+	// False positive: id.String() is used only as a plain field VALUE against
+	// the hardcoded key "_id.id". The official mongo-driver bson.M is a typed
+	// document builder, not a query-language string; only "$"-prefixed KEYS
+	// are interpreted as operators, and no key here is user-controlled.
 	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {

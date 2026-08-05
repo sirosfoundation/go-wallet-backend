@@ -158,6 +158,16 @@ func (c WebauthnCredential) NormalizedStatus() string {
 	return "deactivated"
 }
 
+// TenantOrDefault returns the credential's TenantID, treating an empty value as
+// DefaultTenantID. Credentials created before tenant-scoping was introduced (or
+// otherwise left unset) belong to the default tenant, not to every tenant.
+func (c WebauthnCredential) TenantOrDefault() TenantID {
+	if c.TenantID == "" {
+		return DefaultTenantID
+	}
+	return c.TenantID
+}
+
 // Authenticator represents the authenticator data
 type Authenticator struct {
 	AAGUID       []byte `json:"aaguid" bson:"aaguid"`

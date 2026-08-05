@@ -607,11 +607,7 @@ func (h *AdminHandlers) ListUserCredentials(c *gin.Context) {
 
 	resp := make([]AdminCredentialResponse, 0, len(user.WebauthnCredentials))
 	for _, cred := range user.WebauthnCredentials {
-		credTenant := cred.TenantID
-		if credTenant == "" {
-			credTenant = domain.DefaultTenantID
-		}
-		if credTenant != tenantID {
+		if cred.TenantOrDefault() != tenantID {
 			continue
 		}
 		resp = append(resp, credentialToAdminResponse(cred))
@@ -640,7 +636,7 @@ func (h *AdminHandlers) DeactivateUserCredential(c *gin.Context) {
 		req = DeactivateCredentialRequest{}
 	}
 
-	cred, err := h.userService.DeactivateWebAuthnCredentialByProvider(c.Request.Context(), userID, credID, req.Reason)
+	cred, err := h.userService.DeactivateWebAuthnCredentialByProvider(c.Request.Context(), userID, tenantID, credID, req.Reason)
 	if err != nil {
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
@@ -672,7 +668,7 @@ func (h *AdminHandlers) DeactivateAllUserCredentials(c *gin.Context) {
 		req = DeactivateCredentialRequest{}
 	}
 
-	if err := h.userService.DeactivateAllWebAuthnCredentialsByProvider(c.Request.Context(), userID, req.Reason); err != nil {
+	if err := h.userService.DeactivateAllWebAuthnCredentialsByProvider(c.Request.Context(), userID, tenantID, req.Reason); err != nil {
 		if errors.Is(err, service.ErrNoActiveWebAuthnCredentials) {
 			c.JSON(http.StatusConflict, gin.H{"error": "No active credentials"})
 			return
