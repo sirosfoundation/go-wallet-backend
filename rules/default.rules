@@ -17,7 +17,16 @@
 ; duplicated per shape:
 ;   - shape A: acr, aud, sub, tac, tenant_id  (passkey-authenticated session)
 ;   - shape B: aud, sub, tac, tenant_id        (non-passkey session/delegation)
-;   - shape C: aud, tac, tenant_id             (anonymous, no sub)
+;   - shape C: acr, aud, tac, tenant_id        ("anonymous" - identity-free
+;              token for an already-authenticated session; see
+;              handleAnonymousTokenRequest. No shape omits acr: the AS never
+;              mints a token without one, authenticated or not - a session
+;              with no ACR is rejected in code before a query is ever built.)
+;
+; No rule in this file gives the "default" tenant name any special
+; treatment: it is the fallback tenant unspecified requests resolve to and
+; nothing else, and every shape below scopes tenant_id the same way -
+; wildcard here, matched against the caller's own session tenant in code.
 
 ; --- Shape A: acr present ---
 (token (acr (*)) (aud (*)) (sub (*)) (tac r))
@@ -33,16 +42,30 @@
 (token (aud (*)) (sub (*)) (tac rl))
 (token (aud (*)) (sub (*)) (tac (*)) (tenant_id (*)))
 
-; --- Shape C: anonymous (no acr, no sub) ---
-; Read-only access only - anonymous requests never get an unrestricted tac.
-; tenant_id is constrained to the literal "default" tenant, unlike shape
-; A/B's tenant_id (*) wildcard: for authenticated requests, the code layer
-; (handleSessionTokenRequest) already rejects a caller-supplied tenant_id
-; that doesn't match their own session's tenant unless the session itself is
-; cross-tenant ("*", admin-level only), so the rule can safely defer to that
-; check. Anonymous requests have no session at all, so nothing upstream
-; stops a caller from requesting tenant_id=* (or any other tenant) - the
-; rule below is the only defense, and must not leave tenant_id unconstrained.
-(token (aud (*)) (tac r) (tenant_id default))
-(token (aud (*)) (tac l) (tenant_id default))
-(token (aud (*)) (tac rl) (tenant_id default))
+; --- Shape C: "anonymous" (acr present, no sub) ---
+; Despite the name, this is not an unauthenticated path: it requires the
+; same valid, already-authenticated session as shape A/B (see
+; handleAnonymousTokenRequest) - "anonymous" only means the issued token
+; omits "sub". tenant_id is a wildcard here
+; too, on exactly the same basis as shape A/B: the code layer already
+; enforces that the requested tenant_id matches the caller's own session
+; tenant (unless the session itself is cross-tenant "*"), so this rule can
+; safely defer to that check. The "default" tenant is not treated specially.
+;
+; Read-only access only - handleAnonymousTokenRequest caps tac to read-only
+; regardless of what the caller's session MaxTAC would otherwise allow, so
+; this rule only ever needs to consider r/l/rl.
+;
+; aud remains a specific enumerated set rather than the (*) wildcard shape
+; A/B use: this is what limits an identity-free token to the specific
+; purposes it's meant for (today: trust evaluation, engine transport) rather
+; than every audience shape A/B could reach.
+;   - wallet-registry: the intended long-term audience for these calls.
+;   - wallet-backend: kept temporarily alongside wallet-registry so that
+;     already-deployed clients requesting the old audience value for these
+;     same calls keep working during the migration. Remove once no client
+;     requests an anonymous wallet-backend token any more (see
+;     TestSPOCPEngine_AnonymousRequestsRejectUnlistedAudience).
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac r) (tenant_id (*)))
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac l) (tenant_id (*)))
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac rl) (tenant_id (*)))

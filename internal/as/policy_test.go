@@ -121,7 +121,9 @@ func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
 	}{
 		{"passkey session, read-only", BuildTokenQuery("user-1", "wallet-backend", "default", TAC("rl"), "urn:siros:acr:passkey")},
 		{"session, no acr, read-only", BuildTokenQuery("user-1", "wallet-backend", "default", TAC("r"), "")},
-		{"anonymous, read-only", BuildTokenQuery("", "wallet-backend", "default", TAC("r"), "")},
+		// "Anonymous" still requires acr - it identifies an already-authenticated
+		// session, just one whose token omits "sub". See handleAnonymousTokenRequest.
+		{"anonymous (identity-free, session-backed), read-only", BuildTokenQuery("", "wallet-backend", "default", TAC("r"), "urn:siros:acr:passkey")},
 	} {
 		allowed, err := pe.Evaluate(q.query)
 		if err != nil {
@@ -133,16 +135,52 @@ func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
 	}
 }
 
-// Regression test for a real Copilot review finding: the shipped anonymous
-// (shape C) rules didn't constrain tenant_id at all, so an anonymous caller
-// could request tenant_id="*" (or any other tenant) and get a read-only
-// token for it - contrary to docs/new-as.md's requirement that cross-tenant
-// ("*") tokens be restricted to admin-level subjects, enforced by policy.
-// Authenticated requests are safe leaving tenant_id unconstrained in the
-// rule (handleSessionTokenRequest rejects a mismatched tenant_id in code,
-// before the query is even built) - anonymous requests have no session, so
-// the rule itself is the only defense and must pin tenant_id to "default".
-func TestSPOCPEngine_AnonymousRequestsCannotEscapeDefaultTenant(t *testing.T) {
+// Regression test for a real Copilot review finding, since superseded by a
+// deeper fix: the shipped anonymous (shape C) rules originally didn't
+// constrain tenant_id at all, and anonymous requests had no session to
+// enforce a tenant match in code either - so an anonymous caller could
+// request tenant_id="*" (or any other tenant) and get a read-only token for
+// it. The actual fix was to stop treating "anonymous" as unauthenticated at
+// all: handleAnonymousTokenRequest now requires the same real session as
+// shape A/B, so tenant scoping can be enforced the exact same way shape A/B
+// already do it - in code (session.TenantID must match, unless the session
+// itself is cross-tenant) - rather than needing the SPOCP rule to pin
+// tenant_id to a literal value. At the policy layer alone, tenant_id is
+// therefore correctly a wildcard for shape C now, exactly like shape A/B;
+// this test documents that and exists mainly to make the "why" traceable
+// for a future reader who might otherwise "fix" the wildcard back to a
+// literal. The actual enforcement is covered at the HTTP-handler level by
+// TestTokenEndpoint_Anonymous_CrossTenantDenied and
+// TestTokenEndpoint_Anonymous_NoSessionDenied.
+func TestSPOCPEngine_AnonymousShapeTenantIDIsWildcardLikeOtherShapes(t *testing.T) {
+	dir := shippedRulesDir(t)
+	pe := NewSPOCPEngine(zap.NewNop())
+	if err := pe.LoadRulesFromDir(dir); err != nil {
+		t.Fatalf("LoadRulesFromDir(%q): %v", dir, err)
+	}
+
+	for _, tenantID := range []string{"default", "some-other-tenant", "*"} {
+		query := BuildTokenQuery("", "wallet-backend", tenantID, TAC("r"), "urn:siros:acr:passkey")
+		allowed, err := pe.Evaluate(query)
+		if err != nil {
+			t.Fatalf("tenant_id=%s: Evaluate: %v", tenantID, err)
+		}
+		if !allowed {
+			t.Errorf("tenant_id=%s: query %q allowed=false, want true (tenant scoping is enforced in code, not by this rule)", tenantID, query)
+		}
+	}
+}
+
+// Regression test for a design gap found alongside the tenant_id fix above:
+// the shipped anonymous (shape C) rules previously left `aud` unconstrained
+// too ((aud (*))), so an anonymous, wholly unauthenticated caller could mint
+// a read-only token for literally any audience just by asking for it - not
+// just the specific purposes anonymous access is meant for (trust
+// evaluation, engine transport). `aud` is now a specific enumerated set
+// (wallet-registry, plus wallet-backend kept temporarily so already-deployed
+// clients requesting the old value keep working during migration - see the
+// comment in rules/default.rules) rather than a wildcard.
+func TestSPOCPEngine_AnonymousRequestsRejectUnlistedAudience(t *testing.T) {
 	dir := shippedRulesDir(t)
 	pe := NewSPOCPEngine(zap.NewNop())
 	if err := pe.LoadRulesFromDir(dir); err != nil {
@@ -151,14 +189,15 @@ func TestSPOCPEngine_AnonymousRequestsCannotEscapeDefaultTenant(t *testing.T) {
 
 	for _, q := range []struct {
 		name     string
-		tenantID string
+		audience string
 		wantOK   bool
 	}{
-		{"default tenant allowed", "default", true},
-		{"cross-tenant wildcard denied", "*", false},
-		{"arbitrary other tenant denied", "some-other-tenant", false},
+		{"wallet-registry allowed (intended long-term audience)", "wallet-registry", true},
+		{"wallet-backend allowed (transitional back-compat)", "wallet-backend", true},
+		{"wallet-engine denied (not a listed anonymous purpose)", "wallet-engine", false},
+		{"arbitrary unlisted audience denied", "some-other-service", false},
 	} {
-		query := BuildTokenQuery("", "wallet-backend", q.tenantID, TAC("r"), "")
+		query := BuildTokenQuery("", q.audience, "default", TAC("r"), "urn:siros:acr:passkey")
 		allowed, err := pe.Evaluate(query)
 		if err != nil {
 			t.Fatalf("%s: Evaluate: %v", q.name, err)
