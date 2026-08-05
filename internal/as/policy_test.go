@@ -133,6 +133,42 @@ func TestSPOCPEngine_LoadsShippedDefaultRules(t *testing.T) {
 	}
 }
 
+// Regression test for a real Copilot review finding: the shipped anonymous
+// (shape C) rules didn't constrain tenant_id at all, so an anonymous caller
+// could request tenant_id="*" (or any other tenant) and get a read-only
+// token for it - contrary to docs/new-as.md's requirement that cross-tenant
+// ("*") tokens be restricted to admin-level subjects, enforced by policy.
+// Authenticated requests are safe leaving tenant_id unconstrained in the
+// rule (handleSessionTokenRequest rejects a mismatched tenant_id in code,
+// before the query is even built) - anonymous requests have no session, so
+// the rule itself is the only defense and must pin tenant_id to "default".
+func TestSPOCPEngine_AnonymousRequestsCannotEscapeDefaultTenant(t *testing.T) {
+	dir := shippedRulesDir(t)
+	pe := NewSPOCPEngine(zap.NewNop())
+	if err := pe.LoadRulesFromDir(dir); err != nil {
+		t.Fatalf("LoadRulesFromDir(%q): %v", dir, err)
+	}
+
+	for _, q := range []struct {
+		name     string
+		tenantID string
+		wantOK   bool
+	}{
+		{"default tenant allowed", "default", true},
+		{"cross-tenant wildcard denied", "*", false},
+		{"arbitrary other tenant denied", "some-other-tenant", false},
+	} {
+		query := BuildTokenQuery("", "wallet-backend", q.tenantID, TAC("r"), "")
+		allowed, err := pe.Evaluate(query)
+		if err != nil {
+			t.Fatalf("%s: Evaluate: %v", q.name, err)
+		}
+		if allowed != q.wantOK {
+			t.Errorf("%s: query %q allowed=%v, want %v", q.name, query, allowed, q.wantOK)
+		}
+	}
+}
+
 // Regression test for a bug where rule files were loaded with go-spocp's
 // canonical (netstring) format, under which a literal "(1:*)" parses as an
 // ordinary empty list tagged "*" rather than a starform.Wildcard - so

@@ -35,6 +35,14 @@
 
 ; --- Shape C: anonymous (no acr, no sub) ---
 ; Read-only access only - anonymous requests never get an unrestricted tac.
-(token (aud (*)) (tac r))
-(token (aud (*)) (tac l))
-(token (aud (*)) (tac rl))
+; tenant_id is constrained to the literal "default" tenant, unlike shape
+; A/B's tenant_id (*) wildcard: for authenticated requests, the code layer
+; (handleSessionTokenRequest) already rejects a caller-supplied tenant_id
+; that doesn't match their own session's tenant unless the session itself is
+; cross-tenant ("*", admin-level only), so the rule can safely defer to that
+; check. Anonymous requests have no session at all, so nothing upstream
+; stops a caller from requesting tenant_id=* (or any other tenant) - the
+; rule below is the only defense, and must not leave tenant_id unconstrained.
+(token (aud (*)) (tac r) (tenant_id default))
+(token (aud (*)) (tac l) (tenant_id default))
+(token (aud (*)) (tac rl) (tenant_id default))
