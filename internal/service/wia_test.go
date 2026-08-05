@@ -286,6 +286,16 @@ func TestWIAService_GenerateWIA_OmitX5C(t *testing.T) {
 		t.Error("x5c header should be omitted when OmitX5C is set")
 	}
 
+	// Regression: without a kid header, a relying party has no self-contained
+	// key material (no x5c, no embedded jwk) and no way to know which of the
+	// wallet provider's published JWKS keys to use for signature
+	// verification (confirmed against a real relying party: SUNET/vc's
+	// pkg/trust JWT verification requires kid to resolve via JWKS). Must
+	// match RegisterWalletProviderJWKSRoute's hardcoded KeyID.
+	if token.Header["kid"] != "wallet-provider" {
+		t.Errorf("kid = %v, want %q (must match RegisterWalletProviderJWKSRoute's KeyID)", token.Header["kid"], "wallet-provider")
+	}
+
 	claims := token.Claims.(jwt.MapClaims)
 	if claims["iss"] != "https://wallet-provider.example" {
 		t.Errorf("iss = %v, want https://wallet-provider.example", claims["iss"])
