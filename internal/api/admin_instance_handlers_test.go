@@ -133,6 +133,83 @@ func TestGetWalletInstance_NotFound(t *testing.T) {
 	}
 }
 
+// TestGetWalletInstance_CrossTenant_NotFound guards against a cross-tenant
+// data access bug: an instance belonging to tenant "other" must not be
+// fetchable via a different tenant's ("acme") path.
+func TestGetWalletInstance_CrossTenant_NotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.GET("/admin/tenants/:id/instances/:instance_id", h.GetWalletInstance)
+
+	seedInstance(t, h, "inst-1", "other", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/acme/instances/inst-1", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-tenant access, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestUpdateWalletInstanceStatus_CrossTenant_NotFound guards against a
+// cross-tenant data access bug: an instance belonging to tenant "other"
+// must not be modifiable via a different tenant's ("acme") path.
+func TestUpdateWalletInstanceStatus_CrossTenant_NotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "inst-1", "other", nil)
+
+	body := `{"status":"suspended","reason":"compliance review"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-tenant access, got %d: %s", w.Code, w.Body.String())
+	}
+
+	inst, err := store.WalletInstances().GetByID(nil, "inst-1")
+	if err != nil {
+		t.Fatalf("get instance: %v", err)
+	}
+	if inst.Status != domain.InstanceStatusActive {
+		t.Errorf("expected status to remain active after rejected cross-tenant update, got %s", inst.Status)
+	}
+}
+
+// TestDeleteWalletInstance_CrossTenant_NotFound guards against a cross-tenant
+// data access bug: an instance belonging to tenant "other" must not be
+// deletable via a different tenant's ("acme") path.
+func TestDeleteWalletInstance_CrossTenant_NotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	seedInstance(t, h, "inst-1", "other", nil)
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/inst-1", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-tenant access, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if _, err := store.WalletInstances().GetByID(nil, "inst-1"); err != nil {
+		t.Errorf("expected instance to still exist after rejected cross-tenant delete, got err: %v", err)
+	}
+}
+
 func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -403,6 +480,11 @@ func TestDeleteWalletInstance_StoreError(t *testing.T) {
 	h := NewAdminHandlers(store, zap.NewNop(), nil, nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	// Seed via the underlying (non-erroring) store so the handler's tenant
+	// ownership check (GetByID, not overridden here) succeeds and the
+	// request reaches the injected Delete error.
+	seedInstance(t, h, "inst-1", "acme", nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/inst-1", nil)
 	w := httptest.NewRecorder()
