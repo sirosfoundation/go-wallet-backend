@@ -116,6 +116,37 @@ func (c *ASConfig) SetDefaults() {
 	}
 }
 
+// EnableForRole turns on the AS (if not already explicitly configured) for
+// deployments that request the "auth" role (including via --mode=all).
+// There is no separate AS-specific key or policy to configure: it reuses the
+// wallet provider's own signing key, since every deployment already
+// configures one for WIA/Key Attestation, and defaults to an "allow all"
+// authorization policy (no RulesDir) rather than requiring one - a role flag
+// alone should be enough to turn AS on, matching how every other role works.
+//
+// A caller-supplied c.AS.Enabled (explicitly set false or true in config)
+// always wins - this only fills in what an unconfigured AS section would
+// otherwise leave empty.
+func (c *Config) EnableForRole() {
+	if c.AS.Enabled {
+		return
+	}
+	c.AS.Enabled = true
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
+		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
+	}
+	if c.AS.RulesDir == "" {
+		// Ships in the image alongside the binary (see Dockerfile) - the
+		// baseline policy (read-only always allowed, own-tenant access for
+		// any tac) every deployment gets unless it configures its own.
+		c.AS.RulesDir = "/app/rules"
+	}
+	c.AS.SetDefaults()
+	if c.AS.Issuer == "" {
+		c.AS.Issuer = c.JWT.Issuer
+	}
+}
+
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
 func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	if ttl, ok := c.AudienceTTLs[audience]; ok {
@@ -337,7 +368,7 @@ func (c *CORSConfig) SetDefaults() {
 	}
 	if len(c.AllowedHeaders) == 0 {
 		c.AllowedHeaders = []string{
-			"Authorization", "Content-Type", "X-Tenant-ID",
+			"Authorization", "Content-Type", "X-Tenant-ID", "X-Token-Mode",
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
@@ -471,26 +502,27 @@ type PKCS11SigningConfig struct {
 }
 
 // AttestationConfig controls attestation lifecycle behavior.
+//
+// Revocation design: this wallet provider deliberately does NOT put
+// `client_status`/`key_storage_status` claims into WIAs or KAs (see
+// signWIA/GenerateKeyAttestation) — instead of a revocation-chaining
+// mechanism, it relies on WIA.LifetimeSeconds being short enough (default 5
+// minutes) that a compromised or revoked wallet instance's outstanding WIA
+// simply expires before it matters. EmptyStatusList still serves a validly
+// shaped, always-empty (all-valid) IETF Token Status List for interop
+// completeness (see RegisterWalletProviderStatusListRoute), but nothing this
+// wallet provider issues ever references it.
 type AttestationConfig struct {
-	// LifetimeSeconds is the global attestation lifetime (WIA + KA).
-	// CS-04 requires < 24h (86400). Default: 3600 (1 hour).
+	// LifetimeSeconds is the WIA lifetime. TS03 v1.5.2 caps this at < 24h
+	// (86400); this wallet provider defaults far below that (300s / 5 min)
+	// specifically so that WIA lifetime — not revocation-list checking — is
+	// the mechanism that bounds exposure from a compromised/revoked wallet
+	// instance. See the type-level comment above.
 	LifetimeSeconds int `yaml:"lifetime_seconds" envconfig:"LIFETIME_SECONDS"`
 
 	// KAExpirySeconds is the key attestation JWT expiry.
 	// Short-lived by default (15s) for single-use credential issuance.
 	KAExpirySeconds int `yaml:"ka_expiry_seconds" envconfig:"KA_EXPIRY_SECONDS"`
-
-	// StatusListMode controls whether attestations include a status_list entry.
-	// Values: "always" (always include), "never" (omit for short-lived),
-	// "auto" (include only if lifetime > threshold). Default: "never".
-	StatusListMode string `yaml:"status_list_mode" envconfig:"STATUS_LIST_MODE"`
-
-	// StatusListURL is the base URL for the Token Status List endpoint.
-	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
-
-	// StatusListExpiry is the lifetime (seconds) of a status list entry.
-	// When > 0, the client_status object includes an "exp" field (Annex C §C.3.2).
-	StatusListExpiry int `yaml:"status_list_expiry" envconfig:"STATUS_LIST_EXPIRY"`
 
 	// NativeAttestation controls platform attestation verification.
 	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
@@ -524,24 +556,69 @@ type NativeAttestationConfig struct {
 	GooglePlayIntegrityVerificationKeyPath string `yaml:"google_play_integrity_verification_key_path" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH"`
 }
 
+// WIA trust-model modes — see WIAConfig.Mode.
+const (
+	WIAModeETSI = "etsi"
+	WIAModeIETF = "ietf"
+)
+
 // WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
 type WIAConfig struct {
 	// Enabled controls whether WIA endpoints are registered
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
-	// Issuer is the optional `iss` claim in WIA JWTs.
-	// Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain).
-	// Some national profiles require an explicit iss for interop.
+	// Issuer is the `iss` claim in WIA JWTs. Required when Mode is "ietf"
+	// (it's the only way a relying party can locate the JWKS to verify the
+	// WIA); unused/omitted when Mode is "etsi".
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+
+	// Mode selects which WIA trust model this wallet provider issues:
+	//
+	//   - "etsi" (default): the EUDI ARF v3.0 / EC TS03 v1.5.2 / ETSI TS 119
+	//     472-3 V1.1.1 model. The WIA always carries the signing certificate
+	//     chain in the `x5c` JOSE header; relying parties verify it against
+	//     the Trusted List for Wallet Providers (ETSI TS 119 472-3
+	//     AUTH-REQ-PROC-4.4.3-01 / TOKEN-REQ-PROC-4.5.2-01). No `iss` or
+	//     `kid` is set — TS03 v1.5 explicitly removed `iss` from the WIA;
+	//     Wallet Provider identity is inferred solely from the x5c signing
+	//     certificate. This is the only mode with a defined trust path under
+	//     the current EUDI/ARF/ETSI specs; use it when interoperating with
+	//     ARF-conformant PID/EAA Providers.
+	//
+	//   - "ietf": the generic IETF draft-ietf-oauth-attestation-based-client-auth
+	//     model, with no ARF/ETSI counterpart. The WIA omits `x5c` and
+	//     instead carries a `kid` header plus the `iss` claim (required);
+	//     relying parties resolve trust via JWKS discovery at
+	//     "<issuer>/.well-known/jwks.json" (see
+	//     RegisterWalletProviderJWKSRoute). Only meaningful for non-EUDI,
+	//     generic-OAuth ecosystems — an ARF-conformant PID/EAA Provider has
+	//     no spec-defined way to resolve trust via this path.
+	//
+	// Note SUNET/vc's parseAttestationIdentity treats x5c as authoritative
+	// and `iss` as a secondary consistency check only when both are present,
+	// so "etsi" mode (no iss) and "ietf" mode (no x5c) are both unambiguous
+	// to that consumer.
+	Mode string `yaml:"mode" envconfig:"MODE"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
-	// WalletName is the wallet_name claim in WIA JWT
+	// WalletName is the wallet_name claim in WIA JWT. REQUIRED by EC TS03
+	// v1.5.2 §2.3.1 when Mode is "etsi" — Validate() enforces this (defaults
+	// to "SIROS ID" so it's populated out of the box).
 	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME"`
-	// WalletVersion is the wallet_version claim
+	// WalletVersion is the wallet_version claim. REQUIRED by EC TS03 v1.5.2
+	// §2.3.1 ("Added `wallet_version` (REQUIRED) to the WIA") when Mode is
+	// "etsi" — Validate() enforces this; there is no sensible built-in
+	// default (it must reflect this deployment's actual released version).
 	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
-	// WalletLink is the wallet download/info URI
+	// WalletLink is the wallet download/info URI. SHOULD per TS03 §2.3.1;
+	// not enforced by Validate().
 	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
-	// CertificationInfo is the wallet_solution_certification_information claim.
-	// Free-form map included as-is in the WIA JWT (Annex C §C.3.2).
+	// CertificationInfo is the wallet_solution_certification_information
+	// claim. Free-form map included as-is in the WIA JWT. SHALL-required by
+	// TS03 §2.3.1 when Mode is "etsi", but TS03 itself notes the
+	// certification scheme is not yet finalized ("the exact content of
+	// wallet_solution_certification_information is undefined") — Validate()
+	// only warns (via the WIA service logger at startup) rather than hard
+	// failing, unlike WalletVersion.
 	CertificationInfo map[string]interface{} `yaml:"certification_info,omitempty"`
 	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
 	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
@@ -1130,6 +1207,7 @@ func defaultConfig() *Config {
 		WalletProvider: WalletProviderConfig{
 			WIA: WIAConfig{
 				Enabled:             true,
+				Mode:                WIAModeETSI,
 				WalletName:          "SIROS ID",
 				MaxExpirySeconds:    86400,
 				ChallengeTTLSeconds: 300,
@@ -1141,9 +1219,11 @@ func defaultConfig() *Config {
 				},
 			},
 			Attestation: AttestationConfig{
-				LifetimeSeconds: 3600,
+				// 5 minutes: short enough that WIA expiry — not revocation-list
+				// checking — bounds exposure from a compromised/revoked wallet
+				// instance. See AttestationConfig's type-level comment.
+				LifetimeSeconds: 300,
 				KAExpirySeconds: 15,
-				StatusListMode:  "never",
 			},
 		},
 	}
@@ -1225,14 +1305,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
 	}
 
-	// Validate StatusListMode if set
-	switch c.WalletProvider.Attestation.StatusListMode {
-	case "", "always", "never", "auto":
-		// valid values
-	default:
-		return fmt.Errorf("invalid wallet_provider.attestation.status_list_mode: %q (must be always, never, or auto)", c.WalletProvider.Attestation.StatusListMode)
-	}
-
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
 	if c.Server.CORS.AllowCredentials {
 		for _, origin := range c.Server.CORS.AllowedOrigins {
@@ -1290,6 +1362,15 @@ func (c *Config) Validate() error {
 
 	// Validate WIA configuration
 	if c.WalletProvider.WIA.Enabled {
+		switch c.WalletProvider.WIA.Mode {
+		case WIAModeETSI, WIAModeIETF:
+		case "":
+			c.WalletProvider.WIA.Mode = WIAModeETSI
+		default:
+			return fmt.Errorf("invalid wallet_provider.wia.mode: %q (must be %q or %q)",
+				c.WalletProvider.WIA.Mode, WIAModeETSI, WIAModeIETF)
+		}
+
 		if c.WalletProvider.WIA.MaxExpirySeconds > 86400 {
 			return fmt.Errorf("wallet_provider.wia.max_expiry_seconds exceeds 24h (86400), CS-04 requires < 24h")
 		}
@@ -1307,10 +1388,42 @@ func (c *Config) Validate() error {
 		// unset. Only require it once WIA is actually operational (signing keys
 		// configured) — not on the zero-config default, where WIA.Enabled is
 		// true but no keys are present and no endpoints get registered.
-		walletProviderKeysConfigured := (c.WalletProvider.PrivateKeyPath != "" && c.WalletProvider.CertificatePath != "") ||
+		// Note: unlike Mode-specific checks below, this doesn't require a
+		// certificate — a signing key alone (file or PKCS#11, with or
+		// without a cert) is enough to make WIA operational in "ietf" mode.
+		walletProviderKeysConfigured := c.WalletProvider.PrivateKeyPath != "" ||
 			(c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != "")
-		if walletProviderKeysConfigured && c.WalletProvider.WIA.WalletProviderURI == "" {
-			return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
+		if walletProviderKeysConfigured {
+			if c.WalletProvider.WIA.WalletProviderURI == "" {
+				return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
+			}
+
+			switch c.WalletProvider.WIA.Mode {
+			case WIAModeIETF:
+				// x5c is never sent in ietf mode, so `iss` + this wallet
+				// provider's own JWKS (RegisterWalletProviderJWKSRoute) is the
+				// only trust path a relying party has — without Issuer, a
+				// WIA would carry no identity at all. No certificate is
+				// required in this mode (JWKS-only trust).
+				if c.WalletProvider.WIA.Issuer == "" {
+					return fmt.Errorf("wallet_provider.wia.issuer is required when wallet_provider.wia.mode is %q", WIAModeIETF)
+				}
+			case WIAModeETSI:
+				// EC TS03 v1.5.2 §2.3.1: wallet_version is REQUIRED. There's
+				// no sensible default (see WIAConfig.WalletVersion), so this
+				// hard-fails rather than silently emitting a non-conformant WIA.
+				if c.WalletProvider.WIA.WalletVersion == "" {
+					return fmt.Errorf("wallet_provider.wia.wallet_version is required when wallet_provider.wia.mode is %q (EC TS03 v1.5.2 requires it)", WIAModeETSI)
+				}
+				if c.WalletProvider.WIA.WalletName == "" {
+					return fmt.Errorf("wallet_provider.wia.wallet_name is required when wallet_provider.wia.mode is %q (EC TS03 v1.5.2 requires it)", WIAModeETSI)
+				}
+				// x5c is mandatory in etsi mode; without a cert the WIA has
+				// no valid trust path under ETSI TS 119 472-3.
+				if c.WalletProvider.CertificatePath == "" {
+					return fmt.Errorf("wallet_provider.certificate_path is required when wallet_provider.wia.mode is %q (WIA identity is x5c-only under ETSI TS 119 472-3)", WIAModeETSI)
+				}
+			}
 		}
 	}
 

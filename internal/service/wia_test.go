@@ -53,7 +53,6 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	logger := zap.NewNop()
@@ -93,7 +92,6 @@ func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletIn
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	logger := zap.NewNop()
@@ -250,6 +248,88 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	jkt, _ := cnf["jkt"].(string)
 	if claims["sub"] != jkt {
 		t.Errorf("sub = %v, want jkt %v (no client_id supplied)", claims["sub"], jkt)
+	}
+}
+
+// "ietf" mode lets a deployment opt into the IETF-draft iss/JWKS identity
+// format instead of ETSI TS 119 472-3's x5c-derived identity - needed when
+// relying parties can't resolve trust via a self-signed x5c chain but can
+// fetch a JWKS from a real iss URL (see RegisterWalletProviderJWKSRoute).
+func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] != nil {
+		t.Error("x5c header should be omitted in ietf mode")
+	}
+	if token.Header["kid"] != "wallet-provider" {
+		t.Errorf("kid = %v, want wallet-provider", token.Header["kid"])
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	if claims["iss"] != "https://wallet-provider.example" {
+		t.Errorf("iss = %v, want https://wallet-provider.example", claims["iss"])
+	}
+}
+
+// TestWIAService_GenerateWIA_ETSIMode is the mirror of the ietf-mode test
+// above: the default ("etsi") mode must always carry x5c and never iss/kid.
+func TestWIAService_GenerateWIA_ETSIMode(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	// Mode left at its zero value ("") — signWIA's mode switch treats that
+	// the same as explicit "etsi" (config.Validate() would normalize it,
+	// but these unit tests construct WIAService directly, bypassing Validate).
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] == nil {
+		t.Error("x5c header should be present in etsi mode")
+	}
+	if token.Header["kid"] != nil {
+		t.Error("kid header should not be present in etsi mode")
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be present in etsi mode, got %v", claims["iss"])
 	}
 }
 
@@ -1055,10 +1135,13 @@ func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestSignWIA_StatusListAlways(t *testing.T) {
+// TestSignWIA_NoClientStatus is a regression test for the no-revocation-
+// chaining design (see AttestationConfig's type-level comment): a WIA must
+// never carry a client_status claim — there is no config knob left that
+// could re-enable it (StatusListMode/StatusListURL/StatusListExpiry were
+// removed).
+func TestSignWIA_NoClientStatus(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://status.example.com/list"
 
 	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
@@ -1072,47 +1155,8 @@ func TestSignWIA_StatusListAlways(t *testing.T) {
 	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
 	claims := token.Claims.(jwt.MapClaims)
 
-	clientStatus, ok := claims["client_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status claim missing when StatusListMode=always")
-	}
-	statusObj, ok := clientStatus["status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status.status missing")
-	}
-	sl, ok := statusObj["status_list"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status.status.status_list missing")
-	}
-	if sl["uri"] != "https://status.example.com/list" {
-		t.Errorf("status_list.uri = %v", sl["uri"])
-	}
-}
-
-func TestSignWIA_StatusListAlwaysWithExpiry(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://status.example.com/list"
-	svc.cfg.WalletProvider.Attestation.StatusListExpiry = 3600
-
-	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
-	pop, _ := createTestPop(t, challenge)
-
-	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
-	if err != nil {
-		t.Fatalf("GenerateWIA: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	clientStatus, ok := claims["client_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status claim missing")
-	}
-	if _, ok := clientStatus["exp"]; !ok {
-		t.Error("client_status.exp should be present when StatusListExpiry > 0")
+	if _, ok := claims["client_status"]; ok {
+		t.Error("client_status should never be present (no revocation-chaining support)")
 	}
 }
 

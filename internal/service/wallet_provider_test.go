@@ -42,7 +42,6 @@ func newTestWalletProviderService(t *testing.T) *WalletProviderService {
 	cfg.Server.BaseURL = "https://wp.example.com"
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		KAExpirySeconds: 15,
-		StatusListMode:  "never",
 	}
 
 	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
@@ -383,11 +382,11 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
 	claims := token.Claims.(jwt.MapClaims)
 
-	if claims["iss"] != "https://wp.example.com" {
-		t.Errorf("iss = %v, want https://wp.example.com", claims["iss"])
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be present on a KA (EC TS03 v1.5.2 removed it), got %v", claims["iss"])
 	}
-	if claims["nonce"] != "my-nonce" {
-		t.Errorf("nonce = %v, want my-nonce", claims["nonce"])
+	if claims["c_nonce"] != "my-nonce" {
+		t.Errorf("c_nonce = %v, want my-nonce", claims["c_nonce"])
 	}
 
 	if token.Header["typ"] != "keyattestation+jwt" {
@@ -415,48 +414,12 @@ func TestGenerateKeyAttestation_NotSupported(t *testing.T) {
 	}
 }
 
-func TestGenerateKeyAttestation_KeyStorageStatus(t *testing.T) {
+// TestGenerateKeyAttestation_NoRevocationClaims is a regression test for the
+// no-revocation-chaining design (see AttestationConfig's type-level comment):
+// a KA must never carry key_storage_status or iss, regardless of config —
+// there is no config knob left that could re-enable them.
+func TestGenerateKeyAttestation_NoRevocationClaims(t *testing.T) {
 	svc := newTestWalletProviderService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://wp.example.com/ka-statuslists/7"
-	svc.cfg.WalletProvider.Attestation.StatusListExpiry = 2678400 // 31 days
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
-	if err != nil {
-		t.Fatalf("GenerateKeyAttestation: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	ksStatus, ok := claims["key_storage_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status claim missing")
-	}
-	statusObj, ok := ksStatus["status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status.status missing")
-	}
-	sl, ok := statusObj["status_list"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status.status.status_list missing")
-	}
-	if sl["uri"] != "https://wp.example.com/ka-statuslists/7" {
-		t.Errorf("uri = %v", sl["uri"])
-	}
-	if _, ok := ksStatus["exp"]; !ok {
-		t.Error("key_storage_status.exp missing when StatusListExpiry > 0")
-	}
-}
-
-func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
-	svc := newTestWalletProviderService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "never"
 
 	jwks := []map[string]interface{}{
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
@@ -472,7 +435,13 @@ func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
 	claims := token.Claims.(jwt.MapClaims)
 
 	if _, ok := claims["key_storage_status"]; ok {
-		t.Error("key_storage_status should not be present when StatusListMode=never")
+		t.Error("key_storage_status should never be present (no revocation-chaining support)")
+	}
+	if _, ok := claims["iss"]; ok {
+		t.Error("iss should never be present on a KA (EC TS03 v1.5.2 removed it; identity is x5c-only)")
+	}
+	if claims["c_nonce"] != "nonce" {
+		t.Errorf("c_nonce = %v, want %q (TS03 §2.3.2 requires c_nonce, not nonce)", claims["c_nonce"], "nonce")
 	}
 }
 
@@ -752,32 +721,5 @@ func TestNewWalletProviderService_NoKeys(t *testing.T) {
 	svc := NewWalletProviderService(cfg, zap.NewNop(), nil)
 	if svc.IsSupported() {
 		t.Error("service should not be supported without keys")
-	}
-}
-
-// TestRandomStatusIndexSeed_NotZeroAndVaries is a regression test: the seed
-// used to initialize statusIndexCounter must be randomized per process, not a
-// constant zero. Without this, every replica in a horizontally-scaled
-// deployment (and every restart of the same replica) would hand out colliding
-// status_list indices once wallet_provider.attestation.status_list_mode is "always".
-func TestRandomStatusIndexSeed_NotZeroAndVaries(t *testing.T) {
-	a := randomStatusIndexSeed()
-	b := randomStatusIndexSeed()
-
-	// Probability of either being exactly 0, or the two colliding, is 2^-64 —
-	// this is a meaningful regression check, not a flaky test.
-	if a == 0 {
-		t.Error("randomStatusIndexSeed returned 0 — counter would start unseeded")
-	}
-	if a == b {
-		t.Error("randomStatusIndexSeed returned the same value twice — not actually randomized")
-	}
-}
-
-// TestStatusIndexCounter_SeededAtInit verifies the package-level counter itself
-// was actually initialized from randomStatusIndexSeed (not left at its zero value).
-func TestStatusIndexCounter_SeededAtInit(t *testing.T) {
-	if statusIndexCounter.Load() == 0 {
-		t.Error("statusIndexCounter was not seeded at init — starts at 0, which will collide across replicas/restarts")
 	}
 }

@@ -41,16 +41,19 @@ func LoadKeyMaterial(cfg *KeyConfig) (*KeyMaterial, error) {
 }
 
 func loadFromPKCS11(cfg *KeyConfig) (*KeyMaterial, error) {
-	if cfg.CertificatePath == "" {
-		return nil, errors.New("certificate_path is required for PKCS#11 mode (x5c chain)")
-	}
-
 	signer, err := NewPKCS11Signer(cfg.PKCS11)
 	if err != nil {
 		return nil, fmt.Errorf("pkcs11 signer: %w", err)
 	}
 
-	// Certificate chain still comes from file
+	// CertificatePath is optional: a signer alone is enough for "ietf"-mode
+	// WIA issuance (JWKS-based trust, no x5c). Callers that need x5c (KA
+	// generation, "etsi"-mode WIA) must configure a certificate and enforce
+	// that themselves — this loader doesn't know which mode a caller wants.
+	if cfg.CertificatePath == "" {
+		return &KeyMaterial{Signer: signer}, nil
+	}
+
 	chain, err := loadCertChain(cfg.CertificatePath, cfg.CACertPath)
 	if err != nil {
 		_ = signer.Close()
@@ -61,8 +64,8 @@ func loadFromPKCS11(cfg *KeyConfig) (*KeyMaterial, error) {
 }
 
 func loadFromFile(cfg *KeyConfig) (*KeyMaterial, error) {
-	if cfg.PrivateKeyPath == "" || cfg.CertificatePath == "" {
-		return nil, errors.New("private_key_path and certificate_path are required")
+	if cfg.PrivateKeyPath == "" {
+		return nil, errors.New("private_key_path is required")
 	}
 
 	keyPEM, err := os.ReadFile(cfg.PrivateKeyPath)
@@ -92,9 +95,13 @@ func loadFromFile(cfg *KeyConfig) (*KeyMaterial, error) {
 		}
 	}
 
-	chain, err := loadCertChain(cfg.CertificatePath, cfg.CACertPath)
-	if err != nil {
-		return nil, err
+	// CertificatePath is optional — see the matching comment in loadFromPKCS11.
+	var chain []string
+	if cfg.CertificatePath != "" {
+		chain, err = loadCertChain(cfg.CertificatePath, cfg.CACertPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &KeyMaterial{Signer: key, CertChain: chain}, nil

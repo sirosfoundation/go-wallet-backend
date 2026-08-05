@@ -519,6 +519,16 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		p.asModule.RegisterRoutes(authGroup)
 	}
 
+	// Register the wallet provider's own JWKS (distinct from the AS's),
+	// for relying parties resolving trust via an iss-based WIA. No-ops if
+	// WIA/the wallet provider signing key isn't configured.
+	service.RegisterWalletProviderJWKSRoute(router, p.Services().WalletProvider)
+
+	// Register an always-empty status list for interop completeness only —
+	// see RegisterWalletProviderStatusListRoute's doc comment. No WIA/KA
+	// this wallet provider issues references it.
+	service.RegisterWalletProviderStatusListRoute(router, p.Services().WalletProvider)
+
 	// Register AuthZEN proxy routes if enabled
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
@@ -825,7 +835,12 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	}
 
 	services := service.NewServices(store, cfg, logger)
-	if services.WalletProvider == nil || !services.WalletProvider.IsSupported() {
+	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
+	// standalone deployment when only "ietf"-mode WIA is needed. Key
+	// Attestation generation (registered unconditionally below) still
+	// individually gates on IsSupported() and fails gracefully per-request
+	// if no certificate is configured.
+	if services.WalletProvider == nil || !services.WalletProvider.HasSigningKey() {
 		return nil, fmt.Errorf("wallet-provider signing keys not configured or not supported")
 	}
 	services.Start()

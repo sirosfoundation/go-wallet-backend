@@ -1701,11 +1701,76 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	cfg.WalletProvider.WIA.Enabled = true
 	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
 	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
 	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
 	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresWalletVersion(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	// WalletVersion deliberately left empty.
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wallet_version is required") {
+		t.Errorf("expected wallet_version error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresCertificate(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// CertificatePath deliberately left empty — etsi mode requires x5c.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "certificate_path is required") {
+		t.Errorf("expected certificate_path error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_IETFModeRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = WIAModeIETF
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// No CertificatePath, no Issuer.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wia.issuer is required") {
+		t.Errorf("expected issuer error, got %v", err)
+	}
+
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error once issuer is set: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_InvalidMode(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = "bogus"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid wallet_provider.wia.mode") {
+		t.Errorf("expected invalid mode error, got %v", err)
 	}
 }
 

@@ -43,9 +43,13 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances())
 
-	// WIA shares the same signing key as the wallet provider
+	// WIA shares the same signing key as the wallet provider. Uses
+	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
+	// signing key, not a certificate — IsSupported additionally requires a
+	// certificate chain, which is only mandatory for Key Attestation and
+	// "etsi"-mode WIA.
 	var wiaSvc *WIAService
-	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
+	if cfg.WalletProvider.WIA.Enabled && wpSvc.HasSigningKey() {
 		var challengeStore WIAChallengeStore
 		// Use MongoDB-backed challenge store if the underlying storage is MongoDB.
 		type databaseProvider interface {

@@ -187,7 +187,6 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	logger := zap.NewNop()
