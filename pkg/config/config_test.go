@@ -1414,6 +1414,78 @@ func TestConfig_EnableForRole_ExplicitRulesDirPreserved(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_RespectsExplicitFalseInYAML(t *testing.T) {
+	// Regression test: EnableForRole must not override an operator's
+	// explicit `as.enabled: false` - a plain bool can't distinguish that
+	// from "as section never configured" (both are the zero value), which
+	// is why this goes through Load() (the only path that can observe the
+	// raw YAML) rather than constructing a Config{} directly.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if cfg.AS.Enabled {
+		t.Error("expected explicit as.enabled: false in YAML to be preserved, but EnableForRole() overrode it to true")
+	}
+}
+
+func TestConfig_EnableForRole_FillsInWhenYAMLOmitsASEntirely(t *testing.T) {
+	// Contrast with the test above: when the `as:` section is absent
+	// entirely (not just enabled: false), EnableForRole should still turn
+	// it on for the auth role.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  private_key_path: /wp/key.pem
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true when as: section is absent entirely")
+	}
+}
+
 func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true

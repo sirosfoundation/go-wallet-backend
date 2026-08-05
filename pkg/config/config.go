@@ -31,6 +31,14 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+
+	// asEnabledExplicit records whether as.enabled was explicitly present in
+	// the YAML file or environment (as opposed to defaulting to its bool
+	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
+	// can tell "operator explicitly disabled AS" apart from "AS section
+	// never configured". Unexported: never (un)marshaled, so it can't leak
+	// into YAML output or be set by config files/env itself.
+	asEnabledExplicit bool
 }
 
 // ASConfig contains the new Authorization Server configuration.
@@ -128,9 +136,13 @@ func (c *ASConfig) SetDefaults() {
 //
 // A caller-supplied c.AS.Enabled (explicitly set false or true in config)
 // always wins - this only fills in what an unconfigured AS section would
-// otherwise leave empty.
+// otherwise leave empty. Relies on Config.asEnabledExplicit (set by Load())
+// rather than c.AS.Enabled itself, since a plain bool can't distinguish
+// "explicitly set to false" from "never configured" (both are the zero
+// value) - without that, an operator's explicit as.enabled: false would be
+// silently overridden to true here.
 func (c *Config) EnableForRole() {
-	if c.AS.Enabled {
+	if c.asEnabledExplicit {
 		return
 	}
 	c.AS.Enabled = true
@@ -976,11 +988,15 @@ func Load(configFile string) (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
+			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 		}
 	}
 
 	// Override with environment variables (highest priority)
 	// Since we removed `default:` tags, this only applies actual env vars
+	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
+		cfg.asEnabledExplicit = true
+	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
@@ -1004,6 +1020,23 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
+// `as.enabled` key, regardless of its value - used to distinguish "operator
+// explicitly configured as.enabled" from "AS section absent/defaulted",
+// which a plain bool field can't express on its own (see EnableForRole).
+func yamlHasASEnabledKey(data []byte) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	as, ok := raw["as"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = as["enabled"]
+	return ok
 }
 
 // loadSecretsFromFiles loads secrets from file paths.

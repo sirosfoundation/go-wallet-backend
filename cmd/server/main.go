@@ -51,6 +51,14 @@ func main() {
 		}
 		if roles.Has(modes.RoleAuth) {
 			backendCfg.EnableForRole()
+			// EnableForRole mutates the already-validated config (e.g.
+			// falling back to WalletProvider's signing key for AS), so
+			// re-validate rather than let an invalid resulting state (say,
+			// AS enabled with no signing key anywhere) surface later as a
+			// less actionable failure during provider init.
+			if err := backendCfg.Validate(); err != nil {
+				log.Fatalf("Invalid backend configuration after enabling AS for role: %v", err)
+			}
 		}
 	}
 
