@@ -134,6 +134,10 @@ func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) (*TypeMet
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied vct URL is inherent to this fallback lookup.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch VCT: %w", err)

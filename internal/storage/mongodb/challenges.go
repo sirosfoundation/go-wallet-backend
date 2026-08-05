@@ -129,6 +129,11 @@ func (s *IssuerStore) GetByID(ctx context.Context, tenantID domain.TenantID, id 
 
 func (s *IssuerStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, identifier string) (*domain.CredentialIssuer, error) {
 	var issuer domain.CredentialIssuer
+	// codeql[go/sql-injection]: tenantID and identifier are used only as
+	// plain string VALUES under hardcoded keys in this bson.M filter. The
+	// official mongo-driver only treats "$"-prefixed KEYS as operators;
+	// a string value can never be reinterpreted as one, so this is not
+	// exploitable NoSQL injection regardless of the string's contents.
 	err := s.collection.FindOne(ctx, bson.M{"tenant_id": string(tenantID), "credential_issuer_identifier": identifier}).Decode(&issuer)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
@@ -286,6 +291,11 @@ func (s *VerifierStore) GetByClientID(ctx context.Context, tenantID domain.Tenan
 
 func (s *VerifierStore) GetByURL(ctx context.Context, tenantID domain.TenantID, url string) (*domain.Verifier, error) {
 	var verifier domain.Verifier
+	// codeql[go/sql-injection]: tenantID and url are used only as plain
+	// string VALUES under hardcoded keys in this bson.M filter. The
+	// official mongo-driver only treats "$"-prefixed KEYS as operators;
+	// a string value can never be reinterpreted as one, so this is not
+	// exploitable NoSQL injection regardless of the string's contents.
 	err := s.collection.FindOne(ctx, bson.M{"tenant_id": string(tenantID), "url": url}).Decode(&verifier)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {

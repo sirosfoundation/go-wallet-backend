@@ -861,6 +861,10 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 		return nil, err
 	}
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied credential_offer_uri is inherent to OID4VCI §4.1.2.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch offer: %w", err)

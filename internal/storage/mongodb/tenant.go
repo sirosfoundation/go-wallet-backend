@@ -165,6 +165,11 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 }
 
 func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+	// codeql[go/sql-injection]: userID and tenantID are used only as plain
+	// string VALUES under hardcoded keys in this bson.M filter. The
+	// official mongo-driver only treats "$"-prefixed KEYS as operators;
+	// a string value can never be reinterpreted as one, so this is not
+	// exploitable NoSQL injection regardless of the string's contents.
 	count, err := s.collection.CountDocuments(ctx, bson.M{
 		"user_id":   userID.String(),
 		"tenant_id": string(tenantID),

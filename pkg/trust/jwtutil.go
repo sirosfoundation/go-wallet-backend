@@ -484,6 +484,10 @@ func FetchJWKS(ctx context.Context, uri string, client *http.Client) (interface{
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// codeql[go/request-forgery]: FetchJWKS is a shared utility; every
+	// in-repo caller passes a client built via cfg.HTTPClient.NewHTTPClient(),
+	// whose DialContext blocks private/loopback/link-local IPs by default
+	// (SSRF protection). Callers must continue to pass a guarded client.
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
