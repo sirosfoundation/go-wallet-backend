@@ -138,9 +138,17 @@ func (c *ASConfig) SetDefaults() {
 // above - relies on Config.asEnabledExplicit (set by Load()) rather than
 // c.AS.Enabled itself, since a plain bool can't distinguish "explicitly set
 // to false" from "never configured" (both are the zero value). An explicit
-// as.enabled: true does NOT skip defaulting - it's treated the same as
-// "unconfigured" for the fields below, so `as: {enabled: true}` alone
-// (without also configuring signing_key_path/rules_dir) still works.
+// as.enabled: true does NOT skip defaulting here - it's treated the same as
+// "unconfigured" by this function's own logic.
+//
+// That said, `as: {enabled: true}` alone in a YAML file does NOT actually
+// work end-to-end via the normal startup path: Load() calls Validate()
+// before cmd/server/main.go ever calls EnableForRole(), and Validate()
+// unconditionally requires signing_key_path/rules_dir whenever AS.Enabled is
+// true - so Load() itself rejects that YAML before this function gets a
+// chance to fill in the defaults. This function's explicit-true handling
+// only matters for callers that construct/mutate a Config without going
+// through Load()'s validation first.
 func (c *Config) EnableForRole() {
 	if c.asEnabledExplicit && !c.AS.Enabled {
 		return
