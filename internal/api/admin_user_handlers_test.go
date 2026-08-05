@@ -17,7 +17,7 @@ import (
 func TestGetUserDetail_TenantNotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop())
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/detail", h.GetUserDetail)
 
@@ -33,7 +33,7 @@ func TestGetUserDetail_TenantNotFound(t *testing.T) {
 func TestGetUserDetail_NotMember(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop())
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/detail", h.GetUserDetail)
 
@@ -55,7 +55,7 @@ func TestGetUserDetail_NotMember(t *testing.T) {
 func TestGetUserDetail_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop())
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users/:user_id/detail", h.GetUserDetail)
 
@@ -108,7 +108,7 @@ func TestGetUserDetail_Success(t *testing.T) {
 func TestGetTenantStats_NotImplemented(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
-	h := NewAdminHandlers(store, zap.NewNop())
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/stats", h.GetTenantStats)
 
