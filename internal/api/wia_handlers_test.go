@@ -48,7 +48,6 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	store := memory.NewStore()

@@ -1530,6 +1530,8 @@ jwt:
   secret: test-secret-that-is-at-least-32-bytes-long
 wallet_provider:
   private_key_path: /wp/key.pem
+  wia:
+    enabled: false
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -1905,6 +1907,8 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	cfg.WalletProvider.WIA.Enabled = true
 	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
 	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
 	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
 	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
 
@@ -1913,43 +1917,66 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	}
 }
 
-// TestConfig_Validate_WIA_OmitX5CRequiresIssuer is a regression test: when
-// OmitX5C is set, the iss claim (not the x5c chain) is the only way a
-// relying party can identify the wallet provider and resolve its JWKS.
-// Without this check, an operator could enable OmitX5C without setting
-// Issuer and get a WIA with neither x5c nor a usable iss - an attestation
-// nobody can resolve trust for.
-func TestConfig_Validate_WIA_OmitX5CRequiresIssuer(t *testing.T) {
+func TestConfig_Validate_WIA_ETSIModeRequiresWalletVersion(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.WalletProvider.WIA.Enabled = true
 	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
 	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
-	cfg.WalletProvider.WIA.OmitX5C = true
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	// WalletVersion deliberately left empty.
 	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
 	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
-	// Issuer intentionally left unset.
 
 	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error when omit_x5c is set without issuer")
-	}
-	if !strings.Contains(err.Error(), "wallet_provider.wia.issuer is required") {
-		t.Errorf("unexpected error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "wallet_version is required") {
+		t.Errorf("expected wallet_version error, got %v", err)
 	}
 }
 
-func TestConfig_Validate_WIA_OmitX5CPassesWithIssuer(t *testing.T) {
+func TestConfig_Validate_WIA_ETSIModeRequiresCertificate(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.WalletProvider.WIA.Enabled = true
 	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
 	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
-	cfg.WalletProvider.WIA.OmitX5C = true
-	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
 	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
-	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// CertificatePath deliberately left empty — etsi mode requires x5c.
 
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "certificate_path is required") {
+		t.Errorf("expected certificate_path error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_IETFModeRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = WIAModeIETF
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// No CertificatePath, no Issuer.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wia.issuer is required") {
+		t.Errorf("expected issuer error, got %v", err)
+	}
+
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("unexpected error once issuer is set: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_InvalidMode(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = "bogus"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid wallet_provider.wia.mode") {
+		t.Errorf("expected invalid mode error, got %v", err)
 	}
 }
 

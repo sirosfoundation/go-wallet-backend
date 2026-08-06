@@ -195,9 +195,18 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 	return svc
 }
 
-// IsSupported returns true if WIA generation is available.
+// IsSupported returns true if WIA generation is available. Unlike
+// WalletProviderService.IsSupported (which gates Key Attestation and always
+// requires a certificate), a certificate is only required here in "etsi"
+// mode — "ietf" mode issues JWKS-trust WIAs from a signing key alone.
 func (s *WIAService) IsSupported() bool {
-	return s.jwtSigner != nil && len(s.certChain) > 0
+	if s.jwtSigner == nil {
+		return false
+	}
+	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF {
+		return true
+	}
+	return len(s.certChain) > 0
 }
 
 // maxChallenges is the maximum number of concurrent pending challenges,
@@ -451,7 +460,11 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
 	now := time.Now()
 
-	// Use global attestation lifetime, capped by WIA max expiry
+	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
+	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
+	// client_status/revocation-chaining mechanism (see below); a short
+	// lifetime is the actual mechanism bounding exposure from a
+	// compromised/revoked wallet instance.
 	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
 	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
 	if maxExpiry <= 0 {
@@ -484,11 +497,22 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		},
 		"iat": now.Unix(),
 		"exp": now.Add(lifetime).Unix(),
-		// attestation_source: SIROS extension (WP4 CS-05 Annex C).
-		// Indicates the attestation tier:
-		//   "backend_attested"         — Tier 3: server-side attestation only
-		//   "ios_app_attest"           — Tier 4/5: Apple App Attest verified
-		//   "android_play_integrity"   — Tier 4/5: Google Play Integrity verified
+		// attestation_source: a SIROS extension claim — neither EC TS03 nor
+		// ETSI TS 119 472-3 define a WIA claim for this. Its values are
+		// chosen to mirror the S1/S3 "WIA dimension" tiers from WE BUILD
+		// wp4-architecture PR #229 ("cs-04: Add Annex C — Tiered WUA for
+		// cross-platform Wallet Solutions", open as of 2026-08, branch
+		// cs-04/annex-c-tiered-attestation) — NOT "WP4 CS-05" (Business
+		// Wallet, unrelated); Annex C is a proposed addition to CS-04.
+		// Annex C's own note is explicit that TS-03/CS-04 don't define this
+		// claim: any such signal "may [be conveyed] via the certification
+		// information or via an extension claim, but this is outside the
+		// scope of TS-03 and CS-04" — this claim is that extension.
+		//   "backend_attested"         — Annex C tier S3: backend-only attestation
+		//   "ios_app_attest"           — Annex C tier S1: full client attestation (Apple App Attest)
+		//   "android_play_integrity"   — Annex C tier S1: full client attestation (Google Play Integrity)
+		// Annex C's tier S2 (partial client attestation, e.g. a browser
+		// extension/companion) has no corresponding value yet.
 		// Third-party wallet providers may omit this claim; issuers must handle
 		// both present and absent cases (absent = unknown tier).
 		"attestation_source": attestationSource,
@@ -509,57 +533,45 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
 	}
 
-	// Client status (WIA revocation via Token Status List, Annex C §C.3.2)
-	switch s.cfg.WalletProvider.Attestation.StatusListMode {
-	case "always":
-		clientStatus := map[string]interface{}{
-			"status": map[string]interface{}{
-				"status_list": map[string]interface{}{
-					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": statusIndexCounter.Add(1),
-				},
-			},
-		}
-		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
-			clientStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
-		}
-		claims["client_status"] = clientStatus
-	case "never":
-		// Omit status list for short-lived attestations
-	default:
-		// "auto" or unset: omit (same as "never" for now)
-	}
+	// No `client_status`: this wallet provider does not implement WIA
+	// revocation-chaining. See AttestationConfig's type-level comment for
+	// the design rationale (short WIA lifetime instead).
 
-	// iss claim: identifies the wallet provider.
-	// Per TS03 §2.2.1, identity is derived from the x5c chain. However, the IETF
-	// draft-ietf-oauth-attestation-based-client-auth §3.1 specifies iss as the
-	// wallet provider identifier. We include both: x5c for EU/EUDI compliance,
-	// iss for efficient PDP routing and non-EU interop.
-	// Falls back to WalletProviderURI if Issuer not explicitly configured.
-	issuer := s.cfg.WalletProvider.WIA.Issuer
-	if issuer == "" {
-		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
-	}
-	if issuer != "" {
-		claims["iss"] = issuer
+	// iss: only set in "ietf" mode, where it's the only way a relying party
+	// locates the JWKS needed to verify the WIA (see the header switch
+	// below). config.Validate() enforces Issuer being set whenever Mode is
+	// "ietf" and signing keys are configured, so no WalletProviderURI
+	// fallback here - WalletProviderService.Issuer() (used by
+	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata) computes the
+	// same value the same way, so both stay consistent with what Validate()
+	// actually requires.
+	//
+	// In "etsi" mode, no iss is set at all: EC TS03 v1.5.2 removed `iss`
+	// from the WIA entirely — Wallet Provider identity is inferred solely
+	// from the x5c signing certificate, verified against the Trusted List
+	// for Wallet Providers (ETSI TS 119 472-3 AUTH-REQ-PROC-4.4.3-01 /
+	// TOKEN-REQ-PROC-4.5.2-01).
+	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF && s.cfg.WalletProvider.WIA.Issuer != "" {
+		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
-	if !s.cfg.WalletProvider.WIA.OmitX5C {
-		token.Header["x5c"] = s.certChain
-	} else {
-		// No x5c means no embedded key material - relying parties must
-		// resolve the wallet provider's signing key from its own JWKS
-		// (RegisterWalletProviderJWKSRoute, served at the WIA's own iss
-		// URL). That resolution is kid-keyed (standard practice for
-		// multi-key JWKS, and what existing JWT trust-verification code
-		// elsewhere already expects), so the WIA itself must carry a kid
-		// header matching the JWKS entry's KeyID ("wallet-provider",
-		// hardcoded there since this deployment publishes exactly one
-		// signing key) - without it, a relying party has no way to know
-		// which of the issuer's published keys to use.
+
+	switch s.cfg.WalletProvider.WIA.Mode {
+	case config.WIAModeIETF:
+		// No x5c: relying parties resolve the wallet provider's signing key
+		// from its own JWKS (RegisterWalletProviderJWKSRoute, served at the
+		// WIA's own iss URL). That resolution is kid-keyed (standard
+		// practice for multi-key JWKS, and what existing JWT
+		// trust-verification code elsewhere already expects), so the WIA
+		// itself must carry a kid header matching the JWKS entry's KeyID
+		// ("wallet-provider", hardcoded there since this deployment
+		// publishes exactly one signing key) - without it, a relying party
+		// has no way to know which of the issuer's published keys to use.
 		token.Header["kid"] = "wallet-provider"
+	default: // config.WIAModeETSI
+		token.Header["x5c"] = s.certChain
 	}
 
 	tokenString, err := s.jwtSigner.SignToken(token)

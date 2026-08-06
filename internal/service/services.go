@@ -43,9 +43,13 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances())
 
-	// WIA shares the same signing key as the wallet provider
+	// WIA shares the same signing key as the wallet provider. Uses
+	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
+	// signing key, not a certificate — IsSupported additionally requires a
+	// certificate chain, which is only mandatory for Key Attestation and
+	// "etsi"-mode WIA.
 	var wiaSvc *WIAService
-	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
+	if cfg.WalletProvider.WIA.Enabled && wpSvc.HasSigningKey() {
 		var challengeStore WIAChallengeStore
 		// Use MongoDB-backed challenge store if the underlying storage is MongoDB.
 		type databaseProvider interface {
@@ -63,6 +67,16 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
 		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		// A signing key alone is enough to construct WIAService, but "etsi"
+		// mode additionally requires a certificate chain (see IsSupported).
+		// Leaving wiaSvc non-nil here would register the WIA routes, but
+		// every actual call would fail with ErrWIANotSupported, which the
+		// handlers map to a generic 500 rather than the clean 503
+		// WIA_NOT_SUPPORTED they already return for services.WIA == nil -
+		// nil it out here so that existing check covers this case too.
+		if !wiaSvc.IsSupported() {
+			wiaSvc = nil
+		}
 	}
 
 	return &Services{

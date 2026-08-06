@@ -442,7 +442,7 @@ func TestBackendProvider_RegisterRoutes_WithoutAuthZENHandler(t *testing.T) {
 // TestBackendProvider_RegisterRoutes_RegistersJWKS is a regression test:
 // co-hosted (BackendProvider) mode must expose /.well-known/jwks.json when a
 // wallet-provider signing key is configured, so relying parties resolving
-// trust via an iss-based WIA (WalletProvider.WIA.OmitX5C) can fetch it.
+// trust via an iss-based WIA (WalletProvider.WIA.Mode == config.WIAModeIETF) can fetch it.
 func TestBackendProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
 	dir := t.TempDir()
 	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
@@ -880,7 +880,7 @@ func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) 
 // test: standalone wallet-provider mode (RoleWalletProvider without
 // RoleBackend) must expose the same /.well-known/jwks.json as the co-hosted
 // BackendProvider does, or relying parties resolving trust via an iss-based
-// WIA (WalletProvider.WIA.OmitX5C) have nowhere to fetch the key when this
+// WIA (WalletProvider.WIA.Mode == config.WIAModeIETF) have nowhere to fetch the key when this
 // role runs as its own standalone microservice.
 func TestWalletProviderProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
 	dir := t.TempDir()

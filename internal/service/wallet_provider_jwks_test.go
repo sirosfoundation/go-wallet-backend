@@ -51,6 +51,7 @@ func TestRegisterWalletProviderJWKSRoute_Success(t *testing.T) {
 
 func TestRegisterWalletProviderJWKSRoute_OAuthMetadata(t *testing.T) {
 	svc := newTestWalletProviderService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
 	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
 
 	gin.SetMode(gin.TestMode)
@@ -91,6 +92,7 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_TrailingSlashIssuer(t *te
 	// (e.g. vc's JWKSKeyResolver) match it exactly against the WIA's own iss
 	// claim, which also uses the untrimmed configured value.
 	svc := newTestWalletProviderService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
 	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com/"
 
 	gin.SetMode(gin.TestMode)
@@ -120,9 +122,18 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_TrailingSlashIssuer(t *te
 	}
 }
 
-func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_FallsBackToWalletProviderURI(t *testing.T) {
+// TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoFallbackToWalletProviderURI
+// is a regression test: WalletProviderURI is a different identifier for a
+// different purpose (the WIA-PoP's expected aud, not this wallet provider's
+// own issuer identity - see docs/wallet-instance-attestation.md), and
+// config.Validate() requires WIA.Issuer to be explicitly set whenever Mode
+// is "ietf". Issuer() must not silently substitute WalletProviderURI when
+// Issuer itself is unset (e.g. because a caller bypassed Validate()).
+func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoFallbackToWalletProviderURI(t *testing.T) {
 	svc := newTestWalletProviderService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
 	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://fallback.example.com"
+	// WIA.Issuer intentionally left unset.
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -132,18 +143,8 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_FallsBackToWalletProvider
 	req, _ := http.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-
-	var meta struct {
-		Issuer string `json:"issuer"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &meta); err != nil {
-		t.Fatalf("unmarshal metadata: %v", err)
-	}
-	if meta.Issuer != "https://fallback.example.com" {
-		t.Errorf("issuer = %q, want %q", meta.Issuer, "https://fallback.example.com")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (route must not be registered without an explicit issuer)", w.Code, http.StatusNotFound)
 	}
 }
 
@@ -164,11 +165,58 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoOpWhenNoIssuerConfigure
 	}
 }
 
+// TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoOpInETSIMode is a
+// regression test for a review finding: publishing RFC 8414 metadata
+// whenever an issuer happened to be configured, regardless of WIA.Mode,
+// would advertise a jwks_uri-based discovery path even in "etsi" mode, where
+// the WIA has no iss at all (identity is x5c-only). The metadata route must
+// stay unregistered unless Mode is explicitly "ietf".
+func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoOpInETSIMode(t *testing.T) {
+	for _, mode := range []string{"", config.WIAModeETSI} {
+		svc := newTestWalletProviderService(t)
+		svc.cfg.WalletProvider.WIA.Mode = mode
+		svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
+
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		RegisterWalletProviderJWKSRoute(r, svc)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("mode=%q: status = %d, want %d (route must not be registered outside ietf mode)", mode, w.Code, http.StatusNotFound)
+		}
+	}
+}
+
 func TestRegisterWalletProviderJWKSRoute_NoOpWhenNoSigningKey(t *testing.T) {
 	svc := &WalletProviderService{
 		cfg: &config.Config{},
 		// No signer configured.
 	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterWalletProviderJWKSRoute(r, svc)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (route should not be registered)", w.Code, http.StatusNotFound)
+	}
+}
+
+// TestRegisterWalletProviderJWKSRoute_NoOpWhenNilConfig is a regression test:
+// a WalletProviderService with a real signer but nil cfg (e.g. constructed
+// directly, bypassing NewWalletProviderService) must no-op rather than panic
+// on the WIA.Mode check below.
+func TestRegisterWalletProviderJWKSRoute_NoOpWhenNilConfig(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+	svc.cfg = nil
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

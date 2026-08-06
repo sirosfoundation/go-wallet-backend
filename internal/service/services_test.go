@@ -187,7 +187,6 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	logger := zap.NewNop()
@@ -198,5 +197,52 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 	}
 	if services.WIA.audit == nil {
 		t.Error("expected WIA service to receive a real audit emitter when cfg.Audit.Enabled is true")
+	}
+}
+
+// TestNewServices_WIANilWhenSigningKeyButNoCertInETSIMode is a regression
+// test: a signing key alone is enough to construct WIAService (HasSigningKey
+// gates construction, for "ietf" mode's sake), but "etsi" mode (the default)
+// additionally requires a certificate chain (WIAService.IsSupported). Without
+// this, services.WIA would be non-nil but permanently unsupported, so every
+// WIA route would 500 (ErrWIANotSupported falls through to the handlers'
+// generic error case) instead of the clean 503 WIA_NOT_SUPPORTED they already
+// return when services.WIA == nil.
+func TestNewServices_WIANilWhenSigningKeyButNoCertInETSIMode(t *testing.T) {
+	dir := t.TempDir()
+	wpKeyPath, _ := writeECKeyAndCert(t, dir, "wallet-provider")
+
+	store := memory.NewStore()
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host:     "localhost",
+			Port:     8080,
+			RPID:     "localhost",
+			RPOrigin: "http://localhost:8080",
+			RPName:   "Test Wallet",
+		},
+		JWT: config.JWTConfig{
+			Secret:      "test-secret-that-is-at-least-32-bytes-long",
+			ExpiryHours: 24,
+			Issuer:      "test-wallet",
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = wpKeyPath
+	// CertificatePath deliberately left unset - etsi mode (the zero-value
+	// default) requires it; ietf mode wouldn't.
+	cfg.WalletProvider.WIA = config.WIAConfig{
+		Enabled:             true,
+		MaxExpirySeconds:    86400,
+		ChallengeTTLSeconds: 300,
+	}
+	cfg.WalletProvider.Attestation = config.AttestationConfig{
+		LifetimeSeconds: 3600,
+	}
+
+	logger := zap.NewNop()
+	services := NewServices(store, cfg, logger)
+
+	if services.WIA != nil {
+		t.Error("expected WIA service to be nil when unsupported (etsi mode, signing key but no certificate)")
 	}
 }

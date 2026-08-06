@@ -4,16 +4,13 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -28,31 +25,6 @@ import (
 var (
 	ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
 )
-
-// statusIndexCounter is a process-scoped monotonic counter for status list indices.
-// Each attestation (WIA or KA) gets a unique index. In a multi-instance deployment,
-// uniqueness across instances is achieved by seeding each process with a random
-// starting offset (see init() below) rather than starting from zero — otherwise
-// every replica (and every restart of the same replica) would hand out colliding
-// indices on the same status_list URI once wallet_provider.attestation.status_list_mode
-// is "always".
-var statusIndexCounter atomic.Uint64
-
-func init() {
-	statusIndexCounter.Store(randomStatusIndexSeed())
-}
-
-// randomStatusIndexSeed returns a random 64-bit starting offset for
-// statusIndexCounter. Extracted for direct unit testing.
-func randomStatusIndexSeed() uint64 {
-	var seed [8]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		// Should never happen on any real platform; falling back to 0 is no
-		// worse than the counter's behavior before this fix.
-		return 0
-	}
-	return binary.BigEndian.Uint64(seed[:])
-}
 
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
 // Prevents DoS via expensive JWT signing with excessively large arrays.
@@ -122,7 +94,7 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances 
 			}
 		}
 	}
-	if !pkcs11Loaded && cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
+	if !pkcs11Loaded && cfg.WalletProvider.PrivateKeyPath != "" {
 		if err := svc.loadKeys(); err != nil {
 			svc.logger.Warn("Failed to load wallet provider keys", zap.Error(err))
 		}
@@ -172,6 +144,18 @@ func (s *WalletProviderService) loadKeys() error {
 	}
 	s.jwtSigner = jwtSigner
 
+	// CertificatePath is optional: a signing key alone is enough for
+	// "ietf"-mode WIA issuance (JWKS-based trust, no x5c — see
+	// WIAConfig.Mode). Key Attestation (KA) and "etsi"-mode WIA always
+	// require x5c, which config.Validate() enforces by requiring a
+	// certificate whenever wallet_provider.wia.mode is "etsi"; without one,
+	// IsSupported() (KA) correctly reports unsupported and only WIAService's
+	// own ietf-mode IsSupported() can be true.
+	if s.cfg.WalletProvider.CertificatePath == "" {
+		s.logger.Info("Loaded wallet provider signing key (no certificate configured; x5c/KA unavailable)")
+		return nil
+	}
+
 	// Load certificate chain using proper PEM parsing
 	s.certChain, err = parsePEMCertChain(s.cfg.WalletProvider.CertificatePath)
 	if err != nil {
@@ -218,15 +202,27 @@ func parsePEMCertChain(path string) ([]string, error) {
 	return chain, nil
 }
 
-// IsSupported returns true if key attestation is supported
+// IsSupported returns true if Key Attestation (KA) generation is supported.
+// KA always requires x5c (there is no "ietf mode" for KA — see
+// GenerateKeyAttestation), so this deliberately requires a certificate chain,
+// unlike HasSigningKey.
 func (s *WalletProviderService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
+}
+
+// HasSigningKey returns true if a signing key (file or PKCS#11) is loaded,
+// regardless of whether a certificate/x5c chain is also configured. Used to
+// gate WIA-only ("ietf" mode) functionality, which doesn't need x5c — unlike
+// IsSupported, which additionally requires a certificate for KA.
+func (s *WalletProviderService) HasSigningKey() bool {
+	return s.jwtSigner != nil
 }
 
 // PublicKey returns the wallet provider's signing public key, or nil if no
 // signing key is configured. Used to serve the wallet provider's own JWKS
 // (see RegisterWalletProviderJWKSRoute) for relying parties resolving trust
-// via an iss-based (WIA.OmitX5C) attestation instead of its x5c chain.
+// via an iss-based (WIA.Mode == config.WIAModeIETF) attestation instead of
+// its x5c chain.
 func (s *WalletProviderService) PublicKey() crypto.PublicKey {
 	if s.signer == nil {
 		return nil
@@ -237,13 +233,15 @@ func (s *WalletProviderService) PublicKey() crypto.PublicKey {
 // Issuer returns the value used as the WIA's iss claim (see WIAService's
 // GenerateWIA), so relying parties' RFC 8414 metadata discovery
 // (RegisterWalletProviderJWKSRoute) advertises the exact issuer the WIA
-// itself claims.
+// itself claims. No WalletProviderURI fallback: config.Validate() requires
+// WIA.Issuer to be explicitly set whenever Mode is "ietf" (the only mode
+// that calls this), so falling back here would only mask a config that
+// bypassed Validate() (e.g. constructed directly in tests) - and
+// WalletProviderURI is a different identifier for a different purpose (the
+// WIA-PoP's expected aud, not this wallet provider's own issuer identity;
+// see docs/wallet-instance-attestation.md).
 func (s *WalletProviderService) Issuer() string {
-	issuer := s.cfg.WalletProvider.WIA.Issuer
-	if issuer == "" {
-		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
-	}
-	return issuer
+	return s.cfg.WalletProvider.WIA.Issuer
 }
 
 // Close releases resources held by the service.
@@ -294,12 +292,19 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		kaExpiry = 15 * time.Second
 	}
 	claims := jwt.MapClaims{
-		"iss":           s.cfg.Server.BaseURL,
+		// No `iss`: EC TS03 v1.5.2 removed `iss` from the KA (as it did for
+		// the WIA) — Wallet Provider identity is inferred solely from the
+		// x5c signing certificate below.
 		"jti":           uuid.New().String(),
 		"attested_keys": attested,
-		"nonce":         nonce,
-		"iat":           now.Unix(),
-		"exp":           now.Add(kaExpiry).Unix(),
+		// c_nonce (not `nonce`): TS03 §2.3.2 requires a KA sent via the
+		// `attestation` proof type to carry `c_nonce`. When a KA is instead
+		// wrapped in the `jwt` proof type, the nonce belongs in the outer
+		// proof JWT's body (built client-side), not here — this claim is
+		// then unused by conformant verifiers but harmless to include.
+		"c_nonce": nonce,
+		"iat":     now.Unix(),
+		"exp":     now.Add(kaExpiry).Unix(),
 	}
 
 	// Bind KA to the wallet instance (CS-04 §7.1.3)
@@ -334,22 +339,9 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		}
 	}
 
-	// key_storage_status: KA revocation via Token Status List (CS-04 §7.1.3)
-	if s.cfg.WalletProvider.Attestation.StatusListMode == "always" && s.cfg.WalletProvider.Attestation.StatusListURL != "" {
-		idx := statusIndexCounter.Add(1)
-		ksStatus := map[string]interface{}{
-			"status": map[string]interface{}{
-				"status_list": map[string]interface{}{
-					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": idx,
-				},
-			},
-		}
-		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
-			ksStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
-		}
-		claims["key_storage_status"] = ksStatus
-	}
+	// No `key_storage_status`: this wallet provider does not implement
+	// KA/WIA revocation-chaining. See AttestationConfig's type-level comment
+	// for the design rationale (short KA/WIA lifetime instead).
 
 	// Create the token with ES256 and x5c header
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
