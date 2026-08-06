@@ -138,55 +138,55 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
 		{
-			session.GET("/account-info", p.handlers.GetAccountInfo)
-			session.POST("/settings", p.handlers.UpdateSettings)
-			session.GET("/private-data", p.handlers.GetPrivateData)
-			session.POST("/private-data", p.handlers.UpdatePrivateData)
-			session.DELETE("/", p.handlers.DeleteUser)
+			session.GET("/account-info", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetAccountInfo)
+			session.POST("/settings", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateSettings)
+			session.GET("/private-data", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetPrivateData)
+			session.POST("/private-data", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdatePrivateData)
+			session.DELETE("/", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
 			// WebAuthn credential management
-			session.POST("/webauthn/register-begin", p.handlers.StartAddWebAuthnCredential)
-			session.POST("/webauthn/register-finish", p.handlers.FinishAddWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/rename", p.handlers.RenameWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/delete", p.handlers.DeleteWebAuthnCredential)
+			session.POST("/webauthn/register-begin", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.StartAddWebAuthnCredential)
+			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
 		}
-		protected.DELETE("/user/session", p.handlers.DeleteUser)
+		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
 		// Issuer routes
 		issuerGroup := protected.Group("/issuer")
 		{
-			issuerGroup.GET("/all", p.handlers.GetAllIssuers)
-			issuerGroup.GET("/:id/metadata", p.handlers.GetIssuerMetadata)
+			issuerGroup.GET("/all", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllIssuers)
+			issuerGroup.GET("/:id/metadata", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetIssuerMetadata)
 		}
 
 		// Verifier routes
 		verifierGroup := protected.Group("/verifier")
 		{
-			verifierGroup.GET("/all", p.handlers.GetAllVerifiers)
+			verifierGroup.GET("/all", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllVerifiers)
 		}
 
 		// Helper routes
-		protected.POST("/helper/get-cert", p.handlers.GetCertificate)
+		protected.POST("/helper/get-cert", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetCertificate)
 
 		// Proxy routes (can be disabled via features.proxy_enabled)
 		if p.cfg.Features.ProxyEnabled {
-			protected.POST("/proxy", p.handlers.ProxyRequest)
+			protected.POST("/proxy", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ProxyRequest)
 		}
 
 		// Keystore routes
 		keystoreGroup := protected.Group("/keystore")
 		{
-			keystoreGroup.GET("/status", p.handlers.KeystoreStatus)
+			keystoreGroup.GET("/status", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.KeystoreStatus)
 		}
 
 		// Wallet provider routes
 		walletProvider := protected.Group("/wallet-provider")
 		{
-			walletProvider.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+			walletProvider.POST("/key-attestation/generate", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.GenerateKeyAttestation)
 			if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
-				walletProvider.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
-				walletProvider.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
+				walletProvider.POST("/wia/challenge", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAChallenge)
+				walletProvider.POST("/wia/generate", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAGenerate)
 			}
 		}
 	}
@@ -213,6 +213,21 @@ func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+}
+
+// requireTACIfEnforced returns MustHaveTAC(required) when tv is non-nil (the
+// go-tokenauth path is active, so tokenauth_result - and therefore a TAC to
+// check - is actually populated). When tv is nil, the legacy HMAC
+// AuthMiddleware path is in effect instead, which has no TAC concept at all
+// (see AuthMiddleware) - MustHaveTAC would 401 every request there since it
+// never finds tokenauth_result, so this no-ops instead of enforcing.
+// Mirrors RequireAudience's own identical conditional application, for the
+// same reason.
+func requireTACIfEnforced(tv *tokenvalidator.Validator, required string) gin.HandlerFunc {
+	if tv == nil {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return middleware.MustHaveTAC(required)
 }
 
 // =============================================================================
@@ -259,11 +274,11 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
-			protected.GET("/vc", p.handlers.GetAllCredentials)
-			protected.POST("/vc", p.handlers.StoreCredential)
-			protected.POST("/vc/update", p.handlers.UpdateCredential)
-			protected.GET("/vc/:credential_identifier", p.handlers.GetCredentialByIdentifier)
-			protected.DELETE("/vc/:credential_identifier", p.handlers.DeleteCredential)
+			protected.GET("/vc", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllCredentials)
+			protected.POST("/vc", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.StoreCredential)
+			protected.POST("/vc/update", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateCredential)
+			protected.GET("/vc/:credential_identifier", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetCredentialByIdentifier)
+			protected.DELETE("/vc/:credential_identifier", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteCredential)
 		}
 	}
 }
@@ -558,8 +573,8 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		}
 		v1 := protected.Group("/v1")
 		{
-			v1.POST("/evaluate", p.authzenHandler.Evaluate)
-			v1.POST("/resolve", p.authzenHandler.Resolve)
+			v1.POST("/evaluate", requireTACIfEnforced(p.tokenValidator, "r"), p.authzenHandler.Evaluate)
+			v1.POST("/resolve", requireTACIfEnforced(p.tokenValidator, "r"), p.authzenHandler.Resolve)
 		}
 	}
 }
@@ -928,11 +943,11 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 		wp.Use(middleware.RequireAudience("wallet-backend"))
 	}
 	{
-		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
+		wp.POST("/key-attestation/generate", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.GenerateKeyAttestation)
 		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
-			wp.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
-			wp.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
+			wp.POST("/wia/challenge", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAChallenge)
+			wp.POST("/wia/generate", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAGenerate)
 		}
 	}
 
