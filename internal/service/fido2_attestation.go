@@ -2,17 +2,19 @@ package service
 
 import (
 	"context"
-	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 var (
@@ -49,13 +51,18 @@ type FIDO2AttestationService struct {
 	cfg       *config.Config
 	logger    *zap.Logger
 	instances storage.WalletInstanceStore
+	trust     *trust.Service
 }
 
-// NewFIDO2AttestationService creates a new FIDO2 attestation verifier.
-func NewFIDO2AttestationService(cfg *config.Config, instances storage.WalletInstanceStore, logger *zap.Logger) *FIDO2AttestationService {
+// NewFIDO2AttestationService creates a new FIDO2 attestation verifier. trust
+// evaluates the attestation's x5c chain against go-trust's fidomds3
+// registry (real FIDO Alliance MDS3 data, keyed by AAGUID) - this service
+// does not embed any trust-anchor material itself, per ADR-010.
+func NewFIDO2AttestationService(cfg *config.Config, instances storage.WalletInstanceStore, trustSvc *trust.Service, logger *zap.Logger) *FIDO2AttestationService {
 	return &FIDO2AttestationService{
 		cfg:       cfg,
 		instances: instances,
+		trust:     trustSvc,
 		logger:    logger.Named("fido2-attestation"),
 	}
 }
@@ -103,42 +110,38 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	}
 
 	// Step 3: verify the x5c chain (present for "packed" Basic Attestation,
-	// which is what a genuine YubiKey produces) against the pinned Yubico
-	// root CAs. go-webauthn's VerifyAttestation above does NOT do this
-	// unless a metadata.Provider is supplied - without this step, any
-	// self-signed leaf cert with a valid signature would pass.
+	// which is what a genuine YubiKey produces) against real FIDO Alliance
+	// MDS3 trust data via go-trust's fidomds3 registry. go-webauthn's
+	// VerifyAttestation above does NOT do this unless a metadata.Provider is
+	// supplied - without this step, any self-signed leaf cert with a valid
+	// signature would pass. Per ADR-010, this service performs no local
+	// trust-anchor evaluation itself - the AAGUID+chain decision is
+	// delegated to the PDP, same as issuer/verifier trust.
 	x5cRaw, ok := attObj.AttStatement["x5c"].([]any)
 	if !ok || len(x5cRaw) == 0 {
 		return fmt.Errorf("%w: no x5c attestation certificate chain present (self-attestation is not accepted)", ErrFIDO2AttestationInvalid)
 	}
 
-	leafDER, ok := x5cRaw[0].([]byte)
-	if !ok {
-		return fmt.Errorf("%w: malformed x5c leaf certificate", ErrFIDO2AttestationInvalid)
-	}
-	leafCert, err := x509.ParseCertificate(leafDER)
-	if err != nil {
-		return fmt.Errorf("%w: parse leaf cert: %v", ErrFIDO2AttestationInvalid, err)
-	}
-
-	intermediates := x509.NewCertPool()
-	for _, raw := range x5cRaw[1:] {
-		certDER, ok := raw.([]byte)
+	x5cChain := make([]string, 0, len(x5cRaw))
+	for i, raw := range x5cRaw {
+		der, ok := raw.([]byte)
 		if !ok {
-			return fmt.Errorf("%w: malformed x5c intermediate certificate", ErrFIDO2AttestationInvalid)
+			return fmt.Errorf("%w: malformed x5c chain element %d", ErrFIDO2AttestationInvalid, i)
 		}
-		cert, err := x509.ParseCertificate(certDER)
-		if err != nil {
-			return fmt.Errorf("%w: parse intermediate cert: %v", ErrFIDO2AttestationInvalid, err)
-		}
-		intermediates.AddCert(cert)
+		x5cChain = append(x5cChain, base64.StdEncoding.EncodeToString(der))
 	}
 
-	if _, err := leafCert.Verify(x509.VerifyOptions{
-		Roots:         YubiKeyAttestationRootCAs(),
-		Intermediates: intermediates,
-	}); err != nil {
-		return fmt.Errorf("%w: x5c chain verification: %v", ErrFIDO2AttestationInvalid, err)
+	aaguid, err := uuid.FromBytes(attObj.AuthData.AttData.AAGUID)
+	if err != nil {
+		return fmt.Errorf("%w: parse AAGUID: %v", ErrFIDO2AttestationInvalid, err)
+	}
+
+	trustInfo, err := s.trust.EvaluateFIDO2Attestation(ctx, aaguid.String(), x5cChain)
+	if err != nil {
+		return fmt.Errorf("%w: trust evaluation: %v", ErrFIDO2AttestationInvalid, err)
+	}
+	if !trustInfo.Trusted {
+		return fmt.Errorf("%w: not trusted by FIDO MDS3 registry: %s", ErrFIDO2AttestationInvalid, trustInfo.Reason)
 	}
 
 	// Step 4: durably record the result. Deliberately a dedicated store
@@ -155,64 +158,4 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	)
 
 	return nil
-}
-
-// YubiKeyAttestationRootCAs returns the Yubico FIDO2 attestation root CA
-// pool: "Yubico FIDO Root CA Serial 450203556" (issued 2024-05-01) and
-// "Yubico Attestation Root 1" (issued 2024-12-01). Both fetched and their
-// OpenPGP signature verified against Yubico's own published signing-key
-// fingerprint (developers.yubico.com/Software_Projects/Software_Signing.html)
-// from https://developers.yubico.com/PKI/yubico-ca-certs.txt on 2026-08-06.
-// The older "Yubico U2F Root CA Serial 457200631" (2014) covers U2F/CTAP1-only
-// devices and is deliberately not included - out of scope for FIDO2/CTAP2
-// rawSign attestation.
-func YubiKeyAttestationRootCAs() *x509.CertPool {
-	pool := x509.NewCertPool()
-	const yubicoFIDORootPEM = `-----BEGIN CERTIFICATE-----
-MIIDMzCCAhugAwIBAgIUSOEjTf//yqRfPW7Qq8qtIyCrAg8wDQYJKoZIhvcNAQEL
-BQAwLzEtMCsGA1UEAwwkWXViaWNvIEZJRE8gUm9vdCBDQSBTZXJpYWwgNDUwMjAz
-NTU2MCAXDTI0MDUwMTAwMDAwMFoYDzIwNjAwNDMwMDAwMDAwWjAvMS0wKwYDVQQD
-DCRZdWJpY28gRklETyBSb290IENBIFNlcmlhbCA0NTAyMDM1NTYwggEiMA0GCSqG
-SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCdvl27w2gu1fPXeEFbIdqx0BalvVDVWrQP
-J7HqviuEtZHlxSLxSFtcXpTolvLvof8f4tMerQTkVGzcmYzm1EBT4IJuMmoEqfkE
-EhWpsADMFrjZkqlZY9EqxQzLoVEEonE5oGxSdVCxCcLIackpyR/CCXvj1Bt/hTgE
-9hTlF4pRqxMkx3plF7y8dDZlRHWs7vbnhmBCGeI0ZPEQ6nl2mCg2r74adF2u6K9r
-rLfhBC3QLE8EPrgqUsI+hkuq2tK4M2SMOp8uUVVkqUeu3h0kr3WVI0W02pkgrOgi
-FKLFNkSrbYhdjMBDj5izmqfc9xJRKoDX612qd8ZGVHpT5AYFX+1hAgMBAAGjRTBD
-MB0GA1UdDgQWBBTZyU5DiQ/a2UEgE7qBK0zhIsRNRjASBgNVHRMBAf8ECDAGAQH/
-AgEAMA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAXvnB4SLuUJfY
-MSVGAhssL/SmWli3FSccgxydvKlACcidIIWKQqa3q/QSUEQzC9DgEfMgr7iC1BkT
-ZbILboV6UZ5knNsvjEZWuMeogJ8tgZs1hVvKwZizwJ+mEcmsjhIrBYuoL1T6yrOJ
-vKFg1jv+Cy4ZwA9Bpk/V3UOir1VyK8dCtyHu6vfosotAdYx8FAuR243gRTMV6Jx8
-Jdig2JDIAQMlzVeDpSUHX/K2HXRHxHwfgjbgUjjBu/72r8OfehyhzHXI3K8CFFdf
-lO+8nEOJK3y8F1ivgS5uN/8SmcYw/STQYwhrxPuwz3nP8baMum4BB2nnYmpB60sX
-3bl5k8QUSw==
------END CERTIFICATE-----`
-	const yubicoAttestationRoot1PEM = `-----BEGIN CERTIFICATE-----
-MIIDPjCCAiagAwIBAgIUXzeiEDJEOTt14F5n0o6Zf/bBwiUwDQYJKoZIhvcNAQEN
-BQAwJDEiMCAGA1UEAwwZWXViaWNvIEF0dGVzdGF0aW9uIFJvb3QgMTAgFw0yNDEy
-MDEwMDAwMDBaGA85OTk5MTIzMTIzNTk1OVowJDEiMCAGA1UEAwwZWXViaWNvIEF0
-dGVzdGF0aW9uIFJvb3QgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-AMZ6/TxM8rIT+EaoPvG81ontMOo/2mQ2RBwJHS0QZcxVaNXvl12LUhBZ5LmiBScI
-Zd1Rnx1od585h+/dhK7hEm7JAALkKKts1fO53KGNLZujz5h3wGncr4hyKF0G74b/
-U3K9hE5mGND6zqYchCRAHfrYMYRDF4YL0X4D5nGdxvppAy6nkEmtWmMnwO3i0TAu
-csrbE485HvGM4r0VpgVdJpvgQjiTJCTIq+D35hwtT8QDIv+nGvpcyi5wcIfCkzyC
-imJukhYy6KoqNMKQEdpNiSOvWyDMTMt1bwCvEzpw91u+msUt4rj0efnO9s0ZOwdw
-MRDnH4xgUl5ZLwrrPkfC1/0CAwEAAaNmMGQwHQYDVR0OBBYEFNLu71oijTptXCOX
-PfKF1SbxJXuSMB8GA1UdIwQYMBaAFNLu71oijTptXCOXPfKF1SbxJXuSMBIGA1Ud
-EwEB/wQIMAYBAf8CAQMwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBDQUAA4IB
-AQC3IW/sgB9pZ8apJNjxuGoX+FkILks0wMNrdXL/coUvsrhzsvl6mePMrbGJByJ1
-XnquB5sgcRENFxdQFma3mio8Upf1owM1ZreXrJ0mADG2BplqbJnxiyYa+R11reIF
-TWeIhMNcZKsDZrFAyPuFjCWSQvJmNWe9mFRYFgNhXJKkXIb5H1XgEDlwiedYRM7V
-olBNlld6pRFKlX8ust6OTMOeADl2xNF0m1LThSdeuXvDyC1g9+ILfz3S6OIYgc3i
-roRcFD354g7rKfu67qFAw9gC4yi0xBTPrY95rh4/HqaUYCA/L8ldRk6H7Xk35D+W
-Vpmq2Sh/xT5HiFuhf4wJb0bK
------END CERTIFICATE-----`
-	if !pool.AppendCertsFromPEM([]byte(yubicoFIDORootPEM)) {
-		panic("failed to parse embedded Yubico FIDO Root CA PEM")
-	}
-	if !pool.AppendCertsFromPEM([]byte(yubicoAttestationRoot1PEM)) {
-		panic("failed to parse embedded Yubico Attestation Root 1 PEM")
-	}
-	return pool
 }

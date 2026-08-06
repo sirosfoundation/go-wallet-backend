@@ -6,6 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -93,7 +94,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), logger),
+		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), engine.NewTrustService(cfg, logger), logger),
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,

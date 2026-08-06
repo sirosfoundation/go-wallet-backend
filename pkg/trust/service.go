@@ -232,6 +232,23 @@ func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trust
 	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, keyMaterial, "verifier")
 }
 
+// EvaluateFIDO2Attestation evaluates a FIDO2/CTAP2 hardware-key attestation's
+// x5c certificate chain against the global PDP (expected to have a fidomds3
+// registry configured - see go-trust's pkg/registry/fidomds3). Unlike issuer/
+// verifier evaluation, this has no per-flow endpoint override - FIDO Alliance
+// MDS3 trust data is global, not tenant- or flow-specific.
+//
+// subjectID is the authenticator model's AAGUID (matches the "name" half of
+// the AuthZEN name-to-key binding the fidomds3 registry evaluates against).
+// If no PDP is configured, this fails closed (Trusted: false) - same as
+// EvaluateIssuer/EvaluateVerifier's "no PDP configured" behavior.
+func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x5cChain []string) (*TrustInfo, error) {
+	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, &KeyMaterial{
+		Type: "x5c",
+		X5C:  x5cChain,
+	}, "aaguid")
+}
+
 // evaluate is the shared implementation for both issuer and verifier trust evaluation.
 func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
 	eval, err := s.GetEvaluator(endpoint)
