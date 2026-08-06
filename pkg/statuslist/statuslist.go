@@ -1,5 +1,7 @@
-// Package statuslist builds an always-empty (all-VALID) IETF Token Status
-// List JWT.
+// Package statuslist builds the compressed, always-empty (all-VALID) bit
+// string for an IETF Token Status List (the `lst` value inside a
+// status_list JWT's payload) - not the JWT itself, which the service layer
+// (RegisterWalletProviderStatusListRoute) wraps this value in.
 //
 // This wallet provider does not implement WIA/KA revocation-chaining (see
 // AttestationConfig's type-level comment in pkg/config) — nothing it issues
