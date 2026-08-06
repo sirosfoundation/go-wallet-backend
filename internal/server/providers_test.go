@@ -628,6 +628,9 @@ func TestBackendProvider_RequireAudience_AuthZENProxy_AllowsWalletRegistry(t *te
 	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
 		t.Fatalf("expected a wallet-registry-audience token to pass RequireAudience, got %d: %s", w.Code, w.Body.String())
 	}
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("route not registered - test would false-pass on a routing regression")
+	}
 }
 
 func TestBackendProvider_RequireAudience_AuthZENProxy_RejectsOtherAudience(t *testing.T) {
@@ -702,6 +705,9 @@ func TestAuthProvider_RequireAudience_AllowsWalletBackendToken(t *testing.T) {
 
 	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
 		t.Fatalf("expected a wallet-backend-audience token to pass RequireAudience, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("route not registered - test would false-pass on a routing regression")
 	}
 }
 

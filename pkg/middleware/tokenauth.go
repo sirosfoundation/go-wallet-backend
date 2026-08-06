@@ -170,6 +170,13 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 // though the deployment as a whole accepts that audience for other
 // purposes.
 func RequireAudience(allowed ...string) gin.HandlerFunc {
+	if len(allowed) == 0 {
+		// allowed is fixed at route-registration time, not per-request, so
+		// this is always a programming error, never a runtime condition -
+		// panic here (once, at startup) rather than have the match loop
+		// below silently 403 every request forever.
+		panic("middleware: RequireAudience called with no allowed audiences")
+	}
 	return func(c *gin.Context) {
 		v, exists := c.Get("tokenauth_result")
 		if !exists {

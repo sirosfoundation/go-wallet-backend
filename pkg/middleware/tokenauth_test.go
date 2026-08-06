@@ -381,6 +381,15 @@ func TestRequireAudience_NoAuth(t *testing.T) {
 	}
 }
 
+func TestRequireAudience_PanicsWithNoAllowedAudiences(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected RequireAudience() with no arguments to panic")
+		}
+	}()
+	RequireAudience()
+}
+
 func TestExtractBearer(t *testing.T) {
 	tests := []struct {
 		name   string
