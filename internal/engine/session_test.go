@@ -518,7 +518,7 @@ func TestManager_handleFlowStart_RejectsInsufficientTAC(t *testing.T) {
 	if msg == nil {
 		t.Fatal("expected a flow_error, got none")
 	}
-	assert.Equal(t, ErrCodeAuthorizationFail, msg.Error.Code)
+	assert.Equal(t, ErrCodeForbidden, msg.Error.Code)
 }
 
 func TestManager_handleFlowStart_AllowsSufficientTAC(t *testing.T) {

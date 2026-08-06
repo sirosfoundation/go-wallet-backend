@@ -497,7 +497,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	// routes (internal/server/providers.go).
 	if session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
-			_ = session.SendFlowError(flowID, "", ErrCodeAuthorizationFail, "insufficient permissions for protocol: "+string(msg.Protocol))
+			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
 			logger.Warn("Rejected flow start - insufficient TAC",
 				zap.String("tac", string(session.TAC)),
 				zap.String("required", required),
