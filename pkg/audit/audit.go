@@ -109,12 +109,14 @@ func NewFromConfig(cfg *config.Config, logger *zap.Logger) *Emitter {
 	return emitter
 }
 
-// Emit emits an audit event.
+// Emit emits an audit event. Errors are logged but do not fail the operation.
 func (a *Emitter) Emit(event set.EventURI, data map[string]any) {
 	if a == nil {
 		return
 	}
-	_ = a.e.Emit(event, data)
+	if err := a.e.Emit(event, data); err != nil {
+		slog.Error("audit emit failed", "event", string(event), "error", err)
+	}
 }
 
 // EmitWithSubject emits an audit event with a subject identifier.
@@ -122,5 +124,7 @@ func (a *Emitter) EmitWithSubject(event set.EventURI, subject string, data map[s
 	if a == nil {
 		return
 	}
-	_ = a.e.EmitWithSubject(event, subject, data)
+	if err := a.e.EmitWithSubject(event, subject, data); err != nil {
+		slog.Error("audit emit failed", "event", string(event), "subject", subject, "error", err)
+	}
 }

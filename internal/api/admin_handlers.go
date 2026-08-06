@@ -932,7 +932,7 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("name", req.Name))
-	h.emitAudit(set.EventVerifierCreated, req.Name, map[string]any{"tenant_id": string(tenantID)})
+	h.emitAudit(set.EventVerifierCreated, verifier.URL, map[string]any{"tenant_id": string(tenantID), "name": req.Name})
 	c.JSON(http.StatusCreated, verifierToResponse(verifier))
 }
 
