@@ -546,7 +546,21 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
-	token.Header["x5c"] = s.certChain
+	if !s.cfg.WalletProvider.WIA.OmitX5C {
+		token.Header["x5c"] = s.certChain
+	} else {
+		// No x5c means no embedded key material - relying parties must
+		// resolve the wallet provider's signing key from its own JWKS
+		// (RegisterWalletProviderJWKSRoute, served at the WIA's own iss
+		// URL). That resolution is kid-keyed (standard practice for
+		// multi-key JWKS, and what existing JWT trust-verification code
+		// elsewhere already expects), so the WIA itself must carry a kid
+		// header matching the JWKS entry's KeyID ("wallet-provider",
+		// hardcoded there since this deployment publishes exactly one
+		// signing key) - without it, a relying party has no way to know
+		// which of the issuer's published keys to use.
+		token.Header["kid"] = "wallet-provider"
+	}
 
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {

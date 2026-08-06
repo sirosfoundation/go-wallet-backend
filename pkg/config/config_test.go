@@ -1343,6 +1343,210 @@ func TestASConfig_GetTokenTTL(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_FillsDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.JWT.Issuer = "https://issuer.example"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://issuer.example" {
+		t.Errorf("expected Issuer to fall back to JWT.Issuer, got %q", cfg.AS.Issuer)
+	}
+	// SetDefaults should still run (TTLs, DefaultMaxTAC etc.)
+	if cfg.AS.DefaultTokenTTL == 0 {
+		t.Error("expected EnableForRole to also apply ASConfig.SetDefaults defaults")
+	}
+}
+
+func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(t *testing.T) {
+	// Regression test for a real Copilot review finding: a wallet provider
+	// configured with PKCS11 (which WalletProviderService tries first,
+	// independently of whether a file key is ALSO configured as a runtime
+	// fallback) actually signs WIA/KA with the HSM key. If EnableForRole()
+	// still inherited PrivateKeyPath here, AS would silently sign its own
+	// tokens with the weaker on-disk key instead - a security downgrade,
+	// not just an unsupported configuration. SigningKeyPath must stay empty
+	// so Validate() rejects with an actionable error instead.
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/fallback-key.pem"
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "" {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/custom/key.pem"
+	cfg.AS.RulesDir = "/custom/rules"
+	cfg.AS.Issuer = "https://custom-issuer.example"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "/custom/key.pem" {
+		t.Errorf("expected explicit SigningKeyPath to be preserved, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://custom-issuer.example" {
+		t.Errorf("expected explicit Issuer to be preserved, got %q", cfg.AS.Issuer)
+	}
+}
+
+func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_ExplicitRulesDirPreserved(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.RulesDir = "/custom/rules"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_RespectsExplicitFalseInYAML(t *testing.T) {
+	// Regression test: EnableForRole must not override an operator's
+	// explicit `as.enabled: false` - a plain bool can't distinguish that
+	// from "as section never configured" (both are the zero value), which
+	// is why this goes through Load() (the only path that can observe the
+	// raw YAML) rather than constructing a Config{} directly.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if cfg.AS.Enabled {
+		t.Error("expected explicit as.enabled: false in YAML to be preserved, but EnableForRole() overrode it to true")
+	}
+}
+
+func TestConfig_EnableForRole_FillsDefaultsWhenExplicitlyEnabledInYAML(t *testing.T) {
+	// Regression test for EnableForRole()'s own logic: an explicit
+	// as.enabled: true must still get defaults filled in for whatever
+	// fields are empty - only an explicit as.enabled: false should skip
+	// defaulting entirely. Before this fix, EnableForRole() treated ANY
+	// explicit as.enabled (true or false) identically ("fully configured,
+	// don't touch it").
+	//
+	// Constructs Config directly (asEnabledExplicit set as Load() would)
+	// rather than going through Load() itself: Load()'s own Validate() call
+	// requires as.signing_key_path/rules_dir whenever as.enabled: true is
+	// present in YAML, regardless of role - so a YAML fixture reproducing
+	// this scenario would fail at Load() before EnableForRole() ever runs.
+	// That's a separate, pre-existing validation-ordering property (AS
+	// config is validated unconditionally on AS.Enabled, not gated on
+	// whether the auth role was even requested) - out of scope for this fix,
+	// which is specifically about EnableForRole()'s own explicit-true-vs-
+	// false handling.
+	cfg := &Config{asEnabledExplicit: true}
+	cfg.AS.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled to stay true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_FillsInWhenYAMLOmitsASEntirely(t *testing.T) {
+	// Contrast with the test above: when the `as:` section is absent
+	// entirely (not just enabled: false), EnableForRole should still turn
+	// it on for the auth role.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  private_key_path: /wp/key.pem
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true when as: section is absent entirely")
+	}
+}
+
 func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
@@ -1701,6 +1905,46 @@ func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
 	cfg.WalletProvider.WIA.Enabled = true
 	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
 	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestConfig_Validate_WIA_OmitX5CRequiresIssuer is a regression test: when
+// OmitX5C is set, the iss claim (not the x5c chain) is the only way a
+// relying party can identify the wallet provider and resolve its JWKS.
+// Without this check, an operator could enable OmitX5C without setting
+// Issuer and get a WIA with neither x5c nor a usable iss - an attestation
+// nobody can resolve trust for.
+func TestConfig_Validate_WIA_OmitX5CRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.OmitX5C = true
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// Issuer intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when omit_x5c is set without issuer")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider.wia.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_OmitX5CPassesWithIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.OmitX5C = true
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
 	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
 	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
 

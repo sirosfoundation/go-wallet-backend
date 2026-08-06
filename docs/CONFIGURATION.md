@@ -13,6 +13,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [storage](#storage)
 - [logging](#logging)
 - [jwt](#jwt)
+- [as](#as)
 - [wallet_provider](#wallet_provider)
 - [trust](#trust)
 - [session_store](#session_store)
@@ -20,6 +21,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [security](#security)
 - [http_client](#http_client)
 - [authzen_proxy](#authzen_proxy)
+- [audit](#audit)
 - [Registry Server](#registry-server)
 - [registry.server](#registryserver)
 - [registry.source](#registrysource)
@@ -49,6 +51,8 @@ Environment prefix: `WALLET_SERVER`
 | `server.engine_port` | `WALLET_SERVER_ENGINE_PORT` | integer | WebSocket engine port (defaults to Port if 0) |
 | `server.registry_host` | `WALLET_SERVER_REGISTRY_HOST` | string | Registry bind address (defaults to Host) |
 | `server.registry_port` | `WALLET_SERVER_REGISTRY_PORT` | integer | VCTM registry port (defaults to 8097) |
+| `server.wp_host` | `WALLET_SERVER_WP_HOST` | string | Wallet-provider bind address (defaults to Host) |
+| `server.wp_port` | `WALLET_SERVER_WP_PORT` | integer | Wallet-provider port (0 = co-hosted with backend) |
 | `server.admin_token` | `WALLET_SERVER_ADMIN_TOKEN` | string | Bearer token for admin API (auto-generated if empty) |
 | `server.admin_token_path` | `WALLET_SERVER_ADMIN_TOKEN_PATH` | string | Path to file containing admin token |
 | `server.rp_id` | `WALLET_SERVER_RP_ID` | string |  |
@@ -114,6 +118,28 @@ Environment prefix: `WALLET_JWT`
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
 | `jwt.issuer` | `WALLET_JWT_ISSUER` | string |  |
 
+## as
+
+Environment prefix: `WALLET_AS`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `as.enabled` | `WALLET_AS_ENABLED` | boolean | Enabled controls whether the new AS is active. |
+| `as.signing_key_path` | `WALLET_AS_SIGNING_KEY_PATH` | string | SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519) used to sign access tokens. Mutually exclusive with SigningKeyPKCS11. |
+| `as.signing_key_pkcs11` | `WALLET_AS_SIGNING_KEY_PKCS11` | string | SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing. Mutually exclusive with SigningKeyPath. |
+| `as.issuer` | `WALLET_AS_ISSUER` | string | Issuer is the value of the "iss" claim in issued access tokens. Defaults to JWT.Issuer if not set. |
+| `as.default_token_ttl` | `WALLET_AS_DEFAULT_TOKEN_TTL` | duration | DefaultTokenTTL is the default access token lifetime. Default: 2m |
+| `as.audience_ttls` | `WALLET_AS_AUDIENCE_TTLS` | map[string]time.Duration | AudienceTTLs allows per-audience TTL overrides. Keys are audience strings, values are durations. |
+| `as.audiences` | `WALLET_AS_AUDIENCES` | string list | Audiences lists the accepted audience values for token validation. Tokens must contain at least one of these in their "aud" claim. When empty, audience validation is skipped. Documented values: "wallet-backend", "wallet-engine", "wallet-registry". |
+| `as.rules_dir` | `WALLET_AS_RULES_DIR` | string | RulesDir is the path to a directory containing SPOCP policy rule files. |
+| `as.session_ttl` | `WALLET_AS_SESSION_TTL` | duration | SessionTTL is the maximum session lifetime before re-authentication. Default: 24h |
+| `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
+| `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
+| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader controls whether Deprecation + Sunset headers are sent on legacy token responses. |
+| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the date after which legacy tokens will no longer be supported. Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z"). |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs. Required when OIDC is used. |
+| `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
+
 ## wallet_provider
 
 Environment prefix: `WALLET_WALLET_PROVIDER`
@@ -123,6 +149,39 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.private_key_path` | `WALLET_WALLET_PROVIDER_PRIVATE_KEY_PATH` | string |  |
 | `wallet_provider.certificate_path` | `WALLET_WALLET_PROVIDER_CERTIFICATE_PATH` | string |  |
 | `wallet_provider.ca_cert_path` | `WALLET_WALLET_PROVIDER_CA_CERT_PATH` | string |  |
+| `wallet_provider.pkcs11.module_path` | `WALLET_WALLET_PROVIDER_PKCS11_MODULE_PATH` | string |  |
+| `wallet_provider.pkcs11.slot_id` | `WALLET_WALLET_PROVIDER_PKCS11_SLOT_ID` | uint |  |
+| `wallet_provider.pkcs11.pin` | `WALLET_WALLET_PROVIDER_PKCS11_PIN` | string |  |
+| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN) |
+| `wallet_provider.pkcs11.key_label` | `WALLET_WALLET_PROVIDER_PKCS11_KEY_LABEL` | string |  |
+| `wallet_provider.pkcs11.pool_size` | `WALLET_WALLET_PROVIDER_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
+| `wallet_provider.wia.enabled` | `WALLET_WALLET_PROVIDER_WIA_ENABLED` | boolean | Enabled controls whether WIA endpoints are registered |
+| `wallet_provider.wia.issuer` | `WALLET_WALLET_PROVIDER_WIA_ISSUER` | string | Issuer is the optional `iss` claim in WIA JWTs. Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain). Some national profiles require an explicit iss for interop. |
+| `wallet_provider.wia.omit_x5c` | `WALLET_WALLET_PROVIDER_WIA_OMIT_X5C` | boolean | OmitX5C skips attaching the wallet provider's certificate chain to the WIA JWT header, so relying parties resolve trust via the `iss` claim's JWKS (draft-ietf-oauth-attestation-based-client-auth, "iss-based IETF draft format") instead of TS03's x5c-derived identity. When x5c is present, consumers (e.g. SUNET/vc's parseAttestationIdentity) treat it as authoritative and iss as a secondary consistency check only — so this is the only way to actually exercise iss/JWKS-based trust when a certificate is configured. Requires Issuer to be set; the wallet provider's public key must be resolvable at "<issuer>/.well-known/jwks.json" (see RegisterWalletProviderJWKSRoute). |
+| `wallet_provider.wia.wallet_provider_uri` | `WALLET_WALLET_PROVIDER_WIA_WALLET_PROVIDER_URI` | string | WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier) |
+| `wallet_provider.wia.wallet_name` | `WALLET_WALLET_PROVIDER_WIA_WALLET_NAME` | string | WalletName is the wallet_name claim in WIA JWT |
+| `wallet_provider.wia.wallet_version` | `WALLET_WALLET_PROVIDER_WIA_WALLET_VERSION` | string | WalletVersion is the wallet_version claim |
+| `wallet_provider.wia.wallet_link` | `WALLET_WALLET_PROVIDER_WIA_WALLET_LINK` | string | WalletLink is the wallet download/info URI |
+| `wallet_provider.wia.certification_info` | `WALLET_WALLET_PROVIDER_WIA_CERTIFICATIONINFO` | map[string]interface{} | CertificationInfo is the wallet_solution_certification_information claim. Free-form map included as-is in the WIA JWT (Annex C §C.3.2). |
+| `wallet_provider.wia.max_expiry_seconds` | `WALLET_WALLET_PROVIDER_WIA_MAX_EXPIRY_SECONDS` | integer | MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h) |
+| `wallet_provider.wia.challenge_ttl_seconds` | `WALLET_WALLET_PROVIDER_WIA_CHALLENGE_TTL_SECONDS` | integer | ChallengeTTLSeconds is the lifetime of WIA challenge nonces in seconds |
+| `wallet_provider.wia.rate_limit.enabled` | `WALLET_WALLET_PROVIDER_WIA_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `wallet_provider.wia.rate_limit.max_attempts` | `WALLET_WALLET_PROVIDER_WIA_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
+| `wallet_provider.wia.rate_limit.window_seconds` | `WALLET_WALLET_PROVIDER_WIA_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
+| `wallet_provider.wia.rate_limit.lockout_seconds` | `WALLET_WALLET_PROVIDER_WIA_RATE_LIMIT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
+| `wallet_provider.attestation.lifetime_seconds` | `WALLET_WALLET_PROVIDER_ATTESTATION_LIFETIME_SECONDS` | integer | LifetimeSeconds is the global attestation lifetime (WIA + KA). CS-04 requires < 24h (86400). Default: 3600 (1 hour). |
+| `wallet_provider.attestation.ka_expiry_seconds` | `WALLET_WALLET_PROVIDER_ATTESTATION_KA_EXPIRY_SECONDS` | integer | KAExpirySeconds is the key attestation JWT expiry. Short-lived by default (15s) for single-use credential issuance. |
+| `wallet_provider.attestation.status_list_mode` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_MODE` | string | StatusListMode controls whether attestations include a status_list entry. Values: "always" (always include), "never" (omit for short-lived), "auto" (include only if lifetime > threshold). Default: "never". |
+| `wallet_provider.attestation.status_list_url` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_URL` | string | StatusListURL is the base URL for the Token Status List endpoint. |
+| `wallet_provider.attestation.status_list_expiry` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_EXPIRY` | integer | StatusListExpiry is the lifetime (seconds) of a status list entry. When > 0, the client_status object includes an "exp" field (Annex C §C.3.2). |
+| `wallet_provider.attestation.native_attestation.enabled` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_ENABLED` | boolean | Enabled controls whether native platform attestation is required. |
+| `wallet_provider.attestation.native_attestation.apple_app_attest_environment` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_APPLE_APP_ATTEST_ENVIRONMENT` | string | AppleAppAttestEnvironment: "production" or "development" |
+| `wallet_provider.attestation.native_attestation.apple_app_id` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_APPLE_APP_ID` | string | AppleAppID is the full App ID (TeamID.BundleID) for Apple App Attest. |
+| `wallet_provider.attestation.native_attestation.google_package_name` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PACKAGE_NAME` | string | GooglePackageName is the Android package name for Play Integrity. |
+| `wallet_provider.attestation.native_attestation.google_play_integrity_decryption_key` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY` | string | GooglePlayIntegrityDecryptionKey is the base64-encoded decryption key. Prefer GooglePlayIntegrityDecryptionKeyPath for production deployments. |
+| `wallet_provider.attestation.native_attestation.google_play_integrity_decryption_key_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY_PATH` | string | GooglePlayIntegrityDecryptionKeyPath is a path to a file containing the decryption key (preferred over the inline value — same pattern as PKCS11.PINPath / JWT.SecretPath, so this AES key material can be mounted from a secret store instead of living in plain env vars/YAML). |
+| `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY` | string | GooglePlayIntegrityVerificationKey is the base64-encoded verification key. Prefer GooglePlayIntegrityVerificationKeyPath for production deployments. |
+| `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH` | string | GooglePlayIntegrityVerificationKeyPath is a path to a file containing the verification key (preferred over the inline value). |
 
 ## trust
 
@@ -206,6 +265,17 @@ Environment prefix: `WALLET_AUTHZEN_PROXY`
 | `authzen_proxy.allow_resolution` | `WALLET_AUTHZEN_PROXY_ALLOW_RESOLUTION` | boolean | AllowResolution controls whether resolution-only requests are allowed. Resolution requests fetch metadata (DID documents, entity configs) without key validation. Default: true |
 | `authzen_proxy.fail_open_on_tenant_lookup_error` | `WALLET_AUTHZEN_PROXY_FAIL_OPEN_ON_TENANT_LOOKUP_ERROR` | boolean | FailOpenOnTenantLookupError controls behavior when per-tenant PDP lookup fails. If false (default), tenant lookup errors return an error to the client. If true, falls back to the global PDP URL on lookup errors. Security note: fail-closed (false) prevents bypassing per-tenant security policies. |
 
+## audit
+
+Environment prefix: `WALLET_AUDIT`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `audit.enabled` | `WALLET_AUDIT_ENABLED` | boolean | Enabled enables SET audit event emission. |
+| `audit.issuer` | `WALLET_AUDIT_ISSUER` | string | Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org"). |
+| `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
+| `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
+
 ## Registry Server
 
 The registry server (`cmd/registry`) has its own configuration file. It serves VCTM (Verifiable Credential Type Metadata) fetched from upstream registries.
@@ -237,7 +307,8 @@ Environment prefix: `REGISTRY_SOURCE`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `source.url` | `REGISTRY_SOURCE_URL` | string | URL of the upstream registry index. Supports both the legacy vctm-registry.json format and the TS11-compliant /api/v1/schemas.json endpoint – the format is auto-detected from the response. |
+| `source.url` | `REGISTRY_SOURCE_URL` | string | URL of the upstream registry. The actual endpoint is determined by the Mode setting. |
+| `source.mode` | `REGISTRY_SOURCE_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials). |
 | `source.local_overrides` | `REGISTRY_SOURCE_LOCAL_OVERRIDES` | string list | LocalOverrides is a list of local file or directory paths containing VCTM JSON files. These are loaded at startup and take priority over entries fetched from the remote registry. Directories are scanned for *.json files. Entries are keyed by their "vct" field. |
 | `source.poll_interval` | `REGISTRY_SOURCE_POLL_INTERVAL` | duration | PollInterval is how often to poll the upstream registry for updates |
 | `source.timeout` | `REGISTRY_SOURCE_TIMEOUT` | duration | Timeout for HTTP requests to the upstream registry |
@@ -250,7 +321,8 @@ Environment prefix: `REGISTRY_SOURCES`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `sources[*].url` | `REGISTRY_SOURCES_URL` | string | URL of the upstream registry index. Supports both the legacy vctm-registry.json format and the TS11-compliant /api/v1/schemas.json endpoint – the format is auto-detected from the response. |
+| `sources[*].url` | `REGISTRY_SOURCES_URL` | string | URL is the base URL of the registry (e.g. "https://registry.siros.org"). The actual endpoint path is determined by the Mode setting. For backward compatibility, if a full path to a specific endpoint is given (e.g. ending in schemas.json or registry.json), it is used as-is regardless of Mode. |
+| `sources[*].mode` | `REGISTRY_SOURCES_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) for only TS11-compliant credentials, or "registry" for all credentials including non-TS11. |
 | `sources[*].timeout` | `REGISTRY_SOURCES_TIMEOUT` | duration | Timeout for HTTP requests to this source. Zero means no per-source timeout (the shared http.Client timeout applies). |
 
 ## registry.cache
@@ -325,6 +397,7 @@ Environment prefix: `REGISTRY_JWT`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `jwt.secret` | `REGISTRY_JWT_SECRET` | string | Secret is the shared secret for validating JWT signatures (HMAC) |
+| `jwt.secret_path` | `REGISTRY_JWT_SECRET_PATH` | string | SecretPath is an alternative to Secret: path to a file containing the JWT secret. If both Secret and SecretPath are set, SecretPath takes precedence. |
 | `jwt.issuer` | `REGISTRY_JWT_ISSUER` | string | Issuer is the expected issuer claim in the JWT |
 | `jwt.require_auth` | `REGISTRY_JWT_REQUIRE_AUTH` | boolean | RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed) |
 
