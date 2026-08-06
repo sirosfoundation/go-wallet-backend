@@ -272,6 +272,11 @@ func handleDelegationTokenRequest(
 	}
 
 	// Validate downscoping: delegated TAC must be subset of parent TAC.
+	// This is the complete security boundary for delegation - a delegated
+	// token can never exceed what its own parent already had, regardless
+	// of what SPOCP evaluation below would otherwise allow - see
+	// rules/delegation.rules for why SPOCP itself doesn't independently
+	// restrict this.
 	if !tac.IsSubsetOf(parentClaims.TAC) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error": "delegated permissions exceed parent token",
