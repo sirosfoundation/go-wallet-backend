@@ -31,7 +31,7 @@ require (
 	github.com/getkin/kin-openapi v0.145.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.0
-	github.com/sirosfoundation/go-tokenauth v0.1.0
+	github.com/sirosfoundation/go-tokenauth v0.3.0
 )
 
 require (

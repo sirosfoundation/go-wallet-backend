@@ -1,6 +1,10 @@
 package engine
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,14 +14,76 @@ import (
 	"testing"
 	"time"
 
+	gojose "github.com/go-jose/go-jose/v4"
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+// setupEngineTokenValidatorTest starts a local JWKS server and a
+// go-tokenauth validator pointed at it, mirroring the same helper used in
+// pkg/middleware and internal/server tests.
+func setupEngineTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ecdsa.PrivateKey, string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	jwk := gojose.JSONWebKey{Key: &key.PublicKey, KeyID: "test-key", Algorithm: string(gojose.ES256)}
+	jwks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(jwks) //nolint:errcheck
+	}))
+	t.Cleanup(srv.Close)
+
+	v := tokenvalidator.New(tokenvalidator.Config{JWKSURL: srv.URL, Issuer: "test-issuer"})
+	v.Start(context.Background())
+	t.Cleanup(v.Stop)
+
+	// Poll until the validator has actually fetched the JWKS, rather than
+	// sleeping a fixed duration (flaky under slow/contended CI runners).
+	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	require.Eventually(t, func() bool {
+		_, err := v.Validate(context.Background(), probe)
+		return err == nil
+	}, 2*time.Second, 10*time.Millisecond, "validator did not fetch JWKS in time")
+
+	return v, key, "test-issuer"
+}
+
+func signEngineToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl claims.AccessTokenClaims) string {
+	t.Helper()
+
+	signer, err := gojose.NewSigner(
+		gojose.SigningKey{Algorithm: gojose.ES256, Key: key},
+		(&gojose.SignerOptions{}).WithType("JWT").WithHeader("kid", "test-key"),
+	)
+	require.NoError(t, err)
+
+	now := time.Now()
+	cl.Claims = gojosejwt.Claims{
+		Issuer:    issuer,
+		Subject:   cl.Claims.Subject,
+		Audience:  cl.Claims.Audience,
+		IssuedAt:  gojosejwt.NewNumericDate(now),
+		NotBefore: gojosejwt.NewNumericDate(now.Add(-1 * time.Second)),
+		Expiry:    gojosejwt.NewNumericDate(now.Add(5 * time.Minute)),
+	}
+
+	raw, err := gojosejwt.Signed(signer).Claims(cl).Serialize()
+	require.NoError(t, err)
+	return raw
+}
 
 // TestManager_ConnectionLimit_CountsUnhandshakedConnections is a regression
 // test: an upgraded connection that never sends a handshake must still count
@@ -329,6 +395,48 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+// TestManager_validateToken_GoTokenauth_AllowsRegistryAudience is a
+// regression test for the engine transport audience restriction: the engine
+// transport, like the AuthZEN proxy, only needs a wallet-registry or
+// wallet-backend audience.
+func TestManager_validateToken_GoTokenauth_AllowsRegistryAudience(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	token := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}},
+		TenantID: "test-tenant",
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	_, tenantID, err := m.validateToken(token)
+	require.NoError(t, err)
+	assert.Equal(t, "test-tenant", tenantID)
+}
+
+// TestManager_validateToken_GoTokenauth_RejectsOtherAudience confirms a
+// token scoped to a different audience is not usable on the engine
+// transport, mirroring the AuthZEN proxy restriction.
+func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	token := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"some-other-audience"}},
+		TenantID: "test-tenant",
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	_, _, err := m.validateToken(token)
 	assert.Error(t, err)
 }
 
