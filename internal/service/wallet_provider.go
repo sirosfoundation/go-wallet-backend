@@ -297,12 +297,20 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		// x5c signing certificate below.
 		"jti":           uuid.New().String(),
 		"attested_keys": attested,
-		// c_nonce (not `nonce`): TS03 §2.3.2 requires a KA sent via the
-		// `attestation` proof type to carry `c_nonce`. When a KA is instead
-		// wrapped in the `jwt` proof type, the nonce belongs in the outer
-		// proof JWT's body (built client-side), not here — this claim is
-		// then unused by conformant verifiers but harmless to include.
+		// c_nonce (TS03 §2.3.2 requires a KA sent via the `attestation`
+		// proof type to carry `c_nonce`) *and* nonce (the plain OpenID4VCI
+		// `attestation` proof type claim name some issuers - confirmed
+		// against a live geneva2026.mdoc.online conformance run - only
+		// recognize under this name, rejecting c_nonce-only KAs with
+		// invalid_nonce/"The nonce is not known"): send both rather than
+		// picking a side in what value TS03 vs. base OpenID4VCI expect
+		// here. An unrecognized extra claim is harmless to a conformant
+		// verifier (same reasoning that already applies when a KA is
+		// wrapped in the `jwt` proof type instead, where neither claim is
+		// consulted at all) - this keeps TS03/ARF compliance for verifiers
+		// that expect c_nonce while restoring interop with ones that don't.
 		"c_nonce": nonce,
+		"nonce":   nonce,
 		"iat":     now.Unix(),
 		"exp":     now.Add(kaExpiry).Unix(),
 	}

@@ -388,6 +388,9 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 	if claims["c_nonce"] != "my-nonce" {
 		t.Errorf("c_nonce = %v, want my-nonce", claims["c_nonce"])
 	}
+	if claims["nonce"] != "my-nonce" {
+		t.Errorf("nonce = %v, want my-nonce (sent alongside c_nonce for interop)", claims["nonce"])
+	}
 
 	if token.Header["typ"] != "keyattestation+jwt" {
 		t.Errorf("typ = %v, want keyattestation+jwt", token.Header["typ"])
@@ -442,6 +445,9 @@ func TestGenerateKeyAttestation_NoRevocationClaims(t *testing.T) {
 	}
 	if claims["c_nonce"] != "nonce" {
 		t.Errorf("c_nonce = %v, want %q (TS03 §2.3.2 requires c_nonce, not nonce)", claims["c_nonce"], "nonce")
+	}
+	if claims["nonce"] != "nonce" {
+		t.Errorf("nonce = %v, want %q (sent alongside c_nonce for interop with issuers expecting the base OpenID4VCI claim name)", claims["nonce"], "nonce")
 	}
 }
 
