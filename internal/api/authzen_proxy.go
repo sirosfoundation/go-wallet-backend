@@ -235,9 +235,15 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 		return
 	}
 
-	// Get user ID for audit logging
-	userIDVal, _ := c.Get("user_id")
-	userID := fmt.Sprintf("%v", userIDVal)
+	// Get user ID for audit logging. Not set at all for anonymous requests
+	// (see TokenAuthMiddleware) - "" (rather than the fmt.Sprintf("<nil>")
+	// a bare type assertion on the missing key would otherwise produce)
+	// keeps this readable in logs and matches the pre-existing convention
+	// used elsewhere in this codebase for "no identity" callers.
+	var userID string
+	if v, exists := c.Get("user_id"); exists {
+		userID = fmt.Sprintf("%v", v)
+	}
 
 	// Parse the evaluation request
 	var req gotrust.EvaluationRequest

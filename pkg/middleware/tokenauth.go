@@ -98,9 +98,23 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			)
 		}
 
-		// Populate context keys for existing handlers
-		c.Set("user_id", result.UserID)
-		c.Set("did", result.DID)
+		// Populate context keys for existing handlers.
+		//
+		// user_id/did are deliberately only set when non-empty: an anonymous
+		// token (see AS's handleAnonymousTokenRequest) validates successfully
+		// with an empty UserID/DID, and the common handler idiom is
+		// `val, exists := c.Get("user_id")`. If we always called c.Set here,
+		// exists would be true even for an anonymous caller — a value of ""
+		// looks like "we know who this is, and it's the empty string" rather
+		// than "no identity at all". Handlers must be able to tell the two
+		// apart via the exists boolean alone, without also remembering to
+		// check for an empty string every time.
+		if result.UserID != "" {
+			c.Set("user_id", result.UserID)
+		}
+		if result.DID != "" {
+			c.Set("did", result.DID)
+		}
 		c.Set("token", rawToken)
 		c.Set("tenant_id", tenantID)
 		c.Set("tenant", tenant)
