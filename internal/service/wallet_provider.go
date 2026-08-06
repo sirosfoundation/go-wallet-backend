@@ -334,7 +334,7 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// remote-HSM claim. See internal/service/wallet_provider_test.go for
 	// the regression tests this guards.
 	if secProps != nil {
-		trusted := s.instanceHasNativeAttestation(ctx, walletInstanceID)
+		trusted := s.instanceHasTrustedKeyEvidence(ctx, walletInstanceID)
 		normalized := normalizeSecurityProperties(secProps, trusted)
 		if len(normalized.KeyStorage) > 0 {
 			claims["key_storage"] = normalized.KeyStorage
@@ -379,13 +379,18 @@ var nativeAttestationSources = map[string]bool{
 	"android_play_integrity": true,
 }
 
-// instanceHasNativeAttestation reports whether walletInstanceID resolves to
-// a WalletInstance whose WIA was backed by verified native platform
-// attestation. Returns false on a missing ID, an unknown instance, a
-// lookup error, or a nil instance store (e.g. in tests that construct
-// WalletProviderService directly) — all of which mean there's no evidence
-// to corroborate an elevated claim, not that one should be granted.
-func (s *WalletProviderService) instanceHasNativeAttestation(ctx context.Context, walletInstanceID string) bool {
+// instanceHasTrustedKeyEvidence reports whether walletInstanceID resolves
+// to a WalletInstance with independent evidence corroborating an elevated
+// security_properties claim — either its WIA was backed by verified native
+// platform attestation (Tier 1: App Attest/Play Integrity, re-derived fresh
+// on every WIA request), OR it has a durably verified FIDO2/CTAP2 hardware
+// attestation on file (HardwareKeyAttested, set once at key-registration
+// time — see MarkHardwareKeyAttested's doc for why this can't be folded
+// into AttestationSource). Returns false on a missing ID, an unknown
+// instance, a lookup error, or a nil instance store (e.g. in tests that
+// construct WalletProviderService directly) — all of which mean there's no
+// evidence to corroborate an elevated claim, not that one should be granted.
+func (s *WalletProviderService) instanceHasTrustedKeyEvidence(ctx context.Context, walletInstanceID string) bool {
 	if s.instances == nil || walletInstanceID == "" {
 		return false
 	}
@@ -396,7 +401,7 @@ func (s *WalletProviderService) instanceHasNativeAttestation(ctx context.Context
 		}
 		return false
 	}
-	return nativeAttestationSources[instance.AttestationSource]
+	return nativeAttestationSources[instance.AttestationSource] || instance.HardwareKeyAttested
 }
 
 // isoAttackPotential maps SIROS's internal WSCD key-storage/user-auth

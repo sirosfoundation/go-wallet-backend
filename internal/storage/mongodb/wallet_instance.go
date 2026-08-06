@@ -168,6 +168,28 @@ func (s *WalletInstanceStore) IncrementAttestation(ctx context.Context, id strin
 	return nil
 }
 
+// MarkHardwareKeyAttested durably records a verified FIDO2 attestation.
+// Deliberately its own targeted $set — never folded into Upsert's, so a
+// routine WIA reissuance (which calls Upsert, not this) can never revert
+// it. See domain.WalletInstance.HardwareKeyAttested's doc comment.
+func (s *WalletInstanceStore) MarkHardwareKeyAttested(ctx context.Context, id string, verifiedAt time.Time) error {
+	update := bson.M{
+		"$set": bson.M{
+			"hardware_key_attested":            true,
+			"hardware_attestation_verified_at": verifiedAt,
+			"updated_at":                       time.Now().UTC(),
+		},
+	}
+	res, err := s.collection.UpdateByID(ctx, id, update)
+	if err != nil {
+		return fmt.Errorf("%w: mark hardware key attested: %v", storage.ErrDatabase, err)
+	}
+	if res.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(ctx context.Context, id string) error {
 	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
 	if err != nil {

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -255,6 +256,12 @@ type WalletInstanceStore interface {
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
+
+	// MarkHardwareKeyAttested durably records that a real FIDO2/CTAP2
+	// attestation object was verified for this instance. Deliberately
+	// separate from Upsert: a routine WIA reissuance must never touch
+	// this field (see domain.WalletInstance.HardwareKeyAttested's doc).
+	MarkHardwareKeyAttested(ctx context.Context, id string, verifiedAt time.Time) error
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error

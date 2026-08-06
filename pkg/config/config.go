@@ -569,6 +569,22 @@ type AttestationConfig struct {
 
 	// NativeAttestation controls platform attestation verification.
 	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
+
+	// FIDO2Attestation controls FIDO2/CTAP2 hardware-key attestation
+	// verification (e.g. a YubiKey's rawSign plugin) — a distinct trust
+	// path from NativeAttestation (platform attestation), verified once at
+	// key-registration time rather than per-WIA-request. See
+	// FIDO2AttestationService.
+	FIDO2Attestation FIDO2AttestationConfig `yaml:"fido2_attestation" envconfig:"FIDO2_ATTESTATION"`
+}
+
+// FIDO2AttestationConfig controls FIDO2/CTAP2 hardware-key attestation
+// verification.
+type FIDO2AttestationConfig struct {
+	// Enabled controls whether the FIDO2 key-attestation registration
+	// endpoint accepts and verifies attestation objects. Off by default —
+	// like NativeAttestation, this is an explicit opt-in trust decision.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 }
 
 // NativeAttestationConfig controls platform-specific attestation verification.

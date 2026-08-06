@@ -25,6 +25,7 @@ type Services struct {
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
+	FIDO2Attestation *FIDO2AttestationService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	AAGUIDValidator  *AAGUIDValidator
@@ -92,6 +93,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
+		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), logger),
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
