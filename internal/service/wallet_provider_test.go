@@ -723,3 +723,30 @@ func TestNewWalletProviderService_NoKeys(t *testing.T) {
 		t.Error("service should not be supported without keys")
 	}
 }
+
+func TestWalletProviderService_PublicKey(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	pub := svc.PublicKey()
+	if pub == nil {
+		t.Fatal("expected non-nil public key when a signer is configured")
+	}
+	ecPub, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("expected *ecdsa.PublicKey, got %T", pub)
+	}
+	signerKey, ok := svc.signer.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatalf("expected signer to be *ecdsa.PrivateKey, got %T", svc.signer)
+	}
+	if !ecPub.Equal(&signerKey.PublicKey) {
+		t.Error("PublicKey() should return the signer's public key")
+	}
+}
+
+func TestWalletProviderService_PublicKey_NilWithoutSigner(t *testing.T) {
+	svc := &WalletProviderService{cfg: &config.Config{}}
+	if pub := svc.PublicKey(); pub != nil {
+		t.Errorf("expected nil PublicKey() without a configured signer, got %v", pub)
+	}
+}

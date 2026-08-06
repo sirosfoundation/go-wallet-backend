@@ -906,6 +906,14 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 			wp.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
 		}
 	}
+
+	// Register the wallet provider's own JWKS, same as BackendProvider does
+	// (see BackendProvider.RegisterRoutes) - deployments that run
+	// wallet-provider as its own standalone role (RoleWalletProvider without
+	// RoleBackend) still need this for relying parties resolving trust via
+	// an iss-based WIA. No-ops if WIA/the wallet provider signing key isn't
+	// configured.
+	service.RegisterWalletProviderJWKSRoute(router, p.Services().WalletProvider)
 }
 
 // Services returns the service aggregate.

@@ -31,6 +31,14 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+
+	// asEnabledExplicit records whether as.enabled was explicitly present in
+	// the YAML file or environment (as opposed to defaulting to its bool
+	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
+	// can tell "operator explicitly disabled AS" apart from "AS section
+	// never configured". Unexported: never (un)marshaled, so it can't leak
+	// into YAML output or be set by config files/env itself.
+	asEnabledExplicit bool
 }
 
 // ASConfig contains the new Authorization Server configuration.
@@ -113,6 +121,72 @@ func (c *ASConfig) SetDefaults() {
 	}
 	if c.DefaultMaxTAC == "" {
 		c.DefaultMaxTAC = "rwl"
+	}
+}
+
+// defaultASRulesDir is where EnableForRole expects the baseline SPOCP
+// policy to ship inside the container image (see rules/, copied here by
+// the Dockerfile). It's a var, not a const, so a packager whose filesystem
+// layout doesn't match the container's (e.g. a .deb following FHS) can
+// override it at build time without patching this file:
+//
+//	go build -ldflags "-X github.com/sirosfoundation/go-wallet-backend/pkg/config.defaultASRulesDir=/usr/share/go-wallet-backend/rules"
+var defaultASRulesDir = "/app/rules"
+
+// EnableForRole turns on the AS for deployments that request the "auth" role
+// (including via --mode=all), and fills in defaults for anything left
+// unconfigured. There is no separate AS-specific key or policy to configure:
+// it reuses the wallet provider's own signing key (when file-based - see the
+// PKCS11 note below), since every deployment already configures one for
+// WIA/Key Attestation, and falls back to the baseline policy bundled in the
+// image (see rules/, copied to /app/rules by the Dockerfile) rather than
+// requiring a deployment-specific RulesDir - a role flag alone should be
+// enough to turn AS on, matching how every other role works.
+//
+// An operator's explicit as.enabled: false always wins and skips all of the
+// above - relies on Config.asEnabledExplicit (set by Load()) rather than
+// c.AS.Enabled itself, since a plain bool can't distinguish "explicitly set
+// to false" from "never configured" (both are the zero value). An explicit
+// as.enabled: true does NOT skip defaulting here - it's treated the same as
+// "unconfigured" by this function's own logic.
+//
+// That said, `as: {enabled: true}` alone in a YAML file does NOT actually
+// work end-to-end via the normal startup path: Load() calls Validate()
+// before cmd/server/main.go ever calls EnableForRole(), and Validate()
+// unconditionally requires signing_key_path/rules_dir whenever AS.Enabled is
+// true - so Load() itself rejects that YAML before this function gets a
+// chance to fill in the defaults. This function's explicit-true handling
+// only matters for callers that construct/mutate a Config without going
+// through Load()'s validation first.
+func (c *Config) EnableForRole() {
+	if c.asEnabledExplicit && !c.AS.Enabled {
+		return
+	}
+	c.AS.Enabled = true
+	// Auto-enable can only inherit the wallet provider's signing key when
+	// the wallet provider is purely file-based - never when PKCS11 is
+	// configured for it, even if PrivateKeyPath is ALSO set as a runtime
+	// fallback (WalletProviderService tries PKCS11 first, independently of
+	// whether a file key is also configured). Inheriting the file path
+	// there would silently sign AS tokens with the weaker on-disk key while
+	// the wallet provider itself actually signs WIA/KA with the HSM key -
+	// a real, silent security downgrade, not just an unsupported
+	// configuration. AS's own PKCS11 signing is not implemented (see
+	// Validate()), so this deliberately leaves SigningKeyPath empty in that
+	// case; Validate() then rejects with a clear, actionable error rather
+	// than silently limping along with AS enabled on the wrong key.
+	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" && !walletProviderUsesPKCS11 {
+		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
+	}
+	if c.AS.RulesDir == "" {
+		// Baseline policy (read-only always allowed, own-tenant access for
+		// any tac) every deployment gets unless it configures its own.
+		c.AS.RulesDir = defaultASRulesDir
+	}
+	c.AS.SetDefaults()
+	if c.AS.Issuer == "" {
+		c.AS.Issuer = c.JWT.Issuer
 	}
 }
 
@@ -337,7 +411,7 @@ func (c *CORSConfig) SetDefaults() {
 	}
 	if len(c.AllowedHeaders) == 0 {
 		c.AllowedHeaders = []string{
-			"Authorization", "Content-Type", "X-Tenant-ID",
+			"Authorization", "Content-Type", "X-Tenant-ID", "X-Token-Mode",
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
@@ -978,11 +1052,15 @@ func Load(configFile string) (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
+			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 		}
 	}
 
 	// Override with environment variables (highest priority)
 	// Since we removed `default:` tags, this only applies actual env vars
+	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
+		cfg.asEnabledExplicit = true
+	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
@@ -1006,6 +1084,23 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
+// `as.enabled` key, regardless of its value - used to distinguish "operator
+// explicitly configured as.enabled" from "AS section absent/defaulted",
+// which a plain bool field can't express on its own (see EnableForRole).
+func yamlHasASEnabledKey(data []byte) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	as, ok := raw["as"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = as["enabled"]
+	return ok
 }
 
 // loadSecretsFromFiles loads secrets from file paths.

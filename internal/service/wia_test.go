@@ -283,8 +283,15 @@ func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
 	if token.Header["x5c"] != nil {
 		t.Error("x5c header should be omitted in ietf mode")
 	}
+
+	// Regression: without a kid header, a relying party has no self-contained
+	// key material (no x5c, no embedded jwk) and no way to know which of the
+	// wallet provider's published JWKS keys to use for signature
+	// verification (confirmed against a real relying party: SUNET/vc's
+	// pkg/trust JWT verification requires kid to resolve via JWKS). Must
+	// match RegisterWalletProviderJWKSRoute's hardcoded KeyID.
 	if token.Header["kid"] != "wallet-provider" {
-		t.Errorf("kid = %v, want wallet-provider", token.Header["kid"])
+		t.Errorf("kid = %v, want %q (must match RegisterWalletProviderJWKSRoute's KeyID)", token.Header["kid"], "wallet-provider")
 	}
 
 	claims := token.Claims.(jwt.MapClaims)
