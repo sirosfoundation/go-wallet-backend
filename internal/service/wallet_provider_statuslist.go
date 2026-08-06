@@ -28,7 +28,7 @@ const emptyStatusListSize = 1
 // No-op (never registers the route) when the wallet provider has no signing
 // key configured, mirroring RegisterWalletProviderJWKSRoute.
 func RegisterWalletProviderStatusListRoute(router gin.IRoutes, wp *WalletProviderService) {
-	if wp == nil || wp.jwtSigner == nil {
+	if wp == nil || wp.cfg == nil || wp.jwtSigner == nil {
 		return
 	}
 

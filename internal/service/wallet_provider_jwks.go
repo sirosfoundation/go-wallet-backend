@@ -31,7 +31,7 @@ import (
 // signing key configured, so environments without WIA enabled see a plain
 // 404 rather than a route that always errors.
 func RegisterWalletProviderJWKSRoute(router gin.IRoutes, wp *WalletProviderService) {
-	if wp == nil {
+	if wp == nil || wp.cfg == nil {
 		return
 	}
 	pub := wp.PublicKey()

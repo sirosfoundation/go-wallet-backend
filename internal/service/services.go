@@ -67,6 +67,16 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
 		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		// A signing key alone is enough to construct WIAService, but "etsi"
+		// mode additionally requires a certificate chain (see IsSupported).
+		// Leaving wiaSvc non-nil here would register the WIA routes, but
+		// every actual call would fail with ErrWIANotSupported, which the
+		// handlers map to a generic 500 rather than the clean 503
+		// WIA_NOT_SUPPORTED they already return for services.WIA == nil -
+		// nil it out here so that existing check covers this case too.
+		if !wiaSvc.IsSupported() {
+			wiaSvc = nil
+		}
 	}
 
 	return &Services{

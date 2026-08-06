@@ -210,6 +210,27 @@ func TestRegisterWalletProviderJWKSRoute_NoOpWhenNoSigningKey(t *testing.T) {
 	}
 }
 
+// TestRegisterWalletProviderJWKSRoute_NoOpWhenNilConfig is a regression test:
+// a WalletProviderService with a real signer but nil cfg (e.g. constructed
+// directly, bypassing NewWalletProviderService) must no-op rather than panic
+// on the WIA.Mode check below.
+func TestRegisterWalletProviderJWKSRoute_NoOpWhenNilConfig(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+	svc.cfg = nil
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterWalletProviderJWKSRoute(r, svc)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (route should not be registered)", w.Code, http.StatusNotFound)
+	}
+}
+
 func TestRegisterWalletProviderJWKSRoute_NoOpWhenNilService(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

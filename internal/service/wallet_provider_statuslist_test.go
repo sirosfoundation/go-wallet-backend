@@ -34,6 +34,27 @@ func TestRegisterWalletProviderStatusListRoute_NoOpWithoutSigner(t *testing.T) {
 	}
 }
 
+// TestRegisterWalletProviderStatusListRoute_NoOpWhenNilConfig is a
+// regression test: a WalletProviderService with a real jwtSigner but nil
+// cfg (e.g. constructed directly, bypassing NewWalletProviderService) must
+// no-op rather than panic on the Server.BaseURL access below.
+func TestRegisterWalletProviderStatusListRoute_NoOpWhenNilConfig(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+	svc.cfg = nil
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	RegisterWalletProviderStatusListRoute(router, svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/wallet-provider/status-list", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (route should not be registered)", rec.Code)
+	}
+}
+
 // TestRegisterWalletProviderStatusListRoute_ServesAllValidList verifies the
 // endpoint serves a well-formed, always-empty (all-VALID) Token Status List
 // JWT — see RegisterWalletProviderStatusListRoute's doc comment: nothing this
