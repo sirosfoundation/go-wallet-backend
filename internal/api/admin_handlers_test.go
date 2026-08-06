@@ -1006,3 +1006,29 @@ func TestTenantToResponse(t *testing.T) {
 
 	// tenantToResponse is tested implicitly through the handlers
 }
+
+func TestAdminHandlers_RegisterRoutes(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	adminGroup := router.Group("/admin")
+	handlers.RegisterRoutes(adminGroup)
+
+	wantPaths := map[string]bool{
+		"/admin/tenants":                           false,
+		"/admin/tenants/:id":                       false,
+		"/admin/tenants/:id/users":                 false,
+		"/admin/tenants/:id/users/:user_id":        false,
+		"/admin/tenants/:id/users/:user_id/detail": false,
+		"/admin/tenants/:id/stats":                 false,
+		"/admin/tenants/:id/invites":               false,
+	}
+	for _, ri := range router.Routes() {
+		if _, ok := wantPaths[ri.Path]; ok {
+			wantPaths[ri.Path] = true
+		}
+	}
+	for path, found := range wantPaths {
+		if !found {
+			t.Errorf("expected route %q to be registered", path)
+		}
+	}
+}

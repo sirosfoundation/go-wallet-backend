@@ -287,7 +287,13 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
 	var user domain.User
-	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user)
+	// False positive: bson.M is a typed document builder, not a query string.
+	// The key here ("_id.id") is a fixed literal; id.String() is only ever used
+	// as a plain field VALUE, which the driver BSON-encodes as a string and
+	// compares by equality. A string value can never be interpreted as a Mongo
+	// query operator (only "$"-prefixed map KEYS are), so untrusted input
+	// reaching this call site cannot inject query semantics.
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user) // codeql[go/sql-injection]
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
