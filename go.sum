@@ -149,8 +149,8 @@ github.com/sirosfoundation/go-siros-set v0.1.0 h1:MN9AM3DXD05h+siUeMiV5Gjjte4Rx1
 github.com/sirosfoundation/go-siros-set v0.1.0/go.mod h1:HmgBclV01wp81itz2gYpn91L8lABWwxpbE38rkR1y20=
 github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G1ihb9FCPs=
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
-github.com/sirosfoundation/go-tokenauth v0.2.0 h1:mHJ9nHN7thXyQ1kSyYka2UI+BY8al3vgkrfcMnrKBc8=
-github.com/sirosfoundation/go-tokenauth v0.2.0/go.mod h1:cF1S4ev6ZaRl/Jt7boxO+fduuFtKDF8DEFaExB95kKM=
+github.com/sirosfoundation/go-tokenauth v0.3.0 h1:M/4R+qrQ78sHmxGa0kIJh1OPorfGMvXWPOUCXOqDLXU=
+github.com/sirosfoundation/go-tokenauth v0.3.0/go.mod h1:cF1S4ev6ZaRl/Jt7boxO+fduuFtKDF8DEFaExB95kKM=
 github.com/sirosfoundation/go-trust v0.9.2 h1:NApXxYMkYi+OimLDhOSFfktsFo6wYmSeLkleL7ycuLc=
 github.com/sirosfoundation/go-trust v0.9.2/go.mod h1:9dYlhsPyK8zoBzSFa+gRsTLfgkpVbeBYCGCv8hhf9ig=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5 h1:1UkTjkgj6NSA04SogK6tvfvlMZVT7vkdfWsJurwe69Q=

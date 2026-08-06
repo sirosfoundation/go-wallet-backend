@@ -191,17 +191,13 @@ func RequireAudience(allowed ...string) gin.HandlerFunc {
 			return
 		}
 
-		for _, tokenAud := range result.Audience {
-			for _, want := range allowed {
-				if tokenAud == want {
-					c.Next()
-					return
-				}
-			}
+		if !result.HasAudience(allowed...) {
+			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
+			c.Abort()
+			return
 		}
 
-		c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
-		c.Abort()
+		c.Next()
 	}
 }
 
