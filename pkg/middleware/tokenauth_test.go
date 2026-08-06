@@ -68,8 +68,19 @@ func setupTokenAuthTest(t *testing.T) (*validator.Validator, *ecdsa.PrivateKey, 
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
-	// Wait for JWKS to be fetched
-	time.Sleep(100 * time.Millisecond)
+	// Poll until the validator has actually fetched the JWKS, rather than
+	// sleeping a fixed duration (flaky under slow/contended CI runners).
+	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := v.Validate(context.Background(), probe); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("validator did not fetch JWKS in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	return v, key, "test-issuer"
 }

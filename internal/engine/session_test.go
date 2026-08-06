@@ -50,7 +50,13 @@ func setupEngineTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
-	time.Sleep(100 * time.Millisecond)
+	// Poll until the validator has actually fetched the JWKS, rather than
+	// sleeping a fixed duration (flaky under slow/contended CI runners).
+	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	require.Eventually(t, func() bool {
+		_, err := v.Validate(context.Background(), probe)
+		return err == nil
+	}, 2*time.Second, 10*time.Millisecond, "validator did not fetch JWKS in time")
 
 	return v, key, "test-issuer"
 }
