@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -53,11 +54,17 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	conn     *websocket.Conn
-	sendMu   sync.Mutex
-	flows    map[string]*Flow
-	flowsMu  sync.RWMutex
-	logger   *zap.Logger
+	// TAC is only ever populated on the go-tokenauth path - see
+	// Manager.validateToken. An empty TAC means "not applicable" (legacy
+	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
+	// per-protocol check must treat it as a no-op, exactly like
+	// requireTACIfEnforced does for HTTP routes.
+	TAC     claims.TAC
+	conn    *websocket.Conn
+	sendMu  sync.Mutex
+	flows   map[string]*Flow
+	flowsMu sync.RWMutex
+	logger  *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -241,7 +248,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	userID, tenantID, err := m.validateToken(handshake.AppToken)
+	userID, tenantID, tac, err := m.validateToken(handshake.AppToken)
 	if err != nil {
 		m.logger.Warn("Authentication failed",
 			zap.Error(err),
@@ -271,6 +278,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		ID:            sessionID,
 		UserID:        userID,
 		TenantID:      tenantID,
+		TAC:           tac,
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -447,6 +455,15 @@ func (m *Manager) handleSession(session *Session) {
 	}
 }
 
+// requiredTACForProtocol maps each flow protocol to the TAC permission its
+// action semantically requires: OID4VP shares an existing credential (read),
+// OID4VCI receives a new one (insert). Only enforced when the session
+// actually has a TAC to check - see handleFlowStart.
+var requiredTACForProtocol = map[Protocol]string{
+	ProtocolOID4VP:  "r",
+	ProtocolOID4VCI: "i",
+}
+
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
@@ -471,6 +488,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	if !ok {
 		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
 		return
+	}
+
+	// TAC check: only enforced when the session actually has a TAC to check
+	// (empty means legacy auth, which has no TAC concept - see
+	// Manager.validateToken - not "no permissions"), mirroring
+	// requireTACIfEnforced's identical conditional enforcement for HTTP
+	// routes (internal/server/providers.go).
+	if session.TAC != "" {
+		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
+			_ = session.SendFlowError(flowID, "", ErrCodeAuthorizationFail, "insufficient permissions for protocol: "+string(msg.Protocol))
+			logger.Warn("Rejected flow start - insufficient TAC",
+				zap.String("tac", string(session.TAC)),
+				zap.String("required", required),
+			)
+			return
+		}
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
@@ -588,20 +621,25 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed")
 }
 
-func (m *Manager) validateToken(tokenString string) (userID, tenantID string, err error) {
+// validateToken authenticates tokenString and returns its identity.
+// tac is only ever populated on the go-tokenauth path - the legacy HMAC
+// path (below) has no TAC concept at all, so callers must treat an empty
+// tac as "not applicable here", not "no permissions", exactly like
+// requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
+func (m *Manager) validateToken(tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
 		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
 		if !result.HasAudience("wallet-registry", "wallet-backend") {
-			return "", "", errors.New("token audience not permitted for engine transport")
+			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, nil
+		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
 	// Legacy path: direct HMAC validation
@@ -613,23 +651,23 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
 		// Support both "user_id" (go-wallet-backend native) and "uuid" (wallet-backend-server compat)
-		userID, _ = claims["user_id"].(string)
+		userID, _ = mapClaims["user_id"].(string)
 		if userID == "" {
-			userID, _ = claims["uuid"].(string)
+			userID, _ = mapClaims["uuid"].(string)
 		}
-		tenantID, _ = claims["tenant_id"].(string)
+		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
-			return "", "", errors.New("invalid token claims: missing user_id or uuid")
+			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
-		return userID, tenantID, nil
+		return userID, tenantID, "", nil
 	}
 
-	return "", "", errors.New("invalid token")
+	return "", "", "", errors.New("invalid token")
 }
 
 func (m *Manager) getCapabilities() []string {
