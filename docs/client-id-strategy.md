@@ -20,9 +20,9 @@ attestation-rooted identity.
 | 3 | Verifier attestation scheme | **Merged** | go-wallet-backend #238 |
 | 3a | SUNET/vc federation entity config | In progress | SUNET/vc (separate session) |
 | 3b | SUNET/vc DID-based identity | In progress | SUNET/vc (separate session) |
-| 3c | SUNET/vc eliminate static client map | **Implemented** (via WIA, see Phase 4) | SUNET/vc #556 |
+| 3c | SUNET/vc eliminate static client map | **Implemented** (via WIA, see Phase 4a) | SUNET/vc #556 |
 | 4 | Server-side issuer trust evaluation | **Merged** | go-wallet-backend #239 |
-| 4 | WIA + KA issuer auth (no pre-registration) | **Implemented, verified E2E against a live issuer** | go-wallet-backend #259, wallet-frontend #196, SUNET/vc #556 |
+| 4a | WIA + KA issuer auth (no pre-registration) | **Implemented, verified E2E against a live issuer** | go-wallet-backend #259, wallet-frontend #196, SUNET/vc #556 |
 | 5 | Deprecate pre-registration | Operational | go-trust config change only |
 | 6 | Native SDK typed TrustResult | **Merged** | Kotlin #46, Swift #44 |
 | 7 | ClientIdScheme parsing + audience validation | **Merged** | Kotlin #47/#48, Swift #45/#46 |

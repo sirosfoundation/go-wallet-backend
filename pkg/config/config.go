@@ -124,6 +124,15 @@ func (c *ASConfig) SetDefaults() {
 	}
 }
 
+// defaultASRulesDir is where EnableForRole expects the baseline SPOCP
+// policy to ship inside the container image (see rules/, copied here by
+// the Dockerfile). It's a var, not a const, so a packager whose filesystem
+// layout doesn't match the container's (e.g. a .deb following FHS) can
+// override it at build time without patching this file:
+//
+//	go build -ldflags "-X github.com/sirosfoundation/go-wallet-backend/pkg/config.defaultASRulesDir=/usr/share/go-wallet-backend/rules"
+var defaultASRulesDir = "/app/rules"
+
 // EnableForRole turns on the AS for deployments that request the "auth" role
 // (including via --mode=all), and fills in defaults for anything left
 // unconfigured. There is no separate AS-specific key or policy to configure:
@@ -171,10 +180,9 @@ func (c *Config) EnableForRole() {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
 	}
 	if c.AS.RulesDir == "" {
-		// Ships in the image alongside the binary (see Dockerfile) - the
-		// baseline policy (read-only always allowed, own-tenant access for
+		// Baseline policy (read-only always allowed, own-tenant access for
 		// any tac) every deployment gets unless it configures its own.
-		c.AS.RulesDir = "/app/rules"
+		c.AS.RulesDir = defaultASRulesDir
 	}
 	c.AS.SetDefaults()
 	if c.AS.Issuer == "" {
