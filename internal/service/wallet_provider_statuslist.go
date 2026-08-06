@@ -31,13 +31,18 @@ func RegisterWalletProviderStatusListRoute(router gin.IRoutes, wp *WalletProvide
 		return
 	}
 
-	router.GET("/wallet-provider/status-list", func(c *gin.Context) {
-		lst, err := statuslist.EmptyCompressedList(emptyStatusListSize)
-		if err != nil {
+	// emptyStatusListSize is fixed, so the compressed list is the same on
+	// every request - compute it once at registration time rather than
+	// redoing the DEFLATE work on every call.
+	lst, err := statuslist.EmptyCompressedList(emptyStatusListSize)
+	if err != nil {
+		router.GET("/wallet-provider/status-list", func(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "STATUS_LIST_GENERATION_FAILED"})
-			return
-		}
+		})
+		return
+	}
 
+	router.GET("/wallet-provider/status-list", func(c *gin.Context) {
 		now := time.Now()
 		claims := jwt.MapClaims{
 			"iat": now.Unix(),

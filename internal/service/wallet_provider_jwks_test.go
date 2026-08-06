@@ -122,10 +122,18 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_TrailingSlashIssuer(t *te
 	}
 }
 
-func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_FallsBackToWalletProviderURI(t *testing.T) {
+// TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoFallbackToWalletProviderURI
+// is a regression test: WalletProviderURI is a different identifier for a
+// different purpose (the WIA-PoP's expected aud, not this wallet provider's
+// own issuer identity - see docs/wallet-instance-attestation.md), and
+// config.Validate() requires WIA.Issuer to be explicitly set whenever Mode
+// is "ietf". Issuer() must not silently substitute WalletProviderURI when
+// Issuer itself is unset (e.g. because a caller bypassed Validate()).
+func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_NoFallbackToWalletProviderURI(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
 	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://fallback.example.com"
+	// WIA.Issuer intentionally left unset.
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -135,18 +143,8 @@ func TestRegisterWalletProviderJWKSRoute_OAuthMetadata_FallsBackToWalletProvider
 	req, _ := http.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-
-	var meta struct {
-		Issuer string `json:"issuer"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &meta); err != nil {
-		t.Fatalf("unmarshal metadata: %v", err)
-	}
-	if meta.Issuer != "https://fallback.example.com" {
-		t.Errorf("issuer = %q, want %q", meta.Issuer, "https://fallback.example.com")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (route must not be registered without an explicit issuer)", w.Code, http.StatusNotFound)
 	}
 }
 

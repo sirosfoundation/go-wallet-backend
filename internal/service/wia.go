@@ -540,26 +540,19 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	// iss: only set in "ietf" mode, where it's the only way a relying party
 	// locates the JWKS needed to verify the WIA (see the header switch
 	// below). config.Validate() enforces Issuer being set whenever Mode is
-	// "ietf" and signing keys are configured. Falls back to
-	// WalletProviderURI if Issuer not explicitly configured.
-	// (WalletProviderService.Issuer(), used by
-	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata, computes this
-	// same fallback independently - WIAService and WalletProviderService are
-	// separate structs sharing this config shape.)
+	// "ietf" and signing keys are configured, so no WalletProviderURI
+	// fallback here - WalletProviderService.Issuer() (used by
+	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata) computes the
+	// same value the same way, so both stay consistent with what Validate()
+	// actually requires.
 	//
 	// In "etsi" mode, no iss is set at all: EC TS03 v1.5.2 removed `iss`
 	// from the WIA entirely — Wallet Provider identity is inferred solely
 	// from the x5c signing certificate, verified against the Trusted List
 	// for Wallet Providers (ETSI TS 119 472-3 AUTH-REQ-PROC-4.4.3-01 /
 	// TOKEN-REQ-PROC-4.5.2-01).
-	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF {
-		issuer := s.cfg.WalletProvider.WIA.Issuer
-		if issuer == "" {
-			issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
-		}
-		if issuer != "" {
-			claims["iss"] = issuer
-		}
+	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF && s.cfg.WalletProvider.WIA.Issuer != "" {
+		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)

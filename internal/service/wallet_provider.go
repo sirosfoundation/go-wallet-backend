@@ -233,13 +233,15 @@ func (s *WalletProviderService) PublicKey() crypto.PublicKey {
 // Issuer returns the value used as the WIA's iss claim (see WIAService's
 // GenerateWIA), so relying parties' RFC 8414 metadata discovery
 // (RegisterWalletProviderJWKSRoute) advertises the exact issuer the WIA
-// itself claims.
+// itself claims. No WalletProviderURI fallback: config.Validate() requires
+// WIA.Issuer to be explicitly set whenever Mode is "ietf" (the only mode
+// that calls this), so falling back here would only mask a config that
+// bypassed Validate() (e.g. constructed directly in tests) - and
+// WalletProviderURI is a different identifier for a different purpose (the
+// WIA-PoP's expected aud, not this wallet provider's own issuer identity;
+// see docs/wallet-instance-attestation.md).
 func (s *WalletProviderService) Issuer() string {
-	issuer := s.cfg.WalletProvider.WIA.Issuer
-	if issuer == "" {
-		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
-	}
-	return issuer
+	return s.cfg.WalletProvider.WIA.Issuer
 }
 
 // Close releases resources held by the service.

@@ -300,6 +300,48 @@ func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
 	}
 }
 
+// TestWIAService_GenerateWIA_IETFMode_NoFallbackToWalletProviderURI is a
+// regression test: WalletProviderURI is a different identifier for a
+// different purpose (the WIA-PoP's expected aud, not this wallet provider's
+// own issuer identity - see docs/wallet-instance-attestation.md), and
+// config.Validate() requires WIA.Issuer to be explicitly set whenever Mode
+// is "ietf". signWIA must not silently substitute WalletProviderURI for iss
+// when Issuer itself is unset (e.g. because a caller bypassed Validate()).
+func TestWIAService_GenerateWIA_IETFMode_NoFallbackToWalletProviderURI(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://fallback.example.com"
+	// WIA.Issuer intentionally left unset.
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	// WalletProviderURI being set means validatePop now requires a matching
+	// aud claim (see TestValidatePop_AudValidation) - unrelated to what this
+	// test checks, but must still be satisfied.
+	pop := newTestPopBuilder(t, challenge).withAudience("https://fallback.example.com").build()
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be set without an explicit issuer, got %v", claims["iss"])
+	}
+}
+
 // TestWIAService_GenerateWIA_ETSIMode is the mirror of the ietf-mode test
 // above: the default ("etsi") mode must always carry x5c and never iss/kid.
 func TestWIAService_GenerateWIA_ETSIMode(t *testing.T) {
