@@ -1,21 +1,24 @@
-; Delegation SPOCP policy rules.
+; Delegation SPOCP policy — intentionally empty.
 ;
-; Delegation tokens are always downscoped: the delegated token's tac must be
-; a subset of the delegating token's tac, and tenant_id must match (or
-; narrow from "*" to a specific tenant). These constraints are enforced at
-; the code level before SPOCP evaluation. The rules below control which
-; delegation-issued tokens the policy engine will permit.
+; Delegation tokens are downscoped entirely at the code level in
+; handleDelegationTokenRequest (internal/as/token_endpoint.go): the
+; delegated token's tac must be a subset of the delegating token's tac,
+; and tenant_id must match (or narrow from "*" to a specific tenant). That
+; check is a complete security boundary on its own - a delegated token can
+; never exceed what its own parent already had - and it allows any subset
+; of the parent's tac (including re-delegation via 'k'), by design.
 ;
-; See default.rules for why rules are duplicated per query shape (positional
-; matching) - delegation queries carry sub always, and acr only when
-; inherited from a passkey-authenticated parent token.
-
-; --- Shape A: acr present (delegated from a passkey-authenticated parent) ---
-(token (acr (*)) (aud (*)) (sub (*)) (tac r))
-(token (acr (*)) (aud (*)) (sub (*)) (tac l))
-(token (acr (*)) (aud (*)) (sub (*)) (tac rl))
-
-; --- Shape B: no acr ---
-(token (aud (*)) (sub (*)) (tac r))
-(token (aud (*)) (sub (*)) (tac l))
-(token (aud (*)) (sub (*)) (tac rl))
+; This file previously carried a set of r/l/rl-only rules attempting to
+; additionally restrict delegation at the SPOCP layer, but they never had
+; any effect: LoadRulesFromDir loads every .rules file in the configured
+; directory into one SPOCP engine, and a query matches if it satisfies ANY
+; loaded rule. Delegation queries use the exact same shape (and go through
+; the exact same issueToken call) as regular session-token queries, so
+; default.rules' "any tac for an authenticated sub" wildcard (shape A/B)
+; already matched every delegation query too - a delegation request
+; downscoping to `tac w`, for example, was never actually blocked by
+; those rules, only permitted (correctly) by the code-level check above.
+; Kept as an explicit placeholder, in case a deployment ever wants SPOCP
+; to distinguish delegation queries from session queries - which would
+; require adding a claim to the query that BuildTokenQuery/the delegation
+; path doesn't emit today, not just rules in this file.
