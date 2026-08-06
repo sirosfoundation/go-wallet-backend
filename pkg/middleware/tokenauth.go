@@ -153,6 +153,51 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 	}
 }
 
+// RequireAudience returns middleware that requires the token's "aud" claim
+// to contain at least one of the given values. Must be placed after
+// TokenAuthMiddleware in the middleware chain.
+//
+// This is a separate, narrower check from TokenAuthMiddleware's own
+// audience validation: that only confirms the token's audience is *some*
+// value from the deployment's shared Config.Audiences allowlist (e.g.
+// "wallet-backend" OR "wallet-registry" OR "wallet-engine", whichever the
+// operator configured) - it has no way to restrict a specific route group
+// to a narrower audience than "anything the deployment accepts overall".
+// RequireAudience is that narrower restriction, applied per route group -
+// e.g. the AuthZEN proxy and engine transport only ever need
+// "wallet-registry"/"wallet-backend" (identity-free calls), while general
+// user-facing routes should reject a "wallet-registry"-only token even
+// though the deployment as a whole accepts that audience for other
+// purposes.
+func RequireAudience(allowed ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		v, exists := c.Get("tokenauth_result")
+		if !exists {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+		result, ok := v.(*claims.Result)
+		if !ok || result == nil {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+
+		for _, tokenAud := range result.Audience {
+			for _, want := range allowed {
+				if tokenAud == want {
+					c.Next()
+					return
+				}
+			}
+		}
+
+		c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
+		c.Abort()
+	}
+}
+
 // extractBearer extracts the token from the Authorization: Bearer header.
 func extractBearer(c *gin.Context) string {
 	auth := c.GetHeader("Authorization")

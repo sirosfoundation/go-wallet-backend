@@ -126,6 +126,14 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
 	)
+	// These are general user-facing routes, not the narrow-purpose calls
+	// (trust evaluation, engine transport) an identity-free anonymous token
+	// is scoped to - reject a wallet-registry-only token here. Only
+	// enforced under go-tokenauth; legacy AuthMiddleware never populates
+	// tokenauth_result (see RequireAudience's doc comment).
+	if p.tokenValidator != nil {
+		protected.Use(middleware.RequireAudience("wallet-backend"))
+	}
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -242,6 +250,12 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
 	)
+	// Credential storage is a general user-facing route, not one of the
+	// narrow purposes (trust evaluation, engine transport) an anonymous
+	// token is scoped to - reject a wallet-registry-only token here.
+	if p.tokenValidator != nil {
+		protected.Use(middleware.RequireAudience("wallet-backend"))
+	}
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -528,6 +542,15 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
 		protected.Use(p.authMiddleware())
+		// Trust-evaluation calls are identity-free by design (see
+		// handleAnonymousTokenRequest) and only need a wallet-registry or
+		// wallet-backend audience - never require a broader one. Only
+		// enforced under go-tokenauth (tokenValidator != nil); the legacy
+		// AuthMiddleware path never populates tokenauth_result, so
+		// RequireAudience would 401 every legacy token if applied there.
+		if p.tokenValidator != nil {
+			protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
+		}
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", p.authzenHandler.Evaluate)
@@ -888,6 +911,12 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Wallet-provider routes with auth middleware
 	wp := router.Group("/wallet-provider")
 	wp.Use(p.authMiddleware())
+	// Key attestation / WIA are general user-facing routes, not one of the
+	// narrow purposes an anonymous token is scoped to - reject a
+	// wallet-registry-only token here.
+	if p.tokenValidator != nil {
+		wp.Use(middleware.RequireAudience("wallet-backend"))
+	}
 	{
 		wp.POST("/key-attestation/generate", p.handlers.GenerateKeyAttestation)
 		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {

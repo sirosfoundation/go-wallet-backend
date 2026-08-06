@@ -595,6 +595,11 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 		if err != nil {
 			return "", "", err
 		}
+		// The engine transport, like the AuthZEN proxy, only needs a
+		// wallet-registry or wallet-backend audience - never a broader one.
+		if !hasAudience(result.Audience, "wallet-registry", "wallet-backend") {
+			return "", "", errors.New("token audience not permitted for engine transport")
+		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, nil
 	}
@@ -625,6 +630,18 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 	}
 
 	return "", "", errors.New("invalid token")
+}
+
+// hasAudience reports whether tokenAud contains at least one of allowed.
+func hasAudience(tokenAud []string, allowed ...string) bool {
+	for _, a := range tokenAud {
+		for _, want := range allowed {
+			if a == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Manager) getCapabilities() []string {
