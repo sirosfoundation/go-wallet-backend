@@ -2,6 +2,7 @@ package service
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -53,9 +54,13 @@ func RegisterWalletProviderStatusListRoute(router gin.IRoutes, wp *WalletProvide
 		}
 		// iss/sub are set consistently regardless of x5c/kid below, so a
 		// verifier can always identify and locate this wallet provider.
-		if wp.cfg.Server.BaseURL != "" {
-			claims["iss"] = wp.cfg.Server.BaseURL
-			claims["sub"] = wp.cfg.Server.BaseURL + "/wallet-provider/status-list"
+		// Trim BaseURL's trailing slash, if any, so sub doesn't end up with
+		// a double slash before the path (unlike the JWKS route's issuer,
+		// nothing else needs to match this iss byte-for-byte, so trimming
+		// it too keeps both claims consistent with each other).
+		if base := strings.TrimSuffix(wp.cfg.Server.BaseURL, "/"); base != "" {
+			claims["iss"] = base
+			claims["sub"] = base + "/wallet-provider/status-list"
 		}
 
 		token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)

@@ -119,6 +119,50 @@ func TestRegisterWalletProviderStatusListRoute_ServesAllValidList(t *testing.T) 
 	}
 }
 
+// TestRegisterWalletProviderStatusListRoute_TrailingSlashBaseURL is a
+// regression test: a configured BaseURL with a trailing slash must not
+// produce a double slash in sub ("https://host//wallet-provider/..."),
+// which strict verifiers reject.
+func TestRegisterWalletProviderStatusListRoute_TrailingSlashBaseURL(t *testing.T) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Server.BaseURL = "https://wp.example.com/"
+	wp := &WalletProviderService{cfg: cfg, jwtSigner: jwtSigner}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	RegisterWalletProviderStatusListRoute(router, wp)
+
+	req := httptest.NewRequest(http.MethodGet, "/wallet-provider/status-list", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(rec.Body.String(), jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("response is not a parseable JWT: %v", err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	if claims["iss"] != "https://wp.example.com" {
+		t.Errorf("iss = %v, want https://wp.example.com (trailing slash trimmed)", claims["iss"])
+	}
+	if claims["sub"] != "https://wp.example.com/wallet-provider/status-list" {
+		t.Errorf("sub = %v, want no double slash", claims["sub"])
+	}
+}
+
 // TestRegisterWalletProviderStatusListRoute_WithCertChain verifies the x5c
 // path: when a certificate chain is configured, it's used instead of kid.
 func TestRegisterWalletProviderStatusListRoute_WithCertChain(t *testing.T) {
