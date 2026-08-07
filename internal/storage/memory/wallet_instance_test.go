@@ -2,9 +2,7 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"testing"
-	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -272,47 +270,5 @@ func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
 	}
 	if got.DeactivationReason != "" {
 		t.Errorf("deactivation_reason should be empty, got %q", got.DeactivationReason)
-	}
-}
-
-func TestWalletInstanceStore_MarkHardwareKeyAttested(t *testing.T) {
-	ctx := context.Background()
-	store := NewStore()
-	wis := store.WalletInstances()
-
-	inst := &domain.WalletInstance{
-		ID:       "inst-fido2",
-		TenantID: "acme",
-		Status:   domain.InstanceStatusActive,
-	}
-	if err := wis.Upsert(ctx, inst); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-
-	verifiedAt := time.Now().UTC()
-	if err := wis.MarkHardwareKeyAttested(ctx, "inst-fido2", verifiedAt); err != nil {
-		t.Fatalf("MarkHardwareKeyAttested: %v", err)
-	}
-
-	got, err := wis.GetByID(ctx, "inst-fido2")
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if !got.HardwareKeyAttested {
-		t.Error("expected HardwareKeyAttested = true")
-	}
-	if got.HardwareAttestationVerifiedAt == nil || !got.HardwareAttestationVerifiedAt.Equal(verifiedAt) {
-		t.Errorf("HardwareAttestationVerifiedAt = %v, want %v", got.HardwareAttestationVerifiedAt, verifiedAt)
-	}
-}
-
-func TestWalletInstanceStore_MarkHardwareKeyAttested_NotFound(t *testing.T) {
-	ctx := context.Background()
-	store := NewStore()
-	wis := store.WalletInstances()
-
-	err := wis.MarkHardwareKeyAttested(ctx, "does-not-exist", time.Now().UTC())
-	if !errors.Is(err, storage.ErrNotFound) {
-		t.Errorf("err = %v, want storage.ErrNotFound", err)
 	}
 }

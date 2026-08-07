@@ -19,6 +19,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -32,24 +33,30 @@ const MaxJWKSPerRequest = 20
 
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
-	cfg       *config.Config
-	logger    *zap.Logger
-	signer    crypto.Signer
-	jwtSigner *signing.CryptoSignerES256
-	certChain []string
-	instances storage.WalletInstanceStore
+	cfg             *config.Config
+	logger          *zap.Logger
+	signer          crypto.Signer
+	jwtSigner       *signing.CryptoSignerES256
+	certChain       []string
+	instances       storage.WalletInstanceStore
+	keyAttestations storage.KeyAttestationStore
 }
 
 // NewWalletProviderService creates a new WalletProviderService.
 // instances is used to corroborate a KA request's self-reported security
 // properties against a WIA that already proved native platform integrity
 // for the same wallet instance (see GenerateKeyAttestation) — may be nil in
-// tests that don't exercise that path.
-func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances storage.WalletInstanceStore) *WalletProviderService {
+// tests that don't exercise that path. keyAttestations resolves per-key
+// FIDO2 hardware evidence for the specific credential keys in a KA
+// request's jwks batch — see instanceHasTrustedKeyEvidence's doc comment
+// for why this is per-key, not per-instance. May also be nil in tests that
+// don't exercise that path.
+func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances storage.WalletInstanceStore, keyAttestations storage.KeyAttestationStore) *WalletProviderService {
 	svc := &WalletProviderService{
-		cfg:       cfg,
-		logger:    logger.Named("wallet-provider-service"),
-		instances: instances,
+		cfg:             cfg,
+		logger:          logger.Named("wallet-provider-service"),
+		instances:       instances,
+		keyAttestations: keyAttestations,
 	}
 
 	// Try PKCS#11 first, then fall back to file-based key loading if PKCS#11
@@ -334,7 +341,7 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// remote-HSM claim. See internal/service/wallet_provider_test.go for
 	// the regression tests this guards.
 	if secProps != nil {
-		trusted := s.instanceHasTrustedKeyEvidence(ctx, walletInstanceID)
+		trusted := s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
 		normalized := normalizeSecurityProperties(secProps, trusted)
 		if len(normalized.KeyStorage) > 0 {
 			claims["key_storage"] = normalized.KeyStorage
@@ -379,29 +386,55 @@ var nativeAttestationSources = map[string]bool{
 	"android_play_integrity": true,
 }
 
-// instanceHasTrustedKeyEvidence reports whether walletInstanceID resolves
-// to a WalletInstance with independent evidence corroborating an elevated
-// security_properties claim — either its WIA was backed by verified native
-// platform attestation (Tier 1: App Attest/Play Integrity, re-derived fresh
-// on every WIA request), OR it has a durably verified FIDO2/CTAP2 hardware
-// attestation on file (HardwareKeyAttested, set once at key-registration
-// time — see MarkHardwareKeyAttested's doc for why this can't be folded
-// into AttestationSource). Returns false on a missing ID, an unknown
-// instance, a lookup error, or a nil instance store (e.g. in tests that
-// construct WalletProviderService directly) — all of which mean there's no
-// evidence to corroborate an elevated claim, not that one should be granted.
-func (s *WalletProviderService) instanceHasTrustedKeyEvidence(ctx context.Context, walletInstanceID string) bool {
-	if s.instances == nil || walletInstanceID == "" {
-		return false
-	}
-	instance, err := s.instances.GetByID(ctx, walletInstanceID)
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
+// keyAttestationTrustsBatch reports whether THIS specific batch of
+// credential-issuance keys (jwks) has independent evidence corroborating
+// an elevated security_properties claim - either:
+//   - the wallet instance's WIA was backed by verified native platform
+//     attestation (Tier 1: App Attest/Play Integrity, re-derived fresh on
+//     every WIA request) - this check legitimately stays instance-scoped,
+//     since it attests runtime/app integrity, not any specific key's own
+//     hardware backing; or
+//   - every key in this batch has a durably verified FIDO2/CTAP2 hardware
+//     attestation on file, looked up per key by JWK Thumbprint via
+//     KeyAttestationStore.
+//
+// Deliberately per-key (not per-instance, and not "any key in the batch"):
+// a wallet instance's identity key and its credential-issuance keys are
+// separate keys, not guaranteed to share a WSCD plugin, and can differ
+// across separate batches over the instance's lifetime - an instance-wide
+// flag (the previous design) would incorrectly apply one key's evidence to
+// unrelated keys generated later, or via a different plugin. Requiring
+// ALL keys in the batch to have evidence matches the fact a single
+// GenerateKeyAttestation call's jwks are already plugin-homogeneous by
+// construction (one generateKeypairs call, one active WSCD plugin) - so
+// this only ever clamps a batch that's actually mixed-evidence or entirely
+// unattested, never a genuinely homogeneous hardware-backed batch.
+func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) bool {
+	if walletInstanceID != "" && s.instances != nil {
+		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
+			}
+		} else if nativeAttestationSources[instance.AttestationSource] {
+			return true
 		}
+	}
+
+	if s.keyAttestations == nil || len(jwks) == 0 {
 		return false
 	}
-	return nativeAttestationSources[instance.AttestationSource] || instance.HardwareKeyAttested
+	for _, j := range jwks {
+		thumbprint, err := jwk.Thumbprint(j)
+		if err != nil {
+			// Unsupported/malformed key (e.g. non-EC) - can't have evidence.
+			return false
+		}
+		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // isoAttackPotential maps SIROS's internal WSCD key-storage/user-auth

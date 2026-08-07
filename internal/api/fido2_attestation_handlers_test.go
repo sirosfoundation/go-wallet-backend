@@ -28,6 +28,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -58,7 +59,7 @@ func setupFIDO2AttestationTestHandlers(t *testing.T, enabled bool, trustDecision
 	trustSvc := trust.NewService(cfg, logger, func(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
 		return &stubFIDO2TrustEvaluator{decision: trustDecision}, nil
 	})
-	fido2Svc := service.NewFIDO2AttestationService(cfg, store.WalletInstances(), trustSvc, logger)
+	fido2Svc := service.NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), trustSvc, logger)
 
 	services := &service.Services{FIDO2Attestation: fido2Svc}
 	handlers := NewHandlers(services, cfg, logger, []string{"test"})
@@ -72,7 +73,7 @@ func setupFIDO2AttestationTestHandlers(t *testing.T, enabled bool, trustDecision
 // "packed" Basic Attestation object - same construction as
 // internal/service/fido2_attestation_test.go's buildTestAttestationObject,
 // duplicated here since test helpers aren't exported across packages.
-func buildFIDO2TestAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataHash []byte) []byte {
+func buildFIDO2TestAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataHash []byte) ([]byte, *ecdsa.PublicKey) {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -139,7 +140,7 @@ func buildFIDO2TestAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataH
 	if err != nil {
 		t.Fatalf("marshal attestation object: %v", err)
 	}
-	return attObjBytes
+	return attObjBytes, &key.PublicKey
 }
 
 func doFIDO2AttestationRequest(router *gin.Engine, body interface{}) *httptest.ResponseRecorder {
@@ -264,14 +265,14 @@ func TestFIDO2AttestationRegister_Success(t *testing.T) {
 	trustSvc := trust.NewService(cfg, logger, func(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
 		return &stubFIDO2TrustEvaluator{decision: true}, nil
 	})
-	fido2Svc := service.NewFIDO2AttestationService(cfg, store.WalletInstances(), trustSvc, logger)
+	fido2Svc := service.NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), trustSvc, logger)
 	handlers := NewHandlers(&service.Services{FIDO2Attestation: fido2Svc}, cfg, logger, []string{"test"})
 	router := gin.New()
 	router.POST("/wallet-provider/fido2-attestation/register", handlers.FIDO2AttestationRegister)
 
 	aaguid := uuid.New()
 	clientDataHash := make([]byte, 32)
-	attObj := buildFIDO2TestAttestationObject(t, aaguid, clientDataHash)
+	attObj, pub := buildFIDO2TestAttestationObject(t, aaguid, clientDataHash)
 
 	w := doFIDO2AttestationRequest(router, map[string]string{
 		"wallet_instance_id": instanceID,
@@ -288,11 +289,22 @@ func TestFIDO2AttestationRegister_Success(t *testing.T) {
 		t.Errorf("verified = %v, want true", resp["verified"])
 	}
 
-	got, err := store.WalletInstances().GetByID(context.Background(), instanceID)
+	// Evidence must be stored keyed by the attested credential key's own
+	// thumbprint, not the wallet instance.
+	thumbprint, err := jwk.Thumbprint(map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(pub.X.FillBytes(make([]byte, 32))),
+		"y":   base64.RawURLEncoding.EncodeToString(pub.Y.FillBytes(make([]byte, 32))),
+	})
 	if err != nil {
-		t.Fatalf("GetByID: %v", err)
+		t.Fatalf("compute expected thumbprint: %v", err)
 	}
-	if !got.HardwareKeyAttested {
-		t.Error("expected HardwareKeyAttested = true after a successful registration")
+	rec, err := store.KeyAttestations().GetByKeyThumbprint(context.Background(), thumbprint)
+	if err != nil {
+		t.Fatalf("expected a stored key attestation record, got: %v", err)
+	}
+	if rec.WalletInstanceID != instanceID {
+		t.Errorf("rec.WalletInstanceID = %q, want %q", rec.WalletInstanceID, instanceID)
 	}
 }

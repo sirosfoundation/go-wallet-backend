@@ -9,11 +9,14 @@ import (
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -43,27 +46,30 @@ type FIDO2AttestationRequest struct {
 
 // FIDO2AttestationService verifies FIDO2/CTAP2 hardware-key attestation
 // objects (e.g. from a YubiKey's rawSign plugin) and durably records the
-// result on the corresponding WalletInstance. Verified once at
-// registration time — see domain.WalletInstance.HardwareKeyAttested's doc
-// for why this is a separate trust path from NativeAttestationService
-// (which re-verifies fresh evidence on every WIA request).
+// result keyed by the attested credential key's own JWK Thumbprint (see
+// domain.KeyAttestationRecord's doc for why this is per-key, not
+// per-instance — a wallet instance's identity key and its
+// credential-issuance keys are separate keys, not guaranteed to share a
+// WSCD plugin).
 type FIDO2AttestationService struct {
-	cfg       *config.Config
-	logger    *zap.Logger
-	instances storage.WalletInstanceStore
-	trust     *trust.Service
+	cfg             *config.Config
+	logger          *zap.Logger
+	instances       storage.WalletInstanceStore
+	keyAttestations storage.KeyAttestationStore
+	trust           *trust.Service
 }
 
 // NewFIDO2AttestationService creates a new FIDO2 attestation verifier. trust
 // evaluates the attestation's x5c chain against go-trust's fidomds3
 // registry (real FIDO Alliance MDS3 data, keyed by AAGUID) - this service
 // does not embed any trust-anchor material itself, per ADR-010.
-func NewFIDO2AttestationService(cfg *config.Config, instances storage.WalletInstanceStore, trustSvc *trust.Service, logger *zap.Logger) *FIDO2AttestationService {
+func NewFIDO2AttestationService(cfg *config.Config, instances storage.WalletInstanceStore, keyAttestations storage.KeyAttestationStore, trustSvc *trust.Service, logger *zap.Logger) *FIDO2AttestationService {
 	return &FIDO2AttestationService{
-		cfg:       cfg,
-		instances: instances,
-		trust:     trustSvc,
-		logger:    logger.Named("fido2-attestation"),
+		cfg:             cfg,
+		instances:       instances,
+		keyAttestations: keyAttestations,
+		trust:           trustSvc,
+		logger:          logger.Named("fido2-attestation"),
 	}
 }
 
@@ -147,16 +153,52 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return fmt.Errorf("%w: not trusted by FIDO MDS3 registry: %s", ErrFIDO2AttestationInvalid, trustInfo.Reason)
 	}
 
-	// Step 4: durably record the result. Deliberately a dedicated store
-	// method, not folded into the WIA-issuance Upsert path - see
-	// domain.WalletInstance.HardwareKeyAttested's doc comment.
+	// Step 4: derive the attested credential key's own JWK Thumbprint from
+	// its COSE public key (embedded in AttData, already decoded above) and
+	// durably record the result keyed by that thumbprint - NOT by
+	// wallet_instance_id, so a batch of credential-issuance keys generated
+	// later via a different WSCD plugin can never inherit this key's
+	// evidence (see domain.KeyAttestationRecord's doc comment).
+	pubKeyAny, err := webauthncose.ParsePublicKey(attObj.AuthData.AttData.CredentialPublicKey)
+	if err != nil {
+		return fmt.Errorf("%w: parse credential public key: %v", ErrFIDO2AttestationInvalid, err)
+	}
+	ec2Key, ok := pubKeyAny.(webauthncose.EC2PublicKeyData)
+	if !ok || ec2Key.Curve != int64(webauthncose.P256) {
+		return fmt.Errorf("%w: unsupported credential key type (only EC P-256 supported)", ErrFIDO2AttestationInvalid)
+	}
+	keyThumbprint, err := jwk.Thumbprint(map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(ec2Key.XCoord),
+		"y":   base64.RawURLEncoding.EncodeToString(ec2Key.YCoord),
+	})
+	if err != nil {
+		return fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
+	}
+
+	// TenantID is for auditing/scoping only - best-effort lookup, not part
+	// of the trust decision (which is keyed by thumbprint alone).
+	var tenantID domain.TenantID
+	if instance, err := s.instances.GetByID(ctx, req.WalletInstanceID); err == nil {
+		tenantID = instance.TenantID
+	}
+
 	verifiedAt := time.Now().UTC()
-	if err := s.instances.MarkHardwareKeyAttested(ctx, req.WalletInstanceID, verifiedAt); err != nil {
+	rec := &domain.KeyAttestationRecord{
+		KeyThumbprint:    keyThumbprint,
+		WalletInstanceID: req.WalletInstanceID,
+		TenantID:         tenantID,
+		AAGUID:           aaguid.String(),
+		VerifiedAt:       verifiedAt,
+	}
+	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
 	s.logger.Info("FIDO2 hardware attestation verified",
 		zap.String("wallet_instance_id", req.WalletInstanceID),
+		zap.String("key_thumbprint", keyThumbprint),
 		zap.String("format", attObj.Format),
 	)
 

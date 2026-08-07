@@ -116,20 +116,6 @@ type WalletInstance struct {
 	// SecurityProperties captures the claimed security level (ISO 18045 AVA scale).
 	SecurityProperties *SecurityProperties `json:"security_properties,omitempty" bson:"security_properties,omitempty"`
 
-	// HardwareKeyAttested is true once a real FIDO2/CTAP2 attestation object
-	// has been verified for this instance (see FIDO2AttestationService).
-	// Unlike AttestationSource, this is set exactly once by
-	// MarkHardwareKeyAttested and is NEVER touched by the ordinary
-	// WIA-issuance Upsert path — a FIDO2 makeCredential attestation happens
-	// once at key creation, with no cheap per-reissuance equivalent to
-	// App Attest/Play Integrity's fresh-every-time evidence, so storing it
-	// the same way AttestationSource is stored would silently revert to
-	// false on the very next WIA reissuance.
-	HardwareKeyAttested bool `json:"hardware_key_attested,omitempty" bson:"hardware_key_attested,omitempty"`
-
-	// HardwareAttestationVerifiedAt is when HardwareKeyAttested was set.
-	HardwareAttestationVerifiedAt *time.Time `json:"hardware_attestation_verified_at,omitempty" bson:"hardware_attestation_verified_at,omitempty"`
-
 	// LastAttestedAt is the time of the most recent WIA generation.
 	LastAttestedAt time.Time `json:"last_attested_at" bson:"last_attested_at"`
 

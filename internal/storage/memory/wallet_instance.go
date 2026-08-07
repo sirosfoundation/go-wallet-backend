@@ -120,21 +120,6 @@ func (s *WalletInstanceStore) IncrementAttestation(_ context.Context, id string)
 	return nil
 }
 
-func (s *WalletInstanceStore) MarkHardwareKeyAttested(_ context.Context, id string, verifiedAt time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	instance, ok := s.data[id]
-	if !ok {
-		return storage.ErrNotFound
-	}
-
-	instance.HardwareKeyAttested = true
-	instance.HardwareAttestationVerifiedAt = &verifiedAt
-	instance.UpdatedAt = time.Now().UTC()
-	return nil
-}
-
 func (s *WalletInstanceStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

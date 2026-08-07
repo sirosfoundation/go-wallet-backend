@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 func TestWalletInstanceStore_UpdateStatus_RejectsUnknownStatus(t *testing.T) {
@@ -63,36 +61,4 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	// Revoked is terminal: attempting to reactivate must fail.
 	err = wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
 	require.Error(t, err)
-}
-
-func TestWalletInstanceStore_MarkHardwareKeyAttested(t *testing.T) {
-	store := skipIfNoMongo(t)
-	ctx := context.Background()
-	wis := store.WalletInstances()
-
-	inst := &domain.WalletInstance{
-		ID:       "inst-fido2-hardware",
-		TenantID: "acme",
-		Status:   domain.InstanceStatusActive,
-	}
-	require.NoError(t, wis.Upsert(ctx, inst))
-
-	verifiedAt := time.Now().UTC().Truncate(time.Millisecond)
-	require.NoError(t, wis.MarkHardwareKeyAttested(ctx, "inst-fido2-hardware", verifiedAt))
-
-	got, err := wis.GetByID(ctx, "inst-fido2-hardware")
-	require.NoError(t, err)
-	require.True(t, got.HardwareKeyAttested)
-	require.NotNil(t, got.HardwareAttestationVerifiedAt)
-	require.WithinDuration(t, verifiedAt, *got.HardwareAttestationVerifiedAt, time.Second)
-}
-
-func TestWalletInstanceStore_MarkHardwareKeyAttested_NotFound(t *testing.T) {
-	store := skipIfNoMongo(t)
-	ctx := context.Background()
-	wis := store.WalletInstances()
-
-	err := wis.MarkHardwareKeyAttested(ctx, "does-not-exist", time.Now().UTC())
-	require.Error(t, err)
-	require.True(t, errors.Is(err, storage.ErrNotFound))
 }

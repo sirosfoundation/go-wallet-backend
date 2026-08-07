@@ -43,7 +43,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
-	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances())
+	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -94,7 +94,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), engine.NewTrustService(cfg, logger), logger),
+		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
