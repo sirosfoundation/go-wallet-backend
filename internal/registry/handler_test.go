@@ -91,6 +91,161 @@ func TestHandler_GetTypeMetadata_NoMetadata(t *testing.T) {
 	assert.Equal(t, "Test Org", result["organization"])
 }
 
+func TestHandler_GetTypeMetadata_AttestationLoS_WithMetadata(t *testing.T) {
+	store := NewStore("")
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential/v1",
+		Name:           "Test Credential",
+		Description:    "A test credential",
+		Organization:   "Test Org",
+		AttestationLoS: "iso_18045_high",
+		Metadata:       json.RawMessage(`{"vct": "https://example.com/credential/v1", "claims": {"name": {"display": [{"name": "Name"}]}}}`),
+	})
+
+	router := setupTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/type-metadata?vct=https://example.com/credential/v1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	require.NoError(t, err)
+	// The raw document's own fields must be preserved.
+	assert.Equal(t, "https://example.com/credential/v1", result["vct"])
+	assert.Contains(t, result, "claims")
+	// attestation_los must be merged in alongside them.
+	assert.Equal(t, "iso_18045_high", result["attestation_los"])
+}
+
+func TestHandler_GetTypeMetadata_AttestationLoS_NoMetadata(t *testing.T) {
+	store := NewStore("")
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential/v1",
+		Name:           "Test Credential",
+		Description:    "A test credential",
+		Organization:   "Test Org",
+		AttestationLoS: "iso_18045_moderate",
+		Metadata:       nil,
+	})
+
+	router := setupTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/type-metadata?vct=https://example.com/credential/v1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	require.NoError(t, err)
+	assert.Equal(t, "Test Credential", result["name"])
+	assert.Equal(t, "iso_18045_moderate", result["attestation_los"])
+}
+
+func TestHandler_GetTypeMetadata_AttestationLoS_MdocDoctype(t *testing.T) {
+	store := NewStore("")
+	// mdoc doctype identifiers (not a "vct" URN) go through the exact same
+	// serveEntry code path as sd-jwt VCTs.
+	store.Put(&VCTMEntry{
+		VCT:            "org.iso.18013.5.1.mDL",
+		Name:           "Mobile Driving Licence",
+		AttestationLoS: "iso_18045_basic",
+		Metadata:       json.RawMessage(`{"doctype": "org.iso.18013.5.1.mDL", "namespaces": {}}`),
+	})
+
+	router := setupTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/type-metadata?vct=org.iso.18013.5.1.mDL", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	require.NoError(t, err)
+	assert.Equal(t, "org.iso.18013.5.1.mDL", result["doctype"])
+	assert.Equal(t, "iso_18045_basic", result["attestation_los"])
+}
+
+func TestHandler_GetTypeMetadata_AttestationLoS_Empty(t *testing.T) {
+	store := NewStore("")
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential/v1",
+		Name:           "Test Credential",
+		AttestationLoS: "", // not populated upstream
+		Metadata:       json.RawMessage(`{"vct": "https://example.com/credential/v1"}`),
+	})
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential/v2",
+		Name:           "Test Credential 2",
+		AttestationLoS: "",
+		Metadata:       nil,
+	})
+
+	router := setupTestRouter(store)
+
+	for _, vct := range []string{"https://example.com/credential/v1", "https://example.com/credential/v2"} {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/type-metadata?vct="+vct, nil)
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+
+		var result map[string]interface{}
+		err := json.Unmarshal(w.Body.Bytes(), &result)
+		require.NoError(t, err)
+		assert.NotContains(t, result, "attestation_los", "attestation_los must be omitted, not emitted empty, for vct=%s", vct)
+	}
+}
+
+func TestHandler_ListCredentials_AttestationLoS(t *testing.T) {
+	store := NewStore("")
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential1",
+		Name:           "Credential 1",
+		AttestationLoS: "iso_18045_high",
+	})
+	store.Put(&VCTMEntry{
+		VCT:  "https://example.com/credential2",
+		Name: "Credential 2",
+		// AttestationLoS empty - omitted
+	})
+
+	router := setupTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/credentials", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &result)
+	require.NoError(t, err)
+
+	credentials := result["credentials"].([]interface{})
+	require.Len(t, credentials, 2)
+
+	var withLoS, withoutLoS map[string]interface{}
+	for _, cred := range credentials {
+		c := cred.(map[string]interface{})
+		if c["vct"] == "https://example.com/credential1" {
+			withLoS = c
+		} else {
+			withoutLoS = c
+		}
+	}
+	require.NotNil(t, withLoS)
+	require.NotNil(t, withoutLoS)
+	assert.Equal(t, "iso_18045_high", withLoS["attestation_los"])
+	assert.NotContains(t, withoutLoS, "attestation_los")
+}
+
 func TestHandler_GetTypeMetadata_NotFound(t *testing.T) {
 	store := NewStore("")
 	router := setupTestRouter(store)
