@@ -58,6 +58,10 @@ const (
 
 	// WSCDTypeNativeAndroid uses Android StrongBox/TEE via Play Integrity.
 	WSCDTypeNativeAndroid WSCDType = "native_android"
+
+	// WSCDTypeFIDO2Hardware uses a FIDO2/CTAP2 hardware security key (e.g.
+	// a YubiKey) via the previewSign rawSign plugin.
+	WSCDTypeFIDO2Hardware WSCDType = "fido2_hardware"
 )
 
 // WalletInstance represents a registered wallet instance identified by

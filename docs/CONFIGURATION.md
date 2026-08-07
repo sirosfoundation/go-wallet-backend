@@ -179,6 +179,7 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.attestation.native_attestation.google_play_integrity_decryption_key_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_DECRYPTION_KEY_PATH` | string | GooglePlayIntegrityDecryptionKeyPath is a path to a file containing the decryption key (preferred over the inline value — same pattern as PKCS11.PINPath / JWT.SecretPath, so this AES key material can be mounted from a secret store instead of living in plain env vars/YAML). |
 | `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY` | string | GooglePlayIntegrityVerificationKey is the base64-encoded verification key. Prefer GooglePlayIntegrityVerificationKeyPath for production deployments. |
 | `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH` | string | GooglePlayIntegrityVerificationKeyPath is a path to a file containing the verification key (preferred over the inline value). |
+| `wallet_provider.attestation.fido2_attestation.enabled` | `WALLET_WALLET_PROVIDER_ATTESTATION_FIDO2_ATTESTATION_ENABLED` | boolean | Enabled controls whether the FIDO2 key-attestation registration endpoint accepts and verifies attestation objects. Off by default — like NativeAttestation, this is an explicit opt-in trust decision. |
 
 ## trust
 

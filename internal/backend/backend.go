@@ -44,6 +44,8 @@ type Backend interface {
 	Invites() storage.InviteStore
 	// WalletInstances returns the wallet instance store
 	WalletInstances() storage.WalletInstanceStore
+	// KeyAttestations returns the per-credential-key FIDO2 attestation store
+	KeyAttestations() storage.KeyAttestationStore
 	// Ping checks if the storage is alive
 	Ping(ctx context.Context) error
 	// Close closes the storage connection
@@ -67,6 +69,9 @@ func (b *memoryBackend) Invites() storage.InviteStore             { return b.sto
 func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
 }
+func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
+	return b.store.KeyAttestations()
+}
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return nil }
 
@@ -86,6 +91,9 @@ func (b *mongoBackend) Verifiers() storage.VerifierStore         { return b.stor
 func (b *mongoBackend) Invites() storage.InviteStore             { return b.store.Invites() }
 func (b *mongoBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
+}
+func (b *mongoBackend) KeyAttestations() storage.KeyAttestationStore {
+	return b.store.KeyAttestations()
 }
 func (b *mongoBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *mongoBackend) Close() error                   { return b.store.Close() }

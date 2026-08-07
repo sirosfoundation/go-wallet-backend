@@ -188,6 +188,9 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 				walletProvider.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
 				walletProvider.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
 			}
+			if p.services.FIDO2Attestation != nil && p.services.FIDO2Attestation.IsEnabled() {
+				walletProvider.POST("/fido2-attestation/register", p.handlers.FIDO2AttestationRegister)
+			}
 		}
 	}
 }
@@ -933,6 +936,9 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 			wp.POST("/wia/challenge", wiaLimit, p.handlers.WIAChallenge)
 			wp.POST("/wia/generate", wiaLimit, p.handlers.WIAGenerate)
+		}
+		if p.services.FIDO2Attestation != nil && p.services.FIDO2Attestation.IsEnabled() {
+			wp.POST("/fido2-attestation/register", p.handlers.FIDO2AttestationRegister)
 		}
 	}
 

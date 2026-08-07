@@ -151,8 +151,8 @@ github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
 github.com/sirosfoundation/go-tokenauth v0.3.0 h1:M/4R+qrQ78sHmxGa0kIJh1OPorfGMvXWPOUCXOqDLXU=
 github.com/sirosfoundation/go-tokenauth v0.3.0/go.mod h1:cF1S4ev6ZaRl/Jt7boxO+fduuFtKDF8DEFaExB95kKM=
-github.com/sirosfoundation/go-trust v0.9.2 h1:NApXxYMkYi+OimLDhOSFfktsFo6wYmSeLkleL7ycuLc=
-github.com/sirosfoundation/go-trust v0.9.2/go.mod h1:9dYlhsPyK8zoBzSFa+gRsTLfgkpVbeBYCGCv8hhf9ig=
+github.com/sirosfoundation/go-trust v0.11.0 h1:V7WHkhpHr1Yf/kS3WHK8qtv/PaL/LzpUmJ3GQo9u1QQ=
+github.com/sirosfoundation/go-trust v0.11.0/go.mod h1:tuZlymZ1vOO08ypbwjJvbr5NHJAojaG9vhTngsuSils=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5 h1:1UkTjkgj6NSA04SogK6tvfvlMZVT7vkdfWsJurwe69Q=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5/go.mod h1:gAxbvM0HnnY4c3aNYo6Za97nPpGSbqLfjUtxJ8qNGjs=
 github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w=
