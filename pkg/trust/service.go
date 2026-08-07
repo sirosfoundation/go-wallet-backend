@@ -216,7 +216,7 @@ func (s *Service) resolveVerifierEndpoint(sessionEndpoint string) string {
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
-	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, keyMaterial, "issuer")
+	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, "", keyMaterial, "issuer")
 }
 
 // EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
@@ -229,8 +229,17 @@ func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndp
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
-	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, keyMaterial, "verifier")
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, "", keyMaterial, "verifier")
 }
+
+// FIDO2AttestationAction is the AuthZEN action.name sent for FIDO2/CTAP2
+// hardware-attestation evaluation. It matches go-trust's own documented
+// policy-name convention for this exact use case (see go-trust's README,
+// "wscd-previewsign-provision" policy example under the fidomds3 registry
+// section), so an operator can attach a distinct FIDO MDS3 AAGUID allow/
+// blocklist policy to this call site without it falling back to whatever
+// default_policy is configured for unmatched action names.
+const FIDO2AttestationAction = "wscd-previewsign-provision"
 
 // EvaluateFIDO2Attestation evaluates a FIDO2/CTAP2 hardware-key attestation's
 // x5c certificate chain against the global PDP (expected to have a fidomds3
@@ -242,15 +251,29 @@ func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trust
 // the AuthZEN name-to-key binding the fidomds3 registry evaluates against).
 // If no PDP is configured, this fails closed (Trusted: false) - same as
 // EvaluateIssuer/EvaluateVerifier's "no PDP configured" behavior.
+//
+// Role is RoleAny here (there's no issuer/verifier role concept for a
+// hardware key), so the outbound action.name is set explicitly to
+// FIDO2AttestationAction instead - without this, evaluate() would send no
+// action.name at all, and go-trust could never target this call site with a
+// dedicated policy (e.g. an AAGUID allow/blocklist).
 func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x5cChain []string) (*TrustInfo, error) {
-	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, &KeyMaterial{
+	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, FIDO2AttestationAction, &KeyMaterial{
 		Type: "x5c",
 		X5C:  x5cChain,
 	}, "aaguid")
 }
 
-// evaluate is the shared implementation for both issuer and verifier trust evaluation.
-func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
+// evaluate is the shared implementation for issuer, verifier, and FIDO2
+// attestation trust evaluation.
+//
+// action is an explicit AuthZEN action.name to send when role alone doesn't
+// identify the call site (e.g. RoleAny). It's only applied when non-empty,
+// and only when role itself is empty - see authzen.Evaluator.toAuthZENRequest,
+// which prefers Role for action.name and falls back to this field. Passing ""
+// preserves today's behavior for callers that rely on Role (EvaluateIssuer,
+// EvaluateVerifier).
+func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, action string, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
 		return nil, err
@@ -274,6 +297,9 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	}
 	req.SubjectID = subjectID
 	req.Role = role
+	if role == "" && action != "" {
+		req.Action = action
+	}
 
 	// Set credential type if provided
 	if keyMaterial != nil && keyMaterial.CredentialType != "" {

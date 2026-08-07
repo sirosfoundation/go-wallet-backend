@@ -20,9 +20,14 @@ type testMockEvaluator struct {
 	returnErr error
 	// For Resolver interface
 	resolveMetadata interface{}
+
+	// gotReq captures the last request passed to Evaluate, so tests can
+	// assert on outbound Role/Action wiring without a real AuthZEN PDP.
+	gotReq *EvaluationRequest
 }
 
-func (m *testMockEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest) (*EvaluationResponse, error) {
+func (m *testMockEvaluator) Evaluate(_ context.Context, req *EvaluationRequest) (*EvaluationResponse, error) {
+	m.gotReq = req
 	if m.returnErr != nil {
 		return nil, m.returnErr
 	}
@@ -516,6 +521,108 @@ func TestService_EvaluateFIDO2Attestation_Trusted(t *testing.T) {
 	}
 	if result.Framework != "authzen" {
 		t.Errorf("EvaluateFIDO2Attestation() Framework = %q, want authzen", result.Framework)
+	}
+}
+
+// TestService_EvaluateFIDO2Attestation_ActionName is the regression test for
+// the bug where this call site sent no action.name at all: with Role ==
+// RoleAny (empty string), go-trust's toAuthZENRequest fell all the way
+// through to req.GetAction(), which was also never set - meaning an operator
+// could never attach a go-trust policy (e.g. a fidomds3 AAGUID allow/
+// blocklist) specifically to FIDO2 attestation evaluation. It must now carry
+// the fixed FIDO2AttestationAction action name.
+func TestService_EvaluateFIDO2Attestation_ActionName(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."}); err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleAny {
+		t.Errorf("gotReq.Role = %q, want RoleAny", eval.gotReq.Role)
+	}
+	if eval.gotReq.GetAction() != FIDO2AttestationAction {
+		t.Errorf("gotReq.GetAction() = %q, want %q", eval.gotReq.GetAction(), FIDO2AttestationAction)
+	}
+}
+
+// TestService_EvaluateIssuer_NoExplicitAction and its verifier counterpart
+// guard against regressing the other evaluate() callers while fixing
+// EvaluateFIDO2Attestation above: issuer/verifier evaluation identifies its
+// call site via Role alone (go-trust's toAuthZENRequest prefers Role for
+// action.name), so no explicit Action should ever be set for these.
+func TestService_EvaluateIssuer_NoExplicitAction(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateIssuer(context.Background(), "https://issuer.example.com", "", nil); err != nil {
+		t.Fatalf("EvaluateIssuer() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleCredentialIssuer {
+		t.Errorf("gotReq.Role = %q, want RoleCredentialIssuer", eval.gotReq.Role)
+	}
+	if eval.gotReq.Action != "" {
+		t.Errorf("gotReq.Action = %q, want empty (Role alone identifies this call site)", eval.gotReq.Action)
+	}
+}
+
+func TestService_EvaluateVerifier_NoExplicitAction(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateVerifier(context.Background(), "https://verifier.example.com", "", nil); err != nil {
+		t.Fatalf("EvaluateVerifier() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleCredentialVerifier {
+		t.Errorf("gotReq.Role = %q, want RoleCredentialVerifier", eval.gotReq.Role)
+	}
+	if eval.gotReq.Action != "" {
+		t.Errorf("gotReq.Action = %q, want empty (Role alone identifies this call site)", eval.gotReq.Action)
 	}
 }
 

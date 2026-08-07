@@ -50,12 +50,14 @@ type stubEvaluator struct {
 	gotSubjectID  string
 	gotResourceID string
 	gotKeyType    trust.ResourceType
+	gotAction     string
 }
 
 func (s *stubEvaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
 	s.gotSubjectID = req.GetSubjectID()
 	s.gotResourceID = req.Resource.ID
 	s.gotKeyType = req.GetKeyType()
+	s.gotAction = req.GetAction()
 	return &trust.EvaluationResponse{Decision: s.decision, Reason: s.reason}, nil
 }
 func (s *stubEvaluator) Name() string { return "stub" }
@@ -276,6 +278,9 @@ func TestFIDO2AttestationService_TrustedByPDP(t *testing.T) {
 	}
 	if eval.gotKeyType != trust.ResourceTypeX5C {
 		t.Errorf("PDP request resource.type = %q, want x5c", eval.gotKeyType)
+	}
+	if eval.gotAction != trust.FIDO2AttestationAction {
+		t.Errorf("PDP request action.name = %q, want %q (so an operator can attach a dedicated go-trust policy to this call site)", eval.gotAction, trust.FIDO2AttestationAction)
 	}
 
 	// Evidence must be stored keyed by the attested CREDENTIAL key's own
