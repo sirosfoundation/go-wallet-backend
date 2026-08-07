@@ -84,6 +84,17 @@ func TestFIDO2AttestationService_Disabled(t *testing.T) {
 	}
 }
 
+func TestFIDO2AttestationService_NilRequest(t *testing.T) {
+	cfg := testFIDO2AttestationConfig(true)
+	instances := memory.NewStore().WalletInstances()
+	svc := NewFIDO2AttestationService(cfg, instances, nil, zap.NewNop())
+
+	err := svc.Verify(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error for nil request, got nil")
+	}
+}
+
 func TestFIDO2AttestationService_EmptyWalletInstanceID(t *testing.T) {
 	cfg := testFIDO2AttestationConfig(true)
 	instances := memory.NewStore().WalletInstances()

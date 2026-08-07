@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
@@ -153,6 +154,48 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 	}
 	if _, exists := keyMap["certification"]; exists {
 		t.Error("certification should not be inside attested_keys entries")
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_TrustedForHardwareKeyAttestedInstance
+// exercises the other half of instanceHasTrustedKeyEvidence: an instance
+// with no native-platform AttestationSource but a durably verified FIDO2
+// hardware-key attestation on file (see FIDO2AttestationService,
+// MarkHardwareKeyAttested) must still be treated as trusted, not clamped.
+func TestGenerateKeyAttestation_SecurityProperties_TrustedForHardwareKeyAttestedInstance(t *testing.T) {
+	svc, instances := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-fido2-hardware"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID: instanceID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := instances.MarkHardwareKeyAttested(context.Background(), instanceID, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkHardwareKeyAttested: %v", err)
+	}
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+	secProps := &SecurityProperties{
+		KeyStorage: []string{"iso_18045_high"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != "iso_18045_high" {
+		t.Errorf("key_storage = %v, want [iso_18045_high] (hardware-key-attested instance should not be clamped)", claims["key_storage"])
 	}
 }
 

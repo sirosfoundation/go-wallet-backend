@@ -458,6 +458,93 @@ func TestService_EvaluateVerifier_Success(t *testing.T) {
 	}
 }
 
+// TestService_EvaluateFIDO2Attestation_NoEndpoint exercises the fail-closed
+// path when no global PDP is configured - FIDO Alliance MDS3 trust data is
+// global (unlike issuer/verifier, it has no per-flow endpoint override), so
+// this always uses cfg.Trust.PDPURL.
+func TestService_EvaluateFIDO2Attestation_NoEndpoint(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL: "",
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = true when no PDP configured, expected fail-closed")
+	}
+	if result.Framework != "none" {
+		t.Errorf("EvaluateFIDO2Attestation() Framework = %q, want none", result.Framework)
+	}
+}
+
+// TestService_EvaluateFIDO2Attestation_Trusted covers the AuthZEN wiring:
+// the AAGUID must be sent as subject.id (the "name" half of the fidomds3
+// registry's name-to-key binding - see go-trust's
+// pkg/registry/fidomds3/registry.go's use of uuid.Parse(req.Subject.ID))
+// and the x5c chain as resource.type=x5c/key.
+func TestService_EvaluateFIDO2Attestation_Trusted(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{decision: true, reason: "AAGUID certified by FIDO MDS3"}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	aaguid := "f8a011f3-8c0a-4d15-8006-17111f9edc7d"
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), aaguid, []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = false, want true")
+	}
+	if result.Framework != "authzen" {
+		t.Errorf("EvaluateFIDO2Attestation() Framework = %q, want authzen", result.Framework)
+	}
+}
+
+func TestService_EvaluateFIDO2Attestation_NotTrusted(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{decision: false, reason: "no FIDO MDS3 entry for AAGUID"}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = true, want false")
+	}
+	if result.Reason != "no FIDO MDS3 entry for AAGUID" {
+		t.Errorf("EvaluateFIDO2Attestation() Reason = %q, want %q", result.Reason, "no FIDO MDS3 entry for AAGUID")
+	}
+}
+
 func TestService_EvaluateIssuer_SessionOverride(t *testing.T) {
 	cfg := &config.Config{
 		Trust: config.TrustConfig{

@@ -78,6 +78,9 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	if !s.IsEnabled() {
 		return ErrFIDO2AttestationDisabled
 	}
+	if req == nil {
+		return fmt.Errorf("%w: nil request", ErrFIDO2AttestationInvalid)
+	}
 	if req.WalletInstanceID == "" {
 		return fmt.Errorf("%w: empty wallet_instance_id", ErrFIDO2AttestationInvalid)
 	}
