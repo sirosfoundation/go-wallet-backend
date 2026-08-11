@@ -1293,7 +1293,8 @@ func TestValidateResponseURIOrigin_HAIPScheme_Mismatch(t *testing.T) {
 		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
 	}
 	err := validateResponseURIOrigin(authReq, msg)
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
 }
 
 func TestValidateResponseURIOrigin_HAIPVPScheme(t *testing.T) {
