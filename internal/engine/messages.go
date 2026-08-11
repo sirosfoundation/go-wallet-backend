@@ -80,7 +80,12 @@ const (
 type ErrorCode string
 
 const (
-	ErrCodeAuthFailed        ErrorCode = "AUTH_FAILED"
+	ErrCodeAuthFailed ErrorCode = "AUTH_FAILED"
+	// ErrCodeForbidden is a permission (tac) rejection, distinct from
+	// ErrCodeAuthorizationFail below despite the similar name - that one is
+	// specifically an OAuth authorization *flow* failure (bad redirect_uri,
+	// state mismatch, etc.), not a token-permission check.
+	ErrCodeForbidden         ErrorCode = "FORBIDDEN"
 	ErrCodeInvalidMessage    ErrorCode = "INVALID_MESSAGE"
 	ErrCodeUnknownFlow       ErrorCode = "UNKNOWN_FLOW"
 	ErrCodeFlowTimeout       ErrorCode = "FLOW_TIMEOUT"
@@ -107,6 +112,8 @@ func (c ErrorCode) UserFacingMessage() string {
 	switch c {
 	case ErrCodeAuthFailed:
 		return "Authentication failed"
+	case ErrCodeForbidden:
+		return "Insufficient permissions"
 	case ErrCodeInvalidMessage:
 		return "Invalid message format"
 	case ErrCodeUnknownFlow:

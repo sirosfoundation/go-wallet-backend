@@ -25,6 +25,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -217,10 +218,14 @@ func TestManager_validateToken_UserID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, tenantID, err := m.validateToken(tokenString)
+	userID, tenantID, tac, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user-123", userID)
 	assert.Equal(t, "test-tenant", tenantID)
+	// Regression: the legacy HMAC path has no TAC concept at all - callers
+	// (handleFlowStart) must treat this as "not applicable", not "no
+	// permissions". See requiredTACForProtocol's doc comment.
+	assert.Equal(t, claims.TAC(""), tac)
 }
 
 func TestManager_validateToken_UUID(t *testing.T) {
@@ -241,7 +246,7 @@ func TestManager_validateToken_UUID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, tenantID, err := m.validateToken(tokenString)
+	userID, tenantID, _, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "uuid-user-456", userID)
 	assert.Empty(t, tenantID) // wallet-backend-server tokens don't have tenant_id
@@ -265,7 +270,7 @@ func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, err := m.validateToken(tokenString)
+	userID, _, _, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "native-user", userID)
 }
@@ -287,7 +292,7 @@ func TestManager_validateToken_MissingBothUserIDAndUUID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(tokenString)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing user_id or uuid")
 }
@@ -308,7 +313,7 @@ func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
 	})
 	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
 
-	_, _, err := m.validateToken(tokenString)
+	_, _, _, err := m.validateToken(tokenString)
 	assert.Error(t, err)
 }
 
@@ -329,7 +334,7 @@ func TestManager_validateToken_ExpiredToken(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(tokenString)
 	assert.Error(t, err)
 }
 
@@ -349,7 +354,7 @@ func TestManager_validateToken_WrongSecret(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("wrong-secret"))
 	require.NoError(t, err)
 
-	_, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(tokenString)
 	assert.Error(t, err)
 }
 
@@ -371,7 +376,7 @@ func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, err := m.validateToken(tokenString)
+	userID, _, _, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user", userID)
 }
@@ -394,7 +399,7 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(tokenString)
 	assert.Error(t, err)
 }
 
@@ -415,9 +420,10 @@ func TestManager_validateToken_GoTokenauth_AllowsRegistryAudience(t *testing.T) 
 		ACR:      "urn:siros:acr:passkey",
 	})
 
-	_, tenantID, err := m.validateToken(token)
+	_, tenantID, tac, err := m.validateToken(token)
 	require.NoError(t, err)
 	assert.Equal(t, "test-tenant", tenantID)
+	assert.Equal(t, claims.TAC("r"), tac)
 }
 
 // TestManager_validateToken_GoTokenauth_RejectsOtherAudience confirms a
@@ -436,8 +442,107 @@ func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
 		ACR:      "urn:siros:acr:passkey",
 	})
 
-	_, _, err := m.validateToken(token)
+	_, _, _, err := m.validateToken(token)
 	assert.Error(t, err)
+}
+
+// ===== handleFlowStart TAC enforcement tests =====
+
+// stubFlowHandler is a minimal FlowHandler that succeeds immediately,
+// for tests that only care whether handleFlowStart's TAC gate let the
+// flow reach a handler at all, not what the handler itself does.
+type stubFlowHandler struct{}
+
+func (stubFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error { return nil }
+func (stubFlowHandler) Cancel()                                                  {}
+
+func newManagerWithStubOID4VCIHandler(t *testing.T) *Manager {
+	t.Helper()
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.RegisterFlowHandler(ProtocolOID4VCI, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return stubFlowHandler{}, nil
+	})
+	return m
+}
+
+// runHandleFlowStart wires a Manager+Session whose conn is the client side
+// of wsTestServer, calls handleFlowStart, and returns whatever the session
+// sent (as observed server-side via srvConn), or nil if nothing arrived
+// within a short window. session.conn.WriteJSON sends the message from the
+// test's "session" (client dialer conn) to the server-side handler
+// (srvConn) - matching the existing TestSendFlowComplete_* convention,
+// where the assertion always happens in the server-side callback, not by
+// reading back from the dialer conn.
+func runHandleFlowStart(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol) *FlowErrorMessage {
+	t.Helper()
+
+	result := make(chan *FlowErrorMessage, 1)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		// Deliberately shorter than the outer select's timeout below, so a
+		// successful (no-message) flow start reliably delivers nil to
+		// result well before the outer timeout could ever race it.
+		_ = srvConn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			result <- nil
+			return
+		}
+		var msg FlowErrorMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			result <- nil
+			return
+		}
+		result <- &msg
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	session.TAC = tac
+
+	m.handleFlowStart(session, &FlowStartMessage{Protocol: protocol})
+
+	select {
+	case msg := <-result:
+		return msg
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server-side callback")
+		return nil
+	}
+}
+
+func TestManager_handleFlowStart_RejectsInsufficientTAC(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+
+	msg := runHandleFlowStart(t, m, "r", ProtocolOID4VCI) // OID4VCI (issuance) requires 'i'
+	if msg == nil {
+		t.Fatal("expected a flow_error, got none")
+	}
+	assert.Equal(t, ErrCodeForbidden, msg.Error.Code)
+}
+
+func TestManager_handleFlowStart_AllowsSufficientTAC(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+
+	// Should reach stubFlowHandler.Execute (which succeeds immediately and
+	// sends nothing) rather than being rejected by the TAC gate.
+	msg := runHandleFlowStart(t, m, "i", ProtocolOID4VCI)
+	if msg != nil {
+		t.Fatalf("expected no flow_error, got code %q", msg.Error.Code)
+	}
+}
+
+// TestManager_handleFlowStart_NoOpWhenTACEmpty is a regression test: an
+// empty session.TAC means "not applicable" (legacy auth, no TAC concept at
+// all - see Manager.validateToken), not "no permissions". A legacy-
+// authenticated session must not be blocked from starting any flow.
+func TestManager_handleFlowStart_NoOpWhenTACEmpty(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+
+	msg := runHandleFlowStart(t, m, "", ProtocolOID4VCI)
+	if msg != nil {
+		t.Fatalf("expected no flow_error, got code %q", msg.Error.Code)
+	}
 }
 
 // ===== SendFlowComplete tests =====

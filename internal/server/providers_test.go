@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -712,6 +713,114 @@ func TestAuthProvider_RequireAudience_AllowsWalletBackendToken(t *testing.T) {
 	}
 	if w.Code == http.StatusNotFound {
 		t.Fatalf("route not registered - test would false-pass on a routing regression")
+	}
+}
+
+// =============================================================================
+// requireTACIfEnforced / route-level TAC enforcement tests
+// =============================================================================
+
+func TestRequireTACIfEnforced_NoOpWhenValidatorNil(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	// No tokenauth_result set at all - if this enforced anything, it would
+	// 401, matching the legacy AuthMiddleware path having no TAC concept.
+	r.Use(requireTACIfEnforced(nil, "w"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 200 {
+		t.Fatalf("expected no-op (200) when tokenValidator is nil, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireTACIfEnforced_EnforcesWhenValidatorSet(t *testing.T) {
+	v, _, _ := setupServerTokenValidatorTest(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(func(c *gin.Context) {
+		c.Set("tokenauth_result", &claims.Result{TAC: "rl"})
+		c.Next()
+	})
+	r.Use(requireTACIfEnforced(v, "w"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (tac 'rl' lacks 'w') when tokenValidator is set, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestStorageProvider_RequireTAC_RejectsInsufficientPermission is an
+// end-to-end proof that requireTACIfEnforced is actually wired into a real
+// route, not just correct in isolation: a token with tac "rl" (read/list,
+// no delete) must be rejected on DELETE /storage/vc/:id.
+func TestStorageProvider_RequireTAC_RejectsInsufficientPermission(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rl",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/storage/vc/some-id", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a tac=rl token on a delete route, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestStorageProvider_RequireTAC_AllowsSufficientPermission is the
+// counterpart: a token with 'd' must reach the handler (not be blocked by
+// requireTACIfEnforced). It still 404s here - DeleteCredential's own
+// business logic correctly reports "no such credential" for an id that was
+// never stored in this bare test fixture - so this asserts the response
+// body is that handler-level not-found, not gin's router-level "no route
+// matches" (which reuses the same status code but a different body).
+func TestStorageProvider_RequireTAC_AllowsSufficientPermission(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rwld",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/storage/vc/some-id", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden {
+		t.Fatalf("expected a tac=rwld token to pass the TAC gate on a delete route, got 403: %s", w.Body.String())
+	}
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "Credential not found") {
+		t.Fatalf("expected DeleteCredential's own not-found response for a nonexistent id, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

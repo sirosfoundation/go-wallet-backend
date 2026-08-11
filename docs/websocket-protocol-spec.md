@@ -112,6 +112,18 @@ Server → Client (failure):
 }
 ```
 
+`app_token` must be scoped to `aud: "wallet-registry"` or `aud:
+"wallet-backend"` - a token requested for any other audience is rejected at
+handshake. Per-flow, starting a flow (`flow_start`) additionally requires a
+specific `tac` on the same token, checked at that point rather than at
+handshake time: `r` for `oid4vp` (presenting an existing credential), `i`
+for `oid4vci` (receiving a new one) - a rejection there uses `flow_error`
+with code `FORBIDDEN` (a permission/tac rejection - not to be confused with
+`AUTHORIZATION_FAILED`, which is specifically an OAuth authorization *flow*
+failure elsewhere in this protocol), not the handshake-level `AUTH_FAILED`
+above. See `docs/authorization-requirements.md` for the full picture,
+including how to request a token with the `tac` your client needs.
+
 ### Keepalive
 
 Clients SHOULD send ping frames every 30 seconds. Servers MUST respond with pong.
@@ -772,6 +784,7 @@ Server → Client:
 | Code | Description |
 |------|-------------|
 | `AUTH_FAILED` | Invalid or expired authentication token |
+| `FORBIDDEN` | Token's `tac` doesn't permit the requested action (e.g. `flow_start` for a protocol the token's `tac` doesn't cover) |
 | `INVALID_MESSAGE` | Malformed message |
 | `UNKNOWN_FLOW` | `flow_id` not recognized |
 | `FLOW_TIMEOUT` | Flow exceeded maximum duration |
