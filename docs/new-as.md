@@ -104,6 +104,12 @@ When a client (wallet or SDK) needs to call an API on behalf of a user, it obtai
 - The session cookie (automatically sent by the browser, or explicitly by native clients)
 - A **token request** JSON body specifying the desired access token properties
 
+> For the concrete, current answer to "what `aud`/`tac` do I need to call
+> route X" (including the identity-free `anonymous` request shape added
+> after this design doc was written), see `docs/authorization-requirements.md`
+> - this section covers the design rationale, not an exhaustive per-route
+> reference.
+
 ### Token request format
 
 ```jsonc
