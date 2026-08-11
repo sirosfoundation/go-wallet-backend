@@ -81,6 +81,7 @@ or session cookie as appropriate for the route group.
 | POST | `/wallet-provider/key-attestation/generate` | `w` | |
 | POST | `/wallet-provider/wia/challenge` | `w` | |
 | POST | `/wallet-provider/wia/generate` | `w` | |
+| POST | `/wallet-provider/fido2-attestation/register` | `w` | Only registered if `wallet_provider.attestation.fido2_attestation.enabled` |
 | GET | `/storage/vc` | `l` | |
 | POST | `/storage/vc` | `i` | |
 | POST | `/storage/vc/update` | `w` | |

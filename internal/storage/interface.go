@@ -201,6 +201,7 @@ type Store interface {
 	Verifiers() VerifierStore
 	Invites() InviteStore
 	WalletInstances() WalletInstanceStore
+	KeyAttestations() KeyAttestationStore
 
 	// Close closes the storage connection
 	Close() error
@@ -258,4 +259,18 @@ type WalletInstanceStore interface {
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+}
+
+// KeyAttestationStore defines the interface for per-credential-key FIDO2
+// attestation evidence storage (see domain.KeyAttestationRecord's doc for
+// why this is keyed by key thumbprint, not wallet instance).
+type KeyAttestationStore interface {
+	// MarkKeyAttested durably records that a real FIDO2/CTAP2 attestation
+	// object was verified for the credential key identified by
+	// rec.KeyThumbprint.
+	MarkKeyAttested(ctx context.Context, rec *domain.KeyAttestationRecord) error
+
+	// GetByKeyThumbprint retrieves a key attestation record by its JWK
+	// Thumbprint. Returns ErrNotFound if no evidence is on file for that key.
+	GetByKeyThumbprint(ctx context.Context, thumbprint string) (*domain.KeyAttestationRecord, error)
 }
