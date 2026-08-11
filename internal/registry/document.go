@@ -10,12 +10,13 @@ import "encoding/json"
 // top-level name/description/organization fields are also checked first for
 // forward compatibility with documents that do set them directly.
 type documentHeader struct {
-	VCT          string         `json:"vct"`
-	DocType      string         `json:"doctype"`
-	Name         string         `json:"name"`
-	Description  string         `json:"description"`
-	Organization string         `json:"organization"`
-	Display      []displayEntry `json:"display"`
+	VCT            string         `json:"vct"`
+	DocType        string         `json:"doctype"`
+	Name           string         `json:"name"`
+	Description    string         `json:"description"`
+	Organization   string         `json:"organization"`
+	Display        []displayEntry `json:"display"`
+	AttestationLoS string         `json:"attestation_los"`
 }
 
 // displayEntry is a single locale's display properties within a "display"
