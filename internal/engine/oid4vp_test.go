@@ -384,6 +384,30 @@ func TestParseRequest(t *testing.T) {
 		assert.Equal(t, "inline-nonce", authReq.Nonce)
 	})
 
+	// HAIP 1.0 final replaced the early-draft "haip://" scheme with
+	// "haip-vp://" (presentation) - regression test for a bug where real
+	// verifiers (e.g. Multipaz) emitting haip-vp:// links fell through to
+	// the "direct URL" branch (same bug class as haip:// above), which never
+	// dereferenced the request_uri query param and failed with a generic
+	// "invalid message format" instead of unwrapping it.
+	t.Run("haip-vp scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip-vp://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	t.Run("haip-vp scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip-vp://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
 	// Regression test for a bug where a bare reference URL with no query
 	// string (e.g. a QR/link that IS itself the request_uri, no
 	// openid4vp://...&request_uri= wrapper at all) was parsed as if the
@@ -1267,6 +1291,31 @@ func TestValidateResponseURIOrigin_HAIPScheme_Mismatch(t *testing.T) {
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
+}
+
+func TestValidateResponseURIOrigin_HAIPVPScheme(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip-vp://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_HAIPVPScheme_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip-vp://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
 	}
 	err := validateResponseURIOrigin(authReq, msg)
 	require.Error(t, err)
