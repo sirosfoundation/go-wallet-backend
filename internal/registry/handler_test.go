@@ -203,6 +203,54 @@ func TestHandler_GetTypeMetadata_AttestationLoS_Empty(t *testing.T) {
 	}
 }
 
+func TestHandler_GetTypeMetadata_AttestationLoS_MergeError(t *testing.T) {
+	store := NewStore("")
+	store.Put(&VCTMEntry{
+		VCT:            "https://example.com/credential/v1",
+		Name:           "Test Credential",
+		AttestationLoS: "iso_18045_high",
+		// Malformed upstream metadata: mergeAttestationLoS will fail to
+		// decode it, so serveEntry must log a warning and fall back to
+		// returning the original (unmodified) bytes rather than erroring
+		// out the whole request.
+		Metadata: json.RawMessage(`not-valid-json`),
+	})
+
+	router := setupTestRouter(store)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/type-metadata?vct=https://example.com/credential/v1", nil)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "not-valid-json", w.Body.String(), "on merge failure the original raw bytes must pass through unchanged")
+}
+
+func TestMergeAttestationLoS(t *testing.T) {
+	t.Run("preserves nested fields and types exactly", func(t *testing.T) {
+		// A JSON number that would change representation if round-tripped
+		// through map[string]interface{} (float64) is the regression case:
+		// it must come back byte-for-byte identical.
+		input := json.RawMessage(`{"vct":"urn:example","claims":{"age":{"min":18}},"weight":1.50}`)
+
+		merged, err := mergeAttestationLoS(input, "iso_18045_high")
+		require.NoError(t, err)
+
+		var result map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(merged, &result))
+		assert.JSONEq(t, `"urn:example"`, string(result["vct"]))
+		assert.JSONEq(t, `{"age":{"min":18}}`, string(result["claims"]))
+		// Preserved exactly as the original bytes, not renormalized to "1.5".
+		assert.Equal(t, "1.50", string(result["weight"]))
+		assert.JSONEq(t, `"iso_18045_high"`, string(result["attestation_los"]))
+	})
+
+	t.Run("returns error on malformed input", func(t *testing.T) {
+		_, err := mergeAttestationLoS(json.RawMessage(`not-valid-json`), "iso_18045_high")
+		require.Error(t, err)
+	})
+}
+
 func TestHandler_ListCredentials_AttestationLoS(t *testing.T) {
 	store := NewStore("")
 	store.Put(&VCTMEntry{
@@ -228,12 +276,16 @@ func TestHandler_ListCredentials_AttestationLoS(t *testing.T) {
 	err := json.Unmarshal(w.Body.Bytes(), &result)
 	require.NoError(t, err)
 
-	credentials := result["credentials"].([]interface{})
+	credentialsAny, ok := result["credentials"]
+	require.True(t, ok, "response must contain a credentials field")
+	credentials, ok := credentialsAny.([]interface{})
+	require.True(t, ok, "credentials field must be a JSON array")
 	require.Len(t, credentials, 2)
 
 	var withLoS, withoutLoS map[string]interface{}
 	for _, cred := range credentials {
-		c := cred.(map[string]interface{})
+		c, ok := cred.(map[string]interface{})
+		require.True(t, ok, "each credential entry must be a JSON object")
 		if c["vct"] == "https://example.com/credential1" {
 			withLoS = c
 		} else {

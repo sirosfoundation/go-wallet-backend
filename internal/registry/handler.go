@@ -268,14 +268,21 @@ func (h *Handler) serveEntry(c *gin.Context, entry *VCTMEntry) {
 }
 
 // mergeAttestationLoS decodes a raw VCTM/MDDL JSON document as an object,
-// injects the attestation_los field, and re-serializes it. The document's
-// other fields and overall shape are preserved as-is.
+// injects the attestation_los field, and re-serializes it. Fields are kept
+// as json.RawMessage (not map[string]interface{}) so every other field's
+// original bytes - number representations, key order within nested
+// objects, everything - round-trip untouched; only the top-level key set
+// changes (one key added).
 func mergeAttestationLoS(data json.RawMessage, attestationLoS string) (json.RawMessage, error) {
-	var doc map[string]interface{}
+	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("failed to decode metadata document: %w", err)
 	}
-	doc["attestation_los"] = attestationLoS
+	losJSON, err := json.Marshal(attestationLoS)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode attestation_los: %w", err)
+	}
+	doc["attestation_los"] = losJSON
 	merged, err := json.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to re-serialize metadata document: %w", err)
