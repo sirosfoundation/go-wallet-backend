@@ -208,12 +208,20 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 	var authReq AuthorizationRequest
 
 	if msg.RequestURI != "" {
-		// Parse from openid4vp://, haip://, or a direct https:// URL. HAIP
-		// (OpenID4VC High Assurance Interoperability Profile) uses the same
-		// openid4vp://?client_id=...&request_uri=... wire shape as plain
-		// OID4VP, just under its own scheme - treat both identically.
+		// Parse from openid4vp://, haip://, haip-vp://, or a direct https://
+		// URL. HAIP (OpenID4VC High Assurance Interoperability Profile) uses
+		// the same openid4vp://?client_id=...&request_uri=... wire shape as
+		// plain OID4VP, just under its own scheme(s) - treat all three
+		// identically. "haip://" was HAIP's early-draft (1-3) scheme; HAIP
+		// 1.0 final replaced it with "haip-vp://" (presentation) - real
+		// verifiers (e.g. Multipaz) already emit the new one, and omitting
+		// it here fell through to the raw-https-URL branch below, which
+		// treats the whole thing as either an inline query string or a
+		// fetchable reference URL - neither is right for a haip-vp:// link
+		// carrying its own request_uri query param, so it never dereferenced
+		// that reference and failed with a generic "invalid message format".
 		requestStr := msg.RequestURI
-		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") {
+		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") || strings.HasPrefix(requestStr, "haip-vp://") {
 			u, err := url.Parse(requestStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid request URL: %w", err)
@@ -1302,7 +1310,7 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	requestURL := msg.RequestURI
-	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") {
+	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") || strings.HasPrefix(requestURL, "haip-vp://") {
 		if u, err := url.Parse(requestURL); err == nil {
 			requestURL = u.Query().Get("request_uri")
 		}
