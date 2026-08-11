@@ -12,7 +12,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/prometheus/client_golang v1.24.1
-	github.com/redis/go-redis/v9 v9.21.0
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sirosfoundation/go-cryptoutil v0.6.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-trust v0.11.0
@@ -28,7 +28,7 @@ require (
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.2
-	github.com/getkin/kin-openapi v0.145.0
+	github.com/getkin/kin-openapi v0.146.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.4.0
