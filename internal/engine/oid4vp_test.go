@@ -647,7 +647,7 @@ func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	h := &OID4VPHandler{httpClient: server.Client()}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
 	authReq := &AuthorizationRequest{
 		ClientID: "https://verifier.example.com",
 		State:    "test-state",

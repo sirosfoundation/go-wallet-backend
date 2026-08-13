@@ -1494,12 +1494,18 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	h.Logger.Debug("direct_post.jwt: verifier response received",
+		zap.String("endpoint", endpoint),
+		zap.Int("status", resp.StatusCode),
+		zap.String("body", string(respBody)))
+
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		var result struct {
 			RedirectURI                string `json:"redirect_uri"`
 			PresentationDuringIssuance string `json:"presentation_during_issuance_session"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+		if err := json.Unmarshal(respBody, &result); err == nil {
 			if result.RedirectURI != "" {
 				return result.RedirectURI, nil
 			}
@@ -1511,8 +1517,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 		return resp.Header.Get("Location"), nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(body))
+	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
 func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, error) {
