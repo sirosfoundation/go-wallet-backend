@@ -796,10 +796,12 @@ func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
 	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
 }
 
-func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
+func TestSubmitDirectPostJWT_DefaultEncIsA128GCM(t *testing.T) {
 	// When authorization_encrypted_response_enc is absent, default should be
-	// A128CBC-HS256 (preserved for backward compatibility with existing verifiers
-	// that omit enc but expect the original default).
+	// A128GCM, not A128CBC-HS256 (RFC 7518's first mandatory-to-implement
+	// "enc" but not universally implemented - confirmed live against
+	// verifier.multipaz.org's own JsonWebEncryption decrypter, which only
+	// implements the GCM family and rejects CBC-HS256 outright).
 	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
@@ -832,7 +834,17 @@ func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
 
 	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "vp-token")
 	require.NoError(t, err, "should succeed with default A128GCM enc")
-	assert.Equal(t, 5, len(splitDots(receivedForm.Get("response"))))
+	response := receivedForm.Get("response")
+	assert.Equal(t, 5, len(splitDots(response)))
+
+	headerB64 := splitDots(response)[0]
+	headerJSON, err := base64.RawURLEncoding.DecodeString(headerB64)
+	require.NoError(t, err)
+	var header struct {
+		Enc string `json:"enc"`
+	}
+	require.NoError(t, json.Unmarshal(headerJSON, &header))
+	assert.Equal(t, string(jose.A128GCM), header.Enc, "default enc should be A128GCM, not A128CBC-HS256")
 }
 
 func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {

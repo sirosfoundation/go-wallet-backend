@@ -1428,7 +1428,18 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 			zap.String("verifier", authReq.ClientID))
 	}
 	if encEnc == "" {
-		encEnc = "A128CBC-HS256"
+		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
+		// "enc" algorithm, but it is not universally implemented in
+		// practice: confirmed live against verifier.multipaz.org, whose
+		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
+		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
+		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
+		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
+		// despite not declaring encrypted_response_enc_values_supported to
+		// signal that restriction. GCM is an equally spec-valid default
+		// choice absent an explicit verifier preference and has broader
+		// real-world interop, so prefer it.
+		encEnc = "A128GCM"
 	}
 
 	// Extract verifier's public key for encryption
