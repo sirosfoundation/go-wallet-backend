@@ -60,6 +60,14 @@ func (h *BaseHandler) Error(step FlowStep, code ErrorCode, message string) error
 	return h.Flow.Session.SendFlowError(h.Flow.ID, step, code, message)
 }
 
+// ErrorWithDetails sends a flow error to the client along with structured
+// details - e.g. a redirect_uri a verifier returned from its own error-
+// response endpoint (see submitErrorResponse), so the client can still send
+// the user back to the verifier even when the flow itself failed.
+func (h *BaseHandler) ErrorWithDetails(step FlowStep, code ErrorCode, message string, details map[string]interface{}) error {
+	return h.Flow.Session.SendFlowError(h.Flow.ID, step, code, message, details)
+}
+
 // Complete sends a flow completion message
 func (h *BaseHandler) Complete(credentials []CredentialResult, redirectURI string) error {
 	return h.Flow.Session.SendFlowComplete(h.Flow.ID, credentials, redirectURI)

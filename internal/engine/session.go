@@ -817,8 +817,11 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 	return s.Send(&msg)
 }
 
-// SendFlowError sends a flow error message
-func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, message string) error {
+// SendFlowError sends a flow error message. An optional details map (e.g. a
+// redirect_uri returned by a verifier's error-response endpoint per OID4VP
+// §8.2/§8.5) can be passed as a trailing argument without touching the many
+// existing 4-arg call sites.
+func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, message string, details ...map[string]interface{}) error {
 	msg := FlowErrorMessage{
 		Message: Message{
 			Type:      TypeFlowError,
@@ -830,6 +833,9 @@ func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, me
 			Code:    code,
 			Message: message,
 		},
+	}
+	if len(details) > 0 {
+		msg.Error.Details = details[0]
 	}
 	return s.Send(&msg)
 }
