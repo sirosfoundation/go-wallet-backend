@@ -224,6 +224,15 @@ type FlowStartMessage struct {
 	// holder-binding proof with the original credential's key rather than a
 	// fresh one (see that field's doc comment for the full rationale).
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+	// DPoPJWK, when set on a renewal request, is the private JWK the backend
+	// previously exported at FlowCompleteMessage.DPoPJWK for the flow that
+	// issued RefreshToken. The issuer's refresh_token grant binds the token
+	// to the exact DPoP key used at initial issuance (RFC 9449/ARF 3.0
+	// §6.6.6.2.2), so the renewal must reuse that same key rather than the
+	// fresh ephemeral one Execute() would otherwise generate. The backend
+	// never persists this key itself; the client (via privatedata) is the
+	// only durable custodian - see feedback_backend_key_persistence_principle.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -266,6 +275,15 @@ type FlowCompleteMessage struct {
 	// it durably (e.g. via privatedata) and present it back on a future
 	// renewal request for this credential_configuration_id.
 	RefreshToken string `json:"refresh_token,omitempty"`
+	// DPoPJWK is the private JWK of the ephemeral DPoP key this flow used for
+	// its token exchange, present only alongside RefreshToken. The issuer
+	// binds RefreshToken to this exact key (RFC 9449/ARF 3.0 §6.6.6.2.2), so
+	// a later renewal must present it back as FlowStartMessage.DPoPJWK
+	// instead of Execute() generating a fresh one - see that field's doc
+	// comment. The backend only ever holds this key ephemerally in memory
+	// for the current flow and never persists it; relaying it here makes
+	// the client (via privatedata) the sole durable custodian.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle

@@ -309,6 +309,58 @@ func generateDPoPKey() (*ecdsa.PrivateKey, error) {
 	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 }
 
+// dpopPrivateKeyJWK exports the DPoP key as a private JWK so the client can
+// hold onto it (in its own privatedata store) across the renewal boundary.
+// vc's refresh_token grant binds the token to the exact DPoP key used at
+// initial issuance (RFC 9449/ARF 3.0 §6.6.6.2.2 sender-constraining) and a
+// later renewal must present that same key - but this handler generates a
+// fresh ephemeral h.dpopKey per flow and never persists it itself (per this
+// codebase's rule that only the client, via privatedata, holds keys
+// long-term). Round-tripping the JWK through the client is what lets a
+// later renewal reconstruct the identical key in-memory for that one
+// exchange, instead of the backend storing it.
+func dpopPrivateKeyJWK(key *ecdsa.PrivateKey) (string, error) {
+	fields, err := ecPublicKeyJWK(&key.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: %w", err)
+	}
+	raw, err := key.Bytes()
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: %w", err)
+	}
+	fields["d"] = base64.RawURLEncoding.EncodeToString(raw)
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+// parseDPoPPrivateKeyJWK reconstructs the ecdsa.PrivateKey a client supplies
+// on a renewal request, previously obtained via dpopPrivateKeyJWK.
+func parseDPoPPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
+	var raw struct {
+		Kty string `json:"kty"`
+		Crv string `json:"crv"`
+		D   string `json:"d"`
+	}
+	if err := json.Unmarshal([]byte(jwkJSON), &raw); err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid JSON: %w", err)
+	}
+	if raw.Kty != "EC" || raw.Crv != "P-256" {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: unsupported kty/crv %q/%q", raw.Kty, raw.Crv)
+	}
+	d, err := base64.RawURLEncoding.DecodeString(raw.D)
+	if err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid d: %w", err)
+	}
+	priv, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), d)
+	if err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid key material: %w", err)
+	}
+	return priv, nil
+}
+
 // ecPublicKeyJWK returns the JWK representation of an ECDSA P-256 public key as a map.
 func ecPublicKeyJWK(pub *ecdsa.PublicKey) (map[string]interface{}, error) {
 	// ECDH conversion gives us the raw uncompressed point bytes
@@ -708,12 +760,24 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("selected_config", selectedConfig)
 	h.SetData("selected_credential_configuration_id", selectedConfigID)
 
-	// Generate ephemeral DPoP key pair (RFC 9449)
-	h.dpopKey, err = generateDPoPKey()
-	if err != nil {
-		h.Logger.Debug("failed to generate DPoP key", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-		return err
+	// Generate an ephemeral DPoP key pair (RFC 9449) - unless this is a
+	// renewal presenting the client-supplied key its refresh_token was
+	// originally bound to (vc's refresh_token grant rejects any other key
+	// per RFC 9449/ARF 3.0 §6.6.6.2.2 - see dpopPrivateKeyJWK's doc comment).
+	if msg.RefreshToken != "" && msg.DPoPJWK != "" {
+		h.dpopKey, err = parseDPoPPrivateKeyJWK(msg.DPoPJWK)
+		if err != nil {
+			h.Logger.Debug("failed to parse client-supplied DPoP JWK", zap.Error(err))
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return err
+		}
+	} else {
+		h.dpopKey, err = generateDPoPKey()
+		if err != nil {
+			h.Logger.Debug("failed to generate DPoP key", zap.Error(err))
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return err
+		}
 	}
 
 	// Step 5: Handle authorization (renewal, resumption, or fresh grant)
@@ -818,13 +882,32 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
 		h.registerNotificationContext(metadata, token, deferredResp)
-		return h.CompleteWithRefreshToken(results, "", token.RefreshToken)
+		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token))
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
 	h.registerNotificationContext(metadata, token, credential)
-	return h.CompleteWithRefreshToken(results, "", token.RefreshToken)
+	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token))
+}
+
+// dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
+// client alongside a refresh_token, so a later renewal can present the same
+// key back (see FlowStartMessage.DPoPJWK). Returns "" when there's no
+// refresh_token to pair it with, or on export failure - a failure here must
+// not fail the overall flow, since the credential itself already issued
+// successfully; it just means this particular refresh_token won't be
+// renewable later.
+func (h *OID4VCIHandler) dpopJWKForRefreshToken(token *TokenResponse) string {
+	if token.RefreshToken == "" || h.dpopKey == nil {
+		return ""
+	}
+	jwk, err := dpopPrivateKeyJWK(h.dpopKey)
+	if err != nil {
+		h.Logger.Warn("failed to export DPoP key for refresh_token relay", zap.Error(err))
+		return ""
+	}
+	return jwk
 }
 
 // registerNotificationContext captures the ephemeral state needed to forward an

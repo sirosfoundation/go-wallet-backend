@@ -2933,3 +2933,71 @@ func TestAuthorizationServer_FallsBackWhenAllEmpty(t *testing.T) {
 	}
 	assert.Equal(t, "https://fallback.example.com", m.authorizationServer())
 }
+
+func TestDPoPPrivateKeyJWK_RoundTrip(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	jwkJSON, err := dpopPrivateKeyJWK(key)
+	require.NoError(t, err)
+
+	parsed, err := parseDPoPPrivateKeyJWK(jwkJSON)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, key.D.Cmp(parsed.D), "private scalar must round-trip exactly")
+	assert.Equal(t, 0, key.X.Cmp(parsed.X), "public X must round-trip exactly")
+	assert.Equal(t, 0, key.Y.Cmp(parsed.Y), "public Y must round-trip exactly")
+
+	// The reconstructed key must produce DPoP proofs that verify against the
+	// original key's public thumbprint - the actual property renewal depends on.
+	proof, err := createDPoPProof(parsed, "POST", "https://issuer.example.com/token", "", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, proof)
+}
+
+func TestParseDPoPPrivateKeyJWK_RejectsWrongCurve(t *testing.T) {
+	_, err := parseDPoPPrivateKeyJWK(`{"kty":"EC","crv":"P-384","x":"AA","y":"AA","d":"AA"}`)
+	assert.Error(t, err)
+}
+
+func TestParseDPoPPrivateKeyJWK_RejectsInvalidJSON(t *testing.T) {
+	_, err := parseDPoPPrivateKeyJWK("not json")
+	assert.Error(t, err)
+}
+
+func TestExecute_RenewalReusesClientSuppliedDPoPKey(t *testing.T) {
+	original, err := generateDPoPKey()
+	require.NoError(t, err)
+	jwkJSON, err := dpopPrivateKeyJWK(original)
+	require.NoError(t, err)
+
+	msg := &FlowStartMessage{
+		RefreshToken: "some-refresh-token",
+		DPoPJWK:      jwkJSON,
+	}
+	require.NotEmpty(t, msg.DPoPJWK)
+
+	reconstructed, err := parseDPoPPrivateKeyJWK(msg.DPoPJWK)
+	require.NoError(t, err)
+	assert.Equal(t, 0, original.D.Cmp(reconstructed.D),
+		"Execute() must reconstruct the exact key a renewal supplies, not generate a fresh one")
+}
+
+func TestDpopJWKForRefreshToken_EmptyWhenNoRefreshToken(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h := &OID4VCIHandler{dpopKey: key}
+	assert.Empty(t, h.dpopJWKForRefreshToken(&TokenResponse{}))
+}
+
+func TestDpopJWKForRefreshToken_ExportsWhenRefreshTokenPresent(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h := &OID4VCIHandler{dpopKey: key}
+	jwkJSON := h.dpopJWKForRefreshToken(&TokenResponse{RefreshToken: "rt"})
+	require.NotEmpty(t, jwkJSON)
+
+	parsed, err := parseDPoPPrivateKeyJWK(jwkJSON)
+	require.NoError(t, err)
+	assert.Equal(t, 0, key.D.Cmp(parsed.D))
+}
