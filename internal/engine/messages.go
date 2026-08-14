@@ -259,6 +259,13 @@ type FlowCompleteMessage struct {
 	TypeMetadata                      json.RawMessage    `json:"type_metadata,omitempty"`
 	CredentialIssuer                  string             `json:"credential_issuer,omitempty"`
 	SelectedCredentialConfigurationID string             `json:"selected_credential_configuration_id,omitempty"`
+	// RefreshToken is the OAuth refresh_token the issuer's token endpoint
+	// returned alongside this batch, if any (OID4VCI issuance only - never
+	// set for OID4VP). The backend does not persist this itself (see the
+	// credential re-issuance/renewal plan); the client is expected to store
+	// it durably (e.g. via privatedata) and present it back on a future
+	// renewal request for this credential_configuration_id.
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle

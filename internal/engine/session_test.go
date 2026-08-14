@@ -667,3 +667,130 @@ func TestSendFlowComplete_EmptyDataMapOmitsIssuerFields(t *testing.T) {
 	assert.False(t, hasIssuer, "credential_issuer should not be present when Data map is empty")
 	assert.False(t, hasConfig, "selected_credential_configuration_id should not be present when Data map is empty")
 }
+
+// TestSendFlowCompleteWithRefreshToken_IncludesRefreshToken covers the
+// credential re-issuance/renewal plan's Phase 1 first step: an OID4VCI
+// refresh_token must actually reach the client instead of being silently
+// discarded (as internal/engine/oid4vci.go's TokenResponse.RefreshToken
+// field previously was - parsed, never read again).
+func TestSendFlowCompleteWithRefreshToken_IncludesRefreshToken(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return
+		}
+		_ = srvConn.WriteJSON(msg)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{
+		ID:      "test-flow-refresh-token",
+		Session: session,
+		Data:    make(map[string]interface{}),
+	}
+	session.flowsMu.Lock()
+	session.flows["test-flow-refresh-token"] = flow
+	session.flowsMu.Unlock()
+
+	credentials := []CredentialResult{
+		{Format: "dc+sd-jwt", Credential: "eyJ..."},
+	}
+
+	err := session.SendFlowCompleteWithRefreshToken("test-flow-refresh-token", credentials, "", "opaque-refresh-token-value")
+	require.NoError(t, err)
+
+	var received map[string]interface{}
+	err = conn.ReadJSON(&received)
+	require.NoError(t, err)
+
+	assert.Equal(t, "opaque-refresh-token-value", received["refresh_token"])
+}
+
+// TestSendFlowCompleteWithRefreshToken_EmptyOmitsField confirms an empty
+// refresh_token (the common case - most issuers don't return one) doesn't
+// add a spurious empty field to the wire message, matching every other
+// omitempty field on FlowCompleteMessage.
+func TestSendFlowCompleteWithRefreshToken_EmptyOmitsField(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return
+		}
+		_ = srvConn.WriteJSON(msg)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{
+		ID:      "test-flow-no-refresh-token",
+		Session: session,
+		Data:    make(map[string]interface{}),
+	}
+	session.flowsMu.Lock()
+	session.flows["test-flow-no-refresh-token"] = flow
+	session.flowsMu.Unlock()
+
+	err := session.SendFlowCompleteWithRefreshToken("test-flow-no-refresh-token", nil, "", "")
+	require.NoError(t, err)
+
+	var received map[string]interface{}
+	err = conn.ReadJSON(&received)
+	require.NoError(t, err)
+
+	_, hasRefreshToken := received["refresh_token"]
+	assert.False(t, hasRefreshToken, "refresh_token should be omitted when empty")
+}
+
+// TestBaseHandler_CompleteWithRefreshToken covers the BaseHandler-level
+// delegation to Session.SendFlowCompleteWithRefreshToken (mirroring
+// TestBaseHandler_RequestMatch's pattern in match_test.go) - the actual
+// OID4VCI call sites (internal/engine/oid4vci.go) go through this method,
+// not SendFlowCompleteWithRefreshToken directly.
+func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return
+		}
+		_ = srvConn.WriteJSON(msg)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{
+		ID:      "flow-handler-refresh-token",
+		Session: session,
+	}
+	handler := &BaseHandler{
+		Flow:   flow,
+		Logger: zap.NewNop(),
+	}
+
+	credentials := []CredentialResult{
+		{Format: "dc+sd-jwt", Credential: "eyJ..."},
+	}
+	err := handler.CompleteWithRefreshToken(credentials, "", "handler-refresh-token-value")
+	require.NoError(t, err)
+
+	var received map[string]interface{}
+	err = conn.ReadJSON(&received)
+	require.NoError(t, err)
+
+	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
+}

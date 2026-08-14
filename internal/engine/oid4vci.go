@@ -805,13 +805,13 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
 		h.registerNotificationContext(metadata, token, deferredResp)
-		return h.Complete(results, "")
+		return h.CompleteWithRefreshToken(results, "", token.RefreshToken)
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
 	h.registerNotificationContext(metadata, token, credential)
-	return h.Complete(results, "")
+	return h.CompleteWithRefreshToken(results, "", token.RefreshToken)
 }
 
 // registerNotificationContext captures the ephemeral state needed to forward an
