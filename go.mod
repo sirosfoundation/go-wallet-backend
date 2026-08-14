@@ -1,6 +1,6 @@
 module github.com/sirosfoundation/go-wallet-backend
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/descope/virtualwebauthn v1.0.3
