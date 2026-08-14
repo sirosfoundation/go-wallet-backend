@@ -346,6 +346,40 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 	return h, cleanup
 }
 
+// TestExecute_RenewalMissingCredentialIssuerFails and
+// TestExecute_RenewalMissingConfigurationIDFails cover the credential
+// re-issuance/renewal plan's Phase 1 Slice 2 entry-point validation: a
+// renewal request (RefreshToken set) has no fresh offer to parse, so it
+// must supply CredentialIssuer and SelectedCredentialConfigurationID
+// directly - Execute must reject the request immediately (before any
+// network calls) if either is missing, rather than synthesizing a broken
+// CredentialOffer and failing confusingly downstream.
+func TestExecute_RenewalMissingCredentialIssuerFails(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	err := h.Execute(context.Background(), &FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+		// CredentialIssuer deliberately omitted.
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_issuer")
+}
+
+func TestExecute_RenewalMissingConfigurationIDFails(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	err := h.Execute(context.Background(), &FlowStartMessage{
+		RefreshToken:     "some-refresh-token",
+		CredentialIssuer: "https://issuer.example.com",
+		// SelectedCredentialConfigurationID deliberately omitted.
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selected_credential_configuration_id")
+}
+
 func TestExchangeAuthCode_IncludesCodeVerifier(t *testing.T) {
 	// Mock token endpoint that verifies code_verifier is present
 	var receivedForm url.Values
@@ -741,6 +775,122 @@ func TestExchangePreAuthCode_SendsDPoP(t *testing.T) {
 	require.NoError(t, err)
 	claims := tok.Claims.(jwt.MapClaims)
 	assert.Equal(t, "POST", claims["htm"])
+}
+
+// TestExchangeRefreshToken_SendsGrantTypeAndToken covers the credential
+// re-issuance/renewal plan's Phase 1 Slice 2: a renewal must send an
+// ordinary OAuth 2.0 refresh_token grant (grant_type=refresh_token plus the
+// refresh_token itself), structurally identical to exchangePreAuthCode's
+// pre-authorized_code grant otherwise.
+func TestExchangeRefreshToken_SendsGrantTypeAndToken(t *testing.T) {
+	var receivedForm url.Values
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		receivedForm = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "renewed-access-token",
+			TokenType:    "DPoP",
+			RefreshToken: "rotated-refresh-token",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangeRefreshToken(context.Background(), metadata, "original-refresh-token")
+	require.NoError(t, err)
+	assert.Equal(t, "renewed-access-token", token.AccessToken)
+	assert.Equal(t, "rotated-refresh-token", token.RefreshToken)
+
+	assert.Equal(t, "refresh_token", receivedForm.Get("grant_type"))
+	assert.Equal(t, "original-refresh-token", receivedForm.Get("refresh_token"))
+	assert.Empty(t, receivedForm.Get("pre-authorized_code"), "must not send a pre-authorized_code param")
+	assert.Empty(t, receivedForm.Get("code"), "must not send an authorization_code param")
+}
+
+// TestExchangeRefreshToken_SendsDPoP mirrors TestExchangePreAuthCode_SendsDPoP:
+// the renewal's OAuth-transport-layer DPoP proof uses this flow's own
+// ephemeral h.dpopKey (generated fresh per Execute() call, same as every
+// other grant in this file) - deliberately NOT the wallet's persistent
+// credential-holder-binding key. Same-wallet-unit continuity is a separate
+// concern, proven via requestProofs' reissuanceKid instead (see
+// TestRequestProofs_PassesReissuanceKid) - conflating the two would be a
+// design error (see exchangeRefreshToken's doc comment).
+func TestExchangeRefreshToken_SendsDPoP(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "renewed-access-token",
+			TokenType:   "DPoP",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangeRefreshToken(context.Background(), metadata, "original-refresh-token")
+	require.NoError(t, err)
+	assert.Equal(t, "DPoP", token.TokenType)
+	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+
+	dpopProof := receivedHeaders.Get("DPoP")
+	tok, err := jwt.Parse(dpopProof, func(tok *jwt.Token) (interface{}, error) {
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+	claims := tok.Claims.(jwt.MapClaims)
+	assert.Equal(t, "POST", claims["htm"])
+}
+
+// TestExchangeRefreshToken_TokenEndpointError verifies error responses from
+// the refresh grant are surfaced the same way as every other grant (parsed
+// OAuth error, StepExchangingToken failure), not silently swallowed.
+func TestExchangeRefreshToken_TokenEndpointError(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"refresh token expired or revoked"}`))
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	_, err = h.exchangeRefreshToken(context.Background(), metadata, "revoked-refresh-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid_grant")
 }
 
 // TestExchangePreAuthCode_SendsAttestationHeaders is a regression test:
@@ -1744,7 +1894,7 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 		},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "")
 	require.NoError(t, err)
 	require.Len(t, proofs, 1)
 	assert.Equal(t, "jwt", proofs[0].ProofType)
@@ -1758,6 +1908,71 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 	require.NotNil(t, receivedParams.ProofTypesSupported)
 	_, ok := receivedParams.ProofTypesSupported["jwt"]
 	assert.True(t, ok, "jwt should be in proof_types_supported sent to frontend")
+}
+
+// TestRequestProofs_PassesReissuanceKid covers the credential re-issuance/
+// renewal plan's Phase 1 Slice 2: when a renewal supplies a reissuanceKid,
+// it must reach SignRequestParams.ReissuanceKid so the client knows to sign
+// with the existing keypair instead of generating a fresh one.
+func TestRequestProofs_PassesReissuanceKid(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "jwt", JWT: "proof-1"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{
+			"jwt": map[string]interface{}{"alg_values_supported": []string{"ES256"}},
+		},
+	}
+
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "original-credential-kid")
+	require.NoError(t, err)
+	require.Len(t, proofs, 1)
+
+	receivedParams := <-paramsCh
+	assert.Equal(t, "original-credential-kid", receivedParams.ReissuanceKid)
 }
 
 func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
@@ -1818,7 +2033,7 @@ func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
 		},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "")
 	require.NoError(t, err)
 	require.Len(t, proofs, 1)
 
@@ -1885,7 +2100,7 @@ func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.NoError(t, err)
 	assert.Len(t, proofs, 3)
 
@@ -1942,7 +2157,7 @@ func TestRequestProofs_RejectsUnsupportedProofType(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported proof type")
 	assert.Contains(t, err.Error(), "unknown_type")
@@ -1993,7 +2208,7 @@ func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "frontend returned no proofs")
 }

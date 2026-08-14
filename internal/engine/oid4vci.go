@@ -580,12 +580,34 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		h.redirectURI = msg.RedirectURI
 	}
 
-	// Step 1: Parse credential offer
-	offer, err := h.parseOffer(ctx, msg)
-	if err != nil {
-		h.Logger.Debug("failed to parse offer", zap.Error(err))
-		_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
-		return err
+	// Step 1: Parse credential offer, or synthesize one for a renewal request.
+	//
+	// A renewal (credential re-issuance/renewal plan, Phase 1 Slice 2) has no
+	// fresh credential_offer to parse - the client already knows the issuer
+	// and credential_configuration_id from the credential being renewed, and
+	// supplies a previously-obtained refresh_token instead. Building a
+	// synthetic single-config CredentialOffer lets every downstream step
+	// (metadata fetch, trust evaluation, awaitCredentialSelection's existing
+	// auto-select-when-one path) run completely unchanged; only token
+	// acquisition (Step 5, below) and proof generation (requestProofs) differ.
+	var offer *CredentialOffer
+	if msg.RefreshToken != "" {
+		if msg.CredentialIssuer == "" || msg.SelectedCredentialConfigurationID == "" {
+			_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, "renewal request missing credential_issuer or selected_credential_configuration_id")
+			return errors.New("renewal request missing credential_issuer or selected_credential_configuration_id")
+		}
+		offer = &CredentialOffer{
+			CredentialIssuer:           msg.CredentialIssuer,
+			CredentialConfigurationIDs: []string{msg.SelectedCredentialConfigurationID},
+		}
+	} else {
+		var err error
+		offer, err = h.parseOffer(ctx, msg)
+		if err != nil {
+			h.Logger.Debug("failed to parse offer", zap.Error(err))
+			_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
+			return err
+		}
 	}
 	h.SetData("offer", offer)
 	h.SetData("credential_issuer", offer.CredentialIssuer)
@@ -681,9 +703,13 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 
-	// Step 5: Handle authorization (or resume with provided auth code)
+	// Step 5: Handle authorization (renewal, resumption, or fresh grant)
 	var token *TokenResponse
-	if msg.AuthCode != "" {
+	if msg.RefreshToken != "" {
+		// Renewal: exchange the client-supplied refresh_token instead of
+		// running any authorization/pre-authorized_code grant.
+		token, err = h.exchangeRefreshToken(ctx, metadata, msg.RefreshToken)
+	} else if msg.AuthCode != "" {
 		// Resumption: client already completed OAuth and returned with auth code.
 		// Verify the offer actually supports the authorization_code grant.
 		if _, ok := offer.Grants["authorization_code"]; !ok {
@@ -718,7 +744,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		var proofs []ProofObject
 		if h.needsProof(selectedConfig) {
 			var proofErr error
-			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce)
+			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, msg.ReissuanceKid)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
 				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
@@ -1399,6 +1425,88 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 	return nil, errors.New("token request failed after DPoP nonce retry")
 }
 
+// exchangeRefreshToken performs an OAuth 2.0 refresh_token grant against the
+// issuer's token endpoint - the renewal path (credential re-issuance/renewal
+// plan, Phase 1 Slice 2) taken instead of any authorization/pre-authorized_code
+// grant when FlowStartMessage.RefreshToken is set. Structurally identical to
+// exchangePreAuthCode (same DPoP-nonce-retry/client-auth/error-handling
+// scaffold, same TokenResponse decode) - only the grant_type/parameter differs.
+//
+// This is deliberately a plain OAuth-transport-layer refresh (using this
+// handler's own ephemeral per-flow h.dpopKey, exactly like every other grant
+// in this file) - it does NOT attempt same-wallet-unit continuity itself.
+// That's a separate concern, proven instead via requestProofs' reissuanceKid
+// (see SignRequestParams.ReissuanceKid's doc comment): the client signs the
+// renewal's holder-binding proof with the ORIGINAL credential's key, which
+// the issuer can match against cnf.jwk. Conflating the two would be a
+// design error - see the plan's explicit note on why they answer different
+// questions ("is this OAuth token request from whoever we gave the refresh
+// token to" vs. "is this credential request from whoever holds the original
+// credential's key").
+func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *IssuerMetadata, refreshToken string) (*TokenResponse, error) {
+	_ = h.ProgressMessage(StepExchangingToken, "Exchanging refresh token for a renewed credential batch")
+
+	tokenEndpoint := metadata.TokenEndpoint
+	if tokenEndpoint == "" {
+		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
+	}
+
+	// Token exchange with DPoP nonce retry (RFC 9449 §8)
+	for attempt := 0; attempt < 2; attempt++ {
+		data := url.Values{}
+		data.Set("grant_type", "refresh_token")
+		data.Set("refresh_token", refreshToken)
+		if err := h.setClientAuth(data); err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if err := h.setAttestationHeaders(ctx, req); err != nil {
+			return nil, err
+		}
+		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
+			return nil, err
+		}
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("token request failed: %w", err)
+		}
+
+		// Check for DPoP nonce requirement — retry once with server-provided nonce
+		if attempt == 0 && isDPoPNonceError(resp) {
+			h.updateDPoPNonce(resp)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.updateDPoPNonce(resp)
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			_ = resp.Body.Close()
+			h.Logger.Debug("refresh token endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
+			return nil, parseOAuthError(resp.StatusCode, body)
+		}
+
+		var token TokenResponse
+		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to parse token response: %w", err)
+		}
+		_ = resp.Body.Close()
+
+		_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
+		return &token, nil
+	}
+
+	return nil, errors.New("refresh token request failed after DPoP nonce retry")
+}
+
 // fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
 // Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
 func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
@@ -1782,7 +1890,14 @@ func credentialBatchSize(metadata *IssuerMetadata) int {
 
 // requestProofs asks the frontend to generate the required OID4VCI proofs and
 // validates that each returned proof type is listed in proof_types_supported.
-func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string) ([]ProofObject, error) {
+//
+// reissuanceKid, when non-empty (a renewal request - credential re-issuance/
+// renewal plan, Phase 1 Slice 2), asks the frontend to sign the proof with
+// the EXISTING keypair identified by that kid instead of generating a fresh
+// one, so the issuer can match it against the original credential's cnf.jwk
+// as same-wallet-unit evidence (mirrors wallet-frontend issue #70's Tier 2
+// "same-key re-signing" design - see SignRequestParams.ReissuanceKid).
+func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string) ([]ProofObject, error) {
 	count := credentialBatchSize(metadata)
 
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
@@ -1791,6 +1906,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		Issuer:              h.clientID,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
+		ReissuanceKid:       reissuanceKid,
 	})
 	if err != nil {
 		return nil, err
