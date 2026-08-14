@@ -791,6 +791,16 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "")
+}
+
+// SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
+// refresh_token to relay to the client (see FlowCompleteMessage.RefreshToken).
+func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string) error {
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken)
+}
+
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -801,8 +811,9 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 			FlowID:    flowID,
 			Timestamp: Now(),
 		},
-		Credentials: credentials,
-		RedirectURI: redirectURI,
+		Credentials:  credentials,
+		RedirectURI:  redirectURI,
+		RefreshToken: refreshToken,
 	}
 	if flow != nil {
 		flow.mu.RLock()
