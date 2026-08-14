@@ -380,6 +380,42 @@ func TestExecute_RenewalMissingConfigurationIDFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "selected_credential_configuration_id")
 }
 
+// TestBuildRenewalOffer_Succeeds covers the synthesis success path Execute's
+// Step 1 delegates to for a renewal request: given both required fields, it
+// must build a single-config CredentialOffer naming exactly the credential
+// being renewed, so downstream steps (metadata fetch, trust evaluation,
+// awaitCredentialSelection's auto-select-when-one path) run unchanged.
+func TestBuildRenewalOffer_Succeeds(t *testing.T) {
+	offer, err := buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		CredentialIssuer:                  "https://issuer.example.com",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, offer)
+	assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
+	assert.Equal(t, []string{"PID_SD_JWT"}, offer.CredentialConfigurationIDs)
+}
+
+// TestBuildRenewalOffer_MissingFieldsFail covers both required-field
+// validation branches directly (TestExecute_RenewalMissing* above already
+// cover them end-to-end through Execute).
+func TestBuildRenewalOffer_MissingFieldsFail(t *testing.T) {
+	_, err := buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_issuer")
+
+	_, err = buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:     "some-refresh-token",
+		CredentialIssuer: "https://issuer.example.com",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selected_credential_configuration_id")
+}
+
 func TestExchangeAuthCode_IncludesCodeVerifier(t *testing.T) {
 	// Mock token endpoint that verifies code_verifier is present
 	var receivedForm url.Values

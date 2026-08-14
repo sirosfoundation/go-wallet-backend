@@ -349,8 +349,8 @@ type SignRequestParams struct {
 	// generate_proof request with the EXISTING keypair identified by this
 	// kid rather than generating a fresh one, so the issuer can match the
 	// proof's public key against the original credential's cnf.jwk as
-	// same-wallet-unit evidence (ARF ISSU_65) - mirrors wallet-frontend
-	// issue #70's Tier 2 "same-key re-signing" design
+	// same-wallet-unit evidence (ARF ISSU_65) - mirrors
+	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
 }
