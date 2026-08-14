@@ -751,3 +751,46 @@ func TestSendFlowCompleteWithRefreshToken_EmptyOmitsField(t *testing.T) {
 	_, hasRefreshToken := received["refresh_token"]
 	assert.False(t, hasRefreshToken, "refresh_token should be omitted when empty")
 }
+
+// TestBaseHandler_CompleteWithRefreshToken covers the BaseHandler-level
+// delegation to Session.SendFlowCompleteWithRefreshToken (mirroring
+// TestBaseHandler_RequestMatch's pattern in match_test.go) - the actual
+// OID4VCI call sites (internal/engine/oid4vci.go) go through this method,
+// not SendFlowCompleteWithRefreshToken directly.
+func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return
+		}
+		_ = srvConn.WriteJSON(msg)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{
+		ID:      "flow-handler-refresh-token",
+		Session: session,
+	}
+	handler := &BaseHandler{
+		Flow:   flow,
+		Logger: zap.NewNop(),
+	}
+
+	credentials := []CredentialResult{
+		{Format: "dc+sd-jwt", Credential: "eyJ..."},
+	}
+	err := handler.CompleteWithRefreshToken(credentials, "", "handler-refresh-token-value")
+	require.NoError(t, err)
+
+	var received map[string]interface{}
+	err = conn.ReadJSON(&received)
+	require.NoError(t, err)
+
+	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
+}
