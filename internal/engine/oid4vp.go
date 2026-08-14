@@ -943,7 +943,13 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", "User declined the request")
+		if redirectURI != "" {
+			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
+				map[string]interface{}{"redirect_uri": redirectURI})
+		} else {
+			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
+		}
 		return nil, errors.New("user declined presentation")
 	}
 
@@ -1192,10 +1198,14 @@ func inferClientIDScheme(clientID string) string {
 // submitErrorResponse posts an OAuth 2.0 error response to the verifier's
 // response_uri per OID4VP §8.2 / §8.5. This allows the conformance suite
 // (and real verifiers) to learn why the wallet rejected the request instead
-// of timing out waiting for a response.
-func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) {
+// of timing out waiting for a response. Some verifiers (e.g. multipaz-based
+// ones, mirroring their direct_post.jwt success response) return a
+// redirect_uri here too, so the user can still be sent back to the
+// verifier's own page even on decline/error - returned as a best-effort
+// string, empty if the verifier didn't provide one or the POST failed.
+func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) string {
 	if authReq == nil || authReq.ResponseURI == "" {
-		return
+		return ""
 	}
 	data := url.Values{}
 	data.Set("error", errCode)
@@ -1209,20 +1219,31 @@ func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *Author
 	req, err := http.NewRequestWithContext(ctx, "POST", authReq.ResponseURI, strings.NewReader(data.Encode()))
 	if err != nil {
 		h.Logger.Debug("failed to create error response request", zap.Error(err))
-		return
+		return ""
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		h.Logger.Debug("failed to send error response to response_uri", zap.Error(err))
-		return
+		return ""
 	}
 	defer resp.Body.Close() //nolint:errcheck
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	h.Logger.Debug("sent error response to response_uri",
 		zap.String("response_uri", authReq.ResponseURI),
 		zap.String("error", errCode),
-		zap.Int("status", resp.StatusCode))
+		zap.Int("status", resp.StatusCode),
+		zap.String("body", string(respBody)))
+
+	var result struct {
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := json.Unmarshal(respBody, &result); err == nil {
+		return result.RedirectURI
+	}
+	return ""
 }
 
 // validateAuthorizationRequest performs OID4VP 1.0 Final spec-mandated validation
@@ -1428,7 +1449,18 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 			zap.String("verifier", authReq.ClientID))
 	}
 	if encEnc == "" {
-		encEnc = "A128CBC-HS256"
+		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
+		// "enc" algorithm, but it is not universally implemented in
+		// practice: confirmed live against verifier.multipaz.org, whose
+		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
+		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
+		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
+		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
+		// despite not declaring encrypted_response_enc_values_supported to
+		// signal that restriction. GCM is an equally spec-valid default
+		// choice absent an explicit verifier preference and has broader
+		// real-world interop, so prefer it.
+		encEnc = "A128GCM"
 	}
 
 	// Extract verifier's public key for encryption
@@ -1483,12 +1515,18 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	h.Logger.Debug("direct_post.jwt: verifier response received",
+		zap.String("endpoint", endpoint),
+		zap.Int("status", resp.StatusCode),
+		zap.String("body", string(respBody)))
+
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		var result struct {
 			RedirectURI                string `json:"redirect_uri"`
 			PresentationDuringIssuance string `json:"presentation_during_issuance_session"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+		if err := json.Unmarshal(respBody, &result); err == nil {
 			if result.RedirectURI != "" {
 				return result.RedirectURI, nil
 			}
@@ -1500,8 +1538,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 		return resp.Header.Get("Location"), nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(body))
+	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
 func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, error) {
