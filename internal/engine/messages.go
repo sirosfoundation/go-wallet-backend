@@ -207,6 +207,32 @@ type FlowStartMessage struct {
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
+
+	// Renewal fields (credential re-issuance/renewal plan, Phase 1 Slice 2).
+	// When RefreshToken is set, this FlowStart is a renewal request rather
+	// than a fresh issuance: Offer/CredentialOfferURI are not used (there is
+	// no fresh offer - the client already knows the issuer and credential
+	// type from the credential being renewed), CredentialIssuer and
+	// SelectedCredentialConfigurationID are required instead, and the token
+	// step performs a refresh_token grant against the issuer's token
+	// endpoint instead of any authorization/pre-authorized_code grant.
+	RefreshToken                      string `json:"refresh_token,omitempty"`
+	CredentialIssuer                  string `json:"credential_issuer,omitempty"`
+	SelectedCredentialConfigurationID string `json:"selected_credential_configuration_id,omitempty"`
+	// ReissuanceKid, when set, is threaded through to
+	// SignRequestParams.ReissuanceKid so the client signs the renewal's
+	// holder-binding proof with the original credential's key rather than a
+	// fresh one (see that field's doc comment for the full rationale).
+	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+	// DPoPJWK, when set on a renewal request, is the private JWK the backend
+	// previously exported at FlowCompleteMessage.DPoPJWK for the flow that
+	// issued RefreshToken. The issuer's refresh_token grant binds the token
+	// to the exact DPoP key used at initial issuance (RFC 9449/ARF 3.0
+	// §6.6.6.2.2), so the renewal must reuse that same key rather than the
+	// fresh ephemeral one Execute() would otherwise generate. The backend
+	// never persists this key itself; the client (via privatedata) is the
+	// only durable custodian - see feedback_backend_key_persistence_principle.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -249,6 +275,15 @@ type FlowCompleteMessage struct {
 	// it durably (e.g. via privatedata) and present it back on a future
 	// renewal request for this credential_configuration_id.
 	RefreshToken string `json:"refresh_token,omitempty"`
+	// DPoPJWK is the private JWK of the ephemeral DPoP key this flow used for
+	// its token exchange, present only alongside RefreshToken. The issuer
+	// binds RefreshToken to this exact key (RFC 9449/ARF 3.0 §6.6.6.2.2), so
+	// a later renewal must present it back as FlowStartMessage.DPoPJWK
+	// instead of Execute() generating a fresh one - see that field's doc
+	// comment. The backend only ever holds this key ephemerally in memory
+	// for the current flow and never persists it; relaying it here makes
+	// the client (via privatedata) the sole durable custodian.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -327,6 +362,15 @@ type SignRequestParams struct {
 	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
 	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// ReissuanceKid, when set (a renewal request - credential re-issuance/
+	// renewal plan, Phase 1 Slice 2), asks the client to sign this
+	// generate_proof request with the EXISTING keypair identified by this
+	// kid rather than generating a fresh one, so the issuer can match the
+	// proof's public key against the original credential's cnf.jwk as
+	// same-wallet-unit evidence (ARF ISSU_65) - mirrors
+	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
+	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
+	ReissuanceKid string `json:"reissuance_kid,omitempty"`
 }
 
 // CredentialRef references a credential for signing

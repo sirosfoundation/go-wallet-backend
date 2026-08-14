@@ -702,7 +702,7 @@ func TestSendFlowCompleteWithRefreshToken_IncludesRefreshToken(t *testing.T) {
 		{Format: "dc+sd-jwt", Credential: "eyJ..."},
 	}
 
-	err := session.SendFlowCompleteWithRefreshToken("test-flow-refresh-token", credentials, "", "opaque-refresh-token-value")
+	err := session.SendFlowCompleteWithRefreshToken("test-flow-refresh-token", credentials, "", "opaque-refresh-token-value", "")
 	require.NoError(t, err)
 
 	var received map[string]interface{}
@@ -741,7 +741,7 @@ func TestSendFlowCompleteWithRefreshToken_EmptyOmitsField(t *testing.T) {
 	session.flows["test-flow-no-refresh-token"] = flow
 	session.flowsMu.Unlock()
 
-	err := session.SendFlowCompleteWithRefreshToken("test-flow-no-refresh-token", nil, "", "")
+	err := session.SendFlowCompleteWithRefreshToken("test-flow-no-refresh-token", nil, "", "", "")
 	require.NoError(t, err)
 
 	var received map[string]interface{}
@@ -785,7 +785,7 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	credentials := []CredentialResult{
 		{Format: "dc+sd-jwt", Credential: "eyJ..."},
 	}
-	err := handler.CompleteWithRefreshToken(credentials, "", "handler-refresh-token-value")
+	err := handler.CompleteWithRefreshToken(credentials, "", "handler-refresh-token-value", "")
 	require.NoError(t, err)
 
 	var received map[string]interface{}
