@@ -73,6 +73,14 @@ func (h *BaseHandler) Complete(credentials []CredentialResult, redirectURI strin
 	return h.Flow.Session.SendFlowComplete(h.Flow.ID, credentials, redirectURI)
 }
 
+// CompleteWithRefreshToken is Complete plus an OID4VCI refresh_token to relay
+// to the client (see FlowCompleteMessage.RefreshToken) - a separate method
+// rather than a new Complete parameter so OID4VP's existing call sites (which
+// never have a refresh_token) are untouched.
+func (h *BaseHandler) CompleteWithRefreshToken(credentials []CredentialResult, redirectURI string, refreshToken string) error {
+	return h.Flow.Session.SendFlowCompleteWithRefreshToken(h.Flow.ID, credentials, redirectURI, refreshToken)
+}
+
 // RequestSign requests a client-side signature
 func (h *BaseHandler) RequestSign(ctx context.Context, action SignAction, params SignRequestParams) (*SignResponseMessage, error) {
 	return h.Flow.Session.RequestSign(ctx, h.Flow.ID, action, params)
