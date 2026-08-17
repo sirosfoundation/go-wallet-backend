@@ -247,19 +247,27 @@ func TestFetchRequestFromURI(t *testing.T) {
 	fakeHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	fakeJWT := fakeHeader + "." + jwtPayload + ".fakesig"
 
-	// A plain JSON object whose client_id contains no dots so that the naive
-	// dot-count heuristic in fetchRequestFromURI does not misclassify it as a JWT.
+	// A plain JSON object whose client_id contains no dots.
 	plainJSON := `{"client_id":"verifier","response_type":"vp_token","nonce":"test-nonce"}`
 	// The same JSON object encoded as a JSON string (as some verifiers return it).
 	quotedJSON := `"{\"client_id\":\"verifier\",\"response_type\":\"vp_token\",\"nonce\":\"test-nonce\"}"`
+	// A JSON object containing exactly two '.' characters in a field value
+	// (a response_uri host). fetchRequestFromURI used to classify body type
+	// by counting '.' characters and treating exactly two as "must be a
+	// JWT", which misclassified JSON bodies like this one and tried (and
+	// failed) to parse them as a JWT. It now checks for a leading '{'/'['
+	// instead, so this must parse as JSON.
+	jsonWithTwoDots := `{"client_id":"verifier","response_type":"vp_token","nonce":"test-nonce","response_uri":"https://a.b.c/path"}`
 
 	tests := []struct {
-		name         string
-		responseBody string
-		statusCode   int
-		wantClientID string
-		wantErr      bool
-		wantErrMsg   string
+		name          string
+		responseBody  string
+		requestQuery  string
+		statusCode    int
+		wantClientID  string
+		wantSessionID string
+		wantErr       bool
+		wantErrMsg    string
 	}{
 		{
 			name:         "plain JWT response",
@@ -286,6 +294,20 @@ func TestFetchRequestFromURI(t *testing.T) {
 			wantClientID: "verifier",
 		},
 		{
+			name:         "JSON object response containing exactly two dots",
+			responseBody: jsonWithTwoDots,
+			statusCode:   http.StatusOK,
+			wantClientID: "verifier",
+		},
+		{
+			name:          "sessionId query param is forwarded as VerifierSessionID",
+			responseBody:  plainJSON,
+			requestQuery:  "sessionId=abc-123",
+			statusCode:    http.StatusOK,
+			wantClientID:  "verifier",
+			wantSessionID: "abc-123",
+		},
+		{
 			name:         "HTTP error status",
 			responseBody: "not found",
 			statusCode:   http.StatusNotFound,
@@ -304,7 +326,12 @@ func TestFetchRequestFromURI(t *testing.T) {
 
 			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
 
-			authReq, err := h.fetchRequestFromURI(context.Background(), srv.URL)
+			uri := srv.URL
+			if tt.requestQuery != "" {
+				uri += "?" + tt.requestQuery
+			}
+
+			authReq, err := h.fetchRequestFromURI(context.Background(), uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrMsg != "" {
@@ -314,6 +341,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantClientID, authReq.ClientID)
+			assert.Equal(t, tt.wantSessionID, authReq.VerifierSessionID)
 		})
 	}
 }

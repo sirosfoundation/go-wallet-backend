@@ -435,15 +435,21 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	}
 
 	var authReq *AuthorizationRequest
-	if strings.Count(bodyStr, ".") == 2 {
-		// Likely a JWT
-		authReq, err = h.parseRequestJWT(bodyStr)
-	} else {
+	if strings.HasPrefix(bodyStr, "{") || strings.HasPrefix(bodyStr, "[") {
+		// A dot count can't reliably distinguish JWT from JSON: a JSON
+		// request object can easily contain exactly two '.' characters (for
+		// example a response_uri like "https://a.b.c/path"), which would
+		// misclassify it as a JWT and fail to parse. JSON always starts with
+		// '{' or '[' once whitespace is trimmed, and a JWT never does, so
+		// check that instead.
 		authReq = &AuthorizationRequest{}
 		err = json.Unmarshal([]byte(bodyStr), authReq)
 		if err != nil {
 			err = fmt.Errorf("failed to parse request: %w", err)
 		}
+	} else {
+		// Likely a JWT
+		authReq, err = h.parseRequestJWT(bodyStr)
 	}
 	if err != nil {
 		return nil, err
