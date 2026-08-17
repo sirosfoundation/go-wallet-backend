@@ -36,6 +36,17 @@ const (
 
 	// maxConnections is the maximum number of concurrent WebSocket connections.
 	maxConnections = 10000
+
+	// wsMaxMessageSize bounds incoming WebSocket messages from the wallet.
+	// A ZK-wrapped presentation's sign_presentation response (base64 proof
+	// bytes + CBOR/JSON overhead) can run several hundred KB - a real
+	// pairwise-pseudonym proof measured at ~620KB raw, well past the
+	// previous 64KB cap, confirmed live: exceeding it here causes gorilla to
+	// close the connection with 1009 (message too big) before the verifier
+	// ever sees a complete vp_token - the same class of stale-assumption
+	// bug already fixed at the go-wallet-backend -> verifier HTTP hop via
+	// nginx's client_max_body_size.
+	wsMaxMessageSize = 4 * 1024 * 1024
 )
 
 // SignatureAction defines the type of signing operation
@@ -168,8 +179,7 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
-	// Limit message size to 64KB to prevent memory exhaustion attacks
-	conn.SetReadLimit(64 * 1024)
+	conn.SetReadLimit(wsMaxMessageSize)
 
 	// Configure ping/pong keepalive to detect dead connections.
 	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
