@@ -103,6 +103,15 @@ type AuthorizationRequest struct {
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
+	// VerifierSessionID is the verifier-assigned "sessionId" query parameter
+	// carried on the request_uri we fetched the signed request object from
+	// (e.g. ".../openid4vpRequest?sessionId=X"). A real ZK/PPID pseudonym's
+	// verifier_context binds to THIS specific presentation session (per
+	// zk-cred-longfellow's V8/PPID reference implementation), not to the
+	// verifier's static identity - confirmed 2026-08-17 via direct report
+	// from that implementation's author. Empty for non-ZK presentations or
+	// request URIs that never carried a sessionId to begin with.
+	VerifierSessionID string `json:"-"`
 }
 
 // ClientMetadata represents verifier/client metadata
@@ -384,6 +393,16 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
 	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
+
+	// The verifier assigns this session id itself (it's the query param on
+	// the request_uri it handed us) - extract it up front from the URI
+	// string directly, rather than from the fetched request object, since
+	// it never appears inside the JWT/JSON body itself.
+	var verifierSessionID string
+	if parsedURI, err := url.Parse(uri); err == nil {
+		verifierSessionID = parsedURI.Query().Get("sessionId")
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, err
@@ -415,17 +434,23 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		}
 	}
 
+	var authReq *AuthorizationRequest
 	if strings.Count(bodyStr, ".") == 2 {
 		// Likely a JWT
-		return h.parseRequestJWT(bodyStr)
+		authReq, err = h.parseRequestJWT(bodyStr)
+	} else {
+		authReq = &AuthorizationRequest{}
+		err = json.Unmarshal([]byte(bodyStr), authReq)
+		if err != nil {
+			err = fmt.Errorf("failed to parse request: %w", err)
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	var authReq AuthorizationRequest
-	if err := json.Unmarshal([]byte(bodyStr), &authReq); err != nil {
-		return nil, fmt.Errorf("failed to parse request: %w", err)
-	}
-
-	return &authReq, nil
+	authReq.VerifierSessionID = verifierSessionID
+	return authReq, nil
 }
 
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
@@ -990,6 +1015,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		CredentialsToInclude:  credRefs,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
+		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
 	})
 	if err != nil {
