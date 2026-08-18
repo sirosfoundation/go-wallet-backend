@@ -359,6 +359,12 @@ type SignRequestParams struct {
 	// verifier's encryption key (for direct_post.jwt). Empty for other response modes.
 	// The frontend uses this to build the OID4VP 1.0 OpenID4VPHandover session transcript.
 	VerifierJwkThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
+	// VerifierSessionID is the verifier-assigned session id for this specific
+	// presentation (see AuthorizationRequest.VerifierSessionID) - needed by
+	// a ZK/PPID pseudonym's verifier_context derivation, which binds to the
+	// session rather than the verifier's static identity. Empty for
+	// non-ZK presentations.
+	VerifierSessionID string `json:"verifier_session_id,omitempty"`
 	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
 	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`

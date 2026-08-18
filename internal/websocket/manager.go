@@ -36,6 +36,26 @@ const (
 
 	// maxConnections is the maximum number of concurrent WebSocket connections.
 	maxConnections = 10000
+
+	// wsMaxMessageSize bounds incoming WebSocket messages from the wallet,
+	// but only once the connection has authenticated. A ZK-wrapped
+	// presentation's sign_presentation response (base64 proof bytes +
+	// CBOR/JSON overhead) can run several hundred KB - a real
+	// pairwise-pseudonym proof measured at ~620KB raw, well past the
+	// previous 64KB cap, confirmed live: exceeding it here causes gorilla to
+	// close the connection with 1009 (message too big) before the verifier
+	// ever sees a complete vp_token - the same class of stale-assumption
+	// bug already fixed at the go-wallet-backend -> verifier HTTP hop via
+	// nginx's client_max_body_size.
+	wsMaxMessageSize = 4 * 1024 * 1024
+
+	// wsHandshakeMaxMessageSize bounds messages from a connection that has
+	// not authenticated yet. The handshake payload (a JWT plus a small
+	// amount of JSON wrapping) is tiny, so this stays at the original 64KB
+	// cap: raising the limit to wsMaxMessageSize before authentication would
+	// let an unauthenticated client force repeated multi-MB allocations,
+	// widening the DoS/memory-exhaustion surface the limit exists to close.
+	wsHandshakeMaxMessageSize = 64 * 1024
 )
 
 // SignatureAction defines the type of signing operation
@@ -168,8 +188,7 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
-	// Limit message size to 64KB to prevent memory exhaustion attacks
-	conn.SetReadLimit(64 * 1024)
+	conn.SetReadLimit(wsHandshakeMaxMessageSize)
 
 	// Configure ping/pong keepalive to detect dead connections.
 	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
@@ -249,6 +268,10 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			}
 			m.clients[userID] = client
 			m.clientsMu.Unlock()
+
+			// Only raise the read limit for connections that have proven
+			// ownership of a valid token - see wsHandshakeMaxMessageSize.
+			conn.SetReadLimit(wsMaxMessageSize)
 
 			m.logger.Info("WebSocket handshake established", zap.String("tenant_id", tenantID))
 			_ = conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})
