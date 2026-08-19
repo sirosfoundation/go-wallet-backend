@@ -55,6 +55,25 @@ jobs:
           args: --timeout=5m --tests=false
           verify: false
 
+  config-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check docs/CONFIGURATION.md is up to date
+        run: |
+          make gen-config-docs
+          if ! git diff --exit-code docs/CONFIGURATION.md; then
+            echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
+            exit 1
+          fi
+
   build:
     runs-on: ubuntu-latest
     needs: [test, lint]
