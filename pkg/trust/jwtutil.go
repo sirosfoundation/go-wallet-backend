@@ -18,6 +18,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/sirosfoundation/go-cryptoutil"
+	jwkutil "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
 // ExtractKeyMaterialFromJWT extracts key material (x5c or jwk) from a JWT header.
@@ -334,11 +335,11 @@ func ecJWKToPublicKey(jwk map[string]any) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("failed to decode EC y coordinate: %w", err)
 	}
 
-	return &ecdsa.PublicKey{
-		Curve: curve,
-		X:     new(big.Int).SetBytes(xBytes),
-		Y:     new(big.Int).SetBytes(yBytes),
-	}, nil
+	pub, err := jwkutil.BuildECPublicKeyFromCoordinates(curve, xBytes, yBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse EC public key for %s: %w", crv, err)
+	}
+	return pub, nil
 }
 
 func rsaJWKToPublicKey(jwk map[string]any) (*rsa.PublicKey, error) {

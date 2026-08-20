@@ -160,12 +160,22 @@ func TestEcJWKToPublicKey(t *testing.T) {
 		t.Fatalf("Failed to generate key: %v", err)
 	}
 
+	// FillBytes (not X.Bytes()/Y.Bytes()) matches the real RFC 7518
+	// §6.2.1.2 fixed-length JWK encoding - a coordinate whose big-endian
+	// value happens to have a leading zero byte would otherwise serialize
+	// shorter than 32 bytes and (now that ecJWKToPublicKey enforces exact
+	// coordinate length) intermittently fail this test.
+	xBytes := make([]byte, 32)
+	privateKey.PublicKey.X.FillBytes(xBytes)
+	yBytes := make([]byte, 32)
+	privateKey.PublicKey.Y.FillBytes(yBytes)
+
 	t.Run("valid P-256 key", func(t *testing.T) {
 		jwk := map[string]any{
 			"kty": "EC",
 			"crv": "P-256",
-			"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-			"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+			"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
 		}
 
 		key, err := ecJWKToPublicKey(jwk)
@@ -180,13 +190,69 @@ func TestEcJWKToPublicKey(t *testing.T) {
 	t.Run("missing curve", func(t *testing.T) {
 		jwk := map[string]any{
 			"kty": "EC",
-			"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-			"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+			"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
 		}
 
 		_, err := ecJWKToPublicKey(jwk)
 		if err == nil {
 			t.Error("Expected error for missing curve")
+		}
+	})
+
+	t.Run("oversized x/y coordinate is rejected", func(t *testing.T) {
+		jwk := map[string]any{
+			"kty": "EC",
+			"crv": "P-256",
+			"x":   base64.RawURLEncoding.EncodeToString(append([]byte{0}, xBytes...)), // 33 bytes, not 32
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
+		}
+
+		_, err := ecJWKToPublicKey(jwk)
+		if err == nil {
+			t.Error("Expected error for oversized x/y coordinate")
+		}
+	})
+
+	t.Run("shorter x/y coordinate (leading zero omitted) is left-padded and accepted", func(t *testing.T) {
+		// Real-world producers sometimes omit a coordinate's leading zero
+		// byte rather than following RFC 7518 §6.2.1.2's fixed-length
+		// encoding - find a key whose X has one (~1/256 of keys) and
+		// confirm the shortened form still parses to the same point.
+		var shortKey *ecdsa.PrivateKey
+		var shortXBytes []byte
+		for i := 0; i < 4096; i++ {
+			k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatalf("Failed to generate key: %v", err)
+			}
+			full := make([]byte, 32)
+			k.PublicKey.X.FillBytes(full)
+			if full[0] == 0 {
+				shortKey = k
+				shortXBytes = full[1:]
+				break
+			}
+		}
+		if shortKey == nil {
+			t.Fatal("failed to find a P-256 key with a leading-zero X coordinate after 4096 attempts")
+		}
+		fullYBytes := make([]byte, 32)
+		shortKey.PublicKey.Y.FillBytes(fullYBytes)
+
+		jwk := map[string]any{
+			"kty": "EC",
+			"crv": "P-256",
+			"x":   base64.RawURLEncoding.EncodeToString(shortXBytes), // 31 bytes
+			"y":   base64.RawURLEncoding.EncodeToString(fullYBytes),
+		}
+
+		key, err := ecJWKToPublicKey(jwk)
+		if err != nil {
+			t.Fatalf("ecJWKToPublicKey() error = %v", err)
+		}
+		if key.X.Cmp(shortKey.PublicKey.X) != 0 || key.Y.Cmp(shortKey.PublicKey.Y) != 0 {
+			t.Error("left-padded coordinate did not reconstruct the original point")
 		}
 	})
 
