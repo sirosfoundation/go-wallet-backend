@@ -34,6 +34,8 @@ require (
 	github.com/sirosfoundation/go-tokenauth v0.4.0
 )
 
+require github.com/sirosfoundation/go-ts11client v0.0.0-20260820231641-44c4c4fc7c90
+
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect

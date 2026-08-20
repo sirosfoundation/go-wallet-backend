@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	ts11client "github.com/sirosfoundation/go-ts11client"
 	"go.uber.org/zap"
 )
 
@@ -354,81 +355,72 @@ func (s *RemoteSourceConfig) resolveURL() string {
 	}
 }
 
-// processTS11Response processes a TS11-format /api/v1/schemas.json response,
-// including following pagination via offset/limit or legacy "next" field.
-func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
+// processTS11Response processes a TS11-format /api/v1/schemas.json response.
+// The initial page (body, already fetched by fetchFromSource) is discarded
+// in favor of re-fetching from resolvedURL via ts11client.FetchTS11Schemas,
+// which owns the actual pagination-following and per-schema-document fetch
+// mechanics (offset/limit or legacy "next" field); this keeps exactly one
+// implementation of that logic instead of two.
+func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, _ []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
-	var fetchedCount, filteredCount, errorCount int
+	var fetchedCount, filteredCount int
 
-	// Use the resolved endpoint URL for pagination (not the raw base URL)
 	resolvedURL := source.resolveURL()
-	currentBody := body
-	for {
-		var page TS11SchemasResponse
-		if err := json.Unmarshal(currentBody, &page); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal TS11 schemas response: %w", err)
+	docs, skipped, err := ts11client.FetchTS11Schemas(ctx, f.client, resolvedURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch TS11 schemas: %w", err)
+	}
+
+	for _, s := range skipped {
+		f.logger.Warn("failed to fetch schema document",
+			zap.String("schema_id", s.SchemaID),
+			zap.String("format", s.FormatIdentifier),
+			zap.String("url", s.URI),
+			zap.Error(s.Err))
+	}
+
+	// Each TS11Document is one format's document for a schema. A schema
+	// may offer both an sd-jwt (VCTM) and an mso_mdoc (MDDL) document for
+	// the same logical credential; each is cached under its own
+	// identifier ("vct" or "doctype") so both are queryable.
+	for _, doc := range docs {
+		// NOTE: we do not pre-derive the identifier from the schemaURI.
+		// The authoritative identifier lives inside the fetched document
+		// itself ("vct" for sd-jwt, "doctype" for mso_mdoc) and may not
+		// match the HTTP URL used to fetch it (e.g. a "vct" that's a URN
+		// like "urn:eudi:diploma:1"). We must apply the filter on the
+		// real value, extracted from the document, not the URL.
+		header := parseDocumentHeader(doc.Data)
+		id := header.identifier()
+		if id == "" {
+			id = doc.URI
 		}
 
-		for _, schema := range page.Entries() {
-			if len(schema.SchemaURIs) == 0 {
-				f.logger.Warn("TS11 schema has no schemaURIs, skipping", zap.String("id", schema.ID))
-				errorCount++
-				continue
-			}
-
-			// Fetch every format's document, not just one. A schema may
-			// offer both an sd-jwt (VCTM) and an mso_mdoc (MDDL) document
-			// for the same logical credential; each is cached under its own
-			// identifier ("vct" or "doctype") so both are queryable.
-			for _, su := range schema.SchemaURIs {
-				// NOTE: we do not pre-derive the identifier from the
-				// schemaURI. The authoritative identifier lives inside the
-				// fetched document itself ("vct" for sd-jwt, "doctype" for
-				// mso_mdoc) and may not match the HTTP URL used to fetch it
-				// (e.g. a "vct" that's a URN like "urn:eudi:diploma:1"). We
-				// must fetch first, then apply the filter on the real value.
-				entry, err := f.fetchSchemaDocument(ctx, schema, su.URI)
-				if err != nil {
-					errorCount++
-					f.logger.Warn("failed to fetch schema document",
-						zap.String("schema_id", schema.ID),
-						zap.String("format", su.FormatIdentifier),
-						zap.String("url", su.URI),
-						zap.Error(err))
-					continue
-				}
-
-				if !f.config.Filter.Matches(entry.VCT) {
-					filteredCount++
-					f.logger.Debug("filtered out credential", zap.String("id", entry.VCT))
-					continue
-				}
-
-				entries[entry.VCT] = entry
-				fetchedCount++
-			}
+		if !f.config.Filter.Matches(id) {
+			filteredCount++
+			f.logger.Debug("filtered out credential", zap.String("id", id))
+			continue
 		}
 
-		// Follow pagination if more pages are available.
-		if !page.HasMorePages() {
-			break
+		entries[id] = &VCTMEntry{
+			VCT:              id,
+			Name:             header.displayName(),
+			Description:      header.displayDescription(),
+			Metadata:         json.RawMessage(doc.Data),
+			AttestationLoS:   doc.Schema.AttestationLoS,
+			BindingType:      doc.Schema.BindingType,
+			RulebookURI:      doc.Schema.RulebookURI,
+			SupportedFormats: doc.Schema.SupportedFormats,
+			FetchedAt:        time.Now(),
 		}
-		nextURL := page.NextPageURL(resolvedURL)
-		nextBody, err := f.fetchRaw(ctx, nextURL)
-		if err != nil {
-			f.logger.Warn("failed to fetch next page of schemas",
-				zap.String("url", nextURL),
-				zap.Error(err))
-			break
-		}
-		currentBody = nextBody
+		fetchedCount++
 	}
 
 	f.logger.Info("TS11 fetch complete",
 		zap.String("url", source.URL),
 		zap.Int("fetched", fetchedCount),
 		zap.Int("filtered", filteredCount),
-		zap.Int("errors", errorCount))
+		zap.Int("errors", len(skipped)))
 
 	return entries, nil
 }
