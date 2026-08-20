@@ -355,28 +355,34 @@ func (s *RemoteSourceConfig) resolveURL() string {
 	}
 }
 
-// processTS11Response processes a TS11-format /api/v1/schemas.json response.
-// The initial page (body, already fetched by fetchFromSource) is discarded
-// in favor of re-fetching from resolvedURL via ts11client.FetchTS11Schemas,
-// which owns the actual pagination-following and per-schema-document fetch
-// mechanics (offset/limit or legacy "next" field); this keeps exactly one
-// implementation of that logic instead of two.
-func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, _ []byte) (map[string]*VCTMEntry, error) {
+// processTS11Response processes a TS11-format /api/v1/schemas.json
+// response. body is the page fetchFromSource already fetched for format
+// auto-detection; FetchTS11SchemasFromFirstPage reuses it instead of
+// fetching page 1 again, and owns the actual pagination-following and
+// per-schema-document fetch mechanics for any subsequent pages (offset/
+// limit or legacy "next" field) - this keeps exactly one implementation
+// of that logic instead of two.
+func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount int
 
 	resolvedURL := source.resolveURL()
-	docs, skipped, err := ts11client.FetchTS11Schemas(ctx, f.client, resolvedURL)
+	docs, skipped, err := ts11client.FetchTS11SchemasFromFirstPage(ctx, f.client, resolvedURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch TS11 schemas: %w", err)
 	}
 
 	for _, s := range skipped {
-		f.logger.Warn("failed to fetch schema document",
-			zap.String("schema_id", s.SchemaID),
-			zap.String("format", s.FormatIdentifier),
-			zap.String("url", s.URI),
-			zap.Error(s.Err))
+		switch s.Reason {
+		case ts11client.SkipReasonNoSchemaURIs:
+			f.logger.Warn("TS11 schema has no schemaURIs, skipping", zap.String("id", s.SchemaID))
+		default:
+			f.logger.Warn("failed to fetch schema document",
+				zap.String("schema_id", s.SchemaID),
+				zap.String("format", s.FormatIdentifier),
+				zap.String("url", s.URI),
+				zap.Error(s.Err))
+		}
 	}
 
 	// Each TS11Document is one format's document for a schema. A schema

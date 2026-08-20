@@ -153,8 +153,12 @@ github.com/sirosfoundation/go-tokenauth v0.4.0 h1:3V6KgxJUN96MAoXKB43rpL3mgfL51o
 github.com/sirosfoundation/go-tokenauth v0.4.0/go.mod h1:GcaY3K5tsqlMt76NoVFO+Eq8j/h6DXLE4SG1fTGhzuI=
 github.com/sirosfoundation/go-trust v0.15.0 h1:m/8NwheG3/sJcRJZqEHKvAFJ9gsrmscK+15g7j7/guk=
 github.com/sirosfoundation/go-trust v0.15.0/go.mod h1:tuZlymZ1vOO08ypbwjJvbr5NHJAojaG9vhTngsuSils=
+github.com/sirosfoundation/go-ts11client v0.0.0-20260820230845-d45f20d8c6f8 h1:meXu4JraHzbB9O+fsI1xftqUtM6GHQhNWLcEPjYxCeQ=
+github.com/sirosfoundation/go-ts11client v0.0.0-20260820230845-d45f20d8c6f8/go.mod h1:orKb1BE+vDIHbSYAl6dGpDWHs7poqSTKvQyF5F/2PmA=
 github.com/sirosfoundation/go-ts11client v0.0.0-20260820231641-44c4c4fc7c90 h1:9mNzZKQ9UDLdlxfBvxwvX65gZX5UitwzmczPw4/uRkA=
 github.com/sirosfoundation/go-ts11client v0.0.0-20260820231641-44c4c4fc7c90/go.mod h1:orKb1BE+vDIHbSYAl6dGpDWHs7poqSTKvQyF5F/2PmA=
+github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67 h1:eJT3WaDRt6dPJMuob9cNDREkEaKCKVCPkIgQMP2ISos=
+github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67/go.mod h1:orKb1BE+vDIHbSYAl6dGpDWHs7poqSTKvQyF5F/2PmA=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5 h1:1UkTjkgj6NSA04SogK6tvfvlMZVT7vkdfWsJurwe69Q=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5/go.mod h1:gAxbvM0HnnY4c3aNYo6Za97nPpGSbqLfjUtxJ8qNGjs=
 github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w=
