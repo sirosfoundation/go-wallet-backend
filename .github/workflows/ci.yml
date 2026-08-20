@@ -69,7 +69,8 @@ jobs:
       - name: Check docs/CONFIGURATION.md is up to date
         run: |
           make gen-config-docs
-          if ! git diff --exit-code docs/CONFIGURATION.md; then
+          if [ -n "$(git status --porcelain -- docs/CONFIGURATION.md)" ]; then
+            git diff -- docs/CONFIGURATION.md || true
             echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
             exit 1
           fi
