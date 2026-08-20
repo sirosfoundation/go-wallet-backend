@@ -1,6 +1,8 @@
 package oidc
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -113,5 +115,90 @@ func TestJWK_rsaPublicKey_EmptyExponent(t *testing.T) {
 	_, err = jwk.rsaPublicKey()
 	if err == nil {
 		t.Error("expected error for empty/zero exponent, got nil")
+	}
+}
+
+func TestJWK_ecPublicKey_ValidP256(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate EC key: %v", err)
+	}
+	xBytes := make([]byte, 32)
+	privateKey.PublicKey.X.FillBytes(xBytes)
+	yBytes := make([]byte, 32)
+	privateKey.PublicKey.Y.FillBytes(yBytes)
+
+	jwk := &JWK{
+		Kty: "EC",
+		Crv: "P-256",
+		X:   base64.RawURLEncoding.EncodeToString(xBytes),
+		Y:   base64.RawURLEncoding.EncodeToString(yBytes),
+	}
+
+	key, err := jwk.ecPublicKey()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if key == nil {
+		t.Fatal("expected non-nil key")
+	}
+	if key.X.Cmp(privateKey.PublicKey.X) != 0 || key.Y.Cmp(privateKey.PublicKey.Y) != 0 {
+		t.Error("parsed public key does not match the original")
+	}
+}
+
+func TestJWK_ecPublicKey_UnsupportedCurve(t *testing.T) {
+	jwk := &JWK{
+		Kty: "EC",
+		Crv: "P-192",
+		X:   "test",
+		Y:   "test",
+	}
+
+	_, err := jwk.ecPublicKey()
+	if err == nil {
+		t.Error("expected error for unsupported curve, got nil")
+	}
+}
+
+func TestJWK_ecPublicKey_InvalidXBase64(t *testing.T) {
+	jwk := &JWK{
+		Kty: "EC",
+		Crv: "P-256",
+		X:   "!!!invalid!!!",
+		Y:   base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+	}
+
+	_, err := jwk.ecPublicKey()
+	if err == nil {
+		t.Error("expected error for invalid x coordinate, got nil")
+	}
+}
+
+func TestJWK_ecPublicKey_InvalidYBase64(t *testing.T) {
+	jwk := &JWK{
+		Kty: "EC",
+		Crv: "P-256",
+		X:   base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		Y:   "!!!invalid!!!",
+	}
+
+	_, err := jwk.ecPublicKey()
+	if err == nil {
+		t.Error("expected error for invalid y coordinate, got nil")
+	}
+}
+
+func TestJWK_ecPublicKey_CoordinateSizeMismatch(t *testing.T) {
+	jwk := &JWK{
+		Kty: "EC",
+		Crv: "P-256",
+		X:   base64.RawURLEncoding.EncodeToString(make([]byte, 31)), // wrong size
+		Y:   base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+	}
+
+	_, err := jwk.ecPublicKey()
+	if err == nil {
+		t.Error("expected error for x/y coordinate size mismatch, got nil")
 	}
 }
