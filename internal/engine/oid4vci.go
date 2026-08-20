@@ -1661,6 +1661,16 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 
 	var authURL string
 
+	if oauthMeta.PushedAuthorizationRequestEndpoint == "" && oauthMeta.RequirePushedAuthorizationRequests {
+		// The AS metadata declares PAR mandatory (RFC 9126 "require_pushed_authorization_requests")
+		// but advertises no pushed_authorization_request_endpoint to push to - there is no
+		// non-PAR /authorize path that could succeed. Fail fast instead of building a
+		// doomed authorization URL.
+		err := errors.New("AS metadata requires PAR (require_pushed_authorization_requests) but does not advertise a pushed_authorization_request_endpoint")
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, err.Error())
+		return nil, err
+	}
+
 	if oauthMeta.PushedAuthorizationRequestEndpoint != "" {
 		// Use Pushed Authorization Request (RFC 9126)
 		// Add client authentication for PAR if available
@@ -1675,8 +1685,8 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		}
 		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
 		if parErr != nil {
-			// An AS that requires PAR (RFC 9126 §5, "require_pushed_authorization_
-			// requests") has no non-PAR /authorize path at all - falling back to a
+			// An AS that requires PAR (RFC 9126 §5, "require_pushed_authorization_requests")
+			// has no non-PAR /authorize path at all - falling back to a
 			// "standard" authorization URL here is guaranteed to fail there too,
 			// just later and with a far more confusing error (e.g. a generic
 			// "request_uri is required" binding/validation error on /authorize,
@@ -1805,6 +1815,11 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		h.Logger.Debug("PAR endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+
+		var errResp PARResponse
+		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+			return "", fmt.Errorf("PAR endpoint returned status %d: %s %s", resp.StatusCode, errResp.Error, errResp.ErrorDesc)
+		}
 		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
 	}
 
