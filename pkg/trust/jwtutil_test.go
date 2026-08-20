@@ -160,12 +160,22 @@ func TestEcJWKToPublicKey(t *testing.T) {
 		t.Fatalf("Failed to generate key: %v", err)
 	}
 
+	// FillBytes (not X.Bytes()/Y.Bytes()) matches the real RFC 7518
+	// §6.2.1.2 fixed-length JWK encoding - a coordinate whose big-endian
+	// value happens to have a leading zero byte would otherwise serialize
+	// shorter than 32 bytes and (now that ecJWKToPublicKey enforces exact
+	// coordinate length) intermittently fail this test.
+	xBytes := make([]byte, 32)
+	privateKey.PublicKey.X.FillBytes(xBytes)
+	yBytes := make([]byte, 32)
+	privateKey.PublicKey.Y.FillBytes(yBytes)
+
 	t.Run("valid P-256 key", func(t *testing.T) {
 		jwk := map[string]any{
 			"kty": "EC",
 			"crv": "P-256",
-			"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-			"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+			"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
 		}
 
 		key, err := ecJWKToPublicKey(jwk)
@@ -180,13 +190,27 @@ func TestEcJWKToPublicKey(t *testing.T) {
 	t.Run("missing curve", func(t *testing.T) {
 		jwk := map[string]any{
 			"kty": "EC",
-			"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-			"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
+			"x":   base64.RawURLEncoding.EncodeToString(xBytes),
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
 		}
 
 		_, err := ecJWKToPublicKey(jwk)
 		if err == nil {
 			t.Error("Expected error for missing curve")
+		}
+	})
+
+	t.Run("x/y coordinate size mismatch", func(t *testing.T) {
+		jwk := map[string]any{
+			"kty": "EC",
+			"crv": "P-256",
+			"x":   base64.RawURLEncoding.EncodeToString(xBytes[1:]), // 31 bytes, not 32
+			"y":   base64.RawURLEncoding.EncodeToString(yBytes),
+		}
+
+		_, err := ecJWKToPublicKey(jwk)
+		if err == nil {
+			t.Error("Expected error for x/y coordinate size mismatch")
 		}
 	})
 

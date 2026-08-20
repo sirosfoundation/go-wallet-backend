@@ -308,13 +308,17 @@ func ecJWKToPublicKey(jwk map[string]any) (*ecdsa.PublicKey, error) {
 	crv, _ := jwk["crv"].(string)
 
 	var curve elliptic.Curve
+	var coordSize int
 	switch crv {
 	case "P-256":
 		curve = elliptic.P256()
+		coordSize = 32
 	case "P-384":
 		curve = elliptic.P384()
+		coordSize = 48
 	case "P-521":
 		curve = elliptic.P521()
+		coordSize = 66
 	default:
 		return nil, fmt.Errorf("unsupported EC curve: %s", crv)
 	}
@@ -334,10 +338,19 @@ func ecJWKToPublicKey(jwk map[string]any) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("failed to decode EC y coordinate: %w", err)
 	}
 
-	// SEC1 uncompressed point format (0x04 || X || Y) - RFC 7518 §6.2.1.2
-	// JWK x/y fields are already fixed-length (zero-padded to the curve's
-	// coordinate size), matching what ParseUncompressedPublicKey expects.
-	uncompressed := make([]byte, 0, 1+len(xBytes)+len(yBytes))
+	// RFC 7518 §6.2.1.2: x/y MUST be exactly the curve's coordinate size
+	// (zero-padded, no more). Reject anything else before it ever reaches
+	// an allocation - both defends against a malformed/adversarial JWK
+	// claiming an oversized coordinate and bounds the sizes fed into the
+	// uncompressed-point allocation below to small curve-fixed constants
+	// (CodeQL previously flagged the unbounded len(xBytes)+len(yBytes) sum
+	// here as a potential allocation-size overflow).
+	if len(xBytes) != coordSize || len(yBytes) != coordSize {
+		return nil, fmt.Errorf("EC JWK x/y coordinate size mismatch for %s: expected %d bytes, got x=%d y=%d", crv, coordSize, len(xBytes), len(yBytes))
+	}
+
+	// SEC1 uncompressed point format (0x04 || X || Y) - RFC 7518 §6.2.1.2.
+	uncompressed := make([]byte, 0, 1+2*coordSize)
 	uncompressed = append(uncompressed, 0x04)
 	uncompressed = append(uncompressed, xBytes...)
 	uncompressed = append(uncompressed, yBytes...)
