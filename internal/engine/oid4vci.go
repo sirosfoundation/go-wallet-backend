@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -502,26 +501,18 @@ func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, string, error) {
 		return nil, "", fmt.Errorf("unsupported curve %q", raw.Crv)
 	}
 
-	xBytes, err := base64.RawURLEncoding.DecodeString(raw.X)
-	if err != nil {
-		return nil, "", fmt.Errorf("decoding x: %w", err)
-	}
-	yBytes, err := base64.RawURLEncoding.DecodeString(raw.Y)
-	if err != nil {
-		return nil, "", fmt.Errorf("decoding y: %w", err)
-	}
 	dBytes, err := base64.RawURLEncoding.DecodeString(raw.D)
 	if err != nil {
 		return nil, "", fmt.Errorf("decoding d: %w", err)
 	}
 
-	key := &ecdsa.PrivateKey{
-		PublicKey: ecdsa.PublicKey{
-			Curve: curve,
-			X:     new(big.Int).SetBytes(xBytes),
-			Y:     new(big.Int).SetBytes(yBytes),
-		},
-		D: new(big.Int).SetBytes(dBytes),
+	// ParseRawPrivateKey derives the public key from d itself rather than
+	// trusting the JWK's own x/y fields (which this function previously
+	// decoded and stuffed in unchecked) - strictly more correct, and drops
+	// the deprecated PublicKey.X/Y/PrivateKey.D field construction.
+	key, err := ecdsa.ParseRawPrivateKey(curve, dBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("parsing raw private key: %w", err)
 	}
 	return key, raw.Kid, nil
 }

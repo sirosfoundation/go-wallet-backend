@@ -334,11 +334,18 @@ func ecJWKToPublicKey(jwk map[string]any) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("failed to decode EC y coordinate: %w", err)
 	}
 
-	return &ecdsa.PublicKey{
-		Curve: curve,
-		X:     new(big.Int).SetBytes(xBytes),
-		Y:     new(big.Int).SetBytes(yBytes),
-	}, nil
+	// SEC1 uncompressed point format (0x04 || X || Y) - RFC 7518 §6.2.1.2
+	// JWK x/y fields are already fixed-length (zero-padded to the curve's
+	// coordinate size), matching what ParseUncompressedPublicKey expects.
+	uncompressed := make([]byte, 0, 1+len(xBytes)+len(yBytes))
+	uncompressed = append(uncompressed, 0x04)
+	uncompressed = append(uncompressed, xBytes...)
+	uncompressed = append(uncompressed, yBytes...)
+	pub, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse EC public key: %w", err)
+	}
+	return pub, nil
 }
 
 func rsaJWKToPublicKey(jwk map[string]any) (*rsa.PublicKey, error) {

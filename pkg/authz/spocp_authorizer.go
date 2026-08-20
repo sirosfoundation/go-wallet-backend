@@ -178,6 +178,11 @@ func DefaultWalletRules() []sexp.Element {
 			sexp.NewAtom("wallet-provider"),
 			sexp.NewAtom("pid-provider"),
 			sexp.NewAtom("mdl-issuer"),
+			// ISO 18013-5 second-edition RICAL reader-trust evaluation
+			// (siros-sdk-kotlin/swift's proximity-presentation readerAuth
+			// check, proxied to go-trust's `mdocrical` registry) - same
+			// subject/resource shape (key/x5c) as the other actions above.
+			sexp.NewAtom("mdoc-reader-auth"),
 		},
 	}
 
