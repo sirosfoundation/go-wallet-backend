@@ -557,6 +557,26 @@ func TestOAuthServerMetadata_PAREndpointParsing(t *testing.T) {
 	assert.Equal(t, "https://as.example.com/authorize", meta.AuthorizationEndpoint)
 	assert.Equal(t, "https://as.example.com/token", meta.TokenEndpoint)
 	assert.Equal(t, "https://as.example.com/par", meta.PushedAuthorizationRequestEndpoint)
+	assert.False(t, meta.RequirePushedAuthorizationRequests)
+}
+
+func TestOAuthServerMetadata_RequirePARParsing(t *testing.T) {
+	// An AS that mandates PAR (RFC 9126 §5) - e.g. vc-apigw's
+	// require_pushed_authorization_requests:true - must be recognized so
+	// startAuthorizationFlow knows not to fall back to a non-PAR /authorize
+	// request that such an AS has no code path for at all.
+	body := `{
+		"issuer": "https://as.example.com",
+		"authorization_endpoint": "https://as.example.com/authorize",
+		"token_endpoint": "https://as.example.com/token",
+		"pushed_authorization_request_endpoint": "https://as.example.com/par",
+		"require_pushed_authorization_requests": true
+	}`
+
+	var meta oauthServerMetadata
+	err := json.Unmarshal([]byte(body), &meta)
+	require.NoError(t, err)
+	assert.True(t, meta.RequirePushedAuthorizationRequests)
 }
 
 // errRoundTripper always returns an error, used for deterministic network failure tests.

@@ -92,6 +92,7 @@ type oauthServerMetadata struct {
 	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
 	TokenEndpoint                      string   `json:"token_endpoint"`
 	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests bool     `json:"require_pushed_authorization_requests"`
 	CodeChallengeMethodsSupported      []string `json:"code_challenge_methods_supported"`
 	codeChallengeMethodsDeclared       bool
 }
@@ -103,6 +104,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 		AuthorizationEndpoint              string    `json:"authorization_endpoint"`
 		TokenEndpoint                      string    `json:"token_endpoint"`
 		PushedAuthorizationRequestEndpoint string    `json:"pushed_authorization_request_endpoint"`
+		RequirePushedAuthorizationRequests bool      `json:"require_pushed_authorization_requests"`
 		CodeChallengeMethodsSupported      *[]string `json:"code_challenge_methods_supported"`
 	}
 	var aux alias
@@ -112,6 +114,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	m.AuthorizationEndpoint = aux.AuthorizationEndpoint
 	m.TokenEndpoint = aux.TokenEndpoint
 	m.PushedAuthorizationRequestEndpoint = aux.PushedAuthorizationRequestEndpoint
+	m.RequirePushedAuthorizationRequests = aux.RequirePushedAuthorizationRequests
 	m.codeChallengeMethodsDeclared = aux.CodeChallengeMethodsSupported != nil
 	if aux.CodeChallengeMethodsSupported != nil {
 		m.CodeChallengeMethodsSupported = *aux.CodeChallengeMethodsSupported
@@ -1672,7 +1675,23 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		}
 		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
 		if parErr != nil {
-			// PAR failed — fall back to standard authorization URL
+			// An AS that requires PAR (RFC 9126 §5, "require_pushed_authorization_
+			// requests") has no non-PAR /authorize path at all - falling back to a
+			// "standard" authorization URL here is guaranteed to fail there too,
+			// just later and with a far more confusing error (e.g. a generic
+			// "request_uri is required" binding/validation error on /authorize,
+			// or an invalid_client at the authorization step instead of the real
+			// PAR failure). Surface the actual PAR error immediately instead.
+			if oauthMeta.RequirePushedAuthorizationRequests {
+				h.Logger.Warn("PAR request failed and this AS requires PAR - not falling back",
+					zap.Error(parErr))
+				_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail,
+					fmt.Sprintf("Pushed authorization request failed: %v", parErr))
+				return nil, fmt.Errorf("PAR request failed (AS requires PAR, no fallback available): %w", parErr)
+			}
+			// PAR is merely advertised, not required - fall back to a standard
+			// authorization URL, matching what an AS without a PAR endpoint at
+			// all would have received.
 			h.Logger.Debug("PAR request failed, falling back to standard authorization", zap.Error(parErr))
 			q := authEndpoint.Query()
 			for key, values := range params {
