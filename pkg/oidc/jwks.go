@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"go.uber.org/zap"
 )
 
@@ -117,17 +118,13 @@ func (k *JWK) rsaPublicKey() (*rsa.PublicKey, error) {
 // ecPublicKey converts EC JWK to *ecdsa.PublicKey
 func (k *JWK) ecPublicKey() (*ecdsa.PublicKey, error) {
 	var curve elliptic.Curve
-	var coordSize int
 	switch k.Crv {
 	case "P-256":
 		curve = elliptic.P256()
-		coordSize = 32
 	case "P-384":
 		curve = elliptic.P384()
-		coordSize = 48
 	case "P-521":
 		curve = elliptic.P521()
-		coordSize = 66
 	default:
 		return nil, fmt.Errorf("unsupported curve: %s", k.Crv)
 	}
@@ -142,32 +139,9 @@ func (k *JWK) ecPublicKey() (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("failed to decode y: %w", err)
 	}
 
-	// RFC 7518 §6.2.1.2 mandates x/y be exactly the curve's coordinate
-	// size, but some producers in the wild omit leading zero bytes -
-	// reject anything longer (bounds the sizes fed into the
-	// uncompressed-point allocation below to small curve-fixed constants;
-	// CodeQL flagged the identical unbounded len(xBytes)+len(yBytes)
-	// pattern elsewhere in this codebase as a potential allocation-size
-	// overflow) but left-pad anything shorter, matching this codebase's
-	// other EC JWK parser (pkg/jwk.parseECJWK).
-	if len(xBytes) > coordSize || len(yBytes) > coordSize {
-		return nil, fmt.Errorf("EC JWK x/y coordinate too large for %s: expected <= %d bytes, got x=%d y=%d", k.Crv, coordSize, len(xBytes), len(yBytes))
-	}
-	for len(xBytes) < coordSize {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < coordSize {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-
-	// SEC1 uncompressed point format (0x04 || X || Y) - RFC 7518 §6.2.1.2
-	uncompressed := make([]byte, 0, 1+2*coordSize)
-	uncompressed = append(uncompressed, 0x04)
-	uncompressed = append(uncompressed, xBytes...)
-	uncompressed = append(uncompressed, yBytes...)
-	pub, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
+	pub, err := jwk.BuildECPublicKeyFromCoordinates(curve, xBytes, yBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse EC public key: %w", err)
+		return nil, fmt.Errorf("failed to parse EC public key for %s: %w", k.Crv, err)
 	}
 	return pub, nil
 }
