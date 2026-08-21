@@ -301,6 +301,205 @@ func TestGetIssuerMetadata_NoRegistryStoreLeavesMetadataUnmodified(t *testing.T)
 	}
 }
 
+// mockIssuerWithDoctype mirrors mockIssuerWithVct but for an ISO 18013-5 mdoc
+// config, which identifies itself via "doctype" rather than "vct" -
+// enrichCredentialMetadataFromRegistry falls back to doctype when vct is
+// absent, and this exercises that path directly rather than only vct.
+func mockIssuerWithDoctype(t *testing.T, doctype string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"mdl": map[string]interface{}{
+					"format":  "mso_mdoc",
+					"doctype": doctype,
+					"credential_metadata": map[string]interface{}{
+						"display": []interface{}{
+							map[string]interface{}{"name": "Issuer's own mDL"},
+						},
+					},
+				},
+			},
+		})
+	}))
+}
+
+func TestGetIssuerMetadata_RegistryOverridesCredentialMetadataForMdocDoctype(t *testing.T) {
+	const doctype = "org.iso.18013.5.1.mDL"
+	mockIssuer := mockIssuerWithDoctype(t, doctype)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	registryStore.Put(&registry.VCTMEntry{
+		VCT:      doctype,
+		Metadata: json.RawMessage(`{"doctype":"` + doctype + `","display":[{"name":"Registry's mDL"}]}`),
+	})
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["mdl"].CredentialMetadata.Display[0].Name
+	if name != "Registry's mDL" {
+		t.Errorf("Expected registry-sourced credential_metadata to win for a doctype-identified config, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_RegistryMissEntryLeavesIssuerMetadataUnmodified(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	// A registry store IS wired up, but it never learned about this vct -
+	// distinct from the expired-entry case: here Get itself returns found=false.
+	registryStore := registry.NewStore("")
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["ehic"].CredentialMetadata.Display[0].Name
+	if name != "Issuer's own EHIC" {
+		t.Errorf("Expected a registry miss (no entry for this vct) to leave credential_metadata untouched, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_ConfigWithoutVctOrDoctypeIsSkipped(t *testing.T) {
+	mockIssuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// A config with neither "vct" nor "doctype" - e.g. a jwt_vc_json
+		// format that identifies itself some other way. There's nothing for
+		// enrichCredentialMetadataFromRegistry to look up, so this whole
+		// config (and, since it's the only one, the whole enrichment pass)
+		// must be a no-op.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"other": map[string]interface{}{
+					"format": "jwt_vc_json",
+					"credential_metadata": map[string]interface{}{
+						"display": []interface{}{
+							map[string]interface{}{"name": "Issuer's own credential"},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["other"].CredentialMetadata.Display[0].Name
+	if name != "Issuer's own credential" {
+		t.Errorf("Expected a config with no vct/doctype to be left untouched, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_MalformedCredentialConfigurationsSupportedIsIgnored(t *testing.T) {
+	mockIssuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// credential_configurations_supported is required to be a JSON
+		// object keyed by config ID (OpenID4VCI ยง10.2.3) - a malformed
+		// issuer sending an array here must not crash enrichment, just skip
+		// it and return whatever DiscoverIssuer already parsed.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"credential_issuer":                   "https://issuer.example.com",
+			"credential_endpoint":                 "https://issuer.example.com/credential",
+			"credential_configurations_supported": []string{"not", "an", "object"},
+		})
+	}))
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected malformed credential_configurations_supported to still return %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
 func TestGetIssuerMetadata_CachesResponses(t *testing.T) {
 	callCount := 0
 	mockIssuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
