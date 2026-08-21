@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/metadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -172,7 +174,11 @@ func mockIssuerWithVct(t *testing.T, vct string) *httptest.Server {
 func createTestIssuer(t *testing.T, store *memory.Store, issuerURL string) int64 {
 	t.Helper()
 	ctx := context.Background()
-	store.Tenants().Create(ctx, &domain.Tenant{ID: "default", Name: "Default", Enabled: true})
+	// memory.NewStore() already seeds the "default" tenant, so this
+	// consistently returns ErrAlreadyExists - expected, not a real failure.
+	if err := store.Tenants().Create(ctx, &domain.Tenant{ID: "default", Name: "Default", Enabled: true}); err != nil && !errors.Is(err, storage.ErrAlreadyExists) {
+		t.Fatal(err)
+	}
 	issuer := &domain.CredentialIssuer{
 		TenantID:                   "default",
 		CredentialIssuerIdentifier: issuerURL,
