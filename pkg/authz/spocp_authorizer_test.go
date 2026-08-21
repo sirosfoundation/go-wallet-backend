@@ -136,6 +136,21 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 			shouldPass: true,
 		},
 		{
+			name:     "issuer metadata resolution (url type, HTTP dev)",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "url",
+					ID:   "http://vc-apigw:8080",
+				},
+				Resource: gotrust.Resource{
+					Type: "credential_issuer",
+					ID:   "http://vc-apigw:8080",
+				},
+			},
+			shouldPass: true,
+		},
+		{
 			name:     "authorization server metadata resolution (url type, HTTPS)",
 			tenantID: "default",
 			request: &gotrust.EvaluationRequest{

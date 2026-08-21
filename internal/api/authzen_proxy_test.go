@@ -686,6 +686,51 @@ func TestResolve_URLSubject_NonHTTPS_Rejected(t *testing.T) {
 	}
 }
 
+func TestResolve_URLSubject_HTTPAllowed_WhenAllowHTTPSet(t *testing.T) {
+	// When allowHTTP is set (test/dev environments, e.g. docker-compose's
+	// http://vc-apigw:8080), plain HTTP subject_ids must not be rejected by
+	// the initial scheme validation - same escape hatch every other scheme
+	// check in this file already honors (jwks_uri, logo URLs, proxy dispatch).
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	handler, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, pdpHandler)
+	defer pdpServer.Close()
+	handler.allowHTTP = true
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "http://vc-apigw:8080",
+		"subject_type": "url",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	// Assert the request actually succeeds, not merely that it isn't a 400 -
+	// a 403/500/502 would also clear a "not BadRequest" check while leaving
+	// the resolution just as broken as the bug this covers.
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp resolveURLResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if !resp.Decision {
+		t.Errorf("Expected decision true, got false: %s", w.Body.String())
+	}
+	if resp.Context == nil || resp.Context.TrustMetadata == nil {
+		t.Errorf("Expected trust_metadata in response, got: %s", w.Body.String())
+	}
+}
+
 func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 	// Integration test: subject.type="url" with an HTTPS URL must be authorized by
 	// the default SPOCP rules (Rule 5 added alongside the issuer-url registry).
