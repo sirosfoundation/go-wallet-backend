@@ -132,17 +132,25 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 }
 
 // enrichCredentialMetadataFromRegistry replaces each credential
-// configuration's credential_metadata with the registry's published VCTM,
-// for any configuration whose vct/doctype the local registry (registry.siros.org
-// mirror, see Handlers.SetRegistryStore) carries a non-expired entry for.
-// This is deliberately an override, not a merge - go-trust/registry-cli's
+// configuration's credential_metadata.display with the registry's published
+// VCTM's own display array, for any configuration whose vct/doctype the
+// local registry (registry.siros.org mirror, see Handlers.SetRegistryStore)
+// carries a non-expired entry for.
+//
+// Deliberately extracts just the display array rather than substituting the
+// registry's entire VCTM document (vct/claims/schema/display) for
+// credential_metadata - a review comment on the PR that introduced this
+// (sirosfoundation/go-wallet-backend#284) correctly pointed out that the
+// endpoint's credential_metadata field is meant to hold this endpoint's
+// condensed display info, not a full VCTM; the one genuine benefit over an
+// issuer's own local vctm_file_path fixture is that go-trust/registry-cli's
 // TS11 VCTM documents already have their images embedded as data: URIs (see
-// internal/registry's ImageEmbedder), so preferring them over an issuer's own
-// (possibly stale, possibly pointing at a live third-party URL) local
-// vctm_file_path fixture removes both the drift risk and the live
-// cross-origin dependency. No-op (leaves credential_metadata exactly as the
-// issuer returned it) if no registryStore is wired up, or for any
-// configuration the registry doesn't carry.
+// internal/registry's ImageEmbedder) rather than pointing at a live,
+// possibly-stale third-party URL, and only the display array carries that
+// benefit. No-op (leaves credential_metadata exactly as the issuer returned
+// it) if no registryStore is wired up, if the registry has no non-expired
+// entry for a configuration, or if the registry's entry has no display
+// array to extract.
 func (h *Handlers) enrichCredentialMetadataFromRegistry(m *metadata.IssuerMetadata) {
 	if h.registryStore == nil || m == nil || len(m.CredentialConfigurationsSupported) == 0 {
 		return
@@ -157,6 +165,9 @@ func (h *Handlers) enrichCredentialMetadataFromRegistry(m *metadata.IssuerMetada
 	var identifier struct {
 		Vct     string `json:"vct"`
 		Doctype string `json:"doctype"`
+	}
+	var vctm struct {
+		Display json.RawMessage `json:"display"`
 	}
 	changed := false
 	for key, raw := range configs {
@@ -178,11 +189,22 @@ func (h *Handlers) enrichCredentialMetadataFromRegistry(m *metadata.IssuerMetada
 			continue
 		}
 
+		vctm.Display = nil
+		if err := json.Unmarshal(entry.Metadata, &vctm); err != nil || len(vctm.Display) == 0 {
+			continue
+		}
+		credentialMetadata, err := json.Marshal(struct {
+			Display json.RawMessage `json:"display"`
+		}{Display: vctm.Display})
+		if err != nil {
+			continue
+		}
+
 		var config map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &config); err != nil {
 			continue
 		}
-		config["credential_metadata"] = entry.Metadata
+		config["credential_metadata"] = credentialMetadata
 		merged, err := json.Marshal(config)
 		if err != nil {
 			continue

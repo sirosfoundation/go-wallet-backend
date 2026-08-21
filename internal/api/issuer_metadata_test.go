@@ -506,6 +506,104 @@ func TestGetIssuerMetadata_MalformedCredentialConfigurationsSupportedIsIgnored(t
 	}
 }
 
+func TestGetIssuerMetadata_RegistryEntryWithoutDisplayLeavesIssuerMetadataUnmodified(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	registryStore.Put(&registry.VCTMEntry{
+		VCT: vct,
+		// A real VCTM document (vct/name/claims/schema/...) but with no
+		// display array - there's nothing here worth overriding the
+		// issuer's own credential_metadata with.
+		Metadata: json.RawMessage(`{"vct":"` + vct + `","name":"EHIC"}`),
+	})
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["ehic"].CredentialMetadata.Display[0].Name
+	if name != "Issuer's own EHIC" {
+		t.Errorf("Expected a registry entry with no display array to leave credential_metadata untouched, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_RegistryOverrideExtractsOnlyDisplayNotFullVctm(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	registryStore.Put(&registry.VCTMEntry{
+		VCT: vct,
+		// A full VCTM document, per VCTMEntry.Metadata's own doc comment -
+		// enrichCredentialMetadataFromRegistry must extract only "display"
+		// into credential_metadata, not substitute this whole document (the
+		// scope smncd flagged in review on #284).
+		Metadata: json.RawMessage(`{
+			"vct": "` + vct + `",
+			"name": "EHIC",
+			"claims": [{"path": ["issuance_date"]}],
+			"schema": {"type": "object"},
+			"display": [{"name": "Registry's EHIC"}]
+		}`),
+	})
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]json.RawMessage
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(configs["ehic"], &config); err != nil {
+		t.Fatalf("Failed to parse ehic config: %v", err)
+	}
+	var credentialMetadata map[string]json.RawMessage
+	if err := json.Unmarshal(config["credential_metadata"], &credentialMetadata); err != nil {
+		t.Fatalf("Failed to parse credential_metadata: %v", err)
+	}
+	if _, hasClaims := credentialMetadata["claims"]; hasClaims {
+		t.Errorf("credential_metadata should only contain display, but found claims: %s", config["credential_metadata"])
+	}
+	if _, hasSchema := credentialMetadata["schema"]; hasSchema {
+		t.Errorf("credential_metadata should only contain display, but found schema: %s", config["credential_metadata"])
+	}
+	if _, hasDisplay := credentialMetadata["display"]; !hasDisplay {
+		t.Errorf("credential_metadata is missing display: %s", config["credential_metadata"])
+	}
+}
+
 func TestGetIssuerMetadata_CachesResponses(t *testing.T) {
 	callCount := 0
 	mockIssuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
