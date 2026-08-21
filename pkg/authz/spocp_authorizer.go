@@ -195,6 +195,27 @@ func DefaultWalletRules() []sexp.Element {
 		},
 	}
 
+	// issuerURLRule builds a subject.type="url" resolution rule for the given
+	// URL scheme. HTTPS and plain-HTTP (dev) variants are otherwise identical,
+	// so they share this builder rather than being spelled out twice.
+	issuerURLRule := func(schemePrefix string) sexp.Element {
+		return sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: schemePrefix}),
+			),
+		)
+	}
+
 	return []sexp.Element{
 		// Rule 1: Allow credential evaluation with standard key types
 		// (authzen (tenant)(action <credential-issuer|credential-verifier|...>)(resource (type <jwk|x5c|...>)(id))(subject (type key)(id)))
@@ -260,45 +281,16 @@ func DefaultWalletRules() []sexp.Element {
 
 		// Rule 5: Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata or credential offers.
-		sexp.NewList("authzen",
-			sexp.NewList("tenant"),
-			sexp.NewList("action"),
-			sexp.NewList("resource",
-				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
-					sexp.NewAtom("credential_issuer"),
-					sexp.NewAtom("credential_offer_uri"),
-				}}),
-				sexp.NewList("id"),
-			),
-			sexp.NewList("subject",
-				sexp.NewList("type", sexp.NewAtom("url")),
-				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
-			),
-		),
+		issuerURLRule("https://"),
 
-		// Rule 5b: Allow issuer metadata and credential offer URI resolution
-		// for HTTP URLs (dev environments) - the HTTP counterpart to Rule 5,
-		// following the same pattern as Rules 3/4 and 6/7. Missing until now:
+		// Rule 5b: the HTTP counterpart to Rule 5 (dev environments), following
+		// the same pattern as Rules 3/4 and 6/7. Missing until now:
 		// subject_type="url" resolution against an http:// issuer (e.g.
 		// docker-compose's http://vc-apigw:8080) was denied here even with
 		// the AuthZEN proxy's own allowHTTP escape hatch set, since this
 		// SPOCP authorizer's default rules aren't config-aware and had no
 		// http:// variant for this specific resource/subject shape.
-		sexp.NewList("authzen",
-			sexp.NewList("tenant"),
-			sexp.NewList("action"),
-			sexp.NewList("resource",
-				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
-					sexp.NewAtom("credential_issuer"),
-					sexp.NewAtom("credential_offer_uri"),
-				}}),
-				sexp.NewList("id"),
-			),
-			sexp.NewList("subject",
-				sexp.NewList("type", sexp.NewAtom("url")),
-				sexp.NewList("id", &starform.Prefix{Value: "http://"}),
-			),
-		),
+		issuerURLRule("http://"),
 
 		// Rule 6: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with resource_type="oauth-authorization-server" to fetch RFC 8414 metadata.
