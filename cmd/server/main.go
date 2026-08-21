@@ -217,6 +217,15 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
+
+		// Let GetIssuerMetadata prefer a registry-published credential_metadata
+		// over an issuer's own (possibly stale, possibly third-party-hosted)
+		// local vctm_file_path fixture - only possible when both roles run on
+		// this server, same as the verifierStore/sharedResolver/issuerLookup
+		// sharing below.
+		if backendProvider != nil {
+			backendProvider.SetRegistryStore(provider.Store())
+		}
 	}
 
 	if roles.Has(modes.RoleEngine) {

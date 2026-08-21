@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -123,7 +124,80 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 		return
 	}
 
+	h.enrichCredentialMetadataFromRegistry(result.Metadata)
+
 	h.metadataCache.put(issuerURL, result.Metadata)
 
 	c.JSON(http.StatusOK, result.Metadata)
+}
+
+// enrichCredentialMetadataFromRegistry replaces each credential
+// configuration's credential_metadata with the registry's published VCTM,
+// for any configuration whose vct/doctype the local registry (registry.siros.org
+// mirror, see Handlers.SetRegistryStore) carries a non-expired entry for.
+// This is deliberately an override, not a merge - go-trust/registry-cli's
+// TS11 VCTM documents already have their images embedded as data: URIs (see
+// internal/registry's ImageEmbedder), so preferring them over an issuer's own
+// (possibly stale, possibly pointing at a live third-party URL) local
+// vctm_file_path fixture removes both the drift risk and the live
+// cross-origin dependency. No-op (leaves credential_metadata exactly as the
+// issuer returned it) if no registryStore is wired up, or for any
+// configuration the registry doesn't carry.
+func (h *Handlers) enrichCredentialMetadataFromRegistry(m *metadata.IssuerMetadata) {
+	if h.registryStore == nil || m == nil || len(m.CredentialConfigurationsSupported) == 0 {
+		return
+	}
+
+	var configs map[string]json.RawMessage
+	if err := json.Unmarshal(m.CredentialConfigurationsSupported, &configs); err != nil {
+		h.logger.Warn("Failed to parse credential_configurations_supported for registry enrichment", zap.Error(err))
+		return
+	}
+
+	var identifier struct {
+		Vct     string `json:"vct"`
+		Doctype string `json:"doctype"`
+	}
+	changed := false
+	for key, raw := range configs {
+		identifier.Vct = ""
+		identifier.Doctype = ""
+		if err := json.Unmarshal(raw, &identifier); err != nil {
+			continue
+		}
+		vctID := identifier.Vct
+		if vctID == "" {
+			vctID = identifier.Doctype
+		}
+		if vctID == "" {
+			continue
+		}
+
+		entry, found := h.registryStore.Get(vctID)
+		if !found || entry.IsExpired() || len(entry.Metadata) == 0 {
+			continue
+		}
+
+		var config map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &config); err != nil {
+			continue
+		}
+		config["credential_metadata"] = entry.Metadata
+		merged, err := json.Marshal(config)
+		if err != nil {
+			continue
+		}
+		configs[key] = merged
+		changed = true
+	}
+
+	if !changed {
+		return
+	}
+	updated, err := json.Marshal(configs)
+	if err != nil {
+		h.logger.Warn("Failed to re-marshal registry-enriched credential_configurations_supported", zap.Error(err))
+		return
+	}
+	m.CredentialConfigurationsSupported = updated
 }

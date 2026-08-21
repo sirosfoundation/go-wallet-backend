@@ -64,6 +64,14 @@ func (p *AuthProvider) Name() string         { return "auth" }
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
+// SetRegistryStore wires the VCTM registry (see RegistryProvider) into this
+// provider's Handlers, so GetIssuerMetadata can prefer registry-published
+// credential_metadata over an issuer's own local fixture. Only meaningful
+// when RoleRegistry is also enabled on this server - see cmd/server/main.go.
+func (p *AuthProvider) SetRegistryStore(store *registry.Store) {
+	p.handlers.SetRegistryStore(store)
+}
+
 // Close stops background workers in the auth provider.
 func (p *AuthProvider) Close() error {
 	p.services.Stop()
@@ -628,6 +636,15 @@ func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 	return p.metadataResolver
 }
 
+// SetRegistryStore wires the VCTM registry into this provider's issuer-
+// metadata handler. See AuthProvider.SetRegistryStore and RegistryProvider.Store -
+// called from cmd/server/main.go once both providers exist, the same
+// pattern already used to share verifierStore/sharedResolver/issuerLookup
+// with the engine provider.
+func (p *BackendProvider) SetRegistryStore(store *registry.Store) {
+	p.auth.SetRegistryStore(store)
+}
+
 // ASModule returns the AS module, or nil if AS is not enabled.
 func (p *BackendProvider) ASModule() *as.ASModule {
 	return p.asModule
@@ -778,6 +795,11 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 
 func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
+
+// Store returns this provider's VCTM store, for cross-provider wiring (see
+// BackendProvider.SetRegistryStore) - mirrors how MetadataResolver/Store are
+// already shared between providers in cmd/server/main.go.
+func (p *RegistryProvider) Store() *registry.Store { return p.store }
 
 func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 	// Registry routes with its own middleware group

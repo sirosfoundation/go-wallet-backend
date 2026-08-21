@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/metadata"
+	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -133,6 +135,169 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 	// The response should be the IssuerMetadata directly with proper JSON keys
 	if result["credential_issuer"] != "https://issuer.example.com" {
 		t.Errorf("Expected credential_issuer, got %v", result["credential_issuer"])
+	}
+}
+
+// mockIssuerWithVct starts a mock .well-known server whose single
+// credential_configurations_supported entry (key "ehic") has both a top-level
+// "vct" (SD-JWT VC configs carry this directly per OpenID4VCI) and its own
+// credential_metadata.display, so tests can tell apart "the issuer's own
+// value" from "the registry's value".
+func mockIssuerWithVct(t *testing.T, vct string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"ehic": map[string]interface{}{
+					"format": "dc+sd-jwt",
+					"vct":    vct,
+					"credential_metadata": map[string]interface{}{
+						"display": []interface{}{
+							map[string]interface{}{"name": "Issuer's own EHIC"},
+						},
+					},
+				},
+			},
+		})
+	}))
+}
+
+func createTestIssuer(t *testing.T, store *memory.Store, issuerURL string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	store.Tenants().Create(ctx, &domain.Tenant{ID: "default", Name: "Default", Enabled: true})
+	issuer := &domain.CredentialIssuer{
+		TenantID:                   "default",
+		CredentialIssuerIdentifier: issuerURL,
+		Visible:                    true,
+	}
+	if err := store.Issuers().Create(ctx, issuer); err != nil {
+		t.Fatal(err)
+	}
+	return issuer.ID
+}
+
+func TestGetIssuerMetadata_RegistryOverridesCredentialMetadata(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	registryStore.Put(&registry.VCTMEntry{
+		VCT:      vct,
+		Metadata: json.RawMessage(`{"vct":"` + vct + `","display":[{"name":"Registry's EHIC"}]}`),
+	})
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["ehic"].CredentialMetadata.Display[0].Name
+	if name != "Registry's EHIC" {
+		t.Errorf("Expected registry-sourced credential_metadata to win, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_ExpiredRegistryEntryFallsBackToIssuer(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	handlers, router, store := setupIssuerMetadataTest(t)
+	registryStore := registry.NewStore("")
+	registryStore.Put(&registry.VCTMEntry{
+		VCT:       vct,
+		Metadata:  json.RawMessage(`{"vct":"` + vct + `","display":[{"name":"Registry's EHIC"}]}`),
+		ExpiresAt: time.Now().Add(-time.Hour),
+	})
+	handlers.SetRegistryStore(registryStore)
+
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["ehic"].CredentialMetadata.Display[0].Name
+	if name != "Issuer's own EHIC" {
+		t.Errorf("Expected an expired registry entry to be ignored, got display name %q", name)
+	}
+}
+
+func TestGetIssuerMetadata_NoRegistryStoreLeavesMetadataUnmodified(t *testing.T) {
+	const vct = "urn:eudi:ehic:1"
+	mockIssuer := mockIssuerWithVct(t, vct)
+	defer mockIssuer.Close()
+
+	// setupIssuerMetadataTest's handlers never has SetRegistryStore called -
+	// this is the "registry role disabled on this server" case.
+	_, router, store := setupIssuerMetadataTest(t)
+	issuerID := createTestIssuer(t, store, mockIssuer.URL)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/issuer/%d/metadata", issuerID), nil)
+	router.ServeHTTP(w, req)
+
+	var result metadata.IssuerMetadata
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	var configs map[string]struct {
+		CredentialMetadata struct {
+			Display []struct {
+				Name string `json:"name"`
+			} `json:"display"`
+		} `json:"credential_metadata"`
+	}
+	if err := json.Unmarshal(result.CredentialConfigurationsSupported, &configs); err != nil {
+		t.Fatalf("Failed to parse credential_configurations_supported: %v", err)
+	}
+	name := configs["ehic"].CredentialMetadata.Display[0].Name
+	if name != "Issuer's own EHIC" {
+		t.Errorf("Expected no registry store to leave credential_metadata untouched, got display name %q", name)
 	}
 }
 
