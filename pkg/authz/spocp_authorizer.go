@@ -276,6 +276,30 @@ func DefaultWalletRules() []sexp.Element {
 			),
 		),
 
+		// Rule 5b: Allow issuer metadata and credential offer URI resolution
+		// for HTTP URLs (dev environments) - the HTTP counterpart to Rule 5,
+		// following the same pattern as Rules 3/4 and 6/7. Missing until now:
+		// subject_type="url" resolution against an http:// issuer (e.g.
+		// docker-compose's http://vc-apigw:8080) was denied here even with
+		// the AuthZEN proxy's own allowHTTP escape hatch set, since this
+		// SPOCP authorizer's default rules aren't config-aware and had no
+		// http:// variant for this specific resource/subject shape.
+		sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: "http://"}),
+			),
+		),
+
 		// Rule 6: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with resource_type="oauth-authorization-server" to fetch RFC 8414 metadata.
 		sexp.NewList("authzen",

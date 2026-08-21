@@ -383,10 +383,15 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// When subject_type is "url", validate that subject_id is a well-formed HTTPS URL.
+	// When subject_type is "url", validate that subject_id is a well-formed
+	// HTTPS URL. Plain HTTP is permitted when allowHTTP is set (test/dev
+	// environments) - same escape hatch every other scheme check in this
+	// file already honors (jwks_uri, logo URLs, proxy dispatch); this one
+	// was missed, so an http:// issuer (e.g. docker-compose's
+	// http://vc-apigw:8080) always 400ed here before reaching any of those.
 	if subjectType == "url" {
 		u, err := url.Parse(req.SubjectID)
-		if err != nil || u.Scheme != "https" || u.Host == "" {
+		if err != nil || u.Host == "" || (u.Scheme != "https" && (!h.allowHTTP || u.Scheme != "http")) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_id must be a valid HTTPS URL when subject_type is 'url'"})
 			return
 		}
