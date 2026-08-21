@@ -1,0 +1,93 @@
+# Opt a repo into AI-generated release notes.
+#
+# Copy to .github/workflows/release-notes.yml in the repo, and make sure the
+# siros-release-notes-bot GitHub App is installed on it.
+#
+# Carries no secrets: the OIDC token is minted per-run by GitHub, and every
+# real credential lives on the service.
+name: Release Notes
+
+on:
+  push:
+    # GitHub Actions filter patterns aren't plain globs — `[0-9]` is a
+    # character range and `+` means "one or more of the preceding character",
+    # so this does match v1.2.3 (and v1.2.3-rc1 via the trailing *).
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)generate. Required for mode=single, ignored for mode=all.'
+        required: false
+      mode:
+        description: 'single = one tag; all = bootstrap the whole file (refuses if it already exists)'
+        type: choice
+        options: [single, all]
+        default: single
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target tag
+        id: target
+        env:
+          MODE: ${{ inputs.mode || 'single' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MODE" = "all" ]; then
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="$INPUT_TAG"
+          # Only fall back to the ref when it actually *is* a tag — on a manual
+          # dispatch from a branch, github.ref_name is the branch name, and
+          # sending that would ask the service to treat "main" as a release.
+          if [ -z "$TAG" ] && [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::mode=single needs a tag — pass the 'tag' input, or run this from a tag push."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Request release notes
+        env:
+          MODE: ${{ inputs.mode || 'single' }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          OIDC_TOKEN=$(curl -sS --fail-with-body \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=release-notes-bot" \
+            | jq -r '.value // empty')
+
+          if [ -z "$OIDC_TOKEN" ]; then
+            echo "::error::could not mint an OIDC token — check that this job has 'id-token: write'."
+            exit 1
+          fi
+
+          BODY=$(jq -nc \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg mode "$MODE" \
+            --arg tag "$TAG" \
+            '{repo: $repo, mode: $mode} + (if $tag == "" then {} else {tag: $tag} end)')
+
+          curl -sS --fail-with-body -X POST \
+            https://release-notes-bot.fly.dev/generate \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY" \
+            | tee /dev/stderr | jq -r '.pull_request // .detail // .'
