@@ -712,8 +712,22 @@ func TestResolve_URLSubject_HTTPAllowed_WhenAllowHTTPSet(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
-	if w.Code == http.StatusBadRequest {
-		t.Errorf("Expected HTTP subject_id to pass scheme validation when allowHTTP is set, got %d: %s", w.Code, w.Body.String())
+	// Assert the request actually succeeds, not merely that it isn't a 400 -
+	// a 403/500/502 would also clear a "not BadRequest" check while leaving
+	// the resolution just as broken as the bug this covers.
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp resolveURLResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if !resp.Decision {
+		t.Errorf("Expected decision true, got false: %s", w.Body.String())
+	}
+	if resp.Context == nil || resp.Context.TrustMetadata == nil {
+		t.Errorf("Expected trust_metadata in response, got: %s", w.Body.String())
 	}
 }
 

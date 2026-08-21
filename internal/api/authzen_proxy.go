@@ -392,7 +392,14 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 	if subjectType == "url" {
 		u, err := url.Parse(req.SubjectID)
 		if err != nil || u.Host == "" || (u.Scheme != "https" && (!h.allowHTTP || u.Scheme != "http")) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_id must be a valid HTTPS URL when subject_type is 'url'"})
+			// Message tracks the scheme actually accepted, so an operator
+			// running with allow_http isn't told to use HTTPS for a URL that
+			// would have been fine over HTTP.
+			msg := "subject_id must be a valid HTTPS URL when subject_type is 'url'"
+			if h.allowHTTP {
+				msg = "subject_id must be a valid HTTPS or HTTP URL (allow_http is enabled) when subject_type is 'url'"
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 			return
 		}
 	}
