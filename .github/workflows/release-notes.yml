@@ -85,18 +85,29 @@ jobs:
           # diagnostic body gets swallowed by the substitution and thrown away
           # when set -e fires, leaving only curl's terse exit code and a jq
           # parse error. Writing the body to a file keeps it printable.
+          #
+          # `|| true` rather than `|| echo 000`: on a connection failure curl
+          # writes its own "000" to stdout *and* exits non-zero, so the echo
+          # would append a second one and report a nonsense "000000".
           OIDC_RESPONSE="$RUNNER_TEMP/oidc-response.json"
           OIDC_STATUS=$(curl -sS -o "$OIDC_RESPONSE" -w '%{http_code}' \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=release-notes-bot" || echo 000)
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=release-notes-bot" || true)
+          OIDC_STATUS=${OIDC_STATUS:-000}
 
           if [ "$OIDC_STATUS" != "200" ]; then
             echo "::error::OIDC token request failed (HTTP $OIDC_STATUS): $(cat "$OIDC_RESPONSE" 2>/dev/null || true)"
             exit 1
           fi
 
-          # Read the token out of the file; never echoed, on success or failure.
-          OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_RESPONSE")
+          # Handle a non-JSON body explicitly: bare `VAR=$(jq ...)` would fail
+          # under set -e and kill the step before the message below could run.
+          # The body is deliberately NOT printed here — on this endpoint it can
+          # contain the token itself.
+          if ! OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_RESPONSE" 2>/dev/null); then
+            echo "::error::OIDC endpoint returned a 200 that was not valid JSON (body withheld — it may contain the token)."
+            exit 1
+          fi
           if [ -z "$OIDC_TOKEN" ]; then
             echo "::error::OIDC response contained no token — check that this job has 'id-token: write'."
             exit 1
@@ -113,11 +124,19 @@ jobs:
             https://release-notes-bot.fly.dev/generate \
             -H "Authorization: Bearer $OIDC_TOKEN" \
             -H 'Content-Type: application/json' \
-            -d "$BODY" || echo 000)
+            -d "$BODY" || true)
+          STATUS=${STATUS:-000}
 
           if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
             echo "::error::release-notes-bot returned HTTP $STATUS: $(cat "$RESPONSE" 2>/dev/null || true)"
             exit 1
           fi
 
-          jq -r '.pull_request // .detail // .' "$RESPONSE"
+          # Same guard on the way out: a 2xx with a non-JSON body (a proxy error
+          # page, say) would otherwise die on jq with the body never shown.
+          # Printing it here is safe — this is the service's own response.
+          if ! jq -r '.pull_request // .detail // .' "$RESPONSE" 2>/dev/null; then
+            echo "::error::release-notes-bot returned HTTP $STATUS with a body that isn't JSON:"
+            cat "$RESPONSE" || true
+            exit 1
+          fi
