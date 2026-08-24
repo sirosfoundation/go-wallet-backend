@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -27,6 +28,12 @@ type Handlers struct {
 	roles         []string
 	metadataCache *issuerMetadataCache
 	httpClient    *http.Client
+
+	// imageEmbedder inlines remote images referenced by an issuer's own
+	// metadata as data: URIs before the response is handed to a client. It
+	// does not change WHAT the issuer says about its credentials - only how
+	// the assets it points at are delivered. See embedIssuerMetadataImages.
+	imageEmbedder *embed.ImageEmbedder
 }
 
 // NewHandlers creates a new Handlers instance
@@ -38,6 +45,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
@@ -51,6 +59,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
