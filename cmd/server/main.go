@@ -27,7 +27,7 @@ import (
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
-	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine (comma-separated or 'all')")
+	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
 	buildTime          = "unknown"
 )
