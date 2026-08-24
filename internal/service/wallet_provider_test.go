@@ -549,8 +549,12 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 		t.Errorf("nonce = %v, want my-nonce (sent alongside c_nonce for interop)", claims["nonce"])
 	}
 
-	if token.Header["typ"] != "keyattestation+jwt" {
-		t.Errorf("typ = %v, want keyattestation+jwt", token.Header["typ"])
+	// Hyphenated, per the IANA media type OpenID4VCI 1.0 registers for a Key
+	// Attestation JWT. Issuers pin this exactly (vc's apigw uses an `eq`
+	// validation on it), so a regression here fails every credential request
+	// that uses the "attestation" proof type.
+	if token.Header["typ"] != "key-attestation+jwt" {
+		t.Errorf("typ = %v, want key-attestation+jwt", token.Header["typ"])
 	}
 
 	if _, ok := claims["iat"]; !ok {
