@@ -358,9 +358,23 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// KA/WIA revocation-chaining. See AttestationConfig's type-level comment
 	// for the design rationale (short KA/WIA lifetime instead).
 
-	// Create the token with ES256 and x5c header
+	// Create the token with ES256 and x5c header.
+	//
+	// OpenID4VCI 1.0 registers "application/key-attestation+jwt" as the media
+	// type of a Key Attestation JWT (Appendix G.6.2). The JOSE "typ" header
+	// carries the short form, "key-attestation+jwt" - RFC 7515 §4.1.9 allows
+	// omitting the "application/" prefix when no other "/" appears, and
+	// recommends it. What matters here is the hyphen. The unhyphenated
+	// "keyattestation+jwt" this used to emit was the pre-1.0 draft spelling,
+	// and an issuer validating against the final spec rejects the whole
+	// credential request with invalid_credential_request rather than falling
+	// back - observed against vc's apigw (pkg/openid4vci/proof_attestation.go
+	// pins typ with `eq=key-attestation+jwt`), which failed EVERY credential
+	// type using the "attestation" proof type. Other implementations in this
+	// ecosystem - siros-sdk-kotlin's keystore, multipaz - already emit the
+	// hyphenated form, so this was the outlier.
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["typ"] = "keyattestation+jwt"
+	token.Header["typ"] = "key-attestation+jwt"
 	token.Header["x5c"] = s.certChain
 
 	// Sign the token via crypto.Signer (supports both file and PKCS#11)
