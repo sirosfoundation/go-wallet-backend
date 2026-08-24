@@ -4,6 +4,18 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.15.0:start -->
+## [v0.15.0] - 2026-08-24
+
+### Fixed
+
+**Key Attestation JWTs now carry the spec-registered `typ`** (#289). The JOSE header said `keyattestation+jwt`, the pre-1.0 draft spelling; OpenID4VCI 1.0 registers the media type as `application/key-attestation+jwt` (Appendix G.6.2), and the JOSE `typ` carries the short form `key-attestation+jwt`, hyphenated. Issuers pin this exactly and reject the whole credential request rather than falling back to the `jwt` proof type. Because a wallet picks its proof type per *issuer* rather than per credential, this failed **every** credential type at once against any issuer advertising the `attestation` proof type. The error was invisible from the client, which only ever saw the sanitized `"Credential issuance failed"`. This release is worth taking before bumping any issuer image past 2026-08-19, the point at which SUNET/vc began advertising `attestation` alongside `jwt` for every scope. Deployments pinned to an older issuer were unaffected only because their issuer never offered the attestation path.
+
+### Changed
+
+**`GET /issuer/:id/metadata` embeds the issuer's own images as `data:` URIs** (#284). A logo or SVG template hosted somewhere that sends no `Access-Control-Allow-Origin` is unusable by a browser wallet, which fetches the SVG to substitute claim values into it and renders a broken image. The endpoint now runs the issuer's own `credential_configurations_supported` through the existing image embedder, which removes the cross-origin fetch. Only asset delivery changes — nothing is substituted from the VCTM registry, so the response remains the issuer's own content. Failure is soft by construction: an image too large (>1 MB), too slow (>10 s) or unreachable leaves the issuer's original URL in place, exactly as before. Note that only `https://` image URLs are embedded, so an all-HTTP local development stack sees no change.
+<!-- release-notes:v0.15.0:end -->
+
 <!-- release-notes:v0.14.1:start -->
 ## [v0.14.1] - 2026-08-21
 
