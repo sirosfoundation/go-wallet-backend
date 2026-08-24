@@ -11,7 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -29,23 +29,11 @@ type Handlers struct {
 	metadataCache *issuerMetadataCache
 	httpClient    *http.Client
 
-	// registryStore is the local VCTM registry (registry.siros.org mirror),
-	// wired in only when the registry role is also enabled on this server
-	// (see server.BackendProvider.SetRegistryStore) - nil otherwise, in
-	// which case GetIssuerMetadata falls back to the issuer's own raw
-	// credential_metadata unmodified, exactly as before this field existed.
-	registryStore *registry.Store
-}
-
-// SetRegistryStore wires the local VCTM registry into GetIssuerMetadata, so
-// it can prefer a registry-published credential_metadata (already
-// image-embedded, not subject to an individual issuer's local fixture
-// drift) over whatever the issuer's own .well-known response says, for any
-// credential type the registry carries. Safe to call with nil (or never
-// call at all) - GetIssuerMetadata treats a nil registryStore as "no
-// registry available" and passes the issuer's metadata through unmodified.
-func (h *Handlers) SetRegistryStore(store *registry.Store) {
-	h.registryStore = store
+	// imageEmbedder inlines remote images referenced by an issuer's own
+	// metadata as data: URIs before the response is handed to a client. It
+	// does not change WHAT the issuer says about its credentials - only how
+	// the assets it points at are delivered. See embedIssuerMetadataImages.
+	imageEmbedder *embed.ImageEmbedder
 }
 
 // NewHandlers creates a new Handlers instance
@@ -57,6 +45,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
@@ -70,6 +59,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
