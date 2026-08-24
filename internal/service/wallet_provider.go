@@ -360,8 +360,11 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 
 	// Create the token with ES256 and x5c header.
 	//
-	// "key-attestation+jwt", hyphenated, is the IANA media type OpenID4VCI 1.0
-	// registers for a Key Attestation JWT (Appendix G.6.2). The unhyphenated
+	// OpenID4VCI 1.0 registers "application/key-attestation+jwt" as the media
+	// type of a Key Attestation JWT (Appendix G.6.2). The JOSE "typ" header
+	// carries the short form, "key-attestation+jwt" - RFC 7515 §4.1.9 allows
+	// omitting the "application/" prefix when no other "/" appears, and
+	// recommends it. What matters here is the hyphen. The unhyphenated
 	// "keyattestation+jwt" this used to emit was the pre-1.0 draft spelling,
 	// and an issuer validating against the final spec rejects the whole
 	// credential request with invalid_credential_request rather than falling
