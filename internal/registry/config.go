@@ -56,10 +56,11 @@ type Config struct {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host           string              `yaml:"host"`
-	Port           int                 `yaml:"port"`
-	ServedByHeader *string             `yaml:"served_by_header"`
-	TLS            pkgconfig.TLSConfig `yaml:"tls"`
+	Host           string               `yaml:"host"`
+	Port           int                  `yaml:"port"`
+	ServedByHeader *string              `yaml:"served_by_header"`
+	TLS            pkgconfig.TLSConfig  `yaml:"tls"`
+	CORS           pkgconfig.CORSConfig `yaml:"cors" envconfig:"CORS"`
 }
 
 // Address returns the server address in host:port format
@@ -302,10 +303,13 @@ type LoggingConfig struct {
 
 // DefaultConfig returns a Config with sensible default values
 func DefaultConfig() *Config {
+	cors := pkgconfig.CORSConfig{}
+	cors.SetDefaults()
 	return &Config{
 		Server: ServerConfig{
 			Host: "0.0.0.0",
 			Port: 8097,
+			CORS: cors,
 		},
 		Source: SourceConfig{
 			URL:          "https://registry.siros.org/api/v1/schemas.json",
@@ -350,6 +354,10 @@ func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
 	}
+
+	// Fill CORS defaults after YAML/env overlay so registry-only mode
+	// never starts gin-contrib/cors with an empty AllowOrigins list.
+	c.Server.CORS.SetDefaults()
 
 	// Validate TLS configuration
 	if c.Server.TLS.Enabled {

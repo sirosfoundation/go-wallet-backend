@@ -28,6 +28,15 @@ func TestDefaultConfig(t *testing.T) {
 	assert.False(t, config.JWT.RequireAuth)
 	assert.Equal(t, "info", config.Logging.Level)
 	assert.Equal(t, "json", config.Logging.Format)
+	assert.Equal(t, []string{"*"}, config.Server.CORS.AllowedOrigins)
+}
+
+func TestConfig_Validate_FillsEmptyCORS(t *testing.T) {
+	config := DefaultConfig()
+	config.Server.CORS.AllowedOrigins = nil
+
+	require.NoError(t, config.Validate())
+	assert.Equal(t, []string{"*"}, config.Server.CORS.AllowedOrigins)
 }
 
 func TestServerConfig_Address(t *testing.T) {
