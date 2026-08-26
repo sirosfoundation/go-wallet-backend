@@ -33,7 +33,7 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestConfig_Validate_FillsEmptyCORS(t *testing.T) {
 	config := DefaultConfig()
-	config.Server.CORS.AllowedOrigins = nil
+	config.Server.CORS.AllowedOrigins = []string{}
 
 	require.NoError(t, config.Validate())
 	assert.Equal(t, []string{"*"}, config.Server.CORS.AllowedOrigins)
