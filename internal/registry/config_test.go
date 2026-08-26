@@ -222,6 +222,23 @@ func TestConfig_Validate(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "CORS credentials with wildcard origin",
+			modify: func(c *Config) {
+				c.Server.CORS.AllowCredentials = true
+				c.Server.CORS.AllowedOrigins = []string{"*"}
+			},
+			expectError: true,
+			errorMsg:    "CORS: allow_credentials cannot be true when allowed_origins contains '*'",
+		},
+		{
+			name: "CORS credentials with specific origins",
+			modify: func(c *Config) {
+				c.Server.CORS.AllowCredentials = true
+				c.Server.CORS.AllowedOrigins = []string{"https://wallet.example.com"}
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
