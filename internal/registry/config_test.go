@@ -28,6 +28,15 @@ func TestDefaultConfig(t *testing.T) {
 	assert.False(t, config.JWT.RequireAuth)
 	assert.Equal(t, "info", config.Logging.Level)
 	assert.Equal(t, "json", config.Logging.Format)
+	assert.Equal(t, []string{"*"}, config.Server.CORS.AllowedOrigins)
+}
+
+func TestConfig_Validate_FillsEmptyCORS(t *testing.T) {
+	config := DefaultConfig()
+	config.Server.CORS.AllowedOrigins = []string{}
+
+	require.NoError(t, config.Validate())
+	assert.Equal(t, []string{"*"}, config.Server.CORS.AllowedOrigins)
 }
 
 func TestServerConfig_Address(t *testing.T) {
@@ -210,6 +219,23 @@ func TestConfig_Validate(t *testing.T) {
 				c.Server.TLS.Enabled = false
 				c.Server.TLS.CertFile = ""
 				c.Server.TLS.KeyFile = ""
+			},
+			expectError: false,
+		},
+		{
+			name: "CORS credentials with wildcard origin",
+			modify: func(c *Config) {
+				c.Server.CORS.AllowCredentials = true
+				c.Server.CORS.AllowedOrigins = []string{"*"}
+			},
+			expectError: true,
+			errorMsg:    "CORS: allow_credentials cannot be true when allowed_origins contains '*'",
+		},
+		{
+			name: "CORS credentials with specific origins",
+			modify: func(c *Config) {
+				c.Server.CORS.AllowCredentials = true
+				c.Server.CORS.AllowedOrigins = []string{"https://wallet.example.com"}
 			},
 			expectError: false,
 		},
