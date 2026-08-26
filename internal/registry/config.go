@@ -359,6 +359,15 @@ func (c *Config) Validate() error {
 	// never starts gin-contrib/cors with an empty AllowOrigins list.
 	c.Server.CORS.SetDefaults()
 
+	// Validate CORS: AllowCredentials cannot be true with wildcard origins
+	if c.Server.CORS.AllowCredentials {
+		for _, origin := range c.Server.CORS.AllowedOrigins {
+			if origin == "*" {
+				return fmt.Errorf("CORS: allow_credentials cannot be true when allowed_origins contains '*'")
+			}
+		}
+	}
+
 	// Validate TLS configuration
 	if c.Server.TLS.Enabled {
 		if c.Server.TLS.CertFile == "" {
