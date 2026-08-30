@@ -415,6 +415,15 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
+		// The body is logged (capped, Debug level only) because a bare status
+		// code is not enough to tell a dead/expired request_uri (e.g. a
+		// verifier explicitly reporting "unknown token") apart from a wrong
+		// path or an unrelated server error - distinguishing those otherwise
+		// requires reproducing the failure with an out-of-band HTTP client.
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		h.Logger.Debug("request fetch returned non-200 status",
+			zap.Int("status", resp.StatusCode),
+			zap.ByteString("body", errBody))
 		return nil, fmt.Errorf("request fetch returned status %d", resp.StatusCode)
 	}
 
