@@ -149,8 +149,6 @@ github.com/sirosfoundation/go-spocp v0.1.0 h1:fH/jrSHS8vc+KfAzJmq3fE9OH69ShRgL7G
 github.com/sirosfoundation/go-spocp v0.1.0/go.mod h1:a6WtxG5hnsUzcqUt5iHmSMvyX4PLUPMDFK7FLoDMSMs=
 github.com/sirosfoundation/go-tokenauth v0.4.0 h1:3V6KgxJUN96MAoXKB43rpL3mgfL51oOw6SQL/h5hRP0=
 github.com/sirosfoundation/go-tokenauth v0.4.0/go.mod h1:GcaY3K5tsqlMt76NoVFO+Eq8j/h6DXLE4SG1fTGhzuI=
-github.com/sirosfoundation/go-trust v0.15.0 h1:m/8NwheG3/sJcRJZqEHKvAFJ9gsrmscK+15g7j7/guk=
-github.com/sirosfoundation/go-trust v0.15.0/go.mod h1:tuZlymZ1vOO08ypbwjJvbr5NHJAojaG9vhTngsuSils=
 github.com/sirosfoundation/go-trust v0.16.0 h1:GKFT4Nx1G6+3/eJNGXEKOoyBgrpzlBetsN/VJkb4k50=
 github.com/sirosfoundation/go-trust v0.16.0/go.mod h1:tuZlymZ1vOO08ypbwjJvbr5NHJAojaG9vhTngsuSils=
 github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67 h1:eJT3WaDRt6dPJMuob9cNDREkEaKCKVCPkIgQMP2ISos=
