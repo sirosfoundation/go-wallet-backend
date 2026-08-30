@@ -261,6 +261,7 @@ func TestErrorCodeConstants(t *testing.T) {
 		ErrCodeFlowTimeout:       "FLOW_TIMEOUT",
 		ErrCodeOfferParseError:   "OFFER_PARSE_ERROR",
 		ErrCodeOfferFetchError:   "OFFER_FETCH_ERROR",
+		ErrCodeRequestParseError: "REQUEST_PARSE_ERROR",
 		ErrCodeMetadataFetchErr:  "METADATA_FETCH_ERROR",
 		ErrCodeUntrustedIssuer:   "UNTRUSTED_ISSUER",
 		ErrCodeUntrustedVerifier: "UNTRUSTED_VERIFIER",

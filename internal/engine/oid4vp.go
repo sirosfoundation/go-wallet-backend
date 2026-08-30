@@ -155,7 +155,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
 		h.Logger.Debug("failed to parse request", zap.Error(err))
-		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
+		_ = h.Error(StepParsingRequest, ErrCodeRequestParseError, ErrCodeRequestParseError.UserFacingMessage())
 		return err
 	}
 
