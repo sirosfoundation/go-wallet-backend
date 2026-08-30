@@ -183,6 +183,14 @@ func DefaultWalletRules() []sexp.Element {
 			// check, proxied to go-trust's `mdocrical` registry) - same
 			// subject/resource shape (key/x5c) as the other actions above.
 			sexp.NewAtom("mdoc-reader-auth"),
+			// VICAL issuer-trust evaluation (siros-sdk-kotlin/swift's
+			// evaluateIssuerTrust, proxied to go-trust's `vical` registry) -
+			// the issuer-side mirror of mdoc-reader-auth above, same
+			// subject/resource shape. Omitted when mdoc-reader-auth was
+			// added here (go-wallet-backend#279); every mdoc issuance since
+			// has had its issuer-trust query denied at this gate before it
+			// ever reaches the PDP.
+			sexp.NewAtom("mdoc-issuer-auth"),
 		},
 	}
 
