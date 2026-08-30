@@ -182,6 +182,7 @@ func main() {
 		serverCfg.HTTPAddress = registryCfg.Server.Host
 		serverCfg.HTTPPort = registryCfg.Server.Port
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
+		serverCfg.CORS = registryCfg.Server.CORS
 	}
 
 	if backendCfg != nil {

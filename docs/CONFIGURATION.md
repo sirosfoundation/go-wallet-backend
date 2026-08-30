@@ -296,6 +296,12 @@ Environment prefix: `REGISTRY_SERVER`
 | `server.tls.cert_file` | `REGISTRY_SERVER_TLS_CERT_FILE` | string | CertFile is the path to the TLS certificate file |
 | `server.tls.key_file` | `REGISTRY_SERVER_TLS_KEY_FILE` | string | KeyFile is the path to the TLS private key file |
 | `server.tls.min_version` | `REGISTRY_SERVER_TLS_MIN_VERSION` | string | MinVersion is the minimum TLS version (tls12 or tls13, default: tls12) |
+| `server.cors.allowed_origins` | `REGISTRY_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
+| `server.cors.allowed_methods` | `REGISTRY_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
+| `server.cors.allowed_headers` | `REGISTRY_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. |
+| `server.cors.exposed_headers` | `REGISTRY_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. |
+| `server.cors.allow_credentials` | `REGISTRY_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
+| `server.cors.max_age` | `REGISTRY_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
 
 ## registry.source
 
