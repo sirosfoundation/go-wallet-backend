@@ -155,7 +155,12 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
 		h.Logger.Debug("failed to parse request", zap.Error(err))
-		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
+		var fetchErr *requestFetchError
+		if errors.As(err, &fetchErr) {
+			_ = h.Error(StepParsingRequest, ErrCodeRequestFetchError, ErrCodeRequestFetchError.UserFacingMessage())
+		} else {
+			_ = h.Error(StepParsingRequest, ErrCodeRequestParseError, ErrCodeRequestParseError.UserFacingMessage())
+		}
 		return err
 	}
 
@@ -391,6 +396,17 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 	return &authReq, nil
 }
 
+// requestFetchError distinguishes a failure to retrieve the request object
+// (network error, non-200 status) from a failure to parse it once
+// retrieved, so Execute() can report ErrCodeRequestFetchError instead of the
+// generic ErrCodeRequestParseError for what's really a connectivity/lookup
+// problem against the verifier's request_uri (e.g. an already-expired
+// reference), not a malformed request.
+type requestFetchError struct{ err error }
+
+func (e *requestFetchError) Error() string { return e.err.Error() }
+func (e *requestFetchError) Unwrap() error { return e.err }
+
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
 	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
 
@@ -410,12 +426,24 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch request: %w", err)
+		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request fetch returned status %d", resp.StatusCode)
+		// Only the length is logged, not the body itself: the body comes from
+		// a verifier-controlled endpoint and could contain session tokens,
+		// diagnostic detail, or embedded JWTs - the same class of concern
+		// redactURIForLogging already avoids for request_uri query strings.
+		// A bare status code alone can't tell a dead/expired request_uri
+		// apart from a wrong path or an unrelated server error, but the
+		// content length is enough of a differential signal for that
+		// without echoing untrusted content into logs.
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+		h.Logger.Debug("request fetch returned non-200 status",
+			zap.Int("status", resp.StatusCode),
+			zap.Int64("body_length", n))
+		return nil, &requestFetchError{fmt.Errorf("request fetch returned status %d", resp.StatusCode)}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))

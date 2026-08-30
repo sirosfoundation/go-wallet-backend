@@ -85,12 +85,23 @@ const (
 	// ErrCodeAuthorizationFail below despite the similar name - that one is
 	// specifically an OAuth authorization *flow* failure (bad redirect_uri,
 	// state mismatch, etc.), not a token-permission check.
-	ErrCodeForbidden         ErrorCode = "FORBIDDEN"
-	ErrCodeInvalidMessage    ErrorCode = "INVALID_MESSAGE"
-	ErrCodeUnknownFlow       ErrorCode = "UNKNOWN_FLOW"
-	ErrCodeFlowTimeout       ErrorCode = "FLOW_TIMEOUT"
-	ErrCodeOfferParseError   ErrorCode = "OFFER_PARSE_ERROR"
-	ErrCodeOfferFetchError   ErrorCode = "OFFER_FETCH_ERROR"
+	ErrCodeForbidden       ErrorCode = "FORBIDDEN"
+	ErrCodeInvalidMessage  ErrorCode = "INVALID_MESSAGE"
+	ErrCodeUnknownFlow     ErrorCode = "UNKNOWN_FLOW"
+	ErrCodeFlowTimeout     ErrorCode = "FLOW_TIMEOUT"
+	ErrCodeOfferParseError ErrorCode = "OFFER_PARSE_ERROR"
+	ErrCodeOfferFetchError ErrorCode = "OFFER_FETCH_ERROR"
+	// ErrCodeRequestParseError is OID4VP's counterpart to ErrCodeOfferParseError -
+	// distinct so a failure to parse/fetch an *authorization* request never
+	// surfaces the OID4VCI-flavored "credential offer" wording on a presentation
+	// flow.
+	ErrCodeRequestParseError ErrorCode = "REQUEST_PARSE_ERROR"
+	// ErrCodeRequestFetchError is OID4VP's counterpart to ErrCodeOfferFetchError -
+	// a request_uri that couldn't be retrieved (network error, non-200
+	// status - e.g. an already-expired/consumed reference) is a distinct,
+	// more actionable condition from one that WAS retrieved but failed to
+	// parse.
+	ErrCodeRequestFetchError ErrorCode = "REQUEST_FETCH_ERROR"
 	ErrCodeMetadataFetchErr  ErrorCode = "METADATA_FETCH_ERROR"
 	ErrCodeUntrustedIssuer   ErrorCode = "UNTRUSTED_ISSUER"
 	ErrCodeUntrustedVerifier ErrorCode = "UNTRUSTED_VERIFIER"
@@ -124,6 +135,10 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Could not parse credential offer"
 	case ErrCodeOfferFetchError:
 		return "Could not fetch credential offer"
+	case ErrCodeRequestParseError:
+		return "Could not parse the presentation request"
+	case ErrCodeRequestFetchError:
+		return "Could not fetch the presentation request"
 	case ErrCodeMetadataFetchErr:
 		return "Could not fetch issuer metadata"
 	case ErrCodeUntrustedIssuer:
