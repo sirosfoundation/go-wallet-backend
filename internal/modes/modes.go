@@ -90,7 +90,7 @@ func ParseRoles(s string) (*RoleSet, error) {
 
 	// Handle "all" as a special case
 	if s == "all" {
-		return NewRoleSet([]Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleAdmin}), nil
+		return NewRoleSet(ValidRoles), nil
 	}
 
 	parts := strings.Split(s, ",")
