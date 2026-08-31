@@ -1377,6 +1377,21 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		}
 	}
 
+	// x509_hash has the same trust-cache-bypass risk as x509_san_dns above -
+	// verify the JWT signature against its embedded x5c before anything else,
+	// rather than only inside evaluateVerifierTrust's scheme switch (which
+	// runs after the in-memory trust cache check and so would never fire for
+	// a client_id already cached as trusted under a tampered request).
+	if authReq.ClientIDScheme == ClientIDSchemeX509Hash && authReq.RequestJWT != "" {
+		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if err != nil {
+			return fmt.Errorf("x509_hash JWT signature verification failed: %w", err)
+		}
+		if km.Type != "x5c" {
+			return fmt.Errorf("x509_hash scheme requires x5c in JWT header, got %q", km.Type)
+		}
+	}
+
 	// OID4VP §5: For direct_post, response_uri origin must be consistent with request_uri origin.
 	if err := validateResponseURIOrigin(authReq, msg); err != nil {
 		return err
