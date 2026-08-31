@@ -56,6 +56,7 @@ const (
 	ClientIDSchemeDID                 = "did"
 	ClientIDSchemeX509SANDNS          = "x509_san_dns"
 	ClientIDSchemeX509SANURI          = "x509_san_uri"
+	ClientIDSchemeX509Hash            = "x509_hash"
 	ClientIDSchemeVerifierAttestation = "verifier_attestation"
 )
 
@@ -222,20 +223,21 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 	var authReq AuthorizationRequest
 
 	if msg.RequestURI != "" {
-		// Parse from openid4vp://, haip://, haip-vp://, or a direct https://
-		// URL. HAIP (OpenID4VC High Assurance Interoperability Profile) uses
-		// the same openid4vp://?client_id=...&request_uri=... wire shape as
-		// plain OID4VP, just under its own scheme(s) - treat all three
-		// identically. "haip://" was HAIP's early-draft (1-3) scheme; HAIP
-		// 1.0 final replaced it with "haip-vp://" (presentation) - real
-		// verifiers (e.g. Multipaz) already emit the new one, and omitting
-		// it here fell through to the raw-https-URL branch below, which
-		// treats the whole thing as either an inline query string or a
+		// Parse from openid4vp://, haip://, haip-vp://, mdoc-openid4vp://, or
+		// a direct https:// URL. HAIP (OpenID4VC High Assurance
+		// Interoperability Profile) and ISO 18013-7 Annex B's mdoc-specific
+		// scheme both use the same openid4vp://?client_id=...&request_uri=...
+		// wire shape as plain OID4VP, just under their own scheme(s) - treat
+		// them all identically. "haip://" was HAIP's early-draft (1-3)
+		// scheme; HAIP 1.0 final replaced it with "haip-vp://" (presentation)
+		// - real verifiers (e.g. Multipaz) already emit the new one, and
+		// omitting it here fell through to the raw-https-URL branch below,
+		// which treats the whole thing as either an inline query string or a
 		// fetchable reference URL - neither is right for a haip-vp:// link
 		// carrying its own request_uri query param, so it never dereferenced
 		// that reference and failed with a generic "invalid message format".
 		requestStr := msg.RequestURI
-		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") || strings.HasPrefix(requestStr, "haip-vp://") {
+		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") || strings.HasPrefix(requestStr, "haip-vp://") || strings.HasPrefix(requestStr, "mdoc-openid4vp://") {
 			u, err := url.Parse(requestStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid request URL: %w", err)
@@ -607,6 +609,25 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		if km.Type != "x5c" {
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
+		}
+		keyMaterial = km
+
+	case ClientIDSchemeX509Hash:
+		// X.509 hash scheme: client_id is the leaf cert's own digest rather
+		// than a SAN entry, so (unlike x509_san_dns) there's no domain/origin
+		// to check here at all - go-trust's PDP already has the client_id-vs-
+		// cert-hash comparison (added alongside its x509_hash skip-chain-
+		// validation support), so this case only needs to verify the request
+		// JWT's signature against its embedded x5c, same as x509_san_dns.
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("x509_hash scheme requires a signed request JWT")
+		}
+		km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if verifyErr != nil {
+			return nil, fmt.Errorf("x509_hash JWT verification failed: %w", verifyErr)
+		}
+		if km.Type != "x5c" {
+			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
 
@@ -1327,7 +1348,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	// OID4VP §5: Validate client_id_scheme prefix is recognized
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
-		ClientIDSchemeX509SANURI, ClientIDSchemeVerifierAttestation:
+		ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
 		// Known scheme
 	default:
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
@@ -1353,6 +1374,21 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		}
 		if km.Type != "x5c" {
 			return fmt.Errorf("x509_san_dns scheme requires x5c in JWT header, got %q", km.Type)
+		}
+	}
+
+	// x509_hash has the same trust-cache-bypass risk as x509_san_dns above -
+	// verify the JWT signature against its embedded x5c before anything else,
+	// rather than only inside evaluateVerifierTrust's scheme switch (which
+	// runs after the in-memory trust cache check and so would never fire for
+	// a client_id already cached as trusted under a tampered request).
+	if authReq.ClientIDScheme == ClientIDSchemeX509Hash && authReq.RequestJWT != "" {
+		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if err != nil {
+			return fmt.Errorf("x509_hash JWT signature verification failed: %w", err)
+		}
+		if km.Type != "x5c" {
+			return fmt.Errorf("x509_hash scheme requires x5c in JWT header, got %q", km.Type)
 		}
 	}
 
@@ -1391,7 +1427,7 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	requestURL := msg.RequestURI
-	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") || strings.HasPrefix(requestURL, "haip-vp://") {
+	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") || strings.HasPrefix(requestURL, "haip-vp://") || strings.HasPrefix(requestURL, "mdoc-openid4vp://") {
 		if u, err := url.Parse(requestURL); err == nil {
 			requestURL = u.Query().Get("request_uri")
 		}
