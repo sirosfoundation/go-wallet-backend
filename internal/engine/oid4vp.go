@@ -56,6 +56,7 @@ const (
 	ClientIDSchemeDID                 = "did"
 	ClientIDSchemeX509SANDNS          = "x509_san_dns"
 	ClientIDSchemeX509SANURI          = "x509_san_uri"
+	ClientIDSchemeX509Hash            = "x509_hash"
 	ClientIDSchemeVerifierAttestation = "verifier_attestation"
 )
 
@@ -607,6 +608,25 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		if km.Type != "x5c" {
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
+		}
+		keyMaterial = km
+
+	case ClientIDSchemeX509Hash:
+		// X.509 hash scheme: client_id is the leaf cert's own digest rather
+		// than a SAN entry, so (unlike x509_san_dns) there's no domain/origin
+		// to check here at all - go-trust's PDP already has the client_id-vs-
+		// cert-hash comparison (added alongside its x509_hash skip-chain-
+		// validation support), so this case only needs to verify the request
+		// JWT's signature against its embedded x5c, same as x509_san_dns.
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("x509_hash scheme requires a signed request JWT")
+		}
+		km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if verifyErr != nil {
+			return nil, fmt.Errorf("x509_hash JWT verification failed: %w", verifyErr)
+		}
+		if km.Type != "x5c" {
+			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
 
@@ -1327,7 +1347,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	// OID4VP §5: Validate client_id_scheme prefix is recognized
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
-		ClientIDSchemeX509SANURI, ClientIDSchemeVerifierAttestation:
+		ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
 		// Known scheme
 	default:
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
