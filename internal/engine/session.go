@@ -982,7 +982,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timer := time.NewTimer(5 * time.Minute)
+	timer := time.NewTimer(3 * time.Minute)
 	defer timer.Stop()
 	for {
 		select {
