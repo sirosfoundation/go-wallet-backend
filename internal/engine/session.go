@@ -982,7 +982,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(5 * time.Minute)
 	for {
 		select {
 		case <-ctx.Done():
