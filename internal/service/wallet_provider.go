@@ -485,11 +485,16 @@ func isoAttackPotential(raw string, omitIfNone bool) (string, bool) {
 // normalizeSecurityProperties maps secProps onto the registered
 // `iso_18045_*` vocabulary and, when trusted is false, clamps every claim
 // down to the software/K3 floor regardless of what the client asserted.
+// The untrusted floor still emits all three TS03-required claims
+// (key_storage, user_authentication, certification) — omitting
+// user_authentication caused PID issuers to reject the KA with
+// "missing TS03 claims" even when the client had sent security_properties.
 func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *SecurityProperties {
 	if !trusted {
 		return &SecurityProperties{
-			KeyStorage:    []string{"iso_18045_basic"},
-			Certification: "none",
+			KeyStorage:         []string{"iso_18045_basic"},
+			UserAuthentication: []string{"iso_18045_basic"},
+			Certification:      "none",
 		}
 	}
 
