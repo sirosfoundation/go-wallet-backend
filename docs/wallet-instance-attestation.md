@@ -12,7 +12,7 @@ See `docs/CONFIGURATION.md`'s `wallet_provider.wia.*` section for the full field
 | `POST /wallet-provider/wia/generate` | Verifies the challenge PoP, then issues a WIA (`wallet_instance_attestation`) bound to the caller's key. |
 | `GET /.well-known/jwks.json` | Serves the wallet provider's own signing public key (`RegisterWalletProviderJWKSRoute`, `internal/service/wallet_provider_jwks.go`). Only registered when a wallet-provider signing key is configured. |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata pointing at the JWKS above (`issuer` + `jwks_uri`). Only registered in `ietf` mode (see below) with `wallet_provider.wia.issuer` explicitly set - no fallback to `wallet_provider_uri` (see below). |
-| `GET /wallet-provider/status-list` | Always-empty (never revoked) Token Status List, for interop completeness only — no WIA/KA this wallet provider issues actually references it (`RegisterWalletProviderStatusListRoute`, `internal/service/wallet_provider_statuslist.go`). |
+| `GET /wallet-provider/status-list` | The Token Status List that every WIA's `client_status` and every KA's `key_storage_status` references (WE BUILD CS-04 §7.1.2/§7.1.3 require those claims). Always served all-VALID: this wallet provider does not revoke through the list — short WIA/KA lifetimes bound exposure instead — so no bit in it is ever set. Turn the claims off with `wallet_provider.attestation.status_list.enabled: false`, at the cost of CS-04 conformance (`RegisterWalletProviderStatusListRoute`, `internal/service/wallet_provider_statuslist.go`). |
 
 ## Two identity formats: x5c vs. `iss`-based
 

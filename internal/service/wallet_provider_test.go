@@ -453,11 +453,12 @@ func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *te
 	}
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_moderate")
-	// omitIfNone: a "none" user_authentication claim is dropped, not mapped
-	// to a placeholder value.
-	if _, ok := claims["user_authentication"]; ok {
-		t.Errorf("user_authentication = %v, want omitted for \"none\"", claims["user_authentication"])
-	}
+	// omitIfNone drops the "none" entry rather than mapping it to a
+	// placeholder tier, but the claim itself is still emitted at the floor:
+	// CS-04 §7.1.3 requires user_authentication on every KA, so an empty
+	// mapping result falls back to the weakest value rather than omitting
+	// the claim (see normalizeSecurityProperties).
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 // TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic

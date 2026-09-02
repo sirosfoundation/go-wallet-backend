@@ -3,12 +3,14 @@
 // status_list JWT's payload) - not the JWT itself, which the service layer
 // (RegisterWalletProviderStatusListRoute) wraps this value in.
 //
-// This wallet provider does not implement WIA/KA revocation-chaining (see
-// AttestationConfig's type-level comment in pkg/config) — nothing it issues
-// ever references a status list index. This package exists purely so the
-// wallet provider can still publish a validly-shaped, always-empty status
-// list for interop completeness (some deployments expect a Wallet Provider
-// to expose one), without any WIA/KA depending on it.
+// Every WIA's `client_status` and every KA's `key_storage_status` does
+// reference an index in this list (CS-04 §7.1.2/§7.1.3 require the claims),
+// but no bit in it is ever set: this wallet provider does not implement
+// WIA/KA revocation-chaining (see AttestationConfig's type-level comment in
+// pkg/config), so the list is permanently all-VALID and the compressed
+// value this package returns is a constant. What actually bounds exposure
+// from a compromised or revoked wallet instance is the short WIA/KA
+// lifetime, not this list.
 package statuslist
 
 import (

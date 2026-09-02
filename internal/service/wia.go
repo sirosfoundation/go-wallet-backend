@@ -533,9 +533,14 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
 	}
 
-	// No `client_status`: this wallet provider does not implement WIA
-	// revocation-chaining. See AttestationConfig's type-level comment for
-	// the design rationale (short WIA lifetime instead).
+	// client_status: WIA revocation reference (CS-04 §7.1.2, TS-03 clause
+	// 2.3.1). Required on every WIA by CS-04 — a conformant PID/EAA
+	// Provider rejects one without it. It points at this wallet provider's
+	// own always-VALID status list; see StatusListConfig for why that is
+	// not the mechanism actually bounding exposure here.
+	if cs := statusClaim(s.cfg, statusIndexWIA, now); cs != nil {
+		claims["client_status"] = cs
+	}
 
 	// iss: only set in "ietf" mode, where it's the only way a relying party
 	// locates the JWKS needed to verify the WIA (see the header switch

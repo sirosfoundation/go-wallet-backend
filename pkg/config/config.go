@@ -546,15 +546,17 @@ type PKCS11SigningConfig struct {
 
 // AttestationConfig controls attestation lifecycle behavior.
 //
-// Revocation design: this wallet provider deliberately does NOT put
-// `client_status`/`key_storage_status` claims into WIAs or KAs (see
-// signWIA/GenerateKeyAttestation) — instead of a revocation-chaining
-// mechanism, it relies on WIA.LifetimeSeconds being short enough (default 5
-// minutes) that a compromised or revoked wallet instance's outstanding WIA
-// simply expires before it matters. EmptyStatusList still serves a validly
-// shaped, always-empty (all-valid) IETF Token Status List for interop
-// completeness (see RegisterWalletProviderStatusListRoute), but nothing this
-// wallet provider issues ever references it.
+// Revocation design: WIAs carry a `client_status` and KAs a
+// `key_storage_status` (see signWIA/GenerateKeyAttestation), both required
+// by WE BUILD CS-04 §7.1.2/§7.1.3 (TS-03 clauses 2.3.1/2.3.2) — an issuer
+// conforming to CS-04 rejects a WUA that omits them. Both reference this
+// wallet provider's own Token Status List
+// (RegisterWalletProviderStatusListRoute), which is served but never has a
+// bit set: this wallet provider does not implement revocation-chaining, and
+// what actually bounds exposure from a compromised or revoked wallet
+// instance is LifetimeSeconds being short enough (default 5 minutes) that
+// an outstanding WIA expires before it matters. See StatusListConfig for
+// what that does and does not buy an issuer, and how to turn the claims off.
 type AttestationConfig struct {
 	// LifetimeSeconds is the WIA lifetime. TS03 v1.5.2 caps this at < 24h
 	// (86400); this wallet provider defaults far below that (300s / 5 min)
@@ -576,6 +578,52 @@ type AttestationConfig struct {
 	// key-registration time rather than per-WIA-request. See
 	// FIDO2AttestationService.
 	FIDO2Attestation FIDO2AttestationConfig `yaml:"fido2_attestation" envconfig:"FIDO2_ATTESTATION"`
+
+	// StatusList controls the Token Status List references embedded in the
+	// WIA (`client_status`) and KA (`key_storage_status`).
+	StatusList StatusListConfig `yaml:"status_list" envconfig:"STATUS_LIST"`
+}
+
+// StatusListRefMinMaintenanceSeconds is the floor CS-04 §7.2.2 (TS-03
+// clause 2.4.2) puts on how far ahead `client_status.exp` /
+// `key_storage_status.exp` must be at the time of presentation: 31 days.
+const StatusListRefMinMaintenanceSeconds = 31 * 24 * 60 * 60
+
+// StatusListConfig configures the `client_status` (WIA) and
+// `key_storage_status` (KA) claims, which WE BUILD CS-04 §7.1.2/§7.1.3
+// (TS-03 clauses 2.3.1/2.3.2) require on every WUA.
+//
+// What these claims mean here: both reference this wallet provider's own
+// Token Status List endpoint (RegisterWalletProviderStatusListRoute), whose
+// entries are always 0 (VALID). This wallet provider does not revoke via
+// the list — see AttestationConfig's type-level comment for why (short
+// attestation lifetimes instead) — so an issuer that polls the referenced
+// entry learns nothing beyond "still valid". The claims are emitted because
+// a CS-04-conformant issuer rejects a WUA without them, not because they
+// carry revocation signal; a deployment that would rather advertise no
+// revocation mechanism at all than advertise an inert one can set Enabled
+// to false, at the cost of failing CS-04 conformance.
+type StatusListConfig struct {
+	// Enabled controls whether `client_status`/`key_storage_status` are
+	// emitted at all. Defaults to true (CS-04 conformance); set false to go
+	// back to omitting them.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// URI overrides the status list URI the claims reference. Defaults to
+	// this wallet provider's own endpoint,
+	// "<server.base_url>/wallet-provider/status-list". Set it only when the
+	// list is published somewhere else (e.g. behind a CDN on a different
+	// host than server.base_url).
+	URI string `yaml:"uri" envconfig:"URI"`
+
+	// MaintenancePeriodSeconds is how far ahead of issuance the claims'
+	// `exp` — the revocation *maintenance* commitment, independent of the
+	// token's own `exp` (CS-04 §7.2's note; TS-03 clause 2.4.1) — is set.
+	// CS-04 §7.2.2 requires at least 31 days remaining at presentation;
+	// this defaults to 45 days so a WUA still satisfies that after sitting
+	// unused for a fortnight. Values below 31 days are rejected by
+	// Validate() when StatusList is enabled.
+	MaintenancePeriodSeconds int `yaml:"maintenance_period_seconds" envconfig:"MAINTENANCE_PERIOD_SECONDS"`
 }
 
 // FIDO2AttestationConfig controls FIDO2/CTAP2 hardware-key attestation
@@ -1304,6 +1352,15 @@ func defaultConfig() *Config {
 				// instance. See AttestationConfig's type-level comment.
 				LifetimeSeconds: 300,
 				KAExpirySeconds: 15,
+				StatusList: StatusListConfig{
+					// On by default: CS-04 §7.1.2/§7.1.3 require
+					// client_status/key_storage_status on every WUA, and a
+					// conformant issuer rejects one without them.
+					Enabled: true,
+					// 45 days, comfortably above the 31-day floor CS-04
+					// §7.2.2 requires to still be remaining at presentation.
+					MaintenancePeriodSeconds: 45 * 24 * 60 * 60,
+				},
 			},
 		},
 	}
@@ -1504,6 +1561,20 @@ func (c *Config) Validate() error {
 					return fmt.Errorf("wallet_provider.certificate_path is required when wallet_provider.wia.mode is %q (WIA identity is x5c-only under ETSI TS 119 472-3)", WIAModeETSI)
 				}
 			}
+		}
+	}
+
+	// Validate the WUA status-list references. Applies regardless of
+	// WIA.Enabled: the same settings drive the KA's key_storage_status, and
+	// KAs are issued through the wallet-provider service independently of
+	// the WIA endpoints.
+	if c.WalletProvider.Attestation.StatusList.Enabled {
+		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds == 0 {
+			c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds = 45 * 24 * 60 * 60
+		}
+		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds < StatusListRefMinMaintenanceSeconds {
+			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
+				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
 	}
 
