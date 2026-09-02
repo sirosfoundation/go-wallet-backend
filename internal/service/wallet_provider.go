@@ -332,31 +332,36 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		claims["aud"] = audience
 	}
 
-	// Security properties are top-level KA claims (Annex C §C.3.1). These are
-	// self-reported by the client — trust them only when the same wallet
-	// instance already has a WIA proving native platform integrity
-	// (Tier 1: ios_app_attest / android_play_integrity). Otherwise clamp to
-	// the software/K3 floor: a client can always claim more than it can
-	// back up, and nothing here independently verifies a hardware or
-	// remote-HSM claim. See internal/service/wallet_provider_test.go for
-	// the regression tests this guards.
+	// Security properties are top-level KA claims (Annex C §C.3.1 / TS03).
+	// TS03 requires key_storage, user_authentication, and certification on
+	// every KA — PID issuers reject the request if any are missing. When the
+	// client omits security_properties, emit the software/K3 floor rather
+	// than leaving the claims absent. Elevated values are still only honored
+	// when the client asserts them AND the batch is trusted (native platform
+	// integrity or per-key FIDO2 evidence); a client can always claim more
+	// than it can back up. See internal/service/wallet_provider_test.go.
+	trusted := false
 	if secProps != nil {
-		trusted := s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
-		normalized := normalizeSecurityProperties(secProps, trusted)
-		if len(normalized.KeyStorage) > 0 {
-			claims["key_storage"] = normalized.KeyStorage
-		}
-		if len(normalized.UserAuthentication) > 0 {
-			claims["user_authentication"] = normalized.UserAuthentication
-		}
-		if normalized.Certification != nil {
-			claims["certification"] = normalized.Certification
-		}
+		trusted = s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
+	}
+	normalized := normalizeSecurityProperties(secProps, trusted)
+	if len(normalized.KeyStorage) > 0 {
+		claims["key_storage"] = normalized.KeyStorage
+	}
+	if len(normalized.UserAuthentication) > 0 {
+		claims["user_authentication"] = normalized.UserAuthentication
+	}
+	if normalized.Certification != nil {
+		claims["certification"] = normalized.Certification
 	}
 
-	// No `key_storage_status`: this wallet provider does not implement
-	// KA/WIA revocation-chaining. See AttestationConfig's type-level comment
-	// for the design rationale (short KA/WIA lifetime instead).
+	// key_storage_status: KA revocation reference (CS-04 §7.1.3, TS-03
+	// clause 2.3.2). Required on every KA by CS-04 — a conformant PID/EAA
+	// Provider rejects one without it. Indexed by keystore tier (CS-04
+	// §7.2.3 Option 1, type-shared); see kaStatusIndex and StatusListConfig.
+	if kss := statusClaim(s.cfg, kaStatusIndex(normalized.KeyStorage), now); kss != nil {
+		claims["key_storage_status"] = kss
+	}
 
 	// Create the token with ES256 and x5c header.
 	//
@@ -483,13 +488,17 @@ func isoAttackPotential(raw string, omitIfNone bool) (string, bool) {
 }
 
 // normalizeSecurityProperties maps secProps onto the registered
-// `iso_18045_*` vocabulary and, when trusted is false, clamps every claim
-// down to the software/K3 floor regardless of what the client asserted.
+// `iso_18045_*` vocabulary and, when trusted is false or secProps is nil,
+// clamps every claim down to the software/K3 floor. The floor still emits
+// all three TS03-required claims (key_storage, user_authentication,
+// certification) — omitting any of them caused PID issuers to reject the KA
+// with "missing TS03 claims".
 func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *SecurityProperties {
-	if !trusted {
+	if secProps == nil || !trusted {
 		return &SecurityProperties{
-			KeyStorage:    []string{"iso_18045_basic"},
-			Certification: "none",
+			KeyStorage:         []string{"iso_18045_basic"},
+			UserAuthentication: []string{"iso_18045_basic"},
+			Certification:      "none",
 		}
 	}
 
@@ -499,6 +508,18 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.KeyStorage = []string{"iso_18045_basic"}
 	}
 	out.UserAuthentication = mapDistinct(secProps.UserAuthentication, true)
+	// CS-04 §7.1.3 requires user_authentication and certification on every
+	// KA, so the trusted path needs the same floor the untrusted one gets:
+	// a client that asserted "none" (dropped by mapDistinct's omitIfNone)
+	// or omitted the field entirely must not produce a KA missing the
+	// claim. The floor value is the weakest in the vocabulary, so flooring
+	// never overstates what the client claimed.
+	if len(out.UserAuthentication) == 0 {
+		out.UserAuthentication = []string{"iso_18045_basic"}
+	}
+	if out.Certification == nil {
+		out.Certification = "none"
+	}
 	return out
 }
 

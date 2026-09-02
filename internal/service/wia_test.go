@@ -1184,11 +1184,11 @@ func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-// TestSignWIA_NoClientStatus is a regression test for the no-revocation-
-// chaining design (see AttestationConfig's type-level comment): a WIA must
-// never carry a client_status claim — there is no config knob left that
-// could re-enable it (StatusListMode/StatusListURL/StatusListExpiry were
-// removed).
+// TestSignWIA_NoClientStatus covers the full GenerateWIA path (not just
+// signWIA, which TestWIAService_ClientStatusDisabled exercises) with
+// attestation.status_list disabled: no client_status claim, and in
+// particular no reference to a status list this deployment isn't
+// publishing.
 func TestSignWIA_NoClientStatus(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
@@ -1205,7 +1205,7 @@ func TestSignWIA_NoClientStatus(t *testing.T) {
 	claims := token.Claims.(jwt.MapClaims)
 
 	if _, ok := claims["client_status"]; ok {
-		t.Error("client_status should never be present (no revocation-chaining support)")
+		t.Error("client_status emitted while attestation.status_list is disabled")
 	}
 }
 

@@ -259,6 +259,7 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysH
 	if !ok || len(ks) != 1 || ks[0] != "iso_18045_basic" {
 		t.Errorf("key_storage = %v, want [iso_18045_basic] (one unattested key in the batch must clamp the whole batch)", claims["key_storage"])
 	}
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 // TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoesNotLeak
@@ -311,6 +312,7 @@ func TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoes
 	if !ok || len(ks) != 1 || ks[0] != "iso_18045_basic" {
 		t.Errorf("key_storage = %v, want [iso_18045_basic] (an unrelated prior key's evidence must not leak into this batch)", claims["key_storage"])
 	}
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
@@ -349,7 +351,9 @@ func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
 // iso_18045_high) with no wallet_instance_id and no verification at all,
 // and have it signed straight into the KA JWT. With no walletInstanceID to
 // even attempt a lookup against, the claim must be clamped to the
-// software/K3 floor.
+// software/K3 floor. The floor still emits all three TS03-required claims
+// (including user_authentication at iso_18045_basic): omitting it caused
+// PID issuers to reject the KA as missing TS03 claims.
 func TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 
@@ -371,11 +375,9 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance(t *tes
 
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 	if cert := claims["certification"]; cert != "none" {
 		t.Errorf("certification = %v, want \"none\"", cert)
-	}
-	if _, ok := claims["user_authentication"]; ok {
-		t.Error("user_authentication should be clamped away, not passed through")
 	}
 }
 
@@ -400,7 +402,9 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInst
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
-	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 // TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance
@@ -416,7 +420,9 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance(t *
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
-	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 // TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary is a
@@ -447,11 +453,12 @@ func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *te
 	}
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_moderate")
-	// omitIfNone: a "none" user_authentication claim is dropped, not mapped
-	// to a placeholder value.
-	if _, ok := claims["user_authentication"]; ok {
-		t.Errorf("user_authentication = %v, want omitted for \"none\"", claims["user_authentication"])
-	}
+	// omitIfNone drops the "none" entry rather than mapping it to a
+	// placeholder tier, but the claim itself is still emitted at the floor:
+	// CS-04 §7.1.3 requires user_authentication on every KA, so an empty
+	// mapping result falls back to the weakest value rather than omitting
+	// the claim (see normalizeSecurityProperties).
+	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
 // TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic
@@ -496,6 +503,18 @@ func assertKeyStorage(t *testing.T, claims jwt.MapClaims, want string) {
 	}
 }
 
+func assertUserAuthentication(t *testing.T, claims jwt.MapClaims, want string) {
+	t.Helper()
+	ua, ok := claims["user_authentication"].([]interface{})
+	if !ok || len(ua) != 1 || ua[0] != want {
+		t.Errorf("user_authentication = %v, want [%s]", claims["user_authentication"], want)
+	}
+}
+
+// TestGenerateKeyAttestation_NoSecurityProperties is a regression for PID
+// issuers that require TS03's key_storage / user_authentication /
+// certification on every KA: omitting security_properties must still emit
+// the software floor, not leave the claims absent.
 func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 
@@ -508,18 +527,41 @@ func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
 
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != "none" {
+		t.Errorf("certification = %v, want \"none\"", cert)
+	}
+}
 
-	if _, ok := claims["key_storage"]; ok {
-		t.Error("key_storage should not be present when secProps is nil")
+// TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor
+// verifies that native-platform trust does not invent elevated claims when
+// the client never asserted security_properties.
+func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-no-secprops"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := claims["user_authentication"]; ok {
-		t.Error("user_authentication should not be present when secProps is nil")
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
-	if _, ok := claims["certification"]; ok {
-		t.Error("certification should not be present when secProps is nil")
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", nil, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != "none" {
+		t.Errorf("certification = %v, want \"none\"", cert)
 	}
 }
 

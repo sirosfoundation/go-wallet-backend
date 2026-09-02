@@ -556,9 +556,10 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	// WIA/the wallet provider signing key isn't configured.
 	service.RegisterWalletProviderJWKSRoute(router, p.Services().WalletProvider)
 
-	// Register an always-empty status list for interop completeness only —
-	// see RegisterWalletProviderStatusListRoute's doc comment. No WIA/KA
-	// this wallet provider issues references it.
+	// Register the always-VALID Token Status List that every WIA's
+	// client_status and every KA's key_storage_status references — see
+	// RegisterWalletProviderStatusListRoute's doc comment for why no bit in
+	// it is ever set.
 	service.RegisterWalletProviderStatusListRoute(router, p.Services().WalletProvider)
 
 	// Register AuthZEN proxy routes if enabled
