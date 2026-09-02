@@ -4,6 +4,17 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.16.0:start -->
+## [v0.16.0] - 2026-09-02
+
+### Fixed
+
+- Key attestation now correctly emits `user_authentication` claim when `security_properties` is clamped to the untrusted level, ensuring proper security signaling for devices that don't meet minimum requirements (#302)
+- Key attestation now emits TS03-compliant security claims even when the `security_properties` field is omitted from the request, maintaining baseline security guarantees (#302)
+- Wallet unit attestation now includes required `client_status` and `key_storage_status` claims as mandated by CS-04 §7.1 (#302)
+- Wallet unit attestation now correctly falls back to the 45-day default maintenance period instead of using the minimum floor value when no explicit period is provided (#302)
+<!-- release-notes:v0.16.0:end -->
+
 <!-- release-notes:v0.15.2:start -->
 ## [v0.15.2] - 2026-08-31
 
