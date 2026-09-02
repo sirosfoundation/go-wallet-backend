@@ -4,6 +4,22 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.15.1:start -->
+## [v0.15.1] - 2026-08-30
+
+### Fixed
+
+- Fixed OID4VP presentation flows incorrectly reporting "Could not parse credential offer" (an issuance error) when the actual failure was fetching or parsing the presentation request from a verifier's `request_uri`. Now returns a distinct "Could not parse the presentation request" error code. Also logs the response body (capped, at Debug level) when a `request_uri` fetch fails, making it possible to distinguish expired verifier sessions from network errors without reproducing the failure separately (#294)
+- Fixed mdoc issuance flows being blocked with 403 errors during issuer-trust evaluation. The authorization proxy's allowlist included `mdoc-reader-auth` (for presentation) but was missing the issuer-side mirror `mdoc-issuer-auth`, causing all VICAL issuer-trust queries to be denied before reaching the policy decision point regardless of issuer identity (#296)
+- Fixed `--mode registry` panicking on startup when CORS origins list is empty. Now handles empty configuration gracefully and warns when wildcard CORS is combined with `AllowCredentials` (#292)
+
+### Changed
+
+- Updated to go-trust v0.16.0, which adds support for loading additional trusted roots via YAML configuration (#288)
+- Updated Go runtime to 1.27 stable (#287)
+- Updated dependency group including testify, cbor, and kin-openapi (#288)
+<!-- release-notes:v0.15.1:end -->
+
 <!-- release-notes:v0.15.0:start -->
 ## [v0.15.0] - 2026-08-24
 
