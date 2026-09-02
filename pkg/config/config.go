@@ -589,6 +589,16 @@ type AttestationConfig struct {
 // `key_storage_status.exp` must be at the time of presentation: 31 days.
 const StatusListRefMinMaintenanceSeconds = 31 * 24 * 60 * 60
 
+// StatusListDefaultMaintenanceSeconds is the default
+// StatusListConfig.MaintenancePeriodSeconds: 45 days. Note that it is not
+// StatusListRefMinMaintenanceSeconds — CS-04 §7.2.2's 31 days must remain
+// *at presentation*, not at issuance, so defaulting to exactly the floor
+// would put a WUA out of conformance the moment it sat unused for a
+// second. The 14-day margin is what a WUA can spend between issuance and
+// presentation. Anything deriving a maintenance period must use this, not
+// the floor.
+const StatusListDefaultMaintenanceSeconds = 45 * 24 * 60 * 60
+
 // StatusListConfig configures the `client_status` (WIA) and
 // `key_storage_status` (KA) claims, which WE BUILD CS-04 §7.1.2/§7.1.3
 // (TS-03 clauses 2.3.1/2.3.2) require on every WUA.
@@ -1356,10 +1366,8 @@ func defaultConfig() *Config {
 					// On by default: CS-04 §7.1.2/§7.1.3 require
 					// client_status/key_storage_status on every WUA, and a
 					// conformant issuer rejects one without them.
-					Enabled: true,
-					// 45 days, comfortably above the 31-day floor CS-04
-					// §7.2.2 requires to still be remaining at presentation.
-					MaintenancePeriodSeconds: 45 * 24 * 60 * 60,
+					Enabled:                  true,
+					MaintenancePeriodSeconds: StatusListDefaultMaintenanceSeconds,
 				},
 			},
 		},
@@ -1570,7 +1578,7 @@ func (c *Config) Validate() error {
 	// the WIA endpoints.
 	if c.WalletProvider.Attestation.StatusList.Enabled {
 		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds == 0 {
-			c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds = 45 * 24 * 60 * 60
+			c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds = StatusListDefaultMaintenanceSeconds
 		}
 		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds < StatusListRefMinMaintenanceSeconds {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",

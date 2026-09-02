@@ -120,9 +120,14 @@ func statusClaim(cfg *config.Config, idx int, now time.Time) map[string]interfac
 	if uri == "" {
 		return nil
 	}
+	// Validate() fills this in, so the fallback only matters for a config
+	// that bypassed it (tests, direct struct construction). It has to be
+	// the 45-day default, NOT StatusListRefMinMaintenanceSeconds: CS-04
+	// §7.2.2's 31 days must remain at *presentation*, so a WUA issued with
+	// exactly the floor is out of conformance a second later.
 	maintenance := cfg.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds
 	if maintenance <= 0 {
-		maintenance = config.StatusListRefMinMaintenanceSeconds
+		maintenance = config.StatusListDefaultMaintenanceSeconds
 	}
 	return map[string]interface{}{
 		"status": map[string]interface{}{

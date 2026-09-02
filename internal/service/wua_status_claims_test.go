@@ -17,7 +17,7 @@ func enableStatusList(cfg *config.Config, uri string) {
 	cfg.WalletProvider.Attestation.StatusList = config.StatusListConfig{
 		Enabled:                  true,
 		URI:                      uri,
-		MaintenancePeriodSeconds: 45 * 24 * 60 * 60,
+		MaintenancePeriodSeconds: config.StatusListDefaultMaintenanceSeconds,
 	}
 }
 
@@ -208,6 +208,39 @@ func TestWIAService_ClientStatusDisabled(t *testing.T) {
 	}
 	if _, ok := token.Claims.(jwt.MapClaims)["client_status"]; ok {
 		t.Error("client_status emitted while status_list is disabled")
+	}
+}
+
+// TestStatusClaimMaintenanceFallback pins the fallback used when a config
+// bypassed Validate() (tests, direct struct construction) to the 45-day
+// default rather than the 31-day floor. CS-04 §7.2.2's 31 days must remain
+// at *presentation*, so falling back to exactly the floor would emit a WUA
+// that is out of conformance a second after it is issued.
+func TestStatusClaimMaintenanceFallback(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Server.BaseURL = "https://wp.example.com"
+	cfg.WalletProvider.Attestation.StatusList = config.StatusListConfig{Enabled: true}
+
+	now := time.Now()
+	claim := statusClaim(cfg, statusIndexWIA, now)
+	if claim == nil {
+		t.Fatal("statusClaim returned nil for an enabled, resolvable config")
+	}
+	want := now.Add(config.StatusListDefaultMaintenanceSeconds * time.Second).Unix()
+	if got := claim["exp"]; got != want {
+		t.Errorf("exp = %v, want %v (the 45-day default, not the 31-day floor)", got, want)
+	}
+	if want <= now.Add(config.StatusListRefMinMaintenanceSeconds*time.Second).Unix() {
+		t.Error("the fallback leaves no margin above the floor for time between issuance and presentation")
+	}
+}
+
+// TestStatusListURINilConfig covers the nil-config guard: statusListURI is
+// reachable from services constructed directly in tests, where cfg may be
+// unset, and must not panic there.
+func TestStatusListURINilConfig(t *testing.T) {
+	if got := statusListURI(nil); got != "" {
+		t.Errorf("statusListURI(nil) = %q, want empty", got)
 	}
 }
 
