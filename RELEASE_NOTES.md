@@ -4,6 +4,20 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.16.0:start -->
+## [v0.16.0] - 2026-09-02
+
+### Fixed
+
+**Wallet Unit Attestations now carry the status claims CS-04 requires** (#302). The WIA was missing `client_status` and the Key Attestation was missing `key_storage_status`, both mandated by WE BUILD CS-04 §7.1.2/§7.1.3 (TS-03 clauses 2.3.1/2.3.2). A conformant PID or Attestation Provider rejects a WUA without them, which is exactly what the WE BUILD ITB testbed did: `invalid_proof: WUA signature verification failed: Key Attestation missing required key_storage_status`. Take this release before any interop run against a CS-04-conformant issuer.
+
+The claims were removed in v0.13.0 (#261) on the grounds that this wallet provider implements no revocation-chaining. That reasoning still holds — short attestation lifetimes, not a revocation list, are what bound exposure here — but it conflated *not revoking through a status list* with *being allowed to omit the claims that reference one*. Both now reference the wallet provider's own Token Status List, which is served all-VALID and never has a bit set; the config comments and `docs/wallet-instance-attestation.md` say so plainly rather than implying a revocation capability that isn't there. KA indices follow CS-04 §7.2.3 Option 1 (type-shared, one per keystore tier), and a mixed batch is indexed by its weakest tier so an issuer is never told the batch is better protected than it is.
+
+A deployment that would rather advertise no revocation mechanism than an inert one can set `wallet_provider.attestation.status_list.enabled: false` and go back to omitting the claims, at the cost of CS-04 conformance. The reference URI defaults to `<server.base_url>/wallet-provider/status-list`, and the maintenance `exp` defaults to 45 days — deliberately not the 31-day floor, since CS-04 §7.2.2 requires those 31 days to still be *remaining* at presentation, not at issuance.
+
+- The Key Attestation also emitted no `key_storage`, `user_authentication` or `certification` at all when the client omitted `security_properties`, and could still drop `user_authentication` for a *trusted* client that reported `"none"`. All three are required on every KA, so each now falls back to the weakest value in the ISO 18045 vocabulary rather than being left absent — a floor never overstates what the client claimed. (#302, with fixes from @Didr)
+<!-- release-notes:v0.16.0:end -->
+
 <!-- release-notes:v0.15.2:start -->
 ## [v0.15.2] - 2026-08-31
 
