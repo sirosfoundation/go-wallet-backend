@@ -4,6 +4,13 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.15.2:start -->
+## [v0.15.2] - 2026-08-31
+
+### Fixed
+- OID4VP presentation requests using `client_id_scheme=x509_hash` are now accepted. Previously the wallet rejected all such requests with "Invalid message format" because the scheme was missing from the allowlist, breaking interoperability with verifiers like NIST's OpenID4VP reference implementation. (#298)
+<!-- release-notes:v0.15.2:end -->
+
 <!-- release-notes:v0.15.1:start -->
 ## [v0.15.1] - 2026-08-30
 
