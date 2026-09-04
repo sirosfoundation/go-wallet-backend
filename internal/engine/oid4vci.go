@@ -590,7 +590,7 @@ func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Re
 // after metadata fetch. The client signs the PoP locally; its instance key
 // never reaches the backend.
 //
-// Any failure leaves h.attestationProvider nil and the flow proceeds without
+// Any failure leaves h.attestationProvider unchanged and the flow proceeds without
 // client attestation (falling back to private_key_jwt or client_id when
 // configured); an issuer that requires attestation rejects on its own.
 func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
