@@ -7,8 +7,13 @@
 <!-- release-notes:v0.17.0:start -->
 ## [v0.17.0] - 2026-09-04
 
-### Fixed
-- Introduced a separate signing step in the engine OID4VCI flow to request client attestations. This resolves an issue where the frontend couldn't fetch credential offers (when provided as URIs) independently and had to rely on the backend to fetch and provide them (#304).
+### Added
+
+**The engine now asks the client for its Wallet Instance Attestation at the point where it can actually be built** (#304). The per-flow `OAuth-Client-Attestation-PoP` has to name the issuer's authorization server as its `aud`, and that server is only known after the credential offer and issuer metadata have been resolved. A browser wallet cannot resolve a cross-origin `credential_offer_uri` itself, so it could never compute the audience before starting the flow; the native SDKs only managed it by duplicating the backend's discovery on the device.
+
+The OID4VCI engine therefore sends a new `sign_request` action, `request_attestation`, right after metadata resolution whenever FlowStart did not already carry `client_attestation` and `client_attestation_pop`. Its params are `audience` (the authorization server URL, for the PoP `aud`) and `issuer` (the effective `client_id`, for the PoP `iss`); the client answers with `client_attestation` and `client_attestation_pop` in its `sign_response`, or with neither to proceed without attestation. Attestation supplied up front on FlowStart is still honoured and takes precedence. The instance key never leaves the client.
+
+**Client compatibility.** A client that predates this action does not answer the request. The engine waits at most 10 seconds for it (not the general 30 second signing timeout) and then continues without attestation, so older wallet-frontend and SDK builds keep working with a one-off delay per issuance until they are updated. The companion changes are wallet-frontend#196, siros-sdk-kotlin#154 and siros-sdk-swift#122; the follow-ups that drop the SDKs' own discovery (siros-sdk-kotlin#155, siros-sdk-swift#123) must not ship before this release is deployed.
 <!-- release-notes:v0.17.0:end -->
 
 <!-- release-notes:v0.16.0:start -->
