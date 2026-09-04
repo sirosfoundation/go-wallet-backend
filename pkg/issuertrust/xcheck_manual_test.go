@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuertrust"
@@ -33,6 +34,9 @@ func TestWrpacToolOutputSatisfiesIssuerTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A file written by a shell redirect or an editor carries a trailing
+	// newline; a compact JWS with one is not a compact JWS.
+	registrationCert := strings.TrimSpace(string(jwt))
 
 	var chain []*x509.Certificate
 	rest := pemBytes
@@ -58,7 +62,7 @@ func TestWrpacToolOutputSatisfiesIssuerTrust(t *testing.T) {
 
 	d := issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
-		RegistrationCert: string(jwt),
+		RegistrationCert: registrationCert,
 		Offers: []issuertrust.Offer{
 			{Format: "dc+sd-jwt", Type: "urn:eudi:pid:1"},
 			{Format: "mso_mdoc", Type: "eu.europa.ec.eudi.pid.1"},
@@ -79,7 +83,7 @@ func TestWrpacToolOutputSatisfiesIssuerTrust(t *testing.T) {
 	// And the negative: something it did not register for must be refused.
 	d2 := issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
-		RegistrationCert: string(jwt),
+		RegistrationCert: registrationCert,
 		Offers:           []issuertrust.Offer{{Format: "dc+sd-jwt", Type: "urn:example:unregistered"}},
 	}, issuertrust.ModeFail)
 	if d2.Allowed {

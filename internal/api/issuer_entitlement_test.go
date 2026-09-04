@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/base64"
 	"testing"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuertrust"
@@ -90,5 +92,40 @@ func TestParseX5CChainIgnoresUndecodableEntries(t *testing.T) {
 func TestEntitlementModeDefaultsToWarn(t *testing.T) {
 	if issuertrust.ParseMode("") != issuertrust.ModeWarn {
 		t.Error("an unset mode must default to warn")
+	}
+}
+
+// TestDecodeX5CAcceptsBothBase64Alphabets pins the fix for a chain that the
+// signature-verification path accepts and this one used to drop.
+//
+// A dropped chain does not surface as a decoding problem; it surfaces as
+// CodeNoAccessCertificate, which reads as an issuer that published nothing
+// rather than one this code could not read.
+func TestDecodeX5CAcceptsBothBase64Alphabets(t *testing.T) {
+	// Bytes chosen so the two alphabets actually differ: 0xFB 0xFF encodes as
+	// "+/8=" in standard base64 and "-_8" raw URL-safe.
+	raw := []byte{0xFB, 0xFF}
+
+	for _, tc := range []struct {
+		name    string
+		encoded string
+	}{
+		{"standard", base64.StdEncoding.EncodeToString(raw)},
+		{"raw url", base64.RawURLEncoding.EncodeToString(raw)},
+		{"padded url", base64.URLEncoding.EncodeToString(raw)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decodeX5C(tc.encoded)
+			if err != nil {
+				t.Fatalf("decodeX5C(%q) failed: %v", tc.encoded, err)
+			}
+			if !bytes.Equal(got, raw) {
+				t.Errorf("decodeX5C(%q) = %x, want %x", tc.encoded, got, raw)
+			}
+		})
+	}
+
+	if _, err := decodeX5C("not base64 at all!!"); err == nil {
+		t.Error("expected an error for a value that is neither alphabet")
 	}
 }

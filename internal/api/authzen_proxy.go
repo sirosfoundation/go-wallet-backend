@@ -1190,7 +1190,7 @@ func parseX5CChain(km *trust.KeyMaterial) []*x509.Certificate {
 	}
 	out := make([]*x509.Certificate, 0, len(km.X5C))
 	for _, encoded := range km.X5C {
-		der, err := base64.StdEncoding.DecodeString(encoded)
+		der, err := decodeX5C(encoded)
 		if err != nil {
 			continue
 		}
@@ -1201,6 +1201,21 @@ func parseX5CChain(km *trust.KeyMaterial) []*x509.Certificate {
 		out = append(out, cert)
 	}
 	return out
+}
+
+// decodeX5C accepts both base64 alphabets, matching what the signature
+// verification path already tolerates.
+//
+// RFC 7515 specifies standard base64 for x5c, but
+// trust.VerifyJWTWithEmbeddedKey falls back to raw URL encoding, so a chain it
+// accepted could be dropped here - and a dropped chain does not surface as a
+// decoding problem, it surfaces as "no_access_certificate", which reads as an
+// issuer that published nothing rather than one this code failed to read.
+func decodeX5C(encoded string) ([]byte, error) {
+	if der, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+		return der, nil
+	}
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
 }
 
 // offersFor turns the credential configurations the wallet is about to request
