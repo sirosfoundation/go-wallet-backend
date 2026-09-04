@@ -1891,6 +1891,151 @@ func TestRequestCredential_RegularErrorNotWrapped(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid_request")
 }
 
+// TestRequestClientAttestation_WiresProviderFromResponse covers the success
+// path of the engine-driven request_attestation step: the client returns a WIA
+// + PoP, and requestClientAttestation wires them into h.attestationProvider.
+// Also asserts the sign request carries the AS issuer (PoP aud) and client_id.
+func TestRequestClientAttestation_WiresProviderFromResponse(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			ClientAttestation:    "signed.wia.jwt",
+			ClientAttestationPoP: "signed.pop.jwt",
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	// Route the sign_response from the WebSocket client side to signCh
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	h.requestClientAttestation(context.Background())
+
+	require.NotNil(t, h.attestationProvider)
+	require.True(t, h.attestationProvider.Available())
+	assert.Equal(t, "https://wallet.example.com/cb", h.attestationProvider.ClientID())
+	tsa, ok := h.attestationProvider.(*TransportSuppliedAttestation)
+	require.True(t, ok)
+	assert.Equal(t, "signed.wia.jwt", tsa.WIA)
+	assert.Equal(t, "signed.pop.jwt", tsa.PoP)
+
+	// Verify params sent to frontend (received via channel - no data race)
+	receivedParams := <-paramsCh
+	assert.Equal(t, "https://as.example.com", receivedParams.Audience)
+	assert.Equal(t, "https://wallet.example.com/cb", receivedParams.Issuer)
+}
+
+// TestRequestClientAttestation_EmptyResponseLeavesProviderNil covers the
+// declined path: a client that returns no attestation leaves the flow without a
+// client-attestation provider (Tier 3), so issuance proceeds unattested.
+func TestRequestClientAttestation_EmptyResponseLeavesProviderNil(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	h.requestClientAttestation(context.Background())
+
+	assert.Nil(t, h.attestationProvider)
+}
+
+// TestRequestClientAttestation_ErrorLeavesProviderNil covers the error path
+// (e.g. a sign timeout / cancelled context): requestClientAttestation must not
+// set a provider, leaving the flow to fall back to other client auth.
+func TestRequestClientAttestation_ErrorLeavesProviderNil(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		// Read the request but never respond.
+		_, _, _ = srvConn.ReadMessage()
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	// Cancel immediately so RequestSign returns ctx.Err() without waiting.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h.requestClientAttestation(ctx)
+
+	assert.Nil(t, h.attestationProvider)
+}
+
 // TestRequestProofs_PassesProofTypesAndCount tests that requestProofs correctly
 // passes proof_types_supported and count to the frontend via the sign request,
 // and validates that the returned proof types are supported.

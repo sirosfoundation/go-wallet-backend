@@ -174,8 +174,8 @@ func (c ErrorCode) UserFacingMessage() string {
 type SignAction string
 
 const (
-	SignActionGenerateProof    SignAction = "generate_proof"
-	SignActionSignPresentation SignAction = "sign_presentation"
+	SignActionGenerateProof      SignAction = "generate_proof"
+	SignActionSignPresentation   SignAction = "sign_presentation"
 	SignActionRequestAttestation SignAction = "request_attestation"
 )
 
