@@ -581,6 +581,13 @@ func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Re
 	return h.attestationProvider.SetHeaders(ctx, req)
 }
 
+// attestationRequestTimeout bounds how long requestClientAttestation waits for
+// the client's sign_response. Shorter than Session.RequestSign's 30s default
+// because this step is best-effort and, unlike proof/presentation signing,
+// involves no user interaction: the client only fetches its WIA and signs a
+// PoP. A package var rather than a const so tests can shorten it.
+var attestationRequestTimeout = 10 * time.Second
+
 // requestClientAttestation asks the client to supply a Wallet Instance
 // Attestation (WIA) and matching PoP, then wires up h.attestationProvider so
 // the PAR/token request carries OAuth-Client-Attestation[-PoP] headers
@@ -598,6 +605,11 @@ func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
+	// Bound the wait: a client that predates SignActionRequestAttestation
+	// never answers, and Session.RequestSign's default 30s would stall every
+	// such issuance before falling back to other client auth.
+	ctx, cancel := context.WithTimeout(ctx, attestationRequestTimeout)
+	defer cancel()
 	resp, err := h.RequestSign(ctx, SignActionRequestAttestation, SignRequestParams{
 		Audience: h.authServerIssuer, // PoP aud = the AS the token request is sent to
 		Issuer:   h.clientID,         // WIA sub / PoP iss = this flow's effective client_id

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
@@ -2008,10 +2009,49 @@ func TestRequestClientAttestation_EmptyResponseLeavesProviderNil(t *testing.T) {
 	assert.Nil(t, h.attestationProvider)
 }
 
-// TestRequestClientAttestation_ErrorLeavesProviderNil covers the error path
-// (e.g. a sign timeout / cancelled context): requestClientAttestation must not
-// set a provider, leaving the flow to fall back to other client auth.
-func TestRequestClientAttestation_ErrorLeavesProviderNil(t *testing.T) {
+// TestRequestClientAttestation_CancelledContextSkipsRequest covers the
+// already-cancelled context path: requestClientAttestation short-circuits on
+// ctx.Err() before sending any sign request, and sets no provider.
+func TestRequestClientAttestation_CancelledContextSkipsRequest(t *testing.T) {
+	received := make(chan struct{}, 1)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		if _, _, err := srvConn.ReadMessage(); err == nil {
+			received <- struct{}{}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h.requestClientAttestation(ctx)
+
+	assert.Nil(t, h.attestationProvider)
+	select {
+	case <-received:
+		t.Fatal("sign request was sent despite cancelled context")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestRequestClientAttestation_TimeoutLeavesProviderNil covers a client that
+// never answers (e.g. an SDK build predating request_attestation): the step
+// gives up after attestationRequestTimeout rather than Session.RequestSign's
+// 30s default, and leaves the flow without a provider.
+func TestRequestClientAttestation_TimeoutLeavesProviderNil(t *testing.T) {
+	prev := attestationRequestTimeout
+	attestationRequestTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { attestationRequestTimeout = prev })
+
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
 		// Read the request but never respond.
@@ -2027,14 +2067,11 @@ func TestRequestClientAttestation_ErrorLeavesProviderNil(t *testing.T) {
 	h.authServerIssuer = "https://as.example.com"
 	h.clientID = "https://wallet.example.com/cb"
 
-	// Cancel before calling so requestClientAttestation short-circuits on
-	// ctx.Err() and never sends a sign request.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	h.requestClientAttestation(ctx)
+	start := time.Now()
+	h.requestClientAttestation(context.Background())
 
 	assert.Nil(t, h.attestationProvider)
+	assert.Less(t, time.Since(start), 5*time.Second, "should give up at attestationRequestTimeout, not the 30s sign timeout")
 }
 
 // TestRequestProofs_PassesProofTypesAndCount tests that requestProofs correctly
