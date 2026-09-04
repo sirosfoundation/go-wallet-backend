@@ -615,7 +615,7 @@ func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
 		ID:  h.clientID,
 	}
 	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
-		zap.String("issuer", h.authServerIssuer),
+		zap.String("auth_server_issuer", h.authServerIssuer),
 		zap.String("client_id", h.clientID))
 }
 
