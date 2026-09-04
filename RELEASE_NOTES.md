@@ -4,6 +4,13 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.17.0:start -->
+## [v0.17.0] - 2026-09-04
+
+### Fixed
+- Introduced a separate signing step in the engine OID4VCI flow to request client attestations. This resolves an issue where the frontend couldn't fetch credential offers (when provided as URIs) independently and had to rely on the backend to fetch and provide them (#304).
+<!-- release-notes:v0.17.0:end -->
+
 <!-- release-notes:v0.16.0:start -->
 ## [v0.16.0] - 2026-09-02
 
