@@ -594,6 +594,10 @@ func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Re
 // client attestation (falling back to private_key_jwt or client_id when
 // configured); an issuer that requires attestation rejects on its own.
 func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
+	// Skip entirely if the context is already done
+	if err := ctx.Err(); err != nil {
+		return
+	}
 	resp, err := h.RequestSign(ctx, SignActionRequestAttestation, SignRequestParams{
 		Audience: h.authServerIssuer, // PoP aud = the AS the token request is sent to
 		Issuer:   h.clientID,         // WIA sub / PoP iss = this flow's effective client_id

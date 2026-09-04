@@ -2027,7 +2027,8 @@ func TestRequestClientAttestation_ErrorLeavesProviderNil(t *testing.T) {
 	h.authServerIssuer = "https://as.example.com"
 	h.clientID = "https://wallet.example.com/cb"
 
-	// Cancel immediately so RequestSign returns ctx.Err() without waiting.
+	// Cancel before calling so requestClientAttestation short-circuits on
+	// ctx.Err() and never sends a sign request.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
