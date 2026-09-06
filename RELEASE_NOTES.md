@@ -4,8 +4,23 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.18.2:start -->
+## [v0.18.2] - 2026-09-06
+
+**Use this instead of v0.18.1.** v0.18.1 does not compile and produced no
+container image; everything it lists is delivered here.
+
+### Fixed
+
+- Restored compilation against go-webauthn 0.18 by updating the `VerifyAttestation` call site to pass the two new policy arguments required by the library's API change. The signature policy explicitly selects BER encoding tolerance to maintain support for YubiKey firmware 5.8's non-minimally-encoded ECDSA signatures, which would otherwise be rejected by 0.18's stricter DER-only default (#310)
+<!-- release-notes:v0.18.2:end -->
+
 <!-- release-notes:v0.18.1:start -->
 ## [v0.18.1] - 2026-09-06
+
+> **Broken release - use v0.18.2.** The go-webauthn 0.18.0 bump below changed
+> an API whose call site was not updated, so this tag does not build and no
+> image was published for it.
 
 ### Fixed
 
