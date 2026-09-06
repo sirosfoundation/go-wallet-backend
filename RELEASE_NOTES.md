@@ -4,6 +4,19 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.18.1:start -->
+## [v0.18.1] - 2026-09-06
+
+### Fixed
+
+- Increased signing timeout from 30 seconds to 3 minutes to accommodate zero-knowledge proof operations on slower devices (#300)
+- `-mode all` now starts every role. It expanded to a hardcoded list of five, silently omitting `storage` and `wallet-provider`, so a deployment that asked for every role was not running those two; it now expands to `ValidRoles`. The `-mode` help text also lists every role rather than three (#290)
+
+### Changed
+
+- Updated dependencies: go-webauthn/webauthn to v0.18.0 (adds Post-Quantum Cryptography support), golang.org/x/crypto, and getkin/kin-openapi (#308)
+<!-- release-notes:v0.18.1:end -->
+
 <!-- release-notes:v0.18.0:start -->
 ## [v0.18.0] - 2026-09-06
 
