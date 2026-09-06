@@ -618,7 +618,14 @@ func (m *Manager) unregisterSession(session *Session) {
 		_ = m.sessionStore.Delete(context.Background(), session.ID)
 	}
 
-	session.logger.Info("Session closed")
+	// "session" (session.logger's bound field) is the user's short ID, not
+	// this session's own - deliberately shared across every reconnect for
+	// that user so log lines from the same user grep together. Without an
+	// explicit session_id here (unlike "Session established", which already
+	// logs one), two rapid reconnects for one user produce two "Session
+	// closed" lines that are indistinguishable from each other, which read
+	// as a session-eviction bug when reconnects were simply frequent.
+	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
 // validateToken authenticates tokenString and returns its identity.
