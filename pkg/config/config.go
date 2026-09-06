@@ -946,6 +946,18 @@ type AuthZENProxyConfig struct {
 	// If empty, default wallet rules are used.
 	RulesFile string `yaml:"rules_file" envconfig:"RULES_FILE"`
 
+	// IssuerEntitlementMode decides what happens when a PID or attestation
+	// provider is not registered for what it is offering: "warn" (default,
+	// report and continue), "fail" (refuse), or "off" (do not check).
+	//
+	// The default is warn, not fail, because the ARF obligation to verify
+	// registration certificates applies 24 months after the amending
+	// Regulation enters into force. Until then, refusing a provider that has
+	// simply not been registered yet would break issuance that is currently
+	// legitimate. An unrecognised value is treated as warn rather than off, so
+	// a typo cannot silently disable the check.
+	IssuerEntitlementMode string `yaml:"issuer_entitlement_mode" envconfig:"ISSUER_ENTITLEMENT_MODE"`
+
 	// AllowResolution controls whether resolution-only requests are allowed.
 	// Resolution requests fetch metadata (DID documents, entity configs) without key validation.
 	// Default: true
