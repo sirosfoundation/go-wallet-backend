@@ -4,6 +4,13 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.18.0:start -->
+## [v0.18.0] - 2026-09-06
+
+### Added
+- Issuer entitlement verification implementing ARF v3.0.0 §6.6.2.3 and CIR (EU) 2025/848 requirements. The `/v1/resolve` endpoint now evaluates an issuer's access certificate (WRPAC) and registration certificate (WRPRC) to determine whether the issuer is entitled to issue what it offers, returning an `issuer_entitlement` decision alongside metadata. Controlled by `ISSUER_ENTITLEMENT_MODE` environment variable (`warn` by default, `fail`, or `off`). The default `warn` mode logs violations without blocking issuance, reflecting the 24-month grace period before ARF registration obligations take effect. (#306)
+<!-- release-notes:v0.18.0:end -->
+
 <!-- release-notes:v0.17.0:start -->
 ## [v0.17.0] - 2026-09-04
 
