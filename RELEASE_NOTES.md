@@ -10,7 +10,7 @@
 ### Fixed
 
 - Increased signing timeout from 30 seconds to 3 minutes to accommodate zero-knowledge proof operations on slower devices (#300)
-- Corrected `-mode` flag documentation to include previously missing roles: admin, auth, and wallet-provider (#290)
+- `-mode all` now starts every role. It expanded to a hardcoded list of five, silently omitting `storage` and `wallet-provider`, so a deployment that asked for every role was not running those two; it now expands to `ValidRoles`. The `-mode` help text also lists every role rather than three (#290)
 
 ### Changed
 
