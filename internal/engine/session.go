@@ -982,12 +982,13 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timeout := time.After(30 * time.Second)
+	timer := time.NewTimer(3 * time.Minute)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-timeout:
+		case <-timer.C:
 			return nil, ErrSignTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
