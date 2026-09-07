@@ -1532,9 +1532,14 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 		if keyErr != nil {
 			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
 		}
+		// Only honor the JWK's declared "alg" when it is a JARM key-management
+		// algorithm we support.
 		if jwkAlg != "" {
-			encAlg = jwkAlg
-		} else {
+			if _, err := mapKeyAlgorithm(jwkAlg); err == nil {
+				encAlg = jwkAlg
+			}
+		}
+		if encAlg == "" {
 			switch inferredKey.(type) {
 			case *ecdsa.PublicKey:
 				encAlg = "ECDH-ES"
