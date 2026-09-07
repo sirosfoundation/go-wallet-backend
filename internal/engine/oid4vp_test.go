@@ -736,6 +736,55 @@ func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromECKey(t *testing.T) {
 	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
 }
 
+func TestSubmitDirectPostJWT_MissingEncAlg_HonorsJWKAlg(t *testing.T) {
+	// When authorization_encrypted_response_alg is absent but the verifier's
+	// encryption JWK declares its own "alg" (e.g. ECDH-ES+A256KW), that value
+	// must be used for the JWE header rather than inferring ECDH-ES from the
+	// EC key type. Verifiers validate the JWE header "alg" against their
+	// selected encryption JWK and reject a mismatch (regression test for the
+	// "JWE header does not match the selected verifier encryption JWK" failure).
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	jwksBytes := makeJWKS(jose.JSONWebKey{
+		Key:       &encKey.PublicKey,
+		KeyID:     "enc-key-1",
+		Use:       "enc",
+		Algorithm: "ECDH-ES+A256KW",
+	})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		// No AuthorizationEncryptedResponseAlg — must fall back to the JWK's alg.
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should succeed by honoring the JWK's declared alg")
+
+	response := receivedForm.Get("response")
+	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+
+	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
+	require.NoError(t, err)
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	require.NoError(t, json.Unmarshal(headerJSON, &header))
+	assert.Equal(t, string(jose.ECDH_ES_A256KW), header.Alg,
+		"JWE header alg should honor the JWK's declared ECDH-ES+A256KW, not inferred ECDH-ES")
+}
+
 func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromRSAKey(t *testing.T) {
 	// When authorization_encrypted_response_alg is absent but an RSA key is
 	// available in client_metadata.jwks, the algorithm should be inferred as

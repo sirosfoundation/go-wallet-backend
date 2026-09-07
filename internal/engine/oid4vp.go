@@ -1649,10 +1649,10 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 			Keys []json.RawMessage `json:"keys"`
 		}
 		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
-			// Select the best key for encryption: prefer use="enc", then
-			// matching alg, then fall back to first parseable key. The JWK's
-			// own "alg" is returned so the caller can  honor the verifier's declared
-			// algorithm instead of inferring one from the key type.
+			// Select the best key for encryption: prefer use="enc", else fall
+			// back to the first parseable key. The JWK's own "alg" is returned
+			// so the caller can honor the verifier's declared algorithm instead
+			// of inferring one from the key type.
 			var fallbackKey *jose.JSONWebKey
 			for _, raw := range jwks.Keys {
 				var jwk jose.JSONWebKey
