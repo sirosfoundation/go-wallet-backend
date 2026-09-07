@@ -1528,17 +1528,21 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	// This allows interoperability with verifiers that embed their key in the request
 	// JWT x5c header but do not explicitly declare JARM encryption parameters.
 	if encAlg == "" {
-		inferredKey, _, keyErr := h.extractVerifierEncryptionKey(authReq)
+		inferredKey, _, jwkAlg, keyErr := h.extractVerifierEncryptionKey(authReq)
 		if keyErr != nil {
 			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
 		}
-		switch inferredKey.(type) {
-		case *ecdsa.PublicKey:
-			encAlg = "ECDH-ES"
-		case *rsa.PublicKey:
-			encAlg = "RSA-OAEP"
-		default:
-			return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
+		if jwkAlg != "" {
+			encAlg = jwkAlg
+		} else {
+			switch inferredKey.(type) {
+			case *ecdsa.PublicKey:
+				encAlg = "ECDH-ES"
+			case *rsa.PublicKey:
+				encAlg = "RSA-OAEP"
+			default:
+				return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
+			}
 		}
 		h.Logger.Info("direct_post.jwt: inferred encryption algorithm from key material",
 			zap.String("alg", encAlg),
@@ -1560,7 +1564,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 
 	// Extract verifier's public key for encryption
-	verifierKey, kid, err := h.extractVerifierEncryptionKey(authReq)
+	verifierKey, kid, _, err := h.extractVerifierEncryptionKey(authReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract verifier encryption key: %w", err)
 	}
@@ -1637,7 +1641,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
-func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, error) {
+func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, string, error) {
 	// Prefer client_metadata.jwks — this is where verifiers put their
 	// ephemeral encryption key for JARM (ECDH-ES key agreement).
 	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
@@ -1646,7 +1650,9 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 		}
 		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
 			// Select the best key for encryption: prefer use="enc", then
-			// matching alg, then fall back to first parseable key.
+			// matching alg, then fall back to first parseable key. The JWK's
+			// own "alg" is returned so the caller can  honor the verifier's declared
+			// algorithm instead of inferring one from the key type.
 			var fallbackKey *jose.JSONWebKey
 			for _, raw := range jwks.Keys {
 				var jwk jose.JSONWebKey
@@ -1654,7 +1660,7 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 					continue
 				}
 				if jwk.Use == "enc" {
-					return jwk.Key, jwk.KeyID, nil
+					return jwk.Key, jwk.KeyID, jwk.Algorithm, nil
 				}
 				if fallbackKey == nil {
 					k := jwk // copy
@@ -1662,13 +1668,15 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 				}
 			}
 			if fallbackKey != nil {
-				return fallbackKey.Key, fallbackKey.KeyID, nil
+				return fallbackKey.Key, fallbackKey.KeyID, fallbackKey.Algorithm, nil
 			}
 		}
 	}
 
 	// Fallback: x5c from request JWT header (signing key, used when no
-	// dedicated encryption key is provided in client_metadata)
+	// dedicated encryption key is provided in client_metadata). The x5c
+	// certificate carries no JARM key-management alg, so none is returned
+	// and the caller infers one from the key type.
 	if authReq.RequestJWT != "" {
 		parts := strings.Split(authReq.RequestJWT, ".")
 		var kid string
@@ -1689,18 +1697,18 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 			if err != nil {
 				certDER, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to decode x5c certificate: %w", err)
+					return nil, "", "", fmt.Errorf("failed to decode x5c certificate: %w", err)
 				}
 			}
 			cert, err := x509.ParseCertificate(certDER)
 			if err != nil {
-				return nil, "", fmt.Errorf("failed to parse x5c certificate: %w", err)
+				return nil, "", "", fmt.Errorf("failed to parse x5c certificate: %w", err)
 			}
-			return cert.PublicKey, kid, nil
+			return cert.PublicKey, kid, "", nil
 		}
 	}
 
-	return nil, "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
+	return nil, "", "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
 }
 
 // Returns the verifier's encryption key as a JSONWebKey.

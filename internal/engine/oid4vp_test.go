@@ -901,7 +901,7 @@ func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
 
 	jwksBytes := makeJWKS(
 		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
-		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc"},
+		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc", Algorithm: "ECDH-ES+A256KW"},
 	)
 
 	h := &OID4VPHandler{}
@@ -909,9 +909,10 @@ func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
 		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
 	}
 
-	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	_, kid, alg, err := h.extractVerifierEncryptionKey(authReq)
 	require.NoError(t, err)
 	assert.Equal(t, "enc-key-1", kid, "should select the key with use=enc")
+	assert.Equal(t, "ECDH-ES+A256KW", alg, "should return the JWK's declared alg")
 }
 
 func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
@@ -930,7 +931,7 @@ func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
 		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
 	}
 
-	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	_, kid, _, err := h.extractVerifierEncryptionKey(authReq)
 	require.NoError(t, err)
 	assert.Equal(t, "only-key", kid)
 }
@@ -941,7 +942,7 @@ func TestExtractVerifierEncryptionKey_NoKeysReturnsError(t *testing.T) {
 		ClientMetadata: &ClientMetadata{},
 	}
 
-	_, _, err := h.extractVerifierEncryptionKey(authReq)
+	_, _, _, err := h.extractVerifierEncryptionKey(authReq)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no verifier encryption key found")
 }
