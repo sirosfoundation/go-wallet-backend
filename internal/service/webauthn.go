@@ -64,6 +64,13 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 		RPDisplayName: cfg.Server.RPName,
 		RPID:          cfg.Server.RPID,
 		RPOrigins:     cfg.Server.GetRPOrigins(),
+		// go-webauthn >= 0.18 rejects client extension outputs that were not
+		// listed in the session's requested extensions. Our clients add the PRF
+		// eval input themselves (the wallet-frontend and the native SDKs derive
+		// the keystore key from the PRF output on both registration and login),
+		// so the backend cannot know the full set of extensions a client will
+		// return. Unsolicited outputs carry no security weight; ignore them.
+		ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore,
 	}
 
 	wa, err := webauthn.New(wconfig)
@@ -485,6 +492,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
+		// Extensions must record what was sent to the client in BeginRegistration
+		Extensions: protocol.SessionExtensions{
+			Requested: []string{protocol.ExtensionCredProps, protocol.ExtensionPRF},
 		},
 	}
 
@@ -1512,6 +1523,10 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256},
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgEdDSA},
 			{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgRS256},
+		},
+		// Extensions must record what was sent to the client in BeginAddCredential
+		Extensions: protocol.SessionExtensions{
+			Requested: []string{protocol.ExtensionCredProps, protocol.ExtensionPRF},
 		},
 	}
 
