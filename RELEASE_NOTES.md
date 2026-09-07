@@ -4,6 +4,13 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.19.0:start -->
+## [v0.19.0] - 2026-09-07
+
+### Fixed
+- OID4VP request encryption now respects the `alg` header specified in the verifier's JWK instead of always inferring it from the key material, preventing validation failures when the verifier checks the returned `vp_token` (#315)
+<!-- release-notes:v0.19.0:end -->
+
 <!-- release-notes:v0.18.4:start -->
 ## [v0.18.4] - 2026-09-07
 
