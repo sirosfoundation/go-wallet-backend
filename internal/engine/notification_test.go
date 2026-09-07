@@ -269,7 +269,7 @@ func dpopNotifContext(t *testing.T, endpoint string) *notificationContext {
 		endpoint:    endpoint,
 		accessToken: "tok-dpop",
 		tokenType:   "DPoP",
-		dpopKey:     key,
+		dpopSigner:  &localDPoPSigner{key: key},
 		expiresAt:   time.Now().Add(time.Minute),
 	}
 }
