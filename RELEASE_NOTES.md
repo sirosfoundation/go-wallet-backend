@@ -7,6 +7,10 @@
 <!-- release-notes:v0.18.4:start -->
 ## [v0.18.4] - 2026-09-07
 
+**This is the first usable release of the 0.18 line.** v0.18.1 does not
+build, v0.18.2 rejects every WebAuthn sign-up and login, and v0.18.3 was
+tagged on the wrong commit. Deployments on v0.17.0 should move straight here.
+
 ### Fixed
 
 - WebAuthn registration and login now accept PRF (Pseudo-Random Function) extension outputs from clients. After the go-webauthn 0.18 upgrade, both flows were rejecting credentials when clients returned PRF outputs that the backend hadn't explicitly requested, breaking sign-up and authentication for wallets that use client-side PRF salts (#312)
@@ -15,12 +19,20 @@
 <!-- release-notes:v0.18.3:start -->
 ## [v0.18.3] - 2026-09-06
 
+> **Broken release - use v0.18.4.** This tag was created on the wrong commit
+> and contains the same code as v0.18.2, including the WebAuthn sign-up and
+> login failure fixed in v0.18.4. No container image was published for it.
+
 ### Changed
 - Updated release notes documentation for v0.18.2 (#311)
 <!-- release-notes:v0.18.3:end -->
 
 <!-- release-notes:v0.18.2:start -->
 ## [v0.18.2] - 2026-09-06
+
+> **Do not deploy - use v0.18.4.** WebAuthn sign-up and login fail on this
+> release with `Client returned the "prf" extension output which was not
+> requested`; v0.18.4 fixes it and delivers everything listed here.
 
 **Use this instead of v0.18.1.** v0.18.1 does not compile and produced no
 container image; everything it lists is delivered here.
