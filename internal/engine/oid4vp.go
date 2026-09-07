@@ -1544,7 +1544,7 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 				return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
 			}
 		}
-		h.Logger.Info("direct_post.jwt: inferred encryption algorithm from key material",
+		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
 			zap.String("alg", encAlg),
 			zap.String("verifier", authReq.ClientID))
 	}
