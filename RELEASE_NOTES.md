@@ -4,6 +4,14 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.18.4:start -->
+## [v0.18.4] - 2026-09-07
+
+### Fixed
+
+- WebAuthn registration and login now accept PRF (Pseudo-Random Function) extension outputs from clients. After the go-webauthn 0.18 upgrade, both flows were rejecting credentials when clients returned PRF outputs that the backend hadn't explicitly requested, breaking sign-up and authentication for wallets that use client-side PRF salts (#312)
+<!-- release-notes:v0.18.4:end -->
+
 <!-- release-notes:v0.18.3:start -->
 ## [v0.18.3] - 2026-09-06
 
