@@ -114,7 +114,17 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	// matters for FIDO MDS3-based trust-anchor lookup, which this v1
 	// doesn't use; we do the trust-anchor check ourselves next, exactly
 	// like NativeAttestationService.verifyAppleAppAttest does for x5c.
-	if err := attObj.VerifyAttestation(req.ClientDataHash, nil); err != nil {
+	//
+	// go-webauthn 0.18 turned the BER tolerance into an explicit Relying Party
+	// choice whose default is the conforming DER-only behaviour, so it has to
+	// be selected here: taking the zero value would silently drop support for
+	// exactly the authenticators the paragraph above says this depends on. The
+	// library rightly calls the relaxation insecure - it makes a signature's
+	// encoding malleable - and it is chosen deliberately because YubiKey
+	// firmware 5.8 is a population we have to accept.
+	policy := protocol.AttestationPolicy{}
+	signature := protocol.SignaturePolicy{ECDSAEncoding: protocol.ECDSASignatureEncodingBER}
+	if err := attObj.VerifyAttestation(req.ClientDataHash, nil, policy, signature); err != nil {
 		return fmt.Errorf("%w: attestation signature: %v", ErrFIDO2AttestationInvalid, err)
 	}
 

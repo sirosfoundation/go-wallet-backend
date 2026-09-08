@@ -355,9 +355,13 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		claims["certification"] = normalized.Certification
 	}
 
-	// No `key_storage_status`: this wallet provider does not implement
-	// KA/WIA revocation-chaining. See AttestationConfig's type-level comment
-	// for the design rationale (short KA/WIA lifetime instead).
+	// key_storage_status: KA revocation reference (CS-04 §7.1.3, TS-03
+	// clause 2.3.2). Required on every KA by CS-04 — a conformant PID/EAA
+	// Provider rejects one without it. Indexed by keystore tier (CS-04
+	// §7.2.3 Option 1, type-shared); see kaStatusIndex and StatusListConfig.
+	if kss := statusClaim(s.cfg, kaStatusIndex(normalized.KeyStorage), now); kss != nil {
+		claims["key_storage_status"] = kss
+	}
 
 	// Create the token with ES256 and x5c header.
 	//
@@ -504,6 +508,18 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.KeyStorage = []string{"iso_18045_basic"}
 	}
 	out.UserAuthentication = mapDistinct(secProps.UserAuthentication, true)
+	// CS-04 §7.1.3 requires user_authentication and certification on every
+	// KA, so the trusted path needs the same floor the untrusted one gets:
+	// a client that asserted "none" (dropped by mapDistinct's omitIfNone)
+	// or omitted the field entirely must not produce a KA missing the
+	// claim. The floor value is the weakest in the vocabulary, so flooring
+	// never overstates what the client claimed.
+	if len(out.UserAuthentication) == 0 {
+		out.UserAuthentication = []string{"iso_18045_basic"}
+	}
+	if out.Certification == nil {
+		out.Certification = "none"
+	}
 	return out
 }
 

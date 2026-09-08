@@ -4,6 +4,124 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.19.0:start -->
+## [v0.19.0] - 2026-09-07
+
+### Fixed
+- OID4VP request encryption now respects the `alg` header specified in the verifier's JWK instead of always inferring it from the key material, preventing validation failures when the verifier checks the returned `vp_token` (#315)
+<!-- release-notes:v0.19.0:end -->
+
+<!-- release-notes:v0.18.4:start -->
+## [v0.18.4] - 2026-09-07
+
+**This is the first usable release of the 0.18 line.** v0.18.1 does not
+build, v0.18.2 rejects every WebAuthn sign-up and login, and v0.18.3 was
+tagged on the wrong commit. Deployments on v0.17.0 should move straight here.
+
+### Fixed
+
+- WebAuthn registration and login now accept PRF (Pseudo-Random Function) extension outputs from clients. After the go-webauthn 0.18 upgrade, both flows were rejecting credentials when clients returned PRF outputs that the backend hadn't explicitly requested, breaking sign-up and authentication for wallets that use client-side PRF salts (#312)
+<!-- release-notes:v0.18.4:end -->
+
+<!-- release-notes:v0.18.3:start -->
+## [v0.18.3] - 2026-09-06
+
+> **Broken release - use v0.18.4.** This tag was created on the wrong commit
+> and contains the same code as v0.18.2, including the WebAuthn sign-up and
+> login failure fixed in v0.18.4. No container image was published for it.
+
+### Changed
+- Updated release notes documentation for v0.18.2 (#311)
+<!-- release-notes:v0.18.3:end -->
+
+<!-- release-notes:v0.18.2:start -->
+## [v0.18.2] - 2026-09-06
+
+> **Do not deploy - use v0.18.4.** WebAuthn sign-up and login fail on this
+> release with `Client returned the "prf" extension output which was not
+> requested`; v0.18.4 fixes it and delivers everything listed here.
+
+**Use this instead of v0.18.1.** v0.18.1 does not compile and produced no
+container image; everything it lists is delivered here.
+
+### Fixed
+
+- Restored compilation against go-webauthn 0.18 by updating the `VerifyAttestation` call site to pass the two new policy arguments required by the library's API change. The signature policy explicitly selects BER encoding tolerance to maintain support for YubiKey firmware 5.8's non-minimally-encoded ECDSA signatures, which would otherwise be rejected by 0.18's stricter DER-only default (#310)
+<!-- release-notes:v0.18.2:end -->
+
+<!-- release-notes:v0.18.1:start -->
+## [v0.18.1] - 2026-09-06
+
+> **Broken release - use v0.18.2.** The go-webauthn 0.18.0 bump below changed
+> an API whose call site was not updated, so this tag does not build and no
+> image was published for it.
+
+### Fixed
+
+- Increased signing timeout from 30 seconds to 3 minutes to accommodate zero-knowledge proof operations on slower devices (#300)
+- `-mode all` now starts every role. It expanded to a hardcoded list of five, silently omitting `storage` and `wallet-provider`, so a deployment that asked for every role was not running those two; it now expands to `ValidRoles`. The `-mode` help text also lists every role rather than three (#290)
+
+### Changed
+
+- Updated dependencies: go-webauthn/webauthn to v0.18.0 (adds Post-Quantum Cryptography support), golang.org/x/crypto, and getkin/kin-openapi (#308)
+<!-- release-notes:v0.18.1:end -->
+
+<!-- release-notes:v0.18.0:start -->
+## [v0.18.0] - 2026-09-06
+
+### Added
+- Issuer entitlement verification implementing ARF v3.0.0 §6.6.2.3 and CIR (EU) 2025/848 requirements. The `/v1/resolve` endpoint now evaluates an issuer's access certificate (WRPAC) and registration certificate (WRPRC) to determine whether the issuer is entitled to issue what it offers, returning an `issuer_entitlement` decision alongside metadata. Controlled by `ISSUER_ENTITLEMENT_MODE` environment variable (`warn` by default, `fail`, or `off`). The default `warn` mode logs violations without blocking issuance, reflecting the 24-month grace period before ARF registration obligations take effect. (#306)
+<!-- release-notes:v0.18.0:end -->
+
+<!-- release-notes:v0.17.0:start -->
+## [v0.17.0] - 2026-09-04
+
+### Added
+
+**The engine now asks the client for its Wallet Instance Attestation at the point where it can actually be built** (#304). The per-flow `OAuth-Client-Attestation-PoP` has to name the issuer's authorization server as its `aud`, and that server is only known after the credential offer and issuer metadata have been resolved. A browser wallet cannot resolve a cross-origin `credential_offer_uri` itself, so it could never compute the audience before starting the flow; the native SDKs only managed it by duplicating the backend's discovery on the device.
+
+The OID4VCI engine therefore sends a new `sign_request` action, `request_attestation`, right after metadata resolution whenever FlowStart did not already carry `client_attestation` and `client_attestation_pop`. Its params are `audience` (the authorization server URL, for the PoP `aud`) and `issuer` (the effective `client_id`, for the PoP `iss`); the client answers with `client_attestation` and `client_attestation_pop` in its `sign_response`, or with neither to proceed without attestation. Attestation supplied up front on FlowStart is still honoured and takes precedence. The instance key never leaves the client.
+
+**Client compatibility.** A client that predates this action does not answer the request. The engine waits at most 10 seconds for it (not the general 30 second signing timeout) and then continues without attestation, so older wallet-frontend and SDK builds keep working with a one-off delay per issuance until they are updated. The companion changes are wallet-frontend#196, siros-sdk-kotlin#154 and siros-sdk-swift#122; the follow-ups that drop the SDKs' own discovery (siros-sdk-kotlin#155, siros-sdk-swift#123) must not ship before this release is deployed.
+<!-- release-notes:v0.17.0:end -->
+
+<!-- release-notes:v0.16.0:start -->
+## [v0.16.0] - 2026-09-02
+
+### Fixed
+
+**Wallet Unit Attestations now carry the status claims CS-04 requires** (#302). The WIA was missing `client_status` and the Key Attestation was missing `key_storage_status`, both mandated by WE BUILD CS-04 §7.1.2/§7.1.3 (TS-03 clauses 2.3.1/2.3.2). A conformant PID or Attestation Provider rejects a WUA without them, which is exactly what the WE BUILD ITB testbed did: `invalid_proof: WUA signature verification failed: Key Attestation missing required key_storage_status`. Take this release before any interop run against a CS-04-conformant issuer.
+
+The claims were removed in v0.13.0 (#261) on the grounds that this wallet provider implements no revocation-chaining. That reasoning still holds — short attestation lifetimes, not a revocation list, are what bound exposure here — but it conflated *not revoking through a status list* with *being allowed to omit the claims that reference one*. Both now reference the wallet provider's own Token Status List, which is served all-VALID and never has a bit set; the config comments and `docs/wallet-instance-attestation.md` say so plainly rather than implying a revocation capability that isn't there. KA indices follow CS-04 §7.2.3 Option 1 (type-shared, one per keystore tier), and a mixed batch is indexed by its weakest tier so an issuer is never told the batch is better protected than it is.
+
+A deployment that would rather advertise no revocation mechanism than an inert one can set `wallet_provider.attestation.status_list.enabled: false` and go back to omitting the claims, at the cost of CS-04 conformance. The reference URI defaults to `<server.base_url>/wallet-provider/status-list`, and the maintenance `exp` defaults to 45 days — deliberately not the 31-day floor, since CS-04 §7.2.2 requires those 31 days to still be *remaining* at presentation, not at issuance.
+
+- The Key Attestation also emitted no `key_storage`, `user_authentication` or `certification` at all when the client omitted `security_properties`, and could still drop `user_authentication` for a *trusted* client that reported `"none"`. All three are required on every KA, so each now falls back to the weakest value in the ISO 18045 vocabulary rather than being left absent — a floor never overstates what the client claimed. (#302, with fixes from @Didr)
+<!-- release-notes:v0.16.0:end -->
+
+<!-- release-notes:v0.15.2:start -->
+## [v0.15.2] - 2026-08-31
+
+### Fixed
+- OID4VP presentation requests using `client_id_scheme=x509_hash` are now accepted. Previously the wallet rejected all such requests with "Invalid message format" because the scheme was missing from the allowlist, breaking interoperability with verifiers like NIST's OpenID4VP reference implementation. (#298)
+<!-- release-notes:v0.15.2:end -->
+
+<!-- release-notes:v0.15.1:start -->
+## [v0.15.1] - 2026-08-30
+
+### Fixed
+
+- Fixed OID4VP presentation flows incorrectly reporting "Could not parse credential offer" (an issuance error) when the actual failure was fetching or parsing the presentation request from a verifier's `request_uri`. Now returns a distinct "Could not parse the presentation request" error code. Also logs the response body (capped, at Debug level) when a `request_uri` fetch fails, making it possible to distinguish expired verifier sessions from network errors without reproducing the failure separately (#294)
+- Fixed mdoc issuance flows being blocked with 403 errors during issuer-trust evaluation. The authorization proxy's allowlist included `mdoc-reader-auth` (for presentation) but was missing the issuer-side mirror `mdoc-issuer-auth`, causing all VICAL issuer-trust queries to be denied before reaching the policy decision point regardless of issuer identity (#296)
+- Fixed `--mode registry` panicking on startup when CORS origins list is empty. Now handles empty configuration gracefully and warns when wildcard CORS is combined with `AllowCredentials` (#292)
+
+### Changed
+
+- Updated to go-trust v0.16.0, which adds support for loading additional trusted roots via YAML configuration (#288)
+- Updated Go runtime to 1.27 stable (#287)
+- Updated dependency group including testify, cbor, and kin-openapi (#288)
+<!-- release-notes:v0.15.1:end -->
+
 <!-- release-notes:v0.15.0:start -->
 ## [v0.15.0] - 2026-08-24
 

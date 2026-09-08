@@ -581,6 +581,60 @@ func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Re
 	return h.attestationProvider.SetHeaders(ctx, req)
 }
 
+// attestationRequestTimeout bounds how long requestClientAttestation waits for
+// the client's sign_response. Shorter than Session.RequestSign's 30s default
+// because this step is best-effort and, unlike proof/presentation signing,
+// involves no user interaction: the client only fetches its WIA and signs a
+// PoP. A package var rather than a const so tests can shorten it.
+var attestationRequestTimeout = 10 * time.Second
+
+// requestClientAttestation asks the client to supply a Wallet Instance
+// Attestation (WIA) and matching PoP, then wires up h.attestationProvider so
+// the PAR/token request carries OAuth-Client-Attestation[-PoP] headers
+// (draft-ietf-oauth-attestation-based-client-auth §3.1).
+//
+// It runs here because the PoP audience (h.authServerIssuer) is only known
+// after metadata fetch. The client signs the PoP locally; its instance key
+// never reaches the backend.
+//
+// Any failure leaves h.attestationProvider unchanged and the flow proceeds without
+// client attestation (falling back to private_key_jwt or client_id when
+// configured); an issuer that requires attestation rejects on its own.
+func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
+	// Skip entirely if the context is already done
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	// Bound the wait: a client that predates SignActionRequestAttestation
+	// never answers, and Session.RequestSign's default 30s would stall every
+	// such issuance before falling back to other client auth.
+	ctx, cancel := context.WithTimeout(ctx, attestationRequestTimeout)
+	defer cancel()
+	resp, err := h.RequestSign(ctx, SignActionRequestAttestation, SignRequestParams{
+		Audience: h.authServerIssuer, // PoP aud = the AS the token request is sent to
+		Issuer:   h.clientID,         // WIA sub / PoP iss = this flow's effective client_id
+	})
+	if err != nil {
+		h.Logger.Debug("client attestation request skipped",
+			zap.String("client_id", h.clientID),
+			zap.Error(err))
+		return
+	}
+	if resp.ClientAttestation == "" || resp.ClientAttestationPoP == "" {
+		h.Logger.Debug("client returned no attestation; proceeding without",
+			zap.String("client_id", h.clientID))
+		return
+	}
+	h.attestationProvider = &TransportSuppliedAttestation{
+		WIA: resp.ClientAttestation,
+		PoP: resp.ClientAttestationPoP,
+		ID:  h.clientID,
+	}
+	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
+		zap.String("auth_server_issuer", h.authServerIssuer),
+		zap.String("client_id", h.clientID))
+}
+
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
 type OAuthError struct {
 	Error            string `json:"error"`
@@ -726,6 +780,12 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// PRF-encrypted storage, iOS Secure Enclave, Android StrongBox/TEE, or a
 	// remote HSM via R2PS — see domain.WSCDType) and signs the PoP locally.
 	// The backend simply forwards the client-supplied WIA + PoP as HTTP headers.
+	//
+	// Two ways the WIA arrives, in priority order:
+	//  1. Supplied up front on FlowStartMessage (a client that already resolved
+	//     the offer/AS itself). Preferred when present.
+	//  2. Engine-requested here via SignActionRequestAttestation.
+	//     Best-effort / Tier 3.
 	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
 		h.attestationProvider = &TransportSuppliedAttestation{
 			WIA: msg.ClientAttestation,
@@ -736,6 +796,8 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			zap.String("issuer", offer.CredentialIssuer),
 			zap.String("client_id", h.clientID),
 		)
+	} else {
+		h.requestClientAttestation(ctx)
 	}
 
 	// Step 3: Evaluate trust
