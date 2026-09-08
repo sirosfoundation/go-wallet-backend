@@ -53,6 +53,15 @@ type WebAuthnService struct {
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
 var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
 
+// ErrWalletInstanceSuspended and ErrWalletInstanceRevoked refuse a login whose
+// passkey belongs to a suspended or revoked wallet instance, or whose wallet
+// has been deactivated (every instance revoked) - SID-AUTH-06 login gate, see
+// checkWalletLifecycle and WalletLifecycleService.
+var (
+	ErrWalletInstanceSuspended = errors.New("wallet instance suspended")
+	ErrWalletInstanceRevoked   = errors.New("wallet instance revoked")
+)
+
 // NewWebAuthnService creates a new WebAuthnService
 func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Logger) (*WebAuthnService, error) {
 	return NewWebAuthnServiceWithValidator(store, cfg, logger, nil)
@@ -1074,6 +1083,14 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
+	// SID-AUTH-06 login gate: a suspended or revoked wallet instance must not
+	// be able to log in, and a deactivated wallet (all instances revoked) must
+	// require a fresh enrollment. Checked only after the assertion verified,
+	// so an attacker cannot probe lifecycle state with a forged assertion.
+	if err := s.checkWalletLifecycle(ctx, tenantID, userID, matchedCred.ID); err != nil {
+		return nil, err
+	}
+
 	// Update the credential's signature count
 	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
 	user.UpdatedAt = time.Now()
@@ -1757,4 +1774,46 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 		}
 	}
 	return creds
+}
+
+// checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).
+//
+// Two rules. The instance linked to this passkey (WalletInstance.CredentialID,
+// recorded when the wallet supplies credential_id at WIA generation) must be
+// active. And if the user has instances at all, at least one must be
+// non-revoked: when every instance is revoked the wallet has been deactivated
+// and WalletLifecycleService already erased its data, so every passkey of the
+// user is refused until a new enrollment. A suspended instance that is not
+// linked to this passkey does not block login - it is still blocked from
+// obtaining a WIA (WIAService), and the user must be able to log in from
+// another device to manage it. A user with no instances yet is unaffected.
+func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID string) error {
+	instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	anyLive := false
+	for _, inst := range instances {
+		if inst.CredentialID != "" && inst.CredentialID == credentialID {
+			switch inst.Status {
+			case domain.InstanceStatusSuspended:
+				return ErrWalletInstanceSuspended
+			case domain.InstanceStatusRevoked:
+				return ErrWalletInstanceRevoked
+			}
+		}
+		if inst.Status != domain.InstanceStatusRevoked {
+			anyLive = true
+		}
+	}
+	if !anyLive {
+		return ErrWalletInstanceRevoked
+	}
+	return nil
 }

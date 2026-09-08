@@ -45,6 +45,9 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	if instance.DeviceInfo != nil {
 		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
 	}
+	if instance.CredentialID != "" {
+		update["$set"].(bson.M)["credential_id"] = instance.CredentialID
+	}
 
 	opts := options.Update().SetUpsert(true)
 	_, err := s.collection.UpdateOne(ctx, filter, update, opts)

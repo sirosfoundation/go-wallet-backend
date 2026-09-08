@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
@@ -87,6 +88,25 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 	status := domain.InstanceStatus(req.Status)
 	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition", "current": string(instance.Status), "target": string(status)})
+		return
+	}
+
+	if h.lifecycle != nil {
+		// Shared lifecycle service: same transition rules, audit and cascade
+		// (session drop, wallet erasure on last revocation) as self-service.
+		if _, err := h.lifecycle.ChangeStatus(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, instanceID, status, req.Reason); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrNotFound):
+				c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			case errors.Is(err, domain.ErrInvalidStatusTransition):
+				c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition"})
+			default:
+				h.logger.Error("failed to update wallet instance status", zap.Error(err))
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"id": instanceID, "status": req.Status})
 		return
 	}
 

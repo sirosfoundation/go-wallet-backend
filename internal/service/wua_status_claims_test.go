@@ -173,7 +173,7 @@ func TestWIAService_ClientStatus(t *testing.T) {
 	svc.cfg.Server.BaseURL = "https://wp.example.com/"
 	enableStatusList(svc.cfg, "")
 
-	wia, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "test-jkt", "tenant", nil, "backend_attested", "client-id")
+	wia, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "test-jkt", "tenant", nil, "backend_attested", "client-id", "")
 	if err != nil {
 		t.Fatalf("signWIA: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestWIAService_ClientStatusDisabled(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.Server.BaseURL = "https://wp.example.com"
 
-	wia, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "test-jkt", "tenant", nil, "backend_attested", "client-id")
+	wia, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "test-jkt", "tenant", nil, "backend_attested", "client-id", "")
 	if err != nil {
 		t.Fatalf("signWIA: %v", err)
 	}

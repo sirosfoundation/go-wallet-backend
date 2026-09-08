@@ -149,6 +149,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
+			// Wallet instance lifecycle, self-service (SID-AUTH-06)
+			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ListMyWalletInstances)
+			session.PUT("/instances/:instance_id/status", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateMyWalletInstanceStatus)
+			session.POST("/instances/revoke-all", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.RevokeAllMyWalletInstances)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
@@ -642,6 +646,10 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	if svcs := p.Services(); svcs != nil {
+		// Admin status changes share the self-service cascade (SID-AUTH-06).
+		adminHandlers.SetLifecycle(svcs.WalletLifecycle)
+	}
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the

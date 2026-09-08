@@ -143,6 +143,55 @@ Finish WebAuthn registration.
 
 ---
 
+#### Wallet instance lifecycle (SID-AUTH-06)
+
+A wallet instance is one wallet installation, identified by the JWK thumbprint of
+its instance key and registered when it first obtains a Wallet Instance
+Attestation. A user can inspect and manage their own instances; a provider
+manages them through the admin API (`/admin/tenants/{id}/instances`). Both paths
+share one lifecycle: `active` → `suspended` (reversible) or `revoked`
+(terminal), `suspended` → `active` or `revoked`. Any change away from `active`
+drops the user's live sessions and refuses new WIAs for that instance. Login with
+the passkey linked to a suspended or revoked instance is refused with `403
+WALLET_SUSPENDED` / `WALLET_REVOKED`. Revoking the last non-revoked instance
+deactivates the wallet: the encrypted private data, server-side credentials,
+presentations and pending challenges are erased, every passkey of the user is
+refused at login, and a new enrollment is required.
+
+The passkey link is recorded when the wallet passes its passkey's base64url
+credential id as `credential_id` to `POST /wallet-provider/wia/generate`.
+
+##### GET /user/session/instances
+
+List the caller's wallet instances in the current tenant.
+
+**Response:**
+```json
+{ "instances": [ { "id": "<jkt>", "status": "active", "wscd_type": "native_android", "last_attested_at": "..." } ] }
+```
+
+##### PUT /user/session/instances/{instance_id}/status
+
+Change the status of one of the caller's instances.
+
+**Request:**
+```json
+{ "status": "suspended", "reason": "lost phone" }
+```
+
+**Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `404` if the instance
+is not the caller's; `409` for an invalid transition (e.g. reactivating a
+revoked instance).
+
+##### POST /user/session/instances/revoke-all
+
+Deactivate the wallet: revoke every instance of the caller and erase the wallet
+data.
+
+**Request (optional):** `{ "reason": "device stolen" }`
+
+**Response:** `200 {"revoked": 2}`
+
 ### Credential Management
 
 All credential endpoints require authentication.
