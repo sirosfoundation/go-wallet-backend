@@ -15,7 +15,7 @@ package statuslist
 
 import (
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"encoding/base64"
 	"fmt"
 )
@@ -34,9 +34,9 @@ func EmptyCompressedList(n int) (string, error) {
 	raw := make([]byte, (n+7)/8)
 
 	var buf bytes.Buffer
-	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	w, err := zlib.NewWriterLevel(&buf, zlib.BestCompression)
 	if err != nil {
-		return "", fmt.Errorf("create deflate writer: %w", err)
+		return "", fmt.Errorf("create zlib writer: %w", err)
 	}
 	if _, err := w.Write(raw); err != nil {
 		return "", fmt.Errorf("compress status list: %w", err)
