@@ -21,7 +21,7 @@ import (
 )
 
 // EmptyCompressedList returns the base64url-encoded (no padding), raw
-// DEFLATE-compressed (RFC 1951) byte array for a 1-bit-per-status list of
+// ZLIB-compressed byte array for a 1-bit-per-status list of
 // size n, with every status set to 0 (VALID) — the `lst` value of a Token
 // Status List's `status_list` claim.
 func EmptyCompressedList(n int) (string, error) {
