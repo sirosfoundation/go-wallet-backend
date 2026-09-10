@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,8 +45,11 @@ type notificationContext struct {
 	endpoint    string
 	accessToken string
 	tokenType   string
-	dpopKey     *ecdsa.PrivateKey
-	dpopNonce   string
+	// dpopSigner signs the DPoP proof when the issuance token was DPoP-bound:
+	// the engine-held key in legacy mode, or a client-held signer that asks
+	// the client over the still-open session (see clientHeldDPoPSigner).
+	dpopSigner dpopProofSigner
+	dpopNonce  string
 	// notificationID is the value the issuer returned for this Credential
 	// Response. Per OID4VCI §8.3/§11 there is exactly one notification_id per
 	// response (covering one or more credentials), so the client-supplied ID
@@ -164,8 +166,8 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 		}
 		req.Header.Set("Content-Type", "application/json")
 		setNotificationAuthHeader(req, nc)
-		if nc.dpopKey != nil && strings.EqualFold(nc.tokenType, "DPoP") {
-			proof, err := createDPoPProof(nc.dpopKey, req.Method, nc.endpoint, nc.accessToken, dpopNonce)
+		if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
+			proof, err := nc.dpopSigner.Proof(ctx, req.Method, nc.endpoint, nc.accessToken, dpopNonce)
 			if err != nil {
 				return fmt.Errorf("failed to create DPoP proof for notification: %w", err)
 			}

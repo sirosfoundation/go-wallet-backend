@@ -177,6 +177,15 @@ const (
 	SignActionGenerateProof      SignAction = "generate_proof"
 	SignActionSignPresentation   SignAction = "sign_presentation"
 	SignActionRequestAttestation SignAction = "request_attestation"
+	// SignActionSignClientAuth asks the client to authenticate one outbound
+	// request with its own key: a DPoP proof (RFC 9449) when htm/htu are set,
+	// and a WIA + fresh attestation PoP when audience is set. The client
+	// holds the key that is both the WIA cnf key and the DPoP key, so the
+	// engine never sees a DPoP private key (go-wallet-backend#317). A client
+	// that supports the action always returns dpop_key_id; an empty response
+	// means it does not, and the engine falls back to its own DPoP key plus
+	// a single SignActionRequestAttestation.
+	SignActionSignClientAuth SignAction = "sign_client_auth"
 )
 
 // Message is the base message envelope for all WebSocket messages
@@ -249,6 +258,13 @@ type FlowStartMessage struct {
 	// never persists this key itself; the client (via privatedata) is the
 	// only durable custodian - see feedback_backend_key_persistence_principle.
 	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID, when set on a renewal request, is the identifier the client
+	// returned at FlowCompleteMessage.DPoPKeyID for the flow that issued
+	// RefreshToken: the client-held key the token is bound to. The engine
+	// passes it back as SignRequestParams.KeyID on every
+	// SignActionSignClientAuth of the renewal so the client signs with that
+	// same key. Takes precedence over DPoPJWK.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -300,6 +316,13 @@ type FlowCompleteMessage struct {
 	// for the current flow and never persists it; relaying it here makes
 	// the client (via privatedata) the sole durable custodian.
 	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID is the client-chosen identifier of the client-held key this
+	// flow used for DPoP (SignActionSignClientAuth), present only alongside
+	// RefreshToken and only when the flow ran in client-held mode, in which
+	// case DPoPJWK is absent because the engine never had the private key.
+	// The client stores it with RefreshToken and presents it back as
+	// FlowStartMessage.DPoPKeyID on renewal.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -393,6 +416,20 @@ type SignRequestParams struct {
 	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
+	// DPoP proof over that HTTP method and URL; DPoPNonce is the
+	// server-provided DPoP nonce to include (RFC 9449 §8), ATH the
+	// base64url(SHA-256(access_token)) claim for resource requests (empty
+	// for the token endpoint). KeyID, when set (a renewal), names the key
+	// the client returned as dpop_key_id at the original issuance and must
+	// sign with again. Audience and Issuer double as the attestation PoP
+	// aud/iss when the request also needs client attestation.
+	HTM       string `json:"htm,omitempty"`
+	HTU       string `json:"htu,omitempty"`
+	DPoPNonce string `json:"dpop_nonce,omitempty"`
+	ATH       string `json:"ath,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
 }
 
 // CredentialRef references a credential for signing
@@ -424,6 +461,15 @@ type SignResponseMessage struct {
 	// could not attest - the flow proceeds without wallet attestation (Tier 3).
 	ClientAttestation    string `json:"client_attestation,omitempty"`
 	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
+	// DPoPKeyID and DPoPProof answer a SignActionSignClientAuth request.
+	// DPoPKeyID is the client's opaque identifier for the key it uses for
+	// DPoP in this flow and is set whenever the client supports the action,
+	// even when no proof was asked for; empty means unsupported. DPoPProof is
+	// the DPoP proof JWT when htm/htu were given. ClientAttestation and
+	// ClientAttestationPoP carry the WIA and a fresh PoP when audience was
+	// given.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+	DPoPProof string `json:"dpop_proof,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.
