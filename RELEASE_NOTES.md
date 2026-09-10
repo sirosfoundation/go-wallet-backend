@@ -4,6 +4,21 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.20.0:start -->
+## [v0.20.0] - 2026-09-10
+
+### Added
+- **Client-held DPoP keys**: New `sign_client_auth` action allows clients to hold their own DPoP private keys instead of the engine generating them. For each authenticated request, the engine now requests fresh signatures (DPoP proofs and wallet attestation PoPs) from the client with request-specific parameters. This ensures `cnf == DPoP key` because clients use one key for both, and eliminates replay of stale attestations. (#318)
+- **Automatic mode detection**: The engine probes clients at the first authenticated request and adapts per-flow—client-held mode if the client answers `sign_client_auth`, legacy mode (engine-generated keys) if the client doesn't respond or times out. Pre-resolved attestations or renewals with `dpop_jwk` skip the probe and use legacy mode. (#318)
+
+### Changed
+- **Renewal flow**: in client-held mode `flow_complete` returns `dpop_key_id` instead of the private `dpop_jwk`, and a renewal `flow_start` sends `dpop_key_id` back so the engine asks the client to sign with the key the refresh token is bound to. `dpop_jwk` keeps working for tokens issued by older backends. (#318)
+- **Notification endpoint**: DPoP-bound notifications now work in both client-held and legacy modes after flow completion by abstracting the signing mechanism. (#318)
+
+### Fixed
+- **Documentation**: The WebSocket protocol spec now documents `sign_client_auth`, `request_attestation`, and renewal fields that were previously undocumented. (#318)
+<!-- release-notes:v0.20.0:end -->
+
 <!-- release-notes:v0.19.0:start -->
 ## [v0.19.0] - 2026-09-07
 
