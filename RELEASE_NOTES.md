@@ -12,7 +12,7 @@
 - **Automatic mode detection**: The engine probes clients at the first authenticated request and adapts per-flow—client-held mode if the client answers `sign_client_auth`, legacy mode (engine-generated keys) if the client doesn't respond or times out. Pre-resolved attestations or renewals with `dpop_jwk` skip the probe and use legacy mode. (#318)
 
 ### Changed
-- **Renewal flow**: `flow_complete` now returns `dpop_key_id` (client-held mode) instead of `dpop_jwk`, and `flow_start` accepts `dpop_key_id` to resume flows with client-held keys. (#318)
+- **Renewal flow**: in client-held mode `flow_complete` returns `dpop_key_id` instead of the private `dpop_jwk`, and a renewal `flow_start` sends `dpop_key_id` back so the engine asks the client to sign with the key the refresh token is bound to. `dpop_jwk` keeps working for tokens issued by older backends. (#318)
 - **Notification endpoint**: DPoP-bound notifications now work in both client-held and legacy modes after flow completion by abstracting the signing mechanism. (#318)
 
 ### Fixed
