@@ -272,3 +272,38 @@ func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
 		t.Errorf("deactivation_reason should be empty, got %q", got.DeactivationReason)
 	}
 }
+
+func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	inst := &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}
+	if err := store.WalletInstances().Upsert(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", domain.InstanceStatusSuspended, "x"); err != nil {
+		t.Fatal(err)
+	}
+	// A later attestation that now names the passkey records the link but
+	// must not reactivate the instance.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-1"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.WalletInstances().GetByID(ctx, "inst-cred")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CredentialID != "pk-1" {
+		t.Errorf("credential id not recorded: %q", got.CredentialID)
+	}
+	if got.Status != domain.InstanceStatusSuspended {
+		t.Errorf("status must be untouched by upsert, got %s", got.Status)
+	}
+	// An attestation without the id keeps the recorded link.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.WalletInstances().GetByID(ctx, "inst-cred")
+	if got.CredentialID != "pk-1" {
+		t.Errorf("credential id must persist, got %q", got.CredentialID)
+	}
+}

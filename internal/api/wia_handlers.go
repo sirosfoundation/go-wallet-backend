@@ -60,6 +60,10 @@ type WIAGenerateRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID is the base64url WebAuthn credential id of the passkey this
+	// wallet instance logs in with, so that suspending or revoking the instance
+	// also refuses login with that passkey (SID-AUTH-06). Optional.
+	CredentialID string `json:"credential_id,omitempty"`
 }
 
 // WIAGenerate handles POST /wallet-provider/wia/generate
@@ -93,6 +97,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		Challenge:         req.Challenge,
 		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
+		CredentialID:      req.CredentialID,
 	})
 	if err != nil {
 		switch {

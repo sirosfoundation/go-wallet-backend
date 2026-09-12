@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
@@ -369,5 +370,49 @@ func TestDeleteWalletInstance_WithAudit(t *testing.T) {
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// With the shared lifecycle service wired (as BackendProvider does), an admin
+// revocation of the user's last instance runs the SID-AUTH-06 cascade.
+func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), testAuditEmitter(t))
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	userID := domain.NewUserID()
+	if err := store.Users().Create(context.Background(), &domain.User{UUID: userID, PrivateData: []byte("vault")}); err != nil {
+		t.Fatal(err)
+	}
+	seedInstance(t, h, "inst-1", "acme", &userID)
+
+	r := gin.New()
+	r.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"revoked","reason":"compromised"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", w.Code, w.Body.String())
+	}
+	inst, err := store.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil || inst.Status != domain.InstanceStatusRevoked {
+		t.Fatalf("expected revoked, got %v %v", err, inst)
+	}
+	user, err := store.Users().GetByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.PrivateData != nil {
+		t.Errorf("revoking the last instance must erase the wallet's private data")
+	}
+
+	// Revoked is terminal, also via the lifecycle path.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"active"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
 	}
 }

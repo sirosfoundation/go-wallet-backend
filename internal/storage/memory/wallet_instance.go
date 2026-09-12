@@ -33,6 +33,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		if instance.DeviceInfo != nil {
 			existing.DeviceInfo = instance.DeviceInfo
 		}
+		if instance.CredentialID != "" {
+			existing.CredentialID = instance.CredentialID
+		}
 	} else {
 		instance.AttestationCount = 1
 		if instance.CreatedAt.IsZero() {

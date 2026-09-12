@@ -276,6 +276,12 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID, when provided, is the base64url WebAuthn credential id of
+	// the passkey this wallet instance logs in with. Recorded as
+	// WalletInstance.CredentialID so suspending or revoking the instance also
+	// refuses login with that passkey (SID-AUTH-06). Optional: without it the
+	// login gate still enforces whole-wallet deactivation.
+	CredentialID string `json:"credential_id,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -358,7 +364,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -457,7 +463,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string) (string, error) {
 	now := time.Now()
 
 	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
@@ -601,6 +607,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			TenantID:          tenantID,
 			UserID:            userID,
 			Status:            domain.InstanceStatusActive,
+			CredentialID:      credentialID,
 			WSCDType:          wscdTypeFromAttestation(attestationSource),
 			AttestationSource: attestationSource,
 			LastAttestedAt:    now,

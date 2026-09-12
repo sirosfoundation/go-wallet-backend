@@ -175,6 +175,31 @@ func TestPasskeyLoginFinish_AuthError(t *testing.T) {
 	}
 }
 
+// SID-AUTH-06: a suspended or revoked wallet instance is a distinct 403 with a
+// stable code, not the generic 401, so the client can explain instead of retry.
+func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED"},
+		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED"},
+	} {
+		router, _ := setupPasskeyHandlers(&mockWebAuthn{finishLoginErr: tc.err})
+		body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s: expected 403, got %d", tc.code, w.Code)
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(tc.code)) {
+			t.Errorf("expected body to carry %s, got %s", tc.code, w.Body.String())
+		}
+	}
+}
+
 func TestPasskeyLoginFinish_BadRequest(t *testing.T) {
 	mock := &mockWebAuthn{}
 	router, _ := setupPasskeyHandlers(mock)

@@ -247,9 +247,12 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 
-		// Wire session store into UserService so DeleteUser purges active sessions
+		// Wire session store into UserService so DeleteUser purges active sessions,
+		// and into the wallet lifecycle service so suspending or revoking a
+		// wallet instance drops the user's live sessions (SID-AUTH-06).
 		if backendProvider != nil {
 			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+			backendProvider.Services().WalletLifecycle.SetSessionCleaner(provider.SessionStore())
 		}
 	}
 

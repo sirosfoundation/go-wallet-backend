@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -74,7 +75,17 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
+		// SID-AUTH-06: a suspended or revoked wallet instance is a distinct,
+		// stable refusal so the client can tell the user what happened
+		// instead of retrying a login that can never succeed.
+		switch {
+		case errors.Is(err, service.ErrWalletInstanceSuspended):
+			c.JSON(http.StatusForbidden, gin.H{"error": "WALLET_SUSPENDED"})
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
+			c.JSON(http.StatusForbidden, gin.H{"error": "WALLET_REVOKED"})
+		default:
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
+		}
 		return
 	}
 
