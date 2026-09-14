@@ -33,7 +33,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		if instance.DeviceInfo != nil {
 			existing.DeviceInfo = instance.DeviceInfo
 		}
-		if instance.CredentialID != "" {
+		// The passkey link is client-supplied; the first non-empty binding
+		// is kept so a later attestation cannot move the instance to another
+		// passkey and slip past per-instance login gating.
+		if existing.CredentialID == "" && instance.CredentialID != "" {
 			existing.CredentialID = instance.CredentialID
 		}
 	} else {

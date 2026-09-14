@@ -45,14 +45,25 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	if instance.DeviceInfo != nil {
 		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
 	}
-	if instance.CredentialID != "" {
-		update["$set"].(bson.M)["credential_id"] = instance.CredentialID
-	}
 
 	opts := options.Update().SetUpsert(true)
 	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
+	}
+
+	// The passkey link is client-supplied, so only the first non-empty
+	// binding is recorded: the filter matches the document only while it has
+	// no credential_id, which makes "first link wins" atomic and stops a later
+	// attestation from moving the instance to another passkey.
+	if instance.CredentialID != "" {
+		linkFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
+			{"credential_id": bson.M{"$exists": false}},
+			{"credential_id": ""},
+		}}
+		if _, err := s.collection.UpdateOne(ctx, linkFilter, bson.M{"$set": bson.M{"credential_id": instance.CredentialID}}); err != nil {
+			return fmt.Errorf("%w: link wallet instance credential: %v", storage.ErrDatabase, err)
+		}
 	}
 	return nil
 }

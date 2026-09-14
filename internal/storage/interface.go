@@ -240,6 +240,8 @@ type InviteStore interface {
 // WalletInstanceStore defines the interface for wallet instance storage
 type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	// An existing instance keeps its Status (only UpdateStatus changes it) and its first
+	// non-empty CredentialID (the passkey link is client-supplied and must not be moved).
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.
