@@ -19,6 +19,13 @@ import (
 // so the existence of other users' instances is not disclosed.
 var ErrWalletInstanceNotOwned = errors.New("wallet instance does not belong to this user")
 
+// ErrErasureIncomplete is returned by ChangeStatus and RevokeAllForUser when
+// the status change was persisted (the instance *is* suspended or revoked)
+// but part of the cascade - dropping sessions, erasing wallet data - failed.
+// Handlers map it to 409: the client repeats the request to finish the
+// erasure. It wraps the underlying failures.
+var ErrErasureIncomplete = errors.New("wallet instance status changed but erasure incomplete")
+
 // LifecycleActor says who asked for a wallet instance status change.
 type LifecycleActor struct {
 	// Kind is "user" for self-service changes and "provider" for admin ones.
@@ -72,7 +79,10 @@ func (s *WalletLifecycleService) ListForUser(ctx context.Context, tenantID domai
 // ChangeStatus moves one instance to target after checking tenant, ownership
 // (for a user actor) and the domain transition rules, then runs the cascade.
 // Returns storage.ErrNotFound, ErrWalletInstanceNotOwned or
-// domain.ErrInvalidStatusTransition for the caller to map.
+// domain.ErrInvalidStatusTransition for the caller to map. When the status
+// change was persisted but the cascade did not fully complete, the updated
+// instance is returned together with ErrErasureIncomplete; repeating the same
+// request re-runs the cascade, so the caller can retry until it succeeds.
 func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, instanceID string, target domain.InstanceStatus, reason string) (*domain.WalletInstance, error) {
 	inst, err := s.store.WalletInstances().GetByID(ctx, instanceID)
 	if err != nil {
@@ -88,6 +98,10 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		return nil, err
 	}
 	if inst.Status == target {
+		if target == domain.InstanceStatusRevoked {
+			// Idempotent retry: finish an erasure that failed last time.
+			return inst, s.cascade(ctx, tenantID, inst)
+		}
 		return inst, nil
 	}
 	if err := s.store.WalletInstances().UpdateStatus(ctx, instanceID, target, reason); err != nil {
@@ -97,14 +111,17 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	inst.UpdatedAt = time.Now().UTC()
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
-		s.cascade(ctx, tenantID, inst)
+		return inst, s.cascade(ctx, tenantID, inst)
 	}
 	return inst, nil
 }
 
 // RevokeAllForUser revokes every non-revoked instance of the user in the
 // tenant - the "deactivate my wallet" action - and returns how many changed.
-// The cascade then erases the wallet data, since nothing live remains.
+// The cascade then erases the wallet data, since nothing live remains in the
+// tenant. Like ChangeStatus it returns ErrErasureIncomplete when the
+// revocations were persisted but the erasure did not complete; calling it
+// again with everything already revoked re-runs the erasure.
 func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, userID domain.UserID, reason string) (int, error) {
 	instances, err := s.ListForUser(ctx, tenantID, userID)
 	if err != nil {
@@ -124,117 +141,155 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 		changed++
 		last = inst
 	}
+	if last == nil && len(instances) > 0 {
+		last = instances[len(instances)-1] // everything already revoked: retry the erasure
+	}
 	if last != nil {
-		s.cascade(ctx, tenantID, last)
+		return changed, s.cascade(ctx, tenantID, last)
 	}
 	return changed, nil
 }
 
 // cascade runs after an instance left the active state: drop the user's live
 // sessions, and erase the wallet data once no instance the user could
-// reactivate remains.
-func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance) {
+// reactivate remains in the tenant. Wallet instances are per tenant, so the
+// decision is taken per tenant. It returns ErrErasureIncomplete (wrapping the
+// underlying failures) when any step did not complete; the status change
+// itself is already persisted at that point.
+func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance) error {
 	if inst.UserID == nil {
-		return
+		return nil
 	}
 	userID := *inst.UserID
+	var errs []error
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("failed to drop sessions after instance status change", zap.Error(err))
+			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
 		}
 	}
 	remaining, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		s.logger.Warn("failed to list remaining instances; not erasing wallet data", zap.Error(err))
-		return
+		errs = append(errs, fmt.Errorf("list remaining instances: %w", err))
+		return s.incomplete(userID, errs)
 	}
 	for _, other := range remaining {
 		if other.Status != domain.InstanceStatusRevoked {
-			return // something is still active or reactivatable
+			return s.incomplete(userID, errs) // something is still active or reactivatable
 		}
 	}
-	s.eraseWalletData(ctx, userID)
+	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
+	return s.incomplete(userID, errs)
 }
 
-// eraseWalletData is the SID-AUTH-06 "secure erasure on deactivation": the
-// same server-side data UserService.DeleteUser removes, but the user record
-// and its passkeys stay so the revocation remains attributable and login can
-// be refused with a clear reason rather than "user not found".
-func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, userID domain.UserID) {
+// incomplete turns the collected cascade failures into ErrErasureIncomplete
+// (nil when there were none), logging them once.
+func (s *WalletLifecycleService) incomplete(userID domain.UserID, errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	joined := errors.Join(errs...)
+	s.logger.Error("wallet lifecycle cascade incomplete", zap.String("user_id", userID.String()), zap.Error(joined))
+	return fmt.Errorf("%w: %w", ErrErasureIncomplete, joined)
+}
+
+// eraseWalletData is the SID-AUTH-06 "secure erasure on deactivation" for one
+// tenant: the credentials and presentations the user holds in that tenant are
+// deleted. The user-level state - the encrypted private data and legacy key
+// blob (the only durable custodians of the user's keys) and pending
+// challenges - is shared by all of the user's tenants, so it is erased only
+// when no non-revoked instance remains in any tenant the user belongs to.
+// The user record and its passkeys stay so the revocation remains attributable
+// and login can be refused with a clear reason rather than "user not found".
+func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) []error {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
-		s.logger.Warn("failed to load user for wallet erasure", zap.Error(err))
-		return
+		return []error{fmt.Errorf("load user: %w", err)}
 	}
-	// PrivateData is the encrypted vault; Keys is the legacy key blob some
-	// registrations still upload. Both are key material and both go.
+	// Credentials and presentations are keyed by holder DID; users without a
+	// DID have theirs stored under the user id (the API's getHolderDID fallback).
+	holder := user.DID
+	if holder == "" {
+		holder = userID.String()
+	}
+	errs := s.eraseHolderData(ctx, tenantID, holder)
+
+	live, err := s.liveInstanceElsewhere(ctx, userID, tenantID)
+	if err != nil {
+		return append(errs, err)
+	}
+	if live {
+		s.logger.Info("wallet data erased in tenant; user-level data kept, a live instance remains in another tenant",
+			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
+		return errs
+	}
 	user.PrivateData = nil
 	user.PrivateDataETag = ""
 	user.Keys = nil
 	user.UpdatedAt = time.Now()
 	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Warn("failed to clear private data", zap.Error(err))
-	}
-
-	// Credentials and presentations are keyed by holder DID, and the API
-	// handlers (getHolderDID) fall back to the user id for users without a
-	// DID - so erase under the same identity they were stored under.
-	holder := user.DID
-	if holder == "" {
-		holder = userID.String()
-	}
-	for _, tid := range s.tenantsForErasure(ctx, userID) {
-		s.eraseHolderData(ctx, tid, holder)
+		errs = append(errs, fmt.Errorf("clear private data: %w", err))
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
-		s.logger.Warn("failed to delete challenges", zap.Error(err))
+		errs = append(errs, fmt.Errorf("delete challenges: %w", err))
 	}
-	s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()))
+	s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
+	return errs
 }
 
-// tenantsForErasure lists the tenants whose credentials and presentations
-// belong to the user: every explicit membership plus the default tenant,
-// where users registered without a membership row keep their data. Erasure
-// must not stop on a failed membership lookup, but then credentials in other
-// tenants may survive, so that is logged as an error rather than treated
-// like an empty membership.
-func (s *WalletLifecycleService) tenantsForErasure(ctx context.Context, userID domain.UserID) []domain.TenantID {
+// liveInstanceElsewhere reports whether the user still has a non-revoked
+// wallet instance in any tenant other than exclude: the explicit memberships
+// plus the default tenant, where users registered without a membership row
+// live. A failed membership lookup is an error, because erasing the user-level
+// data on a guess could destroy a wallet that is still in use elsewhere.
+func (s *WalletLifecycleService) liveInstanceElsewhere(ctx context.Context, userID domain.UserID, exclude domain.TenantID) (bool, error) {
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
-		s.logger.Error("failed to list tenant memberships for wallet erasure; only the default tenant will be erased",
-			zap.String("user_id", userID.String()), zap.Error(err))
-		tenantIDs = nil
+		return false, fmt.Errorf("list tenant memberships: %w", err)
 	}
+	tenantIDs = append(tenantIDs, domain.DefaultTenantID)
+	seen := map[domain.TenantID]bool{exclude: true}
 	for _, tid := range tenantIDs {
-		if tid == domain.DefaultTenantID {
-			return tenantIDs
+		if seen[tid] {
+			continue
+		}
+		seen[tid] = true
+		instances, err := s.store.WalletInstances().GetByUser(ctx, tid, userID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return false, fmt.Errorf("list instances in tenant %s: %w", tid, err)
+		}
+		for _, inst := range instances {
+			if inst.Status != domain.InstanceStatusRevoked {
+				return true, nil
+			}
 		}
 	}
-	return append(tenantIDs, domain.DefaultTenantID)
+	return false, nil
 }
 
 // eraseHolderData deletes the holder's credentials and presentations in one
-// tenant, logging (not aborting on) individual failures so as much as
-// possible is erased.
-func (s *WalletLifecycleService) eraseHolderData(ctx context.Context, tid domain.TenantID, did string) {
+// tenant, continuing past individual failures so as much as possible is
+// erased, and returns every failure.
+func (s *WalletLifecycleService) eraseHolderData(ctx context.Context, tid domain.TenantID, did string) []error {
+	var errs []error
 	creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, did)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		s.logger.Warn("failed to list credentials for erasure", zap.Error(err))
+		errs = append(errs, fmt.Errorf("list credentials: %w", err))
 	}
 	for _, c := range creds {
 		if err := s.store.Credentials().Delete(ctx, tid, did, c.CredentialIdentifier); err != nil {
-			s.logger.Warn("failed to delete credential", zap.Error(err))
+			errs = append(errs, fmt.Errorf("delete credential %s: %w", c.CredentialIdentifier, err))
 		}
 	}
 	pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, did)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		s.logger.Warn("failed to list presentations for erasure", zap.Error(err))
+		errs = append(errs, fmt.Errorf("list presentations: %w", err))
 	}
 	for _, p := range pres {
 		if err := s.store.Presentations().Delete(ctx, tid, did, p.PresentationIdentifier); err != nil {
-			s.logger.Warn("failed to delete presentation", zap.Error(err))
+			errs = append(errs, fmt.Errorf("delete presentation %s: %w", p.PresentationIdentifier, err))
 		}
 	}
+	return errs
 }
 
 func (s *WalletLifecycleService) emitAudit(instanceID string, status domain.InstanceStatus, reason string, actor LifecycleActor) {

@@ -154,11 +154,21 @@ share one lifecycle: `active` → `suspended` (reversible) or `revoked`
 drops the user's live sessions and refuses new WIAs for that instance. Login with
 the passkey linked to a suspended or revoked instance is refused with `403
 WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
-still log in. Revoking the last non-revoked instance
-deactivates the wallet: the encrypted private data, server-side credentials,
-presentations and pending challenges are erased, every passkey of the user is
-refused at login (`403 WALLET_REVOKED`), and a new enrollment is required. The
-`message` field of the 403 tells the two cases apart for the user.
+still log in.
+
+Wallet instances are per tenant. Revoking the last non-revoked instance of a
+user in a tenant deactivates the wallet in that tenant: the credentials and
+presentations held there are erased, every passkey of the user is refused at
+login in that tenant (`403 WALLET_REVOKED`), and a new enrollment is required.
+The `message` field of the 403 tells the two cases apart for the user. The
+user-level data shared across tenants - the encrypted private data (the
+custodian of the wallet's keys) and pending challenges - is erased once no
+non-revoked instance remains in any tenant the user belongs to.
+
+The status change is recorded before the cascade runs. If dropping sessions or
+erasing data then fails, the status change stands and the request answers
+`409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
+re-runs the erasure, so the client retries until it gets `200`.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
 credential id as `credential_id` to `POST /wallet-provider/wia/generate`.
@@ -182,8 +192,10 @@ Change the status of one of the caller's instances.
 ```
 
 **Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `404` if the instance
-is not the caller's; `409` for an invalid transition (e.g. reactivating a
-revoked instance).
+is not the caller's; `409 {"error": "invalid status transition"}` for an invalid
+transition (e.g. reactivating a revoked instance); `409 {"error":
+"ERASURE_INCOMPLETE", "id": ..., "status": "revoked"}` when the change was
+recorded but the erasure must be retried.
 
 ##### POST /user/session/instances/revoke-all
 
@@ -192,7 +204,9 @@ data.
 
 **Request (optional):** `{ "reason": "device stolen" }`
 
-**Response:** `200 {"revoked": 2}`
+**Response:** `200 {"revoked": 2}`; `409 {"error": "ERASURE_INCOMPLETE",
+"revoked": 2}` when the instances were revoked but the erasure must be retried
+(repeat the request; it answers `200 {"revoked": 0}` once complete).
 
 ### Credential Management
 

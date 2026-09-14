@@ -27,6 +27,14 @@ type revokeAllInstancesRequest struct {
 	Reason string `json:"reason"`
 }
 
+// Error code for a lifecycle change that was persisted but whose cascade
+// (session drop, wallet erasure) did not complete. The status is final;
+// repeating the same request re-runs the erasure.
+const (
+	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
+	errMsgErasureIncomplete  = "the status change was recorded but part of the wallet data could not be erased; repeat the request to complete it"
+)
+
 func (h *Handlers) lifecycleActor(c *gin.Context) (service.LifecycleActor, domain.TenantID, bool) {
 	uid, exists := c.Get("user_id")
 	if !exists {
@@ -75,6 +83,9 @@ func (h *Handlers) UpdateMyWalletInstanceStatus(c *gin.Context) {
 	inst, err := h.services.WalletLifecycle.ChangeStatus(c.Request.Context(), actor, tenantID, c.Param("instance_id"), domain.InstanceStatus(req.Status), req.Reason)
 	if err != nil {
 		switch {
+		case errors.Is(err, service.ErrErasureIncomplete):
+			h.logger.Error("wallet instance status changed but cascade incomplete", zap.Error(err))
+			c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "id": inst.ID, "status": string(inst.Status), "message": errMsgErasureIncomplete})
 		case errors.Is(err, storage.ErrNotFound), errors.Is(err, service.ErrWalletInstanceNotOwned):
 			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
 		case errors.Is(err, domain.ErrInvalidStatusTransition):
@@ -104,6 +115,11 @@ func (h *Handlers) RevokeAllMyWalletInstances(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req) // body is optional
 	n, err := h.services.WalletLifecycle.RevokeAllForUser(c.Request.Context(), actor, tenantID, *actor.UserID, req.Reason)
 	if err != nil {
+		if errors.Is(err, service.ErrErasureIncomplete) {
+			h.logger.Error("wallet instances revoked but cascade incomplete", zap.Error(err))
+			c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "revoked": n, "message": errMsgErasureIncomplete})
+			return
+		}
 		h.logger.Error("failed to revoke wallet instances", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke wallet instances"})
 		return

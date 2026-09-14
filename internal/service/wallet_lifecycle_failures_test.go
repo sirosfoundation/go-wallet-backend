@@ -238,7 +238,7 @@ func TestWalletLifecycle_ChangeStatus_NoOpAndInvalid(t *testing.T) {
 	assert.ErrorIs(t, err, errBoom)
 }
 
-func TestWalletLifecycle_Cascade_UnownedInstanceAndErrorsDoNotErase(t *testing.T) {
+func TestWalletLifecycle_Cascade_UnownedInstanceAndErrors(t *testing.T) {
 	ctx := context.Background()
 	provider := LifecycleActor{Kind: "provider"}
 
@@ -250,52 +250,80 @@ func TestWalletLifecycle_Cascade_UnownedInstanceAndErrorsDoNotErase(t *testing.T
 		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
 	})
 
-	t.Run("session drop failure is logged, erasure still runs", func(t *testing.T) {
+	t.Run("session drop failure: erasure still runs, reported as incomplete", func(t *testing.T) {
 		store := memory.NewStore()
 		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 		svc.SetSessionCleaner(erroringSessionCleaner{})
 		uid := seedWalletUser(t, store, domain.DefaultTenantID)
-		_, err := svc.ChangeStatus(ctx, provider, domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusRevoked, "")
-		require.NoError(t, err)
+		inst, err := svc.ChangeStatus(ctx, provider, domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusRevoked, "")
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
+		assert.ErrorIs(t, err, errBoom, "the underlying failure is wrapped")
+		require.NotNil(t, inst, "the persisted state is returned alongside the error")
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
 		user, _ := store.Users().GetByID(ctx, uid)
 		assert.Nil(t, user.PrivateData)
 	})
 
-	t.Run("cannot list remaining instances: wallet data is kept", func(t *testing.T) {
+	t.Run("cannot list remaining instances: wallet data is kept, reported as incomplete", func(t *testing.T) {
 		fs := newFailStore()
 		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 		uid := seedWalletUser(t, fs, domain.DefaultTenantID)
 		fs.fail["instances.GetByUser"] = true
 		_, err := svc.ChangeStatus(ctx, provider, domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusRevoked, "")
-		require.NoError(t, err)
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
 		user, _ := fs.Store.Users().GetByID(ctx, uid)
 		assert.NotNil(t, user.PrivateData, "no erasure when we cannot prove nothing live remains")
 	})
 }
 
-func TestWalletLifecycle_Erasure_CoversEveryTenantMembership(t *testing.T) {
+// Wallet instances are per tenant: deactivating the wallet in one tenant
+// erases the holder data of that tenant only. The user-level vault is erased
+// only once no live instance remains anywhere.
+func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 	ctx := context.Background()
-	store := memory.NewStore()
-	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
-	uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
-	c, p := countHolderData(t, store, "acme", uid)
-	require.Equal(t, 1, c)
-	require.Equal(t, 1, p)
 
-	n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "leaving")
-	require.NoError(t, err)
-	assert.Equal(t, 1, n)
+	t.Run("live instance in another tenant keeps the vault", func(t *testing.T) {
+		store := memory.NewStore()
+		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+		uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
+		require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "acme-inst", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+		}))
 
-	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
-		c, p := countHolderData(t, store, tid, uid)
-		assert.Zero(t, c, "credentials erased in %s", tid)
-		assert.Zero(t, p, "presentations erased in %s", tid)
-	}
-	_, err = store.Challenges().GetByID(ctx, "chal-"+uid.String())
-	assert.Error(t, err, "pending challenges are gone")
+		n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "leaving")
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+
+		c, p := countHolderData(t, store, domain.DefaultTenantID, uid)
+		assert.Zero(t, c, "default-tenant credentials erased")
+		assert.Zero(t, p, "default-tenant presentations erased")
+		c, p = countHolderData(t, store, "acme", uid)
+		assert.Equal(t, 1, c, "acme credentials untouched")
+		assert.Equal(t, 1, p, "acme presentations untouched")
+		user, _ := store.Users().GetByID(ctx, uid)
+		assert.NotNil(t, user.PrivateData, "the vault serves the live acme instance")
+		_, err = store.Challenges().GetByID(ctx, "chal-"+uid.String())
+		assert.NoError(t, err, "challenges are user-level too")
+	})
+
+	t.Run("no live instance anywhere erases the vault but not other tenants' holder data", func(t *testing.T) {
+		store := memory.NewStore()
+		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+		uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme") // acme membership + data, no acme instance
+
+		_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "leaving")
+		require.NoError(t, err)
+
+		user, _ := store.Users().GetByID(ctx, uid)
+		assert.Nil(t, user.PrivateData)
+		_, err = store.Challenges().GetByID(ctx, "chal-"+uid.String())
+		assert.Error(t, err, "pending challenges are gone")
+		c, _ := countHolderData(t, store, "acme", uid)
+		assert.Equal(t, 1, c, "acme's holder data belongs to acme's lifecycle")
+	})
 }
 
-func TestWalletLifecycle_Erasure_StoreFailuresAreLoggedNotFatal(t *testing.T) {
+func TestWalletLifecycle_Erasure_StoreFailuresAreReportedAndRetryable(t *testing.T) {
 	ctx := context.Background()
 	for _, op := range []string{
 		"users.Update", "usertenants.GetUserTenants", "credentials.GetAllByHolder", "credentials.Delete",
@@ -304,19 +332,31 @@ func TestWalletLifecycle_Erasure_StoreFailuresAreLoggedNotFatal(t *testing.T) {
 		t.Run(op, func(t *testing.T) {
 			fs := newFailStore()
 			svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
-			uid := seedWalletUser(t, fs, domain.DefaultTenantID, "acme")
+			uid := seedWalletUser(t, fs, domain.DefaultTenantID)
 			fs.fail[op] = true
 			n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
-			require.NoError(t, err, "erasure problems never fail the revocation")
-			assert.Equal(t, 1, n)
+			assert.ErrorIs(t, err, ErrErasureIncomplete, "erasure problems are reported, not swallowed")
+			assert.Equal(t, 1, n, "the revocation itself took effect")
 			inst, _ := fs.Store.WalletInstances().GetByID(ctx, "inst-"+uid.String())
 			assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
 			if op == "usertenants.GetUserTenants" {
+				user, _ := fs.Store.Users().GetByID(ctx, uid)
+				assert.NotNil(t, user.PrivateData, "vault kept: cannot prove no live instance elsewhere")
 				c, _ := countHolderData(t, fs.Store, domain.DefaultTenantID, uid)
-				assert.Zero(t, c, "the default tenant is still erased")
-				c, _ = countHolderData(t, fs.Store, "acme", uid)
-				assert.Equal(t, 1, c, "the other tenant survives - which is why this is logged as an error")
+				assert.Zero(t, c, "this tenant's holder data is still erased")
 			}
+
+			// Retry with everything already revoked re-runs the cascade.
+			fs.fail[op] = false
+			n, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
+			require.NoError(t, err)
+			assert.Zero(t, n)
+			user, _ := fs.Store.Users().GetByID(ctx, uid)
+			assert.Nil(t, user.PrivateData)
+			c, p := countHolderData(t, fs.Store, domain.DefaultTenantID, uid)
+			assert.Zero(t, c+p)
+			_, err = fs.Store.Challenges().GetByID(ctx, "chal-"+uid.String())
+			assert.Error(t, err)
 		})
 	}
 
@@ -326,9 +366,26 @@ func TestWalletLifecycle_Erasure_StoreFailuresAreLoggedNotFatal(t *testing.T) {
 		uid := seedWalletUser(t, fs, domain.DefaultTenantID)
 		fs.fail["users.GetByID"] = true
 		_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
-		require.NoError(t, err)
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
 		_, err = fs.Store.Challenges().GetByID(ctx, "chal-"+uid.String())
 		assert.NoError(t, err, "erasure stops when the user cannot be loaded")
+	})
+
+	t.Run("retry via ChangeStatus on the revoked instance", func(t *testing.T) {
+		fs := newFailStore("credentials.Delete")
+		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+		uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+		id := "inst-" + uid.String()
+		inst, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "stolen")
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
+
+		fs.fail["credentials.Delete"] = false
+		inst, err = svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "stolen")
+		require.NoError(t, err)
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
+		c, _ := countHolderData(t, fs.Store, domain.DefaultTenantID, uid)
+		assert.Zero(t, c)
 	})
 }
 

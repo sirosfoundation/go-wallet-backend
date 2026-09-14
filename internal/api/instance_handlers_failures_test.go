@@ -24,7 +24,21 @@ var errStoreDown = errors.New("store down")
 // reads and status updates fail, to drive the handlers' 500 branches.
 type brokenInstanceStore struct {
 	storage.Store
-	failReads, failUpdates bool
+	failReads, failUpdates, failUserUpdate bool
+}
+
+func (b *brokenInstanceStore) Users() storage.UserStore { return &brokenUsers{b.Store.Users(), b} }
+
+type brokenUsers struct {
+	storage.UserStore
+	b *brokenInstanceStore
+}
+
+func (u *brokenUsers) Update(ctx context.Context, user *domain.User) error {
+	if u.b.failUserUpdate {
+		return errStoreDown
+	}
+	return u.UserStore.Update(ctx, user)
 }
 
 func (b *brokenInstanceStore) WalletInstances() storage.WalletInstanceStore {
@@ -157,5 +171,69 @@ func TestUpdateWalletInstanceStatus_LifecycleStoreFailure(t *testing.T) {
 	w := doJSON(r, http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", `{"status":"suspended"}`)
 	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), errMsgInstanceUpdateFailed) {
 		t.Fatalf("expected 500 %q, got %d %s", errMsgInstanceUpdateFailed, w.Code, w.Body.String())
+	}
+}
+
+// A revocation whose erasure fails answers 409 ERASURE_INCOMPLETE with the
+// persisted status; repeating the request completes the erasure and gives 200.
+func TestMyWalletInstances_ErasureIncompleteIs409AndRetryable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	broken := &brokenInstanceStore{Store: memory.NewStore()}
+	services := service.NewServices(broken, lifecycleTestConfig(), zap.NewNop())
+	h := NewHandlersWithStore(services, broken, lifecycleTestConfig(), zap.NewNop(), []string{"test"})
+	me := domain.UserIDFromString("user-123")
+	if err := broken.Store.Users().Create(context.Background(), &domain.User{UUID: me, PrivateData: []byte("vault")}); err != nil {
+		t.Fatal(err)
+	}
+	seedUserInstance(t, h, "mine-1", me)
+	seedUserInstance(t, h, "mine-2", me)
+	r := instanceRoutes(h, authMiddleware("user-123", "did:example:123"))
+
+	broken.failUserUpdate = true
+	w := doJSON(r, http.MethodPut, "/user/session/instances/mine-1/status", `{"status":"suspended"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("suspend with a live sibling does not erase, so nothing fails: got %d %s", w.Code, w.Body.String())
+	}
+	w = doJSON(r, http.MethodPost, "/user/session/instances/revoke-all", "")
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeErasureIncomplete) || !strings.Contains(w.Body.String(), `"revoked":2`) {
+		t.Fatalf("revoke-all with failing erasure: expected 409 ERASURE_INCOMPLETE revoked=2, got %d %s", w.Code, w.Body.String())
+	}
+	w = doJSON(r, http.MethodPut, "/user/session/instances/mine-1/status", `{"status":"revoked"}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"status":"revoked"`) {
+		t.Fatalf("retry via status on a revoked instance: expected 409 with status revoked, got %d %s", w.Code, w.Body.String())
+	}
+
+	broken.failUserUpdate = false
+	w = doJSON(r, http.MethodPost, "/user/session/instances/revoke-all", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":0`) {
+		t.Fatalf("retry: expected 200 revoked=0, got %d %s", w.Code, w.Body.String())
+	}
+	user, err := broken.Store.Users().GetByID(context.Background(), me)
+	if err != nil || user.PrivateData != nil {
+		t.Fatalf("the retry must complete the erasure: %v %v", err, user)
+	}
+}
+
+func TestUpdateWalletInstanceStatus_LifecycleErasureIncompleteIs409(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	broken := &brokenInstanceStore{Store: memory.NewStore()}
+	h := NewAdminHandlers(broken, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(broken, zap.NewNop(), nil))
+	userID := domain.NewUserID()
+	if err := broken.Store.Users().Create(context.Background(), &domain.User{UUID: userID, PrivateData: []byte("vault")}); err != nil {
+		t.Fatal(err)
+	}
+	seedInstance(t, h, "inst-1", "acme", &userID)
+
+	r := gin.New()
+	r.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+	broken.failUserUpdate = true
+	w := doJSON(r, http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", `{"status":"revoked","reason":"compromised"}`)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeErasureIncomplete) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeErasureIncomplete, w.Code, w.Body.String())
+	}
+	inst, err := broken.Store.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil || inst.Status != domain.InstanceStatusRevoked {
+		t.Fatalf("the revocation itself must be persisted: %v %v", err, inst)
 	}
 }

@@ -103,6 +103,9 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 		// (session drop, wallet erasure on last revocation) as self-service.
 		if _, err := h.lifecycle.ChangeStatus(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, instanceID, status, req.Reason); err != nil {
 			switch {
+			case errors.Is(err, service.ErrErasureIncomplete):
+				h.logger.Error("wallet instance status changed but cascade incomplete", zap.Error(err))
+				c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "id": instanceID, "status": req.Status, "message": errMsgErasureIncomplete})
 			case errors.Is(err, storage.ErrNotFound):
 				c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
 			case errors.Is(err, domain.ErrInvalidStatusTransition):
