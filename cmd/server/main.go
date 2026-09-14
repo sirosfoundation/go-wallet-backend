@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -247,9 +248,13 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 
-		// Wire session store into UserService so DeleteUser purges active sessions
+		// Wire session stores into UserService so DeleteUser purges active
+		// engine (WebSocket) sessions and AS cookie sessions alike.
 		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+			backendProvider.Services().User.SetSessionCleaner(service.MultiSessionCleaner{
+				provider.SessionStore(),
+				backendProvider.ASSessionCleaner(),
+			})
 		}
 	}
 
