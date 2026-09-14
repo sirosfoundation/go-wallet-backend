@@ -173,43 +173,60 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, userID dom
 		s.logger.Warn("failed to clear private data", zap.Error(err))
 	}
 
-	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
-	if err != nil {
-		// Erasure must not stop here, but a failed membership lookup means
-		// credentials in other tenants may survive: say so loudly.
-		s.logger.Error("failed to list tenant memberships for wallet erasure; only the default tenant will be erased",
-			zap.String("user_id", userID.String()), zap.Error(err))
-		tenantIDs = nil
-	}
-	if len(tenantIDs) == 0 {
-		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
-	}
 	if user.DID != "" {
-		for _, tid := range tenantIDs {
-			creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, user.DID)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				s.logger.Warn("failed to list credentials for erasure", zap.Error(err))
-			}
-			for _, c := range creds {
-				if err := s.store.Credentials().Delete(ctx, tid, user.DID, c.CredentialIdentifier); err != nil {
-					s.logger.Warn("failed to delete credential", zap.Error(err))
-				}
-			}
-			pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, user.DID)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				s.logger.Warn("failed to list presentations for erasure", zap.Error(err))
-			}
-			for _, p := range pres {
-				if err := s.store.Presentations().Delete(ctx, tid, user.DID, p.PresentationIdentifier); err != nil {
-					s.logger.Warn("failed to delete presentation", zap.Error(err))
-				}
-			}
+		for _, tid := range s.tenantsForErasure(ctx, userID) {
+			s.eraseHolderData(ctx, tid, user.DID)
 		}
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		s.logger.Warn("failed to delete challenges", zap.Error(err))
 	}
 	s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()))
+}
+
+// tenantsForErasure lists the tenants whose credentials and presentations
+// belong to the user: every explicit membership plus the default tenant,
+// where users registered without a membership row keep their data. Erasure
+// must not stop on a failed membership lookup, but then credentials in other
+// tenants may survive, so that is logged as an error rather than treated
+// like an empty membership.
+func (s *WalletLifecycleService) tenantsForErasure(ctx context.Context, userID domain.UserID) []domain.TenantID {
+	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		s.logger.Error("failed to list tenant memberships for wallet erasure; only the default tenant will be erased",
+			zap.String("user_id", userID.String()), zap.Error(err))
+		tenantIDs = nil
+	}
+	for _, tid := range tenantIDs {
+		if tid == domain.DefaultTenantID {
+			return tenantIDs
+		}
+	}
+	return append(tenantIDs, domain.DefaultTenantID)
+}
+
+// eraseHolderData deletes the holder's credentials and presentations in one
+// tenant, logging (not aborting on) individual failures so as much as
+// possible is erased.
+func (s *WalletLifecycleService) eraseHolderData(ctx context.Context, tid domain.TenantID, did string) {
+	creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.logger.Warn("failed to list credentials for erasure", zap.Error(err))
+	}
+	for _, c := range creds {
+		if err := s.store.Credentials().Delete(ctx, tid, did, c.CredentialIdentifier); err != nil {
+			s.logger.Warn("failed to delete credential", zap.Error(err))
+		}
+	}
+	pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.logger.Warn("failed to list presentations for erasure", zap.Error(err))
+	}
+	for _, p := range pres {
+		if err := s.store.Presentations().Delete(ctx, tid, did, p.PresentationIdentifier); err != nil {
+			s.logger.Warn("failed to delete presentation", zap.Error(err))
+		}
+	}
 }
 
 func (s *WalletLifecycleService) emitAudit(instanceID string, status domain.InstanceStatus, reason string, actor LifecycleActor) {

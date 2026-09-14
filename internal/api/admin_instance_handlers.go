@@ -13,6 +13,13 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
+// Error strings shared by the admin instance handlers (kept identical to the
+// self-service handlers so clients see one vocabulary).
+const (
+	errMsgInstanceUpdateFailed    = "failed to update wallet instance"
+	errMsgInvalidStatusTransition = "invalid status transition"
+)
+
 // ListWalletInstances returns all wallet instances for a tenant.
 func (h *AdminHandlers) ListWalletInstances(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
@@ -77,7 +84,7 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 			return
 		}
 		h.logger.Error("failed to get wallet instance", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
 		return
 	}
 	if instance.TenantID != tenantID {
@@ -87,7 +94,7 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 
 	status := domain.InstanceStatus(req.Status)
 	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition", "current": string(instance.Status), "target": string(status)})
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition, "current": string(instance.Status), "target": string(status)})
 		return
 	}
 
@@ -99,10 +106,10 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 			case errors.Is(err, storage.ErrNotFound):
 				c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
 			case errors.Is(err, domain.ErrInvalidStatusTransition):
-				c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition"})
+				c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition})
 			default:
 				h.logger.Error("failed to update wallet instance status", zap.Error(err))
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
 			}
 			return
 		}
@@ -116,11 +123,11 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, domain.ErrInvalidStatusTransition) {
-			c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition"})
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition})
 			return
 		}
 		h.logger.Error("failed to update wallet instance status", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
 		return
 	}
 
