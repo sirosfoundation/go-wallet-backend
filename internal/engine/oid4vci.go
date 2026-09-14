@@ -58,7 +58,19 @@ type OID4VCIHandler struct {
 	// Client attestation provider for OAuth-Client-Attestation-based auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
 	// When available, takes precedence over private_key_jwt.
+	// Legacy mode only (see clientAuthMode): in client-held mode the WIA and
+	// a fresh PoP arrive with every SignActionSignClientAuth response.
 	attestationProvider ClientAttestationProvider
+	// legacyAttestationRequested records that the one-shot
+	// SignActionRequestAttestation of legacy mode has been sent, so a flow
+	// whose client declined is not asked again on every request.
+	legacyAttestationRequested bool
+
+	// clientAuthMode and dpopKeyID implement engine-requested DPoP signing
+	// (go-wallet-backend#317): see clientauth.go. dpopKey above is only set
+	// in legacy mode.
+	clientAuthMode clientAuthMode
+	dpopKeyID      string
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -548,14 +560,15 @@ func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string
 
 // setClientAuth adds client authentication parameters to the request form data.
 // Priority: attestation-based auth (§3.1) > private_key_jwt > client_id only.
-// When attestation is available, client_id is still set in form data (some AS require it)
-// but the actual auth is via HTTP headers set by setAttestationHeaders.
-func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
+// When the request carries attestation (attested, resolved beforehand by
+// resolveClientAuth), client_id is still set in form data (some AS require it)
+// but the actual auth is via the OAuth-Client-Attestation HTTP headers.
+func (h *OID4VCIHandler) setClientAuth(data url.Values, attested bool) error {
 	data.Set("client_id", h.clientID)
 
-	// When attestation provider is available, form-body auth is not used;
-	// the attestation is sent via HTTP headers in setAttestationHeaders.
-	if h.attestationProvider != nil && h.attestationProvider.Available() {
+	// When the request is attested, form-body auth is not used; the
+	// attestation goes in HTTP headers.
+	if attested {
 		return nil
 	}
 
@@ -569,16 +582,6 @@ func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
 	data.Set("client_assertion", assertion)
 	return nil
-}
-
-// setAttestationHeaders sets OAuth-Client-Attestation and OAuth-Client-Attestation-PoP
-// HTTP headers on the request per draft-ietf-oauth-attestation-based-client-auth-04 §3.1.
-// No-op if attestation provider is not available.
-func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Request) error {
-	if h.attestationProvider == nil || !h.attestationProvider.Available() {
-		return nil
-	}
-	return h.attestationProvider.SetHeaders(ctx, req)
 }
 
 // attestationRequestTimeout bounds how long requestClientAttestation waits for
@@ -786,18 +789,27 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	//     the offer/AS itself). Preferred when present.
 	//  2. Engine-requested here via SignActionRequestAttestation.
 	//     Best-effort / Tier 3.
+	//  3. Engine-requested per request via SignActionSignClientAuth, together
+	//     with the DPoP proof (client-held mode, go-wallet-backend#317). This
+	//     is what resolveClientAuth tries first when neither of the above
+	//     applies; it falls back to 2 for clients without the action.
 	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
 		h.attestationProvider = &TransportSuppliedAttestation{
 			WIA: msg.ClientAttestation,
 			PoP: msg.ClientAttestationPoP,
 			ID:  h.clientID,
 		}
+		// A client that pre-resolved its attestation signed the PoP with a
+		// key the engine cannot ask to sign DPoP proofs with, so the flow is
+		// a legacy one: engine-held DPoP key, replayed WIA + PoP.
+		if err := h.useLegacyClientAuth(); err != nil {
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return err
+		}
 		h.Logger.Info("using OAuth-Client-Attestation authentication (client-signed PoP)",
 			zap.String("issuer", offer.CredentialIssuer),
 			zap.String("client_id", h.clientID),
 		)
-	} else {
-		h.requestClientAttestation(ctx)
 	}
 
 	// Step 3: Evaluate trust
@@ -816,24 +828,24 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("selected_config", selectedConfig)
 	h.SetData("selected_credential_configuration_id", selectedConfigID)
 
-	// Generate an ephemeral DPoP key pair (RFC 9449) - unless this is a
-	// renewal presenting the client-supplied key its refresh_token was
-	// originally bound to (vc's refresh_token grant rejects any other key
-	// per RFC 9449/ARF 3.0 §6.6.6.2.2 - see dpopPrivateKeyJWK's doc comment).
-	if msg.RefreshToken != "" && msg.DPoPJWK != "" {
+	// DPoP key (RFC 9449). A renewal must reuse the key its refresh_token
+	// was bound to at issuance (vc's refresh_token grant rejects any other
+	// key per RFC 9449/ARF 3.0 §6.6.6.2.2): the client-held key named by
+	// dpop_key_id, or the engine-held key it relayed as dpop_jwk (see
+	// dpopPrivateKeyJWK's doc comment). Any other flow decides who holds the
+	// key at its first authenticated request - see resolveClientAuth.
+	switch {
+	case msg.RefreshToken != "" && msg.DPoPKeyID != "":
+		h.clientAuthMode = clientAuthClientHeld
+		h.dpopKeyID = msg.DPoPKeyID
+	case msg.RefreshToken != "" && msg.DPoPJWK != "":
 		h.dpopKey, err = parseDPoPPrivateKeyJWK(msg.DPoPJWK)
 		if err != nil {
 			h.Logger.Debug("failed to parse client-supplied DPoP JWK", zap.Error(err))
 			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 			return err
 		}
-	} else {
-		h.dpopKey, err = generateDPoPKey()
-		if err != nil {
-			h.Logger.Debug("failed to generate DPoP key", zap.Error(err))
-			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-			return err
-		}
+		h.clientAuthMode = clientAuthLegacy
 	}
 
 	// Step 5: Handle authorization (renewal, resumption, or fresh grant)
@@ -938,13 +950,13 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
 		h.registerNotificationContext(metadata, token, deferredResp)
-		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token))
+		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
 	h.registerNotificationContext(metadata, token, credential)
-	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token))
+	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
 }
 
 // dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
@@ -985,7 +997,7 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		endpoint:       metadata.NotificationEndpoint,
 		accessToken:    token.AccessToken,
 		tokenType:      token.TokenType,
-		dpopKey:        h.dpopKey,
+		dpopSigner:     h.dpopSigner(),
 		dpopNonce:      h.dpopNonce,
 		notificationID: resp.NotificationID,
 	})
@@ -1538,9 +1550,22 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
+		// Resolve client auth first: whether the request is attested decides
+		// the form-body auth, and each attempt needs a fresh DPoP proof (new
+		// nonce) and, in client-held mode, a fresh attestation PoP.
+		auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
+			attestation: true,
+			dpop:        true,
+			htm:         "POST",
+			htu:         tokenEndpoint,
+		})
+		if err != nil {
+			return nil, err
+		}
+
 		data := url.Values{}
 		setGrantParams(data)
-		if err := h.setClientAuth(data); err != nil {
+		if err := h.setClientAuth(data, auth.attested()); err != nil {
 			return nil, err
 		}
 
@@ -1549,12 +1574,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if err := h.setAttestationHeaders(ctx, req); err != nil {
-			return nil, err
-		}
-		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
-			return nil, err
-		}
+		auth.apply(req)
 
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
@@ -1740,12 +1760,19 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		for k, v := range params {
 			parParams[k] = v
 		}
+		// PAR carries client attestation (fresh PoP in client-held mode) but
+		// no DPoP proof: DPoP binds tokens, and PAR issues none.
+		parAuth, parErr := h.resolveClientAuth(ctx, clientAuthNeeds{attestation: true})
+		if parErr != nil {
+			_ = h.Error(StepAuthorizationReq, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return nil, parErr
+		}
 		if h.clientJWK != nil {
-			if err := h.setClientAuth(parParams); err != nil {
+			if err := h.setClientAuth(parParams, parAuth.attested()); err != nil {
 				h.Logger.Warn("failed to add client auth to PAR", zap.Error(err))
 			}
 		}
-		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
+		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams, parAuth)
 		if parErr != nil {
 			// An AS that requires PAR (RFC 9126 §5, "require_pushed_authorization_requests")
 			// has no non-PAR /authorize path at all - falling back to a
@@ -1858,15 +1885,13 @@ type PARResponse struct {
 
 // sendPushedAuthorizationRequest sends authorization parameters to the PAR endpoint
 // and returns the request_uri to use in the authorization redirect (RFC 9126).
-func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, parEndpoint string, params url.Values) (string, error) {
+func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, parEndpoint string, params url.Values, auth clientAuthHeaders) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", parEndpoint, strings.NewReader(params.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create PAR request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if err := h.setAttestationHeaders(ctx, req); err != nil {
-		return "", fmt.Errorf("failed to set attestation headers: %w", err)
-	}
+	auth.apply(req)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
@@ -2111,9 +2136,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		req.Header.Set("Content-Type", "application/json")
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
-			if err := h.setDPoPHeader(req, metadata.CredentialEndpoint, token.AccessToken); err != nil {
+			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: metadata.CredentialEndpoint, accessToken: token.AccessToken})
+			if err != nil {
 				return nil, err
 			}
+			auth.apply(req)
 		}
 
 		resp, err := h.httpClient.Do(req)
@@ -2217,9 +2244,11 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		req.Header.Set("Content-Type", "application/json")
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
-			if err := h.setDPoPHeader(req, deferredEndpoint, token.AccessToken); err != nil {
+			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: deferredEndpoint, accessToken: token.AccessToken})
+			if err != nil {
 				return nil, err
 			}
+			auth.apply(req)
 		}
 
 		resp, err := h.httpClient.Do(req)

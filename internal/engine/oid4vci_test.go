@@ -97,7 +97,7 @@ func TestSendPushedAuthorizationRequest_Success(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 	assert.Equal(t, "urn:ietf:params:oauth:request_uri:abc123", requestURI)
 }
@@ -118,7 +118,7 @@ func TestSendPushedAuthorizationRequest_ErrorResponse(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 400")
 }
@@ -139,7 +139,7 @@ func TestSendPushedAuthorizationRequest_ErrorInBody(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR error")
 	assert.Contains(t, err.Error(), "bad scope")
@@ -158,7 +158,7 @@ func TestSendPushedAuthorizationRequest_MissingRequestURI(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing request_uri")
 }
@@ -258,7 +258,7 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 
 	// Verify the redirect URL would be built correctly
@@ -342,6 +342,15 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 	}
 	h := &OID4VCIHandler{
 		httpClient: httpClient,
+		// The drain-only server above never answers a sign_client_auth
+		// probe, so settle on legacy mode up front: the handler signs DPoP
+		// with h.dpopKey when a test sets one and sends no proof otherwise,
+		// which is what these tests were written against. Tests of the
+		// probe itself (clientauth_test.go) build their own handler.
+		clientAuthMode: clientAuthLegacy,
+		// Likewise treat the one-shot request_attestation as already done
+		// (declined), as Execute would have before reaching the token step.
+		legacyAttestationRequested: true,
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	return h, cleanup
@@ -593,7 +602,7 @@ func TestSendPushedAuthorizationRequest_NetworkError(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR request failed")
 }
@@ -611,7 +620,7 @@ func TestSendPushedAuthorizationRequest_InvalidJSON(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse PAR response")
 }
