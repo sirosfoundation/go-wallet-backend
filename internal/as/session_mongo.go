@@ -35,8 +35,9 @@ type sessionDoc struct {
 // expires_at that removes documents shortly after they expire (MongoDB's TTL
 // monitor runs about once a minute), which replaces MemorySessionStore's
 // cleanup goroutine. Revocation flips a flag and leaves the document to the
-// TTL index, so SessionMiddleware keeps distinguishing "revoked" from
-// "not found" for a client that still presents the cookie.
+// TTL index, so a lookup for a cookie still in circulation finds a revoked
+// session rather than nothing. The client is refused with 401 either way;
+// the distinction is kept for the store and for SessionMiddleware's logging.
 type MongoSessionStore struct {
 	coll *mongo.Collection
 }

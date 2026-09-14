@@ -67,8 +67,10 @@ type SessionStore interface {
 	// service.SessionCleaner, so whatever holds the cleaner (today
 	// UserService.DeleteUser, via the wiring in cmd/server) drops AS
 	// sessions the same way it drops engine sessions. Sessions are marked
-	// revoked rather than removed so a request still holding the cookie is
-	// told "revoked", not "not found".
+	// revoked rather than removed, so a lookup for a cookie still in
+	// circulation yields a revoked session rather than a missing one; the
+	// client is refused with 401 either way, the distinction is kept for the
+	// store and for SessionMiddleware's logging.
 	DeleteByUser(ctx context.Context, userID string) error
 }
 

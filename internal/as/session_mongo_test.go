@@ -12,12 +12,17 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// mongoSessionStoreForTest connects to the test MongoDB (same env contract as
-// internal/storage/mongodb's tests), using a per-test database that is
+// mongoDatabaseForTest connects to the test MongoDB (same env contract as
+// internal/storage/mongodb's tests) and returns a per-test database that is
 // dropped on cleanup.
-func mongoSessionStoreForTest(t *testing.T) *MongoSessionStore {
+func mongoDatabaseForTest(t *testing.T) *mongo.Database {
 	t.Helper()
 	if os.Getenv("MONGODB_TEST_URI") == "" && os.Getenv("TEST_MONGODB") == "" {
 		t.Skip("Skipping MongoDB test: set MONGODB_TEST_URI or TEST_MONGODB=1 to enable")
@@ -37,9 +42,44 @@ func mongoSessionStoreForTest(t *testing.T) *MongoSessionStore {
 		_ = db.Drop(c)
 		_ = client.Disconnect(c)
 	})
-	store, err := NewMongoSessionStore(ctx, db)
+	return db
+}
+
+// mongoSessionStoreForTest is a MongoSessionStore on mongoDatabaseForTest.
+func mongoSessionStoreForTest(t *testing.T) *MongoSessionStore {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, err := NewMongoSessionStore(ctx, mongoDatabaseForTest(t))
 	require.NoError(t, err)
 	return store
+}
+
+// mongoBackedStore stands in for the MongoDB storage backend: the only thing
+// newSessionStore asks of it beyond storage.Store is the Database accessor.
+type mongoBackedStore struct {
+	storage.Store
+	db *mongo.Database
+}
+
+func (m mongoBackedStore) Database() *mongo.Database { return m.db }
+
+// With a MongoDB storage backend the default ("" and "auto") and the explicit
+// "mongodb" setting select the persistent store; "memory" still opts out.
+func TestNewSessionStore_SelectionWithMongo(t *testing.T) {
+	store := mongoBackedStore{Store: memory.NewStore(), db: mongoDatabaseForTest(t)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, mode := range []string{"", "auto", "mongodb"} {
+		s, err := newSessionStore(ctx, &config.ASConfig{SessionStore: mode}, store, zap.NewNop())
+		require.NoError(t, err, mode)
+		assert.IsType(t, &MongoSessionStore{}, s, mode)
+	}
+
+	s, err := newSessionStore(ctx, &config.ASConfig{SessionStore: "memory"}, store, zap.NewNop())
+	require.NoError(t, err)
+	assert.IsType(t, &MemorySessionStore{}, s)
 }
 
 func testSession(jti, userID string) *Session {
@@ -99,7 +139,7 @@ func TestMongoSessionStore_RevokeKeepsDocumentAsRevoked(t *testing.T) {
 	require.NoError(t, store.Revoke(ctx, jti))
 	got, err := store.Get(ctx, jti)
 	require.NoError(t, err)
-	require.NotNil(t, got, "a revoked session is still found, so the client is told 'revoked', not 'not found'")
+	require.NotNil(t, got, "a revoked session stays discoverable as revoked instead of disappearing")
 	assert.True(t, got.Revoked)
 	assert.False(t, got.IsValid())
 

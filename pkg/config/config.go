@@ -80,10 +80,11 @@ type ASConfig struct {
 	SessionTTL time.Duration `yaml:"session_ttl" envconfig:"SESSION_TTL"`
 
 	// SessionStore selects where AS sessions (the cookie-bound server-side
-	// sessions that mint access tokens) are kept: "mongodb" or "memory".
-	// Empty means "mongodb" when the storage backend is MongoDB and "memory"
-	// otherwise. Memory sessions are lost on restart and are not shared
-	// between instances; use "mongodb" for high availability.
+	// sessions that mint access tokens) are kept: "mongodb", "memory" or
+	// "auto". "auto" (the default when empty) means "mongodb" when the
+	// storage backend is MongoDB and "memory" otherwise. Memory sessions are
+	// lost on restart and are not shared between instances; use "mongodb" for
+	// high availability.
 	SessionStore string `yaml:"session_store" envconfig:"SESSION_STORE"`
 
 	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.

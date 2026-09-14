@@ -142,7 +142,8 @@ type mongoDatabaseProvider interface {
 }
 
 // newSessionStore picks the SessionStore for cfg.SessionStore: "memory",
-// "mongodb", or empty for "mongodb when the backend is MongoDB, else memory".
+// "mongodb", or "auto" (the default when empty) for "mongodb when the backend
+// is MongoDB, else memory".
 func newSessionStore(ctx context.Context, cfg *config.ASConfig, store storage.Store, logger *zap.Logger) (SessionStore, error) {
 	dbp, hasMongo := store.(mongoDatabaseProvider)
 	switch cfg.SessionStore {
@@ -159,7 +160,7 @@ func newSessionStore(ctx context.Context, cfg *config.ASConfig, store storage.St
 			return nil, fmt.Errorf("as.session_store=mongodb requires the MongoDB storage backend")
 		}
 	default:
-		return nil, fmt.Errorf("as.session_store: unknown value %q (memory, mongodb)", cfg.SessionStore)
+		return nil, fmt.Errorf("as.session_store: unknown value %q (memory, mongodb, or auto)", cfg.SessionStore)
 	}
 	mongoStore, err := NewMongoSessionStore(ctx, dbp.Database())
 	if err != nil {
