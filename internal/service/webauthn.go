@@ -1808,26 +1808,36 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	// "wallet deactivated" for every passkey, including one linked to a
 	// revoked instance - telling that user "use another device" would be
 	// wrong, since no device can log in any more.
+	//
+	// The store does not enforce that a passkey is linked to at most one
+	// instance, so every instance linked to this passkey is considered and
+	// the most restrictive status wins: a passkey that is also linked to a
+	// suspended or revoked instance is refused even if an active duplicate
+	// exists, rather than letting store ordering decide.
 	anyLive := false
-	var linked *domain.WalletInstance
+	linkedSuspended, linkedRevoked := false, false
 	for _, inst := range instances {
 		if inst.Status != domain.InstanceStatusRevoked {
 			anyLive = true
 		}
-		if linked == nil && inst.CredentialID != "" && inst.CredentialID == credentialID {
-			linked = inst
+		if inst.CredentialID == "" || inst.CredentialID != credentialID {
+			continue
+		}
+		switch inst.Status {
+		case domain.InstanceStatusSuspended:
+			linkedSuspended = true
+		case domain.InstanceStatusRevoked:
+			linkedRevoked = true
 		}
 	}
 	if !anyLive {
 		return ErrWalletDeactivated
 	}
-	if linked != nil {
-		switch linked.Status {
-		case domain.InstanceStatusSuspended:
-			return ErrWalletInstanceSuspended
-		case domain.InstanceStatusRevoked:
-			return ErrWalletInstanceRevoked
-		}
+	if linkedRevoked {
+		return ErrWalletInstanceRevoked
+	}
+	if linkedSuspended {
+		return ErrWalletInstanceSuspended
 	}
 	return nil
 }

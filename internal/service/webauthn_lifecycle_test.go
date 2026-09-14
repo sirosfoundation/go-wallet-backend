@@ -73,6 +73,20 @@ func TestCheckWalletLifecycle(t *testing.T) {
 			"no device can log in any more, so the refusal must not suggest using another one")
 	})
 
+	t.Run("passkey linked to both a revoked and an active instance fails closed", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		// Store ordering must not decide: seed the active duplicate first.
+		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+		seedLifecycleInstance(t, s, "i2", userID, "pk-1", domain.InstanceStatusRevoked)
+		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceRevoked,
+			"an active duplicate link must not let a passkey of a revoked instance log in")
+
+		s = &WebAuthnService{store: memory.NewStore()}
+		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+		seedLifecycleInstance(t, s, "i2", userID, "pk-1", domain.InstanceStatusSuspended)
+		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceSuspended)
+	})
+
 	t.Run("linked instance revoked while another is live is not deactivation", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)

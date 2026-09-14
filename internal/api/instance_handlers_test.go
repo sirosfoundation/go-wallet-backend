@@ -129,3 +129,36 @@ func TestMyWalletInstances_ListUpdateRevokeAll(t *testing.T) {
 		t.Fatalf("reactivate revoked: expected 409, got %d %s", w.Code, w.Body.String())
 	}
 }
+
+// The revoke-all body is optional, but "optional" means an empty body: a
+// malformed payload must not be mistaken for "no options" on a destructive
+// endpoint.
+func TestRevokeAllMyWalletInstances_OptionalBody(t *testing.T) {
+	handlers, router := setupLifecycleHandlers(t)
+	me := domain.UserIDFromString("user-123")
+	if err := handlers.store.Users().Create(context.Background(), &domain.User{UUID: me}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	seedUserInstance(t, handlers, "mine-1", me)
+	router.POST("/user/session/instances/revoke-all", authMiddleware("user-123", "did:example:123"), handlers.RevokeAllMyWalletInstances)
+
+	// Malformed JSON is a 400 and revokes nothing.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", strings.NewReader(`{"reason":"trunc`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed body: expected 400, got %d %s", w.Code, w.Body.String())
+	}
+	inst, err := handlers.store.WalletInstances().GetByID(context.Background(), "mine-1")
+	if err != nil || inst.Status != domain.InstanceStatusActive {
+		t.Fatalf("malformed body must not revoke: %v %v", err, inst)
+	}
+
+	// No body at all is fine.
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":1`) {
+		t.Fatalf("empty body: %d %s", w.Code, w.Body.String())
+	}
+}

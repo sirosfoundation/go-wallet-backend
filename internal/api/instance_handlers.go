@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -99,6 +102,26 @@ func (h *Handlers) UpdateMyWalletInstanceStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"id": inst.ID, "status": string(inst.Status)})
 }
 
+// bindOptionalJSON decodes an optional JSON body into dst. An empty body is
+// accepted as "no options"; any other decoding failure answers 400 and returns
+// false, so that on a destructive endpoint a malformed payload (say a
+// truncated reason) cannot silently pass as an unannotated request.
+func bindOptionalJSON(c *gin.Context, dst any) bool {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return false
+	}
+	return true
+}
+
 // RevokeAllMyWalletInstances handles POST /user/session/instances/revoke-all:
 // deactivate the wallet. Every instance is revoked and the wallet data erased;
 // a new enrollment is required afterwards.
@@ -112,7 +135,9 @@ func (h *Handlers) RevokeAllMyWalletInstances(c *gin.Context) {
 		return
 	}
 	var req revokeAllInstancesRequest
-	_ = c.ShouldBindJSON(&req) // body is optional
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
 	n, err := h.services.WalletLifecycle.RevokeAllForUser(c.Request.Context(), actor, tenantID, *actor.UserID, req.Reason)
 	if err != nil {
 		if errors.Is(err, service.ErrErasureIncomplete) {
