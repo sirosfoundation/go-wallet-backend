@@ -34,6 +34,7 @@ func lifecycleFixture(t *testing.T, statuses ...domain.InstanceStatus) (*WalletL
 		DID:             "did:example:" + userID.String(),
 		PrivateData:     []byte("encrypted-vault"),
 		PrivateDataETag: "etag-1",
+		Keys:            []byte("legacy-key-blob"),
 	}))
 	require.NoError(t, store.Challenges().Create(ctx, &domain.WebauthnChallenge{
 		ID: "chal-1", UserID: userID.String(), Challenge: "c", Action: "login", ExpiresAt: time.Now().Add(time.Minute),
@@ -91,8 +92,44 @@ func TestWalletLifecycle_RevokingLastInstanceErasesWalletData(t *testing.T) {
 	require.NoError(t, err, "the user record itself is kept")
 	assert.Nil(t, user.PrivateData)
 	assert.Empty(t, user.PrivateDataETag)
+	assert.Nil(t, user.Keys, "the legacy key blob is key material too")
 	_, err = store.Challenges().GetByID(ctx, "chal-1")
 	assert.True(t, errors.Is(err, storage.ErrNotFound), "pending challenges are deleted")
+}
+
+// Users registered without a DID have their credentials stored under the
+// user id (the handlers' getHolderDID fallback); erasure must look there.
+func TestWalletLifecycle_ErasureUsesUserIDForHolderWithoutDID(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	holder := userID.String()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, PrivateData: []byte("vault")}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-nodid", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: domain.DefaultTenantID, HolderDID: holder, CredentialIdentifier: "cred-1", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}))
+	require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+		TenantID: domain.DefaultTenantID, HolderDID: holder, PresentationIdentifier: "pres-1", Presentation: "jwt",
+	}))
+
+	n, err := svc.RevokeAllForUser(ctx, userActor(userID), domain.DefaultTenantID, userID, "deactivate")
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	creds, err := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, holder)
+	if err != nil {
+		require.True(t, errors.Is(err, storage.ErrNotFound), err)
+	}
+	assert.Empty(t, creds, "credentials stored under the user-id fallback are erased")
+	pres, err := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, holder)
+	if err != nil {
+		require.True(t, errors.Is(err, storage.ErrNotFound), err)
+	}
+	assert.Empty(t, pres, "presentations stored under the user-id fallback are erased")
 }
 
 func TestWalletLifecycle_RevokeAllForUser(t *testing.T) {

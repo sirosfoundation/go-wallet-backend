@@ -166,17 +166,25 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, userID dom
 		s.logger.Warn("failed to load user for wallet erasure", zap.Error(err))
 		return
 	}
+	// PrivateData is the encrypted vault; Keys is the legacy key blob some
+	// registrations still upload. Both are key material and both go.
 	user.PrivateData = nil
 	user.PrivateDataETag = ""
+	user.Keys = nil
 	user.UpdatedAt = time.Now()
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		s.logger.Warn("failed to clear private data", zap.Error(err))
 	}
 
-	if user.DID != "" {
-		for _, tid := range s.tenantsForErasure(ctx, userID) {
-			s.eraseHolderData(ctx, tid, user.DID)
-		}
+	// Credentials and presentations are keyed by holder DID, and the API
+	// handlers (getHolderDID) fall back to the user id for users without a
+	// DID - so erase under the same identity they were stored under.
+	holder := user.DID
+	if holder == "" {
+		holder = userID.String()
+	}
+	for _, tid := range s.tenantsForErasure(ctx, userID) {
+		s.eraseHolderData(ctx, tid, holder)
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		s.logger.Warn("failed to delete challenges", zap.Error(err))

@@ -1804,22 +1804,30 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	if len(instances) == 0 {
 		return nil
 	}
+	// Decide deactivation first: when nothing live remains, the answer is
+	// "wallet deactivated" for every passkey, including one linked to a
+	// revoked instance - telling that user "use another device" would be
+	// wrong, since no device can log in any more.
 	anyLive := false
+	var linked *domain.WalletInstance
 	for _, inst := range instances {
-		if inst.CredentialID != "" && inst.CredentialID == credentialID {
-			switch inst.Status {
-			case domain.InstanceStatusSuspended:
-				return ErrWalletInstanceSuspended
-			case domain.InstanceStatusRevoked:
-				return ErrWalletInstanceRevoked
-			}
-		}
 		if inst.Status != domain.InstanceStatusRevoked {
 			anyLive = true
+		}
+		if linked == nil && inst.CredentialID != "" && inst.CredentialID == credentialID {
+			linked = inst
 		}
 	}
 	if !anyLive {
 		return ErrWalletDeactivated
+	}
+	if linked != nil {
+		switch linked.Status {
+		case domain.InstanceStatusSuspended:
+			return ErrWalletInstanceSuspended
+		case domain.InstanceStatusRevoked:
+			return ErrWalletInstanceRevoked
+		}
 	}
 	return nil
 }

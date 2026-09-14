@@ -337,7 +337,17 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
 		case errors.Is(err, storage.ErrNotFound):
-			// First attestation for this instance key — nothing to check yet.
+			// First attestation for this instance key. A fresh key must not
+			// revive a deactivated wallet: once every instance of the user is
+			// revoked its data has been erased and a new enrollment is required
+			// (SID-AUTH-06). Deleting sessions does not invalidate an access
+			// token already issued, so this is where that token is stopped
+			// from registering a new active instance.
+			if userID != nil {
+				if err := s.refuseIfWalletDeactivated(ctx, tenantID, *userID); err != nil {
+					return "", err
+				}
+			}
 		default:
 			return "", fmt.Errorf("check wallet instance status: %w", err)
 		}
@@ -627,6 +637,31 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	}
 
 	return tokenString, nil
+}
+
+// refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
+// has wallet instances in the tenant and every one of them is revoked - the
+// same "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
+// login for. A user with no instances yet, or with a suspended (reactivatable)
+// one, may attest a new key.
+func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) error {
+	instances, err := s.instances.GetByUser(ctx, tenantID, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	for _, inst := range instances {
+		if inst.Status != domain.InstanceStatusRevoked {
+			return nil
+		}
+	}
+	s.emitAuditFailure("wallet_deactivated", errors.New("every wallet instance of the user is revoked"))
+	return fmt.Errorf("%w: wallet deactivated, every instance is revoked", ErrWIAInstanceDeactivated)
 }
 
 // CleanupExpiredChallenges removes expired challenges from the store.

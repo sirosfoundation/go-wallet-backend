@@ -64,6 +64,15 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		assert.ErrorIs(t, err, ErrWalletInstanceRevoked, "deactivation is a kind of revocation for callers that do not distinguish")
 	})
 
+	t.Run("every instance revoked: the linked passkey is told deactivated, not merely revoked", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)
+		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusRevoked)
+		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
+		assert.ErrorIs(t, err, ErrWalletDeactivated,
+			"no device can log in any more, so the refusal must not suggest using another one")
+	})
+
 	t.Run("linked instance revoked while another is live is not deactivation", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)
