@@ -2,7 +2,7 @@ package statuslist
 
 import (
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"encoding/base64"
 	"io"
 	"testing"
@@ -20,11 +20,14 @@ func TestEmptyCompressedList_DecodesToAllZero(t *testing.T) {
 			t.Fatalf("lst is not valid base64url: %v", err)
 		}
 
-		r := flate.NewReader(bytes.NewReader(compressed))
+		r, err := zlib.NewReader(bytes.NewReader(compressed))
+		if err != nil {
+			t.Fatalf("lst is not valid ZLIB data: %v", err)
+		}
 		defer r.Close()
 		raw, err := io.ReadAll(r)
 		if err != nil {
-			t.Fatalf("lst does not decompress as raw DEFLATE: %v", err)
+			t.Fatalf("lst does not decompress as ZLIB: %v", err)
 		}
 
 		wantLen := (n + 7) / 8
