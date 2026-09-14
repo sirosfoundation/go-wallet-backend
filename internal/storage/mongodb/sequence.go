@@ -13,14 +13,16 @@ import (
 // the new value, creating the counter on first use. The update must return
 // the document *after* the increment: with the driver default (before) the
 // first two callers on a fresh database both receive 1 and the second insert
-// fails with a duplicate _id.
+// fails with a duplicate _id. The increment operand is an explicit int64 so
+// that the upsert creates the counter as a 64-bit integer matching the ID
+// fields, rather than the int32 an untyped literal would encode to.
 func nextSequence(ctx context.Context, counters *mongo.Collection, key string) (int64, error) {
 	var doc struct {
 		Value int64 `bson:"value"`
 	}
 	err := counters.FindOneAndUpdate(ctx,
 		bson.M{"_id": key},
-		bson.M{"$inc": bson.M{"value": 1}},
+		bson.M{"$inc": bson.M{"value": int64(1)}},
 		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
 	).Decode(&doc)
 	if err != nil {
