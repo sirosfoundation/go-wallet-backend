@@ -556,9 +556,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	// from the x5c signing certificate, verified against the Trusted List
 	// for Wallet Providers (ETSI TS 119 472-3 AUTH-REQ-PROC-4.4.3-01 /
 	// TOKEN-REQ-PROC-4.5.2-01).
-	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF && s.cfg.WalletProvider.WIA.Issuer != "" {
-		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
-	}
+	claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
