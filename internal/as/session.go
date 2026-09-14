@@ -64,10 +64,11 @@ type SessionStore interface {
 	// Delete removes a session (for cleanup of expired sessions).
 	Delete(ctx context.Context, jti string) error
 	// DeleteByUser revokes every session of a user. It satisfies
-	// service.SessionCleaner, so account deletion and wallet-instance
-	// suspension/revocation drop AS sessions the same way they drop engine
-	// sessions. Sessions are marked revoked rather than removed so a
-	// request still holding the cookie is told "revoked", not "not found".
+	// service.SessionCleaner, so whatever holds the cleaner (today
+	// UserService.DeleteUser, via the wiring in cmd/server) drops AS
+	// sessions the same way it drops engine sessions. Sessions are marked
+	// revoked rather than removed so a request still holding the cookie is
+	// told "revoked", not "not found".
 	DeleteByUser(ctx context.Context, userID string) error
 }
 
