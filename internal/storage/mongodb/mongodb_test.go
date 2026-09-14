@@ -635,3 +635,17 @@ func TestNewStore_TLSErrors(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to load MongoDB client certificate")
 	})
 }
+
+// On a fresh database the counter must hand out 1, 2, 3, ...: with the
+// driver's default "return the document before the update" the first two
+// callers both got 1 and the second insert failed with a duplicate _id.
+func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	counters := store.database.Collection("counters")
+	for want := int64(1); want <= 3; want++ {
+		got, err := nextSequence(ctx, counters, "test_seq")
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+}
