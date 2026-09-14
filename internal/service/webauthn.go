@@ -54,12 +54,18 @@ type WebAuthnService struct {
 var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
 
 // ErrWalletInstanceSuspended and ErrWalletInstanceRevoked refuse a login whose
-// passkey belongs to a suspended or revoked wallet instance, or whose wallet
-// has been deactivated (every instance revoked) - SID-AUTH-06 login gate, see
-// checkWalletLifecycle and WalletLifecycleService.
+// passkey belongs to a suspended or revoked wallet instance - SID-AUTH-06
+// login gate, see checkWalletLifecycle and WalletLifecycleService.
+//
+// ErrWalletDeactivated refuses every passkey of a wallet whose instances have
+// all been revoked (the wallet data has been erased and a new enrollment is
+// required). It wraps ErrWalletInstanceRevoked, so callers that only tell
+// "suspended" from "revoked" keep working; callers that want to tell the user
+// whether other devices can still log in check for ErrWalletDeactivated first.
 var (
 	ErrWalletInstanceSuspended = errors.New("wallet instance suspended")
 	ErrWalletInstanceRevoked   = errors.New("wallet instance revoked")
+	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
 )
 
 // NewWebAuthnService creates a new WebAuthnService
@@ -1813,7 +1819,7 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 		}
 	}
 	if !anyLive {
-		return ErrWalletInstanceRevoked
+		return ErrWalletDeactivated
 	}
 	return nil
 }

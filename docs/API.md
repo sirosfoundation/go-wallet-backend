@@ -153,10 +153,12 @@ share one lifecycle: `active` → `suspended` (reversible) or `revoked`
 (terminal), `suspended` → `active` or `revoked`. Any change away from `active`
 drops the user's live sessions and refuses new WIAs for that instance. Login with
 the passkey linked to a suspended or revoked instance is refused with `403
-WALLET_SUSPENDED` / `WALLET_REVOKED`. Revoking the last non-revoked instance
+WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
+still log in. Revoking the last non-revoked instance
 deactivates the wallet: the encrypted private data, server-side credentials,
 presentations and pending challenges are erased, every passkey of the user is
-refused at login, and a new enrollment is required.
+refused at login (`403 WALLET_REVOKED`), and a new enrollment is required. The
+`message` field of the 403 tells the two cases apart for the user.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
 credential id as `credential_id` to `POST /wallet-provider/wia/generate`.

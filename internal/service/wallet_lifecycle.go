@@ -174,7 +174,14 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, userID dom
 	}
 
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
-	if err != nil || len(tenantIDs) == 0 {
+	if err != nil {
+		// Erasure must not stop here, but a failed membership lookup means
+		// credentials in other tenants may survive: say so loudly.
+		s.logger.Error("failed to list tenant memberships for wallet erasure; only the default tenant will be erased",
+			zap.String("user_id", userID.String()), zap.Error(err))
+		tenantIDs = nil
+	}
+	if len(tenantIDs) == 0 {
 		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
 	}
 	if user.DID != "" {

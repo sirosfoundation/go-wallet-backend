@@ -282,10 +282,10 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
-		case errors.Is(err, service.ErrWalletInstanceSuspended):
-			c.JSON(403, gin.H{"error": "WALLET_SUSPENDED", "message": "This wallet instance has been suspended"})
-		case errors.Is(err, service.ErrWalletInstanceRevoked):
-			c.JSON(403, gin.H{"error": "WALLET_REVOKED", "message": "This wallet has been deactivated; a new enrollment is required"})
+		case errors.Is(err, service.ErrWalletInstanceSuspended),
+			errors.Is(err, service.ErrWalletInstanceRevoked):
+			code, message := lifecycleRefusal(err)
+			c.JSON(403, gin.H{"error": code, "message": message})
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
 		case errors.Is(err, service.ErrIdentityNotBound):
@@ -1316,4 +1316,19 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 		}
 	}
 	return resp
+}
+
+// lifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
+// and a user-facing message. The code only says suspended or revoked (that is
+// what clients switch on); the message tells the user whether other devices
+// still work or the whole wallet is gone and must be re-enrolled.
+func lifecycleRefusal(err error) (code, message string) {
+	switch {
+	case errors.Is(err, service.ErrWalletInstanceSuspended):
+		return "WALLET_SUSPENDED", "This wallet instance has been suspended"
+	case errors.Is(err, service.ErrWalletDeactivated):
+		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
+	default:
+		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet can still be used"
+	}
 }

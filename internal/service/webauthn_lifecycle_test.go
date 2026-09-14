@@ -59,6 +59,17 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "", domain.InstanceStatusRevoked)
 		seedLifecycleInstance(t, s, "i2", userID, "", domain.InstanceStatusRevoked)
-		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-new"), ErrWalletInstanceRevoked)
+		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-new")
+		assert.ErrorIs(t, err, ErrWalletDeactivated)
+		assert.ErrorIs(t, err, ErrWalletInstanceRevoked, "deactivation is a kind of revocation for callers that do not distinguish")
+	})
+
+	t.Run("linked instance revoked while another is live is not deactivation", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)
+		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
+		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
+		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
+		assert.NotErrorIs(t, err, ErrWalletDeactivated, "the user can still log in from the other device")
 	})
 }
