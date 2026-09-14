@@ -343,10 +343,8 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			// (SID-AUTH-06). Deleting sessions does not invalidate an access
 			// token already issued, so this is where that token is stopped
 			// from registering a new active instance.
-			if userID != nil {
-				if err := s.refuseIfWalletDeactivated(ctx, tenantID, *userID); err != nil {
-					return "", err
-				}
+			if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
+				return "", err
 			}
 		default:
 			return "", fmt.Errorf("check wallet instance status: %w", err)
@@ -643,9 +641,13 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 // has wallet instances in the tenant and every one of them is revoked - the
 // same "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
 // login for. A user with no instances yet, or with a suspended (reactivatable)
-// one, may attest a new key.
-func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) error {
-	instances, err := s.instances.GetByUser(ctx, tenantID, userID)
+// one, may attest a new key; an anonymous attestation (nil userID) has no
+// wallet to check.
+func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
+	if userID == nil {
+		return nil
+	}
+	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
