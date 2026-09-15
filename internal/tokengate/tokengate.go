@@ -11,8 +11,11 @@ package tokengate
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -67,15 +70,30 @@ func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) err
 	return nil
 }
 
-// IssuedAt extracts the iat claim from a JWT without verifying it. Callers
-// must have verified the token already; this only reads a claim the
-// verification library did not surface. The zero time means "no iat".
+// IssuedAt reads the iat claim out of a compact JWS/JWT without verifying
+// it. Callers must have verified the token already (go-tokenauth surfaces
+// no iat in its result); this only decodes the payload segment, it performs
+// no signature or claim validation of its own. The zero time means "no iat".
 func IssuedAt(raw string) time.Time {
-	var claims jwt.RegisteredClaims
-	if _, _, err := jwt.NewParser().ParseUnverified(raw, &claims); err != nil || claims.IssuedAt == nil {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
 		return time.Time{}
 	}
-	return claims.IssuedAt.Time
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		IAT json.Number `json:"iat"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.IAT == "" {
+		return time.Time{}
+	}
+	f, err := claims.IAT.Float64()
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(int64(f), 0)
 }
 
 // IssuedAtFromClaims reads iat from already-parsed map claims.
