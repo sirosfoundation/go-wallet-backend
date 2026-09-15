@@ -2,9 +2,11 @@ package as
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
@@ -62,9 +64,13 @@ func NewASModule(
 		)
 	}
 
-	// Session store.
-	sessions := NewMemorySessionStore()
-	sessions.StartCleanup(ctx, 5*time.Minute)
+	// Session store: MongoDB when the storage backend is MongoDB (sessions
+	// survive restarts and are shared across instances, #324), memory
+	// otherwise, unless as.session_store says which.
+	sessions, err := newSessionStore(ctx, cfg, store, logger)
+	if err != nil {
+		return nil, err
+	}
 
 	// Policy engine.
 	var policy PolicyEngine
@@ -128,4 +134,44 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 	// Logout (requires session cookie).
 	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Config.InsecureCookies, m.Logger))
+}
+
+// mongoDatabaseProvider is implemented by the MongoDB storage backend.
+type mongoDatabaseProvider interface {
+	Database() *mongo.Database
+}
+
+// newSessionStore picks the SessionStore for cfg.SessionStore: "memory",
+// "mongodb", or "auto" (the default when empty) for "mongodb when the backend
+// is MongoDB, else memory".
+func newSessionStore(ctx context.Context, cfg *config.ASConfig, store storage.Store, logger *zap.Logger) (SessionStore, error) {
+	dbp, hasMongo := store.(mongoDatabaseProvider)
+	switch cfg.SessionStore {
+	case "", "auto":
+		if !hasMongo {
+			logger.Info("AS sessions: in-memory store (storage backend is not MongoDB; sessions do not survive restarts)")
+			return newMemorySessionStoreWithCleanup(ctx), nil
+		}
+	case "memory":
+		logger.Info("AS sessions: in-memory store (as.session_store=memory; sessions do not survive restarts)")
+		return newMemorySessionStoreWithCleanup(ctx), nil
+	case "mongodb":
+		if !hasMongo {
+			return nil, fmt.Errorf("as.session_store=mongodb requires the MongoDB storage backend")
+		}
+	default:
+		return nil, fmt.Errorf("as.session_store: unknown value %q (memory, mongodb, or auto)", cfg.SessionStore)
+	}
+	mongoStore, err := NewMongoSessionStore(ctx, dbp.Database())
+	if err != nil {
+		return nil, fmt.Errorf("as.session_store: %w", err)
+	}
+	logger.Info("AS sessions: MongoDB store")
+	return mongoStore, nil
+}
+
+func newMemorySessionStoreWithCleanup(ctx context.Context) *MemorySessionStore {
+	sessions := NewMemorySessionStore()
+	sessions.StartCleanup(ctx, 5*time.Minute)
+	return sessions
 }

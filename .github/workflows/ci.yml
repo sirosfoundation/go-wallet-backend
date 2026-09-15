@@ -15,6 +15,13 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # MongoDB-backed tests (internal/storage/mongodb, internal/as session
+    # store, WIA challenge store) skip themselves unless TEST_MONGODB is set;
+    # run them here so they count for coverage and catch regressions.
+    services:
+      mongodb:
+        image: mongo:7
+        ports: ["27017:27017"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -28,6 +35,8 @@ jobs:
         run: go mod download
 
       - name: Run tests
+        env:
+          TEST_MONGODB: "1"
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
       - name: Upload coverage
