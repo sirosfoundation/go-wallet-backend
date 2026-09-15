@@ -265,12 +265,14 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 
-		// Wire session store into UserService so DeleteUser purges active sessions,
-		// and into the wallet lifecycle service so suspending or revoking a
-		// wallet instance drops the user's live sessions (SID-AUTH-06).
+		// Wire the engine's session cleaner into UserService so DeleteUser
+		// purges active sessions, and into the wallet lifecycle service so
+		// suspending or revoking a wallet instance drops the user's live
+		// sessions (SID-AUTH-06). The cleaner is the engine Manager, which
+		// closes the open WebSocket as well as deleting the persisted record.
 		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
-			backendProvider.Services().WalletLifecycle.SetSessionCleaner(provider.SessionStore())
+			backendProvider.Services().User.SetSessionCleaner(provider.SessionCleaner())
+			backendProvider.Services().WalletLifecycle.SetSessionCleaner(provider.SessionCleaner())
 		}
 	}
 

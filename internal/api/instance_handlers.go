@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -90,6 +91,15 @@ func (h *Handlers) UpdateMyWalletInstanceStatus(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: status must be active, suspended, or revoked"})
 		return
 	}
+	// The route needs TAC `w` for the reversible changes; `revoked` is
+	// terminal and runs the same destructive cascade as revoke-all (wallet
+	// data erasure once it is the last instance), so it additionally needs
+	// `d`, like revoke-all and credential deletion. Otherwise a write-only
+	// token could erase the wallet one instance at a time.
+	if req.Status == string(domain.InstanceStatusRevoked) && !tacAllows(c, "d") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+		return
+	}
 	inst, err := h.services.WalletLifecycle.ChangeStatus(c.Request.Context(), actor, tenantID, c.Param("instance_id"), domain.InstanceStatus(req.Status), req.Reason)
 	if err != nil {
 		switch {
@@ -107,6 +117,21 @@ func (h *Handlers) UpdateMyWalletInstanceStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"id": inst.ID, "status": string(inst.Status)})
+}
+
+// tacAllows reports whether the request's go-tokenauth TAC grants required.
+// Like requireTACIfEnforced it is a no-op under legacy AuthMiddleware, which
+// never sets tokenauth_result (there is no TAC concept there).
+func tacAllows(c *gin.Context, required string) bool {
+	v, ok := c.Get("tokenauth_result")
+	if !ok {
+		return true
+	}
+	result, ok := v.(*claims.Result)
+	if !ok || result == nil {
+		return true
+	}
+	return result.TAC.HasAll(required)
 }
 
 // bindOptionalJSON decodes an optional JSON body into dst. An empty body is

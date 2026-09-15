@@ -25,7 +25,8 @@ var (
 )
 
 // SessionCleaner can remove sessions for a user.
-// Implemented by engine.SessionStore (memory or Redis).
+// Implemented by engine.Manager (which also closes the live WebSocket) and
+// by engine.SessionStore (memory or Redis) for the persisted record alone.
 type SessionCleaner interface {
 	DeleteByUser(ctx context.Context, userID string) error
 }

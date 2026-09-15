@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -160,5 +161,53 @@ func TestRevokeAllMyWalletInstances_OptionalBody(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", nil))
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":1`) {
 		t.Fatalf("empty body: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// Revoking an instance is terminal and can erase the wallet, so under
+// go-tokenauth it needs TAC `d` on top of the route's `w`; suspend and
+// reactivate stay `w`-only, and legacy auth (no tokenauth_result) is unaffected.
+func TestUpdateMyWalletInstanceStatus_RevokeNeedsDeleteTAC(t *testing.T) {
+	handlers, router := setupLifecycleHandlers(t)
+	me := domain.UserIDFromString("user-123")
+	if err := handlers.store.Users().Create(context.Background(), &domain.User{UUID: me}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	seedUserInstance(t, handlers, "mine-1", me)
+	seedUserInstance(t, handlers, "mine-2", me)
+	withTAC := func(tac string) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			c.Set("user_id", "user-123")
+			c.Set("tokenauth_result", &claims.Result{UserID: "user-123", TAC: claims.TAC(tac)})
+			c.Next()
+		}
+	}
+	put := func(mw gin.HandlerFunc, id, status string) *httptest.ResponseRecorder {
+		r := gin.New()
+		r.PUT("/user/session/instances/:instance_id/status", mw, handlers.UpdateMyWalletInstanceStatus)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/user/session/instances/"+id+"/status", strings.NewReader(`{"status":"`+status+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		return w
+	}
+	_ = router
+
+	if w := put(withTAC("rw"), "mine-1", "suspended"); w.Code != http.StatusOK {
+		t.Fatalf("suspend with w: expected 200, got %d %s", w.Code, w.Body.String())
+	}
+	if w := put(withTAC("rw"), "mine-1", "revoked"); w.Code != http.StatusForbidden {
+		t.Fatalf("revoke with w only: expected 403, got %d %s", w.Code, w.Body.String())
+	}
+	inst, err := handlers.store.WalletInstances().GetByID(context.Background(), "mine-1")
+	if err != nil || inst.Status != domain.InstanceStatusSuspended {
+		t.Fatalf("a refused revocation must leave the instance untouched: %v %v", err, inst)
+	}
+	if w := put(withTAC("rwd"), "mine-1", "revoked"); w.Code != http.StatusOK {
+		t.Fatalf("revoke with d: expected 200, got %d %s", w.Code, w.Body.String())
+	}
+	// Legacy auth never sets tokenauth_result: no TAC concept, no extra gate.
+	if w := put(authMiddleware("user-123", "did:example:123"), "mine-2", "revoked"); w.Code != http.StatusOK {
+		t.Fatalf("revoke under legacy auth: expected 200, got %d %s", w.Code, w.Body.String())
 	}
 }

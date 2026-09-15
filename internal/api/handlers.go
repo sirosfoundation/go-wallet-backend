@@ -1320,8 +1320,10 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 
 // lifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
 // and a user-facing message. The code only says suspended or revoked (that is
-// what clients switch on); the message tells the user whether other devices
-// still work or the whole wallet is gone and must be re-enrolled.
+// what clients switch on); the message tells the user whether the other
+// devices keep their own status (a suspended sibling still needs
+// reactivation, so it does not promise they all log in) or the whole wallet
+// is gone and must be re-enrolled.
 func lifecycleRefusal(err error) (code, message string) {
 	switch {
 	case errors.Is(err, service.ErrWalletInstanceSuspended):
@@ -1329,6 +1331,6 @@ func lifecycleRefusal(err error) (code, message string) {
 	case errors.Is(err, service.ErrWalletDeactivated):
 		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
 	default:
-		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet can still be used"
+		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet are not affected"
 	}
 }

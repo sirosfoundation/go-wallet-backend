@@ -665,13 +665,16 @@ func (s *WIAService) wiaLifetime() time.Duration {
 	return lifetime
 }
 
-// checkInstanceBinding refuses a re-attestation that would move an existing
-// instance record to another tenant or user: Upsert overwrites tenant_id and
-// (when given) user_id, so without this a caller holding the instance key but
-// authenticated elsewhere could re-parent the lifecycle record out from under
-// its owner. The first user binding of an anonymously attested instance is
-// still allowed, as is an anonymous re-attestation of a bound instance (which
-// leaves user_id untouched).
+// checkInstanceBinding is the pre-signing ownership check for a
+// re-attestation: a caller holding the instance key but authenticated in
+// another tenant or as another user is refused before any WIA is signed.
+// It is not what keeps the record in place - both stores fix tenant_id at
+// insert and bind user_id once (Upsert never re-parents) - but it turns what
+// would otherwise be a silently ignored write into an explicit refusal, and
+// the read-back in signWIA covers the race where the binding lands between
+// this check and the write. The first user binding of an anonymously
+// attested instance is still allowed, as is an anonymous re-attestation of a
+// bound instance (which leaves user_id untouched).
 func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.TenantID, userID *domain.UserID) error {
 	if existing.TenantID != tenantID {
 		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)

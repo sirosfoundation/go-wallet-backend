@@ -153,6 +153,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
 			// Wallet instance lifecycle, self-service (SID-AUTH-06)
 			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ListMyWalletInstances)
+			// `w` covers suspend/reactivate; the handler additionally requires
+			// `d` when the target status is `revoked` (terminal, may erase).
 			session.PUT("/instances/:instance_id/status", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateMyWalletInstanceStatus)
 			session.POST("/instances/revoke-all", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.RevokeAllMyWalletInstances)
 		}
@@ -379,6 +381,14 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
+// SessionCleaner returns the cleaner that drops a user's engine sessions:
+// the Manager itself, which closes the live WebSocket and deletes the
+// persisted record, rather than the bare SessionStore, which only does the
+// latter (see Manager.DeleteByUser).
+func (p *EngineProvider) SessionCleaner() service.SessionCleaner {
+	return p.manager
+}
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
@@ -398,10 +408,14 @@ func (p *BackendProvider) TokenGate() *tokengate.Gate {
 
 // NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
 // engine that runs without the backend role in the same process. It opens
-// the configured storage backend read-only for user lookups. With no
-// persistent storage configured (memory) there is nothing to consult: the
-// caller gets a nil gate and must warn that pre-suspension tokens are not
-// cut off at the engine handshake in that deployment.
+// the configured storage backend exactly as the backend role does -
+// backend.New runs the store's startup initialization (Mongo default tenant
+// and index creation), so the database principal needs the same rights as
+// a backend instance; there is no read-only constructor - and then uses it
+// for user lookups only. With no persistent storage configured (memory)
+// there is nothing to consult: the caller gets a nil gate and must warn that
+// pre-suspension tokens are not cut off at the engine handshake in that
+// deployment.
 func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate.Gate, io.Closer, error) {
 	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
 		return nil, nil, nil

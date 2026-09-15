@@ -212,7 +212,10 @@ Change the status of one of the caller's instances.
 { "status": "suspended", "reason": "lost phone" }
 ```
 
-**Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `404` if the instance
+**Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `403` when the
+token's TAC lacks `d` and the target status is `revoked` (suspend and
+reactivate need `w`; revocation is terminal and may erase the wallet, so it
+needs `d` like `revoke-all`); `404` if the instance
 is not the caller's; `409 {"error": "invalid status transition"}` for an invalid
 transition (e.g. reactivating a revoked instance); `409 {"error":
 "ERASURE_INCOMPLETE", "id": ..., "status": "revoked"}` when the change was

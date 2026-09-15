@@ -734,6 +734,32 @@ func (m *Manager) GetSessionByUser(userID string) (*Session, error) {
 	return session, nil
 }
 
+// DeleteByUser drops the user's live WebSocket session as well as its
+// persisted record. It is the engine's service.SessionCleaner: SessionStore
+// alone only forgets the SessionData, while the Manager keeps the
+// authenticated Session and its socket in sessions/userIndex and would let an
+// already-connected client continue flows after its wallet instance was
+// suspended or revoked (SID-AUTH-06). Closing the connection ends the read
+// loop, which unregisters the session; the maps are cleared here as well so
+// the user is gone from the Manager the moment this returns.
+func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	m.sessionsMu.Lock()
+	if live, ok := m.userIndex[userID]; ok {
+		m.logger.Info("Closing live session for user", zap.String("user_id", userID))
+		_ = live.conn.Close()
+		delete(m.sessions, live.ID)
+		delete(m.userIndex, userID)
+	}
+	m.sessionsMu.Unlock()
+	if m.sessionStore == nil {
+		return nil
+	}
+	return m.sessionStore.DeleteByUser(ctx, userID)
+}
+
 // ListSessions returns all sessions for a tenant from the persistent store
 func (m *Manager) ListSessions(ctx context.Context, tenantID string) ([]*SessionData, error) {
 	if m.sessionStore == nil {
