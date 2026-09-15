@@ -498,7 +498,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		return &SecurityProperties{
 			KeyStorage:         []string{"iso_18045_basic"},
 			UserAuthentication: []string{"iso_18045_basic"},
-			Certification:      "none",
+			Certification:      "https://developers.siros.org/wallet/architecture/key-management",
 		}
 	}
 
@@ -518,7 +518,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.UserAuthentication = []string{"iso_18045_basic"}
 	}
 	if out.Certification == nil {
-		out.Certification = "none"
+		out.Certification = "https://developers.siros.org/wallet/architecture/key-management"
 	}
 	return out
 }
