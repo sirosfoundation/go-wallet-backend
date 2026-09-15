@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
 func seedWIAInstance(t *testing.T, instances interface {
@@ -86,5 +88,92 @@ func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsSuspended(t *testin
 	}
 	if len(byUser) != 3 {
 		t.Errorf("instances = %d, want 3 (the new key was recorded)", len(byUser))
+	}
+}
+
+// failingUpsertInstances makes Upsert fail: the instance record is the
+// enforcement boundary for suspension/revocation, so a WIA must not be
+// issued when it cannot be written.
+type failingUpsertInstances struct{ storage.WalletInstanceStore }
+
+func (failingUpsertInstances) Upsert(context.Context, *domain.WalletInstance) error {
+	return errors.New("db down")
+}
+
+func TestWIAService_GenerateWIA_FailsWhenInstanceCannotBeRecorded(t *testing.T) {
+	base := memory.NewStore().WalletInstances()
+	svc := newTestWIAServiceUsing(t, failingUpsertInstances{base})
+	ctx := context.Background()
+	uid := domain.UserIDFromString("user-record-fail")
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ := createTestPop(t, challenge)
+	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if err == nil || wia != "" {
+		t.Fatalf("expected no WIA when the instance record cannot be written, got wia=%q err=%v", wia, err)
+	}
+}
+
+// racingRevokeInstances simulates a wallet deactivation landing between
+// GenerateWIA's lifecycle check and the insert of the new instance: right
+// after the first Upsert it revokes every *other* instance of the user.
+type racingRevokeInstances struct {
+	storage.WalletInstanceStore
+	userID domain.UserID
+	fired  bool
+}
+
+func (r *racingRevokeInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if err := r.WalletInstanceStore.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	if r.fired {
+		return nil
+	}
+	r.fired = true
+	others, err := r.WalletInstanceStore.GetByUser(ctx, inst.TenantID, r.userID)
+	if err != nil {
+		return err
+	}
+	for _, o := range others {
+		if o.ID != inst.ID && o.Status != domain.InstanceStatusRevoked {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func TestWIAService_GenerateWIA_RevokesNewKeyWhenWalletDeactivatedMeanwhile(t *testing.T) {
+	uid := domain.UserIDFromString("user-racing")
+	base := memory.NewStore().WalletInstances()
+	seedWIAInstance(t, base, "old-key", uid, domain.InstanceStatusActive) // live at check time
+	racing := &racingRevokeInstances{WalletInstanceStore: base, userID: uid}
+	svc := newTestWIAServiceUsing(t, racing)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ := createTestPop(t, challenge)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("expected ErrWIAInstanceDeactivated after a concurrent deactivation, got %v", err)
+	}
+	byUser, err := base.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byUser) != 2 {
+		t.Fatalf("instances = %d, want 2 (old + the new one, both revoked)", len(byUser))
+	}
+	for _, inst := range byUser {
+		if inst.Status != domain.InstanceStatusRevoked {
+			t.Errorf("instance %s status = %s, want revoked: the new key must not stand as a live instance of a deactivated wallet", inst.ID, inst.Status)
+		}
 	}
 }

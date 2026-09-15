@@ -245,6 +245,11 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// SID-AUTH-06: tokens issued before a wallet suspension/revocation
+		// cannot open a new engine session (applies to both token paths).
+		if backendProvider != nil {
+			provider.SetTokenGate(backendProvider.TokenGate())
+		}
 		mgr.AddProvider(provider)
 
 		// Wire session store into UserService so DeleteUser purges active sessions,

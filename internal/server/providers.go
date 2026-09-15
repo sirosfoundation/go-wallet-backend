@@ -20,6 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -217,7 +218,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -293,7 +294,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -381,6 +382,17 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
+}
+
+// SetTokenGate passes the SID-AUTH-06 token cut-off check to the engine so a
+// token issued before a suspension/revocation cannot open a new session.
+func (p *EngineProvider) SetTokenGate(g *tokengate.Gate) {
+	p.manager.SetTokenGate(g)
+}
+
+// TokenGate returns the token cut-off check over this backend's user store.
+func (p *BackendProvider) TokenGate() *tokengate.Gate {
+	return tokengate.New(p.store.Users())
 }
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
@@ -590,7 +602,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -939,7 +951,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }

@@ -170,6 +170,18 @@ erasing data then fails, the status change stands and the request answers
 `409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
 re-runs the erasure, so the client retries until it gets `200`.
 
+Any change away from `active` also cuts off bearer tokens issued before it:
+legacy access and refresh tokens, and access tokens validated by the backend
+or accepted for a WebSocket handshake, are refused with `401` when their `iat`
+is not after the cut-off, even if they have not expired. Tokens obtained after
+a reactivation work normally.
+
+Revoked instances of a user are retained as lifecycle records: they are what
+keeps login and new attestations refused for that wallet. The admin API
+answers `409 REVOKED_INSTANCE_RETAINED` to `DELETE
+/admin/tenants/{id}/instances/{instance_id}` for such an instance; records
+without a user (stray attestation records) can still be deleted.
+
 The passkey link is recorded when the wallet passes its passkey's base64url
 credential id as `credential_id` to `POST /wallet-provider/wia/generate`.
 

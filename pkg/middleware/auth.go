@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -76,6 +79,7 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 
 // AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
 func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+	gate := tokengate.New(store.Users())
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
@@ -140,6 +144,13 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		if !ok {
 			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
 			c.Abort()
+			return
+		}
+
+		// SID-AUTH-06: refuse tokens issued before the user's wallet was
+		// suspended or revoked (sessions are dropped, but a stateless token
+		// would otherwise stay valid until it expires).
+		if !checkTokenGate(c, gate, userID, tokengate.IssuedAtFromClaims(claims), logger) {
 			return
 		}
 
@@ -235,4 +246,22 @@ func Logger(logger *zap.Logger, skipPaths ...string) gin.HandlerFunc {
 			zap.Int("status", c.Writer.Status()),
 		)
 	}
+}
+
+// checkTokenGate applies the SID-AUTH-06 token cut-off and writes the
+// response on refusal. It returns false when the request was aborted.
+func checkTokenGate(c *gin.Context, gate *tokengate.Gate, userID string, issuedAt time.Time, logger *zap.Logger) bool {
+	err := gate.Check(c.Request.Context(), userID, issuedAt)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, tokengate.ErrRevoked):
+		logger.Warn("Token issued before authorization cut-off", zap.String("user_id", userID))
+		c.JSON(401, gin.H{"error": "Token has been revoked"})
+	default:
+		logger.Error("Failed to check token authorization cut-off", zap.String("user_id", userID), zap.Error(err))
+		c.JSON(500, gin.H{"error": "Internal server error"})
+	}
+	c.Abort()
+	return false
 }

@@ -1340,6 +1340,15 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		return nil, ErrInvalidRefreshToken
 	}
 
+	// SID-AUTH-06: a refresh token issued before the wallet was suspended or
+	// revoked must not mint new access tokens.
+	if !user.AuthInvalidBefore.IsZero() {
+		if iat, ok := claims["iat"].(float64); !ok || !time.Unix(int64(iat), 0).After(user.AuthInvalidBefore) {
+			s.logger.Warn("Refresh token predates authorization cut-off", zap.String("user_id", userIDStr))
+			return nil, ErrInvalidRefreshToken
+		}
+	}
+
 	// Generate new access token
 	accessToken, err := s.generateToken(user, tenantID)
 	if err != nil {

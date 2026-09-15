@@ -70,6 +70,14 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 // suspend/revoke enforcement.
 func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletInstanceStore) {
 	t.Helper()
+	instances := memory.NewStore().WalletInstances()
+	return newTestWIAServiceUsing(t, instances), instances
+}
+
+// newTestWIAServiceUsing builds a WIA service over the given instance store,
+// so tests can inject a failing or racing store.
+func newTestWIAServiceUsing(t *testing.T, instances storage.WalletInstanceStore) *WIAService {
+	t.Helper()
 
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -99,10 +107,7 @@ func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletIn
 	if err != nil {
 		t.Fatal(err)
 	}
-	instances := memory.NewStore().WalletInstances()
-	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, nil, nil)
-
-	return svc, instances
+	return NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, nil, nil)
 }
 
 // createTestPop creates a WIA-PoP JWT for testing.

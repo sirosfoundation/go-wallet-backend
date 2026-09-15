@@ -314,6 +314,33 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	if t.After(user.AuthInvalidBefore) {
+		user.AuthInvalidBefore = t
+	}
+	return nil
+}
+
+func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+	user.Keys = nil
+	user.UpdatedAt = time.Now()
+	return nil
+}
+
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

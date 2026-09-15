@@ -416,3 +416,37 @@ func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
 		t.Fatalf("expected 409, got %d", w.Code)
 	}
 }
+
+// SID-AUTH-06: a revoked instance of a user is the tombstone that keeps the
+// login gate and WIA guard refusing the wallet; the admin API must not delete
+// it. Stray records without a user can still be removed.
+func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	seedInstance(t, h, "owned-revoked", "acme", &userID)
+	seedInstance(t, h, "stray-revoked", "acme", nil)
+	for _, id := range []string{"owned-revoked", "stray-revoked"} {
+		if err := store.WalletInstances().UpdateStatus(context.Background(), id, domain.InstanceStatusRevoked, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/owned-revoked", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeRevokedInstanceRetained) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeRevokedInstanceRetained, w.Code, w.Body.String())
+	}
+	if _, err := store.WalletInstances().GetByID(context.Background(), "owned-revoked"); err != nil {
+		t.Fatalf("the tombstone must still exist: %v", err)
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/stray-revoked", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("a revoked record without a user may be deleted, got %d %s", w.Code, w.Body.String())
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -634,4 +635,31 @@ func TestNewStore_TLSErrors(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to load MongoDB client certificate")
 	})
+}
+
+func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x", PrivateData: []byte("v"), PrivateDataETag: "e", Keys: []byte("k")}))
+
+	t2 := time.Now().Truncate(time.Millisecond)
+	t1 := t2.Add(-time.Hour)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1), "an older cut-off is a no-op ($max)")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(t2), "cut-off only moves forward: %v vs %v", u.AuthInvalidBefore, t2)
+
+	require.NoError(t, store.Users().ClearWalletData(ctx, uid))
+	u, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData)
+	assert.Empty(t, u.PrivateDataETag)
+	assert.Nil(t, u.Keys)
+	assert.Equal(t, "did:x", u.DID, "other fields untouched")
+	assert.True(t, u.AuthInvalidBefore.Equal(t2))
+
+	assert.ErrorIs(t, store.Users().ClearWalletData(ctx, domain.NewUserID()), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2), storage.ErrNotFound)
 }

@@ -36,7 +36,7 @@ func TestWalletInstanceStore_Upsert_KeepsFirstCredentialLink(t *testing.T) {
 	got, err = wis.GetByID(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, "pk-1", got.CredentialID, "first link wins; a later attestation cannot move it")
-	require.Equal(t, 3, got.AttestationCount, "the attestation itself is still recorded")
+	require.EqualValues(t, 3, got.AttestationCount, "the attestation itself is still recorded")
 
 	// A brand-new instance that presents a link on its first attestation gets it.
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id + "-2", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-9"}))

@@ -88,11 +88,18 @@ func (s *failUsers) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	return s.UserStore.GetByID(ctx, id)
 }
 
-func (s *failUsers) Update(ctx context.Context, u *domain.User) error {
-	if err := s.f.err("users.Update"); err != nil {
+func (s *failUsers) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	if err := s.f.err("users.ClearWalletData"); err != nil {
 		return err
 	}
-	return s.UserStore.Update(ctx, u)
+	return s.UserStore.ClearWalletData(ctx, id)
+}
+
+func (s *failUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	if err := s.f.err("users.InvalidateAuthBefore"); err != nil {
+		return err
+	}
+	return s.UserStore.InvalidateAuthBefore(ctx, id, t)
 }
 
 type failUserTenants struct {
@@ -326,7 +333,7 @@ func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 func TestWalletLifecycle_Erasure_StoreFailuresAreReportedAndRetryable(t *testing.T) {
 	ctx := context.Background()
 	for _, op := range []string{
-		"users.Update", "usertenants.GetUserTenants", "credentials.GetAllByHolder", "credentials.Delete",
+		"users.ClearWalletData", "users.InvalidateAuthBefore", "usertenants.GetUserTenants", "credentials.GetAllByHolder", "credentials.Delete",
 		"presentations.GetAllByHolder", "presentations.Delete", "challenges.DeleteByUserID",
 	} {
 		t.Run(op, func(t *testing.T) {

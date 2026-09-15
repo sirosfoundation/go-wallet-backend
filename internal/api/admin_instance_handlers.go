@@ -16,8 +16,9 @@ import (
 // Error strings shared by the admin instance handlers (kept identical to the
 // self-service handlers so clients see one vocabulary).
 const (
-	errMsgInstanceUpdateFailed    = "failed to update wallet instance"
-	errMsgInvalidStatusTransition = "invalid status transition"
+	errMsgInstanceUpdateFailed     = "failed to update wallet instance"
+	errMsgInvalidStatusTransition  = "invalid status transition"
+	errCodeRevokedInstanceRetained = "REVOKED_INSTANCE_RETAINED"
 )
 
 // ListWalletInstances returns all wallet instances for a tenant.
@@ -160,6 +161,19 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	}
 	if instance.TenantID != tenantID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+		return
+	}
+
+	// SID-AUTH-06: a revoked instance of a user is the record that keeps the
+	// login gate and the WIA guard refusing that wallet. Deleting it would
+	// make the user look never-enrolled and re-open both. Revocation is
+	// terminal, so the record stays as a tombstone; only instances without
+	// a user (stray attestation records) or non-revoked ones may be removed.
+	if instance.Status == domain.InstanceStatusRevoked && instance.UserID != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   errCodeRevokedInstanceRetained,
+			"message": "revoked wallet instances are retained as lifecycle records and cannot be deleted",
+		})
 		return
 	}
 

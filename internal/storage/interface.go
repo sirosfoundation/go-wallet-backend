@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -79,6 +80,16 @@ type UserStore interface {
 
 	// UpdatePrivateData updates user's private data with optimistic locking
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+
+	// InvalidateAuthBefore records that bearer tokens issued at or before t
+	// are no longer accepted for the user (see internal/tokengate). It only
+	// moves the cut-off forward and touches no other field.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+
+	// ClearWalletData erases the user's wallet key material - PrivateData,
+	// PrivateDataETag and Keys - as a field-scoped update, so a concurrent
+	// change to other fields (e.g. a passkey registration) is not overwritten.
+	ClearWalletData(ctx context.Context, id domain.UserID) error
 }
 
 // CredentialStore defines the interface for credential storage operations

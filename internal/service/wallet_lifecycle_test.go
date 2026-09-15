@@ -174,3 +174,19 @@ func TestWalletLifecycle_OwnershipAndTransitions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, user.PrivateData, "the single instance was revoked, so the wallet is deactivated")
 }
+
+// SID-AUTH-06: any change away from active also cuts off bearer tokens that
+// were issued before it, since dropping sessions does not invalidate them.
+func TestWalletLifecycle_StatusChangeCutsOffIssuedTokens(t *testing.T) {
+	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+	ctx := context.Background()
+	before := time.Now()
+
+	_, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	require.NoError(t, err)
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.False(t, user.AuthInvalidBefore.IsZero(), "suspension records a token cut-off")
+	assert.False(t, user.AuthInvalidBefore.Before(before))
+	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "suspension still erases nothing")
+}

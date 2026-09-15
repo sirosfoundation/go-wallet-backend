@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
@@ -36,7 +37,11 @@ type TenantLookup interface {
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
+//
+// users may be nil; when set, tokens issued before the user's SID-AUTH-06
+// authorization cut-off (User.AuthInvalidBefore) are refused with 401.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
+	gate := tokengate.New(users)
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -52,6 +57,11 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			logger.Debug("Token validation failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
+			return
+		}
+
+		// SID-AUTH-06 token cut-off (anonymous tokens have no user and pass).
+		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
 

@@ -18,6 +18,7 @@ import (
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -122,6 +123,10 @@ type Manager struct {
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
 
+	// tokenGate refuses tokens issued before the user's SID-AUTH-06
+	// authorization cut-off (optional; see internal/tokengate).
+	tokenGate *tokengate.Gate
+
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
@@ -174,6 +179,13 @@ func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 // SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
+}
+
+// SetTokenGate wires the SID-AUTH-06 token cut-off check into handshake
+// authentication: a token issued before the user's wallet was suspended or
+// revoked cannot open a new engine session.
+func (m *Manager) SetTokenGate(g *tokengate.Gate) {
+	m.tokenGate = g
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -639,6 +651,9 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
+		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
+			return "", "", "", err
+		}
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
@@ -663,6 +678,9 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
+		}
+		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
+			return "", "", "", err
 		}
 		return userID, tenantID, "", nil
 	}

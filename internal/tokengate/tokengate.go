@@ -1,0 +1,90 @@
+// Package tokengate refuses bearer tokens that were issued before a user's
+// authorization was cut off by a wallet lifecycle event (SID-AUTH-06).
+//
+// Suspending or revoking a wallet instance drops the user's live sessions,
+// but a stateless bearer token that was already issued stays valid until it
+// expires - up to a day for legacy HMAC tokens, longer for refresh tokens.
+// The lifecycle service therefore records User.AuthInvalidBefore, and every
+// place that accepts a token for a user consults Gate.Check with the token's
+// iat: a token issued at or before that instant is refused.
+package tokengate
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+)
+
+// ErrRevoked is returned for a token issued before the user's authorization
+// was cut off.
+var ErrRevoked = errors.New("token issued before the user's authorization was revoked")
+
+// UserLookup is the subset of storage.UserStore the gate needs.
+type UserLookup interface {
+	GetByID(ctx context.Context, id domain.UserID) (*domain.User, error)
+}
+
+// Gate checks tokens against User.AuthInvalidBefore.
+type Gate struct {
+	users UserLookup
+}
+
+// New creates a Gate over the given user lookup. A nil lookup yields a nil
+// Gate, on which Check is a no-op, so callers can wire it optionally.
+func New(users UserLookup) *Gate {
+	if users == nil {
+		return nil
+	}
+	return &Gate{users: users}
+}
+
+// Check refuses a token for userID that was issued at or before the user's
+// AuthInvalidBefore. An empty userID (anonymous token) always passes, and so
+// does a user the store does not know: the gate only enforces lifecycle
+// cut-offs, it is not an existence check (handlers do that where it
+// matters). A token without a readable iat is refused once a cut-off exists,
+// since it cannot prove it postdates the cut-off.
+func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) error {
+	if g == nil || userID == "" {
+		return nil
+	}
+	user, err := g.users.GetByID(ctx, domain.UserIDFromString(userID))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check token authorization: %w", err)
+	}
+	if !user.AuthInvalidBefore.IsZero() && !issuedAt.After(user.AuthInvalidBefore) {
+		return ErrRevoked
+	}
+	return nil
+}
+
+// IssuedAt extracts the iat claim from a JWT without verifying it. Callers
+// must have verified the token already; this only reads a claim the
+// verification library did not surface. The zero time means "no iat".
+func IssuedAt(raw string) time.Time {
+	var claims jwt.RegisteredClaims
+	if _, _, err := jwt.NewParser().ParseUnverified(raw, &claims); err != nil || claims.IssuedAt == nil {
+		return time.Time{}
+	}
+	return claims.IssuedAt.Time
+}
+
+// IssuedAtFromClaims reads iat from already-parsed map claims.
+func IssuedAtFromClaims(claims jwt.MapClaims) time.Time {
+	switch v := claims["iat"].(type) {
+	case float64:
+		return time.Unix(int64(v), 0)
+	case int64:
+		return time.Unix(v, 0)
+	}
+	return time.Time{}
+}

@@ -356,6 +356,34 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	// $max only moves the cut-off forward, so two lifecycle events racing
+	// cannot roll it back.
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()},
+		bson.M{"$max": bson.M{"auth_invalid_before": t}})
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, bson.M{
+		"$unset": bson.M{"private_data": "", "private_data_etag": "", "keys": ""},
+		"$set":   bson.M{"updated_at": time.Now()},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to clear wallet data: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
 	filter := bson.M{"id.id": id.String()}
 	if ifMatch != "" {

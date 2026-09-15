@@ -24,7 +24,7 @@ var errStoreDown = errors.New("store down")
 // reads and status updates fail, to drive the handlers' 500 branches.
 type brokenInstanceStore struct {
 	storage.Store
-	failReads, failUpdates, failUserUpdate bool
+	failReads, failUpdates, failClearWalletData bool
 }
 
 func (b *brokenInstanceStore) Users() storage.UserStore { return &brokenUsers{b.Store.Users(), b} }
@@ -34,11 +34,11 @@ type brokenUsers struct {
 	b *brokenInstanceStore
 }
 
-func (u *brokenUsers) Update(ctx context.Context, user *domain.User) error {
-	if u.b.failUserUpdate {
+func (u *brokenUsers) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	if u.b.failClearWalletData {
 		return errStoreDown
 	}
-	return u.UserStore.Update(ctx, user)
+	return u.UserStore.ClearWalletData(ctx, id)
 }
 
 func (b *brokenInstanceStore) WalletInstances() storage.WalletInstanceStore {
@@ -189,7 +189,7 @@ func TestMyWalletInstances_ErasureIncompleteIs409AndRetryable(t *testing.T) {
 	seedUserInstance(t, h, "mine-2", me)
 	r := instanceRoutes(h, authMiddleware("user-123", "did:example:123"))
 
-	broken.failUserUpdate = true
+	broken.failClearWalletData = true
 	w := doJSON(r, http.MethodPut, "/user/session/instances/mine-1/status", `{"status":"suspended"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("suspend with a live sibling does not erase, so nothing fails: got %d %s", w.Code, w.Body.String())
@@ -203,7 +203,7 @@ func TestMyWalletInstances_ErasureIncompleteIs409AndRetryable(t *testing.T) {
 		t.Fatalf("retry via status on a revoked instance: expected 409 with status revoked, got %d %s", w.Code, w.Body.String())
 	}
 
-	broken.failUserUpdate = false
+	broken.failClearWalletData = false
 	w = doJSON(r, http.MethodPost, "/user/session/instances/revoke-all", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":0`) {
 		t.Fatalf("retry: expected 200 revoked=0, got %d %s", w.Code, w.Body.String())
@@ -227,7 +227,7 @@ func TestUpdateWalletInstanceStatus_LifecycleErasureIncompleteIs409(t *testing.T
 
 	r := gin.New()
 	r.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
-	broken.failUserUpdate = true
+	broken.failClearWalletData = true
 	w := doJSON(r, http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", `{"status":"revoked","reason":"compromised"}`)
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeErasureIncomplete) {
 		t.Fatalf("expected 409 %s, got %d %s", errCodeErasureIncomplete, w.Code, w.Body.String())

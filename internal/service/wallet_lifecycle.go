@@ -162,6 +162,13 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	}
 	userID := *inst.UserID
 	var errs []error
+	// Bearer tokens already issued outlive the sessions dropped below (legacy
+	// HMAC tokens for up to a day, refresh tokens longer); cut them off at
+	// this instant so a suspended or revoked instance cannot keep calling
+	// user-authorized endpoints. See internal/tokengate.
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("cut off issued tokens: %w", err))
+	}
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
@@ -222,11 +229,9 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
 		return errs
 	}
-	user.PrivateData = nil
-	user.PrivateDataETag = ""
-	user.Keys = nil
-	user.UpdatedAt = time.Now()
-	if err := s.store.Users().Update(ctx, user); err != nil {
+	// Field-scoped: a full-record Update from the user loaded above would
+	// overwrite anything written concurrently (e.g. a passkey registration).
+	if err := s.store.Users().ClearWalletData(ctx, userID); err != nil {
 		errs = append(errs, fmt.Errorf("clear private data: %w", err))
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
