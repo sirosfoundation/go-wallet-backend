@@ -15,12 +15,44 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-type fakeSessionCleaner struct{ users []string }
+type fakeSessionCleaner struct {
+	users []string
+	err   error // returned by DeleteByUser when set
+}
 
 func (f *fakeSessionCleaner) DeleteByUser(_ context.Context, userID string) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.users = append(f.users, userID)
 	return nil
 }
+
+// failAfterInstances lets the first UpdateStatus through and fails every
+// later one, so a revoke-all can be made to fail part-way through (the
+// memory store returns instances in no particular order).
+type failAfterInstances struct {
+	storage.WalletInstanceStore
+	allowed string
+}
+
+func (f *failAfterInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
+	if f.allowed == "" {
+		f.allowed = id
+	}
+	if id != f.allowed {
+		return errors.New("db down")
+	}
+	return f.WalletInstanceStore.UpdateStatus(ctx, id, st, reason)
+}
+
+// storeWithInstances swaps the wallet-instance store of a storage.Store.
+type storeWithInstances struct {
+	storage.Store
+	instances storage.WalletInstanceStore
+}
+
+func (s storeWithInstances) WalletInstances() storage.WalletInstanceStore { return s.instances }
 
 // lifecycleFixture seeds a user with private data, a pending challenge and
 // the given instances, all in the default tenant.
@@ -189,4 +221,42 @@ func TestWalletLifecycle_StatusChangeCutsOffIssuedTokens(t *testing.T) {
 	assert.False(t, user.AuthInvalidBefore.IsZero(), "suspension records a token cut-off")
 	assert.False(t, user.AuthInvalidBefore.Before(before))
 	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "suspension still erases nothing")
+}
+
+// A suspension whose cascade failed answers ErrErasureIncomplete; repeating
+// the same request (same target status) must re-run the cascade, not answer
+// success while the old sessions are still live.
+func TestWalletLifecycle_SuspendedRetryRerunsCascade(t *testing.T) {
+	svc, _, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive)
+	ctx := context.Background()
+	sc.err = errors.New("session store down")
+
+	inst, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	require.True(t, errors.Is(err, ErrErasureIncomplete), "got %v", err)
+	require.NotNil(t, inst)
+	assert.Equal(t, domain.InstanceStatusSuspended, inst.Status, "the status change itself is persisted")
+	assert.Empty(t, sc.users)
+
+	sc.err = nil
+	_, err = svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	require.NoError(t, err)
+	assert.Equal(t, []string{userID.String()}, sc.users, "the retry dropped the sessions")
+}
+
+// When revoke-all fails part-way, the instances already revoked must still
+// get their cascade (tokens cut off, sessions dropped) instead of staying live
+// until the retry; the not-yet-revoked instance keeps the erasure off.
+func TestWalletLifecycle_RevokeAllPartialFailureStillCascades(t *testing.T) {
+	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
+	ctx := context.Background()
+	svc.store = storeWithInstances{Store: store, instances: &failAfterInstances{WalletInstanceStore: store.WalletInstances()}}
+
+	n, err := svc.RevokeAllForUser(ctx, userActor(userID), domain.DefaultTenantID, userID, "deactivate")
+	require.Error(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, []string{userID.String()}, sc.users, "sessions dropped for the revocation that was persisted")
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.False(t, user.AuthInvalidBefore.IsZero(), "issued tokens cut off")
+	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "one instance is still active, so nothing is erased")
 }

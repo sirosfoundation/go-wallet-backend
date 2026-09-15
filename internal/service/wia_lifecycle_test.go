@@ -2,12 +2,18 @@ package service
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	jwkpkg "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
 func seedWIAInstance(t *testing.T, instances interface {
@@ -175,5 +181,147 @@ func TestWIAService_GenerateWIA_RevokesNewKeyWhenWalletDeactivatedMeanwhile(t *t
 		if inst.Status != domain.InstanceStatusRevoked {
 			t.Errorf("instance %s status = %s, want revoked: the new key must not stand as a live instance of a deactivated wallet", inst.ID, inst.Status)
 		}
+	}
+}
+
+// signTestPopWithKey signs a WIA-PoP for nonce with an existing instance key
+// (a re-attestation of the same instance) and returns it with the key's jkt.
+func signTestPopWithKey(t *testing.T, nonce string, key *ecdsa.PrivateKey) (pop, jkt string) {
+	t.Helper()
+	xBytes, yBytes := key.PublicKey.X.Bytes(), key.PublicKey.Y.Bytes()
+	for len(xBytes) < 32 {
+		xBytes = append([]byte{0}, xBytes...)
+	}
+	for len(yBytes) < 32 {
+		yBytes = append([]byte{0}, yBytes...)
+	}
+	jwk := map[string]interface{}{
+		"kty": "EC", "crv": "P-256",
+		"x": base64.RawURLEncoding.EncodeToString(xBytes),
+		"y": base64.RawURLEncoding.EncodeToString(yBytes),
+	}
+	var err error
+	if jkt, err = jwkpkg.Thumbprint(jwk); err != nil {
+		t.Fatalf("jwk.Thumbprint: %v", err)
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, &WIAPopClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "urn:wallet:instance:test",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+		Nonce: nonce,
+	})
+	token.Header["typ"] = "oauth-client-attestation-pop+jwt"
+	token.Header["jwk"] = jwk
+	if pop, err = token.SignedString(key); err != nil {
+		t.Fatalf("sign pop: %v", err)
+	}
+	return pop, jkt
+}
+
+// attestOnce runs a first attestation for uid in tenant and returns the
+// instance key so the same instance can re-attest.
+func attestOnce(t *testing.T, svc *WIAService, tenant domain.TenantID, uid *domain.UserID) *ecdsa.PrivateKey {
+	t.Helper()
+	ctx := context.Background()
+	challenge, _, err := svc.CreateChallenge(ctx, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, tenant, uid, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("first GenerateWIA: %v", err)
+	}
+	return key
+}
+
+// An existing instance record must not be re-parented: the same instance key
+// presented by another user, or from another tenant, is refused instead of
+// Upsert moving tenant_id/user_id out from under the original owner.
+func TestWIAService_GenerateWIA_RefusesInstanceBoundElsewhere(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+	owner := domain.UserIDFromString("user-owner")
+	other := domain.UserIDFromString("user-other")
+	key := attestOnce(t, svc, domain.DefaultTenantID, &owner)
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, jkt := signTestPopWithKey(t, challenge, key)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &other, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceNotOwned) {
+		t.Fatalf("re-attestation by another user: got err=%v, want ErrWIAInstanceNotOwned", err)
+	}
+
+	challenge, _, err = svc.CreateChallenge(ctx, "other-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ = signTestPopWithKey(t, challenge, key)
+	_, err = svc.GenerateWIA(ctx, "other-tenant", &owner, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceNotOwned) {
+		t.Fatalf("re-attestation from another tenant: got err=%v, want ErrWIAInstanceNotOwned", err)
+	}
+
+	got, err := instances.GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TenantID != domain.DefaultTenantID || got.UserID == nil || *got.UserID != owner {
+		t.Errorf("instance binding changed to tenant=%s user=%v; must stay with the original owner", got.TenantID, got.UserID)
+	}
+
+	// The owner re-attesting, and an anonymous re-attestation, stay allowed.
+	for _, uid := range []*domain.UserID{&owner, nil} {
+		challenge, _, err = svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pop, _ = signTestPopWithKey(t, challenge, key)
+		if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, uid, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+			t.Errorf("re-attestation by owner/anonymous (user=%v): %v", uid, err)
+		}
+	}
+}
+
+// revokeOnReattestInstances simulates a revocation landing between
+// GenerateWIA's status check and the instance write of a re-attestation:
+// when Upsert hits an existing record it first revokes that record.
+type revokeOnReattestInstances struct{ storage.WalletInstanceStore }
+
+func (r revokeOnReattestInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if _, err := r.WalletInstanceStore.GetByID(ctx, inst.ID); err == nil {
+		if err := r.WalletInstanceStore.UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+			return err
+		}
+	}
+	return r.WalletInstanceStore.Upsert(ctx, inst)
+}
+
+func TestWIAService_GenerateWIA_RefusesReattestationRevokedMeanwhile(t *testing.T) {
+	base := memory.NewStore().WalletInstances()
+	svc := newTestWIAServiceUsing(t, revokeOnReattestInstances{base})
+	ctx := context.Background()
+	uid := domain.UserIDFromString("user-reattest-race")
+	key := attestOnce(t, svc, domain.DefaultTenantID, &uid)
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, jkt := signTestPopWithKey(t, challenge, key)
+	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) || wia != "" {
+		t.Fatalf("re-attestation revoked mid-flight: got wia=%q err=%v, want no WIA and ErrWIAInstanceDeactivated", wia, err)
+	}
+	got, err := base.GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, want revoked preserved", got.Status)
 	}
 }

@@ -118,6 +118,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "INSTANCE_DEACTIVATED",
 				"message": "This wallet instance has been suspended or revoked",
 			})
+		case errors.Is(err, service.ErrWIAInstanceNotOwned):
+			h.logger.Warn("WIA generation refused: instance bound to another tenant or user", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "INSTANCE_NOT_OWNED",
+				"message": "This wallet instance is registered to another tenant or user",
+			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))
 			c.JSON(http.StatusInternalServerError, gin.H{

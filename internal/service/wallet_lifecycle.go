@@ -98,8 +98,10 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		return nil, err
 	}
 	if inst.Status == target {
-		if target == domain.InstanceStatusRevoked {
-			// Idempotent retry: finish an erasure that failed last time.
+		if target != domain.InstanceStatusActive {
+			// Idempotent retry: finish a cascade (token cut-off, session
+			// drop, erasure) that did not complete last time - for a
+			// suspension as much as for a revocation.
 			return inst, s.cascade(ctx, tenantID, inst)
 		}
 		return inst, nil
@@ -134,7 +136,15 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 			continue
 		}
 		if err := s.store.WalletInstances().UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, reason); err != nil {
-			return changed, fmt.Errorf("revoke instance %s: %w", inst.ID, err)
+			err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
+			if last != nil {
+				// Revocations already persisted in this loop must not keep
+				// their tokens and sessions until the retry: cascade for
+				// them now (the not-yet-revoked instance keeps the erasure
+				// off) and report the request as incomplete.
+				return changed, errors.Join(err, s.cascade(ctx, tenantID, last))
+			}
+			return changed, err
 		}
 		inst.Status = domain.InstanceStatusRevoked
 		s.emitAudit(inst.ID, domain.InstanceStatusRevoked, reason, actor)
