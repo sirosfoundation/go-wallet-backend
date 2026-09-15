@@ -2,7 +2,7 @@ package service
 
 import (
 	"bytes"
-	"compress/flate"
+	"compress/zlib"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -127,7 +127,10 @@ func TestRegisterWalletProviderStatusListRoute_ServesAllValidList(t *testing.T) 
 	if err != nil {
 		t.Fatalf("lst is not valid base64url: %v", err)
 	}
-	r := flate.NewReader(bytes.NewReader(compressed))
+	r, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatalf("lst is not a zlib stream: %v", err)
+	}
 	defer r.Close()
 	raw, err := io.ReadAll(r)
 	if err != nil {
