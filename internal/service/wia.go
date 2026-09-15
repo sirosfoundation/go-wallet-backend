@@ -479,24 +479,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool) (string, error) {
 	now := time.Now()
 
-	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
-	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
-	// client_status/revocation-chaining mechanism (see below); a short
-	// lifetime is the actual mechanism bounding exposure from a
-	// compromised/revoked wallet instance.
-	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
-	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
-	if maxExpiry <= 0 {
-		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
-	}
-	if lifetime <= 0 {
-		lifetime = maxExpiry
-		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
-			zap.Duration("lifetime", lifetime))
-	}
-	if lifetime > maxExpiry {
-		lifetime = maxExpiry
-	}
+	lifetime := s.wiaLifetime()
 
 	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
 	// claim MUST specify client_id value of the OAuth Client" - NOT the
@@ -654,6 +637,31 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	}
 
 	return tokenString, nil
+}
+
+// wiaLifetime is the WIA validity period: attestation.lifetime_seconds capped
+// by wia.max_expiry_seconds.
+func (s *WIAService) wiaLifetime() time.Duration {
+	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
+	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
+	// client_status/revocation-chaining mechanism (see the client_status
+	// claim in signWIA); a short
+	// lifetime is the actual mechanism bounding exposure from a
+	// compromised/revoked wallet instance.
+	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
+	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if maxExpiry <= 0 {
+		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
+	}
+	if lifetime <= 0 {
+		lifetime = maxExpiry
+		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
+			zap.Duration("lifetime", lifetime))
+	}
+	if lifetime > maxExpiry {
+		lifetime = maxExpiry
+	}
+	return lifetime
 }
 
 // refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
