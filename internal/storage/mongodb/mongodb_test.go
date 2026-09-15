@@ -663,3 +663,28 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	assert.ErrorIs(t, store.Users().ClearWalletData(ctx, domain.NewUserID()), storage.ErrNotFound)
 	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2), storage.ErrNotFound)
 }
+
+func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x", PrivateData: []byte("v")}))
+	stale, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+
+	// A record with no cut-off yet updates normally (missing field).
+	stale.DID = "did:y"
+	require.NoError(t, store.Users().Update(ctx, stale))
+
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond)))
+	require.NoError(t, store.Users().ClearWalletData(ctx, uid))
+	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite)
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData, "the stale copy must not restore erased data")
+	assert.False(t, u.AuthInvalidBefore.IsZero())
+
+	u.DID = "did:z"
+	require.NoError(t, store.Users().Update(ctx, u), "the fresh copy carries the cut-off and updates fine")
+	assert.ErrorIs(t, store.Users().Update(ctx, &domain.User{UUID: domain.NewUserID()}), storage.ErrNotFound)
+}

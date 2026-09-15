@@ -293,8 +293,12 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
+	existing, exists := s.data[user.UUID.String()]
+	if !exists {
 		return storage.ErrNotFound
+	}
+	if existing.AuthInvalidBefore.After(user.AuthInvalidBefore) {
+		return storage.ErrStaleWrite
 	}
 
 	user.UpdatedAt = time.Now()

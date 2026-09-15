@@ -14,6 +14,11 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrStaleWrite is returned by UserStore.Update when the stored record's
+	// lifecycle cut-off (User.AuthInvalidBefore) advanced after the caller
+	// loaded the record: writing the stale copy back would undo a wallet
+	// suspension/revocation. Callers reload and re-check the lifecycle state.
+	ErrStaleWrite = errors.New("stale write: the user's authorization changed since the record was loaded")
 )
 
 // TenantStore defines the interface for tenant storage operations
@@ -72,7 +77,10 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
+	// Update updates a user. It refuses (ErrStaleWrite) a record whose
+	// AuthInvalidBefore is older than the stored one, so a stale copy loaded
+	// before a suspension/revocation cannot roll back the cut-off or restore
+	// erased wallet data.
 	Update(ctx context.Context, user *domain.User) error
 
 	// Delete deletes a user

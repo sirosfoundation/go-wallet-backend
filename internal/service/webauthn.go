@@ -1113,9 +1113,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		)
 	}
 
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Error("Failed to update user", zap.Error(err))
-		// Don't fail login for this
+	if err := s.persistLoginState(ctx, user, tenantID, matchedCred.ID); err != nil {
+		return nil, err
 	}
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
@@ -1789,6 +1788,43 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 		}
 	}
 	return creds
+}
+
+// persistLoginState saves the login's sign-count update. The user record
+// was loaded before the SID-AUTH-06 gate ran; if a suspension or revocation
+// landed in between, the store refuses the stale copy (storage.ErrStaleWrite)
+// because writing it back would roll back the token cut-off and could
+// restore erased wallet data. The gate is then re-run on the fresh record:
+// a refusal aborts the login (no token is issued for a wallet that was just
+// suspended or revoked); otherwise the sign counts are re-applied to the
+// fresh record. Other persistence failures do not fail the login.
+func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.User, tenantID domain.TenantID, credentialID string) error {
+	err := s.store.Users().Update(ctx, user)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, storage.ErrStaleWrite) {
+		s.logger.Error("Failed to update user", zap.Error(err))
+		return nil // don't fail login for this
+	}
+	fresh, err := s.store.Users().GetByID(ctx, user.UUID)
+	if err != nil {
+		return fmt.Errorf("reload user after lifecycle change: %w", err)
+	}
+	if err := s.checkWalletLifecycle(ctx, tenantID, user.UUID, credentialID); err != nil {
+		return err
+	}
+	for i := range fresh.WebauthnCredentials {
+		for _, c := range user.WebauthnCredentials {
+			if fresh.WebauthnCredentials[i].ID == c.ID {
+				fresh.WebauthnCredentials[i].Authenticator.SignCount = c.Authenticator.SignCount
+			}
+		}
+	}
+	if err := s.store.Users().Update(ctx, fresh); err != nil {
+		s.logger.Error("Failed to update user after reload", zap.Error(err))
+	}
+	return nil
 }
 
 // checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).

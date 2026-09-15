@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -94,5 +96,43 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
 		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 		assert.NotErrorIs(t, err, ErrWalletDeactivated, "the user can still log in from the other device")
+	})
+}
+
+// A suspension or revocation that lands between the login gate and the
+// sign-count save must not be undone by the stale user record, and must
+// still refuse the login.
+func TestPersistLoginState_LifecycleChangeDuringLogin(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	s := &WebAuthnService{store: store, logger: zap.NewNop()}
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, PrivateData: []byte("vault"),
+		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}))
+	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+
+	loaded, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	stale := *loaded
+	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}}
+	stale.WebauthnCredentials[0].Authenticator.SignCount = 7
+
+	t.Run("no lifecycle change: the sign count is saved", func(t *testing.T) {
+		copyOf := stale
+		require.NoError(t, s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1"))
+		u, _ := store.Users().GetByID(ctx, userID)
+		assert.EqualValues(t, 7, u.WebauthnCredentials[0].Authenticator.SignCount)
+	})
+
+	t.Run("revoked during login: refused, erased data stays erased", func(t *testing.T) {
+		require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
+		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
+		require.NoError(t, store.Users().ClearWalletData(ctx, userID))
+		copyOf := stale // loaded before the revocation
+		err := s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1")
+		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
+		u, _ := store.Users().GetByID(ctx, userID)
+		assert.Nil(t, u.PrivateData, "the stale record must not restore the vault")
+		assert.False(t, u.AuthInvalidBefore.IsZero(), "the cut-off must not be rolled back")
 	})
 }

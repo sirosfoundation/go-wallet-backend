@@ -1957,3 +1957,37 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+// A record loaded before a lifecycle cut-off must not be written back: it
+// would roll back the cut-off and could restore erased wallet data.
+func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	stale, _ := store.Users().GetByID(ctx, uid)
+	staleCopy := *stale
+
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().ClearWalletData(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().Update(ctx, &staleCopy); err != storage.ErrStaleWrite {
+		t.Fatalf("expected ErrStaleWrite, got %v", err)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if u.PrivateData != nil || u.AuthInvalidBefore.IsZero() {
+		t.Fatalf("the stale copy must not have been written: %+v", u)
+	}
+
+	fresh, _ := store.Users().GetByID(ctx, uid)
+	freshCopy := *fresh
+	freshCopy.DID = "did:new"
+	if err := store.Users().Update(ctx, &freshCopy); err != nil {
+		t.Fatalf("a fresh copy updates fine: %v", err)
+	}
+}

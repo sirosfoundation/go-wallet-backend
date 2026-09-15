@@ -335,12 +335,27 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
+	// Whole-document replace, guarded so a copy loaded before a lifecycle
+	// cut-off (InvalidateAuthBefore) cannot write the old cut-off - or the
+	// erased wallet data - back: the filter only matches while the stored
+	// auth_invalid_before has not advanced past the caller's copy.
+	filter := bson.M{
+		"_id.id":              user.UUID.String(),
+		"auth_invalid_before": bson.M{"$not": bson.M{"$gt": user.AuthInvalidBefore}},
+	}
+	result, err := s.collection.ReplaceOne(ctx, filter, user)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
+		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": user.UUID.String()})
+		if err != nil {
+			return fmt.Errorf("failed to update user: %w", err)
+		}
+		if n == 0 {
+			return storage.ErrNotFound
+		}
+		return storage.ErrStaleWrite
 	}
 	return nil
 }
