@@ -703,3 +703,23 @@ func TestUserStore_InvalidateAuthBefore_ExemptJTI(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, u.AuthCutoffExemptJTI, "an admin change clears the exemption")
 }
+
+// On a fresh database the counter must hand out 1, 2, 3, ...: with the
+// driver's default "return the document before the update" the first two
+// callers both got 1 and the second insert failed with a duplicate _id.
+func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	counters := store.database.Collection("counters")
+	// Start from a known-absent counter so a rerun against a persistent
+	// MONGODB_TEST_URI (or after an interrupted run) still exercises the
+	// fresh-database path rather than continuing from a leftover value.
+	if _, err := counters.DeleteOne(ctx, bson.M{"_id": "test_seq"}); err != nil {
+		t.Fatalf("reset test_seq counter: %v", err)
+	}
+	for want := int64(1); want <= 3; want++ {
+		got, err := nextSequence(ctx, counters, "test_seq")
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+}
