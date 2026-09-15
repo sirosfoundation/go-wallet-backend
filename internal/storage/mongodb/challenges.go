@@ -73,28 +73,7 @@ type IssuerStore struct {
 }
 
 func (s *IssuerStore) getNextID(ctx context.Context) (int64, error) {
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "issuer_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "issuer_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "issuer_id")
 }
 
 func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssuer) error {
@@ -182,28 +161,7 @@ type VerifierStore struct {
 }
 
 func (s *VerifierStore) getNextID(ctx context.Context) (int64, error) {
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "verifier_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "verifier_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "verifier_id")
 }
 
 func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) error {
