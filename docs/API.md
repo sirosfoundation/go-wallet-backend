@@ -143,6 +143,95 @@ Finish WebAuthn registration.
 
 ---
 
+#### Wallet instance lifecycle (SID-AUTH-06)
+
+A wallet instance is one wallet installation, identified by the JWK thumbprint of
+its instance key and registered when it first obtains a Wallet Instance
+Attestation. A user can inspect and manage their own instances; a provider
+manages them through the admin API (`/admin/tenants/{id}/instances`). Both paths
+share one lifecycle: `active` → `suspended` (reversible) or `revoked`
+(terminal), `suspended` → `active` or `revoked`. Any change away from `active`
+drops the user's live sessions and refuses new WIAs for that instance. Login with
+the passkey linked to a suspended or revoked instance is refused with `403
+WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
+still log in.
+
+Wallet instances are per tenant. Revoking the last non-revoked instance of a
+user in a tenant deactivates the wallet in that tenant: the credentials and
+presentations held there are erased, every passkey of the user is refused at
+login in that tenant (`403 WALLET_REVOKED`), and a new enrollment is required.
+The `message` field of the 403 tells the two cases apart for the user. The
+user-level data shared across tenants - the encrypted private data (the
+custodian of the wallet's keys) and pending challenges - is erased once no
+non-revoked instance remains in any tenant the user belongs to.
+
+The status change is recorded before the cascade runs. If dropping sessions or
+erasing data then fails, the status change stands and the request answers
+`409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
+re-runs the erasure, so the client retries until it gets `200`.
+
+Any change away from `active` also cuts off bearer tokens issued before it:
+legacy access and refresh tokens, and access tokens validated by the backend
+or accepted for a WebSocket handshake, are refused with `401` when their `iat`
+is not after the cut-off, even if they have not expired. The one exception is
+the token that made the self-service request: it stays valid, so the user can
+reactivate a suspended instance or repeat a request after `409
+ERASURE_INCOMPLETE` from the same session. Admin-initiated changes exempt no
+token. Tokens obtained after a reactivation work normally. A login or token
+refresh that races with a lifecycle change is refused rather than handed a
+token that would be rejected on first use.
+
+An engine deployed without the backend role in the same process enforces the
+cut-off only when persistent storage is configured; with memory storage it
+logs a warning at startup and relies on the token lifetime.
+
+Revoked instances of a user are retained as lifecycle records: they are what
+keeps login and new attestations refused for that wallet. The admin API
+answers `409 REVOKED_INSTANCE_RETAINED` to `DELETE
+/admin/tenants/{id}/instances/{instance_id}` for such an instance; records
+without a user (stray attestation records) can still be deleted.
+
+The passkey link is recorded when the wallet passes its passkey's base64url
+credential id as `credential_id` to `POST /wallet-provider/wia/generate`.
+
+##### GET /user/session/instances
+
+List the caller's wallet instances in the current tenant.
+
+**Response:**
+```json
+{ "instances": [ { "id": "<jkt>", "status": "active", "wscd_type": "native_android", "last_attested_at": "..." } ] }
+```
+
+##### PUT /user/session/instances/{instance_id}/status
+
+Change the status of one of the caller's instances.
+
+**Request:**
+```json
+{ "status": "suspended", "reason": "lost phone" }
+```
+
+**Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `403` when the
+token's TAC lacks `d` and the target status is `revoked` (suspend and
+reactivate need `w`; revocation is terminal and may erase the wallet, so it
+needs `d` like `revoke-all`); `404` if the instance
+is not the caller's; `409 {"error": "invalid status transition"}` for an invalid
+transition (e.g. reactivating a revoked instance); `409 {"error":
+"ERASURE_INCOMPLETE", "id": ..., "status": "revoked"}` when the change was
+recorded but the erasure must be retried.
+
+##### POST /user/session/instances/revoke-all
+
+Deactivate the wallet: revoke every instance of the caller and erase the wallet
+data.
+
+**Request (optional):** `{ "reason": "device stolen" }`
+
+**Response:** `200 {"revoked": 2}`; `409 {"error": "ERASURE_INCOMPLETE",
+"revoked": 2}` when the instances were revoked but the erasure must be retried
+(repeat the request; it answers `200 {"revoked": 0}` once complete).
+
 ### Credential Management
 
 All credential endpoints require authentication.

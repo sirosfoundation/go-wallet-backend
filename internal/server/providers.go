@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -149,6 +151,12 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
+			// Wallet instance lifecycle, self-service (SID-AUTH-06)
+			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ListMyWalletInstances)
+			// `w` covers suspend/reactivate; the handler additionally requires
+			// `d` when the target status is `revoked` (terminal, may erase).
+			session.PUT("/instances/:instance_id/status", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateMyWalletInstanceStatus)
+			session.POST("/instances/revoke-all", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.RevokeAllMyWalletInstances)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
@@ -213,7 +221,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -289,7 +297,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -373,10 +381,50 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
+// SessionCleaner returns the cleaner that drops a user's engine sessions:
+// the Manager itself, which closes the live WebSocket and deletes the
+// persisted record, rather than the bare SessionStore, which only does the
+// latter (see Manager.DeleteByUser).
+func (p *EngineProvider) SessionCleaner() service.SessionCleaner {
+	return p.manager
+}
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
+}
+
+// SetTokenGate passes the SID-AUTH-06 token cut-off check to the engine so a
+// token issued before a suspension/revocation cannot open a new session.
+func (p *EngineProvider) SetTokenGate(g *tokengate.Gate) {
+	p.manager.SetTokenGate(g)
+}
+
+// TokenGate returns the token cut-off check over this backend's user store.
+func (p *BackendProvider) TokenGate() *tokengate.Gate {
+	return tokengate.New(p.store.Users())
+}
+
+// NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
+// engine that runs without the backend role in the same process. It opens
+// the configured storage backend exactly as the backend role does -
+// backend.New runs the store's startup initialization (Mongo default tenant
+// and index creation), so the database principal needs the same rights as
+// a backend instance; there is no read-only constructor - and then uses it
+// for user lookups only. With no persistent storage configured (memory)
+// there is nothing to consult: the caller gets a nil gate and must warn that
+// pre-suspension tokens are not cut off at the engine handshake in that
+// deployment.
+func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate.Gate, io.Closer, error) {
+	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
+		return nil, nil, nil
+	}
+	store, err := backend.New(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open storage for token gate: %w", err)
+	}
+	return tokengate.New(store.Users()), store, nil
 }
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
@@ -586,7 +634,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }
@@ -642,6 +690,10 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	if svcs := p.Services(); svcs != nil {
+		// Admin status changes share the self-service cascade (SID-AUTH-06).
+		adminHandlers.SetLifecycle(svcs.WalletLifecycle)
+	}
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -931,7 +983,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
 	}
 	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
 }

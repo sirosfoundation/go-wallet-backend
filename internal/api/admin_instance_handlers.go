@@ -9,7 +9,16 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+)
+
+// Error strings shared by the admin instance handlers (kept identical to the
+// self-service handlers so clients see one vocabulary).
+const (
+	errMsgInstanceUpdateFailed     = "failed to update wallet instance"
+	errMsgInvalidStatusTransition  = "invalid status transition"
+	errCodeRevokedInstanceRetained = "REVOKED_INSTANCE_RETAINED"
 )
 
 // ListWalletInstances returns all wallet instances for a tenant.
@@ -76,7 +85,7 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 			return
 		}
 		h.logger.Error("failed to get wallet instance", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
 		return
 	}
 	if instance.TenantID != tenantID {
@@ -86,7 +95,29 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 
 	status := domain.InstanceStatus(req.Status)
 	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition", "current": string(instance.Status), "target": string(status)})
+		c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition, "current": string(instance.Status), "target": string(status)})
+		return
+	}
+
+	if h.lifecycle != nil {
+		// Shared lifecycle service: same transition rules, audit and cascade
+		// (session drop, wallet erasure on last revocation) as self-service.
+		if _, err := h.lifecycle.ChangeStatus(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, instanceID, status, req.Reason); err != nil {
+			switch {
+			case errors.Is(err, service.ErrErasureIncomplete):
+				h.logger.Error("wallet instance status changed but cascade incomplete", zap.Error(err))
+				c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "id": instanceID, "status": req.Status, "message": errMsgErasureIncomplete})
+			case errors.Is(err, storage.ErrNotFound):
+				c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			case errors.Is(err, domain.ErrInvalidStatusTransition):
+				c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition})
+			default:
+				h.logger.Error("failed to update wallet instance status", zap.Error(err))
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
+			}
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"id": instanceID, "status": req.Status})
 		return
 	}
 
@@ -96,11 +127,11 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, domain.ErrInvalidStatusTransition) {
-			c.JSON(http.StatusConflict, gin.H{"error": "invalid status transition"})
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition})
 			return
 		}
 		h.logger.Error("failed to update wallet instance status", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update wallet instance"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
 		return
 	}
 
@@ -130,6 +161,19 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	}
 	if instance.TenantID != tenantID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+		return
+	}
+
+	// SID-AUTH-06: a revoked instance of a user is the record that keeps the
+	// login gate and the WIA guard refusing that wallet. Deleting it would
+	// make the user look never-enrolled and re-open both. Revocation is
+	// terminal, so the record stays as a tombstone; only instances without
+	// a user (stray attestation records) or non-revoked ones may be removed.
+	if instance.Status == domain.InstanceStatusRevoked && instance.UserID != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   errCodeRevokedInstanceRetained,
+			"message": "revoked wallet instances are retained as lifecycle records and cannot be deleted",
+		})
 		return
 	}
 

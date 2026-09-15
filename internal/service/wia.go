@@ -29,6 +29,7 @@ var (
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
 	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
+	ErrWIAInstanceNotOwned     = errors.New("wallet instance is bound to another tenant or user")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -276,6 +277,12 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID, when provided, is the base64url WebAuthn credential id of
+	// the passkey this wallet instance logs in with. Recorded as
+	// WalletInstance.CredentialID so suspending or revoking the instance also
+	// refuses login with that passkey (SID-AUTH-06). Optional: without it the
+	// login gate still enforces whole-wallet deactivation.
+	CredentialID string `json:"credential_id,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -322,6 +329,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
+	firstAttestation := false
 	if s.instances != nil {
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
@@ -330,8 +338,21 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
+			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
+				s.emitAuditFailure("instance_binding_mismatch", err)
+				return "", err
+			}
 		case errors.Is(err, storage.ErrNotFound):
-			// First attestation for this instance key — nothing to check yet.
+			firstAttestation = true
+			// First attestation for this instance key. A fresh key must not
+			// revive a deactivated wallet: once every instance of the user is
+			// revoked its data has been erased and a new enrollment is required
+			// (SID-AUTH-06). Deleting sessions does not invalidate an access
+			// token already issued, so this is where that token is stopped
+			// from registering a new active instance.
+			if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
+				return "", err
+			}
 		default:
 			return "", fmt.Errorf("check wallet instance status: %w", err)
 		}
@@ -358,7 +379,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
+	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -457,27 +478,13 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
+// firstAttestation says the instance record did not exist when GenerateWIA
+// checked the lifecycle state; the record is then re-checked after it is
+// written, see below.
+func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool) (string, error) {
 	now := time.Now()
 
-	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
-	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
-	// client_status/revocation-chaining mechanism (see below); a short
-	// lifetime is the actual mechanism bounding exposure from a
-	// compromised/revoked wallet instance.
-	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
-	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
-	if maxExpiry <= 0 {
-		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
-	}
-	if lifetime <= 0 {
-		lifetime = maxExpiry
-		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
-			zap.Duration("lifetime", lifetime))
-	}
-	if lifetime > maxExpiry {
-		lifetime = maxExpiry
-	}
+	lifetime := s.wiaLifetime()
 
 	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
 	// claim MUST specify client_id value of the OAuth Client" - NOT the
@@ -601,14 +608,25 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			TenantID:          tenantID,
 			UserID:            userID,
 			Status:            domain.InstanceStatusActive,
+			CredentialID:      credentialID,
 			WSCDType:          wscdTypeFromAttestation(attestationSource),
 			AttestationSource: attestationSource,
 			LastAttestedAt:    now,
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
-		if err := s.instances.Upsert(context.Background(), instance); err != nil {
-			s.logger.Warn("failed to record wallet instance", zap.Error(err), zap.String("jkt", jkt[:8]+"..."))
+		// The instance record is the enforcement boundary for suspension and
+		// revocation (GenerateWIA's guard, the login gate, self-service), so a
+		// WIA must not be handed out for an instance we could not record.
+		if err := s.instances.Upsert(ctx, instance); err != nil {
+			s.emitAuditFailure("instance_record_failed", err)
+			return "", fmt.Errorf("record wallet instance: %w", err)
+		}
+		// The lifecycle checks in GenerateWIA ran before this write; a
+		// suspension, revocation or deactivation that landed in between must
+		// not let the already-signed WIA out.
+		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, firstAttestation); err != nil {
+			return "", err
 		}
 	}
 
@@ -620,6 +638,172 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	}
 
 	return tokenString, nil
+}
+
+// wiaLifetime is the WIA validity period: attestation.lifetime_seconds capped
+// by wia.max_expiry_seconds.
+func (s *WIAService) wiaLifetime() time.Duration {
+	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
+	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
+	// client_status/revocation-chaining mechanism (see the client_status
+	// claim in signWIA); a short
+	// lifetime is the actual mechanism bounding exposure from a
+	// compromised/revoked wallet instance.
+	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
+	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if maxExpiry <= 0 {
+		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
+	}
+	if lifetime <= 0 {
+		lifetime = maxExpiry
+		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
+			zap.Duration("lifetime", lifetime))
+	}
+	if lifetime > maxExpiry {
+		lifetime = maxExpiry
+	}
+	return lifetime
+}
+
+// checkInstanceBinding is the pre-signing ownership check for a
+// re-attestation: a caller holding the instance key but authenticated in
+// another tenant or as another user is refused before any WIA is signed.
+// It is not what keeps the record in place - both stores fix tenant_id at
+// insert and bind user_id once (Upsert never re-parents) - but it turns what
+// would otherwise be a silently ignored write into an explicit refusal, and
+// the read-back in signWIA covers the race where the binding lands between
+// this check and the write. The first user binding of an anonymously
+// attested instance is still allowed, as is an anonymous re-attestation of a
+// bound instance (which leaves user_id untouched).
+func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.TenantID, userID *domain.UserID) error {
+	if existing.TenantID != tenantID {
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if existing.UserID != nil && userID != nil && *existing.UserID != *userID {
+		return fmt.Errorf("%w: instance belongs to another user", ErrWIAInstanceNotOwned)
+	}
+	return nil
+}
+
+// recheckLifecycleAfterWrite closes the window between GenerateWIA's
+// lifecycle checks and the instance write. For a first attestation that is
+// the deactivated-wallet re-check (revokeIfWalletDeactivatedMeanwhile); for
+// a re-attestation the instance is read back, since a suspension or
+// revocation that landed in between is preserved by Upsert but the WIA has
+// already been signed and must not be handed out.
+func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt string, firstAttestation bool) error {
+	if firstAttestation {
+		if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
+			return err
+		}
+	}
+	inst, err := s.instances.GetByID(ctx, jkt)
+	if err != nil {
+		return fmt.Errorf("re-check wallet instance status: %w", err)
+	}
+	if inst.Status != domain.InstanceStatusActive {
+		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
+		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
+	}
+	// Upsert fixes tenant_id at insert and binds user_id only while the
+	// record has none, so if two first attestations of the same key raced
+	// (two tenants, or two users for an anonymous instance) the loser finds
+	// the record owned elsewhere here and gets no WIA.
+	if inst.TenantID != tenantID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was recorded in another tenant during attestation"))
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
+		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
+	return nil
+}
+
+// refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
+// has wallet instances in the tenant and every one of them is revoked - the
+// same "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
+// login for. A user with no instances yet, or with a suspended (reactivatable)
+// one, may attest a new key; an anonymous attestation (nil userID) has no
+// wallet to check.
+func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
+	if userID == nil {
+		return nil
+	}
+	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	for _, inst := range instances {
+		if inst.Status != domain.InstanceStatusRevoked {
+			return nil
+		}
+	}
+	s.emitAuditFailure("wallet_deactivated", errors.New("every wallet instance of the user is revoked"))
+	return fmt.Errorf("%w: wallet deactivated, every instance is revoked", ErrWIAInstanceDeactivated)
+}
+
+// revokeIfWalletDeactivatedMeanwhile is the post-insert half of the
+// first-attestation guard. When the user's other instances are all revoked
+// (and there is at least one, so this is a deactivated wallet rather than a
+// first enrollment), the freshly inserted instance is revoked again and the
+// attestation refused with ErrWIAInstanceDeactivated. A revocation that lands
+// after this check sees the new instance as live and does not erase; the
+// operator's revoke-all then covers it.
+func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, newID string) error {
+	if userID == nil {
+		return nil
+	}
+	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("re-check wallet lifecycle: %w", err)
+	}
+	others := 0
+	for _, inst := range instances {
+		if inst.ID == newID {
+			continue
+		}
+		others++
+		if inst.Status != domain.InstanceStatusRevoked {
+			return nil
+		}
+	}
+	if others == 0 {
+		return nil
+	}
+	const reason = "wallet deactivated during attestation"
+	alreadyRevoked := false
+	if err := s.instances.UpdateStatus(ctx, newID, domain.InstanceStatusRevoked, reason); err != nil {
+		// The only transition to revoked a store refuses is from revoked
+		// itself (the memory store treats it as a no-op, Mongo reports an
+		// invalid transition): a concurrent revoke-all already took the new
+		// record with it, which is the outcome this re-check is after.
+		if !errors.Is(err, domain.ErrInvalidStatusTransition) {
+			return fmt.Errorf("revoke instance of deactivated wallet: %w", err)
+		}
+		alreadyRevoked = true
+	}
+	if s.audit != nil && !alreadyRevoked {
+		// The same transition event the lifecycle service emits, so this
+		// revocation shows up in the standard stream and not only as a WIA
+		// issuance failure.
+		s.audit.EmitWithSubject(set.EventWIRevoked, newID, map[string]any{
+			"status": string(domain.InstanceStatusRevoked),
+			"reason": reason,
+			"actor":  "provider",
+		})
+	}
+	s.emitAuditFailure("wallet_deactivated", errors.New("wallet deactivated while the first attestation was in flight"))
+	return fmt.Errorf("%w: wallet deactivated during attestation", ErrWIAInstanceDeactivated)
 }
 
 // CleanupExpiredChallenges removes expired challenges from the store.

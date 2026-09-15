@@ -245,11 +245,34 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// SID-AUTH-06: tokens issued before a wallet suspension/revocation
+		// cannot open a new engine session (applies to both token paths).
+		if backendProvider != nil {
+			provider.SetTokenGate(backendProvider.TokenGate())
+		} else {
+			gateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			gate, closer, err := server.NewStandaloneTokenGate(gateCtx, backendCfg)
+			cancel()
+			switch {
+			case err != nil:
+				logger.Fatal("Failed to open storage for the engine token gate", zap.Error(err))
+			case gate == nil:
+				logger.Warn("Standalone engine without persistent storage: bearer tokens issued before a wallet suspension/revocation are not cut off at the WebSocket handshake; co-host the backend role or configure storage")
+			default:
+				provider.SetTokenGate(gate)
+				resources = append(resources, closer)
+			}
+		}
 		mgr.AddProvider(provider)
 
-		// Wire session store into UserService so DeleteUser purges active sessions
+		// Wire the engine's session cleaner into UserService so DeleteUser
+		// purges active sessions, and into the wallet lifecycle service so
+		// suspending or revoking a wallet instance drops the user's live
+		// sessions (SID-AUTH-06). The cleaner is the engine Manager, which
+		// closes the open WebSocket as well as deleting the persisted record.
 		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+			backendProvider.Services().User.SetSessionCleaner(provider.SessionCleaner())
+			backendProvider.Services().WalletLifecycle.SetSessionCleaner(provider.SessionCleaner())
 		}
 	}
 

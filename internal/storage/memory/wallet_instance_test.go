@@ -272,3 +272,80 @@ func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
 		t.Errorf("deactivation_reason should be empty, got %q", got.DeactivationReason)
 	}
 }
+
+func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	inst := &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}
+	if err := store.WalletInstances().Upsert(ctx, inst); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", domain.InstanceStatusSuspended, "x"); err != nil {
+		t.Fatal(err)
+	}
+	// A later attestation that now names the passkey records the link but
+	// must not reactivate the instance.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-1"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.WalletInstances().GetByID(ctx, "inst-cred")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CredentialID != "pk-1" {
+		t.Errorf("credential id not recorded: %q", got.CredentialID)
+	}
+	if got.Status != domain.InstanceStatusSuspended {
+		t.Errorf("status must be untouched by upsert, got %s", got.Status)
+	}
+	// An attestation without the id keeps the recorded link.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = store.WalletInstances().GetByID(ctx, "inst-cred")
+	if got.CredentialID != "pk-1" {
+		t.Errorf("credential id must persist, got %q", got.CredentialID)
+	}
+}
+
+// The first user binding of an anonymous instance wins; a later attestation
+// by another user must not re-parent the record.
+func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
+	store := NewStore().WalletInstances()
+	ctx := context.Background()
+	a, b := domain.UserIDFromString("user-a"), domain.UserIDFromString("user-b")
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, UserID: &a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, UserID: &b}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetByID(ctx, "anon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID == nil || *got.UserID != a {
+		t.Fatalf("user binding must stay with the first user, got %v", got.UserID)
+	}
+	if got.AttestationCount != 3 {
+		t.Fatalf("attestations still counted: %d", got.AttestationCount)
+	}
+}
+
+func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
+	store := NewStore().WalletInstances()
+	ctx := context.Background()
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "other", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetByID(ctx, "k")
+	if got.TenantID != "acme" {
+		t.Fatalf("tenant must not move on re-attestation, got %s", got.TenantID)
+	}
+}

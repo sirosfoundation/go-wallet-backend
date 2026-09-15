@@ -91,6 +91,18 @@ type User struct {
 	// User settings
 	OpenIDRefreshTokenMaxAge int64 `json:"openid_refresh_token_max_age,omitempty" bson:"openid_refresh_token_max_age,omitempty"`
 
+	// AuthInvalidBefore cuts off bearer tokens issued at or before this
+	// instant (SID-AUTH-06): set when a wallet instance is suspended or
+	// revoked, so stateless tokens that outlive the dropped sessions stop
+	// working too. Checked by internal/tokengate. Zero means no cut-off.
+	AuthInvalidBefore time.Time `json:"-" bson:"auth_invalid_before,omitempty"`
+	// AuthCutoffExemptJTI is the id of the one bearer token exempt from
+	// AuthInvalidBefore: the token that performed the lifecycle change. The
+	// user keeps that session to reactivate a suspended instance or to
+	// repeat a request after 409 ERASURE_INCOMPLETE; every other token
+	// issued before the cut-off is refused.
+	AuthCutoffExemptJTI string `json:"-" bson:"auth_cutoff_exempt_jti,omitempty"`
+
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 }

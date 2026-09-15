@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -13,6 +14,11 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrStaleWrite is returned by UserStore.Update when the stored record's
+	// lifecycle cut-off (User.AuthInvalidBefore) advanced after the caller
+	// loaded the record: writing the stale copy back would undo a wallet
+	// suspension/revocation. Callers reload and re-check the lifecycle state.
+	ErrStaleWrite = errors.New("stale write: the user's authorization changed since the record was loaded")
 )
 
 // TenantStore defines the interface for tenant storage operations
@@ -71,7 +77,10 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
+	// Update updates a user. It refuses (ErrStaleWrite) a record whose
+	// AuthInvalidBefore is older than the stored one, so a stale copy loaded
+	// before a suspension/revocation cannot roll back the cut-off or restore
+	// erased wallet data.
 	Update(ctx context.Context, user *domain.User) error
 
 	// Delete deletes a user
@@ -79,6 +88,18 @@ type UserStore interface {
 
 	// UpdatePrivateData updates user's private data with optimistic locking
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+
+	// InvalidateAuthBefore records that bearer tokens issued at or before t
+	// are no longer accepted for the user (see internal/tokengate), except
+	// the token with id exemptJTI (the one performing the lifecycle change;
+	// may be empty). It only moves the cut-off forward and touches no other
+	// field.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error
+
+	// ClearWalletData erases the user's wallet key material - PrivateData,
+	// PrivateDataETag and Keys - as a field-scoped update, so a concurrent
+	// change to other fields (e.g. a passkey registration) is not overwritten.
+	ClearWalletData(ctx context.Context, id domain.UserID) error
 }
 
 // CredentialStore defines the interface for credential storage operations
@@ -240,6 +261,8 @@ type InviteStore interface {
 // WalletInstanceStore defines the interface for wallet instance storage
 type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	// An existing instance keeps its Status (only UpdateStatus changes it) and its first
+	// non-empty CredentialID (the passkey link is client-supplied and must not be moved).
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.

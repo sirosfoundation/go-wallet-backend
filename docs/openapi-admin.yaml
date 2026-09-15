@@ -848,7 +848,12 @@ paths:
       tags:
         - Wallet Instances
       summary: Delete a wallet instance
-      description: Hard-deletes a wallet instance. Emits an audit event.
+      description: |
+        Hard-deletes a wallet instance and emits an audit event. A revoked
+        instance that belongs to a user is retained as a lifecycle record
+        (it keeps the login gate and WIA issuance refusing that wallet) and
+        cannot be deleted; only instances without a user or non-revoked
+        instances may be removed.
       operationId: deleteWalletInstance
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -858,6 +863,17 @@ paths:
           description: Instance deleted
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Revoked instance of a user is retained as a lifecycle record and
+            cannot be deleted (`error` is `REVOKED_INSTANCE_RETAINED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "REVOKED_INSTANCE_RETAINED"
+                message: "revoked wallet instances are retained as lifecycle records and cannot be deleted"
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -870,7 +886,11 @@ paths:
       summary: Update wallet instance status
       description: |
         Changes the status of a wallet instance (active, suspended, or revoked).
-        Emits an audit event for the status transition.
+        Emits an audit event for the status transition and runs the same
+        lifecycle cascade as self-service (session drop, token cut-off,
+        wallet-data erasure on the last revocation). If the cascade does not
+        complete, the status change is still recorded and the response is
+        409 `ERASURE_INCOMPLETE`; repeat the request to finish it.
       operationId: updateWalletInstanceStatus
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -910,6 +930,28 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Either the transition is not allowed from the current status
+            (`error` is `invalid status transition`; revoked is terminal), or
+            the status change was recorded but the lifecycle cascade did not
+            complete (`error` is `ERASURE_INCOMPLETE`; repeat the request).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidTransition:
+                  value:
+                    error: "invalid status transition"
+                    current: "revoked"
+                    target: "active"
+                erasureIncomplete:
+                  value:
+                    error: "ERASURE_INCOMPLETE"
+                    id: "instance-jkt"
+                    status: "revoked"
+                    message: "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':

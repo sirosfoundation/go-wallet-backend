@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -52,6 +53,21 @@ type WebAuthnService struct {
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
 var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
+
+// ErrWalletInstanceSuspended and ErrWalletInstanceRevoked refuse a login whose
+// passkey belongs to a suspended or revoked wallet instance - SID-AUTH-06
+// login gate, see checkWalletLifecycle and WalletLifecycleService.
+//
+// ErrWalletDeactivated refuses every passkey of a wallet whose instances have
+// all been revoked (the wallet data has been erased and a new enrollment is
+// required). It wraps ErrWalletInstanceRevoked, so callers that only tell
+// "suspended" from "revoked" keep working; callers that want to tell the user
+// whether other devices can still log in check for ErrWalletDeactivated first.
+var (
+	ErrWalletInstanceSuspended = errors.New("wallet instance suspended")
+	ErrWalletInstanceRevoked   = errors.New("wallet instance revoked")
+	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
+)
 
 // NewWebAuthnService creates a new WebAuthnService
 func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Logger) (*WebAuthnService, error) {
@@ -1074,6 +1090,14 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
+	// SID-AUTH-06 login gate: a suspended or revoked wallet instance must not
+	// be able to log in, and a deactivated wallet (all instances revoked) must
+	// require a fresh enrollment. Checked only after the assertion verified,
+	// so an attacker cannot probe lifecycle state with a forged assertion.
+	if err := s.checkWalletLifecycle(ctx, tenantID, userID, matchedCred.ID); err != nil {
+		return nil, err
+	}
+
 	// Update the credential's signature count
 	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
 	user.UpdatedAt = time.Now()
@@ -1090,9 +1114,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		)
 	}
 
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Error("Failed to update user", zap.Error(err))
-		// Don't fail login for this
+	if err := s.persistLoginState(ctx, user, tenantID, matchedCred.ID); err != nil {
+		return nil, err
 	}
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
@@ -1164,6 +1187,13 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	token, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+	// SID-AUTH-06: a suspension/revocation that landed after the gate ran
+	// (during the sign-count save or the OIDC checks) must not hand out a
+	// token that postdates its cut-off. Checked after minting, so a cut-off
+	// set at any later instant refuses the token by iat anyway.
+	if err := s.refuseIfCutOffSince(ctx, tenantID, userID, matchedCred.ID, token); err != nil {
+		return nil, err
 	}
 
 	// Generate refresh token (if enabled)
@@ -1317,10 +1347,24 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		return nil, ErrInvalidRefreshToken
 	}
 
+	// SID-AUTH-06: a refresh token issued before the wallet was suspended or
+	// revoked must not mint new access tokens.
+	if !user.AuthInvalidBefore.IsZero() {
+		if iat, ok := claims["iat"].(float64); !ok || !time.Unix(int64(iat), 0).After(user.AuthInvalidBefore) {
+			s.logger.Warn("Refresh token predates authorization cut-off", zap.String("user_id", userIDStr))
+			return nil, ErrInvalidRefreshToken
+		}
+	}
+
 	// Generate new access token
 	accessToken, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+	// SID-AUTH-06: a cut-off that landed while this request ran must not be
+	// beaten by a freshly minted token.
+	if fresh, err := s.store.Users().GetByID(ctx, userID); err != nil || !fresh.AuthInvalidBefore.IsZero() && !tokengate.IssuedAt(accessToken).After(fresh.AuthInvalidBefore) {
+		return nil, ErrInvalidRefreshToken
 	}
 
 	// Generate new refresh token (rotation for security)
@@ -1757,4 +1801,121 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 		}
 	}
 	return creds
+}
+
+// persistLoginState saves the login's sign-count update. The user record
+// was loaded before the SID-AUTH-06 gate ran; if a suspension or revocation
+// landed in between, the store refuses the stale copy (storage.ErrStaleWrite)
+// because writing it back would roll back the token cut-off and could
+// restore erased wallet data. The gate is then re-run on the fresh record:
+// a refusal aborts the login (no token is issued for a wallet that was just
+// suspended or revoked); otherwise the sign counts are re-applied to the
+// fresh record. Other persistence failures do not fail the login.
+func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.User, tenantID domain.TenantID, credentialID string) error {
+	err := s.store.Users().Update(ctx, user)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, storage.ErrStaleWrite) {
+		s.logger.Error("Failed to update user", zap.Error(err))
+		return nil // don't fail login for this
+	}
+	fresh, err := s.store.Users().GetByID(ctx, user.UUID)
+	if err != nil {
+		return fmt.Errorf("reload user after lifecycle change: %w", err)
+	}
+	if err := s.checkWalletLifecycle(ctx, tenantID, user.UUID, credentialID); err != nil {
+		return err
+	}
+	for i := range fresh.WebauthnCredentials {
+		for _, c := range user.WebauthnCredentials {
+			if fresh.WebauthnCredentials[i].ID == c.ID {
+				fresh.WebauthnCredentials[i].Authenticator.SignCount = c.Authenticator.SignCount
+			}
+		}
+	}
+	if err := s.store.Users().Update(ctx, fresh); err != nil {
+		s.logger.Error("Failed to update user after reload", zap.Error(err))
+	}
+	return nil
+}
+
+// refuseIfCutOffSince is the post-mint half of the login gate: if the user's
+// token cut-off is not before the token's iat, a lifecycle change landed
+// while the login was in flight. The gate is re-run for the precise refusal;
+// if it passes (the cut-off came from an instance unrelated to this passkey)
+// the login is still refused, because the token would be rejected by the
+// token gate on first use - the client simply logs in again.
+func (s *WebAuthnService) refuseIfCutOffSince(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID, token string) error {
+	fresh, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("re-check user after token issuance: %w", err)
+	}
+	if fresh.AuthInvalidBefore.IsZero() || tokengate.IssuedAt(token).After(fresh.AuthInvalidBefore) {
+		return nil
+	}
+	if err := s.checkWalletLifecycle(ctx, tenantID, userID, credentialID); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: authorization changed during login, please log in again", ErrVerificationFailed)
+}
+
+// checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).
+//
+// Two rules. The instance linked to this passkey (WalletInstance.CredentialID,
+// recorded when the wallet supplies credential_id at WIA generation) must be
+// active. And if the user has instances at all, at least one must be
+// non-revoked: when every instance is revoked the wallet has been deactivated
+// and WalletLifecycleService already erased its data, so every passkey of the
+// user is refused until a new enrollment. A suspended instance that is not
+// linked to this passkey does not block login - it is still blocked from
+// obtaining a WIA (WIAService), and the user must be able to log in from
+// another device to manage it. A user with no instances yet is unaffected.
+func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID string) error {
+	instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	// Decide deactivation first: when nothing live remains, the answer is
+	// "wallet deactivated" for every passkey, including one linked to a
+	// revoked instance - telling that user "use another device" would be
+	// wrong, since no device can log in any more.
+	//
+	// The store does not enforce that a passkey is linked to at most one
+	// instance, so every instance linked to this passkey is considered and
+	// the most restrictive status wins: a passkey that is also linked to a
+	// suspended or revoked instance is refused even if an active duplicate
+	// exists, rather than letting store ordering decide.
+	anyLive := false
+	linkedSuspended, linkedRevoked := false, false
+	for _, inst := range instances {
+		if inst.Status != domain.InstanceStatusRevoked {
+			anyLive = true
+		}
+		if inst.CredentialID == "" || inst.CredentialID != credentialID {
+			continue
+		}
+		switch inst.Status {
+		case domain.InstanceStatusSuspended:
+			linkedSuspended = true
+		case domain.InstanceStatusRevoked:
+			linkedRevoked = true
+		}
+	}
+	if !anyLive {
+		return ErrWalletDeactivated
+	}
+	if linkedRevoked {
+		return ErrWalletInstanceRevoked
+	}
+	if linkedSuspended {
+		return ErrWalletInstanceSuspended
+	}
+	return nil
 }

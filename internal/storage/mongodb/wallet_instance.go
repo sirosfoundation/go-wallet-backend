@@ -22,7 +22,6 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	filter := bson.M{"_id": instance.ID}
 	update := bson.M{
 		"$set": bson.M{
-			"tenant_id":          instance.TenantID,
 			"attestation_source": instance.AttestationSource,
 			"last_attested_at":   instance.LastAttestedAt,
 			"updated_at":         instance.UpdatedAt,
@@ -30,17 +29,18 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		// Status is only ever set here for a brand-new document (via $setOnInsert).
 		// An existing instance's status must only change through UpdateStatus —
 		// otherwise a routine re-attestation would silently reactivate a
-		// suspended/revoked instance.
+		// suspended/revoked instance. The tenant is fixed at insert as well:
+		// wallet instances are per tenant, and a later attestation from
+		// another tenant must not move the lifecycle record (callers read the
+		// record back and refuse a mismatch, see WIAService.signWIA).
 		"$setOnInsert": bson.M{
 			"created_at": instance.CreatedAt,
 			"status":     instance.Status,
+			"tenant_id":  instance.TenantID,
 		},
 		"$inc": bson.M{
 			"attestation_count": 1,
 		},
-	}
-	if instance.UserID != nil {
-		update["$set"].(bson.M)["user_id"] = instance.UserID
 	}
 	if instance.DeviceInfo != nil {
 		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
@@ -50,6 +50,34 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
+	}
+
+	// The user binding is written only while the document has none, so two
+	// authenticated attestations of the same anonymous instance cannot both
+	// "win": the second one finds user_id already set and leaves it. Callers
+	// read the record back to learn who owns it (WIAService.signWIA).
+	if instance.UserID != nil {
+		bindFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
+			{"user_id": bson.M{"$exists": false}},
+			{"user_id": nil},
+		}}
+		if _, err := s.collection.UpdateOne(ctx, bindFilter, bson.M{"$set": bson.M{"user_id": instance.UserID}}); err != nil {
+			return fmt.Errorf("%w: bind wallet instance user: %v", storage.ErrDatabase, err)
+		}
+	}
+
+	// The passkey link is client-supplied, so only the first non-empty
+	// binding is recorded: the filter matches the document only while it has
+	// no credential_id, which makes "first link wins" atomic and stops a later
+	// attestation from moving the instance to another passkey.
+	if instance.CredentialID != "" {
+		linkFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
+			{"credential_id": bson.M{"$exists": false}},
+			{"credential_id": ""},
+		}}
+		if _, err := s.collection.UpdateOne(ctx, linkFilter, bson.M{"$set": bson.M{"credential_id": instance.CredentialID}}); err != nil {
+			return fmt.Errorf("%w: link wallet instance credential: %v", storage.ErrDatabase, err)
+		}
 	}
 	return nil
 }

@@ -335,12 +335,27 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
+	// Whole-document replace, guarded so a copy loaded before a lifecycle
+	// cut-off (InvalidateAuthBefore) cannot write the old cut-off - or the
+	// erased wallet data - back: the filter only matches while the stored
+	// auth_invalid_before has not advanced past the caller's copy.
+	filter := bson.M{
+		"_id.id":              user.UUID.String(),
+		"auth_invalid_before": bson.M{"$not": bson.M{"$gt": user.AuthInvalidBefore}},
+	}
+	result, err := s.collection.ReplaceOne(ctx, filter, user)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
+		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": user.UUID.String()})
+		if err != nil {
+			return fmt.Errorf("failed to update user: %w", err)
+		}
+		if n == 0 {
+			return storage.ErrNotFound
+		}
+		return storage.ErrStaleWrite
 	}
 	return nil
 }
@@ -351,6 +366,39 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
 	if result.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
+	// $max only moves the cut-off forward, so two lifecycle events racing
+	// cannot roll it back. The exempt token is the latest actor's.
+	update := bson.M{"$max": bson.M{"auth_invalid_before": t}}
+	if exemptJTI != "" {
+		update["$set"] = bson.M{"auth_cutoff_exempt_jti": exemptJTI}
+	} else {
+		update["$unset"] = bson.M{"auth_cutoff_exempt_jti": ""}
+	}
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, update)
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, bson.M{
+		"$unset": bson.M{"private_data": "", "private_data_etag": "", "keys": ""},
+		"$set":   bson.M{"updated_at": time.Now()},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to clear wallet data: %w", err)
+	}
+	if result.MatchedCount == 0 {
 		return storage.ErrNotFound
 	}
 	return nil

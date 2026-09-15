@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
 // stubTenantStore implements storage.TenantStore for testing.
@@ -127,7 +128,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -160,7 +161,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -178,7 +179,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -205,7 +206,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -230,7 +231,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -418,5 +419,48 @@ func TestExtractBearer(t *testing.T) {
 				t.Errorf("extractBearer() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// SID-AUTH-06: with a user lookup wired, a go-tokenauth token issued before
+// the user's authorization cut-off is refused.
+func TestTokenAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	// The cut-off is in the future relative to the token's iat (signToken
+	// uses "now"), so every token minted below predates it.
+	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(time.Minute), ""); err != nil {
+		t.Fatal(err)
+	}
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims: jwt.Claims{Subject: uid.String()}, TenantID: "test-tenant", TAC: "rwl",
+	})
+
+	r := gin.New()
+	r.Use(TokenAuthMiddleware(v, tenants, store.Users(), zap.NewNop()))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w, req)
+	if w.Code != 401 {
+		t.Fatalf("expected 401 for a token predating the cut-off, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Anonymous tokens carry no user and are not gated.
+	anon := signToken(t, key, issuer, claims.AccessTokenClaims{TenantID: "test-tenant", TAC: "r"})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+anon)
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("anonymous token must pass the gate, got %d: %s", w.Code, w.Body.String())
 	}
 }

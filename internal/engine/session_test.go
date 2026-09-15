@@ -25,7 +25,10 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -793,4 +796,80 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
+}
+
+// SID-AUTH-06: a token issued before the user's wallet was suspended or
+// revoked cannot open a new engine session.
+func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	mint := func(iat time.Time) string {
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": uid.String(), "tenant_id": "t", "iat": iat.Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte("test-secret"))
+		require.NoError(t, err)
+		return s
+	}
+	old := mint(time.Now().Add(-2 * time.Minute))
+	_, _, _, err := m.validateToken(old)
+	require.NoError(t, err, "no cut-off yet")
+
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute), ""))
+	_, _, _, err = m.validateToken(old)
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, _, _, err = m.validateToken(mint(time.Now()))
+	assert.NoError(t, err, "a token issued after the cut-off opens a session")
+}
+
+// Suspending or revoking a wallet instance must end the user's *live*
+// WebSocket session, not just forget its persisted record: the Manager is the
+// service.SessionCleaner precisely so an already-connected client cannot keep
+// running flows after the token gate would refuse a new handshake.
+func TestManager_DeleteByUser_ClosesLiveSessionAndStoreRecord(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+
+	upgrader := websocket.Upgrader{}
+	registered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		m.registerSession(&Session{ID: "sess-1", UserID: "user-1", TenantID: "t", conn: conn, flows: map[string]*Flow{}, logger: zap.NewNop(), closeCh: make(chan struct{}, 1)})
+		close(registered)
+		// Keep the server side of the socket alive until the test ends.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	defer func() { _ = ws.Close() }()
+	<-registered
+
+	_, err = m.GetSessionByUser("user-1")
+	require.NoError(t, err)
+	stored, err := store.GetByUser(context.Background(), "user-1")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "registerSession persists the record")
+
+	require.NoError(t, m.DeleteByUser(context.Background(), "user-1"))
+
+	_, err = m.GetSessionByUser("user-1")
+	assert.ErrorIs(t, err, ErrSessionNotFound, "live session gone from the Manager")
+	_, err = store.GetByUser(context.Background(), "user-1")
+	assert.ErrorIs(t, err, ErrSessionNotFound, "persisted record gone from the store")
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = ws.ReadMessage()
+	assert.Error(t, err, "the client's socket was closed by DeleteByUser")
+
+	assert.NoError(t, m.DeleteByUser(context.Background(), "nobody"), "idempotent for unknown users")
 }

@@ -293,8 +293,12 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
+	existing, exists := s.data[user.UUID.String()]
+	if !exists {
 		return storage.ErrNotFound
+	}
+	if existing.AuthInvalidBefore.After(user.AuthInvalidBefore) {
+		return storage.ErrStaleWrite
 	}
 
 	user.UpdatedAt = time.Now()
@@ -311,6 +315,34 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	}
 
 	delete(s.data, id.String())
+	return nil
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	if t.After(user.AuthInvalidBefore) {
+		user.AuthInvalidBefore = t
+	}
+	user.AuthCutoffExemptJTI = exemptJTI
+	return nil
+}
+
+func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+	user.Keys = nil
+	user.UpdatedAt = time.Now()
 	return nil
 }
 
