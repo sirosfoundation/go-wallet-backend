@@ -773,10 +773,18 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 		return nil
 	}
 	const reason = "wallet deactivated during attestation"
+	alreadyRevoked := false
 	if err := s.instances.UpdateStatus(ctx, newID, domain.InstanceStatusRevoked, reason); err != nil {
-		return fmt.Errorf("revoke instance of deactivated wallet: %w", err)
+		// The only transition to revoked a store refuses is from revoked
+		// itself (the memory store treats it as a no-op, Mongo reports an
+		// invalid transition): a concurrent revoke-all already took the new
+		// record with it, which is the outcome this re-check is after.
+		if !errors.Is(err, domain.ErrInvalidStatusTransition) {
+			return fmt.Errorf("revoke instance of deactivated wallet: %w", err)
+		}
+		alreadyRevoked = true
 	}
-	if s.audit != nil {
+	if s.audit != nil && !alreadyRevoked {
 		// The same transition event the lifecycle service emits, so this
 		// revocation shows up in the standard stream and not only as a WIA
 		// issuance failure.

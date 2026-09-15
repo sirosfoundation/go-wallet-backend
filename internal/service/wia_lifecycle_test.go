@@ -184,6 +184,80 @@ func TestWIAService_GenerateWIA_RevokesNewKeyWhenWalletDeactivatedMeanwhile(t *t
 	}
 }
 
+// revokeAllRacingInstances models a revoke-all that lands between the
+// lifecycle check and the post-insert re-check and takes the new record with
+// it. Its UpdateStatus reports revoked -> revoked as an invalid transition the
+// way the Mongo store does (the memory store treats it as a no-op).
+type revokeAllRacingInstances struct {
+	storage.WalletInstanceStore
+	userID domain.UserID
+	fired  bool
+}
+
+func (r *revokeAllRacingInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if err := r.WalletInstanceStore.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	if r.fired {
+		return nil
+	}
+	r.fired = true
+	all, err := r.WalletInstanceStore.GetByUser(ctx, inst.TenantID, r.userID)
+	if err != nil {
+		return err
+	}
+	for _, o := range all {
+		if o.Status != domain.InstanceStatusRevoked {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "revoke-all raced"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
+	cur, err := r.WalletInstanceStore.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if cur.Status == domain.InstanceStatusRevoked {
+		return domain.ErrInvalidStatusTransition
+	}
+	return r.WalletInstanceStore.UpdateStatus(ctx, id, status, reason)
+}
+
+// A revoke-all that wins the race and revokes the just-inserted instance
+// before the re-check gets to it must still surface as "wallet deactivated",
+// not as a generic WIA failure from the refused revoked -> revoked update.
+func TestWIAService_GenerateWIA_RevokeAllWinningRaceRefusesAsDeactivated(t *testing.T) {
+	uid := domain.UserIDFromString("user-revoke-all-raced")
+	base := memory.NewStore().WalletInstances()
+	seedWIAInstance(t, base, "old-key", uid, domain.InstanceStatusActive)
+	racing := &revokeAllRacingInstances{WalletInstanceStore: base, userID: uid}
+	svc := newTestWIAServiceUsing(t, racing)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ := createTestPop(t, challenge)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("expected ErrWIAInstanceDeactivated when a revoke-all already revoked the new instance, got %v", err)
+	}
+	byUser, err := base.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inst := range byUser {
+		if inst.Status != domain.InstanceStatusRevoked {
+			t.Errorf("instance %s status = %s, want revoked", inst.ID, inst.Status)
+		}
+	}
+}
+
 // signTestPopWithKey signs a WIA-PoP for nonce with an existing instance key
 // (a re-attestation of the same instance) and returns it with the key's jkt.
 func signTestPopWithKey(t *testing.T, nonce string, key *ecdsa.PrivateKey) (pop, jkt string) {
