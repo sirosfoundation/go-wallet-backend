@@ -455,3 +455,47 @@ func TestWIAService_GenerateWIA_LoserOfBindingRaceGetsNoWIA(t *testing.T) {
 		t.Fatalf("the instance must be bound to the winner: %v %v", err, all)
 	}
 }
+
+// tenantRaceInstances records the caller's brand-new instance in another
+// tenant right before the caller's own Upsert, simulating two first
+// attestations of the same key racing in two tenants.
+type tenantRaceInstances struct {
+	storage.WalletInstanceStore
+	fired bool
+}
+
+func (r *tenantRaceInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if !r.fired {
+		r.fired = true
+		clone := *inst
+		clone.TenantID = "other-tenant"
+		clone.UserID = nil
+		if err := r.WalletInstanceStore.Upsert(ctx, &clone); err != nil {
+			return err
+		}
+	}
+	return r.WalletInstanceStore.Upsert(ctx, inst)
+}
+
+func TestWIAService_GenerateWIA_LoserOfTenantRaceGetsNoWIA(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore().WalletInstances()
+	svc := newTestWIAServiceUsing(t, &tenantRaceInstances{WalletInstanceStore: base})
+	uid := domain.UserIDFromString("user-tenant-race")
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ := createTestPop(t, challenge)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceNotOwned) {
+		t.Fatalf("expected ErrWIAInstanceNotOwned when the record landed in another tenant, got %v", err)
+	}
+	mine, err := base.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if len(mine) != 0 {
+		t.Fatalf("no instance may exist for the loser in its tenant: %v", mine)
+	}
+}

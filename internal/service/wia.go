@@ -702,9 +702,14 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
 		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
 	}
-	// Upsert only binds user_id while the record has none, so if two
-	// authenticated attestations raced for an anonymous instance the loser
-	// finds another owner here and gets no WIA.
+	// Upsert fixes tenant_id at insert and binds user_id only while the
+	// record has none, so if two first attestations of the same key raced
+	// (two tenants, or two users for an anonymous instance) the loser finds
+	// the record owned elsewhere here and gets no WIA.
+	if inst.TenantID != tenantID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was recorded in another tenant during attestation"))
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
 	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
 		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
 		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)

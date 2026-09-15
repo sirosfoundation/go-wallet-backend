@@ -334,3 +334,18 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 		t.Fatalf("attestations still counted: %d", got.AttestationCount)
 	}
 }
+
+func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
+	store := NewStore().WalletInstances()
+	ctx := context.Background()
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "other", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetByID(ctx, "k")
+	if got.TenantID != "acme" {
+		t.Fatalf("tenant must not move on re-attestation, got %s", got.TenantID)
+	}
+}

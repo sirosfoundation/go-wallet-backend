@@ -20,9 +20,11 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 	defer s.mu.Unlock()
 
 	if existing, ok := s.data[instance.ID]; ok {
-		// Status is intentionally left untouched here — lifecycle changes only
-		// happen through UpdateStatus. Otherwise a routine re-attestation would
-		// silently reactivate a suspended/revoked instance.
+		// Status and tenant are intentionally left untouched here — lifecycle
+		// changes only happen through UpdateStatus, and an instance never
+		// moves tenant (see the Mongo implementation). Otherwise a routine
+		// re-attestation would silently reactivate a suspended/revoked
+		// instance or re-parent it.
 		existing.AttestationSource = instance.AttestationSource
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt

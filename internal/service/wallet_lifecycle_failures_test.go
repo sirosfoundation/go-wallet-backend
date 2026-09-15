@@ -23,6 +23,9 @@ var errBoom = errors.New("boom")
 type failStore struct {
 	storage.Store
 	fail map[string]bool
+
+	captureBeforeClear bool
+	captured           *domain.User
 }
 
 func newFailStore(ops ...string) *failStore {
@@ -91,6 +94,16 @@ func (s *failUsers) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 func (s *failUsers) ClearWalletData(ctx context.Context, id domain.UserID) error {
 	if err := s.f.err("users.ClearWalletData"); err != nil {
 		return err
+	}
+	if s.f.captureBeforeClear {
+		// A request that loaded the user after the first cut-off but before
+		// the clear: it carries the current cut-off and the intact vault.
+		u, err := s.UserStore.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		c := *u
+		s.f.captured = &c
 	}
 	return s.UserStore.ClearWalletData(ctx, id)
 }
@@ -410,4 +423,24 @@ func TestWalletLifecycle_RevokeAll_StoreErrors(t *testing.T) {
 	fs.fail["instances.GetByUser"] = true
 	_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
 	assert.ErrorIs(t, err, errBoom)
+}
+
+// A user record loaded between the token cut-off and the erasure must not be
+// able to write the erased vault back: the cascade advances the write fence
+// again after clearing.
+func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
+	ctx := context.Background()
+	fs := newFailStore()
+	fs.captureBeforeClear = true
+	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+
+	_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "stolen")
+	require.NoError(t, err)
+	require.NotNil(t, fs.captured, "the copy was taken inside the window")
+	require.NotNil(t, fs.captured.PrivateData, "and it still holds the vault")
+
+	assert.ErrorIs(t, fs.Store.Users().Update(ctx, fs.captured), storage.ErrStaleWrite)
+	u, _ := fs.Store.Users().GetByID(ctx, uid)
+	assert.Nil(t, u.PrivateData, "the erasure stands")
 }

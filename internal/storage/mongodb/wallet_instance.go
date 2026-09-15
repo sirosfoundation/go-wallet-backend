@@ -22,7 +22,6 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	filter := bson.M{"_id": instance.ID}
 	update := bson.M{
 		"$set": bson.M{
-			"tenant_id":          instance.TenantID,
 			"attestation_source": instance.AttestationSource,
 			"last_attested_at":   instance.LastAttestedAt,
 			"updated_at":         instance.UpdatedAt,
@@ -30,10 +29,14 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		// Status is only ever set here for a brand-new document (via $setOnInsert).
 		// An existing instance's status must only change through UpdateStatus —
 		// otherwise a routine re-attestation would silently reactivate a
-		// suspended/revoked instance.
+		// suspended/revoked instance. The tenant is fixed at insert as well:
+		// wallet instances are per tenant, and a later attestation from
+		// another tenant must not move the lifecycle record (callers read the
+		// record back and refuse a mismatch, see WIAService.signWIA).
 		"$setOnInsert": bson.M{
 			"created_at": instance.CreatedAt,
 			"status":     instance.Status,
+			"tenant_id":  instance.TenantID,
 		},
 		"$inc": bson.M{
 			"attestation_count": 1,

@@ -199,7 +199,7 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 			return s.incomplete(userID, errs) // something is still active or reactivatable
 		}
 	}
-	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
+	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID, actor.TokenJTI)...)
 	return s.incomplete(userID, errs)
 }
 
@@ -222,7 +222,7 @@ func (s *WalletLifecycleService) incomplete(userID domain.UserID, errs []error) 
 // when no non-revoked instance remains in any tenant the user belongs to.
 // The user record and its passkeys stay so the revocation remains attributable
 // and login can be refused with a clear reason rather than "user not found".
-func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) []error {
+func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, exemptJTI string) []error {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
@@ -248,6 +248,12 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// overwrite anything written concurrently (e.g. a passkey registration).
 	if err := s.store.Users().ClearWalletData(ctx, userID); err != nil {
 		errs = append(errs, fmt.Errorf("clear private data: %w", err))
+	} else if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), exemptJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		// Advance the write fence past the erasure: a user record loaded
+		// between the first cut-off and the clear carries the old cut-off
+		// and would otherwise pass UserStore.Update's stale check and write
+		// the erased data back.
+		errs = append(errs, fmt.Errorf("advance write fence after erasure: %w", err))
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		errs = append(errs, fmt.Errorf("delete challenges: %w", err))

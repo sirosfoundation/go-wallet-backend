@@ -68,3 +68,16 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, b, *got.UserID)
 }
+
+func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	id := "inst-tenant-fixed-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive}))
+	got, err := wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, domain.TenantID("acme"), got.TenantID, "tenant is fixed at insert")
+	require.EqualValues(t, 2, got.AttestationCount)
+}
