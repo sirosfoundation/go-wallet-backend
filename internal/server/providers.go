@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -393,6 +394,23 @@ func (p *EngineProvider) SetTokenGate(g *tokengate.Gate) {
 // TokenGate returns the token cut-off check over this backend's user store.
 func (p *BackendProvider) TokenGate() *tokengate.Gate {
 	return tokengate.New(p.store.Users())
+}
+
+// NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
+// engine that runs without the backend role in the same process. It opens
+// the configured storage backend read-only for user lookups. With no
+// persistent storage configured (memory) there is nothing to consult: the
+// caller gets a nil gate and must warn that pre-suspension tokens are not
+// cut off at the engine handshake in that deployment.
+func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate.Gate, io.Closer, error) {
+	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
+		return nil, nil, nil
+	}
+	store, err := backend.New(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open storage for token gate: %w", err)
+	}
+	return tokengate.New(store.Users()), store, nil
 }
 
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {

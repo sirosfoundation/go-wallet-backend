@@ -260,3 +260,32 @@ func TestWalletLifecycle_RevokeAllPartialFailureStillCascades(t *testing.T) {
 	assert.False(t, user.AuthInvalidBefore.IsZero(), "issued tokens cut off")
 	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "one instance is still active, so nothing is erased")
 }
+
+// The self-service token that requested the change is recorded as exempt
+// from the cut-off it triggers, so the user can reactivate or retry.
+func TestWalletLifecycle_ActorTokenIsExemptFromCutoff(t *testing.T) {
+	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+	ctx := context.Background()
+	actor := userActor(userID)
+	actor.TokenJTI = "session-1"
+
+	_, err := svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	require.NoError(t, err)
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.Equal(t, "session-1", user.AuthCutoffExemptJTI)
+
+	// Reactivation from the same session works (the handler's gate would let
+	// session-1 through), and reactivation itself does not touch the cut-off.
+	before := user.AuthInvalidBefore
+	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, "inst-a", domain.InstanceStatusActive, "found it")
+	require.NoError(t, err)
+	user, _ = store.Users().GetByID(ctx, userID)
+	assert.True(t, user.AuthInvalidBefore.Equal(before))
+
+	// An admin change carries no session token: no exemption remains.
+	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "")
+	require.NoError(t, err)
+	user, _ = store.Users().GetByID(ctx, userID)
+	assert.Empty(t, user.AuthCutoffExemptJTI)
+}

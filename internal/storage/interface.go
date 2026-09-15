@@ -90,9 +90,11 @@ type UserStore interface {
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
 
 	// InvalidateAuthBefore records that bearer tokens issued at or before t
-	// are no longer accepted for the user (see internal/tokengate). It only
-	// moves the cut-off forward and touches no other field.
-	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+	// are no longer accepted for the user (see internal/tokengate), except
+	// the token with id exemptJTI (the one performing the lifecycle change;
+	// may be empty). It only moves the cut-off forward and touches no other
+	// field.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error
 
 	// ClearWalletData erases the user's wallet key material - PrivateData,
 	// PrivateDataETag and Keys - as a field-scoped update, so a concurrent

@@ -375,7 +375,7 @@ func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	if got := call(old); got != http.StatusOK {
 		t.Fatalf("before any cut-off the token is fine, got %d", got)
 	}
-	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)); err != nil {
+	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute), ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := call(old); got != http.StatusUnauthorized {

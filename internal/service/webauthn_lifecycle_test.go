@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 func seedLifecycleInstance(t *testing.T, s *WebAuthnService, id string, userID domain.UserID, credentialID string, status domain.InstanceStatus) {
@@ -126,7 +127,7 @@ func TestPersistLoginState_LifecycleChangeDuringLogin(t *testing.T) {
 
 	t.Run("revoked during login: refused, erased data stays erased", func(t *testing.T) {
 		require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
-		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
+		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
 		require.NoError(t, store.Users().ClearWalletData(ctx, userID))
 		copyOf := stale // loaded before the revocation
 		err := s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1")
@@ -135,4 +136,33 @@ func TestPersistLoginState_LifecycleChangeDuringLogin(t *testing.T) {
 		assert.Nil(t, u.PrivateData, "the stale record must not restore the vault")
 		assert.False(t, u.AuthInvalidBefore.IsZero(), "the cut-off must not be rolled back")
 	})
+}
+
+// A lifecycle change that lands after the login gate but before the token is
+// handed out must not yield a usable token.
+func TestRefuseIfCutOffSince(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	s := &WebAuthnService{store: store, logger: zap.NewNop(), cfg: &config.Config{JWT: config.JWTConfig{Secret: "s", ExpiryHours: 1, Issuer: "t"}}}
+	userID := domain.NewUserID()
+	user := &domain.User{UUID: userID, WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}
+	require.NoError(t, store.Users().Create(ctx, user))
+	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+	seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
+
+	token, err := s.generateToken(user, domain.DefaultTenantID)
+	require.NoError(t, err)
+	require.NoError(t, s.refuseIfCutOffSince(ctx, domain.DefaultTenantID, userID, "pk-1", token), "no change: token stands")
+
+	// An unrelated instance is suspended after minting: the token would be
+	// refused by the gate, so the login is refused and the client retries.
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i2", domain.InstanceStatusSuspended, "x"))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(time.Second), ""))
+	err = s.refuseIfCutOffSince(ctx, domain.DefaultTenantID, userID, "pk-1", token)
+	assert.ErrorIs(t, err, ErrVerificationFailed)
+
+	// This passkey's own instance revoked after minting: precise refusal.
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
+	err = s.refuseIfCutOffSince(ctx, domain.DefaultTenantID, userID, "pk-1", token)
+	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 }

@@ -307,3 +307,30 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 		t.Errorf("credential id must persist, got %q", got.CredentialID)
 	}
 }
+
+// The first user binding of an anonymous instance wins; a later attestation
+// by another user must not re-parent the record.
+func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
+	store := NewStore().WalletInstances()
+	ctx := context.Background()
+	a, b := domain.UserIDFromString("user-a"), domain.UserIDFromString("user-b")
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, UserID: &a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, UserID: &b}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetByID(ctx, "anon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID == nil || *got.UserID != a {
+		t.Fatalf("user binding must stay with the first user, got %v", got.UserID)
+	}
+	if got.AttestationCount != 3 {
+		t.Fatalf("attestations still counted: %d", got.AttestationCount)
+	}
+}

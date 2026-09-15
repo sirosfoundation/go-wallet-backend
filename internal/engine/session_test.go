@@ -819,7 +819,7 @@ func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	_, _, _, err := m.validateToken(old)
 	require.NoError(t, err, "no cut-off yet")
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)))
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute), ""))
 	_, _, _, err = m.validateToken(old)
 	assert.ErrorIs(t, err, tokengate.ErrRevoked)
 	_, _, _, err = m.validateToken(mint(time.Now()))

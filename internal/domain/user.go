@@ -96,6 +96,12 @@ type User struct {
 	// revoked, so stateless tokens that outlive the dropped sessions stop
 	// working too. Checked by internal/tokengate. Zero means no cut-off.
 	AuthInvalidBefore time.Time `json:"-" bson:"auth_invalid_before,omitempty"`
+	// AuthCutoffExemptJTI is the id of the one bearer token exempt from
+	// AuthInvalidBefore: the token that performed the lifecycle change. The
+	// user keeps that session to reactivate a suspended instance or to
+	// repeat a request after 409 ERASURE_INCOMPLETE; every other token
+	// issued before the cut-off is refused.
+	AuthCutoffExemptJTI string `json:"-" bson:"auth_cutoff_exempt_jti,omitempty"`
 
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`

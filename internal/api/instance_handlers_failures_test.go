@@ -7,14 +7,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -235,5 +238,46 @@ func TestUpdateWalletInstanceStatus_LifecycleErasureIncompleteIs409(t *testing.T
 	inst, err := broken.Store.WalletInstances().GetByID(context.Background(), "inst-1")
 	if err != nil || inst.Status != domain.InstanceStatusRevoked {
 		t.Fatalf("the revocation itself must be persisted: %v %v", err, inst)
+	}
+}
+
+// End to end: the bearer token that suspends an instance keeps working
+// afterwards (it is the exempt token), while an older token of the same user
+// is cut off.
+func TestMyWalletInstances_RequestingTokenSurvivesCutoff(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
+	ctx := context.Background()
+	me := domain.NewUserID()
+	if err := handlers.store.Users().Create(ctx, &domain.User{UUID: me}); err != nil {
+		t.Fatal(err)
+	}
+	seedUserInstance(t, handlers, "mine-1", me)
+	seedUserInstance(t, handlers, "mine-2", me)
+	mint := func(jti string) string {
+		s, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": me.String(), "jti": jti, "iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte("test-secret"))
+		return s
+	}
+	acting, other := mint("acting"), mint("other")
+	withToken := func(tok string) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			c.Set("user_id", me.String())
+			c.Set("token", tok)
+			c.Next()
+		}
+	}
+	r := instanceRoutes(handlers, withToken(acting))
+	w := doJSON(r, http.MethodPut, "/user/session/instances/mine-1/status", `{"status":"suspended"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("suspend: %d %s", w.Code, w.Body.String())
+	}
+
+	gate := tokengate.New(handlers.store.Users())
+	if err := gate.Check(ctx, me.String(), tokengate.IssuedAt(acting), tokengate.JTI(acting)); err != nil {
+		t.Fatalf("the requesting token must survive the cut-off: %v", err)
+	}
+	if err := gate.Check(ctx, me.String(), tokengate.IssuedAt(other), tokengate.JTI(other)); !errors.Is(err, tokengate.ErrRevoked) {
+		t.Fatalf("an older token of the same user must be cut off, got %v", err)
 	}
 }

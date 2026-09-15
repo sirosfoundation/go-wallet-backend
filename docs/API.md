@@ -173,8 +173,17 @@ re-runs the erasure, so the client retries until it gets `200`.
 Any change away from `active` also cuts off bearer tokens issued before it:
 legacy access and refresh tokens, and access tokens validated by the backend
 or accepted for a WebSocket handshake, are refused with `401` when their `iat`
-is not after the cut-off, even if they have not expired. Tokens obtained after
-a reactivation work normally.
+is not after the cut-off, even if they have not expired. The one exception is
+the token that made the self-service request: it stays valid, so the user can
+reactivate a suspended instance or repeat a request after `409
+ERASURE_INCOMPLETE` from the same session. Admin-initiated changes exempt no
+token. Tokens obtained after a reactivation work normally. A login or token
+refresh that races with a lifecycle change is refused rather than handed a
+token that would be rejected on first use.
+
+An engine deployed without the backend role in the same process enforces the
+cut-off only when persistent storage is configured; with memory storage it
+logs a warning at startup and relies on the token lifetime.
 
 Revoked instances of a user are retained as lifecycle records: they are what
 keeps login and new attestations refused for that wallet. The admin API

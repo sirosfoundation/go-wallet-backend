@@ -249,6 +249,19 @@ func main() {
 		// cannot open a new engine session (applies to both token paths).
 		if backendProvider != nil {
 			provider.SetTokenGate(backendProvider.TokenGate())
+		} else {
+			gateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			gate, closer, err := server.NewStandaloneTokenGate(gateCtx, backendCfg)
+			cancel()
+			switch {
+			case err != nil:
+				logger.Fatal("Failed to open storage for the engine token gate", zap.Error(err))
+			case gate == nil:
+				logger.Warn("Standalone engine without persistent storage: bearer tokens issued before a wallet suspension/revocation are not cut off at the WebSocket handshake; co-host the backend role or configure storage")
+			default:
+				provider.SetTokenGate(gate)
+				resources = append(resources, closer)
+			}
 		}
 		mgr.AddProvider(provider)
 

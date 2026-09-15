@@ -651,7 +651,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
+		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString), result.JTI); err != nil {
 			return "", "", "", err
 		}
 		return result.UserID, result.TenantID, result.TAC, nil
@@ -679,7 +679,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
-		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
+		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims), tokengate.JTIFromClaims(mapClaims)); err != nil {
 			return "", "", "", err
 		}
 		return userID, tenantID, "", nil

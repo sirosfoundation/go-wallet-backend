@@ -1930,10 +1930,10 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	}
 	t1 := time.Now().Add(-time.Hour)
 	t2 := time.Now()
-	if err := store.Users().InvalidateAuthBefore(ctx, uid, t2); err != nil {
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, t2, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Users().InvalidateAuthBefore(ctx, uid, t1); err != nil {
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, t1, ""); err != nil {
 		t.Fatal(err)
 	}
 	u, _ := store.Users().GetByID(ctx, uid)
@@ -1953,7 +1953,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	if err := store.Users().ClearWalletData(ctx, domain.NewUserID()); err != storage.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
-	if err := store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2); err != storage.ErrNotFound {
+	if err := store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2, ""); err != storage.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -1970,7 +1970,7 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	stale, _ := store.Users().GetByID(ctx, uid)
 	staleCopy := *stale
 
-	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now()); err != nil {
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Users().ClearWalletData(ctx, uid); err != nil {

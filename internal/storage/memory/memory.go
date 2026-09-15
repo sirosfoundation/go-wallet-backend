@@ -318,7 +318,7 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, exists := s.data[id.String()]
@@ -328,6 +328,7 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	if t.After(user.AuthInvalidBefore) {
 		user.AuthInvalidBefore = t
 	}
+	user.AuthCutoffExemptJTI = exemptJTI
 	return nil
 }
 

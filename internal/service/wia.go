@@ -690,7 +690,9 @@ func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.Tenan
 // already been signed and must not be handed out.
 func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt string, firstAttestation bool) error {
 	if firstAttestation {
-		return s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt)
+		if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
+			return err
+		}
 	}
 	inst, err := s.instances.GetByID(ctx, jkt)
 	if err != nil {
@@ -699,6 +701,13 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	if inst.Status != domain.InstanceStatusActive {
 		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
 		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
+	}
+	// Upsert only binds user_id while the record has none, so if two
+	// authenticated attestations raced for an anonymous instance the loser
+	// finds another owner here and gets no WIA.
+	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
+		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
 	}
 	return nil
 }

@@ -645,8 +645,8 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 
 	t2 := time.Now().Truncate(time.Millisecond)
 	t1 := t2.Add(-time.Hour)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1), "an older cut-off is a no-op ($max)")
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2, ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1, ""), "an older cut-off is a no-op ($max)")
 	u, err := store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.True(t, u.AuthInvalidBefore.Equal(t2), "cut-off only moves forward: %v vs %v", u.AuthInvalidBefore, t2)
@@ -661,7 +661,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	assert.True(t, u.AuthInvalidBefore.Equal(t2))
 
 	assert.ErrorIs(t, store.Users().ClearWalletData(ctx, domain.NewUserID()), storage.ErrNotFound)
-	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2, ""), storage.ErrNotFound)
 }
 
 func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
@@ -676,7 +676,7 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	stale.DID = "did:y"
 	require.NoError(t, store.Users().Update(ctx, stale))
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond)))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond), ""))
 	require.NoError(t, store.Users().ClearWalletData(ctx, uid))
 	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite)
 	u, err := store.Users().GetByID(ctx, uid)
@@ -687,4 +687,19 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	u.DID = "did:z"
 	require.NoError(t, store.Users().Update(ctx, u), "the fresh copy carries the cut-off and updates fine")
 	assert.ErrorIs(t, store.Users().Update(ctx, &domain.User{UUID: domain.NewUserID()}), storage.ErrNotFound)
+}
+
+func TestUserStore_InvalidateAuthBefore_ExemptJTI(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid}))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), "jti-1"))
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Equal(t, "jti-1", u.AuthCutoffExemptJTI)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), ""))
+	u, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Empty(t, u.AuthCutoffExemptJTI, "an admin change clears the exemption")
 }

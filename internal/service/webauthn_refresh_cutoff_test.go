@@ -31,7 +31,7 @@ func TestRefreshAccessToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	require.NoError(t, err, "no cut-off yet")
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, user.UUID, time.Now().Add(time.Second)))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, user.UUID, time.Now().Add(time.Second), ""))
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken)
 }

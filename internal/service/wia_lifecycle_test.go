@@ -325,3 +325,59 @@ func TestWIAService_GenerateWIA_RefusesReattestationRevokedMeanwhile(t *testing.
 		t.Errorf("status = %s, want revoked preserved", got.Status)
 	}
 }
+
+// bindingRaceInstances binds an anonymous instance to another user right
+// before the caller's own Upsert runs, simulating two authenticated
+// attestations racing for the same anonymous instance.
+type bindingRaceInstances struct {
+	storage.WalletInstanceStore
+	winner domain.UserID
+	fired  bool
+}
+
+func (r *bindingRaceInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if !r.fired && inst.UserID != nil {
+		r.fired = true
+		w := r.winner
+		clone := *inst
+		clone.UserID = &w
+		if err := r.WalletInstanceStore.Upsert(ctx, &clone); err != nil {
+			return err
+		}
+	}
+	return r.WalletInstanceStore.Upsert(ctx, inst)
+}
+
+func TestWIAService_GenerateWIA_LoserOfBindingRaceGetsNoWIA(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore().WalletInstances()
+	loser := domain.UserIDFromString("user-loser")
+	winner := domain.UserIDFromString("user-winner")
+	racing := &bindingRaceInstances{WalletInstanceStore: base, winner: winner}
+	svc := newTestWIAServiceUsing(t, racing)
+
+	// First attest anonymously so the instance exists without a user.
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("anonymous attestation: %v", err)
+	}
+
+	// Now the loser attests with the same key while the winner binds first.
+	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop2 := createTestPopWithKey(t, challenge2, key)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &loser, &WIARequest{Pop: pop2, Challenge: challenge2})
+	if !errors.Is(err, ErrWIAInstanceNotOwned) {
+		t.Fatalf("expected ErrWIAInstanceNotOwned for the loser, got %v", err)
+	}
+	all, err := base.GetByUser(ctx, domain.DefaultTenantID, winner)
+	if err != nil || len(all) != 1 {
+		t.Fatalf("the instance must be bound to the winner: %v %v", err, all)
+	}
+}

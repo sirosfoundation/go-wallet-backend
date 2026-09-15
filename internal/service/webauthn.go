@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -1187,6 +1188,13 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
+	// SID-AUTH-06: a suspension/revocation that landed after the gate ran
+	// (during the sign-count save or the OIDC checks) must not hand out a
+	// token that postdates its cut-off. Checked after minting, so a cut-off
+	// set at any later instant refuses the token by iat anyway.
+	if err := s.refuseIfCutOffSince(ctx, tenantID, userID, matchedCred.ID, token); err != nil {
+		return nil, err
+	}
 
 	// Generate refresh token (if enabled)
 	refreshToken, _ := s.generateRefreshToken(user, tenantID) // Ignore error, refresh is optional
@@ -1352,6 +1360,11 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	accessToken, err := s.generateToken(user, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+	// SID-AUTH-06: a cut-off that landed while this request ran must not be
+	// beaten by a freshly minted token.
+	if fresh, err := s.store.Users().GetByID(ctx, userID); err != nil || !fresh.AuthInvalidBefore.IsZero() && !tokengate.IssuedAt(accessToken).After(fresh.AuthInvalidBefore) {
+		return nil, ErrInvalidRefreshToken
 	}
 
 	// Generate new refresh token (rotation for security)
@@ -1825,6 +1838,26 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 		s.logger.Error("Failed to update user after reload", zap.Error(err))
 	}
 	return nil
+}
+
+// refuseIfCutOffSince is the post-mint half of the login gate: if the user's
+// token cut-off is not before the token's iat, a lifecycle change landed
+// while the login was in flight. The gate is re-run for the precise refusal;
+// if it passes (the cut-off came from an instance unrelated to this passkey)
+// the login is still refused, because the token would be rejected by the
+// token gate on first use - the client simply logs in again.
+func (s *WebAuthnService) refuseIfCutOffSince(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID, token string) error {
+	fresh, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("re-check user after token issuance: %w", err)
+	}
+	if fresh.AuthInvalidBefore.IsZero() || tokengate.IssuedAt(token).After(fresh.AuthInvalidBefore) {
+		return nil
+	}
+	if err := s.checkWalletLifecycle(ctx, tenantID, userID, credentialID); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: authorization changed during login, please log in again", ErrVerificationFailed)
 }
 
 // checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).

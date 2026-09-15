@@ -44,3 +44,27 @@ func TestWalletInstanceStore_Upsert_KeepsFirstCredentialLink(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "pk-9", got.CredentialID)
 }
+
+func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	id := "inst-first-user-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	a, b := domain.NewUserID(), domain.NewUserID()
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &a}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &b}))
+	got, err := wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, got.UserID)
+	require.Equal(t, a, *got.UserID, "first user binding wins")
+	require.EqualValues(t, 3, got.AttestationCount)
+
+	// A record created with a user keeps it too.
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id + "-2", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &b}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id + "-2", TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &a}))
+	got, err = wis.GetByID(ctx, id+"-2")
+	require.NoError(t, err)
+	require.Equal(t, b, *got.UserID)
+}

@@ -27,7 +27,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++
-		if instance.UserID != nil {
+		// First user binding wins; a bound instance is never re-parented here
+		// (see the Mongo implementation and WIAService.signWIA's read-back).
+		if existing.UserID == nil && instance.UserID != nil {
 			existing.UserID = instance.UserID
 		}
 		if instance.DeviceInfo != nil {

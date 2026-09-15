@@ -95,11 +95,11 @@ func (s *failUsers) ClearWalletData(ctx context.Context, id domain.UserID) error
 	return s.UserStore.ClearWalletData(ctx, id)
 }
 
-func (s *failUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+func (s *failUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
 	if err := s.f.err("users.InvalidateAuthBefore"); err != nil {
 		return err
 	}
-	return s.UserStore.InvalidateAuthBefore(ctx, id, t)
+	return s.UserStore.InvalidateAuthBefore(ctx, id, t, exemptJTI)
 }
 
 type failUserTenants struct {

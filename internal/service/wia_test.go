@@ -119,6 +119,13 @@ func createTestPop(t *testing.T, nonce string) (string, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return createTestPopWithKey(t, nonce, instanceKey), instanceKey
+}
+
+// createTestPopWithKey creates a WIA-PoP JWT for an existing instance key, so
+// a test can re-attest the same instance.
+func createTestPopWithKey(t *testing.T, nonce string, instanceKey *ecdsa.PrivateKey) string {
+	t.Helper()
 
 	// Build JWK for the public key
 	xBytes := instanceKey.PublicKey.X.Bytes()
@@ -156,7 +163,7 @@ func createTestPop(t *testing.T, nonce string) (string, *ecdsa.PrivateKey) {
 		t.Fatal(err)
 	}
 
-	return popStr, instanceKey
+	return popStr
 }
 
 func TestWIAService_CreateChallenge(t *testing.T) {

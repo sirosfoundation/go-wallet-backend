@@ -32,6 +32,11 @@ type LifecycleActor struct {
 	Kind string
 	// UserID is set for self-service changes: the instance must belong to it.
 	UserID *domain.UserID
+	// TokenJTI is the id of the bearer token that carries the request, for
+	// self-service changes. It stays valid across the token cut-off the
+	// change triggers, so the user can reactivate a suspended instance or
+	// repeat the request after 409 ERASURE_INCOMPLETE from the same session.
+	TokenJTI string
 }
 
 // WalletLifecycleService implements SID-AUTH-06 wallet lifecycle management on
@@ -102,7 +107,7 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 			// Idempotent retry: finish a cascade (token cut-off, session
 			// drop, erasure) that did not complete last time - for a
 			// suspension as much as for a revocation.
-			return inst, s.cascade(ctx, tenantID, inst)
+			return inst, s.cascade(ctx, tenantID, inst, actor)
 		}
 		return inst, nil
 	}
@@ -113,7 +118,7 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	inst.UpdatedAt = time.Now().UTC()
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
-		return inst, s.cascade(ctx, tenantID, inst)
+		return inst, s.cascade(ctx, tenantID, inst, actor)
 	}
 	return inst, nil
 }
@@ -142,7 +147,7 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 				// their tokens and sessions until the retry: cascade for
 				// them now (the not-yet-revoked instance keeps the erasure
 				// off) and report the request as incomplete.
-				return changed, errors.Join(err, s.cascade(ctx, tenantID, last))
+				return changed, errors.Join(err, s.cascade(ctx, tenantID, last, actor))
 			}
 			return changed, err
 		}
@@ -155,7 +160,7 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 		last = instances[len(instances)-1] // everything already revoked: retry the erasure
 	}
 	if last != nil {
-		return changed, s.cascade(ctx, tenantID, last)
+		return changed, s.cascade(ctx, tenantID, last, actor)
 	}
 	return changed, nil
 }
@@ -166,7 +171,7 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 // decision is taken per tenant. It returns ErrErasureIncomplete (wrapping the
 // underlying failures) when any step did not complete; the status change
 // itself is already persisted at that point.
-func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance) error {
+func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
 	if inst.UserID == nil {
 		return nil
 	}
@@ -176,7 +181,7 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	// HMAC tokens for up to a day, refresh tokens longer); cut them off at
 	// this instant so a suspended or revoked instance cannot keep calling
 	// user-authorized endpoints. See internal/tokengate.
-	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		errs = append(errs, fmt.Errorf("cut off issued tokens: %w", err))
 	}
 	if s.sessionCleaner != nil {

@@ -150,7 +150,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// SID-AUTH-06: refuse tokens issued before the user's wallet was
 		// suspended or revoked (sessions are dropped, but a stateless token
 		// would otherwise stay valid until it expires).
-		if !checkTokenGate(c, gate, userID, tokengate.IssuedAtFromClaims(claims), logger) {
+		if !checkTokenGate(c, gate, userID, tokengate.IssuedAtFromClaims(claims), tokengate.JTIFromClaims(claims), logger) {
 			return
 		}
 
@@ -250,8 +250,8 @@ func Logger(logger *zap.Logger, skipPaths ...string) gin.HandlerFunc {
 
 // checkTokenGate applies the SID-AUTH-06 token cut-off and writes the
 // response on refusal. It returns false when the request was aborted.
-func checkTokenGate(c *gin.Context, gate *tokengate.Gate, userID string, issuedAt time.Time, logger *zap.Logger) bool {
-	err := gate.Check(c.Request.Context(), userID, issuedAt)
+func checkTokenGate(c *gin.Context, gate *tokengate.Gate, userID string, issuedAt time.Time, jti string, logger *zap.Logger) bool {
+	err := gate.Check(c.Request.Context(), userID, issuedAt, jti)
 	switch {
 	case err == nil:
 		return true

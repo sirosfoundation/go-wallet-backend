@@ -13,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // Self-service wallet instance lifecycle (SID-AUTH-06, go-wallet-backend#195):
@@ -35,7 +36,7 @@ type revokeAllInstancesRequest struct {
 // repeating the same request re-runs the erasure.
 const (
 	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
-	errMsgErasureIncomplete  = "the status change was recorded but part of the wallet data could not be erased; repeat the request to complete it"
+	errMsgErasureIncomplete  = "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
 )
 
 func (h *Handlers) lifecycleActor(c *gin.Context) (service.LifecycleActor, domain.TenantID, bool) {
@@ -46,7 +47,13 @@ func (h *Handlers) lifecycleActor(c *gin.Context) (service.LifecycleActor, domai
 	}
 	userID := domain.UserIDFromString(uid.(string))
 	tenantID, _ := h.getTenantID(c)
-	return service.LifecycleActor{Kind: "user", UserID: &userID}, tenantID, true
+	actor := service.LifecycleActor{Kind: "user", UserID: &userID}
+	if raw, ok := c.Get("token"); ok {
+		if tok, ok := raw.(string); ok {
+			actor.TokenJTI = tokengate.JTI(tok)
+		}
+	}
+	return actor, tenantID, true
 }
 
 // ListMyWalletInstances handles GET /user/session/instances.

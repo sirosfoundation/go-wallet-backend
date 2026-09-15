@@ -39,9 +39,6 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 			"attestation_count": 1,
 		},
 	}
-	if instance.UserID != nil {
-		update["$set"].(bson.M)["user_id"] = instance.UserID
-	}
 	if instance.DeviceInfo != nil {
 		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
 	}
@@ -50,6 +47,20 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
+	}
+
+	// The user binding is written only while the document has none, so two
+	// authenticated attestations of the same anonymous instance cannot both
+	// "win": the second one finds user_id already set and leaves it. Callers
+	// read the record back to learn who owns it (WIAService.signWIA).
+	if instance.UserID != nil {
+		bindFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
+			{"user_id": bson.M{"$exists": false}},
+			{"user_id": nil},
+		}}
+		if _, err := s.collection.UpdateOne(ctx, bindFilter, bson.M{"$set": bson.M{"user_id": instance.UserID}}); err != nil {
+			return fmt.Errorf("%w: bind wallet instance user: %v", storage.ErrDatabase, err)
+		}
 	}
 
 	// The passkey link is client-supplied, so only the first non-empty

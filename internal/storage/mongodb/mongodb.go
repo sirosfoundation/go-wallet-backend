@@ -371,11 +371,16 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
 	// $max only moves the cut-off forward, so two lifecycle events racing
-	// cannot roll it back.
-	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()},
-		bson.M{"$max": bson.M{"auth_invalid_before": t}})
+	// cannot roll it back. The exempt token is the latest actor's.
+	update := bson.M{"$max": bson.M{"auth_invalid_before": t}}
+	if exemptJTI != "" {
+		update["$set"] = bson.M{"auth_cutoff_exempt_jti": exemptJTI}
+	} else {
+		update["$unset"] = bson.M{"auth_cutoff_exempt_jti": ""}
+	}
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, update)
 	if err != nil {
 		return fmt.Errorf("failed to set auth cut-off: %w", err)
 	}
