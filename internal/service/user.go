@@ -25,10 +25,31 @@ var (
 )
 
 // SessionCleaner can remove sessions for a user.
-// Implemented by engine.Manager (which also closes the live WebSocket) and
-// by engine.SessionStore (memory or Redis) for the persisted record alone.
+// Implemented by engine.Manager (which also closes the live WebSocket),
+// engine.SessionStore (memory or Redis) for the persisted record alone, and
+// as.SessionStore for AS cookie sessions.
 type SessionCleaner interface {
 	DeleteByUser(ctx context.Context, userID string) error
+}
+
+// MultiSessionCleaner fans DeleteByUser out to several cleaners (engine
+// WebSocket sessions and AS cookie sessions), so one wiring point drops
+// every kind of session a user holds. Every cleaner is called even if an
+// earlier one fails; the first error is returned.
+type MultiSessionCleaner []SessionCleaner
+
+// DeleteByUser implements SessionCleaner.
+func (m MultiSessionCleaner) DeleteByUser(ctx context.Context, userID string) error {
+	var first error
+	for _, c := range m {
+		if c == nil {
+			continue
+		}
+		if err := c.DeleteByUser(ctx, userID); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // UserService handles user-related operations

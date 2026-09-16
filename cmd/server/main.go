@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -220,6 +221,7 @@ func main() {
 		resources = append(resources, provider)
 	}
 
+	var engineProvider *server.EngineProvider
 	if roles.Has(modes.RoleEngine) {
 		// Wire verifier store from backend if available (for trust caching)
 		var verifierStore storage.VerifierStore
@@ -264,16 +266,24 @@ func main() {
 			}
 		}
 		mgr.AddProvider(provider)
+		engineProvider = provider
+	}
 
-		// Wire the engine's session cleaner into UserService so DeleteUser
-		// purges active sessions, and into the wallet lifecycle service so
-		// suspending or revoking a wallet instance drops the user's live
-		// sessions (SID-AUTH-06). The cleaner is the engine Manager, which
-		// closes the open WebSocket as well as deleting the persisted record.
-		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionCleaner())
-			backendProvider.Services().WalletLifecycle.SetSessionCleaner(provider.SessionCleaner())
+	// Wire session cleaners into UserService so DeleteUser purges AS cookie
+	// sessions and, when the engine runs in this process, live engine
+	// (WebSocket) sessions alike, and into the wallet lifecycle service so
+	// suspending or revoking a wallet instance drops the same sessions
+	// (SID-AUTH-06). The AS cleaner is wired regardless of the engine role:
+	// a --mode=backend deployment has AS sessions to drop too. The engine
+	// cleaner is the Manager, which closes the open WebSocket as well as
+	// deleting the persisted record.
+	if backendProvider != nil {
+		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
+		if engineProvider != nil {
+			cleaners = append(cleaners, engineProvider.SessionCleaner())
 		}
+		backendProvider.Services().User.SetSessionCleaner(cleaners)
+		backendProvider.Services().WalletLifecycle.SetSessionCleaner(cleaners)
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.

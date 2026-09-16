@@ -687,6 +687,16 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 	return p.tokenValidator
 }
 
+// ASSessionCleaner returns the AS session store as a service.SessionCleaner,
+// or nil if the AS is not enabled, so user deletion can revoke AS cookie
+// sessions alongside engine sessions.
+func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
+	if p.asModule == nil || p.asModule.Sessions == nil {
+		return nil
+	}
+	return p.asModule.Sessions
+}
+
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
