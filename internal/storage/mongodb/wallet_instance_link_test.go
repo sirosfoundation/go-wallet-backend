@@ -81,3 +81,57 @@ func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
 	require.Equal(t, domain.TenantID("acme"), got.TenantID, "tenant is fixed at insert")
 	require.EqualValues(t, 2, got.AttestationCount)
 }
+
+// A losing cross-tenant first attestation must not bind its user, or link its
+// passkey, onto the record the winner inserted. tenant_id is fixed at insert,
+// so the loser cannot move the record - but a bind or link that landed anyway
+// would be permanent, and the read-back that refuses the loser's WIA cannot
+// undo it.
+func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	id := "inst-tenant-own-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	winner, loser := domain.NewUserID(), domain.NewUserID()
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
+	// The loser's attestation: same instance key, another tenant.
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}))
+	got, err := wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, domain.TenantID("acme"), got.TenantID)
+	require.Nil(t, got.UserID, "a user of another tenant must not be bound")
+	require.Empty(t, got.CredentialID, "a passkey of another tenant must not be linked")
+
+	// The record's own tenant still binds and links normally.
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &winner, CredentialID: "pk-winner"}))
+	got, err = wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, got.UserID)
+	require.Equal(t, winner, *got.UserID)
+	require.Equal(t, "pk-winner", got.CredentialID)
+}
+
+// The passkey link may only be written by the user the record is actually
+// bound to: a same-tenant racer whose own bind lost must not get its
+// credential id onto the winner's record, where it would decide the
+// per-instance login gate (SID-AUTH-06) for good.
+func TestWalletInstanceStore_Upsert_CredentialLinkNeedsTheBoundUser(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	id := "inst-link-owner-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	winner, loser := domain.NewUserID(), domain.NewUserID()
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &winner}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}))
+	got, err := wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, winner, *got.UserID, "first user binding still wins")
+	require.Empty(t, got.CredentialID, "only the bound user may link a passkey")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, UserID: &winner, CredentialID: "pk-winner"}))
+	got, err = wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, "pk-winner", got.CredentialID)
+}

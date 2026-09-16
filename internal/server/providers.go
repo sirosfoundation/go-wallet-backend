@@ -152,7 +152,12 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
 			// Wallet instance lifecycle, self-service (SID-AUTH-06)
-			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ListMyWalletInstances)
+			// `l` (list), like every other collection endpoint here
+			// (/issuer/all, /verifier/all, GET /storage/vc); `r` is the
+			// per-object read permission used for /instances/{id}-shaped
+			// reads, and gating a listing on it would let a read-only token
+			// enumerate instances a list-only token cannot see.
+			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.ListMyWalletInstances)
 			// `w` covers suspend/reactivate; the handler additionally requires
 			// `d` when the target status is `revoked` (terminal, may erase).
 			session.PUT("/instances/:instance_id/status", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateMyWalletInstanceStatus)

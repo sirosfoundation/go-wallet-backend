@@ -29,9 +29,16 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++
+		// The ownership writes below only happen inside the record's own
+		// tenant. The tenant is fixed at insert, so when two first
+		// attestations of the same instance key race the loser cannot move
+		// the record - but it could otherwise still bind its user or its
+		// passkey onto the winner's record, which the read-back in
+		// WIAService.signWIA refuses a WIA for yet cannot undo.
+		sameTenant := existing.TenantID == instance.TenantID
 		// First user binding wins; a bound instance is never re-parented here
 		// (see the Mongo implementation and WIAService.signWIA's read-back).
-		if existing.UserID == nil && instance.UserID != nil {
+		if sameTenant && existing.UserID == nil && instance.UserID != nil {
 			existing.UserID = instance.UserID
 		}
 		if instance.DeviceInfo != nil {
@@ -39,8 +46,14 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 		// The passkey link is client-supplied; the first non-empty binding
 		// is kept so a later attestation cannot move the instance to another
-		// passkey and slip past per-instance login gating.
-		if existing.CredentialID == "" && instance.CredentialID != "" {
+		// passkey and slip past per-instance login gating. An authenticated
+		// attestation may only write it onto the record it actually owns, for
+		// the same reason: the link is permanent and decides that gate
+		// (SID-AUTH-06), so a racer whose bind just lost must not set it. An
+		// unauthenticated one has no user to check against and keeps the
+		// plain first-link-wins rule (see the Mongo implementation).
+		if sameTenant && existing.CredentialID == "" && instance.CredentialID != "" &&
+			(instance.UserID == nil || (existing.UserID != nil && *existing.UserID == *instance.UserID)) {
 			existing.CredentialID = instance.CredentialID
 		}
 	} else {

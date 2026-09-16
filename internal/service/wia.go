@@ -355,7 +355,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			if existing.UserID == nil && userID != nil {
 				// First user binding of an anonymously attested instance: for
 				// the wallet's lifecycle this is a new instance of that user,
-				// so a deactivated wallet must not adopt it.
+				// so a deactivated wallet must not adopt it - and it gets the
+				// post-write half of the guard too. The record already exists,
+				// but until this write it was not the user's, so a revoke-all
+				// that lands between here and the Upsert would not have seen
+				// it; without the re-check the adopted instance would stay
+				// active and carry a WIA out of a deactivated wallet.
+				firstAttestation = true
 				if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
 					return "", err
 				}

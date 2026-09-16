@@ -579,3 +579,80 @@ func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
 		}
 	}
 }
+
+// racingRevokeOnBind is racingRevokeInstances for the binding attestation: it
+// fires on the Upsert of an instance that already exists, i.e. when the
+// anonymous record is being adopted by a user, not when it was created.
+type racingRevokeOnBind struct {
+	storage.WalletInstanceStore
+	userID domain.UserID
+	fired  bool
+}
+
+func (r *racingRevokeOnBind) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	_, existedErr := r.WalletInstanceStore.GetByID(ctx, inst.ID)
+	if err := r.WalletInstanceStore.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	if existedErr != nil || r.fired {
+		return nil
+	}
+	r.fired = true
+	others, err := r.WalletInstanceStore.GetByUser(ctx, inst.TenantID, r.userID)
+	if err != nil {
+		return err
+	}
+	for _, o := range others {
+		if o.ID != inst.ID && o.Status != domain.InstanceStatusRevoked {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Adopting an anonymously attested instance is a new instance of that user for
+// the wallet's lifecycle, so it needs the post-write half of the guard as much
+// as a brand-new key does: until the write the record was not the user's, so a
+// revoke-all landing in between does not see it, and without the re-check the
+// adopted instance would stay active and carry a WIA out of a wallet that was
+// deactivated a moment earlier.
+func TestWIAService_GenerateWIA_RevokesBoundKeyWhenWalletDeactivatedMeanwhile(t *testing.T) {
+	uid := domain.UserIDFromString("user-bind-racing")
+	base := memory.NewStore().WalletInstances()
+	seedWIAInstance(t, base, "old-key", uid, domain.InstanceStatusActive) // live at check time
+	racing := &racingRevokeOnBind{WalletInstanceStore: base, userID: uid}
+	svc := newTestWIAServiceUsing(t, racing)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("anonymous attestation: %v", err)
+	}
+
+	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: createTestPopWithKey(t, challenge2, key), Challenge: challenge2})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("expected ErrWIAInstanceDeactivated when the wallet is deactivated while the binding is in flight, got %v", err)
+	}
+	byUser, err := base.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byUser) != 2 {
+		t.Fatalf("instances = %d, want 2 (old + the adopted one, both revoked)", len(byUser))
+	}
+	for _, inst := range byUser {
+		if inst.Status != domain.InstanceStatusRevoked {
+			t.Errorf("instance %s status = %s, want revoked: the adopted instance must not stand in a deactivated wallet", inst.ID, inst.Status)
+		}
+	}
+}

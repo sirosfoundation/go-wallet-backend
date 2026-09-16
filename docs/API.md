@@ -209,7 +209,9 @@ gate for good.
 
 ##### GET /user/session/instances
 
-List the caller's wallet instances in the current tenant.
+List the caller's wallet instances in the current tenant. Needs `l` in the
+token's TAC, like the other collection endpoints (`/issuer/all`,
+`/verifier/all`, `GET /storage/vc`).
 
 **Response:**
 ```json

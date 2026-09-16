@@ -56,8 +56,15 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// authenticated attestations of the same anonymous instance cannot both
 	// "win": the second one finds user_id already set and leaves it. Callers
 	// read the record back to learn who owns it (WIAService.signWIA).
+	//
+	// The filter is scoped to the instance's own tenant as well. tenant_id is
+	// fixed at insert, so when two first attestations race after both saw a
+	// missing record the loser's $setOnInsert is dropped - but without this
+	// clause its bind would still land, permanently parking a user of tenant B
+	// on the record tenant A created. The read-back refuses B's WIA either
+	// way; this keeps A's record bindable by A's real owner.
 	if instance.UserID != nil {
-		bindFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
+		bindFilter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID, "$or": []bson.M{
 			{"user_id": bson.M{"$exists": false}},
 			{"user_id": nil},
 		}}
@@ -70,11 +77,29 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// binding is recorded: the filter matches the document only while it has
 	// no credential_id, which makes "first link wins" atomic and stops a later
 	// attestation from moving the instance to another passkey.
+	//
+	// Like the bind above it is scoped to the fixed tenant, and for an
+	// authenticated attestation further to the user the record ended up bound
+	// to (the bind just above ran, so that is either this caller or the
+	// winner of a race it lost). "First link wins" is permanent and decides
+	// whether suspending the instance also locks that passkey out
+	// (SID-AUTH-06), so a racer whose own bind lost must not be able to write
+	// its credential id onto the winner's record. An unauthenticated
+	// attestation carries no user to check against and keeps the plain
+	// first-link-wins rule; it cannot claim a credential id in practice,
+	// GenerateWIA refuses one without an authenticated caller.
 	if instance.CredentialID != "" {
-		linkFilter := bson.M{"_id": instance.ID, "$or": []bson.M{
-			{"credential_id": bson.M{"$exists": false}},
-			{"credential_id": ""},
-		}}
+		linkFilter := bson.M{
+			"_id":       instance.ID,
+			"tenant_id": instance.TenantID,
+			"$or": []bson.M{
+				{"credential_id": bson.M{"$exists": false}},
+				{"credential_id": ""},
+			},
+		}
+		if instance.UserID != nil {
+			linkFilter["user_id"] = *instance.UserID
+		}
 		if _, err := s.collection.UpdateOne(ctx, linkFilter, bson.M{"$set": bson.M{"credential_id": instance.CredentialID}}); err != nil {
 			return fmt.Errorf("%w: link wallet instance credential: %v", storage.ErrDatabase, err)
 		}
