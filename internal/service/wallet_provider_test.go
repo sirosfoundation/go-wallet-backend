@@ -315,7 +315,7 @@ func TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoes
 	assertUserAuthentication(t, claims, "iso_18045_basic")
 }
 
-func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
+func TestGenerateKeyAttestation_CertificationStringClampedToFloor(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 
 	jwks := []map[string]interface{}{
@@ -340,8 +340,8 @@ func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
 	if !ok {
 		t.Fatal("certification claim missing")
 	}
-	if cert != "none" {
-		t.Errorf("certification = %v, want \"none\"", cert)
+	if cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
@@ -376,8 +376,8 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance(t *tes
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_basic")
 	assertUserAuthentication(t, claims, "iso_18045_basic")
-	if cert := claims["certification"]; cert != "none" {
-		t.Errorf("certification = %v, want \"none\"", cert)
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
@@ -530,8 +530,8 @@ func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_basic")
 	assertUserAuthentication(t, claims, "iso_18045_basic")
-	if cert := claims["certification"]; cert != "none" {
-		t.Errorf("certification = %v, want \"none\"", cert)
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
@@ -560,8 +560,8 @@ func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *t
 	claims := parseKAClaims(t, ka)
 	assertKeyStorage(t, claims, "iso_18045_basic")
 	assertUserAuthentication(t, claims, "iso_18045_basic")
-	if cert := claims["certification"]; cert != "none" {
-		t.Errorf("certification = %v, want \"none\"", cert)
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
