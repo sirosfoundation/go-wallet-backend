@@ -160,6 +160,10 @@ func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.
 func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, userID domain.UserID, reason string) (int, error) {
 	changed := 0
 	var last *domain.WalletInstance
+	// reachedFixedPoint records that a pass found nothing left to revoke, so
+	// the sweep ended because it was done rather than because it ran out of
+	// passes.
+	reachedFixedPoint := false
 	// A first attestation can insert a new instance while this sweep runs
 	// (it works from a listing, not a lock). Repeat until a pass finds
 	// nothing left to revoke, so such an instance cannot end up as the only
@@ -202,13 +206,45 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 			if last == nil && len(instances) > 0 {
 				last = instances[len(instances)-1] // everything already revoked: retry the erasure
 			}
+			reachedFixedPoint = true
 			break
 		}
 	}
-	if last != nil {
-		return changed, s.cascade(ctx, tenantID, last, actor)
+	if last == nil {
+		return changed, nil
 	}
-	return changed, nil
+	err := s.cascade(ctx, tenantID, last, actor)
+	if !reachedFixedPoint {
+		// Every pass still found something to revoke, so the sweep ran out of
+		// passes instead of reaching a fixed point and an instance inserted
+		// during the last pass can still be live. cascade treats a remaining
+		// non-revoked instance as the ordinary "nothing to erase" case, so
+		// without this the request would report success for a wallet that
+		// still has an active instance. Report it as incomplete instead:
+		// repeating the request resumes the sweep, exactly like the other
+		// ErrErasureIncomplete cases.
+		err = errors.Join(err, s.unsweptErr(ctx, tenantID, userID))
+	}
+	return changed, err
+}
+
+// unsweptErr reports ErrErasureIncomplete when RevokeAllForUser exhausted its
+// pass bound with an instance still live, and nil when the last pass happened
+// to finish the job anyway. Serializing attestation with lifecycle
+// transitions outright - so the bound can never be reached - is
+// go-wallet-backend#330.
+func (s *WalletLifecycleService) unsweptErr(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) error {
+	instances, err := s.ListForUser(ctx, tenantID, userID)
+	if err != nil {
+		return fmt.Errorf("%w: list instances after the revoke-all pass bound: %w", ErrErasureIncomplete, err)
+	}
+	for _, inst := range instances {
+		if inst.Status != domain.InstanceStatusRevoked {
+			return fmt.Errorf("%w: revoke-all reached its %d-pass bound with instance %s still %s",
+				ErrErasureIncomplete, revokeAllMaxPasses, inst.ID, inst.Status)
+		}
+	}
+	return nil
 }
 
 // cascade runs after an instance left the active state: drop the user's live

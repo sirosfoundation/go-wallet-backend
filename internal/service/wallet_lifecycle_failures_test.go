@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -591,4 +592,63 @@ func TestWalletLifecycle_ExemptionKeptWhenAnEarlierCascadeStepFailed(t *testing.
 	user, _ := store.Users().GetByID(ctx, uid)
 	assert.Nil(t, user.PrivateData, "the erasure itself went through")
 	assert.Equal(t, "acting", user.AuthCutoffExemptJTI, "the acting session must survive to retry the cascade")
+}
+
+// alwaysAttestingInstances inserts a fresh active instance after every
+// revocation, so the revoke-all sweep never reaches a fixed point and runs out
+// of passes instead.
+type alwaysAttestingInstances struct {
+	storage.WalletInstanceStore
+	userID domain.UserID
+	n      int
+}
+
+func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, st, reason); err != nil {
+		return err
+	}
+	if st != domain.InstanceStatusRevoked {
+		return nil
+	}
+	a.n++
+	uid := a.userID
+	return a.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{
+		ID:       fmt.Sprintf("raced-%d", a.n),
+		TenantID: domain.DefaultTenantID,
+		UserID:   &uid,
+		Status:   domain.InstanceStatusActive,
+	})
+}
+
+// A client attesting fast enough to outrun the bounded sweep must not get a
+// success back for a wallet that still has an active instance: the request is
+// reported as incomplete so repeating it resumes the sweep, and the wallet
+// data is not erased while something live remains.
+func TestWalletLifecycle_RevokeAllReportsIncompleteWhenTheSweepRunsOutOfPasses(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore()
+	uid := seedWalletUser(t, base, domain.DefaultTenantID)
+	racing := &racingInstanceStore{
+		Store:     base,
+		instances: &alwaysAttestingInstances{WalletInstanceStore: base.WalletInstances(), userID: uid},
+	}
+	svc := NewWalletLifecycleService(racing, zap.NewNop(), nil)
+
+	n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "stolen")
+	assert.ErrorIs(t, err, ErrErasureIncomplete, "the sweep hit its bound with an instance still live")
+	assert.Equal(t, revokeAllMaxPasses, n, "one revocation per pass")
+
+	instances, err := base.WalletInstances().GetByUser(ctx, domain.DefaultTenantID, uid)
+	require.NoError(t, err)
+	live := 0
+	for _, inst := range instances {
+		if inst.Status != domain.InstanceStatusRevoked {
+			live++
+		}
+	}
+	assert.Equal(t, 1, live, "the instance attested during the last pass is still active")
+
+	user, err := base.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.NotNil(t, user.PrivateData, "an instance the user could still use remains, so nothing is erased")
 }

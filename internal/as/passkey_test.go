@@ -181,9 +181,14 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		code string
+		// msg distinguishes one revoked instance from a deactivated wallet,
+		// which needs a new enrollment - they share the WALLET_REVOKED code,
+		// so the message is the only thing that tells them apart.
+		msg string
 	}{
-		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED"},
-		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED"},
+		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED", "has been suspended"},
+		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", "other devices enrolled to this wallet are not affected"},
+		{service.ErrWalletDeactivated, "WALLET_REVOKED", "a new enrollment is required"},
 	} {
 		router, _ := setupPasskeyHandlers(&mockWebAuthn{finishLoginErr: tc.err})
 		body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
@@ -196,6 +201,9 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 		}
 		if !bytes.Contains(w.Body.Bytes(), []byte(tc.code)) {
 			t.Errorf("expected body to carry %s, got %s", tc.code, w.Body.String())
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(tc.msg)) {
+			t.Errorf("expected body to carry %q, got %s", tc.msg, w.Body.String())
 		}
 	}
 }

@@ -69,6 +69,27 @@ var (
 	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
 )
 
+// LifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
+// and a user-facing message. The code only says suspended or revoked (that is
+// what clients switch on); the message tells the user whether the other
+// devices keep their own status (a suspended sibling still needs
+// reactivation, so it does not promise they all log in) or the whole wallet
+// is gone and must be re-enrolled. ErrWalletDeactivated wraps
+// ErrWalletInstanceRevoked, so it is matched first.
+//
+// Every login handler answers with this, so the wallet API and the AS passkey
+// endpoint cannot disagree about what a refusal means.
+func LifecycleRefusal(err error) (code, message string) {
+	switch {
+	case errors.Is(err, ErrWalletInstanceSuspended):
+		return "WALLET_SUSPENDED", "This wallet instance has been suspended"
+	case errors.Is(err, ErrWalletDeactivated):
+		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
+	default:
+		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet are not affected"
+	}
+}
+
 // NewWebAuthnService creates a new WebAuthnService
 func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Logger) (*WebAuthnService, error) {
 	return NewWebAuthnServiceWithValidator(store, cfg, logger, nil)
@@ -1828,10 +1849,11 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 }
 
 // mintTokens issues the access token and, when enabled, the refresh token,
-// then checks both against the user's token cut-off (SID-AUTH-06). A
-// suspension or revocation that lands after the login gate ran - during the
-// sign-count save, the OIDC checks, or between the two mints - must not
-// hand out a token that the token gate would accept.
+// then checks both against the user's token cut-off (SID-AUTH-06) by taking
+// the decision on the earliest of them. A suspension or revocation that lands
+// after the login gate ran - during the sign-count save, the OIDC checks, or
+// between the two mints - must not hand out a token that the token gate
+// would then refuse.
 //
 // The comparison is at whole seconds (tokengate.IssuedBeforeCutoff), so a
 // token minted in the same second as a cut-off is refused too. When that is
@@ -1851,11 +1873,20 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 		if err != nil {
 			return "", "", fmt.Errorf("re-check user after token issuance: %w", err)
 		}
-		last := tokengate.IssuedAt(access)
+		// Both minted tokens have to survive the cut-off, so the decision is
+		// taken on the earliest of them. The access token is minted first, so
+		// a cut-off landing between the two mints - or on the second boundary
+		// they straddle - leaves it at or before the cut-off while the
+		// refresh token is past it; gating on the refresh token alone would
+		// hand out an access token the token gate refuses on first use. An
+		// unreadable iat parses as the zero time and is refused here too.
+		earliest := tokengate.IssuedAt(access)
 		if refresh != "" {
-			last = tokengate.IssuedAt(refresh)
+			if r := tokengate.IssuedAt(refresh); r.Before(earliest) {
+				earliest = r
+			}
 		}
-		if !tokengate.IssuedBeforeCutoff(last, cutoff) {
+		if !tokengate.IssuedBeforeCutoff(earliest, cutoff) {
 			return access, refresh, nil
 		}
 		if recheck != nil {
@@ -1863,7 +1894,7 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 				return "", "", err
 			}
 		}
-		if attempt == 0 && last.Unix() == cutoff.Unix() {
+		if attempt == 0 && earliest.Unix() == cutoff.Unix() {
 			// Same second as the cut-off: wait for the next one and mint again.
 			time.Sleep(time.Until(cutoff.Truncate(time.Second).Add(time.Second)))
 			continue

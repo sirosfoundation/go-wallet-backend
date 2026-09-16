@@ -161,10 +161,16 @@ func TestMintTokens(t *testing.T) {
 	// Cut-off in the same second as minting: the tokens are minted again in
 	// the next second and pass.
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
-	access, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
+	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
 	require.NoError(t, err)
 	cutoff, _, _ := store.Users().GetAuthCutoff(ctx, userID)
-	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(access), cutoff), "the re-minted token postdates the cut-off")
+	// Both handed-out tokens have to postdate the cut-off, not just the last
+	// one minted: the access token is minted first, so gating on the refresh
+	// token alone would let an access token the token gate already refuses
+	// out whenever the two mints straddle a second boundary.
+	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(access), cutoff), "the re-minted access token postdates the cut-off")
+	require.NotEmpty(t, refresh)
+	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(refresh), cutoff), "the re-minted refresh token postdates the cut-off")
 
 	// A cut-off set in the future (as a revocation landing mid-request would
 	// be, relative to the minted iat) with the passkey's instance revoked:
