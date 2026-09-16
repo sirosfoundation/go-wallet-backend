@@ -336,12 +336,12 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
 	// Whole-document replace, guarded so a copy loaded before a lifecycle
-	// cut-off (InvalidateAuthBefore) cannot write the old cut-off - or the
-	// erased wallet data - back: the filter only matches while the stored
-	// auth_invalid_before has not advanced past the caller's copy.
+	// write (InvalidateAuthBefore, EraseWalletData) cannot write the old
+	// cut-off - or the erased wallet data - back: the filter only matches
+	// while the stored fence has not advanced past the caller's copy.
 	filter := bson.M{
-		"_id.id":              user.UUID.String(),
-		"auth_invalid_before": bson.M{"$not": bson.M{"$gt": user.AuthInvalidBefore}},
+		"_id.id":     user.UUID.String(),
+		"auth_fence": bson.M{"$not": bson.M{"$gt": user.AuthFence}},
 	}
 	result, err := s.collection.ReplaceOne(ctx, filter, user)
 	if err != nil {
@@ -385,6 +385,9 @@ func cutoffStage(t time.Time, exemptJTI string, extra bson.D) bson.D {
 		exempt = "$$REMOVE"
 	}
 	set := bson.D{
+		// The fence always advances: Update refuses any record loaded before
+		// this write, including one carrying the same cut-off timestamp.
+		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
 		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
 		{Key: "auth_cutoff_exempt_jti", Value: bson.D{{Key: "$cond", Value: bson.A{advances, exempt, bson.D{{Key: "$ifNull", Value: bson.A{"$auth_cutoff_exempt_jti", "$$REMOVE"}}}}}}},
 	}

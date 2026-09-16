@@ -103,6 +103,9 @@ func handleSessionTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
+	if !sessionPassesCutoff(c, deps, session) {
+		return
+	}
 
 	tenantID := req.TenantID
 	if tenantID == "" {
@@ -170,6 +173,9 @@ func handleAnonymousTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
+	if !sessionPassesCutoff(c, deps, session) {
+		return
+	}
 
 	// ACR proves this session came from a real authentication event. Every
 	// login flow sets it, so this should be unreachable in practice, but
@@ -226,6 +232,27 @@ func handleAnonymousTokenRequest(
 	}
 
 	issueToken(c, deps, "", req.Audience, tenantID, tac, session.ACR)
+}
+
+// sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
+// token cut-off, so a session that outlived a suspension or revocation - the
+// lifecycle cascade drops sessions, but that can fail and is reported as
+// ERASURE_INCOMPLETE - cannot mint a fresh bearer token. A session carries no
+// token id, so the acting token's exemption does not apply to it: minting new
+// tokens after a lifecycle change always requires a new login. It writes the
+// response and returns false when the session is refused.
+func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
+	err := deps.gate.Check(c.Request.Context(), session.UserID, session.CreatedAt, "")
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, tokengate.ErrRevoked):
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "session predates a wallet lifecycle change"})
+	default:
+		deps.logger.Error("token cut-off check failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}
+	return false
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token

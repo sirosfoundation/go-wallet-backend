@@ -96,6 +96,12 @@ type User struct {
 	// revoked, so stateless tokens that outlive the dropped sessions stop
 	// working too. Checked by internal/tokengate. Zero means no cut-off.
 	AuthInvalidBefore time.Time `json:"-" bson:"auth_invalid_before,omitempty"`
+	// AuthFence counts the lifecycle writes (cut-offs and erasures) applied
+	// to this user. It only ever increases, and UserStore.Update refuses a
+	// record whose copy is behind the stored value, so a record loaded
+	// before a lifecycle write can never restore what it replaced - even
+	// when both carry the same AuthInvalidBefore timestamp.
+	AuthFence int64 `json:"-" bson:"auth_fence,omitempty"`
 	// AuthCutoffExemptJTI is the id of the one bearer token exempt from
 	// AuthInvalidBefore: the token that performed the lifecycle change. The
 	// user keeps that session to reactivate a suspended instance or to

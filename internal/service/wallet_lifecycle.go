@@ -26,6 +26,9 @@ var ErrWalletInstanceNotOwned = errors.New("wallet instance does not belong to t
 // erasure. It wraps the underlying failures.
 var ErrErasureIncomplete = errors.New("wallet instance status changed but erasure incomplete")
 
+// revokeAllMaxPasses bounds RevokeAllForUser's re-listing (see there).
+const revokeAllMaxPasses = 3
+
 // LifecycleActor says who asked for a wallet instance status change.
 type LifecycleActor struct {
 	// Kind is "user" for self-service changes and "provider" for admin ones.
@@ -49,8 +52,8 @@ type LifecycleActor struct {
 // (WebAuthnService.checkWalletLifecycle). Revocation is terminal. Revoking the
 // last non-revoked instance of a user deactivates the wallet: the encrypted
 // private data - the only durable custodian of the user's keys - and any
-// server-side credentials, presentations and pending challenges are erased,
-// and login is refused for every passkey of that user, so re-activation
+// server-side credentials, presentations and pending WebAuthn challenges are
+// erased, and login is refused for every passkey of that user, so re-activation
 // requires a full new enrollment. Data is never erased while an instance the
 // user could still reactivate remains.
 type WalletLifecycleService struct {
@@ -155,39 +158,52 @@ func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.
 // revocations were persisted but the erasure did not complete; calling it
 // again with everything already revoked re-runs the erasure.
 func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, userID domain.UserID, reason string) (int, error) {
-	instances, err := s.ListForUser(ctx, tenantID, userID)
-	if err != nil {
-		return 0, err
-	}
 	changed := 0
 	var last *domain.WalletInstance
-	for _, inst := range instances {
-		if inst.Status == domain.InstanceStatusRevoked {
-			continue
-		}
-		if changed == 0 {
-			if err := s.cutOffTokens(ctx, inst, actor); err != nil {
-				return 0, err
-			}
-		}
-		if err := s.store.WalletInstances().UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, reason); err != nil {
-			err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
-			if last != nil {
-				// Revocations already persisted in this loop must not keep
-				// their tokens and sessions until the retry: cascade for
-				// them now (the not-yet-revoked instance keeps the erasure
-				// off) and report the request as incomplete.
-				return changed, errors.Join(err, s.cascade(ctx, tenantID, last, actor))
-			}
+	// A first attestation can insert a new instance while this sweep runs
+	// (it works from a listing, not a lock). Repeat until a pass finds
+	// nothing left to revoke, so such an instance cannot end up as the only
+	// live one and leave the wallet undeactivated. Bounded, so a client
+	// attesting in a tight loop cannot hold the request here; serializing
+	// attestation with lifecycle transitions outright is go-wallet-backend#330.
+	for pass := 0; pass < revokeAllMaxPasses; pass++ {
+		instances, err := s.ListForUser(ctx, tenantID, userID)
+		if err != nil {
 			return changed, err
 		}
-		inst.Status = domain.InstanceStatusRevoked
-		s.emitAudit(inst.ID, domain.InstanceStatusRevoked, reason, actor)
-		changed++
-		last = inst
-	}
-	if last == nil && len(instances) > 0 {
-		last = instances[len(instances)-1] // everything already revoked: retry the erasure
+		revokedThisPass := 0
+		for _, inst := range instances {
+			if inst.Status == domain.InstanceStatusRevoked {
+				continue
+			}
+			if changed == 0 {
+				if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+					return 0, err
+				}
+			}
+			if err := s.store.WalletInstances().UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, reason); err != nil {
+				err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
+				if last != nil {
+					// Revocations already persisted must not keep their
+					// tokens and sessions until the retry: cascade for them
+					// now (the not-yet-revoked instance keeps the erasure
+					// off) and report the request as incomplete.
+					return changed, errors.Join(err, s.cascade(ctx, tenantID, last, actor))
+				}
+				return changed, err
+			}
+			inst.Status = domain.InstanceStatusRevoked
+			s.emitAudit(inst.ID, domain.InstanceStatusRevoked, reason, actor)
+			changed++
+			revokedThisPass++
+			last = inst
+		}
+		if revokedThisPass == 0 {
+			if last == nil && len(instances) > 0 {
+				last = instances[len(instances)-1] // everything already revoked: retry the erasure
+			}
+			break
+		}
 	}
 	if last != nil {
 		return changed, s.cascade(ctx, tenantID, last, actor)
@@ -207,8 +223,15 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	}
 	userID := *inst.UserID
 	var errs []error
-	// Issued bearer tokens were cut off before the status was persisted
-	// (cutOffTokens); the live sessions go here.
+	// The status is normally persisted only after cutOffTokens, but a
+	// cascade can also run for a status recorded elsewhere - the standalone
+	// admin path, an older deployment, or the idempotent retry of a request
+	// whose cut-off never landed. Establish the cut-off when the user has
+	// none, without advancing one that is already set (that would need-
+	// lessly invalidate tokens issued since).
+	if err := s.ensureCutoff(ctx, userID, actor); err != nil {
+		errs = append(errs, err)
+	}
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
@@ -224,8 +247,27 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 			return s.incomplete(userID, errs) // something is still active or reactivatable
 		}
 	}
-	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID, actor.TokenJTI)...)
+	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID, actor.TokenJTI, len(errs) > 0)...)
 	return s.incomplete(userID, errs)
+}
+
+// ensureCutoff records a token cut-off for a user that has none. Used by
+// cascade for statuses persisted outside ChangeStatus/RevokeAllForUser.
+func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID, actor LifecycleActor) error {
+	cutoff, _, err := s.store.Users().GetAuthCutoff(ctx, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("read token cut-off: %w", err)
+	}
+	if !cutoff.IsZero() {
+		return nil
+	}
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("cut off issued tokens: %w", err)
+	}
+	return nil
 }
 
 // incomplete turns the collected cascade failures into ErrErasureIncomplete
@@ -247,7 +289,7 @@ func (s *WalletLifecycleService) incomplete(userID domain.UserID, errs []error) 
 // when no non-revoked instance remains in any tenant the user belongs to.
 // The user record and its passkeys stay so the revocation remains attributable
 // and login can be refused with a clear reason rather than "user not found".
-func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, exemptJTI string) []error {
+func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, exemptJTI string, priorFailures bool) []error {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
@@ -284,11 +326,17 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 			errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
 		}
 	}
+	// WebAuthn challenges are per user and deleted here. WIA challenges are
+	// not: they are single-use, short-lived nonces that carry only a tenant,
+	// belong to no user, and are useless to a deactivated wallet because
+	// GenerateWIA refuses it before consuming one.
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
-		errs = append(errs, fmt.Errorf("delete challenges: %w", err))
+		errs = append(errs, fmt.Errorf("delete webauthn challenges: %w", err))
 	}
 	exempt := exemptJTI
-	if len(errs) == 0 {
+	if len(errs) == 0 && !priorFailures {
+		// Only when the whole cascade succeeded: while anything is left to
+		// retry, the acting session must keep working to retry it.
 		exempt = ""
 	}
 	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), exempt); err != nil {

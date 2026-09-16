@@ -755,3 +755,26 @@ func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
 	_, _, err = store.Users().GetAuthCutoff(ctx, domain.NewUserID())
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
+
+func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x", PrivateData: []byte("vault"), Keys: []byte("k")}))
+	stale, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+
+	ts := time.Now().Truncate(time.Millisecond)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, ts, "acting"))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, ts, ""), "same instant, second lifecycle write")
+
+	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite, "equal cut-off but a later fence")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData, "the erasure stands")
+	assert.Nil(t, u.Keys)
+	assert.EqualValues(t, 2, u.AuthFence, "each lifecycle write advances the fence")
+
+	u.DID = "did:z"
+	require.NoError(t, store.Users().Update(ctx, u), "a record loaded after the writes updates fine")
+}

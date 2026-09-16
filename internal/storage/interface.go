@@ -78,9 +78,9 @@ type UserStore interface {
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
 	// Update updates a user. It refuses (ErrStaleWrite) a record whose
-	// AuthInvalidBefore is older than the stored one, so a stale copy loaded
-	// before a suspension/revocation cannot roll back the cut-off or restore
-	// erased wallet data.
+	// AuthFence is behind the stored one, so a copy loaded before a
+	// suspension, revocation or erasure cannot roll back the cut-off or
+	// restore erased wallet data.
 	Update(ctx context.Context, user *domain.User) error
 
 	// Delete deletes a user

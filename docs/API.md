@@ -184,9 +184,11 @@ after a reactivation work normally. A login or token refresh that races with
 a lifecycle change is refused rather than handed a token that would be
 rejected on first use; the comparison is at whole seconds, and a token that
 would fall into the cut-off's own second is simply minted in the next one.
-The same cut-off applies to a delegating token at `POST /auth/token` and is
-re-checked for an established WebSocket session at every flow start, so it
-also holds across separate engine processes or instances.
+The same cut-off applies at `POST /auth/token` - to a delegating bearer token
+and to the session cookie itself, so a session that outlived the change
+cannot mint a fresh token - and is re-checked for an established WebSocket
+session at every flow start, so it also holds across separate engine
+processes or instances.
 
 An engine deployed without the backend role in the same process enforces the
 cut-off only when persistent storage is configured; with memory storage it

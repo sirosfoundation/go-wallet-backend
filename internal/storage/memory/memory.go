@@ -262,7 +262,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return user, nil
+	return cloneUser(user), nil
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain.User, error) {
@@ -271,7 +271,7 @@ func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain
 
 	for _, user := range s.data {
 		if user.Username != nil && *user.Username == username {
-			return user, nil
+			return cloneUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -283,7 +283,7 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 	for _, user := range s.data {
 		if user.DID == did {
-			return user, nil
+			return cloneUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -297,7 +297,7 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	if !exists {
 		return storage.ErrNotFound
 	}
-	if existing.AuthInvalidBefore.After(user.AuthInvalidBefore) {
+	if existing.AuthFence > user.AuthFence {
 		return storage.ErrStaleWrite
 	}
 
@@ -332,13 +332,31 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 // advanceCutoff moves the cut-off forward and replaces the exemption unless
 // t is older than the stored cut-off, so a delayed older event cannot swap a
 // newer cut-off's exemption (equal timestamps do replace it, matching the
-// Mongo implementation's millisecond granularity).
+// Mongo implementation's millisecond granularity). The fence counter always
+// advances, so every lifecycle write invalidates records loaded before it.
 func advanceCutoff(user *domain.User, t time.Time, exemptJTI string) {
+	user.AuthFence++
 	if t.Before(user.AuthInvalidBefore) {
 		return
 	}
 	user.AuthInvalidBefore = t
 	user.AuthCutoffExemptJTI = exemptJTI
+}
+
+// cloneUser returns an independent copy, so a caller that loaded a user
+// before a lifecycle write does not silently observe that write through a
+// shared pointer - the persistent stores hand out snapshots, and the
+// stale-write fence relies on the caller's copy staying behind.
+func cloneUser(u *domain.User) *domain.User {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	c.PrivateData = append([]byte(nil), u.PrivateData...)
+	c.Keys = append([]byte(nil), u.Keys...)
+	c.WebauthnCredentials = append([]domain.WebauthnCredential(nil), u.WebauthnCredentials...)
+	c.EnterpriseIdentities = append([]domain.EnterpriseIdentity(nil), u.EnterpriseIdentities...)
+	return &c
 }
 
 func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {

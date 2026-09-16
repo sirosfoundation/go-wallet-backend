@@ -2022,3 +2022,44 @@ func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+// The stale-write fence is a counter, not a timestamp comparison: a copy
+// loaded before a lifecycle write is refused even when both carry the same
+// cut-off instant. The getters hand out snapshots, so the copy does not
+// silently observe the write through a shared pointer.
+func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("vault"), Keys: []byte("k")}); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := store.Users().GetByID(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := time.Now()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, ts, "acting"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, ts, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !stale.AuthInvalidBefore.IsZero() || stale.PrivateData == nil {
+		t.Fatalf("GetByID must return a snapshot, not the stored pointer: %+v", stale)
+	}
+	if err := store.Users().Update(ctx, stale); err != storage.ErrStaleWrite {
+		t.Fatalf("equal cut-off, later fence: expected ErrStaleWrite, got %v", err)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if u.PrivateData != nil || u.Keys != nil {
+		t.Fatalf("the erasure must stand: %+v", u)
+	}
+
+	fresh, _ := store.Users().GetByID(ctx, uid)
+	fresh.DID = "did:new"
+	if err := store.Users().Update(ctx, fresh); err != nil {
+		t.Fatalf("a record loaded after the writes updates fine: %v", err)
+	}
+}
