@@ -28,9 +28,10 @@ import (
 // was cut off.
 var ErrRevoked = errors.New("token issued before the user's authorization was revoked")
 
-// UserLookup is the subset of storage.UserStore the gate needs.
+// UserLookup is the subset of storage.UserStore the gate needs: a narrow
+// read of the two auth fields, not the whole user record.
 type UserLookup interface {
-	GetByID(ctx context.Context, id domain.UserID) (*domain.User, error)
+	GetAuthCutoff(ctx context.Context, id domain.UserID) (cutoff time.Time, exemptJTI string, err error)
 }
 
 // Gate checks tokens against User.AuthInvalidBefore.
@@ -59,20 +60,35 @@ func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time, jti
 	if g == nil || userID == "" {
 		return nil
 	}
-	user, err := g.users.GetByID(ctx, domain.UserIDFromString(userID))
+	cutoff, exempt, err := g.users.GetAuthCutoff(ctx, domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("check token authorization: %w", err)
 	}
-	if user.AuthInvalidBefore.IsZero() || issuedAt.After(user.AuthInvalidBefore) {
+	if !IssuedBeforeCutoff(issuedAt, cutoff) {
 		return nil
 	}
-	if jti != "" && jti == user.AuthCutoffExemptJTI {
+	if jti != "" && jti == exempt {
 		return nil
 	}
 	return ErrRevoked
+}
+
+// IssuedBeforeCutoff is the one comparison behind every cut-off decision.
+// JWT iat has whole-second precision while the cut-off is recorded with the
+// store's precision, so both are compared as whole seconds: a token is
+// refused when its iat second is not after the cut-off second. A token
+// minted in the same second as the cut-off is therefore refused too (it
+// cannot prove it postdates the cut-off); issuers avoid that by minting
+// again in the next second, see WebAuthnService.mintAccessToken. A zero
+// cut-off refuses nothing; a zero iat is refused once a cut-off exists.
+func IssuedBeforeCutoff(issuedAt, cutoff time.Time) bool {
+	if cutoff.IsZero() {
+		return false
+	}
+	return issuedAt.Unix() <= cutoff.Unix()
 }
 
 // JTI reads the jti claim out of a compact JWS/JWT without verifying it;

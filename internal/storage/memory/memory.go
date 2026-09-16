@@ -325,14 +325,23 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	if !exists {
 		return storage.ErrNotFound
 	}
-	if t.After(user.AuthInvalidBefore) {
-		user.AuthInvalidBefore = t
-	}
-	user.AuthCutoffExemptJTI = exemptJTI
+	advanceCutoff(user, t, exemptJTI)
 	return nil
 }
 
-func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
+// advanceCutoff moves the cut-off forward and replaces the exemption unless
+// t is older than the stored cut-off, so a delayed older event cannot swap a
+// newer cut-off's exemption (equal timestamps do replace it, matching the
+// Mongo implementation's millisecond granularity).
+func advanceCutoff(user *domain.User, t time.Time, exemptJTI string) {
+	if t.Before(user.AuthInvalidBefore) {
+		return
+	}
+	user.AuthInvalidBefore = t
+	user.AuthCutoffExemptJTI = exemptJTI
+}
+
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, exists := s.data[id.String()]
@@ -343,7 +352,18 @@ func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error
 	user.PrivateDataETag = ""
 	user.Keys = nil
 	user.UpdatedAt = time.Now()
+	advanceCutoff(user, fence, exemptJTI)
 	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return time.Time{}, "", storage.ErrNotFound
+	}
+	return user.AuthInvalidBefore, user.AuthCutoffExemptJTI, nil
 }
 
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {

@@ -1940,7 +1940,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	if !u.AuthInvalidBefore.Equal(t2) {
 		t.Fatalf("cut-off only moves forward: got %v want %v", u.AuthInvalidBefore, t2)
 	}
-	if err := store.Users().ClearWalletData(ctx, uid); err != nil {
+	if err := store.Users().EraseWalletData(ctx, uid, t2, ""); err != nil {
 		t.Fatal(err)
 	}
 	u, _ = store.Users().GetByID(ctx, uid)
@@ -1950,7 +1950,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	if u.DID != "did:x" || !u.AuthInvalidBefore.Equal(t2) {
 		t.Fatalf("other fields must be untouched: %+v", u)
 	}
-	if err := store.Users().ClearWalletData(ctx, domain.NewUserID()); err != storage.ErrNotFound {
+	if err := store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now(), ""); err != storage.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 	if err := store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2, ""); err != storage.ErrNotFound {
@@ -1973,7 +1973,7 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Users().ClearWalletData(ctx, uid); err != nil {
+	if err := store.Users().EraseWalletData(ctx, uid, time.Now(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Users().Update(ctx, &staleCopy); err != storage.ErrStaleWrite {
@@ -1989,5 +1989,36 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	freshCopy.DID = "did:new"
 	if err := store.Users().Update(ctx, &freshCopy); err != nil {
 		t.Fatalf("a fresh copy updates fine: %v", err)
+	}
+}
+
+func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	newer := time.Now()
+	older := newer.Add(-time.Minute)
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, newer, "new-jti"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, older, "old-jti"); err != nil {
+		t.Fatal(err)
+	}
+	cutoff, exempt, err := store.Users().GetAuthCutoff(ctx, uid)
+	if err != nil || !cutoff.Equal(newer) || exempt != "new-jti" {
+		t.Fatalf("a delayed older event must not replace the newer exemption: %v %v %v", cutoff, exempt, err)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, older, ""); err != nil {
+		t.Fatal(err)
+	}
+	cutoff, exempt, _ = store.Users().GetAuthCutoff(ctx, uid)
+	if !cutoff.Equal(newer) || exempt != "new-jti" {
+		t.Fatalf("erase with an older fence keeps the newer cut-off and exemption: %v %v", cutoff, exempt)
+	}
+	if _, _, err := store.Users().GetAuthCutoff(ctx, domain.NewUserID()); err != storage.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

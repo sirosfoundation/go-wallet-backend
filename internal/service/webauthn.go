@@ -1183,21 +1183,15 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		}
 	}
 
-	// Generate JWT token with tenant_id included for security boundary
-	token, err := s.generateToken(user, tenantID)
+	// Generate JWT token (and refresh token, if enabled) with tenant_id
+	// included for security boundary. SID-AUTH-06: minted and then checked
+	// against the user's token cut-off, see mintTokens.
+	token, refreshToken, err := s.mintTokens(ctx, user, tenantID, func() error {
+		return s.checkWalletLifecycle(ctx, tenantID, userID, matchedCred.ID)
+	}, ErrVerificationFailed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate token: %w", err)
-	}
-	// SID-AUTH-06: a suspension/revocation that landed after the gate ran
-	// (during the sign-count save or the OIDC checks) must not hand out a
-	// token that postdates its cut-off. Checked after minting, so a cut-off
-	// set at any later instant refuses the token by iat anyway.
-	if err := s.refuseIfCutOffSince(ctx, tenantID, userID, matchedCred.ID, token); err != nil {
 		return nil, err
 	}
-
-	// Generate refresh token (if enabled)
-	refreshToken, _ := s.generateRefreshToken(user, tenantID) // Ignore error, refresh is optional
 
 	displayName := ""
 	if user.DisplayName != nil {
@@ -1356,19 +1350,12 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		}
 	}
 
-	// Generate new access token
-	accessToken, err := s.generateToken(user, tenantID)
+	// Generate the new access token and the rotated refresh token, checked
+	// against the user's token cut-off after minting (SID-AUTH-06).
+	accessToken, newRefreshToken, err := s.mintTokens(ctx, user, tenantID, nil, ErrInvalidRefreshToken)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate access token: %w", err)
+		return nil, err
 	}
-	// SID-AUTH-06: a cut-off that landed while this request ran must not be
-	// beaten by a freshly minted token.
-	if fresh, err := s.store.Users().GetByID(ctx, userID); err != nil || !fresh.AuthInvalidBefore.IsZero() && !tokengate.IssuedAt(accessToken).After(fresh.AuthInvalidBefore) {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Generate new refresh token (rotation for security)
-	newRefreshToken, _ := s.generateRefreshToken(user, tenantID)
 
 	s.logger.Info("Access token refreshed",
 		zap.String("user_id", userIDStr),
@@ -1840,24 +1827,49 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 	return nil
 }
 
-// refuseIfCutOffSince is the post-mint half of the login gate: if the user's
-// token cut-off is not before the token's iat, a lifecycle change landed
-// while the login was in flight. The gate is re-run for the precise refusal;
-// if it passes (the cut-off came from an instance unrelated to this passkey)
-// the login is still refused, because the token would be rejected by the
-// token gate on first use - the client simply logs in again.
-func (s *WebAuthnService) refuseIfCutOffSince(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID, token string) error {
-	fresh, err := s.store.Users().GetByID(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("re-check user after token issuance: %w", err)
+// mintTokens issues the access token and, when enabled, the refresh token,
+// then checks both against the user's token cut-off (SID-AUTH-06). A
+// suspension or revocation that lands after the login gate ran - during the
+// sign-count save, the OIDC checks, or between the two mints - must not
+// hand out a token that the token gate would accept.
+//
+// The comparison is at whole seconds (tokengate.IssuedBeforeCutoff), so a
+// token minted in the same second as a cut-off is refused too. When that is
+// the only problem (recheck passes) the tokens are minted again in the next
+// second, so a second device logging in right after suspending another is
+// not turned away. If the cut-off is older, recheck (when given) supplies
+// the precise lifecycle refusal; otherwise the request fails with refusal
+// and the client simply tries again.
+func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, tenantID domain.TenantID, recheck func() error, refusal error) (string, string, error) {
+	for attempt := 0; ; attempt++ {
+		access, err := s.generateToken(user, tenantID)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to generate token: %w", err)
+		}
+		refresh, _ := s.generateRefreshToken(user, tenantID) // refresh is optional
+		cutoff, _, err := s.store.Users().GetAuthCutoff(ctx, user.UUID)
+		if err != nil {
+			return "", "", fmt.Errorf("re-check user after token issuance: %w", err)
+		}
+		last := tokengate.IssuedAt(access)
+		if refresh != "" {
+			last = tokengate.IssuedAt(refresh)
+		}
+		if !tokengate.IssuedBeforeCutoff(last, cutoff) {
+			return access, refresh, nil
+		}
+		if recheck != nil {
+			if err := recheck(); err != nil {
+				return "", "", err
+			}
+		}
+		if attempt == 0 && last.Unix() == cutoff.Unix() {
+			// Same second as the cut-off: wait for the next one and mint again.
+			time.Sleep(time.Until(cutoff.Truncate(time.Second).Add(time.Second)))
+			continue
+		}
+		return "", "", fmt.Errorf("%w: authorization changed during login, please log in again", refusal)
 	}
-	if fresh.AuthInvalidBefore.IsZero() || tokengate.IssuedAt(token).After(fresh.AuthInvalidBefore) {
-		return nil
-	}
-	if err := s.checkWalletLifecycle(ctx, tenantID, userID, credentialID); err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: authorization changed during login, please log in again", ErrVerificationFailed)
 }
 
 // checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).

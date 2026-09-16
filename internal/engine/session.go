@@ -60,12 +60,16 @@ type Session struct {
 	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
 	// per-protocol check must treat it as a no-op, exactly like
 	// requireTACIfEnforced does for HTTP routes.
-	TAC     claims.TAC
-	conn    *websocket.Conn
-	sendMu  sync.Mutex
-	flows   map[string]*Flow
-	flowsMu sync.RWMutex
-	logger  *zap.Logger
+	TAC claims.TAC
+	// tokenIssuedAt/tokenJTI identify the handshake token for the
+	// SID-AUTH-06 re-check on every flow start (Manager.recheckToken).
+	tokenIssuedAt time.Time
+	tokenJTI      string
+	conn          *websocket.Conn
+	sendMu        sync.Mutex
+	flows         map[string]*Flow
+	flowsMu       sync.RWMutex
+	logger        *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -188,6 +192,13 @@ func (m *Manager) SetTokenGate(g *tokengate.Gate) {
 	m.tokenGate = g
 }
 
+// recheckToken re-applies the token cut-off to an established session (see
+// handleFlowStart). No gate configured means no cut-off enforcement, as at
+// the handshake.
+func (m *Manager) recheckToken(session *Session) error {
+	return m.tokenGate.Check(context.Background(), session.UserID, session.tokenIssuedAt, session.tokenJTI)
+}
+
 // RegisterFlowHandler registers a handler factory for a protocol
 func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFactory) {
 	m.handlersMu.Lock()
@@ -291,6 +302,8 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
+		tokenIssuedAt: tokengate.IssuedAt(handshake.AppToken),
+		tokenJTI:      tokengate.JTI(handshake.AppToken),
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -305,6 +318,15 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// Register session
 	m.registerSession(session)
 	defer m.unregisterSession(session)
+
+	// SID-AUTH-06: a cut-off that landed between validateToken and the
+	// registration above would have been missed by DeleteByUser (nothing to
+	// close yet). Re-check now that the session is visible.
+	if err := m.recheckToken(session); err != nil {
+		m.logger.Warn("Session refused after registration", zap.Error(err))
+		m.sendError(conn, "", ErrCodeAuthFailed, "Authorization revoked")
+		return
+	}
 
 	// Send handshake complete
 	capabilities := m.getCapabilities()
@@ -491,6 +513,18 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 		}
 	}()
+
+	// SID-AUTH-06: an established session keeps running until a flow starts;
+	// re-check the handshake token against the user's cut-off here so a
+	// suspension or revocation that DeleteByUser could not reach - another
+	// engine process or instance in a split or scaled deployment - still
+	// stops the wallet at its next flow. The gate reads the shared store.
+	if err := m.recheckToken(session); err != nil {
+		logger.Warn("Flow refused: authorization revoked", zap.Error(err))
+		_ = session.SendFlowError(flowID, "", ErrCodeAuthFailed, "Authorization revoked")
+		_ = session.conn.Close()
+		return
+	}
 
 	// Get handler factory first (before acquiring flow lock)
 	m.handlersMu.RLock()

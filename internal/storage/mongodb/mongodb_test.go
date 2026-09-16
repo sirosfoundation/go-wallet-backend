@@ -651,7 +651,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, u.AuthInvalidBefore.Equal(t2), "cut-off only moves forward: %v vs %v", u.AuthInvalidBefore, t2)
 
-	require.NoError(t, store.Users().ClearWalletData(ctx, uid))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, t2, ""))
 	u, err = store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.Nil(t, u.PrivateData)
@@ -660,7 +660,7 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	assert.Equal(t, "did:x", u.DID, "other fields untouched")
 	assert.True(t, u.AuthInvalidBefore.Equal(t2))
 
-	assert.ErrorIs(t, store.Users().ClearWalletData(ctx, domain.NewUserID()), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now(), ""), storage.ErrNotFound)
 	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2, ""), storage.ErrNotFound)
 }
 
@@ -677,7 +677,7 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	require.NoError(t, store.Users().Update(ctx, stale))
 
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond), ""))
-	require.NoError(t, store.Users().ClearWalletData(ctx, uid))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, time.Now(), ""))
 	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite)
 	u, err := store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
@@ -722,4 +722,36 @@ func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
 	}
+}
+
+func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v")}))
+	newer := time.Now().Truncate(time.Millisecond)
+	older := newer.Add(-time.Minute)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, newer, "new-jti"))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, older, "old-jti"))
+	cutoff, exempt, err := store.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.Equal(newer), "cut-off stays at the newer value")
+	assert.Equal(t, "new-jti", exempt, "a delayed older event must not replace the newer exemption")
+
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, older, ""), "erase with an older fence")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData, "data erased")
+	assert.True(t, u.AuthInvalidBefore.Equal(newer))
+	assert.Equal(t, "new-jti", u.AuthCutoffExemptJTI, "exemption untouched when the fence does not advance")
+
+	later := newer.Add(time.Second)
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, later, ""))
+	cutoff, exempt, err = store.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.Equal(later))
+	assert.Empty(t, exempt, "advancing with no exemption clears it")
+
+	_, _, err = store.Users().GetAuthCutoff(ctx, domain.NewUserID())
+	assert.ErrorIs(t, err, storage.ErrNotFound)
 }

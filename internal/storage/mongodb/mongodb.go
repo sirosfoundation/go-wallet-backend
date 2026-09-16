@@ -371,16 +371,29 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
-	// $max only moves the cut-off forward, so two lifecycle events racing
-	// cannot roll it back. The exempt token is the latest actor's.
-	update := bson.M{"$max": bson.M{"auth_invalid_before": t}}
-	if exemptJTI != "" {
-		update["$set"] = bson.M{"auth_cutoff_exempt_jti": exemptJTI}
-	} else {
-		update["$unset"] = bson.M{"auth_cutoff_exempt_jti": ""}
+// cutoffStage is the update-pipeline stage that advances auth_invalid_before
+// to t if t is later, and replaces auth_cutoff_exempt_jti with exemptJTI (or
+// removes it when empty) unless t is older than the stored cut-off. One
+// conditional stage, so two lifecycle events racing cannot roll the cut-off
+// back or leave the newer cut-off with the older event's exemption. Equal
+// timestamps (same millisecond, e.g. the erasure fence right after the
+// cut-off of the same cascade) do replace the exemption.
+func cutoffStage(t time.Time, exemptJTI string, extra bson.D) bson.D {
+	advances := bson.D{{Key: "$gte", Value: bson.A{t, bson.D{{Key: "$ifNull", Value: bson.A{"$auth_invalid_before", time.Time{}}}}}}}
+	var exempt interface{} = exemptJTI
+	if exemptJTI == "" {
+		exempt = "$$REMOVE"
 	}
-	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, update)
+	set := bson.D{
+		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
+		{Key: "auth_cutoff_exempt_jti", Value: bson.D{{Key: "$cond", Value: bson.A{advances, exempt, bson.D{{Key: "$ifNull", Value: bson.A{"$auth_cutoff_exempt_jti", "$$REMOVE"}}}}}}},
+	}
+	set = append(set, extra...)
+	return bson.D{{Key: "$set", Value: set}}
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{cutoffStage(t, exemptJTI, nil)})
 	if err != nil {
 		return fmt.Errorf("failed to set auth cut-off: %w", err)
 	}
@@ -390,18 +403,39 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	return nil
 }
 
-func (s *UserStore) ClearWalletData(ctx context.Context, id domain.UserID) error {
-	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, bson.M{
-		"$unset": bson.M{"private_data": "", "private_data_etag": "", "keys": ""},
-		"$set":   bson.M{"updated_at": time.Now()},
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {
+	// One pipeline update: the erasure and the fence advance land together,
+	// so no record loaded before this write can pass Update's stale check.
+	stage := cutoffStage(fence, exemptJTI, bson.D{
+		{Key: "private_data", Value: "$$REMOVE"},
+		{Key: "private_data_etag", Value: "$$REMOVE"},
+		{Key: "keys", Value: "$$REMOVE"},
+		{Key: "updated_at", Value: time.Now()},
 	})
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{stage})
 	if err != nil {
-		return fmt.Errorf("failed to clear wallet data: %w", err)
+		return fmt.Errorf("failed to erase wallet data: %w", err)
 	}
 	if result.MatchedCount == 0 {
 		return storage.ErrNotFound
 	}
 	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, string, error) {
+	var doc struct {
+		Cutoff time.Time `bson:"auth_invalid_before"`
+		Exempt string    `bson:"auth_cutoff_exempt_jti"`
+	}
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()},
+		options.FindOne().SetProjection(bson.M{"auth_invalid_before": 1, "auth_cutoff_exempt_jti": 1})).Decode(&doc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return time.Time{}, "", storage.ErrNotFound
+		}
+		return time.Time{}, "", fmt.Errorf("failed to read auth cut-off: %w", err)
+	}
+	return doc.Cutoff, doc.Exempt, nil
 }
 
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {

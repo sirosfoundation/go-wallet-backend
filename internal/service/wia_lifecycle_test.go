@@ -499,3 +499,31 @@ func TestWIAService_GenerateWIA_LoserOfTenantRaceGetsNoWIA(t *testing.T) {
 		t.Fatalf("no instance may exist for the loser in its tenant: %v", mine)
 	}
 }
+
+// An anonymously attested instance that a deactivated wallet's user then
+// tries to bind must be refused like a brand-new key: otherwise the
+// new-enrollment requirement could be bypassed via an unowned record.
+func TestWIAService_GenerateWIA_RefusesBindingUnownedInstanceToDeactivatedWallet(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+	uid := domain.UserIDFromString("user-deactivated-bind")
+	seedWIAInstance(t, instances, "old-key", uid, domain.InstanceStatusRevoked)
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("anonymous attestation: %v", err)
+	}
+
+	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: createTestPopWithKey(t, challenge2, key), Challenge: challenge2})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("binding an unowned instance to a deactivated wallet must be refused, got %v", err)
+	}
+}

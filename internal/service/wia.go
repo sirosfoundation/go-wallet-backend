@@ -338,6 +338,14 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
+			if existing.UserID == nil && userID != nil {
+				// First user binding of an anonymously attested instance: for
+				// the wallet's lifecycle this is a new instance of that user,
+				// so a deactivated wallet must not adopt it.
+				if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
+					return "", err
+				}
+			}
 			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
 				s.emitAuditFailure("instance_binding_mismatch", err)
 				return "", err

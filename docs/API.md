@@ -176,10 +176,17 @@ or accepted for a WebSocket handshake, are refused with `401` when their `iat`
 is not after the cut-off, even if they have not expired. The one exception is
 the token that made the self-service request: it stays valid, so the user can
 reactivate a suspended instance or repeat a request after `409
-ERASURE_INCOMPLETE` from the same session. Admin-initiated changes exempt no
-token. Tokens obtained after a reactivation work normally. A login or token
-refresh that races with a lifecycle change is refused rather than handed a
-token that would be rejected on first use.
+ERASURE_INCOMPLETE` from the same session; once a wallet is fully deactivated
+and its erasure complete, that exemption is dropped too. Admin-initiated
+changes exempt no token. The cut-off is recorded before the status change is
+persisted, so a blocked instance never keeps working tokens. Tokens obtained
+after a reactivation work normally. A login or token refresh that races with
+a lifecycle change is refused rather than handed a token that would be
+rejected on first use; the comparison is at whole seconds, and a token that
+would fall into the cut-off's own second is simply minted in the next one.
+The same cut-off applies to a delegating token at `POST /auth/token` and is
+re-checked for an established WebSocket session at every flow start, so it
+also holds across separate engine processes or instances.
 
 An engine deployed without the backend role in the same process enforces the
 cut-off only when persistent storage is configured; with memory storage it

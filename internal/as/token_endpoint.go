@@ -1,11 +1,14 @@
 package as
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -14,6 +17,9 @@ type tokenDeps struct {
 	policy  PolicyEngine
 	ttlFunc func(string) time.Duration
 	logger  *zap.Logger
+	// gate refuses delegating tokens issued before the user's SID-AUTH-06
+	// cut-off (optional; nil enforces nothing).
+	gate *tokengate.Gate
 }
 
 // TokenResponse is the response body for POST /auth/token.
@@ -38,10 +44,11 @@ func TokenEndpointHandler(
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
 	insecureCookies bool,
+	gate *tokengate.Gate,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: insecureCookies}
-	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger}
+	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger, gate: gate}
 	return func(c *gin.Context) {
 		var req TokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -241,6 +248,18 @@ func handleDelegationTokenRequest(
 		return
 	}
 
+	// SID-AUTH-06: a delegating token issued before the user's wallet was
+	// suspended or revoked must not mint a fresh (post-cut-off) token.
+	if err := deps.gate.Check(c.Request.Context(), parentClaims.Subject, tokengate.IssuedAt(bearerToken), tokengate.JTI(bearerToken)); err != nil {
+		if errors.Is(err, tokengate.ErrRevoked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
+		} else {
+			deps.logger.Error("token cut-off check failed", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		}
+		return
+	}
+
 	// Delegating token must have the 'k' permission.
 	if !parentClaims.TAC.Has(TACDelegate) {
 		c.JSON(http.StatusForbidden, gin.H{
@@ -350,7 +369,8 @@ func RegisterTokenEndpoint(
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
 	insecureCookies bool,
+	gate *tokengate.Gate,
 	logger *zap.Logger,
 ) {
-	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, insecureCookies, logger))
+	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, insecureCookies, gate, logger))
 }

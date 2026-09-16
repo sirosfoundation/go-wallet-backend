@@ -16,8 +16,8 @@ import (
 
 type erroringUsers struct{}
 
-func (erroringUsers) GetByID(context.Context, domain.UserID) (*domain.User, error) {
-	return nil, errors.New("db down")
+func (erroringUsers) GetAuthCutoff(context.Context, domain.UserID) (time.Time, string, error) {
+	return time.Time{}, "", errors.New("db down")
 }
 
 func TestGate_Check(t *testing.T) {

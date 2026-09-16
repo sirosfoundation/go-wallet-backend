@@ -873,3 +873,28 @@ func TestManager_DeleteByUser_ClosesLiveSessionAndStoreRecord(t *testing.T) {
 
 	assert.NoError(t, m.DeleteByUser(context.Background(), "nobody"), "idempotent for unknown users")
 }
+
+// SID-AUTH-06: an established session is re-checked against the user's token
+// cut-off when a flow starts, so a suspension or revocation that another
+// process or instance performed still stops this wallet at its next flow.
+func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	session := &Session{ID: "s1", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute), tokenJTI: "handshake-jti"}
+	require.NoError(t, m.recheckToken(session), "no cut-off yet")
+
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now(), "other-jti"))
+	assert.ErrorIs(t, m.recheckToken(session), tokengate.ErrRevoked, "the handshake token predates the cut-off")
+
+	exempt := &Session{ID: "s2", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute), tokenJTI: "other-jti"}
+	assert.NoError(t, m.recheckToken(exempt), "the acting session's token is exempt")
+
+	anon := &Session{ID: "s3", UserID: ""}
+	assert.NoError(t, m.recheckToken(anon), "anonymous sessions are not gated")
+	assert.NoError(t, NewManager(cfg, zap.NewNop()).recheckToken(session), "no gate configured: nothing enforced")
+}

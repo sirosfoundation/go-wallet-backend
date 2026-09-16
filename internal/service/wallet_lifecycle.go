@@ -111,6 +111,17 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		}
 		return inst, nil
 	}
+	if target != domain.InstanceStatusActive {
+		// Fail closed: cut off issued tokens before the status is persisted.
+		// If the cut-off cannot be recorded nothing changes and the caller
+		// gets an error; if the status write then fails, the user's tokens
+		// are cut off while the instance stays active, which only costs a
+		// re-login. The reverse order would leave a blocked instance whose
+		// pre-cut-off tokens keep working until a retry.
+		if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.store.WalletInstances().UpdateStatus(ctx, instanceID, target, reason); err != nil {
 		return nil, err
 	}
@@ -121,6 +132,20 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		return inst, s.cascade(ctx, tenantID, inst, actor)
 	}
 	return inst, nil
+}
+
+// cutOffTokens records the SID-AUTH-06 token cut-off for the instance's
+// user (see internal/tokengate): bearer tokens issued before now stop
+// working, except the one carrying this request. Instances without a user
+// have no tokens to cut off.
+func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.WalletInstance, actor LifecycleActor) error {
+	if inst.UserID == nil {
+		return nil
+	}
+	if err := s.store.Users().InvalidateAuthBefore(ctx, *inst.UserID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("cut off issued tokens: %w", err)
+	}
+	return nil
 }
 
 // RevokeAllForUser revokes every non-revoked instance of the user in the
@@ -139,6 +164,11 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 	for _, inst := range instances {
 		if inst.Status == domain.InstanceStatusRevoked {
 			continue
+		}
+		if changed == 0 {
+			if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+				return 0, err
+			}
 		}
 		if err := s.store.WalletInstances().UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, reason); err != nil {
 			err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
@@ -177,13 +207,8 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	}
 	userID := *inst.UserID
 	var errs []error
-	// Bearer tokens already issued outlive the sessions dropped below (legacy
-	// HMAC tokens for up to a day, refresh tokens longer); cut them off at
-	// this instant so a suspended or revoked instance cannot keep calling
-	// user-authorized endpoints. See internal/tokengate.
-	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		errs = append(errs, fmt.Errorf("cut off issued tokens: %w", err))
-	}
+	// Issued bearer tokens were cut off before the status was persisted
+	// (cutOffTokens); the live sessions go here.
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
@@ -235,61 +260,85 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	}
 	errs := s.eraseHolderData(ctx, tenantID, holder)
 
-	live, err := s.liveInstanceElsewhere(ctx, userID, tenantID)
+	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
 		return append(errs, err)
 	}
-	if live {
+	if s.liveInstanceIn(ctx, tenants, tenantID, userID, &errs) {
 		s.logger.Info("wallet data erased in tenant; user-level data kept, a live instance remains in another tenant",
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
 		return errs
 	}
-	// Field-scoped: a full-record Update from the user loaded above would
-	// overwrite anything written concurrently (e.g. a passkey registration).
-	if err := s.store.Users().ClearWalletData(ctx, userID); err != nil {
-		errs = append(errs, fmt.Errorf("clear private data: %w", err))
-	} else if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), exemptJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		// Advance the write fence past the erasure: a user record loaded
-		// between the first cut-off and the clear carries the old cut-off
-		// and would otherwise pass UserStore.Update's stale check and write
-		// the erased data back.
-		errs = append(errs, fmt.Errorf("advance write fence after erasure: %w", err))
+	// No live instance anywhere: the wallet is deactivated. Erase the holder
+	// data of every tenant the user belongs to (#195: stored VCs/VPs for all
+	// of the user's tenants) and the pending challenges, then the user-level
+	// key material. That last write also advances the token cut-off (one
+	// atomic update, see UserStore.EraseWalletData) so a record loaded
+	// before it is fenced out of Update. When everything succeeded the
+	// acting token's exemption is dropped as well: a deactivated wallet
+	// needs a new enrollment, and the session that deactivated it must not
+	// be able to write new wallet data afterwards. When something failed the
+	// exemption stays so the same session can repeat the request.
+	for _, tid := range tenants {
+		if tid != tenantID {
+			errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+		}
 	}
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		errs = append(errs, fmt.Errorf("delete challenges: %w", err))
+	}
+	exempt := exemptJTI
+	if len(errs) == 0 {
+		exempt = ""
+	}
+	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), exempt); err != nil {
+		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
 	s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
 	return errs
 }
 
-// liveInstanceElsewhere reports whether the user still has a non-revoked
-// wallet instance in any tenant other than exclude: the explicit memberships
-// plus the default tenant, where users registered without a membership row
-// live. A failed membership lookup is an error, because erasing the user-level
-// data on a guess could destroy a wallet that is still in use elsewhere.
-func (s *WalletLifecycleService) liveInstanceElsewhere(ctx context.Context, userID domain.UserID, exclude domain.TenantID) (bool, error) {
-	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+// userTenants lists the tenants whose wallet data belongs to the user: the
+// explicit memberships, the default tenant (where users registered without a
+// membership row live) and the tenant at hand, without duplicates. A failed
+// membership lookup is an error: erasing on a guess could destroy a wallet
+// still in use elsewhere.
+func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.UserID, include domain.TenantID) ([]domain.TenantID, error) {
+	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
-		return false, fmt.Errorf("list tenant memberships: %w", err)
+		return nil, fmt.Errorf("list tenant memberships: %w", err)
 	}
-	tenantIDs = append(tenantIDs, domain.DefaultTenantID)
-	seen := map[domain.TenantID]bool{exclude: true}
-	for _, tid := range tenantIDs {
-		if seen[tid] {
+	seen := map[domain.TenantID]bool{}
+	var out []domain.TenantID
+	for _, tid := range append([]domain.TenantID{include, domain.DefaultTenantID}, memberships...) {
+		if !seen[tid] {
+			seen[tid] = true
+			out = append(out, tid)
+		}
+	}
+	return out, nil
+}
+
+// liveInstanceIn reports whether the user still has a non-revoked wallet
+// instance in any of tenants other than exclude. A listing failure is
+// recorded in errs and counts as "live" (fail closed: keep the data).
+func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []domain.TenantID, exclude domain.TenantID, userID domain.UserID, errs *[]error) bool {
+	for _, tid := range tenants {
+		if tid == exclude {
 			continue
 		}
-		seen[tid] = true
 		instances, err := s.store.WalletInstances().GetByUser(ctx, tid, userID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return false, fmt.Errorf("list instances in tenant %s: %w", tid, err)
+			*errs = append(*errs, fmt.Errorf("list instances in tenant %s: %w", tid, err))
+			return true
 		}
 		for _, inst := range instances {
 			if inst.Status != domain.InstanceStatusRevoked {
-				return true, nil
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 // eraseHolderData deletes the holder's credentials and presentations in one

@@ -91,8 +91,8 @@ func (s *failUsers) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	return s.UserStore.GetByID(ctx, id)
 }
 
-func (s *failUsers) ClearWalletData(ctx context.Context, id domain.UserID) error {
-	if err := s.f.err("users.ClearWalletData"); err != nil {
+func (s *failUsers) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {
+	if err := s.f.err("users.EraseWalletData"); err != nil {
 		return err
 	}
 	if s.f.captureBeforeClear {
@@ -105,7 +105,7 @@ func (s *failUsers) ClearWalletData(ctx context.Context, id domain.UserID) error
 		c := *u
 		s.f.captured = &c
 	}
-	return s.UserStore.ClearWalletData(ctx, id)
+	return s.UserStore.EraseWalletData(ctx, id, fence, exemptJTI)
 }
 
 func (s *failUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
@@ -326,7 +326,7 @@ func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 		assert.NoError(t, err, "challenges are user-level too")
 	})
 
-	t.Run("no live instance anywhere erases the vault but not other tenants' holder data", func(t *testing.T) {
+	t.Run("no live instance anywhere erases the vault and every tenant's holder data", func(t *testing.T) {
 		store := memory.NewStore()
 		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 		uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme") // acme membership + data, no acme instance
@@ -338,15 +338,15 @@ func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 		assert.Nil(t, user.PrivateData)
 		_, err = store.Challenges().GetByID(ctx, "chal-"+uid.String())
 		assert.Error(t, err, "pending challenges are gone")
-		c, _ := countHolderData(t, store, "acme", uid)
-		assert.Equal(t, 1, c, "acme's holder data belongs to acme's lifecycle")
+		c, p := countHolderData(t, store, "acme", uid)
+		assert.Zero(t, c+p, "a fully deactivated wallet has its VCs/VPs erased in every tenant (#195)")
 	})
 }
 
 func TestWalletLifecycle_Erasure_StoreFailuresAreReportedAndRetryable(t *testing.T) {
 	ctx := context.Background()
 	for _, op := range []string{
-		"users.ClearWalletData", "users.InvalidateAuthBefore", "usertenants.GetUserTenants", "credentials.GetAllByHolder", "credentials.Delete",
+		"users.EraseWalletData", "usertenants.GetUserTenants", "credentials.GetAllByHolder", "credentials.Delete",
 		"presentations.GetAllByHolder", "presentations.Delete", "challenges.DeleteByUserID",
 	} {
 		t.Run(op, func(t *testing.T) {
@@ -443,4 +443,49 @@ func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
 	assert.ErrorIs(t, fs.Store.Users().Update(ctx, fs.captured), storage.ErrStaleWrite)
 	u, _ := fs.Store.Users().GetByID(ctx, uid)
 	assert.Nil(t, u.PrivateData, "the erasure stands")
+}
+
+// The token cut-off is recorded before the status is persisted: if it cannot
+// be, nothing changes (fail closed), instead of a blocked instance whose
+// pre-cut-off tokens keep working.
+func TestWalletLifecycle_CutoffFailureLeavesStatusUnchanged(t *testing.T) {
+	ctx := context.Background()
+	fs := newFailStore("users.InvalidateAuthBefore")
+	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+	id := "inst-" + uid.String()
+
+	_, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusSuspended, "x")
+	assert.ErrorIs(t, err, errBoom)
+	inst, _ := fs.Store.WalletInstances().GetByID(ctx, id)
+	assert.Equal(t, domain.InstanceStatusActive, inst.Status, "status untouched when the cut-off cannot be recorded")
+
+	n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "x")
+	assert.ErrorIs(t, err, errBoom)
+	assert.Zero(t, n)
+	inst, _ = fs.Store.WalletInstances().GetByID(ctx, id)
+	assert.Equal(t, domain.InstanceStatusActive, inst.Status)
+}
+
+// Once the wallet is fully deactivated and the erasure completed, the acting
+// token's exemption is dropped: that session must not recreate wallet data.
+// While the cascade is incomplete the exemption stays so it can retry.
+func TestWalletLifecycle_ExemptionDroppedAfterCompleteDeactivation(t *testing.T) {
+	ctx := context.Background()
+	fs := newFailStore("credentials.Delete")
+	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+	actor := userActor(uid)
+	actor.TokenJTI = "acting"
+
+	_, err := svc.RevokeAllForUser(ctx, actor, domain.DefaultTenantID, uid, "stolen")
+	assert.ErrorIs(t, err, ErrErasureIncomplete)
+	_, exempt, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.Equal(t, "acting", exempt, "incomplete: the session keeps its exemption to retry")
+
+	fs.fail["credentials.Delete"] = false
+	_, err = svc.RevokeAllForUser(ctx, actor, domain.DefaultTenantID, uid, "stolen")
+	require.NoError(t, err)
+	_, exempt, _ = fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.Empty(t, exempt, "complete deactivation: no token survives")
 }
