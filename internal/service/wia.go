@@ -381,7 +381,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 2.6: a claimed passkey link must be the caller's own passkey.
-	if err := s.checkCredentialOwnership(ctx, userID, req.CredentialID); err != nil {
+	if err := s.checkCredentialOwnership(ctx, tenantID, userID, req.CredentialID); err != nil {
 		s.emitAuditFailure("credential_not_owned", err)
 		return "", err
 	}
@@ -808,6 +808,29 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	if others == 0 {
 		return nil
 	}
+	// GetByUser above says nothing about newID itself: it is skipped there,
+	// and a first attestation of the same instance key that raced this one
+	// may have inserted the record under another tenant or bound it to
+	// another user (Upsert fixes tenant_id at insert and binds user_id
+	// once). Revoking on that evidence alone would destroy the winner's
+	// active instance, so re-read the record and refuse instead - the same
+	// ErrWIAInstanceNotOwned the read-back in recheckLifecycleAfterWrite
+	// would report a moment later, only without the destructive write.
+	inserted, err := s.instances.GetByID(ctx, newID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("re-check wallet instance ownership: %w", err)
+	}
+	if inserted.TenantID != tenantID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was recorded in another tenant during attestation"))
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if inserted.UserID != nil && *inserted.UserID != *userID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
+		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
 	const reason = "wallet deactivated during attestation"
 	alreadyRevoked := false
 	if err := s.instances.UpdateStatus(ctx, newID, domain.InstanceStatusRevoked, reason); err != nil {
@@ -837,8 +860,16 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 // checkCredentialOwnership refuses a credential_id the caller cannot prove is
 // theirs. An empty one claims no passkey and is always fine; a non-empty one
 // needs an authenticated user, a configured user store, and a matching
-// registered WebAuthn credential.
-func (s *WIAService) checkCredentialOwnership(ctx context.Context, userID *domain.UserID, credentialID string) error {
+// registered WebAuthn credential of this tenant.
+//
+// The tenant match matters because user records are global while WebAuthn
+// credentials carry their own tenant (set from the registration challenge):
+// a credential of tenant A linked to an instance of tenant B could never
+// authenticate in B, so B's real passkey would sit outside the per-instance
+// login gate. Credentials registered before tenants existed have no tenant
+// and count as the default one, the same normalisation the login path
+// applies.
+func (s *WIAService) checkCredentialOwnership(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, credentialID string) error {
 	if credentialID == "" {
 		return nil
 	}
@@ -855,10 +886,22 @@ func (s *WIAService) checkCredentialOwnership(ctx context.Context, userID *domai
 		}
 		return fmt.Errorf("check passkey ownership: %w", err)
 	}
+	wantTenant := tenantID
+	if wantTenant == "" {
+		wantTenant = domain.DefaultTenantID
+	}
 	for _, cred := range user.WebauthnCredentials {
-		if cred.ID == credentialID {
-			return nil
+		if cred.ID != credentialID {
+			continue
 		}
+		credTenant := cred.TenantID
+		if credTenant == "" {
+			credTenant = domain.DefaultTenantID
+		}
+		if credTenant != wantTenant {
+			return fmt.Errorf("%w: the passkey belongs to another tenant", ErrWIACredentialNotOwned)
+		}
+		return nil
 	}
 	return fmt.Errorf("%w: the user has no such passkey", ErrWIACredentialNotOwned)
 }

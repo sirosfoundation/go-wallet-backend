@@ -173,6 +173,14 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 	for pass := 0; pass < revokeAllMaxPasses; pass++ {
 		instances, err := s.ListForUser(ctx, tenantID, userID)
 		if err != nil {
+			if last != nil {
+				// An earlier pass already persisted revocations: they must
+				// not keep their sessions and cleanup until the retry, so
+				// cascade for them now and report the request as incomplete
+				// (the documented retry-by-repeating path) rather than as a
+				// plain storage error.
+				return changed, errors.Join(fmt.Errorf("%w: list instances during the revoke-all sweep: %w", ErrErasureIncomplete, err), s.cascade(ctx, tenantID, last, actor))
+			}
 			return changed, err
 		}
 		revokedThisPass := 0
@@ -191,8 +199,12 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 					// Revocations already persisted must not keep their
 					// tokens and sessions until the retry: cascade for them
 					// now (the not-yet-revoked instance keeps the erasure
-					// off) and report the request as incomplete.
-					return changed, errors.Join(err, s.cascade(ctx, tenantID, last, actor))
+					// off) and report the request as incomplete. cascade
+					// returns nil in exactly that case, so ErrErasureIncomplete
+					// is joined explicitly - without it the partially
+					// persisted operation would surface as a plain 500 and
+					// not as the documented 409 retry-by-repeating.
+					return changed, errors.Join(fmt.Errorf("%w: %w", ErrErasureIncomplete, err), s.cascade(ctx, tenantID, last, actor))
 				}
 				return changed, err
 			}
@@ -378,7 +390,16 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), exempt); err != nil {
 		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
-	s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
+	// Only claim the erasure happened when every step of it did: an
+	// ErrErasureIncomplete cascade would otherwise leave a "wallet data
+	// erased" line in the log for data that is still there, which is
+	// exactly the wrong thing to find during incident response.
+	if len(errs) == 0 {
+		s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
+	} else {
+		s.logger.Error("wallet data erasure incomplete: last wallet instance revoked but some data remains",
+			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)), zap.Error(errors.Join(errs...)))
+	}
 	return errs
 }
 

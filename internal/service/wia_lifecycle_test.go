@@ -536,7 +536,13 @@ func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
 	ctx := context.Background()
 	uid := domain.NewUserID()
 	other := domain.NewUserID()
-	if err := store.Users().Create(ctx, &domain.User{UUID: uid, WebauthnCredentials: []domain.WebauthnCredential{{ID: "mine"}}}); err != nil {
+	// "mine" carries no tenant (registered before tenants existed) and so
+	// counts as the default one; "elsewhere" is registered in another tenant
+	// and can never authenticate in the default one.
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, WebauthnCredentials: []domain.WebauthnCredential{
+		{ID: "mine"},
+		{ID: "elsewhere", TenantID: domain.TenantID("other-tenant")},
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Users().Create(ctx, &domain.User{UUID: other, WebauthnCredentials: []domain.WebauthnCredential{{ID: "theirs"}}}); err != nil {
@@ -566,6 +572,7 @@ func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
 		{"another user's passkey", &uid, "theirs"},
 		{"a passkey that does not exist", &uid, "made-up"},
 		{"anonymous attestation claiming a passkey", nil, "mine"},
+		{"the caller's own passkey from another tenant", &uid, "elsewhere"},
 	} {
 		if err := attest(tc.userID, tc.credentialID); !errors.Is(err, ErrWIACredentialNotOwned) {
 			t.Errorf("%s: expected ErrWIACredentialNotOwned, got %v", tc.name, err)
