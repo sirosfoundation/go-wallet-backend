@@ -61,7 +61,7 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 		}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
 		certB64 := base64.StdEncoding.EncodeToString(certDER)
 		jwtSigner, _ := signing.NewCryptoSignerES256(privKey)
-		services.WIA = service.NewWIAService(cfg, logger, jwtSigner, []string{certB64}, store.WalletInstances(), nil, nil)
+		services.WIA = service.NewWIAService(cfg, logger, jwtSigner, []string{certB64}, store.WalletInstances(), store.Users(), nil, nil)
 	}
 
 	handlers := NewHandlers(services, cfg, logger, []string{"test"})

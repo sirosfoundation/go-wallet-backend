@@ -106,6 +106,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "CHALLENGE_INVALID",
 				"message": "Challenge is invalid",
 			})
+		case errors.Is(err, service.ErrWIACredentialNotOwned):
+			h.logger.Warn("WIA request claimed a passkey the caller does not own", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "CREDENTIAL_NOT_OWNED",
+				"message": "credential_id must be one of your own registered passkeys",
+			})
 		case errors.Is(err, service.ErrWIAPopInvalid):
 			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{

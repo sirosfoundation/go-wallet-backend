@@ -60,7 +60,7 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil)
+	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil, nil)
 
 	return svc, privKey
 }
@@ -74,9 +74,22 @@ func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletIn
 	return newTestWIAServiceUsing(t, instances), instances
 }
 
+// newTestWIAServiceWithUsers builds a service over one memory store, so a
+// test can register passkeys for the caller (credential_id ownership).
+func newTestWIAServiceWithUsers(t *testing.T) (*WIAService, storage.Store) {
+	t.Helper()
+	store := memory.NewStore()
+	return newTestWIAServiceUsingStores(t, store.WalletInstances(), store.Users()), store
+}
+
 // newTestWIAServiceUsing builds a WIA service over the given instance store,
 // so tests can inject a failing or racing store.
 func newTestWIAServiceUsing(t *testing.T, instances storage.WalletInstanceStore) *WIAService {
+	t.Helper()
+	return newTestWIAServiceUsingStores(t, instances, nil)
+}
+
+func newTestWIAServiceUsingStores(t *testing.T, instances storage.WalletInstanceStore, users storage.UserStore) *WIAService {
 	t.Helper()
 
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -107,7 +120,7 @@ func newTestWIAServiceUsing(t *testing.T, instances storage.WalletInstanceStore)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, nil, nil)
+	return NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, users, nil, nil)
 }
 
 // createTestPop creates a WIA-PoP JWT for testing.

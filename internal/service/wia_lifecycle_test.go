@@ -527,3 +527,48 @@ func TestWIAService_GenerateWIA_RefusesBindingUnownedInstanceToDeactivatedWallet
 		t.Fatalf("binding an unowned instance to a deactivated wallet must be refused, got %v", err)
 	}
 }
+
+// The passkey link decides whether suspension and revocation refuse login
+// with that passkey, and the first link recorded for an instance wins, so a
+// client must not be able to claim a passkey that is not its own.
+func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
+	svc, store := newTestWIAServiceWithUsers(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	other := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, WebauthnCredentials: []domain.WebauthnCredential{{ID: "mine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().Create(ctx, &domain.User{UUID: other, WebauthnCredentials: []domain.WebauthnCredential{{ID: "theirs"}}}); err != nil {
+		t.Fatal(err)
+	}
+	attest := func(userID *domain.UserID, credentialID string) error {
+		challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pop, _ := createTestPop(t, challenge)
+		_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, userID, &WIARequest{Pop: pop, Challenge: challenge, CredentialID: credentialID})
+		return err
+	}
+
+	if err := attest(&uid, "mine"); err != nil {
+		t.Fatalf("the caller's own passkey is accepted: %v", err)
+	}
+	if err := attest(&uid, ""); err != nil {
+		t.Fatalf("claiming no passkey stays optional: %v", err)
+	}
+	for _, tc := range []struct {
+		name         string
+		userID       *domain.UserID
+		credentialID string
+	}{
+		{"another user's passkey", &uid, "theirs"},
+		{"a passkey that does not exist", &uid, "made-up"},
+		{"anonymous attestation claiming a passkey", nil, "mine"},
+	} {
+		if err := attest(tc.userID, tc.credentialID); !errors.Is(err, ErrWIACredentialNotOwned) {
+			t.Errorf("%s: expected ErrWIACredentialNotOwned, got %v", tc.name, err)
+		}
+	}
+}

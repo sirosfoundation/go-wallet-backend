@@ -201,7 +201,11 @@ answers `409 REVOKED_INSTANCE_RETAINED` to `DELETE
 without a user (stray attestation records) can still be deleted.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
-credential id as `credential_id` to `POST /wallet-provider/wia/generate`.
+credential id as `credential_id` to `POST /wallet-provider/wia/generate`. It
+must be one of the caller's own registered passkeys, or the request is refused
+with `403 CREDENTIAL_NOT_OWNED`: the first link recorded for an instance wins,
+so an unchecked one could keep the real passkey out of the per-instance login
+gate for good.
 
 ##### GET /user/session/instances
 

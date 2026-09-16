@@ -30,6 +30,13 @@ var (
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
 	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
 	ErrWIAInstanceNotOwned     = errors.New("wallet instance is bound to another tenant or user")
+	// ErrWIACredentialNotOwned refuses a credential_id that is not one of the
+	// caller's own passkeys. The link is what makes suspension and revocation
+	// refuse login with that passkey (SID-AUTH-06) and the first non-empty
+	// value recorded for an instance wins, so an unchecked one would let a
+	// client point its instance at someone else's passkey - or at nothing -
+	// and keep the real passkey out of the per-instance login gate for good.
+	ErrWIACredentialNotOwned = errors.New("credential_id is not one of the caller's passkeys")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -161,7 +168,10 @@ type WIAService struct {
 	certChain    []string
 	nativeAttSvc *NativeAttestationService
 	instances    storage.WalletInstanceStore
-	audit        *audit.Emitter
+	// users resolves the caller's registered passkeys, to check a claimed
+	// credential_id (see checkCredentialOwnership). Nil refuses every claim.
+	users storage.UserStore
+	audit *audit.Emitter
 
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
@@ -174,7 +184,10 @@ type WIAService struct {
 
 // NewWIAService creates a new WIA service.
 // It shares the same signing key as the WalletProviderService (same x5c chain).
-func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
+// users is required to accept a credential_id (the passkey link): it is
+// checked against the caller's own registered passkeys. Nil refuses every
+// claim.
+func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, users storage.UserStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
 	if challengeStore == nil {
 		challengeStore = newMemoryWIAChallengeStore(maxChallenges, maxChallengesPerTenant)
 	}
@@ -184,6 +197,7 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 		jwtSigner:  jwtSigner,
 		certChain:  certChain,
 		instances:  instances,
+		users:      users,
 		audit:      auditor,
 		challenges: challengeStore,
 	}
@@ -364,6 +378,12 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		default:
 			return "", fmt.Errorf("check wallet instance status: %w", err)
 		}
+	}
+
+	// Step 2.6: a claimed passkey link must be the caller's own passkey.
+	if err := s.checkCredentialOwnership(ctx, userID, req.CredentialID); err != nil {
+		s.emitAuditFailure("credential_not_owned", err)
+		return "", err
 	}
 
 	// Step 3: Determine attestation source
@@ -812,6 +832,35 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	}
 	s.emitAuditFailure("wallet_deactivated", errors.New("wallet deactivated while the first attestation was in flight"))
 	return fmt.Errorf("%w: wallet deactivated during attestation", ErrWIAInstanceDeactivated)
+}
+
+// checkCredentialOwnership refuses a credential_id the caller cannot prove is
+// theirs. An empty one claims no passkey and is always fine; a non-empty one
+// needs an authenticated user, a configured user store, and a matching
+// registered WebAuthn credential.
+func (s *WIAService) checkCredentialOwnership(ctx context.Context, userID *domain.UserID, credentialID string) error {
+	if credentialID == "" {
+		return nil
+	}
+	if userID == nil {
+		return fmt.Errorf("%w: an anonymous attestation cannot claim a passkey", ErrWIACredentialNotOwned)
+	}
+	if s.users == nil {
+		return fmt.Errorf("%w: passkey ownership cannot be verified here", ErrWIACredentialNotOwned)
+	}
+	user, err := s.users.GetByID(ctx, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("%w: unknown user", ErrWIACredentialNotOwned)
+		}
+		return fmt.Errorf("check passkey ownership: %w", err)
+	}
+	for _, cred := range user.WebauthnCredentials {
+		if cred.ID == credentialID {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: the user has no such passkey", ErrWIACredentialNotOwned)
 }
 
 // CleanupExpiredChallenges removes expired challenges from the store.

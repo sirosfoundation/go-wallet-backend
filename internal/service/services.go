@@ -69,7 +69,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Use the shared SET audit emitter constructor so WIA issuance events are
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), store.Users(), wiaAuditor, challengeStore)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but
