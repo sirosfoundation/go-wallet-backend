@@ -31,6 +31,10 @@ var (
 // Prevents DoS via expensive JWT signing with excessively large arrays.
 const MaxJWKSPerRequest = 20
 
+// The software certification value emitted on the
+// clamped (untrusted or absent security_properties) path.
+const floorCertificationURL = "https://developers.siros.org/wallet/architecture/key-management"
+
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
 	cfg             *config.Config
@@ -498,7 +502,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		return &SecurityProperties{
 			KeyStorage:         []string{"iso_18045_basic"},
 			UserAuthentication: []string{"iso_18045_basic"},
-			Certification:      "https://developers.siros.org/wallet/architecture/key-management",
+			Certification:      floorCertificationURL,
 		}
 	}
 
@@ -518,7 +522,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.UserAuthentication = []string{"iso_18045_basic"}
 	}
 	if out.Certification == nil {
-		out.Certification = "https://developers.siros.org/wallet/architecture/key-management"
+		out.Certification = floorCertificationURL
 	}
 	return out
 }
