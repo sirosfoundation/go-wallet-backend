@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2254,9 +2255,9 @@ func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
 // https-only guard
 // =============================================================================
 
-func TestHTTPSOnlyRoundTripper_RefusesPlaintext(t *testing.T) {
+func TestSSRFGuard_RefusesPlaintext(t *testing.T) {
 	var reached bool
-	guard := httpsOnlyRoundTripper{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		reached = true
 		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
 	})}
@@ -2288,25 +2289,125 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
+// A proxy makes the dialer blind: it is handed the proxy's address, and for
+// https the target only appears in a CONNECT. The guard has to check the
+// request's own host in that case, or an ambient HTTP_PROXY would quietly
+// forward exactly what the dialer exists to refuse.
+func TestSSRFGuard_ChecksTheTargetOfAProxiedRequest(t *testing.T) {
+	proxyURL, err := url.Parse("http://egress.example.com:3128")
+	if err != nil {
+		t.Fatalf("parsing proxy url: %v", err)
+	}
+
+	var reached bool
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			reached = true
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy:  func(*http.Request) (*url.URL, error) { return proxyURL, nil },
+		lookup: staticLookup("10.0.0.5"),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://internal.example.com/secret", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the proxied request to an internal host to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	guard.lookup = staticLookup("93.184.216.34")
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("proxied request to a public host refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the request never reached the transport")
+	}
+}
+
+// Without a proxy the dialer does the checking, and it does it better - one
+// lookup, and it connects to what it checked. No second resolution here.
+func TestSSRFGuard_DoesNotResolveWhenThereIsNoProxy(t *testing.T) {
+	lookups := 0
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		lookup: func(context.Context, string) ([]net.IP, error) {
+			lookups++
+			return []net.IP{net.ParseIP("10.0.0.5")}, nil
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("unproxied request refused: %v", err)
+	}
+	if lookups != 0 {
+		t.Fatalf("resolved %d times without a proxy, want 0", lookups)
+	}
+}
+
+func TestHTTPClientConfig_AllowsPlaintext(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  HTTPClientConfig
+		want bool
+	}{
+		{"default", HTTPClientConfig{}, false},
+		{"allow_http", HTTPClientConfig{AllowHTTP: true}, true},
+		// An internal deployment reaches the in-process registry over
+		// http://localhost, so it cannot also be held to https.
+		{"allow_private_ips", HTTPClientConfig{AllowPrivateIPs: true}, true},
+		// The provider wiring has always folded this into AllowHTTP; keeping
+		// it here is what stops a working deployment from breaking.
+		{"insecure_skip_verify", HTTPClientConfig{InsecureSkipVerify: true}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.AllowsPlaintext(); got != tt.want {
+				t.Fatalf("AllowsPlaintext() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // The wiring: which guards a configuration ends up with.
-func TestHTTPClientConfig_NewHTTPClient_SchemeGuardWiring(t *testing.T) {
+func TestHTTPClientConfig_NewHTTPClient_GuardWiring(t *testing.T) {
 	tests := []struct {
 		name          string
 		cfg           HTTPClientConfig
+		wantGuard     bool
 		wantHTTPSOnly bool
 	}{
-		{"default", HTTPClientConfig{}, true},
-		{"allow_http lifts it", HTTPClientConfig{AllowHTTP: true}, false},
-		{"an internal deployment lifts it", HTTPClientConfig{AllowPrivateIPs: true}, false},
-		{"both", HTTPClientConfig{AllowPrivateIPs: true, AllowHTTP: true}, false},
+		{"default", HTTPClientConfig{}, true, true},
+		{"allow_http keeps the address guard", HTTPClientConfig{AllowHTTP: true}, true, false},
+		{"insecure_skip_verify keeps the address guard", HTTPClientConfig{InsecureSkipVerify: true}, true, false},
+		{"an internal deployment has neither", HTTPClientConfig{AllowPrivateIPs: true}, false, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := tt.cfg.NewHTTPClient(0)
-			_, isGuarded := client.Transport.(httpsOnlyRoundTripper)
-			if isGuarded != tt.wantHTTPSOnly {
-				t.Fatalf("https-only guard present = %v, want %v", isGuarded, tt.wantHTTPSOnly)
+			guard, isGuarded := client.Transport.(ssrfGuard)
+			if isGuarded != tt.wantGuard {
+				t.Fatalf("guard present = %v, want %v", isGuarded, tt.wantGuard)
+			}
+			if isGuarded && guard.httpsOnly != tt.wantHTTPSOnly {
+				t.Fatalf("httpsOnly = %v, want %v", guard.httpsOnly, tt.wantHTTPSOnly)
 			}
 		})
 	}

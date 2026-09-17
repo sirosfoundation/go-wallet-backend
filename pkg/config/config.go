@@ -222,9 +222,8 @@ type HTTPClientConfig struct {
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
 	// Default: false (HTTPS required). Use only for local development.
-	// Setting AllowPrivateIPs implies this: a deployment reaching its own
-	// network is already reaching services that terminate no TLS - the
-	// in-process registry is addressed as http://localhost:<port>.
+	// It is not the only setting that permits plaintext - see AllowsPlaintext,
+	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
@@ -241,9 +240,15 @@ type HTTPClientConfig struct {
 //
 //   - a dialer that refuses private, loopback, link-local and cloud metadata
 //     addresses, and then connects to an address it checked;
-//   - plain HTTP is refused, so a fetch cannot be downgraded to a network any
-//     observer on the path can read or rewrite. AllowHTTP lifts this on its
-//     own, for a deployment that has a reason to talk to a plaintext host.
+//   - plain HTTP is refused unless AllowsPlaintext says otherwise, so a fetch
+//     cannot be downgraded to a network any observer on the path can read or
+//     rewrite.
+//
+// When a proxy is in use the dialer only ever sees the proxy, so the address
+// policy is applied to the request's own host before it is sent. That check is
+// best effort by nature: the proxy resolves the name itself and may reach an
+// address this process never saw. A deployment that relies on an egress proxy
+// should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -274,9 +279,11 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 			KeepAlive: 30 * time.Second,
 		}
 		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
-
-		if !c.AllowHTTP {
-			roundTripper = httpsOnlyRoundTripper{base: transport}
+		roundTripper = ssrfGuard{
+			base:      transport,
+			proxy:     transport.Proxy,
+			lookup:    defaultLookupIP,
+			httpsOnly: !c.AllowsPlaintext(),
 		}
 	}
 
@@ -284,6 +291,23 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		Timeout:   timeout,
 		Transport: roundTripper,
 	}
+}
+
+// AllowsPlaintext reports whether this configuration permits non-TLS (plain
+// HTTP) requests. Three settings say so, and they are consulted together
+// everywhere the policy is applied - this transport, the issuer metadata
+// resolver's URL validation, the AuthZEN proxy - so that a URL one layer
+// accepts is not refused by the next:
+//
+//   - AllowHTTP, which says it directly;
+//   - AllowPrivateIPs, because a deployment reaching its own network is
+//     already reaching services that terminate no TLS, the in-process
+//     registry among them (http://localhost:<registry_port>);
+//   - InsecureSkipVerify, which the provider wiring has always folded into
+//     AllowHTTP: a deployment that has given up certificate verification
+//     altogether is not the one a scheme check is protecting.
+func (c HTTPClientConfig) AllowsPlaintext() bool {
+	return c.AllowHTTP || c.AllowPrivateIPs || c.InsecureSkipVerify
 }
 
 // lookupFunc resolves a host to its addresses. Named so guardedDial can be
@@ -317,18 +341,8 @@ func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
 		if err != nil {
 			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 		}
-		if len(ips) == 0 {
-			return nil, fmt.Errorf("no addresses found for %s", host)
-		}
-		for _, ip := range ips {
-			// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-			// before the generic private/link-local check for a clearer message.
-			if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
-				return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
-			}
-			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-				return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
-			}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
 		}
 
 		// Every address was checked above, so any of them is safe to use; try
@@ -365,21 +379,77 @@ func matchesNetwork(network string, ip net.IP) bool {
 	}
 }
 
-// httpsOnlyRoundTripper refuses plaintext requests before they leave the
-// process. It sits at the round-trip layer rather than in the dialer so that
-// it sees the scheme, and so that it applies to every hop of a redirect
-// chain: a fetch that starts at https:// can be sent anywhere by a 302, and
-// the URL it lands on is no more trusted than the one it started from.
-type httpsOnlyRoundTripper struct {
-	base http.RoundTripper
+// checkAddresses applies the address policy: nothing that would reach the
+// deployment's own network, and the cloud metadata endpoints named separately
+// so the refusal says which rule was hit.
+func checkAddresses(host string, ips []net.IP) error {
+	if len(ips) == 0 {
+		return fmt.Errorf("no addresses found for %s", host)
+	}
+	for _, ip := range ips {
+		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
+		// before the generic private/link-local check for a clearer message.
+		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+		}
+	}
+	return nil
 }
 
-func (t httpsOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "https" {
+// ssrfGuard is the half of the protection that has to sit above the transport
+// rather than in its dialer.
+//
+// The scheme is only visible here, and this is the layer every hop of a
+// redirect chain passes through: a fetch that starts at https:// can be sent
+// anywhere by a 302, and the URL it lands on is no more trusted than the one
+// it started from.
+//
+// A proxied request needs the address policy applied here too. http.Transport
+// dials the proxy, not the target - for https the target travels in a CONNECT
+// and never reaches the dialer at all - so without this a configured or
+// ambient (HTTP_PROXY, HTTPS_PROXY) proxy would quietly forward exactly the
+// requests the dialer exists to refuse. The check is weaker than the dialer's:
+// the proxy resolves the name itself, so it can reach an address this process
+// never saw, which is why it is done only where the dialer cannot see.
+type ssrfGuard struct {
+	base      http.RoundTripper
+	proxy     func(*http.Request) (*url.URL, error)
+	lookup    lookupFunc
+	httpsOnly bool
+}
+
+func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
+	if g.httpsOnly && req.URL.Scheme != "https" {
 		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only (set http_client.allow_http, or allow_private_ips for an internal deployment)",
 			req.URL.Scheme, req.URL.Host)
 	}
-	return t.base.RoundTrip(req)
+
+	if g.proxied(req) {
+		host := req.URL.Hostname()
+		ips, err := g.lookup(req.Context(), host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
+		}
+	}
+
+	return g.base.RoundTrip(req)
+}
+
+// proxied reports whether this request would be sent through a proxy, and so
+// whether the dialer below will see the proxy's address instead of the
+// target's.
+func (g ssrfGuard) proxied(req *http.Request) bool {
+	if g.proxy == nil {
+		return false
+	}
+	proxyURL, err := g.proxy(req)
+	return err == nil && proxyURL != nil
 }
 
 // ServerConfig contains HTTP server configuration
