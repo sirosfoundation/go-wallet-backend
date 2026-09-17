@@ -207,6 +207,35 @@ to act on:
 `scope` is what separates them. `message` is for display only: no client
 decision may depend on reading it.
 
+##### Why revoking the last instance erases (a SIROS decision)
+
+Erasing the wallet data when the last non-revoked instance goes is a product
+decision, not a requirement. ARF v3 has a Wallet Unit reach its terminal
+Revoked state without losing anything: the user can still view the
+attestations and the transaction log they hold, and what they lose is
+issuance and presentation. Erasure goes further than that, so it is recorded
+here rather than presented as conformance.
+
+It is kept because in this backend erasure is not what ends the user's
+access - the login gate is. Once no non-revoked instance remains, every
+passkey of that user is refused at login and a new attestation is refused as
+well, so nothing can read the data any more whichever way the wallet got
+there. Keeping it would retain key material and credentials for a wallet that
+can never be opened again, which is a liability and no benefit to anyone.
+
+Tying erasure to an explicit "deactivate my wallet" alone would also make
+retention depend on the order of clicks: a user who revokes three devices one
+at a time would end in exactly the same unusable state as a user who pressed
+revoke-all, with the data kept in one case and erased in the other. There is
+no distinction there worth holding data for.
+
+The trade-off is real and is tied to the login gate: if login is ever
+narrowed to refuse only a deactivated wallet - so a revoked instance could
+still log in and read what it holds, which is what the ARF's Revoked state
+describes - then this trigger has to be revisited in the same change, because
+erasure would then be taking away something the user could otherwise still
+see.
+
 The status change is recorded before the cascade runs. If dropping sessions or
 erasing data then fails, the status change stands and the request answers
 `409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request

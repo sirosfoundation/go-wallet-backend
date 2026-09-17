@@ -59,6 +59,16 @@ type LifecycleActor struct {
 // erased, and login is refused for every passkey of that user, so re-activation
 // requires a full new enrollment. Data is never erased while an instance the
 // user could still reactivate remains.
+//
+// Erasing on the last revocation rather than only on an explicit "deactivate
+// my wallet" is a SIROS decision, not a requirement: ARF v3 lets a Wallet
+// Unit sit in its terminal Revoked state with the user still able to view
+// what it holds. It is kept because here the login gate, not the erasure,
+// is what ends that access - once nothing live remains every passkey of the
+// user is refused and a new attestation is refused too - so the data could
+// only be retained, never read. See docs/API.md, "Why revoking the last
+// instance erases"; if the login gate is ever narrowed to deactivation
+// alone, this trigger has to be revisited with it.
 type WalletLifecycleService struct {
 	store          storage.Store
 	logger         *zap.Logger
