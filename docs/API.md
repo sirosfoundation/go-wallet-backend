@@ -160,10 +160,28 @@ Wallet instances are per tenant. Revoking the last non-revoked instance of a
 user in a tenant deactivates the wallet in that tenant: the credentials and
 presentations held there are erased, every passkey of the user is refused at
 login in that tenant (`403 WALLET_REVOKED`), and a new enrollment is required.
-The `message` field of the 403 tells the two cases apart for the user. The
-user-level data shared across tenants - the encrypted private data (the
+The user-level data shared across tenants - the encrypted private data (the
 custodian of the wallet's keys) and pending challenges - is erased once no
 non-revoked instance remains in any tenant the user belongs to.
+
+A login refusal carries three fields, and only two of them are for the client
+to act on:
+
+```json
+{ "error": "WALLET_REVOKED", "scope": "instance", "message": "..." }
+```
+
+`error` is the stable code (`WALLET_SUSPENDED` or `WALLET_REVOKED`) and
+`scope` says what the refusal is about:
+
+| `scope` | meaning |
+| --- | --- |
+| `instance` | This device is suspended or revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
+| `wallet` | The wallet is deactivated: nothing of it remains on the server and a new enrollment is required. Only `WALLET_REVOKED` carries this scope. |
+
+`WALLET_REVOKED` means both cases, because it has since the first release, so
+`scope` is what separates them. `message` is for display only: no client
+decision may depend on reading it.
 
 The status change is recorded before the cascade runs. If dropping sessions or
 erasing data then fails, the status change stands and the request answers

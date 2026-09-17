@@ -69,28 +69,66 @@ var (
 	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
 )
 
-// LifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
-// and a user-facing message. The code only says suspended or revoked (that is
-// what clients switch on); the message tells the user whether the other
-// devices keep their own status (a suspended sibling still needs
-// reactivation, so it does not promise they all log in) or the whole wallet
-// is gone and must be re-enrolled. ErrWalletDeactivated wraps
-// ErrWalletInstanceRevoked, so it is matched first.
+// LifecycleScopeInstance and LifecycleScopeWallet are the values of the
+// `scope` field of a SID-AUTH-06 login refusal: whether the refusal is about
+// this one wallet instance, or about the whole wallet.
+//
+// The distinction decides what a client does next, so it must be readable
+// without parsing prose: with scope "instance" the wallet still exists and
+// the user's other devices answer for themselves at their own login, while
+// with scope "wallet" nothing of the wallet remains on the server and a new
+// enrollment is required. The error codes cannot carry it - WALLET_REVOKED
+// has meant both since the first release - so it is exposed alongside them.
+const (
+	LifecycleScopeInstance = "instance"
+	LifecycleScopeWallet   = "wallet"
+)
+
+// LifecycleRefusalDetail is one SID-AUTH-06 login refusal as it appears on
+// the wire: the stable error code clients switch on, the scope that says
+// whether the wallet still exists, and a user-facing message.
+type LifecycleRefusalDetail struct {
+	// Code is WALLET_SUSPENDED or WALLET_REVOKED.
+	Code string
+	// Scope is LifecycleScopeInstance or LifecycleScopeWallet.
+	Scope string
+	// Message is the user-facing explanation. It is for display only:
+	// nothing a client decides may depend on reading it.
+	Message string
+}
+
+// LifecycleRefusalDetails maps a SID-AUTH-06 login refusal to its wire form.
+// The code only says suspended or revoked (that is what existing clients
+// switch on) and the scope says whether one instance or the whole wallet is
+// refused; the message says the same thing for a human. ErrWalletDeactivated
+// wraps ErrWalletInstanceRevoked, so it is matched first.
 //
 // Every login handler answers with this, so the wallet API and the AS passkey
 // endpoint cannot disagree about what a refusal means.
-func LifecycleRefusal(err error) (code, message string) {
+func LifecycleRefusalDetails(err error) LifecycleRefusalDetail {
 	switch {
 	case errors.Is(err, ErrWalletInstanceSuspended):
-		return "WALLET_SUSPENDED", "This wallet instance has been suspended"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_SUSPENDED",
+			Scope:   LifecycleScopeInstance,
+			Message: "This wallet instance has been suspended",
+		}
 	case errors.Is(err, ErrWalletDeactivated):
-		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeWallet,
+			Message: "This wallet has been deactivated; a new enrollment is required",
+		}
 	default:
 		// Not "other devices are not affected": this refusal is about this
 		// instance, and another device may well be suspended or revoked in
 		// its own right. It says what this revocation did, and leaves the
 		// others to answer for themselves at their own login.
-		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeInstance,
+			Message: "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status",
+		}
 	}
 }
 

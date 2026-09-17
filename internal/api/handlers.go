@@ -284,8 +284,7 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(401, gin.H{"error": "Authentication failed"})
 		case errors.Is(err, service.ErrWalletInstanceSuspended),
 			errors.Is(err, service.ErrWalletInstanceRevoked):
-			code, message := lifecycleRefusal(err)
-			c.JSON(403, gin.H{"error": code, "message": message})
+			c.JSON(403, lifecycleRefusalBody(err))
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
 		case errors.Is(err, service.ErrIdentityNotBound):
@@ -1318,9 +1317,11 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 	return resp
 }
 
-// lifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
-// and a user-facing message. It lives in internal/service so the AS passkey
-// handler answers with the same code and message for the same refusal.
-func lifecycleRefusal(err error) (code, message string) {
-	return service.LifecycleRefusal(err)
+// lifecycleRefusalBody is the 403 body of a SID-AUTH-06 login refusal: the
+// error code and message clients already read, plus the `scope` that says
+// whether the wallet still exists. The AS passkey handler builds the same
+// body from the same mapping, so the two login endpoints cannot disagree.
+func lifecycleRefusalBody(err error) gin.H {
+	d := service.LifecycleRefusalDetails(err)
+	return gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message}
 }
