@@ -201,11 +201,20 @@ to act on:
 | `scope` | meaning |
 | --- | --- |
 | `instance` | This device is suspended or revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
-| `wallet` | The wallet is deactivated: nothing of it remains on the server and a new enrollment is required. Only `WALLET_REVOKED` carries this scope. |
+| `wallet` | The wallet is deactivated: no instance of it is left to reactivate, its credentials and presentations here have been erased, and a new enrollment is required. Only `WALLET_REVOKED` carries this scope. |
 
 `WALLET_REVOKED` means both cases, because it has since the first release, so
 `scope` is what separates them. `message` is for display only: no client
 decision may depend on reading it.
+
+Both scopes are about the tenant the login was for, since wallet instances
+are per tenant and so is the refusal. For a user who belongs to more than one
+tenant, `scope: "wallet"` says this wallet cannot be opened in this tenant; it
+does not say that nothing of the user's remains anywhere. The data shared
+across tenants - the private data that holds the wallet's keys, and pending
+challenges - is erased only once no non-revoked instance remains in any of
+that user's tenants, so a user still live in another tenant keeps it and
+keeps logging in there.
 
 ##### Why the login gate is where a blocked instance is stopped
 

@@ -71,14 +71,23 @@ var (
 
 // LifecycleScopeInstance and LifecycleScopeWallet are the values of the
 // `scope` field of a SID-AUTH-06 login refusal: whether the refusal is about
-// this one wallet instance, or about the whole wallet.
+// this one wallet instance, or about the whole wallet the login was for.
 //
 // The distinction decides what a client does next, so it must be readable
 // without parsing prose: with scope "instance" the wallet still exists and
 // the user's other devices answer for themselves at their own login, while
-// with scope "wallet" nothing of the wallet remains on the server and a new
+// with scope "wallet" no instance of it is left to reactivate and a new
 // enrollment is required. The error codes cannot carry it - WALLET_REVOKED
 // has meant both since the first release - so it is exposed alongside them.
+//
+// Both scopes are about the tenant the login was for, because that is what
+// checkWalletLifecycle looks at (WalletInstanceStore.GetByUser is per
+// tenant) and what the refusal governs. For a user who belongs to more than
+// one tenant, scope "wallet" therefore says this wallet cannot be opened
+// here and not that nothing of the user's is left anywhere: the data shared
+// across tenants - the private data that holds the wallet's keys, and the
+// pending challenges - is erased only when no live instance remains in any
+// of the user's tenants, see WalletLifecycleService.eraseWalletData.
 const (
 	LifecycleScopeInstance = "instance"
 	LifecycleScopeWallet   = "wallet"
@@ -90,7 +99,8 @@ const (
 type LifecycleRefusalDetail struct {
 	// Code is WALLET_SUSPENDED or WALLET_REVOKED.
 	Code string
-	// Scope is LifecycleScopeInstance or LifecycleScopeWallet.
+	// Scope is LifecycleScopeInstance or LifecycleScopeWallet, and is
+	// about the tenant the refused login was for.
 	Scope string
 	// Message is the user-facing explanation. It is for display only:
 	// nothing a client decides may depend on reading it.

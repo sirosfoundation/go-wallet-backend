@@ -37,6 +37,25 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"))
 	})
 
+	// The gate, and so the scope on the wire, is per tenant: a user live in
+	// another tenant is still refused here, and their cross-tenant data is
+	// kept (WalletLifecycleService.eraseWalletData). ErrWalletDeactivated
+	// therefore means "no instance of this wallet is left in this tenant",
+	// not "nothing of this user remains anywhere".
+	t.Run("deactivated in this tenant while another tenant is live", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		other := domain.TenantID("tenant-other")
+		seedLifecycleInstance(t, s, "inst-here", userID, "pk-1", domain.InstanceStatusRevoked)
+		require.NoError(t, s.store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "inst-there", TenantID: other, UserID: &userID, CredentialID: "pk-2", Status: domain.InstanceStatusActive,
+		}))
+
+		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletDeactivated,
+			"no instance is left in this tenant, so this login is refused as a deactivated wallet")
+		assert.NoError(t, s.checkWalletLifecycle(ctx, other, userID, "pk-2"),
+			"the same user keeps logging in where they still have a live instance")
+	})
+
 	t.Run("linked instance suspended: refused with suspended", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusSuspended)
