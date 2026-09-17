@@ -2064,23 +2064,66 @@ func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
 	}
 }
 
-func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, func()) {
+// newSelectionTestHandler returns a handler whose session writes to a real
+// socket, plus the channel of messages the client end receives, so a test can
+// assert what the wallet app would actually be told.
+func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, chan map[string]any, func()) {
 	t.Helper()
-	// The client end only has to exist; these tests assert on the flow's
-	// return value, not on what is written to the socket.
-	conn, cleanup := wsTestServer(t, func(c *websocket.Conn) { <-make(chan struct{}) })
+	received := make(chan map[string]any, 20)
+	conn, cleanup := wsTestServer(t, func(c *websocket.Conn) {
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			if json.Unmarshal(data, &msg) == nil {
+				received <- msg
+			}
+		}
+	})
 	session := testSession(conn)
 	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
 	session.flows[flow.ID] = flow
-	return &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}, session, cleanup
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}
+	h.httpClient = &http.Client{Timeout: 5 * time.Second}
+	return h, session, received, cleanup
+}
+
+// awaitMessage returns the first received message of the given type.
+func awaitMessage(t *testing.T, received chan map[string]any, msgType string) map[string]any {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-received:
+			if msg["type"] == msgType {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("no %q message arrived", msgType)
+		}
+	}
 }
 
 func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
-	h, session, cleanup := newSelectionTestHandler(t)
+	h, session, received, cleanup := newSelectionTestHandler(t)
 	defer cleanup()
 
+	// The verifier's response_uri, so the test can assert it is told.
+	posted := make(chan url.Values, 1)
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		posted <- r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer verifier.Close()
+
 	authReq := &AuthorizationRequest{
-		DCQLQuery: json.RawMessage(`{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1"]}}]}`),
+		DCQLQuery:   json.RawMessage(`{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1"]}}]}`),
+		ResponseURI: verifier.URL,
+		State:       "state-123",
 	}
 
 	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
@@ -2094,10 +2137,72 @@ func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
 	require.Error(t, err, "an empty match set must end the flow, not wait for consent")
 	assert.Nil(t, selected)
 	assert.Contains(t, err.Error(), "no credential matches")
+
+	// The verifier is told, so its session ends instead of expiring.
+	select {
+	case form := <-posted:
+		assert.Equal(t, "access_denied", form.Get("error"))
+		assert.Equal(t, "state-123", form.Get("state"))
+		assert.Contains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifier was never notified")
+	}
+
+	// And so is the client, with everything it needs to explain the failure.
+	msg := awaitMessage(t, received, string(TypeFlowError))
+	flowErr, ok := msg["error"].(map[string]any)
+	require.True(t, ok, "flow error must carry an error object, got %v", msg["error"])
+	assert.Equal(t, string(ErrCodeNoMatchingCredential), flowErr["code"])
+	assert.Contains(t, flowErr["message"], "urn:eudi:pid:arf-1.8:1")
+	details, ok := flowErr["details"].(map[string]any)
+	require.True(t, ok, "flow error must carry details, got %v", flowErr["details"])
+	assert.Equal(t, []any{"urn:eudi:pid:arf-1.8:1"}, details["requested_types"])
+	assert.Equal(t, "no credential with vct urn:eudi:pid:arf-1.8:1", details["no_match_reason"])
+	assert.Equal(t, "https://verifier.example/done", details["redirect_uri"])
+}
+
+func TestSubmitErrorResponse_QueryModeRedirectsInsteadOfPosting(t *testing.T) {
+	// A verifier using query/fragment gives a redirect_uri and no
+	// response_uri; it must still learn the request failed.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect, "query mode must yield a redirect for the user agent")
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+	assert.Equal(t, "state-123", u.Query().Get("state"))
+	assert.Equal(t, "nothing to present", u.Query().Get("error_description"))
+}
+
+func TestSubmitErrorResponse_FragmentModePutsErrorInFragment(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeFragment,
+		State:        "s",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Empty(t, u.RawQuery)
+	frag, err := url.ParseQuery(u.Fragment)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", frag.Get("error"))
+	assert.Equal(t, "s", frag.Get("state"))
 }
 
 func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testing.T) {
-	h, session, cleanup := newSelectionTestHandler(t)
+	h, session, _, cleanup := newSelectionTestHandler(t)
 	defer cleanup()
 
 	// A client that reports its matches first and then asks the user must

@@ -64,6 +64,10 @@ const (
 const (
 	ResponseModeDirectPost    = "direct_post"
 	ResponseModeDirectPostJWT = "direct_post.jwt"
+	// Modes that hand the result back through the user agent rather than a
+	// POST from the wallet (previously spelled inline in submitResponse).
+	ResponseModeQuery    = "query"
+	ResponseModeFragment = "fragment"
 )
 
 // HTTP header/content type constants
@@ -1289,9 +1293,9 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
 		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
-	case "fragment":
+	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
-	case "query":
+	case ResponseModeQuery:
 		return h.buildQueryRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	default:
 		return "", fmt.Errorf("unsupported response_mode: %s", responseMode)
@@ -1334,6 +1338,32 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	return "", fmt.Errorf("response submission failed with status %d: %s", resp.StatusCode, string(body))
+}
+
+// buildErrorRedirect returns the URL the user agent is sent to when a
+// query/fragment-mode request ends in an error rather than a vp_token.
+func buildErrorRedirect(endpoint, state, errCode, errDesc string, inFragment bool) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	params := u.Query()
+	if inFragment {
+		params = url.Values{}
+	}
+	params.Set("error", errCode)
+	if errDesc != "" {
+		params.Set("error_description", errDesc)
+	}
+	if state != "" {
+		params.Set("state", state)
+	}
+	if inFragment {
+		u.Fragment = params.Encode()
+	} else {
+		u.RawQuery = params.Encode()
+	}
+	return u.String()
 }
 
 func (h *OID4VPHandler) buildFragmentRedirect(endpoint string, authReq *AuthorizationRequest, vpToken string) string {
@@ -1396,9 +1426,37 @@ func inferClientIDScheme(clientID string) string {
 // verifier's own page even on decline/error - returned as a best-effort
 // string, empty if the verifier didn't provide one or the POST failed.
 func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) string {
-	if authReq == nil || authReq.ResponseURI == "" {
+	if authReq == nil {
 		return ""
 	}
+	// Same endpoint choice submitResponse makes for a successful response:
+	// response_uri when the verifier gave one, otherwise redirect_uri. Only
+	// looking at response_uri meant a verifier using the query or fragment
+	// response mode was never told, and sat waiting for a response that was
+	// never coming.
+	endpoint := authReq.ResponseURI
+	if endpoint == "" {
+		endpoint = authReq.RedirectURI
+	}
+	if endpoint == "" {
+		return ""
+	}
+	endpoint, err := sanitizeEndpointURL(endpoint)
+	if err != nil {
+		h.Logger.Debug("refusing to send error response to an unusable endpoint", zap.Error(err))
+		return ""
+	}
+
+	// query and fragment carry the error back through the user agent, the
+	// way they carry a vp_token: the caller gets a URL to redirect to, and
+	// nothing is posted.
+	switch authReq.ResponseMode {
+	case ResponseModeQuery:
+		return buildErrorRedirect(endpoint, authReq.State, errCode, errDesc, false)
+	case ResponseModeFragment:
+		return buildErrorRedirect(endpoint, authReq.State, errCode, errDesc, true)
+	}
+
 	data := url.Values{}
 	data.Set("error", errCode)
 	if errDesc != "" {
@@ -1408,7 +1466,7 @@ func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *Author
 		data.Set("state", authReq.State)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", authReq.ResponseURI, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		h.Logger.Debug("failed to create error response request", zap.Error(err))
 		return ""
@@ -1424,7 +1482,7 @@ func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *Author
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	h.Logger.Debug("sent error response to response_uri",
-		zap.String("response_uri", authReq.ResponseURI),
+		zap.String("response_uri", endpoint),
 		zap.String("error", errCode),
 		zap.Int("status", resp.StatusCode),
 		zap.String("body", string(respBody)))
