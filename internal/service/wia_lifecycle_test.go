@@ -656,3 +656,46 @@ func TestWIAService_GenerateWIA_RevokesBoundKeyWhenWalletDeactivatedMeanwhile(t 
 		}
 	}
 }
+
+// The passkey link is permanent (first link wins), so a request asking to
+// link a different passkey than the one recorded must not walk away with a
+// WIA: suspending the instance would gate the recorded passkey while this
+// caller keeps using the one it asked for.
+func TestWIAService_GenerateWIA_RefusesADifferentPasskeyThanRecorded(t *testing.T) {
+	svc, store := newTestWIAServiceWithUsers(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, WebauthnCredentials: []domain.WebauthnCredential{
+		{ID: "pk-a", TenantID: domain.DefaultTenantID}, {ID: "pk-b", TenantID: domain.DefaultTenantID},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	attest := func(key *ecdsa.PrivateKey, credentialID string) (*ecdsa.PrivateKey, error) {
+		challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pop string
+		if key == nil {
+			pop, key = createTestPop(t, challenge)
+		} else {
+			pop = createTestPopWithKey(t, challenge, key)
+		}
+		_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge, CredentialID: credentialID})
+		return key, err
+	}
+
+	key, err := attest(nil, "pk-a")
+	if err != nil {
+		t.Fatalf("first attestation links pk-a: %v", err)
+	}
+	if _, err := attest(key, "pk-b"); !errors.Is(err, ErrWIACredentialNotOwned) {
+		t.Fatalf("re-attesting the same instance with another passkey must be refused, got %v", err)
+	}
+	if _, err := attest(key, "pk-a"); err != nil {
+		t.Fatalf("re-attesting with the recorded passkey is fine: %v", err)
+	}
+	if _, err := attest(key, ""); err != nil {
+		t.Fatalf("claiming no passkey stays fine: %v", err)
+	}
+}

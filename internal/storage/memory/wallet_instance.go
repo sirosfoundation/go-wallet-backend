@@ -20,6 +20,13 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 	defer s.mu.Unlock()
 
 	if existing, ok := s.data[instance.ID]; ok {
+		// The instance key is global while the record belongs to one tenant
+		// (the tenant is fixed at insert), so an attestation from another
+		// tenant must not touch this record at all - not even its
+		// attestation metadata. Callers map this to a refusal.
+		if existing.TenantID != instance.TenantID {
+			return storage.ErrAlreadyExists
+		}
 		// Status and tenant are intentionally left untouched here — lifecycle
 		// changes only happen through UpdateStatus, and an instance never
 		// moves tenant (see the Mongo implementation). Otherwise a routine
@@ -29,16 +36,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++
-		// The ownership writes below only happen inside the record's own
-		// tenant. The tenant is fixed at insert, so when two first
-		// attestations of the same instance key race the loser cannot move
-		// the record - but it could otherwise still bind its user or its
-		// passkey onto the winner's record, which the read-back in
-		// WIAService.signWIA refuses a WIA for yet cannot undo.
-		sameTenant := existing.TenantID == instance.TenantID
 		// First user binding wins; a bound instance is never re-parented here
 		// (see the Mongo implementation and WIAService.signWIA's read-back).
-		if sameTenant && existing.UserID == nil && instance.UserID != nil {
+		if existing.UserID == nil && instance.UserID != nil {
 			existing.UserID = instance.UserID
 		}
 		if instance.DeviceInfo != nil {
@@ -52,7 +52,7 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		// (SID-AUTH-06), so a racer whose bind just lost must not set it. An
 		// unauthenticated one has no user to check against and keeps the
 		// plain first-link-wins rule (see the Mongo implementation).
-		if sameTenant && existing.CredentialID == "" && instance.CredentialID != "" &&
+		if existing.CredentialID == "" && instance.CredentialID != "" &&
 			(instance.UserID == nil || (existing.UserID != nil && *existing.UserID == *instance.UserID)) {
 			existing.CredentialID = instance.CredentialID
 		}

@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -102,15 +103,24 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
+	// The login's own token carries the instant FinishLogin checked against
+	// the SID-AUTH-06 cut-off (it re-checks after minting), so the session
+	// inherits it rather than "now": a revocation landing between that check
+	// and here must not be outrun by a fresh session timestamp.
+	authenticatedAt := tokengate.IssuedAt(resp.Token)
+	if authenticatedAt.IsZero() {
+		authenticatedAt = now
+	}
 	session := &Session{
-		JTI:       sessionID,
-		UserID:    resp.UUID,
-		DID:       "", // DID is not in FinishLoginResponse; populated if needed.
-		TenantID:  resp.TenantID,
-		ACR:       "urn:siros:acr:passkey",
-		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
-		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		JTI:             sessionID,
+		UserID:          resp.UUID,
+		DID:             "", // DID is not in FinishLoginResponse; populated if needed.
+		TenantID:        resp.TenantID,
+		ACR:             "urn:siros:acr:passkey",
+		MaxTAC:          TAC(h.cfg.DefaultMaxTAC),
+		CreatedAt:       now,
+		AuthenticatedAt: authenticatedAt,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {

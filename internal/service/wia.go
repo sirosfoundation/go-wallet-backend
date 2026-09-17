@@ -653,13 +653,20 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		// revocation (GenerateWIA's guard, the login gate, self-service), so a
 		// WIA must not be handed out for an instance we could not record.
 		if err := s.instances.Upsert(ctx, instance); err != nil {
+			// The store refuses to touch a record that belongs to another
+			// tenant, which is how a cross-tenant first attestation that lost
+			// the race surfaces here.
+			if errors.Is(err, storage.ErrAlreadyExists) {
+				s.emitAuditFailure("instance_not_owned", err)
+				return "", fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+			}
 			s.emitAuditFailure("instance_record_failed", err)
 			return "", fmt.Errorf("record wallet instance: %w", err)
 		}
 		// The lifecycle checks in GenerateWIA ran before this write; a
 		// suspension, revocation or deactivation that landed in between must
 		// not let the already-signed WIA out.
-		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, firstAttestation); err != nil {
+		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, firstAttestation); err != nil {
 			return "", err
 		}
 	}
@@ -725,7 +732,7 @@ func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.Tenan
 // a re-attestation the instance is read back, since a suspension or
 // revocation that landed in between is preserved by Upsert but the WIA has
 // already been signed and must not be handed out.
-func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt string, firstAttestation bool) error {
+func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt, credentialID string, firstAttestation bool) error {
 	if firstAttestation {
 		if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
 			return err
@@ -750,6 +757,14 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
 		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
 		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
+	// The link is permanent (first link wins), so a request asking for a
+	// different passkey than the one recorded must not walk away with a WIA:
+	// suspending the instance would gate the recorded passkey while this
+	// caller keeps logging in with the one it asked for.
+	if credentialID != "" && inst.CredentialID != "" && inst.CredentialID != credentialID {
+		s.emitAuditFailure("credential_not_owned", errors.New("wallet instance is linked to a different passkey"))
+		return fmt.Errorf("%w: this instance is already linked to a different passkey", ErrWIACredentialNotOwned)
 	}
 	return nil
 }

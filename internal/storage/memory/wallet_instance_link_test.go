@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 // The passkey link (CredentialID) is supplied by the client at attestation.
@@ -62,8 +63,8 @@ func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T)
 	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "i2", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("Upsert 1: %v", err)
 	}
-	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "i2", TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}); err != nil {
-		t.Fatalf("Upsert 2: %v", err)
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "i2", TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}); err != storage.ErrAlreadyExists {
+		t.Fatalf("Upsert 2 from another tenant: expected ErrAlreadyExists, got %v", err)
 	}
 	got, err := wis.GetByID(ctx, "i2")
 	if err != nil {

@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
@@ -99,5 +100,97 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 	newSession("after", time.Now())
 	if got := post("after", `{"aud":"wallet-backend"}`); got != http.StatusOK {
 		t.Fatalf("a session created after the cut-off mints a token, got %d", got)
+	}
+}
+
+// cutoffOnEvaluate advances the user's token cut-off while the policy is
+// being evaluated, i.e. after the endpoint's preflight check and before the
+// token is signed.
+type cutoffOnEvaluate struct {
+	users storage.UserStore
+	uid   domain.UserID
+	fired bool
+}
+
+func (p *cutoffOnEvaluate) Evaluate(string) (bool, error) {
+	if !p.fired {
+		p.fired = true
+		if err := p.users.InvalidateAuthBefore(context.Background(), p.uid, time.Now(), ""); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (p *cutoffOnEvaluate) RuleCount() int { return 0 }
+
+// A suspension landing between the preflight check and the signing must not
+// hand out a token: its own iat would be fresh, so only the session behind it
+// can still be judged.
+func TestTokenEndpoint_CutoffDuringIssuanceIsRefused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "ec.pem")
+	f, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+	f.Close()
+	km, err := NewKeyManager(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ttl := func(string) time.Duration { return 2 * time.Minute }
+	users := memory.NewStore().Users()
+	uid := domain.NewUserID()
+	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	sessions := NewMemorySessionStore()
+	if err := sessions.Create(context.Background(), &Session{
+		JTI: "s", UserID: uid.String(), TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+		MaxTAC: TAC("rwl"), CreatedAt: time.Now().Add(-time.Minute), AuthenticatedAt: time.Now().Add(-time.Minute),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	RegisterTokenEndpoint(router.Group("/auth"), sessions, NewTokenIssuer(km, "test-issuer", ttl),
+		&cutoffOnEvaluate{users: users, uid: uid}, ttl, true, tokengate.New(users), zap.NewNop())
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader(`{"aud":"wallet-backend"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "s"})
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when the cut-off lands during issuance, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A session whose record was written after a cut-off but whose authentication
+// happened before it must not mint tokens: the login is what the cut-off
+// applies to, not the moment the session row was created.
+func TestSession_AuthInstantIsTheAuthenticationNotTheRecord(t *testing.T) {
+	cutoff := time.Now()
+	s := &Session{CreatedAt: cutoff.Add(time.Second), AuthenticatedAt: cutoff.Add(-time.Minute)}
+	if !tokengate.IssuedBeforeCutoff(s.authInstant(), cutoff) {
+		t.Fatal("a session authenticated before the cut-off must be refused even when its record is newer")
+	}
+	legacy := &Session{CreatedAt: cutoff.Add(-time.Minute)}
+	if !tokengate.IssuedBeforeCutoff(legacy.authInstant(), cutoff) {
+		t.Fatal("sessions predating the field fall back to CreatedAt")
+	}
+	fresh := &Session{CreatedAt: cutoff.Add(time.Second), AuthenticatedAt: cutoff.Add(time.Second)}
+	if tokengate.IssuedBeforeCutoff(fresh.authInstant(), cutoff) {
+		t.Fatal("an authentication after the cut-off is fine")
 	}
 }

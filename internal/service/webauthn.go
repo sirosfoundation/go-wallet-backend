@@ -1364,17 +1364,22 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 
 	// SID-AUTH-06: a refresh token issued before the wallet was suspended or
 	// revoked must not mint new access tokens.
-	if !user.AuthInvalidBefore.IsZero() {
-		if iat, ok := claims["iat"].(float64); !ok || !time.Unix(int64(iat), 0).After(user.AuthInvalidBefore) {
-			s.logger.Warn("Refresh token predates authorization cut-off", zap.String("user_id", userIDStr))
-			return nil, ErrInvalidRefreshToken
-		}
+	srcIssuedAt := tokengate.IssuedAtFromClaims(claims)
+	srcJTI, _ := claims["jti"].(string)
+	if err := s.refuseIfSourceCutOff(ctx, userID, srcIssuedAt, srcJTI); err != nil {
+		return nil, err
 	}
 
 	// Generate the new access token and the rotated refresh token, checked
 	// against the user's token cut-off after minting (SID-AUTH-06).
 	accessToken, newRefreshToken, err := s.mintTokens(ctx, user, tenantID, nil, ErrInvalidRefreshToken)
 	if err != nil {
+		return nil, err
+	}
+	// The minted tokens are necessarily fresh, so only the refresh token
+	// behind them can still be judged: a revocation that landed while this
+	// request ran must not be outrun by the new timestamps.
+	if err := s.refuseIfSourceCutOff(ctx, userID, srcIssuedAt, srcJTI); err != nil {
 		return nil, err
 	}
 
@@ -1846,6 +1851,25 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 		s.logger.Error("Failed to update user after reload", zap.Error(err))
 	}
 	return nil
+}
+
+// refuseIfSourceCutOff rejects a refresh token that does not survive the
+// user's current SID-AUTH-06 cut-off. Called before and after minting, so a
+// revocation landing mid-request cannot be beaten by the freshly minted
+// timestamps.
+func (s *WebAuthnService) refuseIfSourceCutOff(ctx context.Context, userID domain.UserID, issuedAt time.Time, jti string) error {
+	cutoff, exempt, err := s.store.Users().GetAuthCutoff(ctx, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrInvalidRefreshToken
+		}
+		return fmt.Errorf("check token cut-off: %w", err)
+	}
+	if !tokengate.IssuedBeforeCutoff(issuedAt, cutoff) || (jti != "" && jti == exempt) {
+		return nil
+	}
+	s.logger.Warn("Refresh token predates the authorization cut-off", zap.String("user_id", userID.String()))
+	return ErrInvalidRefreshToken
 }
 
 // mintTokens issues the access token and, when enabled, the refresh token,

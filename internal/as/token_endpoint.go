@@ -142,7 +142,7 @@ func handleSessionTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleAnonymousTokenRequest issues a token that omits the caller's
@@ -231,7 +231,7 @@ func handleAnonymousTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, "", req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), "", req.Audience, tenantID, tac, session.ACR)
 }
 
 // sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
@@ -242,7 +242,7 @@ func handleAnonymousTokenRequest(
 // tokens after a lifecycle change always requires a new login. It writes the
 // response and returns false when the session is refused.
 func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
-	err := deps.gate.Check(c.Request.Context(), session.UserID, session.CreatedAt, "")
+	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant(), "")
 	switch {
 	case err == nil:
 		return true
@@ -253,6 +253,12 @@ func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 	}
 	return false
+}
+
+// sessionSubject identifies a session for the cut-off re-check. A session
+// carries no token id, so it is never exempt.
+func sessionSubject(session *Session) cutoffSubject {
+	return cutoffSubject{userID: session.UserID, issuedAt: session.authInstant()}
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -330,13 +336,24 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken), jti: tokengate.JTI(bearerToken)},
+		parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // issueToken is the common path for both session and delegation flows.
+// cutoffSubject is what the caller authenticated with, so issueToken can
+// re-check the SID-AUTH-06 cut-off after minting: the new token's own iat is
+// necessarily fresh, so only the credential behind it can still be judged.
+type cutoffSubject struct {
+	userID   string
+	issuedAt time.Time
+	jti      string
+}
+
 func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
+	subject cutoffSubject,
 	sub, audience, tenantID string,
 	tac TAC,
 	acr string,
@@ -376,6 +393,19 @@ func issueToken(
 	if err != nil {
 		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})
+		return
+	}
+
+	// SID-AUTH-06: the cut-off was checked before the policy evaluation and
+	// the signing above; a suspension or revocation landing in between must
+	// not be handed a token whose fresh iat the resource gate would accept.
+	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt, subject.jti); err != nil {
+		if errors.Is(err, tokengate.ErrRevoked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})
+		} else {
+			deps.logger.Error("token cut-off re-check failed", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		}
 		return
 	}
 

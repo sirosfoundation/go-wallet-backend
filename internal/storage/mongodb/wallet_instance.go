@@ -19,7 +19,12 @@ type WalletInstanceStore struct {
 }
 
 func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.WalletInstance) error {
-	filter := bson.M{"_id": instance.ID}
+	// Scoped to the tenant, so an attestation from another tenant does not
+	// even touch this record's metadata. The instance key is global while the
+	// record belongs to one tenant, so a mismatch makes the upsert try to
+	// insert a second document with the same _id: that duplicate key is how
+	// "the record is another tenant's" reaches the caller.
+	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
 	update := bson.M{
 		"$set": bson.M{
 			"attestation_source": instance.AttestationSource,
@@ -49,6 +54,9 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	opts := options.Update().SetUpsert(true)
 	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return storage.ErrAlreadyExists
+		}
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
 	}
 

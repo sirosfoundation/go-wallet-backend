@@ -335,17 +335,23 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	}
 }
 
-func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
+// The instance key is global while the record belongs to one tenant, so an
+// attestation from another tenant is refused outright rather than allowed to
+// touch the record's metadata.
+func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	store := NewStore().WalletInstances()
 	ctx := context.Background()
-	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "acme", Status: domain.InstanceStatusActive, AttestationSource: "first"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "other", Status: domain.InstanceStatusActive}); err != nil {
-		t.Fatal(err)
+	if err := store.Upsert(ctx, &domain.WalletInstance{ID: "k", TenantID: "other", Status: domain.InstanceStatusActive, AttestationSource: "intruder"}); err != storage.ErrAlreadyExists {
+		t.Fatalf("expected ErrAlreadyExists, got %v", err)
 	}
 	got, _ := store.GetByID(ctx, "k")
 	if got.TenantID != "acme" {
 		t.Fatalf("tenant must not move on re-attestation, got %s", got.TenantID)
+	}
+	if got.AttestationSource != "first" || got.AttestationCount != 1 {
+		t.Fatalf("no metadata of another tenant's record may be touched: %+v", got)
 	}
 }

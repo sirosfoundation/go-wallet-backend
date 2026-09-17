@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 // The passkey link (credential_id) is supplied by the client at attestation.
@@ -69,17 +70,21 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	require.Equal(t, b, *got.UserID)
 }
 
-func TestWalletInstanceStore_Upsert_TenantIsFixedAtInsert(t *testing.T) {
+// The instance key is global while the record belongs to one tenant, so an
+// attestation from another tenant is refused outright - it must not even
+// bump the attestation metadata of the owning tenant's record.
+func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
 	wis := store.WalletInstances()
 	id := "inst-tenant-fixed-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
-	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive}))
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive, AttestationSource: "first"}))
+	require.ErrorIs(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive, AttestationSource: "intruder"}), storage.ErrAlreadyExists)
 	got, err := wis.GetByID(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, domain.TenantID("acme"), got.TenantID, "tenant is fixed at insert")
-	require.EqualValues(t, 2, got.AttestationCount)
+	require.Equal(t, "first", got.AttestationSource, "metadata untouched")
+	require.EqualValues(t, 1, got.AttestationCount, "the refused attestation is not counted")
 }
 
 // A losing cross-tenant first attestation must not bind its user, or link its
@@ -96,7 +101,7 @@ func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T)
 
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
 	// The loser's attestation: same instance key, another tenant.
-	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}))
+	require.ErrorIs(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}), storage.ErrAlreadyExists)
 	got, err := wis.GetByID(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, domain.TenantID("acme"), got.TenantID)
