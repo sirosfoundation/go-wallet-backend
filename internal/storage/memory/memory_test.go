@@ -2011,12 +2011,16 @@ func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
 	if err != nil || !cutoff.Equal(newer) || exempt != "new-jti" {
 		t.Fatalf("a delayed older event must not replace the newer exemption: %v %v %v", cutoff, exempt, err)
 	}
+	// An erasure is not an ordinary cut-off event: it destroys the vault
+	// whichever way its fence orders. It therefore keeps the newer cut-off
+	// but must not leave the newer event's exempt token behind - that token
+	// would go on writing wallet data over an erased wallet.
 	if err := store.Users().EraseWalletData(ctx, uid, older, ""); err != nil {
 		t.Fatal(err)
 	}
 	cutoff, exempt, _ = store.Users().GetAuthCutoff(ctx, uid)
-	if !cutoff.Equal(newer) || exempt != "new-jti" {
-		t.Fatalf("erase with an older fence keeps the newer cut-off and exemption: %v %v", cutoff, exempt)
+	if !cutoff.Equal(newer) || exempt != "" {
+		t.Fatalf("erase with an older fence keeps the newer cut-off and drops the exemption: %v %q", cutoff, exempt)
 	}
 	if _, _, err := store.Users().GetAuthCutoff(ctx, domain.NewUserID()); err != storage.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)

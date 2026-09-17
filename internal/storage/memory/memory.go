@@ -370,6 +370,13 @@ func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence
 	user.PrivateDataETag = ""
 	user.Keys = nil
 	user.UpdatedAt = time.Now()
+	// The vault is gone whichever way this fence orders against a concurrent
+	// lifecycle event, so no token may stay exempt from the cut-off. Clearing
+	// it first and letting advanceCutoff install this erasure's own exemption
+	// only when its fence is the newer one means a delayed erasure cannot
+	// leave a newer event's exempt token usable over an erased wallet, and
+	// cannot install an older event's exemption over a newer cut-off either.
+	user.AuthCutoffExemptJTI = ""
 	advanceCutoff(user, fence, exemptJTI)
 	return nil
 }

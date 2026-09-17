@@ -738,12 +738,16 @@ func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
 	assert.True(t, cutoff.Equal(newer), "cut-off stays at the newer value")
 	assert.Equal(t, "new-jti", exempt, "a delayed older event must not replace the newer exemption")
 
+	// An erasure is not an ordinary cut-off event: it destroys the vault
+	// whichever way its fence orders. It therefore keeps the newer cut-off
+	// but must not leave the newer event's exempt token behind - that token
+	// would go on writing wallet data over an erased wallet.
 	require.NoError(t, store.Users().EraseWalletData(ctx, uid, older, ""), "erase with an older fence")
 	u, err := store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.Nil(t, u.PrivateData, "data erased")
 	assert.True(t, u.AuthInvalidBefore.Equal(newer))
-	assert.Equal(t, "new-jti", u.AuthCutoffExemptJTI, "exemption untouched when the fence does not advance")
+	assert.Empty(t, u.AuthCutoffExemptJTI, "the vault is gone: the losing erasure still drops the exemption")
 
 	later := newer.Add(time.Second)
 	require.NoError(t, store.Users().EraseWalletData(ctx, uid, later, ""))

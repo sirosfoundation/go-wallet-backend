@@ -378,25 +378,36 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 // back or leave the newer cut-off with the older event's exemption. Equal
 // timestamps (same millisecond, e.g. the erasure fence right after the
 // cut-off of the same cascade) do replace the exemption.
-func cutoffStage(t time.Time, exemptJTI string, extra bson.D) bson.D {
+//
+// erasing says this stage also destroys the wallet's key material. Then a
+// fence that loses the ordering must still not leave the winner's exemption
+// behind: the vault is gone either way, and an exempt token would otherwise
+// go on writing wallet data over an erased wallet. It drops the exemption
+// instead of preserving it, while the cut-off itself still keeps the newer
+// value ($max).
+func cutoffStage(t time.Time, exemptJTI string, erasing bool, extra bson.D) bson.D {
 	advances := bson.D{{Key: "$gte", Value: bson.A{t, bson.D{{Key: "$ifNull", Value: bson.A{"$auth_invalid_before", time.Time{}}}}}}}
 	var exempt interface{} = exemptJTI
 	if exemptJTI == "" {
 		exempt = "$$REMOVE"
+	}
+	var otherwise interface{} = bson.D{{Key: "$ifNull", Value: bson.A{"$auth_cutoff_exempt_jti", "$$REMOVE"}}}
+	if erasing {
+		otherwise = "$$REMOVE"
 	}
 	set := bson.D{
 		// The fence always advances: Update refuses any record loaded before
 		// this write, including one carrying the same cut-off timestamp.
 		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
 		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
-		{Key: "auth_cutoff_exempt_jti", Value: bson.D{{Key: "$cond", Value: bson.A{advances, exempt, bson.D{{Key: "$ifNull", Value: bson.A{"$auth_cutoff_exempt_jti", "$$REMOVE"}}}}}}},
+		{Key: "auth_cutoff_exempt_jti", Value: bson.D{{Key: "$cond", Value: bson.A{advances, exempt, otherwise}}}},
 	}
 	set = append(set, extra...)
 	return bson.D{{Key: "$set", Value: set}}
 }
 
 func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
-	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{cutoffStage(t, exemptJTI, nil)})
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{cutoffStage(t, exemptJTI, false, nil)})
 	if err != nil {
 		return fmt.Errorf("failed to set auth cut-off: %w", err)
 	}
@@ -409,7 +420,7 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {
 	// One pipeline update: the erasure and the fence advance land together,
 	// so no record loaded before this write can pass Update's stale check.
-	stage := cutoffStage(fence, exemptJTI, bson.D{
+	stage := cutoffStage(fence, exemptJTI, true, bson.D{
 		{Key: "private_data", Value: "$$REMOVE"},
 		{Key: "private_data_etag", Value: "$$REMOVE"},
 		{Key: "keys", Value: "$$REMOVE"},

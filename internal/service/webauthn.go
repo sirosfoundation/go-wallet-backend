@@ -1839,9 +1839,17 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 	if err := s.checkWalletLifecycle(ctx, tenantID, user.UUID, credentialID); err != nil {
 		return err
 	}
+	// Only the passkey that just authenticated has a sign count this login
+	// knows anything about; for every other credential the stale copy holds
+	// whatever was there when the record was loaded. Copying those back would
+	// roll back a counter a concurrent login on another passkey had raised in
+	// the meantime, which is exactly the regression clone detection looks for.
 	for i := range fresh.WebauthnCredentials {
+		if fresh.WebauthnCredentials[i].ID != credentialID {
+			continue
+		}
 		for _, c := range user.WebauthnCredentials {
-			if fresh.WebauthnCredentials[i].ID == c.ID {
+			if c.ID == credentialID {
 				fresh.WebauthnCredentials[i].Authenticator.SignCount = c.Authenticator.SignCount
 			}
 		}
@@ -1880,10 +1888,12 @@ func (s *WebAuthnService) refuseIfSourceCutOff(ctx context.Context, userID domai
 
 // mintTokens issues the access token and, when enabled, the refresh token,
 // then checks both against the user's token cut-off (SID-AUTH-06) by taking
-// the decision on the earliest of them. A suspension or revocation that lands
-// after the login gate ran - during the sign-count save, the OIDC checks, or
-// between the two mints - must not hand out a token that the token gate
-// would then refuse.
+// the decision on the earliest of them, and runs recheck (when given) over
+// the post-mint state either way. A suspension or revocation that lands after
+// the login gate ran - during the sign-count save, the OIDC checks, or
+// between the two mints - must not hand out a token that the token gate would
+// then refuse, nor one it would accept for an instance that is no longer
+// active.
 //
 // The comparison is at whole seconds (tokengate.IssuedBeforeCutoff), so a
 // token minted in the same second as a cut-off is refused too. When that is
@@ -1917,6 +1927,19 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 			}
 		}
 		if !tokengate.IssuedBeforeCutoff(earliest, cutoff) {
+			// Clearing the cut-off is not enough on its own. ChangeStatus
+			// records the cut-off before it persists the new status, so a
+			// login that passed its lifecycle check earlier in the flow
+			// (WebAuthn verification, sign-count save, OIDC checks) mints a
+			// token whose fresh iat is past that cut-off while the instance
+			// is being suspended. Running the caller's check once more, on
+			// the state as it is after the mint, cuts the exposure down to
+			// the gap between those two writes (go-wallet-backend#330).
+			if recheck != nil {
+				if err := recheck(); err != nil {
+					return "", "", err
+				}
+			}
 			return access, refresh, nil
 		}
 		if recheck != nil {

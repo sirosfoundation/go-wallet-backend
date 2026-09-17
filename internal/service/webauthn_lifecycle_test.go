@@ -189,3 +189,65 @@ func TestMintTokens(t *testing.T) {
 	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, nil, ErrInvalidRefreshToken)
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "refresh flow uses its own refusal")
 }
+
+// The reload after ErrStaleWrite re-applies this login's sign count, and only
+// this login's: the stale copy knows nothing about the other passkeys, so
+// copying their counters back would roll back a raise a concurrent login on
+// another device had already made - the very regression clone detection
+// watches for.
+func TestPersistLoginState_ReloadKeepsOtherPasskeySignCounts(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	s := &WebAuthnService{store: store, logger: zap.NewNop()}
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID,
+		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}, {ID: "pk-2"}}}))
+	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+
+	// This login authenticated pk-1 and raised its counter to 7; it loaded
+	// the record while pk-2 was still at 0.
+	loaded, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	stale := *loaded
+	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}, {ID: "pk-2"}}
+	stale.WebauthnCredentials[0].Authenticator.SignCount = 7
+
+	// Meanwhile another device logged in with pk-2 and raised it to 42. That
+	// write also moves the fence, so this login's copy is refused and
+	// reloaded.
+	fresh, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	fresh.WebauthnCredentials[1].Authenticator.SignCount = 42
+	require.NoError(t, store.Users().Update(ctx, fresh))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
+
+	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
+	u, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 7, u.WebauthnCredentials[0].Authenticator.SignCount, "this login's passkey is saved")
+	assert.EqualValues(t, 42, u.WebauthnCredentials[1].Authenticator.SignCount, "the other device's raise survives")
+}
+
+// The cut-off is recorded before the new status is persisted, so a login that
+// passed its lifecycle check earlier in the flow mints a token whose fresh
+// iat clears the cut-off while the instance is being suspended. mintTokens
+// runs the caller's check again over the post-mint state, so that login is
+// refused rather than handed a working token for a suspended wallet.
+func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "s", ExpiryHours: 1, RefreshDays: 7, Issuer: "t"}}
+	s := &WebAuthnService{store: store, cfg: cfg, logger: zap.NewNop()}
+	userID := domain.NewUserID()
+	user := &domain.User{UUID: userID, DID: "did:x"}
+	require.NoError(t, store.Users().Create(ctx, user))
+	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+
+	// No cut-off at all: the minted token is unimpeachable by iat alone, so
+	// only the recheck can see the suspension that landed meanwhile.
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusSuspended, "racing"))
+	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
+		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
+	}, ErrVerificationFailed)
+	assert.ErrorIs(t, err, ErrWalletInstanceSuspended)
+}
