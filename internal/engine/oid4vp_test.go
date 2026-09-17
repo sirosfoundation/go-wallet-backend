@@ -2122,6 +2122,20 @@ func TestFetchRequestObjectPost(t *testing.T) {
 		assert.JSONEq(t, string(metadata), stub.form.Get("wallet_metadata"))
 	})
 
+	// Clients encode their defaults, so "the client said nothing" arrives as
+	// a JSON null - which must fall back to the engine's own metadata rather
+	// than be forwarded to the verifier as the string "null".
+	t.Run("a null wallet_metadata falls back to the default", func(t *testing.T) {
+		stub := &requestURIPostServer{}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", json.RawMessage(`null`))
+		require.NoError(t, err)
+		assert.JSONEq(t, string(defaultWalletMetadata), stub.form.Get("wallet_metadata"))
+	})
+
 	t.Run("invalid wallet_metadata is rejected before any request", func(t *testing.T) {
 		stub := &requestURIPostServer{}
 		srv := httptest.NewServer(stub.handler(t))

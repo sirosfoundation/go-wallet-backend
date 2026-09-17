@@ -486,6 +486,17 @@ var defaultWalletMetadata = json.RawMessage(`{"vp_formats_supported":{` +
 	`"dc+sd-jwt":{"sd-jwt_alg_values":["ES256"],"kb-jwt_alg_values":["ES256"]},` +
 	`"mso_mdoc":{"alg_values":["ES256"]}}}`)
 
+// hasWalletMetadata reports whether the client actually supplied
+// wallet_metadata. Clients serialize the whole flow start message with their
+// nulls included (the Kotlin and Swift SDKs both encode defaults), so a field
+// they left unset arrives as a literal JSON null rather than as nothing at
+// all - which is valid JSON, and would otherwise be forwarded to the verifier
+// as the string "null".
+func hasWalletMetadata(md json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(md))
+	return trimmed != "" && trimmed != "null"
+}
+
 // generateWalletNonce creates the holder-supplied challenge for a
 // request_uri_method=post request. It is generated per request and never
 // stored: it only has to outlive the fetch it is checked against.
@@ -530,7 +541,7 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 			return nil, err
 		}
 		metadata := defaultWalletMetadata
-		if len(walletMetadata) > 0 {
+		if hasWalletMetadata(walletMetadata) {
 			if !json.Valid(walletMetadata) {
 				return nil, &requestCodedError{ErrCodeInvalidMessage,
 					errors.New("wallet_metadata on the flow start message is not valid JSON")}
