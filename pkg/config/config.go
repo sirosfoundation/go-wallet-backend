@@ -222,6 +222,9 @@ type HTTPClientConfig struct {
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
 	// Default: false (HTTPS required). Use only for local development.
+	// Setting AllowPrivateIPs implies this: a deployment reaching its own
+	// network is already reaching services that terminate no TLS - the
+	// in-process registry is addressed as http://localhost:<port>.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
@@ -230,8 +233,17 @@ type HTTPClientConfig struct {
 // timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
 // configured timeout. A zero-value HTTPClientConfig produces a sensible default
 // (30 s timeout, system proxy, TLS verification enabled).
-// When AllowPrivateIPs is false, a custom dialer blocks connections to private,
-// loopback, and link-local IP ranges to prevent SSRF.
+//
+// When AllowPrivateIPs is false, two guards apply to every request this client
+// makes, including each hop of a redirect. Both exist because much of what this
+// backend fetches is addressed by whoever it is talking to: a verifier picks
+// the request_uri the wallet dereferences, an issuer picks its metadata URLs.
+//
+//   - a dialer that refuses private, loopback, link-local and cloud metadata
+//     addresses, and then connects to an address it checked;
+//   - plain HTTP is refused, so a fetch cannot be downgraded to a network any
+//     observer on the path can read or rewrite. AllowHTTP lifts this on its
+//     own, for a deployment that has a reason to talk to a plaintext host.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -254,40 +266,120 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		}
 	}
 
+	var roundTripper http.RoundTripper = transport
+
 	if !c.AllowPrivateIPs {
-		// Block connections to private/loopback/link-local IPs to prevent SSRF.
-		// DNS resolution happens inside the dialer so post-DNS rebinding is also blocked.
 		baseDialer := &net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
-			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
-			}
-			for _, ip := range ips {
-				// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-				// before the generic private/link-local check for a clearer message.
-				if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
-					return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
-				}
-				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-					return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
-				}
-			}
-			return baseDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
+
+		if !c.AllowHTTP {
+			roundTripper = httpsOnlyRoundTripper{base: transport}
 		}
 	}
 
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: transport,
+		Transport: roundTripper,
 	}
+}
+
+// lookupFunc resolves a host to its addresses. Named so guardedDial can be
+// driven without a resolver in tests.
+type lookupFunc func(ctx context.Context, host string) ([]net.IP, error)
+
+// dialFunc opens a connection to an address, as net.Dialer.DialContext does.
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// guardedDial wraps dial so that it refuses to reach the deployment's own
+// network: private, loopback and link-local ranges, and the cloud metadata
+// endpoints on top of them.
+//
+// It connects to an address it checked rather than handing the hostname back
+// to the dialer, which would resolve it a second time. That second lookup is
+// the hole: a DNS server under the requester's control can answer with a
+// public address for the check and an internal one a moment later for the
+// connection, and the guard above would have inspected an address that is
+// never dialled.
+func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+		ips, err := lookup(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses found for %s", host)
+		}
+		for _, ip := range ips {
+			// Block cloud metadata endpoints (169.254.169.254, fd00::1)
+			// before the generic private/link-local check for a clearer message.
+			if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+				return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
+			}
+			if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+			}
+		}
+
+		// Every address was checked above, so any of them is safe to use; try
+		// them in turn the way a resolver-driven dial would, honouring the
+		// address family the caller asked for.
+		var lastErr error
+		for _, ip := range ips {
+			if !matchesNetwork(network, ip) {
+				continue
+			}
+			conn, err := dial(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no %s address found for %s", network, host)
+		}
+		return nil, lastErr
+	}
+}
+
+// matchesNetwork reports whether ip can be dialled on the requested network.
+// "tcp" (and anything else) takes either family; "tcp4" and "tcp6" do not.
+func matchesNetwork(network string, ip net.IP) bool {
+	switch network {
+	case "tcp4", "udp4", "ip4":
+		return ip.To4() != nil
+	case "tcp6", "udp6", "ip6":
+		return ip.To4() == nil
+	default:
+		return true
+	}
+}
+
+// httpsOnlyRoundTripper refuses plaintext requests before they leave the
+// process. It sits at the round-trip layer rather than in the dialer so that
+// it sees the scheme, and so that it applies to every hop of a redirect
+// chain: a fetch that starts at https:// can be sent anywhere by a 302, and
+// the URL it lands on is no more trusted than the one it started from.
+type httpsOnlyRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (t httpsOnlyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" {
+		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only (set http_client.allow_http, or allow_private_ips for an internal deployment)",
+			req.URL.Scheme, req.URL.Host)
+	}
+	return t.base.RoundTrip(req)
 }
 
 // ServerConfig contains HTTP server configuration

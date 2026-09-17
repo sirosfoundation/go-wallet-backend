@@ -1,6 +1,9 @@
 package config
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -2101,5 +2104,223 @@ func TestLoadSecretsFromFiles_PlayIntegrityVerificationKey_BadPath(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "google_play_integrity_verification_key_path") {
 		t.Errorf("error should mention google_play_integrity_verification_key_path: %v", err)
+	}
+}
+
+// SSRF guard tests
+// =============================================================================
+
+// stubConn is the bare minimum net.Conn a successful dial has to return.
+type stubConn struct{ net.Conn }
+
+// recordingDial records the address it was asked to connect to and succeeds.
+func recordingDial(dialed *[]string) dialFunc {
+	return func(_ context.Context, _, addr string) (net.Conn, error) {
+		*dialed = append(*dialed, addr)
+		return stubConn{}, nil
+	}
+}
+
+func staticLookup(ips ...string) lookupFunc {
+	return func(_ context.Context, _ string) ([]net.IP, error) {
+		out := make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			out = append(out, net.ParseIP(ip))
+		}
+		return out, nil
+	}
+}
+
+// The point of the guard: connect to an address that was actually inspected,
+// never to the hostname again.
+func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443] - dialling the name would resolve a second time", dialed)
+	}
+}
+
+// A resolver that answers differently the second time is the whole attack:
+// public for the check, internal for the connection. Only one lookup happens,
+// and the address dialled is the one from it.
+func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
+	calls := 0
+	rebinding := func(_ context.Context, _ string) ([]net.IP, error) {
+		calls++
+		if calls == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return []net.IP{net.ParseIP("10.0.0.5")}, nil
+	}
+
+	var dialed []string
+	dial := guardedDial(rebinding, recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolved %d times, want 1", calls)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443]", dialed)
+	}
+}
+
+func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
+	tests := []struct {
+		name    string
+		ip      string
+		wantErr string
+	}{
+		{"loopback", "127.0.0.1", "private/loopback"},
+		{"ipv6 loopback", "::1", "private/loopback"},
+		{"rfc1918", "10.0.0.5", "private/loopback"},
+		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
+		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cloud metadata", "169.254.169.254", "cloud metadata"},
+		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed))
+
+			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
+			if err == nil {
+				t.Fatal("expected the dial to be refused")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not mention %q", err, tt.wantErr)
+			}
+			if len(dialed) != 0 {
+				t.Fatalf("connected to %v after refusing", dialed)
+			}
+		})
+	}
+}
+
+// One internal address among public ones still refuses the whole dial: the
+// attacker chooses which answer the client happens to pick otherwise.
+func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
+		t.Fatal("expected the dial to be refused")
+	}
+	if len(dialed) != 0 {
+		t.Fatalf("connected to %v after refusing", dialed)
+	}
+}
+
+func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want the IPv4 address for a tcp4 dial", dialed)
+	}
+}
+
+func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
+	var dialed []string
+	failFirst := func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		if len(dialed) == 1 {
+			return nil, fmt.Errorf("connection refused")
+		}
+		return stubConn{}, nil
+	}
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst)
+
+	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 2 {
+		t.Fatalf("dialed %v, want both addresses tried", dialed)
+	}
+}
+
+// https-only guard
+// =============================================================================
+
+func TestHTTPSOnlyRoundTripper_RefusesPlaintext(t *testing.T) {
+	var reached bool
+	guard := httpsOnlyRoundTripper{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		reached = true
+		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+	})}
+
+	req, err := http.NewRequest(http.MethodGet, "http://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("https request refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the https request never reached the transport")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// The wiring: which guards a configuration ends up with.
+func TestHTTPClientConfig_NewHTTPClient_SchemeGuardWiring(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfg           HTTPClientConfig
+		wantHTTPSOnly bool
+	}{
+		{"default", HTTPClientConfig{}, true},
+		{"allow_http lifts it", HTTPClientConfig{AllowHTTP: true}, false},
+		{"an internal deployment lifts it", HTTPClientConfig{AllowPrivateIPs: true}, false},
+		{"both", HTTPClientConfig{AllowPrivateIPs: true, AllowHTTP: true}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := tt.cfg.NewHTTPClient(0)
+			_, isGuarded := client.Transport.(httpsOnlyRoundTripper)
+			if isGuarded != tt.wantHTTPSOnly {
+				t.Fatalf("https-only guard present = %v, want %v", isGuarded, tt.wantHTTPSOnly)
+			}
+		})
+	}
+}
+
+// A plaintext request must fail before anything is dialled, not after.
+func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
+	client := HTTPClientConfig{}.NewHTTPClient(0)
+
+	_, err := client.Get("http://verifier.example.com/request-object")
+	if err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if !strings.Contains(err.Error(), "https only") {
+		t.Fatalf("error %q does not explain the refusal", err)
 	}
 }
