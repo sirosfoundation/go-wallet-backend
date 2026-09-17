@@ -885,14 +885,25 @@ func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T)
 	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
 	m.SetTokenGate(tokengate.New(store.Users()))
 
-	session := &Session{ID: "s1", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute), tokenJTI: "handshake-jti"}
+	session := &Session{ID: "s1", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute)}
 	require.NoError(t, m.recheckToken(session), "no cut-off yet")
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now(), "other-jti"))
+	// The wallet is revoked by a request carrying "acting-jti", which the
+	// backend keeps exempt so that request can be repeated.
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now(), "acting-jti"))
 	assert.ErrorIs(t, m.recheckToken(session), tokengate.ErrRevoked, "the handshake token predates the cut-off")
 
-	exempt := &Session{ID: "s2", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute), tokenJTI: "other-jti"}
-	assert.NoError(t, m.recheckToken(exempt), "the acting session's token is exempt")
+	// That exemption does reach the backend's gate - and deliberately not
+	// the engine's. A flow is an issuance or a presentation, not the
+	// lifecycle retry the exemption exists for, and a socket held by another
+	// engine process is exactly what the cascade's session drop cannot
+	// reach. Session keeps no jti at all, so the divergence holds by
+	// construction rather than by an argument at the call site.
+	gate := tokengate.New(store.Users())
+	assert.NoError(t, gate.Check(context.Background(), uid.String(), session.tokenIssuedAt, "acting-jti"),
+		"the backend gate honours the exemption")
+	assert.ErrorIs(t, m.recheckToken(&Session{ID: "s2", UserID: uid.String(), tokenIssuedAt: session.tokenIssuedAt}),
+		tokengate.ErrRevoked, "the engine does not, whoever holds the socket")
 
 	anon := &Session{ID: "s3", UserID: ""}
 	assert.NoError(t, m.recheckToken(anon), "anonymous sessions are not gated")

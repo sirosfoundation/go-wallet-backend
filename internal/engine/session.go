@@ -61,10 +61,11 @@ type Session struct {
 	// per-protocol check must treat it as a no-op, exactly like
 	// requireTACIfEnforced does for HTTP routes.
 	TAC claims.TAC
-	// tokenIssuedAt/tokenJTI identify the handshake token for the
-	// SID-AUTH-06 re-check on every flow start (Manager.recheckToken).
+	// tokenIssuedAt is the handshake token's iat, for the SID-AUTH-06
+	// re-check on every flow start (Manager.recheckToken). Its jti is
+	// deliberately not kept: the engine never honours the acting token's
+	// exemption, see SetTokenGate.
 	tokenIssuedAt time.Time
-	tokenJTI      string
 	conn          *websocket.Conn
 	sendMu        sync.Mutex
 	flows         map[string]*Flow
@@ -188,6 +189,16 @@ func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 // SetTokenGate wires the SID-AUTH-06 token cut-off check into handshake
 // authentication: a token issued before the user's wallet was suspended or
 // revoked cannot open a new engine session.
+//
+// The engine never honours the acting token's exemption (see
+// domain.User.AuthCutoffExemptJTI), which is why every Check here passes an
+// empty jti. That exemption exists so the session that made a lifecycle
+// request can repeat it or reactivate a suspended instance - both HTTP calls
+// to the backend. An engine flow is neither: it is an issuance or a
+// presentation, exactly the wallet operation a suspended or revoked wallet
+// must not perform. Honouring it here would also be the one case the
+// documented live-session drop cannot reach, since a socket held by another
+// engine process survives the cascade's DeleteByUser.
 func (m *Manager) SetTokenGate(g *tokengate.Gate) {
 	m.tokenGate = g
 }
@@ -196,7 +207,7 @@ func (m *Manager) SetTokenGate(g *tokengate.Gate) {
 // handleFlowStart). No gate configured means no cut-off enforcement, as at
 // the handshake.
 func (m *Manager) recheckToken(session *Session) error {
-	return m.tokenGate.Check(context.Background(), session.UserID, session.tokenIssuedAt, session.tokenJTI)
+	return m.tokenGate.Check(context.Background(), session.UserID, session.tokenIssuedAt, "")
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -303,7 +314,6 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		TenantID:      tenantID,
 		TAC:           tac,
 		tokenIssuedAt: tokengate.IssuedAt(handshake.AppToken),
-		tokenJTI:      tokengate.JTI(handshake.AppToken),
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -685,7 +695,8 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString), result.JTI); err != nil {
+		// No exemption at the engine, see SetTokenGate.
+		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString), ""); err != nil {
 			return "", "", "", err
 		}
 		return result.UserID, result.TenantID, result.TAC, nil
@@ -713,7 +724,8 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
-		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims), tokengate.JTIFromClaims(mapClaims)); err != nil {
+		// No exemption at the engine, see SetTokenGate.
+		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims), ""); err != nil {
 			return "", "", "", err
 		}
 		return userID, tenantID, "", nil

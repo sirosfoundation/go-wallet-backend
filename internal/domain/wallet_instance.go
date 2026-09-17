@@ -98,8 +98,18 @@ type WalletInstance struct {
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey
-	// that created this instance. Only set for WSCDTypeWebCrypto instances.
-	// This allows the admin to correlate instances with passkeys.
+	// that created this instance, recorded whatever backs the instance: it
+	// started out as a correlation aid for the admin on WSCDTypeWebCrypto,
+	// but SID-AUTH-06 made it the key of the per-instance login gate
+	// (WebAuthnService.checkWalletLifecycle), which a native iOS or Android
+	// wallet needs as much as a Web Crypto one - suspending a device's
+	// instance has to refuse that device's passkey. The wallet supplies it
+	// at WIA generation and it must be one of the caller's own passkeys in
+	// the caller's tenant, or the request is refused with
+	// CREDENTIAL_NOT_OWNED; the first link recorded for an instance wins.
+	// Binding it to the passkey that actually authenticated the request -
+	// rather than to any passkey the caller owns - needs a credential id in
+	// the session and the token, tracked in go-wallet-backend#333.
 	CredentialID string `json:"credential_id,omitempty" bson:"credential_id,omitempty"`
 
 	// R2PSClientID is the client_id used in R2PS sessions for this instance.
