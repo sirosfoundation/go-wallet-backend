@@ -168,7 +168,16 @@ non-revoked instance remains in any tenant the user belongs to.
 The status change is recorded before the cascade runs. If dropping sessions or
 erasing data then fails, the status change stands and the request answers
 `409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
-re-runs the erasure, so the client retries until it gets `200`.
+re-runs the erasure, so the client retries until it gets `200`. The one case
+the client cannot retry is a `409` in which the key material *was* erased and
+only some other step failed (stored credentials of another tenant, pending
+challenges): the exemption below ends with the key material, so the acting
+token is cut off from that point on. The wallet is deactivated and its keys
+are gone either way; the residual data is cleaned up by an administrator
+re-sending the same status with `PUT
+/admin/tenants/{tenantId}/instances/{instanceId}/status`, which re-runs the
+same cascade (admin changes exempt no token, so nothing is needed from the
+user's session).
 
 Any change away from `active` also cuts off bearer tokens issued before it:
 legacy access and refresh tokens, and access tokens validated by the backend
@@ -176,8 +185,12 @@ or accepted for a WebSocket handshake, are refused with `401` when their `iat`
 is not after the cut-off, even if they have not expired. The one exception is
 the token that made the self-service request: it stays valid, so the user can
 reactivate a suspended instance or repeat a request after `409
-ERASURE_INCOMPLETE` from the same session; once a wallet is fully deactivated
-and its erasure complete, that exemption is dropped too. Admin-initiated
+ERASURE_INCOMPLETE` from the same session; it is dropped as soon as the key
+material is erased, so it can never be used to write wallet data back into a
+deactivated wallet. It is an exemption from the cut-off only, never a licence
+to mint: `POST /auth/token` and the legacy token refresh refuse it like any
+other pre-cut-off credential, so a new token after a lifecycle change always
+needs a new login. Admin-initiated
 changes exempt no token. The cut-off is recorded before the status change is
 persisted, so a blocked instance never keeps working tokens. Tokens obtained
 after a reactivation work normally. A login or token refresh that races with

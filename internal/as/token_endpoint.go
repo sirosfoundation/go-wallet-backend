@@ -255,8 +255,7 @@ func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool
 	return false
 }
 
-// sessionSubject identifies a session for the cut-off re-check. A session
-// carries no token id, so it is never exempt.
+// sessionSubject identifies a session for the cut-off re-check.
 func sessionSubject(session *Session) cutoffSubject {
 	return cutoffSubject{userID: session.UserID, issuedAt: session.authInstant()}
 }
@@ -282,8 +281,12 @@ func handleDelegationTokenRequest(
 	}
 
 	// SID-AUTH-06: a delegating token issued before the user's wallet was
-	// suspended or revoked must not mint a fresh (post-cut-off) token.
-	if err := deps.gate.Check(c.Request.Context(), parentClaims.Subject, tokengate.IssuedAt(bearerToken), tokengate.JTI(bearerToken)); err != nil {
+	// suspended or revoked must not mint a fresh (post-cut-off) token. The
+	// acting token's exemption is deliberately not passed here (see
+	// cutoffSubject): a child token would carry a new jti and a fresh iat,
+	// so it would be neither exempt nor caught by the cut-off.
+	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
+	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt, ""); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
 		} else {
@@ -336,18 +339,26 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken), jti: tokengate.JTI(bearerToken)},
-		parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parent, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // issueToken is the common path for both session and delegation flows.
 // cutoffSubject is what the caller authenticated with, so issueToken can
 // re-check the SID-AUTH-06 cut-off after minting: the new token's own iat is
 // necessarily fresh, so only the credential behind it can still be judged.
+//
+// It carries no token id, because /auth/token never honours the acting
+// token's exemption. That exemption exists so the session that made a
+// lifecycle request can repeat it (409 ERASURE_INCOMPLETE) or reactivate a
+// suspended instance - not so it can mint credentials. A token minted from it
+// would carry a new jti and a fresh iat: not exempt, but past the cut-off,
+// so every gate in the system would accept it and the one narrowly exempt
+// token would have laundered itself into an unrestricted one for a wallet
+// that was just suspended or revoked. Minting after a lifecycle change always
+// requires a new login, for a delegating bearer token as for a session cookie.
 type cutoffSubject struct {
 	userID   string
 	issuedAt time.Time
-	jti      string
 }
 
 func issueToken(
@@ -399,7 +410,7 @@ func issueToken(
 	// SID-AUTH-06: the cut-off was checked before the policy evaluation and
 	// the signing above; a suspension or revocation landing in between must
 	// not be handed a token whose fresh iat the resource gate would accept.
-	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt, subject.jti); err != nil {
+	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt, ""); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})
 		} else {

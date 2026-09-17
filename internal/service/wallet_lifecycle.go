@@ -39,6 +39,9 @@ type LifecycleActor struct {
 	// self-service changes. It stays valid across the token cut-off the
 	// change triggers, so the user can reactivate a suspended instance or
 	// repeat the request after 409 ERASURE_INCOMPLETE from the same session.
+	// It buys nothing else: the exemption ends with the key material (see
+	// eraseWalletData) and no token-minting path honours it (see
+	// domain.User.AuthCutoffExemptJTI).
 	TokenJTI string
 }
 

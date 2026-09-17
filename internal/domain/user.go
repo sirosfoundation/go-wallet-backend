@@ -106,7 +106,11 @@ type User struct {
 	// AuthInvalidBefore: the token that performed the lifecycle change. The
 	// user keeps that session to reactivate a suspended instance or to
 	// repeat a request after 409 ERASURE_INCOMPLETE; every other token
-	// issued before the cut-off is refused.
+	// issued before the cut-off is refused. The exemption is dropped once
+	// the wallet's key material is erased, and it is never honoured by a
+	// path that mints a new token (as.cutoffSubject,
+	// WebAuthnService.refuseIfSourceCutOff) - a minted token would carry a
+	// fresh iat and a new id, so it would escape the cut-off entirely.
 	AuthCutoffExemptJTI string `json:"-" bson:"auth_cutoff_exempt_jti,omitempty"`
 
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
