@@ -15,7 +15,7 @@ func TestLifecycleRefusal(t *testing.T) {
 		err                 error
 	}{
 		{"suspended", "WALLET_SUSPENDED", "suspended", service.ErrWalletInstanceSuspended},
-		{"single instance revoked", "WALLET_REVOKED", "other devices enrolled to this wallet are not affected", service.ErrWalletInstanceRevoked},
+		{"single instance revoked", "WALLET_REVOKED", "other devices enrolled to this wallet keep their own status", service.ErrWalletInstanceRevoked},
 		{"wallet deactivated", "WALLET_REVOKED", "a new enrollment is required", service.ErrWalletDeactivated},
 		{"wrapped deactivated", "WALLET_REVOKED", "a new enrollment is required", fmt.Errorf("finish login: %w", service.ErrWalletDeactivated)},
 	}

@@ -187,7 +187,7 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 		msg string
 	}{
 		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED", "has been suspended"},
-		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", "other devices enrolled to this wallet are not affected"},
+		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", "other devices enrolled to this wallet keep their own status"},
 		{service.ErrWalletDeactivated, "WALLET_REVOKED", "a new enrollment is required"},
 	} {
 		router, _ := setupPasskeyHandlers(&mockWebAuthn{finishLoginErr: tc.err})

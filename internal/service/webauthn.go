@@ -86,7 +86,11 @@ func LifecycleRefusal(err error) (code, message string) {
 	case errors.Is(err, ErrWalletDeactivated):
 		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
 	default:
-		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet are not affected"
+		// Not "other devices are not affected": this refusal is about this
+		// instance, and another device may well be suspended or revoked in
+		// its own right. It says what this revocation did, and leaves the
+		// others to answer for themselves at their own login.
+		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status"
 	}
 }
 
