@@ -160,10 +160,6 @@ func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.
 func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, userID domain.UserID, reason string) (int, error) {
 	changed := 0
 	var last *domain.WalletInstance
-	// reachedFixedPoint records that a pass found nothing left to revoke, so
-	// the sweep ended because it was done rather than because it ran out of
-	// passes.
-	reachedFixedPoint := false
 	// A first attestation can insert a new instance while this sweep runs
 	// (it works from a listing, not a lock). Repeat until a pass finds
 	// nothing left to revoke, so such an instance cannot end up as the only
@@ -218,33 +214,35 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 			if last == nil && len(instances) > 0 {
 				last = instances[len(instances)-1] // everything already revoked: retry the erasure
 			}
-			reachedFixedPoint = true
 			break
 		}
 	}
 	if last == nil {
 		return changed, nil
 	}
-	err := s.cascade(ctx, tenantID, last, actor)
-	if !reachedFixedPoint {
-		// Every pass still found something to revoke, so the sweep ran out of
-		// passes instead of reaching a fixed point and an instance inserted
-		// during the last pass can still be live. cascade treats a remaining
-		// non-revoked instance as the ordinary "nothing to erase" case, so
-		// without this the request would report success for a wallet that
-		// still has an active instance. Report it as incomplete instead:
-		// repeating the request resumes the sweep, exactly like the other
-		// ErrErasureIncomplete cases.
-		err = errors.Join(err, s.unsweptErr(ctx, tenantID, userID))
+	if changed > 0 {
+		// Advance the cut-off again now that every instance of the tenant is
+		// revoked: a token minted while the sweep was still running carries
+		// an iat after the first cut-off and would otherwise stay valid.
+		if err := s.cutOffTokens(ctx, last, actor); err != nil {
+			return changed, errors.Join(fmt.Errorf("%w: %w", ErrErasureIncomplete, err), s.cascade(ctx, tenantID, last, actor))
+		}
 	}
-	return changed, err
+	// Checked however the sweep ended: an instance can be inserted after the
+	// last pass reported a fixed point just as well as during it, and either
+	// way the request must not report success for a wallet it did not
+	// deactivate. Repeating it resumes the sweep, like the other
+	// ErrErasureIncomplete cases.
+	return changed, errors.Join(s.cascade(ctx, tenantID, last, actor), s.unsweptErr(ctx, tenantID, userID))
 }
 
-// unsweptErr reports ErrErasureIncomplete when RevokeAllForUser exhausted its
-// pass bound with an instance still live, and nil when the last pass happened
-// to finish the job anyway. Serializing attestation with lifecycle
-// transitions outright - so the bound can never be reached - is
-// go-wallet-backend#330.
+// unsweptErr reports ErrErasureIncomplete when an instance of the tenant is
+// still live after RevokeAllForUser swept it: the pass bound ran out, or an
+// attestation landed after the last pass. cascade treats a remaining
+// non-revoked instance as the ordinary "nothing to erase" case, so without
+// this the request would report success for a wallet it did not deactivate.
+// Serializing attestation with lifecycle transitions - so no instance can
+// appear during the sweep at all - is go-wallet-backend#330.
 func (s *WalletLifecycleService) unsweptErr(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) error {
 	instances, err := s.ListForUser(ctx, tenantID, userID)
 	if err != nil {
@@ -295,7 +293,7 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 			return s.incomplete(userID, errs) // something is still active or reactivatable
 		}
 	}
-	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID, actor.TokenJTI, len(errs) > 0)...)
+	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
 	return s.incomplete(userID, errs)
 }
 
@@ -337,7 +335,7 @@ func (s *WalletLifecycleService) incomplete(userID domain.UserID, errs []error) 
 // when no non-revoked instance remains in any tenant the user belongs to.
 // The user record and its passkeys stay so the revocation remains attributable
 // and login can be refused with a clear reason rather than "user not found".
-func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, exemptJTI string, priorFailures bool) []error {
+func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) []error {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
@@ -381,13 +379,13 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		errs = append(errs, fmt.Errorf("delete webauthn challenges: %w", err))
 	}
-	exempt := exemptJTI
-	if len(errs) == 0 && !priorFailures {
-		// Only when the whole cascade succeeded: while anything is left to
-		// retry, the acting session must keep working to retry it.
-		exempt = ""
-	}
-	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), exempt); err != nil {
+	// The acting session's exemption exists to retry the erasure, so it ends
+	// with the erasure: once the vault is gone the wallet is deactivated and
+	// needs a new enrollment, and that session must not be able to write new
+	// wallet data (private data, credentials) with its pre-cut-off token.
+	// When this write fails the exemption stays as it was, so the same
+	// session can repeat the request.
+	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), ""); err != nil {
 		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
 	// Only claim the erasure happened when every step of it did: an

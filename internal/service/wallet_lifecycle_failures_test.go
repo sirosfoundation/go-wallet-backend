@@ -468,12 +468,13 @@ func TestWalletLifecycle_CutoffFailureLeavesStatusUnchanged(t *testing.T) {
 	assert.Equal(t, domain.InstanceStatusActive, inst.Status)
 }
 
-// Once the wallet is fully deactivated and the erasure completed, the acting
-// token's exemption is dropped: that session must not recreate wallet data.
-// While the cascade is incomplete the exemption stays so it can retry.
-func TestWalletLifecycle_ExemptionDroppedAfterCompleteDeactivation(t *testing.T) {
+// The acting session's exemption exists to retry the erasure, so it ends with
+// the erasure: once the vault is gone the wallet needs a new enrollment and
+// that session must not be able to write wallet data back. It survives only
+// while the erasure itself has not happened.
+func TestWalletLifecycle_ExemptionEndsWithTheErasure(t *testing.T) {
 	ctx := context.Background()
-	fs := newFailStore("credentials.Delete")
+	fs := newFailStore("users.EraseWalletData")
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
 	actor := userActor(uid)
@@ -481,14 +482,17 @@ func TestWalletLifecycle_ExemptionDroppedAfterCompleteDeactivation(t *testing.T)
 
 	_, err := svc.RevokeAllForUser(ctx, actor, domain.DefaultTenantID, uid, "stolen")
 	assert.ErrorIs(t, err, ErrErasureIncomplete)
-	_, exempt, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
-	assert.Equal(t, "acting", exempt, "incomplete: the session keeps its exemption to retry")
+	user, _ := fs.Store.Users().GetByID(ctx, uid)
+	assert.NotNil(t, user.PrivateData, "the vault is still there")
+	assert.Equal(t, "acting", user.AuthCutoffExemptJTI, "so the session keeps working to retry")
 
-	fs.fail["credentials.Delete"] = false
+	fs.fail["users.EraseWalletData"] = false
 	_, err = svc.RevokeAllForUser(ctx, actor, domain.DefaultTenantID, uid, "stolen")
 	require.NoError(t, err)
-	_, exempt, _ = fs.Store.Users().GetAuthCutoff(ctx, uid)
-	assert.Empty(t, exempt, "complete deactivation: no token survives")
+	user, _ = fs.Store.Users().GetByID(ctx, uid)
+	assert.Nil(t, user.PrivateData)
+	_, exempt, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.Empty(t, exempt, "the vault is gone: no token survives")
 }
 
 // attestingInstances inserts a brand-new active instance the first time an
@@ -576,9 +580,11 @@ func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 	assert.True(t, again.Equal(cutoff), "an established cut-off stays put")
 }
 
-// While any part of the cascade failed, the acting session keeps its
-// exemption so it can retry - even when the erasure itself succeeded.
-func TestWalletLifecycle_ExemptionKeptWhenAnEarlierCascadeStepFailed(t *testing.T) {
+// A cascade step failing around a successful erasure does not keep the
+// exemption alive: the vault is gone, so the wallet is deactivated and the
+// acting session must not be able to write new wallet data with its
+// pre-cut-off token.
+func TestWalletLifecycle_ExemptionDroppedEvenIfAnotherStepFailed(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
 	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
@@ -591,7 +597,7 @@ func TestWalletLifecycle_ExemptionKeptWhenAnEarlierCascadeStepFailed(t *testing.
 	assert.ErrorIs(t, err, ErrErasureIncomplete, "the session drop failed")
 	user, _ := store.Users().GetByID(ctx, uid)
 	assert.Nil(t, user.PrivateData, "the erasure itself went through")
-	assert.Equal(t, "acting", user.AuthCutoffExemptJTI, "the acting session must survive to retry the cascade")
+	assert.Empty(t, user.AuthCutoffExemptJTI, "so no token survives, retry or not")
 }
 
 // alwaysAttestingInstances inserts a fresh active instance after every
@@ -651,4 +657,31 @@ func TestWalletLifecycle_RevokeAllReportsIncompleteWhenTheSweepRunsOutOfPasses(t
 	user, err := base.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.NotNil(t, user.PrivateData, "an instance the user could still use remains, so nothing is erased")
+}
+
+// The sweep cuts tokens off before its first status write and again once
+// every instance is revoked: a token minted while it was still running
+// carries an iat after the first cut-off and would otherwise survive.
+func TestWalletLifecycle_RevokeAllAdvancesTheCutoffAfterTheSweep(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	uid := seedWalletUser(t, store, domain.DefaultTenantID)
+
+	before, _ := store.Users().GetByID(ctx, uid)
+	require.Zero(t, before.AuthFence)
+
+	_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "stolen")
+	require.NoError(t, err)
+
+	after, _ := store.Users().GetByID(ctx, uid)
+	assert.GreaterOrEqual(t, after.AuthFence, int64(2),
+		"one cut-off before the first revocation and one after the sweep (plus the erasure), each advancing the fence")
+
+	// Nothing left to revoke: the retry path does not keep advancing it.
+	fence := after.AuthFence
+	_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "again")
+	require.NoError(t, err)
+	again, _ := store.Users().GetByID(ctx, uid)
+	assert.Equal(t, fence+1, again.AuthFence, "only the idempotent erasure writes again")
 }
