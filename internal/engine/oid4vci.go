@@ -50,6 +50,14 @@ type OID4VCIHandler struct {
 	dpopKey          *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
 	dpopNonce        string                 // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
+	// authorizationDetails is what the client asked to be sent on the
+	// Authorization Request - see FlowStartMessage.AuthorizationDetails for
+	// why the Wallet decides this and the engine only forwards it.
+	authorizationDetails []AuthorizationDetail
+	// grantedAuthorizationDetails is what the Authorization Server echoed back
+	// in the token response (OID4VCI 1.0 §6), carrying the credential
+	// identifiers it actually granted.
+	grantedAuthorizationDetails []AuthorizationDetail
 	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
 	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 	clientKID        string            // key ID from client JWK (for JWT kid header)
@@ -248,6 +256,11 @@ type TokenResponse struct {
 	RefreshToken    string `json:"refresh_token,omitempty"`
 	CNonce          string `json:"c_nonce,omitempty"`
 	CNonceExpiresIn int    `json:"c_nonce_expires_in,omitempty"`
+	// AuthorizationDetails is what the Authorization Server granted in
+	// response to the ones we asked for (OID4VCI 1.0 §6). When it names
+	// credential identifiers, the Credential Request must use one of them
+	// instead of a credential_configuration_id - see requestCredential.
+	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 }
 
 // CredentialResponse represents credential endpoint response
@@ -694,6 +707,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		ctx = ContextWithTenant(ctx, h.Flow.Session.TenantID)
 	}
 
+	h.authorizationDetails = msg.AuthorizationDetails
 	if msg.RedirectURI != "" {
 		h.redirectURI = msg.RedirectURI
 	}
@@ -1731,6 +1745,28 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	if selectedConfig != nil && selectedConfig.Scope != "" {
 		params.Set("scope", selectedConfig.Scope)
 	}
+	// DIIP requires a Wallet to be able to ask for a credential configuration
+	// by `authorization_details` as well as by `scope`. The wallet decides
+	// (see FlowStartMessage.AuthorizationDetails); this forwards it. Both may
+	// be present - OID4VCI allows it, and an AS that understands only one
+	// still gets what it needs.
+	if len(h.authorizationDetails) > 0 {
+		if encoded, err := json.Marshal(h.authorizationDetails); err == nil {
+			params.Set("authorization_details", string(encoded))
+		} else {
+			h.Logger.Warn("could not encode authorization_details; falling back to scope only",
+				zap.Error(err))
+		}
+	}
+	if params.Get("scope") == "" && params.Get("authorization_details") == "" {
+		// Neither way of naming the credential is available, so the AS has
+		// nothing to act on. Failing here names the cause; letting it through
+		// produces an opaque rejection from the AS, or worse, an arbitrary
+		// credential.
+		err := errors.New("credential configuration declares no scope and the wallet sent no authorization_details")
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, err.Error())
+		return nil, err
+	}
 	if pkceEnabled {
 		params.Set("code_challenge", codeChallenge)
 		params.Set("code_challenge_method", "S256")
@@ -2052,11 +2088,47 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	return resp.Proofs, nil
 }
 
+// grantedCredentialIdentifier returns the credential identifier the
+// Authorization Server granted for configID, or "" when it granted none.
+//
+// Matching is by credential_configuration_id so a token response covering
+// several configurations picks the right one; an entry that names no
+// configuration is accepted only when it is the sole one, since then there is
+// nothing to confuse it with.
+func grantedCredentialIdentifier(token *TokenResponse, configID string) string {
+	if token == nil || len(token.AuthorizationDetails) == 0 {
+		return ""
+	}
+	for _, detail := range token.AuthorizationDetails {
+		if len(detail.CredentialIdentifiers) == 0 {
+			continue
+		}
+		if detail.CredentialConfigurationID == configID {
+			return detail.CredentialIdentifiers[0]
+		}
+	}
+	if len(token.AuthorizationDetails) == 1 &&
+		token.AuthorizationDetails[0].CredentialConfigurationID == "" &&
+		len(token.AuthorizationDetails[0].CredentialIdentifiers) > 0 {
+		return token.AuthorizationDetails[0].CredentialIdentifiers[0]
+	}
+	return ""
+}
+
 func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofs []ProofObject) (*CredentialResponse, error) {
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
 		"credential_configuration_id": configID,
+	}
+	// OID4VCI 1.0 §6: when the AS granted credential identifiers in response
+	// to our authorization_details, the Credential Request names one of those
+	// INSTEAD of the configuration id - an issuer that honours
+	// authorization_details rejects the pair. Our own vc issuer enforces
+	// exactly that.
+	if identifier := grantedCredentialIdentifier(token, configID); identifier != "" {
+		delete(reqBody, "credential_configuration_id")
+		reqBody["credential_identifier"] = identifier
 	}
 	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
 	if len(proofs) > 0 {
