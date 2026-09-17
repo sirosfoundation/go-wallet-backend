@@ -156,6 +156,30 @@ the passkey linked to a suspended or revoked instance is refused with `403
 WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
 still log in.
 
+##### Scope of the cut-off
+
+A lifecycle change is about one wallet instance, but the token cut-off and the
+session drop it triggers are about the whole user: every device of that user
+is signed out and has to authenticate again. The other, non-revoked devices
+log in again immediately - that is the "still log in" above - but they do not
+keep the session they had.
+
+This is wider than the change that caused it, and deliberately so rather than
+by oversight. A bearer token carries the user, the tenant, an `iat` and a
+`jti`, and a session record carries the user and the tenant; neither says
+which wallet instance it belongs to, and the gate has one cut-off instant per
+user to compare them against. Narrowing the cut-off to the affected device
+with no such identity would simply stop cutting it off: its already-issued
+token would keep working until it expired, and no check after login looks at
+instance status, so that device could keep starting issuance and presentation
+flows. Signing the user out everywhere is the only sound approximation the
+data supports.
+
+Narrowing it properly needs the instance identity to survive login - carried
+on the session and in the token, with the cut-off recorded per instance - at
+which point revoking one device would leave the others' sessions alone. That
+is a design change, not a bug fix, and it is open.
+
 Wallet instances are per tenant. Revoking the last non-revoked instance of a
 user in a tenant deactivates the wallet in that tenant: the credentials and
 presentations held there are erased, every passkey of the user is refused at

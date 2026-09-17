@@ -144,6 +144,17 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 // user (see internal/tokengate): bearer tokens issued before now stop
 // working, except the one carrying this request. Instances without a user
 // have no tokens to cut off.
+//
+// The cut-off is user-wide even when one instance changed, because a bearer
+// token carries no instance identity: its claims are the user, the tenant,
+// an iat and a jti (UserService.generateToken), and the gate has nothing
+// finer than User.AuthInvalidBefore to compare them against. Cutting off the
+// user is the only sound over-approximation available - narrowing it to the
+// affected device would leave that device's already-issued token working
+// until it expires, and nothing downstream of login checks instance status,
+// so it could keep running issuance and presentation flows. Narrowing this
+// needs an instance identity to survive login; see the note in
+// docs/API.md under "Scope of the cut-off".
 func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.WalletInstance, actor LifecycleActor) error {
 	if inst.UserID == nil {
 		return nil
@@ -266,6 +277,12 @@ func (s *WalletLifecycleService) unsweptErr(ctx context.Context, tenantID domain
 // decision is taken per tenant. It returns ErrErasureIncomplete (wrapping the
 // underlying failures) when any step did not complete; the status change
 // itself is already persisted at that point.
+//
+// The session drop is user-wide for the same reason the cut-off is (see
+// cutOffTokens): a session record carries the user and the tenant and
+// nothing that says which wallet instance authenticated it. Scoping it alone
+// would change nothing a user could observe anyway, since the user-wide
+// cut-off already forces every device to authenticate again.
 func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
 	if inst.UserID == nil {
 		return nil

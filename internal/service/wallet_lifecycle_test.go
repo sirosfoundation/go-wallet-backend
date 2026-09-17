@@ -289,3 +289,33 @@ func TestWalletLifecycle_ActorTokenIsExemptFromCutoff(t *testing.T) {
 	user, _ = store.Users().GetByID(ctx, userID)
 	assert.Empty(t, user.AuthCutoffExemptJTI)
 }
+
+// TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped pins the documented
+// scope of the cut-off: suspending one device of a two-device user cuts off
+// that user's tokens and drops that user's sessions, so the other device is
+// signed out too and has to authenticate again.
+//
+// This is wider than the change that caused it. It stays that way because a
+// bearer token and a session record carry the user and the tenant and no
+// wallet instance (see cutOffTokens), so there is nothing to narrow the
+// cut-off with: a device whose token was not cut off would keep it until it
+// expired, and nothing after login checks instance status. The test exists so
+// the day an instance identity does survive login, this assertion is the one
+// that has to be rewritten on purpose.
+func TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped(t *testing.T) {
+	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
+	ctx := context.Background()
+
+	_, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	require.NoError(t, err)
+
+	cutoff, _, err := store.Users().GetAuthCutoff(ctx, userID)
+	require.NoError(t, err)
+	assert.False(t, cutoff.IsZero(), "the user's tokens are cut off, not just the suspended instance's")
+	assert.Equal(t, []string{userID.String()}, sc.users, "and every session of the user is dropped, not just that device's")
+
+	other, err := store.WalletInstances().GetByID(ctx, "inst-b")
+	require.NoError(t, err)
+	assert.Equal(t, domain.InstanceStatusActive, other.Status,
+		"the other instance keeps its status: it can log in again, it just cannot keep its session")
+}
