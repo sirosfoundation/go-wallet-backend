@@ -113,8 +113,20 @@ const (
 	ErrCodeMatchTimeout      ErrorCode = "MATCH_TIMEOUT"
 	ErrCodeMatchError        ErrorCode = "MATCH_ERROR"
 	ErrCodePresentationError ErrorCode = "PRESENTATION_ERROR"
-	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeInvalidRequestURIMethod is OpenID4VP's invalid_request_uri_method:
+	// the verifier asked for a request_uri_method this wallet does not
+	// implement. It reaches the client rather than the verifier - the request
+	// object has not been fetched at that point, so response_uri, the only
+	// channel an OAuth error could take, is not known yet.
+	ErrCodeInvalidRequestURIMethod ErrorCode = "INVALID_REQUEST_URI_METHOD"
+	// ErrCodeWalletNonceMismatch reports OpenID4VP 1.0 5.10's MUST: a request
+	// object fetched with request_uri_method=post that does not echo the
+	// wallet_nonce we sent terminates request processing. Without that check
+	// the POST buys nothing - the nonce is the only thing binding the
+	// returned request object to this request rather than an earlier one.
+	ErrCodeWalletNonceMismatch ErrorCode = "WALLET_NONCE_MISMATCH"
+	ErrCodeInternalError       ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests     ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -161,6 +173,10 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Credential matching failed"
 	case ErrCodePresentationError:
 		return "Presentation failed"
+	case ErrCodeInvalidRequestURIMethod:
+		return "This request uses a method this wallet does not support"
+	case ErrCodeWalletNonceMismatch:
+		return "The verifier's request could not be verified"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
@@ -217,8 +233,21 @@ type FlowStartMessage struct {
 	CredentialOfferURI string   `json:"credential_offer_uri,omitempty"` // OID4VCI: https://...
 	RequestURI         string   `json:"request_uri,omitempty"`          // OID4VP: openid4vp://...
 	RequestURIRef      string   `json:"request_uri_ref,omitempty"`      // OID4VP: https://...
-	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
-	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
+	// RequestURIMethod is OpenID4VP 1.0 5.10's request_uri_method. It is
+	// carried on its own here because a client that hands the backend an
+	// already-extracted RequestURIRef has dropped the query string the
+	// parameter arrived in; when RequestURI holds the whole authorization
+	// request URI the engine reads it from there instead and this field is
+	// not needed. Absent or "get" keeps RFC 9101's GET.
+	RequestURIMethod string `json:"request_uri_method,omitempty"`
+	// WalletMetadata, when set, is sent verbatim as the wallet_metadata
+	// parameter of a request_uri_method=post request. The client is the
+	// honest source for it: credential matching and VP token construction
+	// both happen there, so it - not the engine - knows what this wallet can
+	// actually present. The engine falls back to defaultWalletMetadata.
+	WalletMetadata json.RawMessage `json:"wallet_metadata,omitempty"`
+	VCT            string          `json:"vct,omitempty"`          // VCTM lookup
+	RedirectURI    string          `json:"redirect_uri,omitempty"` // OAuth redirect URI for authorization code flow
 
 	// Client attestation for wallet-to-issuer authentication (transport-supplied).
 	// The client (frontend/SDK/WMP) obtains the WIA via /wallet-provider/wia/generate
