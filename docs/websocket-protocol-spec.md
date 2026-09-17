@@ -626,7 +626,9 @@ object that does not echo the `wallet_nonce` fails it with
 the better source for it - matching and VP token construction both happen
 there - but the backend falls back to a conservative default
 (`vp_formats_supported` for `dc+sd-jwt` and `mso_mdoc`, ES256) when it is
-omitted.
+omitted. The per-format shape is OpenID4VP 1.0 Annex B's: `sd-jwt_alg_values`
+/ `kb-jwt_alg_values` with JOSE names for SD-JWT VC, `issuerauth_alg_values` /
+`deviceauth_alg_values` with COSE algorithm identifiers for mdoc.
 
 #### Request Processing
 

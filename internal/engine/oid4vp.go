@@ -486,9 +486,16 @@ func usePostForRequestURI(method string) (bool, error) {
 // what lets a verifier tailor the request object it returns; every further
 // field would be one more claim made on the client's behalf. ES256 is the
 // one signature algorithm every WSCD in this stack produces.
+//
+// The two formats are spelled as OpenID4VP 1.0 Annex B defines them, which
+// is not the same shape twice: SD-JWT VC takes sd-jwt_alg_values and
+// kb-jwt_alg_values with JOSE names, while mdoc takes issuerauth_alg_values
+// and deviceauth_alg_values with COSE algorithm identifiers. -7 is the ES256
+// this stack puts in the COSE header, -9 the same thing named as a
+// fully-specified algorithm; a verifier matching either way finds us.
 var defaultWalletMetadata = json.RawMessage(`{"vp_formats_supported":{` +
 	`"dc+sd-jwt":{"sd-jwt_alg_values":["ES256"],"kb-jwt_alg_values":["ES256"]},` +
-	`"mso_mdoc":{"alg_values":["ES256"]}}}`)
+	`"mso_mdoc":{"issuerauth_alg_values":[-7,-9],"deviceauth_alg_values":[-7,-9]}}}`)
 
 // walletMetadataToSend picks the wallet_metadata for a request_uri_method=post
 // request: the client's own when it supplied one, the engine's list when it
