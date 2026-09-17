@@ -1839,17 +1839,20 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 	if err := s.checkWalletLifecycle(ctx, tenantID, user.UUID, credentialID); err != nil {
 		return err
 	}
-	// Only the passkey that just authenticated has a sign count this login
-	// knows anything about; for every other credential the stale copy holds
-	// whatever was there when the record was loaded. Copying those back would
-	// roll back a counter a concurrent login on another passkey had raised in
-	// the meantime, which is exactly the regression clone detection looks for.
+	// Re-apply this login's sign count, and only ever upwards. Two rollbacks
+	// are possible here and both are the regression clone detection looks
+	// for. A credential this login did not authenticate holds whatever was in
+	// the stale copy, so writing it back undoes a concurrent login on another
+	// passkey - hence the credential filter. And two logins on the same
+	// passkey can interleave, leaving the reloaded record already ahead of
+	// the assertion this request verified - hence the comparison. The counter
+	// only moves forward.
 	for i := range fresh.WebauthnCredentials {
 		if fresh.WebauthnCredentials[i].ID != credentialID {
 			continue
 		}
 		for _, c := range user.WebauthnCredentials {
-			if c.ID == credentialID {
+			if c.ID == credentialID && c.Authenticator.SignCount > fresh.WebauthnCredentials[i].Authenticator.SignCount {
 				fresh.WebauthnCredentials[i].Authenticator.SignCount = c.Authenticator.SignCount
 			}
 		}

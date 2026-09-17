@@ -251,3 +251,38 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	}, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceSuspended)
 }
+
+// Two logins on the same passkey can interleave: the one that reloads after
+// ErrStaleWrite may find the record already ahead of the assertion it
+// verified. Re-applying its own count then would roll the counter back - the
+// regression clone detection looks for - so the merge only ever moves it up.
+func TestPersistLoginState_ReloadNeverRollsBackTheSamePasskey(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	s := &WebAuthnService{store: store, logger: zap.NewNop()}
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID,
+		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}))
+	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
+
+	// This login verified an assertion at 8 and loaded the record before the
+	// other one landed.
+	loaded, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	stale := *loaded
+	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}}
+	stale.WebauthnCredentials[0].Authenticator.SignCount = 8
+
+	// A concurrent login on the same passkey already stored 10, and a
+	// lifecycle write moved the fence, so this copy is refused and reloaded.
+	fresh, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	fresh.WebauthnCredentials[0].Authenticator.SignCount = 10
+	require.NoError(t, store.Users().Update(ctx, fresh))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
+
+	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
+	u, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 10, u.WebauthnCredentials[0].Authenticator.SignCount, "the counter only moves forward")
+}
