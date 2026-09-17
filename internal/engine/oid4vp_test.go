@@ -2048,3 +2048,109 @@ func buildMinimalJWT(t *testing.T, key *ecdsa.PrivateKey, certB64 string) string
 	s.FillBytes(sig[n:])
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
+
+// --- no-matching-credential fast fail ---
+
+// feedAction queues a client action on the session, the way the websocket
+// reader does when a real client answers a credential_selection message.
+func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	s.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flowID},
+		Action:  action,
+		Payload: raw,
+	}
+}
+
+func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, func()) {
+	t.Helper()
+	// The client end only has to exist; these tests assert on the flow's
+	// return value, not on what is written to the socket.
+	conn, cleanup := wsTestServer(t, func(c *websocket.Conn) { <-make(chan struct{}) })
+	session := testSession(conn)
+	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
+	session.flows[flow.ID] = flow
+	return &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}, session, cleanup
+}
+
+func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
+	h, session, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	authReq := &AuthorizationRequest{
+		DCQLQuery: json.RawMessage(`{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1"]}}]}`),
+	}
+
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		NoMatchReason: "no credential with vct urn:eudi:pid:arf-1.8:1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
+
+	require.Error(t, err, "an empty match set must end the flow, not wait for consent")
+	assert.Nil(t, selected)
+	assert.Contains(t, err.Error(), "no credential matches")
+}
+
+func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testing.T) {
+	h, session, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that reports its matches first and then asks the user must
+	// behave exactly like one that only sends consent.
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+	})
+	feedAction(t, session, h.Flow.ID, ActionConsent, ConsentPayload{
+		SelectedCredentials: []ConsentSelection{{CredentialID: "cred-1"}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
+
+	require.NoError(t, err)
+	require.Len(t, selected, 1)
+	assert.Equal(t, "cred-1", selected[0].CredentialID)
+}
+
+func TestRequestedCredentialTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		dcql string
+		want []string
+	}{
+		{
+			name: "sd-jwt vct values",
+			dcql: `{"credentials":[{"id":"pid","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1","urn:eudi:pid:arf-1.5:1"]}}]}`,
+			want: []string{"urn:eudi:pid:arf-1.8:1", "urn:eudi:pid:arf-1.5:1"},
+		},
+		{
+			name: "mdoc doctype",
+			dcql: `{"credentials":[{"id":"mdl","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}`,
+			want: []string{"org.iso.18013.5.1.mDL"},
+		},
+		{
+			name: "falls back to the credential id when the query names no type",
+			dcql: `{"credentials":[{"id":"some-credential","meta":{}}]}`,
+			want: []string{"some-credential"},
+		},
+		{
+			name: "deduplicates across credentials",
+			dcql: `{"credentials":[{"id":"a","meta":{"vct_values":["urn:x"]}},{"id":"b","meta":{"vct_values":["urn:x"]}}]}`,
+			want: []string{"urn:x"},
+		},
+		{name: "empty query", dcql: ``, want: nil},
+		{name: "unparseable query", dcql: `not json`, want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, requestedCredentialTypes(json.RawMessage(tt.dcql)))
+		})
+	}
+}

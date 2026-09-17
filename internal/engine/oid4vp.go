@@ -1006,13 +1006,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
 // credential_selection progress message and waits for the user to consent or decline.
 // The frontend is responsible for local credential matching and the consent UI.
+//
+// A client that finds nothing to present answers with credentials_matched and
+// an empty match set instead, which ends the flow here. Without that answer
+// the only ways out were a decline - untrue, the user was never asked - or
+// silence until the user-interaction timeout, which is what a wallet missing
+// the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
 	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
 	})
 
-	action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline)
+	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
 		return nil, err
 	}
@@ -1045,6 +1051,111 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	}
 
 	return payload.SelectedCredentials, nil
+}
+
+// waitForSelectionAction waits for the client's answer to a
+// credential_selection message. credentials_matched with an empty match set
+// terminates the flow; with a non-empty one it is informational and the wait
+// continues, so a client that reports its matches before asking the user
+// behaves exactly as one that does not.
+func (h *OID4VPHandler) waitForSelectionAction(ctx context.Context, authReq *AuthorizationRequest) (*FlowActionMessage, error) {
+	for {
+		action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline, ActionCredentialsMatched)
+		if err != nil {
+			return nil, err
+		}
+		if action.Action != ActionCredentialsMatched {
+			return action, nil
+		}
+
+		var matched CredentialsMatchedPayload
+		if err := json.Unmarshal(action.Payload, &matched); err != nil {
+			_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid credentials_matched payload")
+			return nil, fmt.Errorf("invalid credentials_matched payload: %w", err)
+		}
+		if len(matched.Matches) > 0 {
+			continue
+		}
+
+		return nil, h.failNoMatchingCredential(ctx, authReq, matched.NoMatchReason)
+	}
+}
+
+// failNoMatchingCredential ends the flow when the wallet holds nothing the
+// verifier asked for. The verifier is told as well, so its session ends now
+// rather than expiring: OpenID4VP has no dedicated code for "holder has no
+// such credential", and access_denied is the response the specification
+// provides for a request the wallet will not fulfil.
+func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *AuthorizationRequest, reason string) error {
+	requested := requestedCredentialTypes(authReq.DCQLQuery)
+
+	message := "You do not have a credential that matches this request"
+	if len(requested) > 0 {
+		message = "This request needs a credential you do not have: " + strings.Join(requested, ", ")
+	}
+
+	h.Logger.Info("no credential matches the verifier's query",
+		zap.Strings("requested_types", requested), zap.String("client_reason", reason))
+
+	details := map[string]interface{}{}
+	if len(requested) > 0 {
+		details["requested_types"] = requested
+	}
+	if reason != "" {
+		details["no_match_reason"] = reason
+	}
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", message); redirectURI != "" {
+		details["redirect_uri"] = redirectURI
+	}
+
+	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredential, message, details)
+
+	return errors.New("no credential matches the verifier's query")
+}
+
+// requestedCredentialTypes lists the credential types a DCQL query asks for,
+// so the error can name what is missing rather than say "nothing matched".
+// Best-effort: an unparseable or exotic query simply yields no names.
+func requestedCredentialTypes(dcql json.RawMessage) []string {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var query struct {
+		Credentials []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				VCTValues     []string `json:"vct_values"`
+				DoctypeValue  string   `json:"doctype_value"`
+				DoctypeValues []string `json:"doctype_values"`
+			} `json:"meta"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &query); err != nil {
+		return nil
+	}
+
+	var types []string
+	seen := map[string]bool{}
+	add := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		types = append(types, v)
+	}
+	for _, c := range query.Credentials {
+		for _, vct := range c.Meta.VCTValues {
+			add(vct)
+		}
+		add(c.Meta.DoctypeValue)
+		for _, dt := range c.Meta.DoctypeValues {
+			add(dt)
+		}
+		if len(c.Meta.VCTValues) == 0 && c.Meta.DoctypeValue == "" && len(c.Meta.DoctypeValues) == 0 {
+			add(c.ID)
+		}
+	}
+	return types
 }
 
 func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
