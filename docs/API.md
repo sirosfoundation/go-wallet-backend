@@ -207,6 +207,32 @@ to act on:
 `scope` is what separates them. `message` is for display only: no client
 decision may depend on reading it.
 
+##### Why the login gate is where a blocked instance is stopped
+
+Refusing login for the passkey linked to a suspended or revoked instance is
+the only enforcement in the backend that knows *which* wallet instance is
+acting. It is not a duplicate of the WIA gate, and removing it as one would
+open a hole.
+
+A wallet instance is identified by its key, and the backend sees that
+identity when the instance asks for a WIA - and at login, through the passkey
+linked to it. Nowhere else: an access token carries the user, the tenant, an
+`iat` and a `jti`, a WebSocket session carries the user, the tenant and the
+handshake token's `iat`, and no issuance or presentation flow checks instance
+status. The WIA gate refuses a blocked instance an attestation, which
+external parties that require client attestation act on, but this backend
+never demands a WIA of its own. A blocked instance that could log in would
+therefore still be able to open a session and run issuance and presentation
+flows here.
+
+ARF v3 puts a revoked Wallet Unit in a state where the user can still view
+what it holds and loses only issuance and presentation, which would mean
+refusing at login only for a deactivated wallet. Getting there means carrying
+the instance identity past login and refusing issuance and presentation where
+they happen - the same prerequisite as scoping the cut-off, above. Until then
+the gate stays where it is, and the cost is stated plainly: the user cannot
+log in from a revoked device to look at what it holds.
+
 ##### Why revoking the last instance erases (a SIROS decision)
 
 Erasing the wallet data when the last non-revoked instance goes is a product

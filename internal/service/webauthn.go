@@ -2012,6 +2012,29 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 // linked to this passkey does not block login - it is still blocked from
 // obtaining a WIA (WIAService), and the user must be able to log in from
 // another device to manage it. A user with no instances yet is unaffected.
+//
+// This gate is load-bearing, not a second copy of the WIA gate, and it is
+// worth saying why before someone removes it as redundant. It is the only
+// check in the backend that knows which wallet instance is acting: the
+// instance is identified by its key, and after login nothing carries that
+// identity - an access token carries the user, the tenant, an iat and a jti,
+// and an engine session carries the user, the tenant and the handshake
+// token's iat. The WIA gate refuses a blocked instance an attestation, which
+// external parties that require client attestation will act on, but this
+// backend never requires a WIA of its own: a token is enough to open a
+// WebSocket and start an issuance or presentation flow, and no flow checks
+// instance status. So a blocked instance that could log in could still issue
+// and present here.
+//
+// ARF v3 would have a revoked Wallet Unit keep reading what it holds and
+// lose only issuance and presentation, which would mean refusing at login
+// only for a deactivated wallet. Narrowing this gate to that is the right
+// shape, and it needs the instance identity to survive login first - the
+// same prerequisite as scoping the token cut-off (see
+// WalletLifecycleService.cutOffTokens) - so that issuance and presentation
+// can be refused where they happen. Until then this is where a blocked
+// instance is stopped, and the cost is the one the ARF would not pay: the
+// user cannot log in to look at what that device holds.
 func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID string) error {
 	instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
 	if err != nil {
