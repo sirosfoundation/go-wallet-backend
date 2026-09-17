@@ -2252,6 +2252,36 @@ func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
 	}
 }
 
+// A black-holed address must not hold the whole dial. net.Dialer gets this
+// right for a hostname it resolved itself; dialling checked addresses loses
+// that unless the attempts overlap.
+func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
+	dial := guardedDial(
+		staticLookup("2606:2800:220:1::1", "93.184.216.34"),
+		func(ctx context.Context, _, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "[2606:") {
+				<-ctx.Done() // never answers, as a dead route does not
+				return nil, ctx.Err()
+			}
+			return stubConn{}, nil
+		},
+	)
+
+	start := time.Now()
+	conn, err := dial(context.Background(), "tcp", "dual.example.com:443")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("dial returned no connection")
+	}
+	// The second attempt starts one fallback delay in; anything near a dialer
+	// timeout means the attempts were serial.
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %s, want roughly one fallback delay", elapsed)
+	}
+}
+
 // https-only guard
 // =============================================================================
 

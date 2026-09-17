@@ -161,7 +161,11 @@ func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
 }
 
 // TestNewEngineProvider_AllowHTTPWiring verifies that NewEngineProvider wires
-// AllowHTTP to the metadata resolver correctly.
+// the plaintext policy to the metadata resolver correctly. The resolver below
+// is built with the same expression the provider uses - config.AllowsPlaintext,
+// which is the point of that helper existing: spelling the rule out a second
+// time here is what let this test keep passing while the provider's own rule
+// changed underneath it.
 func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -182,13 +186,21 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			wantAllow: true,
 		},
 		{
-			name:      "InsecureSkipVerify=true implies AllowHTTP but not AllowPrivateIPs",
+			name:      "InsecureSkipVerify=true permits plaintext but not a loopback address",
 			httpCfg:   config.HTTPClientConfig{InsecureSkipVerify: true},
 			wantAllow: false, // loopback blocked because AllowPrivateIPs is not set
 		},
 		{
-			name:      "AllowHTTP=false blocks HTTP (default)",
+			// AllowPrivateIPs is itself a plaintext-permitting setting: such a
+			// deployment reaches its own registry over http://localhost, so
+			// the resolver must accept the scheme the dialer already allows.
+			name:      "AllowPrivateIPs=true permits plaintext on the private network",
 			httpCfg:   config.HTTPClientConfig{AllowPrivateIPs: true},
+			wantAllow: true,
+		},
+		{
+			name:      "nothing set blocks HTTP (default)",
+			httpCfg:   config.HTTPClientConfig{},
 			wantAllow: false,
 		},
 	}
@@ -203,7 +215,7 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			// Reproduce the wiring to verify behavior.
 			client := tc.httpCfg.NewHTTPClient(10 * time.Second)
 			resolver, err := issuermetadata.New(issuermetadata.Config{
-				AllowHTTP:  tc.httpCfg.AllowHTTP || tc.httpCfg.InsecureSkipVerify,
+				AllowHTTP:  tc.httpCfg.AllowsPlaintext(),
 				HTTPClient: client,
 			})
 			if err != nil {

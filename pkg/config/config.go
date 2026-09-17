@@ -220,9 +220,11 @@ type HTTPClientConfig struct {
 	// Set to true when issuers are hosted on internal networks (dev/staging environments).
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
-	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
+	// AllowHTTP permits non-TLS (plain HTTP) for every outbound fetch this
+	// backend makes - request objects, issuer and verifier metadata, JWKS,
+	// logos, registry and proxy calls - not only for metadata resolution.
 	// Default: false (HTTPS required). Use only for local development.
-	// It is not the only setting that permits plaintext - see AllowsPlaintext,
+	// It is not the only setting that permits plaintext: see AllowsPlaintext,
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
@@ -345,25 +347,109 @@ func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
 			return nil, err
 		}
 
-		// Every address was checked above, so any of them is safe to use; try
-		// them in turn the way a resolver-driven dial would, honouring the
-		// address family the caller asked for.
-		var lastErr error
+		// Every address was checked above, so any of them is safe to use.
+		candidates := make([]string, 0, len(ips))
 		for _, ip := range ips {
-			if !matchesNetwork(network, ip) {
-				continue
+			if matchesNetwork(network, ip) {
+				candidates = append(candidates, net.JoinHostPort(ip.String(), port))
 			}
-			conn, err := dial(ctx, network, net.JoinHostPort(ip.String(), port))
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
 		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no %s address found for %s", network, host)
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("no %s address found for %s", network, host)
 		}
-		return nil, lastErr
+		return dialCandidates(ctx, dial, network, candidates)
 	}
+}
+
+// dialFallbackDelay is how long one connection attempt is given on its own
+// before the next checked address is tried alongside it.
+const dialFallbackDelay = 300 * time.Millisecond
+
+// dialCandidates connects to the first of addrs that answers.
+//
+// The attempts are staggered rather than strictly serial, which is what
+// net.Dialer does for a hostname it resolved itself (RFC 6555, "Happy
+// Eyeballs"). Dialing one after another instead would let a single black-holed
+// address - a dead IPv6 route, most often - hold the whole request for the
+// dialer's full timeout before the working address is ever tried. That
+// behaviour comes free when the dialer is handed a name, and is lost here
+// precisely because this dials addresses it has checked.
+func dialCandidates(ctx context.Context, dial dialFunc, network string, addrs []string) (net.Conn, error) {
+	if len(addrs) == 1 {
+		return dial(ctx, network, addrs[0])
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	// Returning cancels whatever is still in flight. A connection that is
+	// already established is not affected by its dial context being cancelled.
+	defer cancel()
+
+	type attempt struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan attempt, len(addrs))
+
+	// closeLate consumes the attempts still outstanding when a winner has been
+	// picked, so a connection that completes just after the race is closed
+	// rather than left open.
+	closeLate := func(outstanding int) {
+		go func() {
+			for i := 0; i < outstanding; i++ {
+				if a := <-results; a.conn != nil {
+					_ = a.conn.Close()
+				}
+			}
+		}()
+	}
+
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	var firstErr error
+	started, pending := 0, 0
+	for started < len(addrs) || pending > 0 {
+		var nextAttempt <-chan time.Time
+		if started < len(addrs) {
+			nextAttempt = timer.C
+		}
+
+		select {
+		case <-ctx.Done():
+			closeLate(pending)
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return nil, firstErr
+
+		case <-nextAttempt:
+			addr := addrs[started]
+			started++
+			pending++
+			go func() {
+				conn, err := dial(ctx, network, addr)
+				results <- attempt{conn: conn, err: err}
+			}()
+			if started < len(addrs) {
+				timer.Reset(dialFallbackDelay)
+			}
+
+		case a := <-results:
+			pending--
+			if a.err == nil {
+				closeLate(pending)
+				return a.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = a.err
+			}
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no address could be dialled")
+	}
+	return nil, firstErr
 }
 
 // matchesNetwork reports whether ip can be dialled on the requested network.
