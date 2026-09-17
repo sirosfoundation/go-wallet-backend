@@ -2136,17 +2136,27 @@ func TestFetchRequestObjectPost(t *testing.T) {
 		assert.JSONEq(t, string(defaultWalletMetadata), stub.form.Get("wallet_metadata"))
 	})
 
-	t.Run("invalid wallet_metadata is rejected before any request", func(t *testing.T) {
-		stub := &requestURIPostServer{}
-		srv := httptest.NewServer(stub.handler(t))
-		defer srv.Close()
-		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+	// OpenID4VP defines wallet_metadata as a JSON object, and well-formed
+	// JSON that is not one is no more usable to a verifier than a syntax
+	// error - better caught here than at the far end of the presentation.
+	for name, metadata := range map[string]string{
+		"a syntax error": `{not json`,
+		"an array":       `[]`,
+		"a number":       `123`,
+		"a string":       `"metadata"`,
+	} {
+		t.Run("wallet_metadata that is "+name+" is rejected before any request", func(t *testing.T) {
+			stub := &requestURIPostServer{}
+			srv := httptest.NewServer(stub.handler(t))
+			defer srv.Close()
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
 
-		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", json.RawMessage(`{not json`))
-		require.Error(t, err)
-		assert.Equal(t, ErrCodeInvalidMessage, codedErrorCode(t, err))
-		assert.Zero(t, stub.calls)
-	})
+			_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", json.RawMessage(metadata))
+			require.Error(t, err)
+			assert.Equal(t, ErrCodeInvalidMessage, codedErrorCode(t, err))
+			assert.Zero(t, stub.calls)
+		})
+	}
 
 	// OpenID4VP 1.0 5.10 makes this a MUST: a request object that does not
 	// carry the nonce back cannot have been produced for this request.
@@ -2289,6 +2299,19 @@ func TestParseRequestURIMethod(t *testing.T) {
 	t.Run("the URI parameter wins over the flow start message", func(t *testing.T) {
 		msg := &FlowStartMessage{
 			RequestURI:       "openid4vp://?client_id=did:web:verifier&request_uri_method=get&request_uri=" + url.QueryEscape(srv.URL),
+			RequestURIMethod: "post",
+		}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, http.MethodGet, stub.method)
+	})
+
+	// An explicitly empty request_uri_method is the authorization request
+	// asking for a GET, and must not fall through to the client's value:
+	// presence is what makes the URI authoritative, not a non-empty value.
+	t.Run("an empty URI parameter still wins over the flow start message", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI:       "openid4vp://?client_id=did:web:verifier&request_uri_method=&request_uri=" + url.QueryEscape(srv.URL),
 			RequestURIMethod: "post",
 		}
 		_, err := h.parseRequest(context.Background(), msg)

@@ -447,8 +447,12 @@ func (e *requestCodedError) Unwrap() error { return e.err }
 // the parameter on the authorization request URI when it carries one,
 // otherwise whatever the client passed on the FlowStart message.
 func requestURIMethod(u *url.URL, msg *FlowStartMessage) string {
-	if method := u.Query().Get("request_uri_method"); method != "" {
-		return method
+	// Presence, not emptiness: "request_uri_method=" with no value is still
+	// the authorization request speaking, and it means the GET it asks for -
+	// falling through to the client's value there would turn a request the
+	// verifier wrote as a GET into a POST.
+	if q := u.Query(); q.Has("request_uri_method") {
+		return q.Get("request_uri_method")
 	}
 	if msg != nil {
 		return msg.RequestURIMethod
@@ -486,15 +490,31 @@ var defaultWalletMetadata = json.RawMessage(`{"vp_formats_supported":{` +
 	`"dc+sd-jwt":{"sd-jwt_alg_values":["ES256"],"kb-jwt_alg_values":["ES256"]},` +
 	`"mso_mdoc":{"alg_values":["ES256"]}}}`)
 
-// hasWalletMetadata reports whether the client actually supplied
-// wallet_metadata. Clients serialize the whole flow start message with their
-// nulls included (the Kotlin and Swift SDKs both encode defaults), so a field
-// they left unset arrives as a literal JSON null rather than as nothing at
-// all - which is valid JSON, and would otherwise be forwarded to the verifier
-// as the string "null".
-func hasWalletMetadata(md json.RawMessage) bool {
+// walletMetadataToSend picks the wallet_metadata for a request_uri_method=post
+// request: the client's own when it supplied one, the engine's list when it
+// did not.
+//
+// Clients serialize the whole flow start message with their nulls included
+// (the Kotlin and Swift SDKs both encode defaults), so a field the client
+// left unset arrives as a literal JSON null rather than as nothing at all,
+// and means the same thing.
+//
+// Anything else has to be an object. OpenID4VP defines wallet_metadata as
+// one, and syntactic validity is not enough: an array, a number or a quoted
+// string is well-formed JSON that no verifier can read as capabilities, so
+// forwarding it would turn a client bug into a failure at the far end of the
+// presentation, where it is much harder to place.
+func walletMetadataToSend(md json.RawMessage) (json.RawMessage, error) {
 	trimmed := strings.TrimSpace(string(md))
-	return trimmed != "" && trimmed != "null"
+	if trimmed == "" || trimmed == "null" {
+		return defaultWalletMetadata, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return nil, &requestCodedError{ErrCodeInvalidMessage,
+			fmt.Errorf("wallet_metadata on the flow start message is not a JSON object: %w", err)}
+	}
+	return json.RawMessage(trimmed), nil
 }
 
 // generateWalletNonce creates the holder-supplied challenge for a
@@ -540,13 +560,9 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 		if err != nil {
 			return nil, err
 		}
-		metadata := defaultWalletMetadata
-		if hasWalletMetadata(walletMetadata) {
-			if !json.Valid(walletMetadata) {
-				return nil, &requestCodedError{ErrCodeInvalidMessage,
-					errors.New("wallet_metadata on the flow start message is not valid JSON")}
-			}
-			metadata = walletMetadata
+		metadata, mdErr := walletMetadataToSend(walletMetadata)
+		if mdErr != nil {
+			return nil, mdErr
 		}
 		form := url.Values{}
 		form.Set("wallet_metadata", string(metadata))
