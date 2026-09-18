@@ -781,3 +781,52 @@ func TestWIAService_GenerateWIA_RefusesADeletedAccount(t *testing.T) {
 		t.Fatalf("GenerateWIA for a live user: %v", err)
 	}
 }
+
+// A re-attestation of an instance already bound to the user must be refused
+// too when the account is gone. Checking only on the first-attestation path
+// missed the case that matters: an instance that survived its account, through
+// the deletion sweep's race or a failure nobody retried, would keep handing
+// an old bearer token fresh attestations.
+func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newTestWIAServiceWithUsers(t)
+
+	userID := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:key:" + userID.String()}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// First attestation, while the account still exists.
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, instanceKey := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &userID, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("first attestation: %v", err)
+	}
+
+	jkt := expectedThumbprint(t, &instanceKey.PublicKey)
+	inst, err := store.WalletInstances().GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if inst.UserID == nil {
+		t.Fatal("the instance must be bound, so the first-attestation path is behind us")
+	}
+
+	// The account goes, the instance survives it.
+	if err := store.Users().Delete(ctx, userID); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+
+	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop2 := createTestPopWithKey(t, challenge2, instanceKey)
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &userID, &WIARequest{Pop: pop2, Challenge: challenge2})
+	if !errors.Is(err, ErrWIAUnknownUser) {
+		t.Fatalf("re-attestation for a removed account = %v, want ErrWIAUnknownUser", err)
+	}
+}

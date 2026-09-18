@@ -95,9 +95,41 @@ type Flow struct {
 	StartTime time.Time
 	Handler   FlowHandler
 
+	// cancel stops the flow's own context, and is set before the flow is
+	// published on the session. Cancelling through the handler alone is not
+	// enough: a handler is built after the flow becomes visible, and each
+	// handler installs its own cancel at the top of Execute, so a revocation
+	// arriving in that window would find nothing to cancel and the flow
+	// would run on regardless. The context exists from the moment anyone
+	// can see the flow, so cancelling it always lands.
+	cancel context.CancelFunc
+
 	// Flow-specific data
 	Data map[string]interface{}
 	mu   sync.RWMutex
+}
+
+// Cancel stops the flow: its own context first, which always exists, then
+// the handler if one has been built yet. Safe to call more than once, and
+// safe to call on a flow whose handler is still being constructed.
+func (f *Flow) Cancel() {
+	f.mu.Lock()
+	cancel, handler := f.cancel, f.Handler
+	f.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if handler != nil {
+		handler.Cancel()
+	}
+}
+
+// setHandler publishes the handler under the flow's own lock, so a concurrent
+// Cancel either sees it or does not, rather than racing the assignment.
+func (f *Flow) setHandler(h FlowHandler) {
+	f.mu.Lock()
+	f.Handler = h
+	f.mu.Unlock()
 }
 
 // Manager manages WebSocket sessions and flows
@@ -383,9 +415,7 @@ func (m *Manager) handleSession(session *Session) {
 		// Cancel all active flows
 		session.flowsMu.Lock()
 		for _, flow := range session.flows {
-			if flow.Handler != nil {
-				flow.Handler.Cancel()
-			}
+			flow.Cancel()
 		}
 		session.flowsMu.Unlock()
 	}()
@@ -566,6 +596,11 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
+	// The flow's context is created before the flow is published, so a
+	// revocation that arrives while the handler is still being built has
+	// something to cancel.
+	flowCtx, cancelFlow := context.WithTimeout(context.Background(), 5*time.Minute)
+
 	// Create flow while still holding lock
 	flow := &Flow{
 		ID:        flowID,
@@ -573,12 +608,14 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		Session:   session,
 		State:     FlowStep("started"),
 		StartTime: time.Now(),
+		cancel:    cancelFlow,
 		Data:      make(map[string]interface{}),
 	}
 
 	// Register flow immediately to reserve slot
 	session.flows[flowID] = flow
 	session.flowsMu.Unlock()
+	defer cancelFlow()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
@@ -591,7 +628,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
-	flow.Handler = handler
+	flow.setHandler(handler)
 
 	defer func() {
 		session.flowsMu.Lock()
@@ -599,12 +636,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		session.flowsMu.Unlock()
 	}()
 
-	// Execute flow
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// A revocation between publishing the flow and here has already
+	// cancelled flowCtx, so do not start the work.
+	if err := flowCtx.Err(); err != nil {
+		logger.Info("Flow cancelled before it started", zap.Error(err))
+		return
+	}
 
 	logger.Info("Starting flow")
-	if err := handler.Execute(ctx, msg); err != nil {
+	if err := handler.Execute(flowCtx, msg); err != nil {
 		logger.Error("Flow failed", zap.Error(err))
 		// Error should have been sent by handler
 		return
@@ -802,9 +842,7 @@ func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {
 		// not the connection's, so closing the socket does not reach it.
 		live.flowsMu.Lock()
 		for _, flow := range live.flows {
-			if flow.Handler != nil {
-				flow.Handler.Cancel()
-			}
+			flow.Cancel()
 		}
 		live.flowsMu.Unlock()
 		_ = live.conn.Close()

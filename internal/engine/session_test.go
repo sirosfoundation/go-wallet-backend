@@ -906,3 +906,41 @@ func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T)
 	assert.NoError(t, m.recheckToken(anon), "anonymous sessions are not gated")
 	assert.NoError(t, NewManager(cfg, zap.NewNop()).recheckToken(session), "no gate configured: nothing enforced")
 }
+
+// A revocation can arrive while a flow's handler is still being built. The
+// flow is published on the session before the handler exists, and each
+// handler installs its own cancellation at the top of Execute, so cancelling
+// through the handler alone would find nothing and the flow would run on.
+// The flow's own context is created before it is visible, so cancelling it
+// always lands.
+func TestFlow_CancelBeforeHandlerIsBuilt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	flow := &Flow{ID: "f1", cancel: cancel, Data: map[string]interface{}{}}
+
+	// No handler yet, exactly the window handleFlowStart leaves open.
+	require.Nil(t, flow.Handler)
+	flow.Cancel()
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("cancelling a flow with no handler must still cancel its context")
+	}
+
+	// And it stays safe once a handler appears, and on a second call.
+	flow.setHandler(nil)
+	flow.Cancel()
+}
+
+// Cancel must not race the handler assignment: both go through the flow's
+// own lock. Run with -race.
+func TestFlow_CancelRacesHandlerAssignment(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	flow := &Flow{ID: "f2", cancel: cancel, Data: map[string]interface{}{}}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); flow.setHandler(nil) }()
+	go func() { defer wg.Done(); flow.Cancel() }()
+	wg.Wait()
+}

@@ -348,6 +348,18 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
+	// Step 2.4: the named user must still exist, whatever kind of
+	// attestation this is. A deleted account takes its token cut-off with it
+	// - the cut-off is a field on the user record - so an already-issued
+	// bearer token still passes every gate. If an instance of that account
+	// survived its deletion, whether through the sweep's race or a failure
+	// the caller never retried, a re-attestation would hand that token a
+	// fresh WIA and bring the removed account back. Checking only on the
+	// first-attestation path missed exactly that case.
+	if err := s.refuseIfUserGone(ctx, userID); err != nil {
+		return "", err
+	}
+
 	// Step 2.5: Reject issuance for instances an admin has revoked.
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
@@ -795,6 +807,23 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	return nil
 }
 
+// refuseIfUserGone refuses an attestation whose token names a user that is
+// not there. An anonymous attestation names nobody and is unaffected, and a
+// service with no user store cannot check.
+func (s *WIAService) refuseIfUserGone(ctx context.Context, userID *domain.UserID) error {
+	if userID == nil || s.users == nil {
+		return nil
+	}
+	if _, err := s.users.GetByID(ctx, *userID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			s.emitAuditFailure("unknown_user", errors.New("attestation names a user that does not exist"))
+			return ErrWIAUnknownUser
+		}
+		return fmt.Errorf("check attesting user: %w", err)
+	}
+	return nil
+}
+
 // refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
 // has wallet instances in the tenant and none of them is live - the same
 // "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
@@ -804,20 +833,6 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
 	if userID == nil {
 		return nil
-	}
-	// The named user must still exist. A deleted account takes its token
-	// cut-off with it, so an already-issued bearer token still passes every
-	// gate; and DeleteUser removes the wallet instances, so the check below
-	// would see an empty wallet and read it as a first enrollment. Together
-	// those would let a removed account attest itself a new wallet.
-	if s.users != nil {
-		if _, err := s.users.GetByID(ctx, *userID); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				s.emitAuditFailure("unknown_user", errors.New("attestation names a user that does not exist"))
-				return ErrWIAUnknownUser
-			}
-			return fmt.Errorf("check attesting user: %w", err)
-		}
 	}
 	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
 	if err != nil {
