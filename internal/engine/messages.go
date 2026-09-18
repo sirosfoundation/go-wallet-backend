@@ -283,6 +283,10 @@ type FlowStartMessage struct {
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
+// authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
+// §5.1.1 defines for a credential authorization detail.
+const authorizationDetailTypeOpenIDCredential = "openid_credential"
+
 // AuthorizationDetail is one OID4VCI `authorization_details` entry.
 //
 // Only the `credential_configuration_id` form is carried: DIIP requires that
@@ -293,10 +297,6 @@ type FlowStartMessage struct {
 // response with the identifiers it granted (OID4VCI 1.0 §6), and the
 // Credential Request must then name one of those instead of the configuration
 // id.
-// authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
-// §5.1.1 defines for a credential authorization detail.
-const authorizationDetailTypeOpenIDCredential = "openid_credential"
-
 type AuthorizationDetail struct {
 	Type                      string   `json:"type"`
 	CredentialConfigurationID string   `json:"credential_configuration_id,omitempty"`
