@@ -198,7 +198,10 @@ func TestEmit_Success(t *testing.T) {
 }
 
 func TestNew_WithLogger(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
 	joseSigner, err := set.NewSigner(key, "ES256", "test-kid")
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
@@ -218,7 +221,10 @@ func TestNew_WithLogger(t *testing.T) {
 }
 
 func TestEmit_ErrorIsLoggedNotPropagated(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
 	joseSigner, err := set.NewSigner(key, "ES256", "test-kid")
 	if err != nil {
 		t.Fatalf("NewSigner: %v", err)
