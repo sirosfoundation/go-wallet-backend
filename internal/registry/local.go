@@ -85,13 +85,14 @@ func loadFile(store *Store, path string, logger *zap.Logger) error {
 	}
 
 	entry := &VCTMEntry{
-		VCT:          id,
-		Name:         header.displayName(),
-		Description:  header.displayDescription(),
-		Organization: header.Organization,
-		Metadata:     json.RawMessage(data),
-		FetchedAt:    time.Now(),
-		IsLocal:      true,
+		VCT:            id,
+		Name:           header.displayName(),
+		Description:    header.displayDescription(),
+		Organization:   header.Organization,
+		Metadata:       json.RawMessage(data),
+		FetchedAt:      time.Now(),
+		IsLocal:        true,
+		AttestationLoS: header.AttestationLoS,
 	}
 
 	store.Put(entry)

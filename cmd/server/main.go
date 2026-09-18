@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -27,7 +28,7 @@ import (
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
-	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine (comma-separated or 'all')")
+	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
 	buildTime          = "unknown"
 )
@@ -42,12 +43,23 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend, engine, admin, and wallet-provider roles)
+	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleWalletProvider) {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
+		}
+		if roles.Has(modes.RoleAuth) {
+			backendCfg.EnableForRole()
+			// EnableForRole mutates the already-validated config (e.g.
+			// falling back to WalletProvider's signing key for AS), so
+			// re-validate rather than let an invalid resulting state (say,
+			// AS enabled with no signing key anywhere) surface later as a
+			// less actionable failure during provider init.
+			if err := backendCfg.Validate(); err != nil {
+				log.Fatalf("Invalid backend configuration after enabling AS for role: %v", err)
+			}
 		}
 	}
 
@@ -171,6 +183,7 @@ func main() {
 		serverCfg.HTTPAddress = registryCfg.Server.Host
 		serverCfg.HTTPPort = registryCfg.Server.Port
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
+		serverCfg.CORS = registryCfg.Server.CORS
 	}
 
 	if backendCfg != nil {
@@ -208,6 +221,7 @@ func main() {
 		resources = append(resources, provider)
 	}
 
+	var engineProvider *server.EngineProvider
 	if roles.Has(modes.RoleEngine) {
 		// Wire verifier store from backend if available (for trust caching)
 		var verifierStore storage.VerifierStore
@@ -234,11 +248,19 @@ func main() {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
 		mgr.AddProvider(provider)
+		engineProvider = provider
+	}
 
-		// Wire session store into UserService so DeleteUser purges active sessions
-		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+	// Wire session stores into UserService so DeleteUser purges AS cookie
+	// sessions and, when the engine runs in this process, active engine
+	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
+	// engine role: a --mode=backend deployment has AS sessions to drop too.
+	if backendProvider != nil {
+		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
+		if engineProvider != nil {
+			cleaners = append(cleaners, engineProvider.SessionStore())
 		}
+		backendProvider.Services().User.SetSessionCleaner(cleaners)
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.

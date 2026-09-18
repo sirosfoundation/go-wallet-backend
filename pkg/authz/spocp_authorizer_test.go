@@ -69,6 +69,42 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 			shouldPass: true,
 		},
 		{
+			name:     "mdoc-reader-auth with x5c",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "key",
+					ID:   "aabbccdd",
+				},
+				Resource: gotrust.Resource{
+					Type: "x5c",
+					ID:   "aabbccdd",
+				},
+				Action: &gotrust.Action{
+					Name: "mdoc-reader-auth",
+				},
+			},
+			shouldPass: true,
+		},
+		{
+			name:     "mdoc-issuer-auth with x5c",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "key",
+					ID:   "aabbccdd",
+				},
+				Resource: gotrust.Resource{
+					Type: "x5c",
+					ID:   "aabbccdd",
+				},
+				Action: &gotrust.Action{
+					Name: "mdoc-issuer-auth",
+				},
+			},
+			shouldPass: true,
+		},
+		{
 			name:     "resolution for DID",
 			tenantID: "default",
 			request: &gotrust.EvaluationRequest{
@@ -113,6 +149,21 @@ func TestSPOCPAuthorizer_DefaultRules(t *testing.T) {
 				Resource: gotrust.Resource{
 					Type: "credential_issuer",
 					ID:   "https://issuer.example.com",
+				},
+			},
+			shouldPass: true,
+		},
+		{
+			name:     "issuer metadata resolution (url type, HTTP dev)",
+			tenantID: "default",
+			request: &gotrust.EvaluationRequest{
+				Subject: gotrust.Subject{
+					Type: "url",
+					ID:   "http://vc-apigw:8080",
+				},
+				Resource: gotrust.Resource{
+					Type: "credential_issuer",
+					ID:   "http://vc-apigw:8080",
 				},
 			},
 			shouldPass: true,

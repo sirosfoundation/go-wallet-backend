@@ -87,31 +87,44 @@ func ParseECPublicKey(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("unsupported curve: %s", crv)
 	}
 
-	// Validate coordinate lengths match the curve's field size.
+	pubKey, err := BuildECPublicKeyFromCoordinates(curve, xBytes, yBytes)
+	if err != nil {
+		return nil, fmt.Errorf("invalid EC point: %w", err)
+	}
+	return pubKey, nil
+}
+
+// BuildECPublicKeyFromCoordinates builds an *ecdsa.PublicKey from decoded
+// x/y coordinate bytes for the given curve, matching RFC 7518 §6.2.1.2's
+// fixed-length encoding: shorter values (a leading zero byte omitted by
+// some real-world producers) are left-padded to the curve's coordinate
+// size, and anything longer is rejected outright - both to reject a
+// malformed/adversarial JWK claiming an oversized coordinate and to bound
+// the uncompressed-point allocation below to small curve-fixed constants.
+// Curve-agnostic (any curve elliptic.Curve/ecdsa.ParseUncompressedPublicKey
+// accepts) so callers needing P-384/P-521 support beyond ParseECPublicKey's
+// P-256-only scope can still share this one coordinate-handling
+// implementation.
+func BuildECPublicKeyFromCoordinates(curve elliptic.Curve, xBytes, yBytes []byte) (*ecdsa.PublicKey, error) {
 	byteLen := (curve.Params().BitSize + 7) / 8
 	if len(xBytes) > byteLen || len(yBytes) > byteLen {
-		return nil, fmt.Errorf("invalid %s coordinate length: x=%d y=%d (expected <= %d)", crv, len(xBytes), len(yBytes), byteLen)
+		return nil, fmt.Errorf("coordinate too large: x=%d y=%d (expected <= %d)", len(xBytes), len(yBytes), byteLen)
 	}
 
-	// Build uncompressed point encoding: 0x04 || x || y
-	// Pad x and y to the correct length
 	for len(xBytes) < byteLen {
 		xBytes = append([]byte{0}, xBytes...)
 	}
 	for len(yBytes) < byteLen {
 		yBytes = append([]byte{0}, yBytes...)
 	}
+
+	// SEC1 uncompressed point format (0x04 || X || Y) - RFC 7518 §6.2.1.2.
 	uncompressed := make([]byte, 1+2*byteLen)
 	uncompressed[0] = 0x04
 	copy(uncompressed[1:1+byteLen], xBytes)
 	copy(uncompressed[1+byteLen:], yBytes)
 
-	pubKey, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
-	if err != nil {
-		return nil, fmt.Errorf("invalid EC point: %w", err)
-	}
-
-	return pubKey, nil
+	return ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
 }
 
 // CurveForName returns the elliptic curve for the given JWK crv name.

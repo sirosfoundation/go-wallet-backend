@@ -4,16 +4,13 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -22,6 +19,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -29,55 +27,40 @@ var (
 	ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
 )
 
-// statusIndexCounter is a process-scoped monotonic counter for status list indices.
-// Each attestation (WIA or KA) gets a unique index. In a multi-instance deployment,
-// uniqueness across instances is achieved by seeding each process with a random
-// starting offset (see init() below) rather than starting from zero — otherwise
-// every replica (and every restart of the same replica) would hand out colliding
-// indices on the same status_list URI once wallet_provider.attestation.status_list_mode
-// is "always".
-var statusIndexCounter atomic.Uint64
-
-func init() {
-	statusIndexCounter.Store(randomStatusIndexSeed())
-}
-
-// randomStatusIndexSeed returns a random 64-bit starting offset for
-// statusIndexCounter. Extracted for direct unit testing.
-func randomStatusIndexSeed() uint64 {
-	var seed [8]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		// Should never happen on any real platform; falling back to 0 is no
-		// worse than the counter's behavior before this fix.
-		return 0
-	}
-	return binary.BigEndian.Uint64(seed[:])
-}
-
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
 // Prevents DoS via expensive JWT signing with excessively large arrays.
 const MaxJWKSPerRequest = 20
 
+// The software certification value emitted on the
+// clamped (untrusted or absent security_properties) path.
+const floorCertificationURL = "https://developers.siros.org/wallet/architecture/key-management"
+
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
-	cfg       *config.Config
-	logger    *zap.Logger
-	signer    crypto.Signer
-	jwtSigner *signing.CryptoSignerES256
-	certChain []string
-	instances storage.WalletInstanceStore
+	cfg             *config.Config
+	logger          *zap.Logger
+	signer          crypto.Signer
+	jwtSigner       *signing.CryptoSignerES256
+	certChain       []string
+	instances       storage.WalletInstanceStore
+	keyAttestations storage.KeyAttestationStore
 }
 
 // NewWalletProviderService creates a new WalletProviderService.
 // instances is used to corroborate a KA request's self-reported security
 // properties against a WIA that already proved native platform integrity
 // for the same wallet instance (see GenerateKeyAttestation) — may be nil in
-// tests that don't exercise that path.
-func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances storage.WalletInstanceStore) *WalletProviderService {
+// tests that don't exercise that path. keyAttestations resolves per-key
+// FIDO2 hardware evidence for the specific credential keys in a KA
+// request's jwks batch — see instanceHasTrustedKeyEvidence's doc comment
+// for why this is per-key, not per-instance. May also be nil in tests that
+// don't exercise that path.
+func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances storage.WalletInstanceStore, keyAttestations storage.KeyAttestationStore) *WalletProviderService {
 	svc := &WalletProviderService{
-		cfg:       cfg,
-		logger:    logger.Named("wallet-provider-service"),
-		instances: instances,
+		cfg:             cfg,
+		logger:          logger.Named("wallet-provider-service"),
+		instances:       instances,
+		keyAttestations: keyAttestations,
 	}
 
 	// Try PKCS#11 first, then fall back to file-based key loading if PKCS#11
@@ -122,7 +105,7 @@ func NewWalletProviderService(cfg *config.Config, logger *zap.Logger, instances 
 			}
 		}
 	}
-	if !pkcs11Loaded && cfg.WalletProvider.PrivateKeyPath != "" && cfg.WalletProvider.CertificatePath != "" {
+	if !pkcs11Loaded && cfg.WalletProvider.PrivateKeyPath != "" {
 		if err := svc.loadKeys(); err != nil {
 			svc.logger.Warn("Failed to load wallet provider keys", zap.Error(err))
 		}
@@ -172,6 +155,19 @@ func (s *WalletProviderService) loadKeys() error {
 	}
 	s.jwtSigner = jwtSigner
 
+	// CertificatePath is optional: a signing key alone is enough for
+	// "ietf"-mode WIA issuance (JWKS-based trust; x5c is additionally
+	// included only when a certificate is configured — see WIAConfig.Mode).
+	// Key Attestation (KA) and "etsi"-mode WIA always require x5c, which
+	// config.Validate() enforces by requiring a certificate whenever
+	// wallet_provider.wia.mode is "etsi"; without one, IsSupported() (KA)
+	// correctly reports unsupported and only WIAService's own ietf-mode
+	// IsSupported() can be true.
+	if s.cfg.WalletProvider.CertificatePath == "" {
+		s.logger.Info("Loaded wallet provider signing key (no certificate configured; KA unavailable and ietf-mode WIA will be kid-only)")
+		return nil
+	}
+
 	// Load certificate chain using proper PEM parsing
 	s.certChain, err = parsePEMCertChain(s.cfg.WalletProvider.CertificatePath)
 	if err != nil {
@@ -218,9 +214,46 @@ func parsePEMCertChain(path string) ([]string, error) {
 	return chain, nil
 }
 
-// IsSupported returns true if key attestation is supported
+// IsSupported returns true if Key Attestation (KA) generation is supported.
+// KA always requires x5c (there is no "ietf mode" for KA — see
+// GenerateKeyAttestation), so this deliberately requires a certificate chain,
+// unlike HasSigningKey.
 func (s *WalletProviderService) IsSupported() bool {
 	return s.jwtSigner != nil && len(s.certChain) > 0
+}
+
+// HasSigningKey returns true if a signing key (file or PKCS#11) is loaded,
+// regardless of whether a certificate/x5c chain is also configured. Used to
+// gate WIA-only ("ietf" mode) functionality, which doesn't require x5c —
+// unlike IsSupported, which additionally requires a certificate for KA.
+func (s *WalletProviderService) HasSigningKey() bool {
+	return s.jwtSigner != nil
+}
+
+// PublicKey returns the wallet provider's signing public key, or nil if no
+// signing key is configured. Used to serve the wallet provider's own JWKS
+// (see RegisterWalletProviderJWKSRoute) for relying parties resolving trust
+// via an iss-based (WIA.Mode == config.WIAModeIETF) attestation instead of
+// its x5c chain.
+func (s *WalletProviderService) PublicKey() crypto.PublicKey {
+	if s.signer == nil {
+		return nil
+	}
+	return s.signer.Public()
+}
+
+// Issuer returns the value used as the WIA's iss claim (see WIAService's
+// GenerateWIA), so relying parties' RFC 8414 metadata discovery
+// (RegisterWalletProviderJWKSRoute) advertises the exact issuer the WIA
+// itself claims. No WalletProviderURI fallback: config.Validate() requires
+// WIA.Issuer to be explicitly set whenever Mode is "ietf" (the only mode
+// that calls this), so falling back here would only mask a config that
+// bypassed Validate() (e.g. constructed directly in tests) - and
+// WalletProviderURI is a different identifier for a different purpose (the
+// WIA-PoP's expected aud, not this wallet provider's own issuer identity;
+// see docs/wallet-instance-attestation.md).
+func (s *WalletProviderService) Issuer() string {
+	return s.cfg.WalletProvider.WIA.Issuer
 }
 
 // Close releases resources held by the service.
@@ -271,12 +304,27 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		kaExpiry = 15 * time.Second
 	}
 	claims := jwt.MapClaims{
-		"iss":           s.cfg.Server.BaseURL,
+		// No `iss`: EC TS03 v1.5.2 removed `iss` from the KA (as it did for
+		// the WIA) — Wallet Provider identity is inferred solely from the
+		// x5c signing certificate below.
 		"jti":           uuid.New().String(),
 		"attested_keys": attested,
-		"nonce":         nonce,
-		"iat":           now.Unix(),
-		"exp":           now.Add(kaExpiry).Unix(),
+		// c_nonce (TS03 §2.3.2 requires a KA sent via the `attestation`
+		// proof type to carry `c_nonce`) *and* nonce (the plain OpenID4VCI
+		// `attestation` proof type claim name some issuers - confirmed
+		// against a live geneva2026.mdoc.online conformance run - only
+		// recognize under this name, rejecting c_nonce-only KAs with
+		// invalid_nonce/"The nonce is not known"): send both rather than
+		// picking a side in what value TS03 vs. base OpenID4VCI expect
+		// here. An unrecognized extra claim is harmless to a conformant
+		// verifier (same reasoning that already applies when a KA is
+		// wrapped in the `jwt` proof type instead, where neither claim is
+		// consulted at all) - this keeps TS03/ARF compliance for verifiers
+		// that expect c_nonce while restoring interop with ones that don't.
+		"c_nonce": nonce,
+		"nonce":   nonce,
+		"iat":     now.Unix(),
+		"exp":     now.Add(kaExpiry).Unix(),
 	}
 
 	// Bind KA to the wallet instance (CS-04 §7.1.3)
@@ -289,48 +337,54 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		claims["aud"] = audience
 	}
 
-	// Security properties are top-level KA claims (Annex C §C.3.1). These are
-	// self-reported by the client — trust them only when the same wallet
-	// instance already has a WIA proving native platform integrity
-	// (Tier 1: ios_app_attest / android_play_integrity). Otherwise clamp to
-	// the software/K3 floor: a client can always claim more than it can
-	// back up, and nothing here independently verifies a hardware or
-	// remote-HSM claim. See internal/service/wallet_provider_test.go for
-	// the regression tests this guards.
+	// Security properties are top-level KA claims (Annex C §C.3.1 / TS03).
+	// TS03 requires key_storage, user_authentication, and certification on
+	// every KA — PID issuers reject the request if any are missing. When the
+	// client omits security_properties, emit the software/K3 floor rather
+	// than leaving the claims absent. Elevated values are still only honored
+	// when the client asserts them AND the batch is trusted (native platform
+	// integrity or per-key FIDO2 evidence); a client can always claim more
+	// than it can back up. See internal/service/wallet_provider_test.go.
+	trusted := false
 	if secProps != nil {
-		trusted := s.instanceHasNativeAttestation(ctx, walletInstanceID)
-		normalized := normalizeSecurityProperties(secProps, trusted)
-		if len(normalized.KeyStorage) > 0 {
-			claims["key_storage"] = normalized.KeyStorage
-		}
-		if len(normalized.UserAuthentication) > 0 {
-			claims["user_authentication"] = normalized.UserAuthentication
-		}
-		if normalized.Certification != nil {
-			claims["certification"] = normalized.Certification
-		}
+		trusted = s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
+	}
+	normalized := normalizeSecurityProperties(secProps, trusted)
+	if len(normalized.KeyStorage) > 0 {
+		claims["key_storage"] = normalized.KeyStorage
+	}
+	if len(normalized.UserAuthentication) > 0 {
+		claims["user_authentication"] = normalized.UserAuthentication
+	}
+	if normalized.Certification != nil {
+		claims["certification"] = normalized.Certification
 	}
 
-	// key_storage_status: KA revocation via Token Status List (CS-04 §7.1.3)
-	if s.cfg.WalletProvider.Attestation.StatusListMode == "always" && s.cfg.WalletProvider.Attestation.StatusListURL != "" {
-		idx := statusIndexCounter.Add(1)
-		ksStatus := map[string]interface{}{
-			"status": map[string]interface{}{
-				"status_list": map[string]interface{}{
-					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": idx,
-				},
-			},
-		}
-		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
-			ksStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
-		}
-		claims["key_storage_status"] = ksStatus
+	// key_storage_status: KA revocation reference (CS-04 §7.1.3, TS-03
+	// clause 2.3.2). Required on every KA by CS-04 — a conformant PID/EAA
+	// Provider rejects one without it. Indexed by keystore tier (CS-04
+	// §7.2.3 Option 1, type-shared); see kaStatusIndex and StatusListConfig.
+	if kss := statusClaim(s.cfg, kaStatusIndex(normalized.KeyStorage), now); kss != nil {
+		claims["key_storage_status"] = kss
 	}
 
-	// Create the token with ES256 and x5c header
+	// Create the token with ES256 and x5c header.
+	//
+	// OpenID4VCI 1.0 registers "application/key-attestation+jwt" as the media
+	// type of a Key Attestation JWT (Appendix G.6.2). The JOSE "typ" header
+	// carries the short form, "key-attestation+jwt" - RFC 7515 §4.1.9 allows
+	// omitting the "application/" prefix when no other "/" appears, and
+	// recommends it. What matters here is the hyphen. The unhyphenated
+	// "keyattestation+jwt" this used to emit was the pre-1.0 draft spelling,
+	// and an issuer validating against the final spec rejects the whole
+	// credential request with invalid_credential_request rather than falling
+	// back - observed against vc's apigw (pkg/openid4vci/proof_attestation.go
+	// pins typ with `eq=key-attestation+jwt`), which failed EVERY credential
+	// type using the "attestation" proof type. Other implementations in this
+	// ecosystem - siros-sdk-kotlin's keystore, multipaz - already emit the
+	// hyphenated form, so this was the outlier.
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["typ"] = "keyattestation+jwt"
+	token.Header["typ"] = "key-attestation+jwt"
 	token.Header["x5c"] = s.certChain
 
 	// Sign the token via crypto.Signer (supports both file and PKCS#11)
@@ -356,24 +410,55 @@ var nativeAttestationSources = map[string]bool{
 	"android_play_integrity": true,
 }
 
-// instanceHasNativeAttestation reports whether walletInstanceID resolves to
-// a WalletInstance whose WIA was backed by verified native platform
-// attestation. Returns false on a missing ID, an unknown instance, a
-// lookup error, or a nil instance store (e.g. in tests that construct
-// WalletProviderService directly) — all of which mean there's no evidence
-// to corroborate an elevated claim, not that one should be granted.
-func (s *WalletProviderService) instanceHasNativeAttestation(ctx context.Context, walletInstanceID string) bool {
-	if s.instances == nil || walletInstanceID == "" {
-		return false
-	}
-	instance, err := s.instances.GetByID(ctx, walletInstanceID)
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
+// keyAttestationTrustsBatch reports whether THIS specific batch of
+// credential-issuance keys (jwks) has independent evidence corroborating
+// an elevated security_properties claim - either:
+//   - the wallet instance's WIA was backed by verified native platform
+//     attestation (Tier 1: App Attest/Play Integrity, re-derived fresh on
+//     every WIA request) - this check legitimately stays instance-scoped,
+//     since it attests runtime/app integrity, not any specific key's own
+//     hardware backing; or
+//   - every key in this batch has a durably verified FIDO2/CTAP2 hardware
+//     attestation on file, looked up per key by JWK Thumbprint via
+//     KeyAttestationStore.
+//
+// Deliberately per-key (not per-instance, and not "any key in the batch"):
+// a wallet instance's identity key and its credential-issuance keys are
+// separate keys, not guaranteed to share a WSCD plugin, and can differ
+// across separate batches over the instance's lifetime - an instance-wide
+// flag (the previous design) would incorrectly apply one key's evidence to
+// unrelated keys generated later, or via a different plugin. Requiring
+// ALL keys in the batch to have evidence matches the fact a single
+// GenerateKeyAttestation call's jwks are already plugin-homogeneous by
+// construction (one generateKeypairs call, one active WSCD plugin) - so
+// this only ever clamps a batch that's actually mixed-evidence or entirely
+// unattested, never a genuinely homogeneous hardware-backed batch.
+func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) bool {
+	if walletInstanceID != "" && s.instances != nil {
+		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
+			}
+		} else if nativeAttestationSources[instance.AttestationSource] {
+			return true
 		}
+	}
+
+	if s.keyAttestations == nil || len(jwks) == 0 {
 		return false
 	}
-	return nativeAttestationSources[instance.AttestationSource]
+	for _, j := range jwks {
+		thumbprint, err := jwk.Thumbprint(j)
+		if err != nil {
+			// Unsupported/malformed key (e.g. non-EC) - can't have evidence.
+			return false
+		}
+		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // isoAttackPotential maps SIROS's internal WSCD key-storage/user-auth
@@ -408,13 +493,17 @@ func isoAttackPotential(raw string, omitIfNone bool) (string, bool) {
 }
 
 // normalizeSecurityProperties maps secProps onto the registered
-// `iso_18045_*` vocabulary and, when trusted is false, clamps every claim
-// down to the software/K3 floor regardless of what the client asserted.
+// `iso_18045_*` vocabulary and, when trusted is false or secProps is nil,
+// clamps every claim down to the software/K3 floor. The floor still emits
+// all three TS03-required claims (key_storage, user_authentication,
+// certification) — omitting any of them caused PID issuers to reject the KA
+// with "missing TS03 claims".
 func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *SecurityProperties {
-	if !trusted {
+	if secProps == nil || !trusted {
 		return &SecurityProperties{
-			KeyStorage:    []string{"iso_18045_basic"},
-			Certification: "none",
+			KeyStorage:         []string{"iso_18045_basic"},
+			UserAuthentication: []string{"iso_18045_basic"},
+			Certification:      floorCertificationURL,
 		}
 	}
 
@@ -424,6 +513,18 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.KeyStorage = []string{"iso_18045_basic"}
 	}
 	out.UserAuthentication = mapDistinct(secProps.UserAuthentication, true)
+	// CS-04 §7.1.3 requires user_authentication and certification on every
+	// KA, so the trusted path needs the same floor the untrusted one gets:
+	// a client that asserted "none" (dropped by mapDistinct's omitIfNone)
+	// or omitted the field entirely must not produce a KA missing the
+	// claim. The floor value is the weakest in the vocabulary, so flooring
+	// never overstates what the client claimed.
+	if len(out.UserAuthentication) == 0 {
+		out.UserAuthentication = []string{"iso_18045_basic"}
+	}
+	if out.Certification == nil {
+		out.Certification = floorCertificationURL
+	}
 	return out
 }
 

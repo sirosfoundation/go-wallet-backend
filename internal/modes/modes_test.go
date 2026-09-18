@@ -95,8 +95,10 @@ func TestParseRoles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseRoles: %v", err)
 		}
-		if !rs.Has(RoleBackend) || !rs.Has(RoleEngine) || !rs.Has(RoleAdmin) {
-			t.Error("all should include backend, engine, admin")
+		for _, role := range ValidRoles {
+			if !rs.Has(role) {
+				t.Errorf("all should include %s", role)
+			}
 		}
 	})
 

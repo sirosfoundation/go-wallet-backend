@@ -31,6 +31,14 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+
+	// asEnabledExplicit records whether as.enabled was explicitly present in
+	// the YAML file or environment (as opposed to defaulting to its bool
+	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
+	// can tell "operator explicitly disabled AS" apart from "AS section
+	// never configured". Unexported: never (un)marshaled, so it can't leak
+	// into YAML output or be set by config files/env itself.
+	asEnabledExplicit bool
 }
 
 // ASConfig contains the new Authorization Server configuration.
@@ -70,6 +78,14 @@ type ASConfig struct {
 	// SessionTTL is the maximum session lifetime before re-authentication.
 	// Default: 24h
 	SessionTTL time.Duration `yaml:"session_ttl" envconfig:"SESSION_TTL"`
+
+	// SessionStore selects where AS sessions (the cookie-bound server-side
+	// sessions that mint access tokens) are kept: "mongodb", "memory" or
+	// "auto". "auto" (the default when empty) means "mongodb" when the
+	// storage backend is MongoDB and "memory" otherwise. Memory sessions are
+	// lost on restart and are not shared between instances; use "mongodb" for
+	// high availability.
+	SessionStore string `yaml:"session_store" envconfig:"SESSION_STORE"`
 
 	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
 	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
@@ -116,6 +132,72 @@ func (c *ASConfig) SetDefaults() {
 	}
 }
 
+// defaultASRulesDir is where EnableForRole expects the baseline SPOCP
+// policy to ship inside the container image (see rules/, copied here by
+// the Dockerfile). It's a var, not a const, so a packager whose filesystem
+// layout doesn't match the container's (e.g. a .deb following FHS) can
+// override it at build time without patching this file:
+//
+//	go build -ldflags "-X github.com/sirosfoundation/go-wallet-backend/pkg/config.defaultASRulesDir=/usr/share/go-wallet-backend/rules"
+var defaultASRulesDir = "/app/rules"
+
+// EnableForRole turns on the AS for deployments that request the "auth" role
+// (including via --mode=all), and fills in defaults for anything left
+// unconfigured. There is no separate AS-specific key or policy to configure:
+// it reuses the wallet provider's own signing key (when file-based - see the
+// PKCS11 note below), since every deployment already configures one for
+// WIA/Key Attestation, and falls back to the baseline policy bundled in the
+// image (see rules/, copied to /app/rules by the Dockerfile) rather than
+// requiring a deployment-specific RulesDir - a role flag alone should be
+// enough to turn AS on, matching how every other role works.
+//
+// An operator's explicit as.enabled: false always wins and skips all of the
+// above - relies on Config.asEnabledExplicit (set by Load()) rather than
+// c.AS.Enabled itself, since a plain bool can't distinguish "explicitly set
+// to false" from "never configured" (both are the zero value). An explicit
+// as.enabled: true does NOT skip defaulting here - it's treated the same as
+// "unconfigured" by this function's own logic.
+//
+// That said, `as: {enabled: true}` alone in a YAML file does NOT actually
+// work end-to-end via the normal startup path: Load() calls Validate()
+// before cmd/server/main.go ever calls EnableForRole(), and Validate()
+// unconditionally requires signing_key_path/rules_dir whenever AS.Enabled is
+// true - so Load() itself rejects that YAML before this function gets a
+// chance to fill in the defaults. This function's explicit-true handling
+// only matters for callers that construct/mutate a Config without going
+// through Load()'s validation first.
+func (c *Config) EnableForRole() {
+	if c.asEnabledExplicit && !c.AS.Enabled {
+		return
+	}
+	c.AS.Enabled = true
+	// Auto-enable can only inherit the wallet provider's signing key when
+	// the wallet provider is purely file-based - never when PKCS11 is
+	// configured for it, even if PrivateKeyPath is ALSO set as a runtime
+	// fallback (WalletProviderService tries PKCS11 first, independently of
+	// whether a file key is also configured). Inheriting the file path
+	// there would silently sign AS tokens with the weaker on-disk key while
+	// the wallet provider itself actually signs WIA/KA with the HSM key -
+	// a real, silent security downgrade, not just an unsupported
+	// configuration. AS's own PKCS11 signing is not implemented (see
+	// Validate()), so this deliberately leaves SigningKeyPath empty in that
+	// case; Validate() then rejects with a clear, actionable error rather
+	// than silently limping along with AS enabled on the wrong key.
+	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" && !walletProviderUsesPKCS11 {
+		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
+	}
+	if c.AS.RulesDir == "" {
+		// Baseline policy (read-only always allowed, own-tenant access for
+		// any tac) every deployment gets unless it configures its own.
+		c.AS.RulesDir = defaultASRulesDir
+	}
+	c.AS.SetDefaults()
+	if c.AS.Issuer == "" {
+		c.AS.Issuer = c.JWT.Issuer
+	}
+}
+
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
 func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	if ttl, ok := c.AudienceTTLs[audience]; ok {
@@ -138,8 +220,15 @@ type HTTPClientConfig struct {
 	// Set to true when issuers are hosted on internal networks (dev/staging environments).
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
-	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
+	// AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through
+	// the client this configuration builds - request objects, issuer and
+	// verifier metadata, JWKS, logos, registry and proxy calls - not only for
+	// metadata resolution, which was its scope while the resolver was the sole
+	// consumer. Code that builds its own client rather than taking this one is
+	// not governed by it; see NewHTTPClient for which paths those are.
 	// Default: false (HTTPS required). Use only for local development.
+	// It is not the only setting that permits plaintext: see AllowsPlaintext,
+	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
@@ -148,8 +237,37 @@ type HTTPClientConfig struct {
 // timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
 // configured timeout. A zero-value HTTPClientConfig produces a sensible default
 // (30 s timeout, system proxy, TLS verification enabled).
-// When AllowPrivateIPs is false, a custom dialer blocks connections to private,
-// loopback, and link-local IP ranges to prevent SSRF.
+//
+// When AllowPrivateIPs is false, two guards apply to every request this client
+// makes, including each hop of a redirect. Both exist because much of what this
+// backend fetches is addressed by whoever it is talking to: a verifier picks
+// the request_uri the wallet dereferences, an issuer picks its metadata URLs.
+//
+//   - a dialer that refuses private, loopback, link-local and cloud metadata
+//     addresses, and then connects to an address it checked;
+//   - plain HTTP is refused unless AllowsPlaintext says otherwise, so a fetch
+//     cannot be downgraded to a network any observer on the path can read or
+//     rewrite.
+//
+// Both guards reach only what is fetched through this client. Two production
+// paths build their own and are governed by neither:
+//
+//   - internal/service.HelperService.GetCertificateChain, which dials TLS
+//     directly to read a certificate chain, so no http.Client is involved. It
+//     requires https itself but applies no address policy, and it is reachable
+//     from an authenticated endpoint with a caller-supplied URL.
+//   - internal/as's OIDC discovery and token exchange, which construct a bare
+//     http.Client, so neither the address nor the scheme policy applies.
+//
+// Bringing those under this configuration is separate work: the first is not an
+// http.Client at all, and the second would change which IdP addresses an
+// existing deployment can reach.
+//
+// When a proxy is in use the dialer only ever sees the proxy, so the address
+// policy is applied to the request's own host before it is sent. That check is
+// best effort by nature: the proxy resolves the name itself and may reach an
+// address this process never saw. A deployment that relies on an egress proxy
+// should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -172,40 +290,276 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		}
 	}
 
+	var roundTripper http.RoundTripper = transport
+
 	if !c.AllowPrivateIPs {
-		// Block connections to private/loopback/link-local IPs to prevent SSRF.
-		// DNS resolution happens inside the dialer so post-DNS rebinding is also blocked.
 		baseDialer := &net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
-			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
-			}
-			for _, ip := range ips {
-				// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-				// before the generic private/link-local check for a clearer message.
-				if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
-					return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
-				}
-				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-					return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
-				}
-			}
-			return baseDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
+		roundTripper = ssrfGuard{
+			base:      transport,
+			proxy:     transport.Proxy,
+			lookup:    defaultLookupIP,
+			httpsOnly: !c.AllowsPlaintext(),
 		}
 	}
 
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: transport,
+		Transport: roundTripper,
 	}
+}
+
+// AllowsPlaintext reports whether this configuration permits non-TLS (plain
+// HTTP) requests. Three settings say so, and they are consulted together
+// everywhere the policy is applied - this transport, the issuer metadata
+// resolver's URL validation, the AuthZEN proxy - so that a URL one layer
+// accepts is not refused by the next:
+//
+//   - AllowHTTP, which says it directly;
+//   - AllowPrivateIPs, because a deployment reaching its own network is
+//     already reaching services that terminate no TLS, the in-process
+//     registry among them (http://localhost:<registry_port>);
+//   - InsecureSkipVerify, which the provider wiring has always folded into
+//     AllowHTTP: a deployment that has given up certificate verification
+//     altogether is not the one a scheme check is protecting.
+func (c HTTPClientConfig) AllowsPlaintext() bool {
+	return c.AllowHTTP || c.AllowPrivateIPs || c.InsecureSkipVerify
+}
+
+// lookupFunc resolves a host to its addresses. Named so guardedDial can be
+// driven without a resolver in tests.
+type lookupFunc func(ctx context.Context, host string) ([]net.IP, error)
+
+// dialFunc opens a connection to an address, as net.Dialer.DialContext does.
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// guardedDial wraps dial so that it refuses to reach the deployment's own
+// network: private, loopback and link-local ranges, and the cloud metadata
+// endpoints on top of them.
+//
+// It connects to an address it checked rather than handing the hostname back
+// to the dialer, which would resolve it a second time. That second lookup is
+// the hole: a DNS server under the requester's control can answer with a
+// public address for the check and an internal one a moment later for the
+// connection, and the guard above would have inspected an address that is
+// never dialled.
+func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+		ips, err := lookup(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
+		}
+
+		// Every address was checked above, so any of them is safe to use.
+		candidates := make([]string, 0, len(ips))
+		for _, ip := range ips {
+			if matchesNetwork(network, ip) {
+				candidates = append(candidates, net.JoinHostPort(ip.String(), port))
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("no %s address found for %s", network, host)
+		}
+		return dialCandidates(ctx, dial, network, candidates)
+	}
+}
+
+// dialFallbackDelay is how long one connection attempt is given on its own
+// before the next checked address is tried alongside it.
+const dialFallbackDelay = 300 * time.Millisecond
+
+// dialCandidates connects to the first of addrs that answers.
+//
+// The attempts are staggered rather than strictly serial, which is what
+// net.Dialer does for a hostname it resolved itself (RFC 6555, "Happy
+// Eyeballs"). Dialing one after another instead would let a single black-holed
+// address - a dead IPv6 route, most often - hold the whole request for the
+// dialer's full timeout before the working address is ever tried. That
+// behaviour comes free when the dialer is handed a name, and is lost here
+// precisely because this dials addresses it has checked.
+func dialCandidates(ctx context.Context, dial dialFunc, network string, addrs []string) (net.Conn, error) {
+	if len(addrs) == 1 {
+		return dial(ctx, network, addrs[0])
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	// Returning cancels whatever is still in flight. A connection that is
+	// already established is not affected by its dial context being cancelled.
+	defer cancel()
+
+	type attempt struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan attempt, len(addrs))
+
+	// closeLate consumes the attempts still outstanding when a winner has been
+	// picked, so a connection that completes just after the race is closed
+	// rather than left open.
+	closeLate := func(outstanding int) {
+		go func() {
+			for i := 0; i < outstanding; i++ {
+				if a := <-results; a.conn != nil {
+					_ = a.conn.Close()
+				}
+			}
+		}()
+	}
+
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	var firstErr error
+	started, pending := 0, 0
+	for started < len(addrs) || pending > 0 {
+		var nextAttempt <-chan time.Time
+		if started < len(addrs) {
+			nextAttempt = timer.C
+		}
+
+		select {
+		case <-ctx.Done():
+			closeLate(pending)
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return nil, firstErr
+
+		case <-nextAttempt:
+			addr := addrs[started]
+			started++
+			pending++
+			go func() {
+				conn, err := dial(ctx, network, addr)
+				results <- attempt{conn: conn, err: err}
+			}()
+			if started < len(addrs) {
+				timer.Reset(dialFallbackDelay)
+			}
+
+		case a := <-results:
+			pending--
+			if a.err == nil {
+				closeLate(pending)
+				return a.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = a.err
+			}
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no address could be dialled")
+	}
+	return nil, firstErr
+}
+
+// matchesNetwork reports whether ip can be dialled on the requested network.
+// "tcp" (and anything else) takes either family; "tcp4" and "tcp6" do not.
+func matchesNetwork(network string, ip net.IP) bool {
+	switch network {
+	case "tcp4", "udp4", "ip4":
+		return ip.To4() != nil
+	case "tcp6", "udp6", "ip6":
+		return ip.To4() == nil
+	default:
+		return true
+	}
+}
+
+// checkAddresses applies the address policy: nothing that would reach the
+// deployment's own network, and the cloud metadata endpoints named separately
+// so the refusal says which rule was hit.
+func checkAddresses(host string, ips []net.IP) error {
+	if len(ips) == 0 {
+		return fmt.Errorf("no addresses found for %s", host)
+	}
+	for _, ip := range ips {
+		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
+		// before the generic private/link-local check for a clearer message.
+		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+		}
+	}
+	return nil
+}
+
+// ssrfGuard is the half of the protection that has to sit above the transport
+// rather than in its dialer.
+//
+// The scheme is only visible here, and this is the layer every hop of a
+// redirect chain passes through: a fetch that starts at https:// can be sent
+// anywhere by a 302, and the URL it lands on is no more trusted than the one
+// it started from.
+//
+// A proxied request needs the address policy applied here too. http.Transport
+// dials the proxy, not the target - for https the target travels in a CONNECT
+// and never reaches the dialer at all - so without this a configured or
+// ambient (HTTP_PROXY, HTTPS_PROXY) proxy would quietly forward exactly the
+// requests the dialer exists to refuse. The check is weaker than the dialer's:
+// the proxy resolves the name itself, so it can reach an address this process
+// never saw, which is why it is done only where the dialer cannot see.
+type ssrfGuard struct {
+	base      http.RoundTripper
+	proxy     func(*http.Request) (*url.URL, error)
+	lookup    lookupFunc
+	httpsOnly bool
+}
+
+func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
+	if g.httpsOnly && req.URL.Scheme != "https" {
+		// Naming all three keys AllowsPlaintext consults, since an operator
+		// who reads only one of them is told to change a setting that may
+		// already be set. insecure_skip_verify is listed last and with the
+		// warning it deserves: it permits plaintext as a side effect of
+		// giving up certificate verification, which is not a reason to set it.
+		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only "+
+			"(set http_client.allow_http, or http_client.allow_private_ips for an internal deployment; "+
+			"http_client.insecure_skip_verify also permits plaintext, but do not enable it for that)",
+			req.URL.Scheme, req.URL.Host)
+	}
+
+	if g.proxied(req) {
+		host := req.URL.Hostname()
+		ips, err := g.lookup(req.Context(), host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
+		}
+	}
+
+	return g.base.RoundTrip(req)
+}
+
+// proxied reports whether this request would be sent through a proxy, and so
+// whether the dialer below will see the proxy's address instead of the
+// target's.
+func (g ssrfGuard) proxied(req *http.Request) bool {
+	if g.proxy == nil {
+		return false
+	}
+	proxyURL, err := g.proxy(req)
+	return err == nil && proxyURL != nil
 }
 
 // ServerConfig contains HTTP server configuration
@@ -337,7 +691,7 @@ func (c *CORSConfig) SetDefaults() {
 	}
 	if len(c.AllowedHeaders) == 0 {
 		c.AllowedHeaders = []string{
-			"Authorization", "Content-Type", "X-Tenant-ID",
+			"Authorization", "Content-Type", "X-Tenant-ID", "X-Token-Mode",
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
@@ -471,29 +825,104 @@ type PKCS11SigningConfig struct {
 }
 
 // AttestationConfig controls attestation lifecycle behavior.
+//
+// Revocation design: WIAs carry a `client_status` and KAs a
+// `key_storage_status` (see signWIA/GenerateKeyAttestation), both required
+// by WE BUILD CS-04 §7.1.2/§7.1.3 (TS-03 clauses 2.3.1/2.3.2) — an issuer
+// conforming to CS-04 rejects a WUA that omits them. Both reference this
+// wallet provider's own Token Status List
+// (RegisterWalletProviderStatusListRoute), which is served but never has a
+// bit set: this wallet provider does not implement revocation-chaining, and
+// what actually bounds exposure from a compromised or revoked wallet
+// instance is LifetimeSeconds being short enough (default 5 minutes) that
+// an outstanding WIA expires before it matters. See StatusListConfig for
+// what that does and does not buy an issuer, and how to turn the claims off.
 type AttestationConfig struct {
-	// LifetimeSeconds is the global attestation lifetime (WIA + KA).
-	// CS-04 requires < 24h (86400). Default: 3600 (1 hour).
+	// LifetimeSeconds is the WIA lifetime. TS03 v1.5.2 caps this at < 24h
+	// (86400); this wallet provider defaults far below that (300s / 5 min)
+	// specifically so that WIA lifetime — not revocation-list checking — is
+	// the mechanism that bounds exposure from a compromised/revoked wallet
+	// instance. See the type-level comment above.
 	LifetimeSeconds int `yaml:"lifetime_seconds" envconfig:"LIFETIME_SECONDS"`
 
 	// KAExpirySeconds is the key attestation JWT expiry.
 	// Short-lived by default (15s) for single-use credential issuance.
 	KAExpirySeconds int `yaml:"ka_expiry_seconds" envconfig:"KA_EXPIRY_SECONDS"`
 
-	// StatusListMode controls whether attestations include a status_list entry.
-	// Values: "always" (always include), "never" (omit for short-lived),
-	// "auto" (include only if lifetime > threshold). Default: "never".
-	StatusListMode string `yaml:"status_list_mode" envconfig:"STATUS_LIST_MODE"`
-
-	// StatusListURL is the base URL for the Token Status List endpoint.
-	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
-
-	// StatusListExpiry is the lifetime (seconds) of a status list entry.
-	// When > 0, the client_status object includes an "exp" field (Annex C §C.3.2).
-	StatusListExpiry int `yaml:"status_list_expiry" envconfig:"STATUS_LIST_EXPIRY"`
-
 	// NativeAttestation controls platform attestation verification.
 	NativeAttestation NativeAttestationConfig `yaml:"native_attestation" envconfig:"NATIVE_ATTESTATION"`
+
+	// FIDO2Attestation controls FIDO2/CTAP2 hardware-key attestation
+	// verification (e.g. a YubiKey's rawSign plugin) — a distinct trust
+	// path from NativeAttestation (platform attestation), verified once at
+	// key-registration time rather than per-WIA-request. See
+	// FIDO2AttestationService.
+	FIDO2Attestation FIDO2AttestationConfig `yaml:"fido2_attestation" envconfig:"FIDO2_ATTESTATION"`
+
+	// StatusList controls the Token Status List references embedded in the
+	// WIA (`client_status`) and KA (`key_storage_status`).
+	StatusList StatusListConfig `yaml:"status_list" envconfig:"STATUS_LIST"`
+}
+
+// StatusListRefMinMaintenanceSeconds is the floor CS-04 §7.2.2 (TS-03
+// clause 2.4.2) puts on how far ahead `client_status.exp` /
+// `key_storage_status.exp` must be at the time of presentation: 31 days.
+const StatusListRefMinMaintenanceSeconds = 31 * 24 * 60 * 60
+
+// StatusListDefaultMaintenanceSeconds is the default
+// StatusListConfig.MaintenancePeriodSeconds: 45 days. Note that it is not
+// StatusListRefMinMaintenanceSeconds — CS-04 §7.2.2's 31 days must remain
+// *at presentation*, not at issuance, so defaulting to exactly the floor
+// would put a WUA out of conformance the moment it sat unused for a
+// second. The 14-day margin is what a WUA can spend between issuance and
+// presentation. Anything deriving a maintenance period must use this, not
+// the floor.
+const StatusListDefaultMaintenanceSeconds = 45 * 24 * 60 * 60
+
+// StatusListConfig configures the `client_status` (WIA) and
+// `key_storage_status` (KA) claims, which WE BUILD CS-04 §7.1.2/§7.1.3
+// (TS-03 clauses 2.3.1/2.3.2) require on every WUA.
+//
+// What these claims mean here: both reference this wallet provider's own
+// Token Status List endpoint (RegisterWalletProviderStatusListRoute), whose
+// entries are always 0 (VALID). This wallet provider does not revoke via
+// the list — see AttestationConfig's type-level comment for why (short
+// attestation lifetimes instead) — so an issuer that polls the referenced
+// entry learns nothing beyond "still valid". The claims are emitted because
+// a CS-04-conformant issuer rejects a WUA without them, not because they
+// carry revocation signal; a deployment that would rather advertise no
+// revocation mechanism at all than advertise an inert one can set Enabled
+// to false, at the cost of failing CS-04 conformance.
+type StatusListConfig struct {
+	// Enabled controls whether `client_status`/`key_storage_status` are
+	// emitted at all. Defaults to true (CS-04 conformance); set false to go
+	// back to omitting them.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// URI overrides the status list URI the claims reference. Defaults to
+	// this wallet provider's own endpoint,
+	// "<server.base_url>/wallet-provider/status-list". Set it only when the
+	// list is published somewhere else (e.g. behind a CDN on a different
+	// host than server.base_url).
+	URI string `yaml:"uri" envconfig:"URI"`
+
+	// MaintenancePeriodSeconds is how far ahead of issuance the claims'
+	// `exp` — the revocation *maintenance* commitment, independent of the
+	// token's own `exp` (CS-04 §7.2's note; TS-03 clause 2.4.1) — is set.
+	// CS-04 §7.2.2 requires at least 31 days remaining at presentation;
+	// this defaults to 45 days so a WUA still satisfies that after sitting
+	// unused for a fortnight. Values below 31 days are rejected by
+	// Validate() when StatusList is enabled.
+	MaintenancePeriodSeconds int `yaml:"maintenance_period_seconds" envconfig:"MAINTENANCE_PERIOD_SECONDS"`
+}
+
+// FIDO2AttestationConfig controls FIDO2/CTAP2 hardware-key attestation
+// verification.
+type FIDO2AttestationConfig struct {
+	// Enabled controls whether the FIDO2 key-attestation registration
+	// endpoint accepts and verifies attestation objects. Off by default —
+	// like NativeAttestation, this is an explicit opt-in trust decision.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 }
 
 // NativeAttestationConfig controls platform-specific attestation verification.
@@ -524,24 +953,70 @@ type NativeAttestationConfig struct {
 	GooglePlayIntegrityVerificationKeyPath string `yaml:"google_play_integrity_verification_key_path" envconfig:"GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH"`
 }
 
+// WIA trust-model modes — see WIAConfig.Mode.
+const (
+	WIAModeETSI = "etsi"
+	WIAModeIETF = "ietf"
+)
+
 // WIAConfig contains WIA-specific configuration (CS-04 §7.1.2)
 type WIAConfig struct {
 	// Enabled controls whether WIA endpoints are registered
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
-	// Issuer is the optional `iss` claim in WIA JWTs.
-	// Default is empty (omitted per TS03 §2.2.1, identity derived from x5c chain).
-	// Some national profiles require an explicit iss for interop.
+	// Issuer is the `iss` claim in WIA JWTs. Required when Mode is "ietf"
+	// (it's the only way a relying party can locate the JWKS to verify the
+	// WIA); unused/omitted when Mode is "etsi".
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+
+	// Mode selects which WIA trust model this wallet provider issues:
+	//
+	//   - "etsi" (default): the EUDI ARF v3.0 / EC TS03 v1.5.2 / ETSI TS 119
+	//     472-3 V1.1.1 model. The WIA always carries the signing certificate
+	//     chain in the `x5c` JOSE header; relying parties verify it against
+	//     the Trusted List for Wallet Providers (ETSI TS 119 472-3
+	//     AUTH-REQ-PROC-4.4.3-01 / TOKEN-REQ-PROC-4.5.2-01). No `iss` or
+	//     `kid` is set — TS03 v1.5 explicitly removed `iss` from the WIA;
+	//     Wallet Provider identity is inferred solely from the x5c signing
+	//     certificate. This is the only mode with a defined trust path under
+	//     the current EUDI/ARF/ETSI specs; use it when interoperating with
+	//     ARF-conformant PID/EAA Providers.
+	//
+	//   - "ietf": the generic IETF draft-ietf-oauth-attestation-based-client-auth
+	//     model, with no ARF/ETSI counterpart. The WIA always carries a
+	//     `kid` header plus the `iss` claim (required), and also includes
+	//     `x5c` when a certificate chain is configured so consumers can
+	//     resolve trust either from the header or via JWKS discovery at
+	//     "<issuer>/.well-known/jwks.json" (see
+	//     RegisterWalletProviderJWKSRoute). Only meaningful for non-EUDI,
+	//     generic-OAuth ecosystems — an ARF-conformant PID/EAA Provider has
+	//     no spec-defined way to resolve trust via this path.
+	//
+	// Note SUNET/vc's parseAttestationIdentity treats x5c as authoritative
+	// and `iss` as a secondary consistency check only when both are present,
+	// so "etsi" mode (no iss) remains unambiguous and "ietf" mode can offer
+	// both trust-resolution paths to that consumer.
+	Mode string `yaml:"mode" envconfig:"MODE"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
-	// WalletName is the wallet_name claim in WIA JWT
+	// WalletName is the wallet_name claim in WIA JWT. REQUIRED by EC TS03
+	// v1.5.2 §2.3.1 when Mode is "etsi" — Validate() enforces this (defaults
+	// to "SIROS ID" so it's populated out of the box).
 	WalletName string `yaml:"wallet_name" envconfig:"WALLET_NAME"`
-	// WalletVersion is the wallet_version claim
+	// WalletVersion is the wallet_version claim. REQUIRED by EC TS03 v1.5.2
+	// §2.3.1 ("Added `wallet_version` (REQUIRED) to the WIA") when Mode is
+	// "etsi" — Validate() enforces this; there is no sensible built-in
+	// default (it must reflect this deployment's actual released version).
 	WalletVersion string `yaml:"wallet_version" envconfig:"WALLET_VERSION"`
-	// WalletLink is the wallet download/info URI
+	// WalletLink is the wallet download/info URI. SHOULD per TS03 §2.3.1;
+	// not enforced by Validate().
 	WalletLink string `yaml:"wallet_link" envconfig:"WALLET_LINK"`
-	// CertificationInfo is the wallet_solution_certification_information claim.
-	// Free-form map included as-is in the WIA JWT (Annex C §C.3.2).
+	// CertificationInfo is the wallet_solution_certification_information
+	// claim. Free-form map included as-is in the WIA JWT. SHALL-required by
+	// TS03 §2.3.1 when Mode is "etsi", but TS03 itself notes the
+	// certification scheme is not yet finalized ("the exact content of
+	// wallet_solution_certification_information is undefined") — Validate()
+	// only warns (via the WIA service logger at startup) rather than hard
+	// failing, unlike WalletVersion.
 	CertificationInfo map[string]interface{} `yaml:"certification_info,omitempty"`
 	// MaxExpirySeconds is the maximum WIA lifetime in seconds (CS-04 requires < 24h)
 	MaxExpirySeconds int `yaml:"max_expiry_seconds" envconfig:"MAX_EXPIRY_SECONDS"`
@@ -752,6 +1227,18 @@ type AuthZENProxyConfig struct {
 	// If empty, default wallet rules are used.
 	RulesFile string `yaml:"rules_file" envconfig:"RULES_FILE"`
 
+	// IssuerEntitlementMode decides what happens when a PID or attestation
+	// provider is not registered for what it is offering: "warn" (default,
+	// report and continue), "fail" (refuse), or "off" (do not check).
+	//
+	// The default is warn, not fail, because the ARF obligation to verify
+	// registration certificates applies 24 months after the amending
+	// Regulation enters into force. Until then, refusing a provider that has
+	// simply not been registered yet would break issuance that is currently
+	// legitimate. An unrecognised value is treated as warn rather than off, so
+	// a typo cannot silently disable the check.
+	IssuerEntitlementMode string `yaml:"issuer_entitlement_mode" envconfig:"ISSUER_ENTITLEMENT_MODE"`
+
 	// AllowResolution controls whether resolution-only requests are allowed.
 	// Resolution requests fetch metadata (DID documents, entity configs) without key validation.
 	// Default: true
@@ -932,11 +1419,15 @@ func Load(configFile string) (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
+			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 		}
 	}
 
 	// Override with environment variables (highest priority)
 	// Since we removed `default:` tags, this only applies actual env vars
+	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
+		cfg.asEnabledExplicit = true
+	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
@@ -960,6 +1451,23 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
+// `as.enabled` key, regardless of its value - used to distinguish "operator
+// explicitly configured as.enabled" from "AS section absent/defaulted",
+// which a plain bool field can't express on its own (see EnableForRole).
+func yamlHasASEnabledKey(data []byte) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	as, ok := raw["as"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = as["enabled"]
+	return ok
 }
 
 // loadSecretsFromFiles loads secrets from file paths.
@@ -1130,6 +1638,7 @@ func defaultConfig() *Config {
 		WalletProvider: WalletProviderConfig{
 			WIA: WIAConfig{
 				Enabled:             true,
+				Mode:                WIAModeETSI,
 				WalletName:          "SIROS ID",
 				MaxExpirySeconds:    86400,
 				ChallengeTTLSeconds: 300,
@@ -1141,9 +1650,18 @@ func defaultConfig() *Config {
 				},
 			},
 			Attestation: AttestationConfig{
-				LifetimeSeconds: 3600,
+				// 5 minutes: short enough that WIA expiry — not revocation-list
+				// checking — bounds exposure from a compromised/revoked wallet
+				// instance. See AttestationConfig's type-level comment.
+				LifetimeSeconds: 300,
 				KAExpirySeconds: 15,
-				StatusListMode:  "never",
+				StatusList: StatusListConfig{
+					// On by default: CS-04 §7.1.2/§7.1.3 require
+					// client_status/key_storage_status on every WUA, and a
+					// conformant issuer rejects one without them.
+					Enabled:                  true,
+					MaintenancePeriodSeconds: StatusListDefaultMaintenanceSeconds,
+				},
 			},
 		},
 	}
@@ -1225,14 +1743,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
 	}
 
-	// Validate StatusListMode if set
-	switch c.WalletProvider.Attestation.StatusListMode {
-	case "", "always", "never", "auto":
-		// valid values
-	default:
-		return fmt.Errorf("invalid wallet_provider.attestation.status_list_mode: %q (must be always, never, or auto)", c.WalletProvider.Attestation.StatusListMode)
-	}
-
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
 	if c.Server.CORS.AllowCredentials {
 		for _, origin := range c.Server.CORS.AllowedOrigins {
@@ -1290,6 +1800,15 @@ func (c *Config) Validate() error {
 
 	// Validate WIA configuration
 	if c.WalletProvider.WIA.Enabled {
+		switch c.WalletProvider.WIA.Mode {
+		case WIAModeETSI, WIAModeIETF:
+		case "":
+			c.WalletProvider.WIA.Mode = WIAModeETSI
+		default:
+			return fmt.Errorf("invalid wallet_provider.wia.mode: %q (must be %q or %q)",
+				c.WalletProvider.WIA.Mode, WIAModeETSI, WIAModeIETF)
+		}
+
 		if c.WalletProvider.WIA.MaxExpirySeconds > 86400 {
 			return fmt.Errorf("wallet_provider.wia.max_expiry_seconds exceeds 24h (86400), CS-04 requires < 24h")
 		}
@@ -1307,10 +1826,56 @@ func (c *Config) Validate() error {
 		// unset. Only require it once WIA is actually operational (signing keys
 		// configured) — not on the zero-config default, where WIA.Enabled is
 		// true but no keys are present and no endpoints get registered.
-		walletProviderKeysConfigured := (c.WalletProvider.PrivateKeyPath != "" && c.WalletProvider.CertificatePath != "") ||
+		// Note: unlike Mode-specific checks below, this doesn't require a
+		// certificate — a signing key alone (file or PKCS#11, with or
+		// without a cert) is enough to make WIA operational in "ietf" mode.
+		walletProviderKeysConfigured := c.WalletProvider.PrivateKeyPath != "" ||
 			(c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != "")
-		if walletProviderKeysConfigured && c.WalletProvider.WIA.WalletProviderURI == "" {
-			return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
+		if walletProviderKeysConfigured {
+			if c.WalletProvider.WIA.WalletProviderURI == "" {
+				return fmt.Errorf("wallet_provider.wia.wallet_provider_uri is required when WIA is enabled with signing keys configured (used to validate the WIA-PoP aud claim)")
+			}
+
+			switch c.WalletProvider.WIA.Mode {
+			case WIAModeIETF:
+				// x5c is never sent in ietf mode, so `iss` + this wallet
+				// provider's own JWKS (RegisterWalletProviderJWKSRoute) is the
+				// only trust path a relying party has — without Issuer, a
+				// WIA would carry no identity at all. No certificate is
+				// required in this mode (JWKS-only trust).
+				if c.WalletProvider.WIA.Issuer == "" {
+					return fmt.Errorf("wallet_provider.wia.issuer is required when wallet_provider.wia.mode is %q", WIAModeIETF)
+				}
+			case WIAModeETSI:
+				// EC TS03 v1.5.2 §2.3.1: wallet_version is REQUIRED. There's
+				// no sensible default (see WIAConfig.WalletVersion), so this
+				// hard-fails rather than silently emitting a non-conformant WIA.
+				if c.WalletProvider.WIA.WalletVersion == "" {
+					return fmt.Errorf("wallet_provider.wia.wallet_version is required when wallet_provider.wia.mode is %q (EC TS03 v1.5.2 requires it)", WIAModeETSI)
+				}
+				if c.WalletProvider.WIA.WalletName == "" {
+					return fmt.Errorf("wallet_provider.wia.wallet_name is required when wallet_provider.wia.mode is %q (EC TS03 v1.5.2 requires it)", WIAModeETSI)
+				}
+				// x5c is mandatory in etsi mode; without a cert the WIA has
+				// no valid trust path under ETSI TS 119 472-3.
+				if c.WalletProvider.CertificatePath == "" {
+					return fmt.Errorf("wallet_provider.certificate_path is required when wallet_provider.wia.mode is %q (WIA identity is x5c-only under ETSI TS 119 472-3)", WIAModeETSI)
+				}
+			}
+		}
+	}
+
+	// Validate the WUA status-list references. Applies regardless of
+	// WIA.Enabled: the same settings drive the KA's key_storage_status, and
+	// KAs are issued through the wallet-provider service independently of
+	// the WIA endpoints.
+	if c.WalletProvider.Attestation.StatusList.Enabled {
+		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds == 0 {
+			c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds = StatusListDefaultMaintenanceSeconds
+		}
+		if c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds < StatusListRefMinMaintenanceSeconds {
+			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
+				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
 	}
 

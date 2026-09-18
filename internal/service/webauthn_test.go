@@ -1604,3 +1604,89 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
 }
+
+// ============================================================================
+// Client extension output tests
+// ============================================================================
+
+// withClientExtensionResults injects a clientExtensionResults member into a
+// virtualwebauthn credential JSON, simulating a browser that returns extension
+// outputs (the wallet-frontend adds the PRF eval input itself on both
+// registration and login, so the browser returns a "prf" output the backend
+// never listed in its own options).
+func withClientExtensionResults(t *testing.T, credentialJSON string, results map[string]any) json.RawMessage {
+	t.Helper()
+	var cred map[string]any
+	require.NoError(t, json.Unmarshal([]byte(credentialJSON), &cred))
+	cred["clientExtensionResults"] = results
+	out, err := json.Marshal(cred)
+	require.NoError(t, err)
+	return out
+}
+
+func TestFullRegistrationFlow_WithPRFClientExtensionOutput(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	beginResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "PRF User"})
+	require.NoError(t, err)
+
+	optionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(optionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, setup.credential, *attestationOptions)
+
+	finishResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential: withClientExtensionResults(t, attestationResponse, map[string]any{
+			"credProps": map[string]any{"rk": true},
+			"prf":       map[string]any{"enabled": true},
+		}),
+		DisplayName: "PRF User",
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, finishResp.UUID)
+}
+
+func TestFullLoginFlow_WithPRFClientExtensionOutput(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	// Register first (no extension outputs needed here).
+	regBegin, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{DisplayName: "PRF Login User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(regBegin.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, setup.credential, *regOptions)
+	regFinish, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: regBegin.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "PRF Login User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(regFinish.UUID)
+	setup.authenticator.Options.UserHandle = userID.AsUserHandle()
+	setup.authenticator.AddCredential(setup.credential)
+
+	// Login: the frontend adds prf.eval.first to the request options on its own,
+	// so the browser returns a prf output the backend did not request.
+	loginBegin, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+	loginOptionsJSON, err := json.Marshal(loginBegin.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(setup.rp, setup.authenticator, setup.credential, *assertionOptions)
+
+	loginFinish, err := setup.service.FinishLogin(setup.ctx, &FinishLoginRequest{
+		ChallengeID: loginBegin.ChallengeID,
+		Credential: withClientExtensionResults(t, assertionResponse, map[string]any{
+			"prf": map[string]any{"results": map[string]any{"first": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},
+		}),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, regFinish.UUID, loginFinish.UUID)
+}

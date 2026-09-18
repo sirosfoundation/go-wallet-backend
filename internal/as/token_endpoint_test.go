@@ -571,12 +571,15 @@ func TestTokenEndpoint_CrossTenantAllowedForWildcard(t *testing.T) {
 func TestTokenEndpoint_AnonymousPriorityOverSession(t *testing.T) {
 	router, store, issuer := setupTokenEndpoint(t)
 
-	// Create a session so a session cookie is present.
+	// Create a session so a session cookie is present. ACR is required -
+	// handleAnonymousTokenRequest still requires a real, already-
+	// authenticated session; "anonymous" only omits "sub" from the token.
 	sess := &Session{
 		JTI:       "sess-anon-priority",
 		UserID:    "user-123",
 		TenantID:  "tenant-1",
 		MaxTAC:    TAC("rw"),
+		ACR:       "urn:siros:acr:passkey",
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
@@ -610,13 +613,34 @@ func TestTokenEndpoint_AnonymousPriorityOverSession(t *testing.T) {
 	}
 }
 
-func TestTokenEndpoint_AnonymousDefaultTenantID(t *testing.T) {
-	router, _, issuer := setupTokenEndpoint(t)
+// TestTokenEndpoint_AnonymousDefaultsToSessionTenant is a regression test
+// for a design change: an anonymous request without an explicit tenant_id
+// used to always get "default", regardless of who was asking - because the
+// old implementation had no session to fall back to. Now that
+// handleAnonymousTokenRequest requires a real session (see
+// TestTokenEndpoint_Anonymous_NoSessionDenied), it defaults to that
+// session's own tenant instead, exactly like handleSessionTokenRequest -
+// the "default" tenant is not given any special treatment.
+func TestTokenEndpoint_AnonymousDefaultsToSessionTenant(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
 
-	// Anonymous request without explicit tenant_id should get "default".
+	sess := &Session{
+		JTI:       "sess-anon-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-acme",
+		MaxTAC:    TAC("rwl"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Anonymous request without explicit tenant_id should get the session's
+	// own tenant - not "default".
 	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-tenant"})
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -633,7 +657,208 @@ func TestTokenEndpoint_AnonymousDefaultTenantID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claims.TenantID != "default" {
-		t.Errorf("expected tenant_id %q, got %q", "default", claims.TenantID)
+	if claims.TenantID != "tenant-acme" {
+		t.Errorf("expected tenant_id %q (the session's own tenant), got %q", "tenant-acme", claims.TenantID)
+	}
+	if claims.Subject != "" {
+		t.Errorf("expected empty subject (identity-free), got %q", claims.Subject)
+	}
+}
+
+// TestTokenEndpoint_Anonymous_NoSessionDenied is a regression test for the
+// core design fix: "anonymous" means the issued token omits the caller's
+// identity, not that no authentication is required at all. A caller with no
+// session must be rejected before SPOCP is even consulted.
+func TestTokenEndpoint_Anonymous_NoSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// No session cookie.
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for anonymous request with no session, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_NoACRDenied covers a session that somehow has
+// no ACR - should be unreachable via any real login flow, but
+// handleAnonymousTokenRequest must fail closed rather than mint a token
+// with no authentication context behind it at all.
+func TestTokenEndpoint_Anonymous_NoACRDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-no-acr",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+		// ACR deliberately left empty.
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-no-acr"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a session with no ACR, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_CrossTenantDenied mirrors
+// TestTokenEndpoint_CrossTenantDenied for the anonymous path: tenant scoping
+// is enforced identically, in code, regardless of whether the issued token
+// carries the caller's identity.
+func TestTokenEndpoint_Anonymous_CrossTenantDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-cross-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true, TenantID: "tenant-other", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-cross-tenant"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant anonymous token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_WriteTACDenied is a regression test: an
+// anonymous token must be read-only regardless of what the caller's own
+// session MaxTAC would otherwise permit - the point of this path is a
+// narrowly-scoped, identity-free token, not "everything my session can do,
+// minus my name".
+func TestTokenEndpoint_Anonymous_WriteTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-write",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwlidka"), // full permissions
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true, TAC: "w"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-write"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for anonymous request with tac=w, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_InvalidSessionDenied covers a session cookie
+// that doesn't resolve to a real session (expired/never existed) - distinct
+// from TestTokenEndpoint_Anonymous_NoSessionDenied, which covers no cookie
+// at all.
+func TestTokenEndpoint_Anonymous_InvalidSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-does-not-exist"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a session cookie that doesn't resolve, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_EmptyMaxTACDenied covers a session with no
+// granted permissions at all - mirrors the equivalent check on the
+// authenticated path.
+func TestTokenEndpoint_Anonymous_EmptyMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-empty-maxtac",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC(""),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-empty-maxtac"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session with no granted permissions, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied is distinct from
+// TestTokenEndpoint_Anonymous_WriteTACDenied: that test's requested tac
+// ("w") fails the read-only cap before session.MaxTAC is even consulted.
+// This one requests a tac that passes the read-only cap ("r", the default)
+// but still exceeds what this specific session's own MaxTAC ("l" only, no
+// "r") permits - a session with only list access can't be used to mint even
+// a read-only-scoped anonymous token.
+func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-list-only",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("l"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-list-only"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session whose MaxTAC (l) doesn't include the default anonymous tac (r), got %d: %s", w.Code, w.Body.String())
 	}
 }

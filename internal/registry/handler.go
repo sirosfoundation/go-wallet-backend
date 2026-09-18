@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -232,17 +234,60 @@ func (h *Handler) serveEntry(c *gin.Context, entry *VCTMEntry) {
 			}
 		}
 
+		// Best-effort: surface the TS11 key-storage assurance tier alongside
+		// the document's own fields, so wallets can pick a WSCD plugin before
+		// generating keys for this credential type. Upstream TS11 population
+		// isn't guaranteed for every entry, so this is skipped when empty.
+		if entry.AttestationLoS != "" {
+			merged, err := mergeAttestationLoS(data, entry.AttestationLoS)
+			if err != nil {
+				h.logger.Warn("failed to merge attestation_los into metadata document",
+					zap.String("vct", entry.VCT),
+					zap.Error(err),
+				)
+			} else {
+				data = merged
+			}
+		}
+
 		c.Data(http.StatusOK, "application/json", data)
 		return
 	}
 
 	// No metadata available, return basic info
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"vct":          entry.VCT,
 		"name":         entry.Name,
 		"description":  entry.Description,
 		"organization": entry.Organization,
-	})
+	}
+	if entry.AttestationLoS != "" {
+		response["attestation_los"] = entry.AttestationLoS
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// mergeAttestationLoS decodes a raw VCTM/MDDL JSON document as an object,
+// injects the attestation_los field, and re-serializes it. Fields are kept
+// as json.RawMessage (not map[string]interface{}) so every other field's
+// original bytes - number representations, key order within nested
+// objects, everything - round-trip untouched; only the top-level key set
+// changes (one key added).
+func mergeAttestationLoS(data json.RawMessage, attestationLoS string) (json.RawMessage, error) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("failed to decode metadata document: %w", err)
+	}
+	losJSON, err := json.Marshal(attestationLoS)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode attestation_los: %w", err)
+	}
+	doc["attestation_los"] = losJSON
+	merged, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-serialize metadata document: %w", err)
+	}
+	return merged, nil
 }
 
 // ListCredentials handles GET /credentials
@@ -252,12 +297,16 @@ func (h *Handler) ListCredentials(c *gin.Context) {
 
 	credentials := make([]gin.H, 0, len(entries))
 	for _, entry := range entries {
-		credentials = append(credentials, gin.H{
+		cred := gin.H{
 			"vct":          entry.VCT,
 			"name":         entry.Name,
 			"description":  entry.Description,
 			"organization": entry.Organization,
-		})
+		}
+		if entry.AttestationLoS != "" {
+			cred["attestation_los"] = entry.AttestationLoS
+		}
+		credentials = append(credentials, cred)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

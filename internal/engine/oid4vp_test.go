@@ -247,19 +247,27 @@ func TestFetchRequestFromURI(t *testing.T) {
 	fakeHeader := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	fakeJWT := fakeHeader + "." + jwtPayload + ".fakesig"
 
-	// A plain JSON object whose client_id contains no dots so that the naive
-	// dot-count heuristic in fetchRequestFromURI does not misclassify it as a JWT.
+	// A plain JSON object whose client_id contains no dots.
 	plainJSON := `{"client_id":"verifier","response_type":"vp_token","nonce":"test-nonce"}`
 	// The same JSON object encoded as a JSON string (as some verifiers return it).
 	quotedJSON := `"{\"client_id\":\"verifier\",\"response_type\":\"vp_token\",\"nonce\":\"test-nonce\"}"`
+	// A JSON object containing exactly two '.' characters in a field value
+	// (a response_uri host). fetchRequestFromURI used to classify body type
+	// by counting '.' characters and treating exactly two as "must be a
+	// JWT", which misclassified JSON bodies like this one and tried (and
+	// failed) to parse them as a JWT. It now checks for a leading '{'/'['
+	// instead, so this must parse as JSON.
+	jsonWithTwoDots := `{"client_id":"verifier","response_type":"vp_token","nonce":"test-nonce","response_uri":"https://a.b.c/path"}`
 
 	tests := []struct {
-		name         string
-		responseBody string
-		statusCode   int
-		wantClientID string
-		wantErr      bool
-		wantErrMsg   string
+		name          string
+		responseBody  string
+		requestQuery  string
+		statusCode    int
+		wantClientID  string
+		wantSessionID string
+		wantErr       bool
+		wantErrMsg    string
 	}{
 		{
 			name:         "plain JWT response",
@@ -286,6 +294,20 @@ func TestFetchRequestFromURI(t *testing.T) {
 			wantClientID: "verifier",
 		},
 		{
+			name:         "JSON object response containing exactly two dots",
+			responseBody: jsonWithTwoDots,
+			statusCode:   http.StatusOK,
+			wantClientID: "verifier",
+		},
+		{
+			name:          "sessionId query param is forwarded as VerifierSessionID",
+			responseBody:  plainJSON,
+			requestQuery:  "sessionId=abc-123",
+			statusCode:    http.StatusOK,
+			wantClientID:  "verifier",
+			wantSessionID: "abc-123",
+		},
+		{
 			name:         "HTTP error status",
 			responseBody: "not found",
 			statusCode:   http.StatusNotFound,
@@ -304,7 +326,12 @@ func TestFetchRequestFromURI(t *testing.T) {
 
 			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
 
-			authReq, err := h.fetchRequestFromURI(context.Background(), srv.URL)
+			uri := srv.URL
+			if tt.requestQuery != "" {
+				uri += "?" + tt.requestQuery
+			}
+
+			authReq, err := h.fetchRequestFromURI(context.Background(), uri)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrMsg != "" {
@@ -314,6 +341,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantClientID, authReq.ClientID)
+			assert.Equal(t, tt.wantSessionID, authReq.VerifierSessionID)
 		})
 	}
 }
@@ -378,6 +406,30 @@ func TestParseRequest(t *testing.T) {
 	t.Run("haip scheme with inline params", func(t *testing.T) {
 		msg := &FlowStartMessage{
 			RequestURI: "haip://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "inline-nonce", authReq.Nonce)
+	})
+
+	// HAIP 1.0 final replaced the early-draft "haip://" scheme with
+	// "haip-vp://" (presentation) - regression test for a bug where real
+	// verifiers (e.g. Multipaz) emitting haip-vp:// links fell through to
+	// the "direct URL" branch (same bug class as haip:// above), which never
+	// dereferenced the request_uri query param and failed with a generic
+	// "invalid message format" instead of unwrapping it.
+	t.Run("haip-vp scheme with request_uri reference", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip-vp://?client_id=did:web:verifier&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "fetched-nonce", authReq.Nonce)
+	})
+
+	t.Run("haip-vp scheme with inline params", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "haip-vp://?response_type=vp_token&client_id=https://verifier.example.com&nonce=inline-nonce",
 		}
 		authReq, err := h.parseRequest(context.Background(), msg)
 		require.NoError(t, err)
@@ -623,7 +675,7 @@ func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	h := &OID4VPHandler{httpClient: server.Client()}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
 	authReq := &AuthorizationRequest{
 		ClientID: "https://verifier.example.com",
 		State:    "test-state",
@@ -682,6 +734,102 @@ func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromECKey(t *testing.T) {
 	response := receivedForm.Get("response")
 	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
 	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+}
+
+func TestSubmitDirectPostJWT_MissingEncAlg_HonorsJWKAlg(t *testing.T) {
+	// When authorization_encrypted_response_alg is absent but the verifier's
+	// encryption JWK declares its own "alg" (e.g. ECDH-ES+A256KW), that value
+	// must be used for the JWE header rather than inferring ECDH-ES from the
+	// EC key type. Verifiers validate the JWE header "alg" against their
+	// selected encryption JWK and reject a mismatch (regression test for the
+	// "JWE header does not match the selected verifier encryption JWK" failure).
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	jwksBytes := makeJWKS(jose.JSONWebKey{
+		Key:       &encKey.PublicKey,
+		KeyID:     "enc-key-1",
+		Use:       "enc",
+		Algorithm: "ECDH-ES+A256KW",
+	})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com",
+		// No AuthorizationEncryptedResponseAlg — must fall back to the JWK's alg.
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should succeed by honoring the JWK's declared alg")
+
+	response := receivedForm.Get("response")
+	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+
+	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
+	require.NoError(t, err)
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	require.NoError(t, json.Unmarshal(headerJSON, &header))
+	assert.Equal(t, string(jose.ECDH_ES_A256KW), header.Alg,
+		"JWE header alg should honor the JWK's declared ECDH-ES+A256KW, not inferred ECDH-ES")
+}
+
+func TestSubmitDirectPostJWT_MissingEncAlg_IgnoresNonJARMJWKAlg(t *testing.T) {
+	// When authorization_encrypted_response_alg is absent and the verifier's
+	// JWK carries a non-JARM key-management "alg" (e.g. a signature alg like
+	// "ES256"), that value must NOT be forced onto the JWE. The code should
+	// fall back to key-type inference (EC key → ECDH-ES) instead of failing on
+	// an unsupported JARM key algorithm.
+	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	jwksBytes := makeJWKS(jose.JSONWebKey{
+		Key:       &encKey.PublicKey,
+		KeyID:     "enc-key-1",
+		Use:       "enc",
+		Algorithm: "ES256", // signature alg, not a JARM key-management alg
+	})
+
+	var receivedForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		receivedForm = r.PostForm
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
+	authReq := &AuthorizationRequest{
+		ClientID:       "https://verifier.example.com",
+		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
+	}
+
+	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
+	require.NoError(t, err, "should fall back to ECDH-ES key-type inference, not fail on ES256")
+
+	response := receivedForm.Get("response")
+	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
+
+	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
+	require.NoError(t, err)
+	var header struct {
+		Alg string `json:"alg"`
+	}
+	require.NoError(t, json.Unmarshal(headerJSON, &header))
+	assert.Equal(t, string(jose.ECDH_ES), header.Alg,
+		"non-JARM JWK alg should be ignored in favor of inferred ECDH-ES")
 }
 
 func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromRSAKey(t *testing.T) {
@@ -772,10 +920,12 @@ func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
 	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
 }
 
-func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
+func TestSubmitDirectPostJWT_DefaultEncIsA128GCM(t *testing.T) {
 	// When authorization_encrypted_response_enc is absent, default should be
-	// A128CBC-HS256 (preserved for backward compatibility with existing verifiers
-	// that omit enc but expect the original default).
+	// A128GCM, not A128CBC-HS256 (RFC 7518's first mandatory-to-implement
+	// "enc" but not universally implemented - confirmed live against
+	// verifier.multipaz.org's own JsonWebEncryption decrypter, which only
+	// implements the GCM family and rejects CBC-HS256 outright).
 	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
@@ -808,7 +958,17 @@ func TestSubmitDirectPostJWT_DefaultEncIsA128CBC(t *testing.T) {
 
 	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "vp-token")
 	require.NoError(t, err, "should succeed with default A128GCM enc")
-	assert.Equal(t, 5, len(splitDots(receivedForm.Get("response"))))
+	response := receivedForm.Get("response")
+	assert.Equal(t, 5, len(splitDots(response)))
+
+	headerB64 := splitDots(response)[0]
+	headerJSON, err := base64.RawURLEncoding.DecodeString(headerB64)
+	require.NoError(t, err)
+	var header struct {
+		Enc string `json:"enc"`
+	}
+	require.NoError(t, json.Unmarshal(headerJSON, &header))
+	assert.Equal(t, string(jose.A128GCM), header.Enc, "default enc should be A128GCM, not A128CBC-HS256")
 }
 
 func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {
@@ -837,7 +997,7 @@ func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
 
 	jwksBytes := makeJWKS(
 		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
-		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc"},
+		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc", Algorithm: "ECDH-ES+A256KW"},
 	)
 
 	h := &OID4VPHandler{}
@@ -845,9 +1005,10 @@ func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
 		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
 	}
 
-	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	_, kid, alg, err := h.extractVerifierEncryptionKey(authReq)
 	require.NoError(t, err)
 	assert.Equal(t, "enc-key-1", kid, "should select the key with use=enc")
+	assert.Equal(t, "ECDH-ES+A256KW", alg, "should return the JWK's declared alg")
 }
 
 func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
@@ -866,7 +1027,7 @@ func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
 		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
 	}
 
-	_, kid, err := h.extractVerifierEncryptionKey(authReq)
+	_, kid, _, err := h.extractVerifierEncryptionKey(authReq)
 	require.NoError(t, err)
 	assert.Equal(t, "only-key", kid)
 }
@@ -877,7 +1038,7 @@ func TestExtractVerifierEncryptionKey_NoKeysReturnsError(t *testing.T) {
 		ClientMetadata: &ClientMetadata{},
 	}
 
-	_, _, err := h.extractVerifierEncryptionKey(authReq)
+	_, _, _, err := h.extractVerifierEncryptionKey(authReq)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no verifier encryption key found")
 }
@@ -1267,6 +1428,31 @@ func TestValidateResponseURIOrigin_HAIPScheme_Mismatch(t *testing.T) {
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "haip://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match request_uri origin")
+}
+
+func TestValidateResponseURIOrigin_HAIPVPScheme(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip-vp://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
+	}
+	err := validateResponseURIOrigin(authReq, msg)
+	assert.NoError(t, err)
+}
+
+func TestValidateResponseURIOrigin_HAIPVPScheme_Mismatch(t *testing.T) {
+	authReq := &AuthorizationRequest{
+		ResponseURI:    "https://evil.example.com/response",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+	}
+	msg := &FlowStartMessage{
+		RequestURI: "haip-vp://?request_uri=https%3A%2F%2Fverifier.example.com%2Frequest",
 	}
 	err := validateResponseURIOrigin(authReq, msg)
 	require.Error(t, err)

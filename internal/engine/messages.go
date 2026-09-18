@@ -80,12 +80,28 @@ const (
 type ErrorCode string
 
 const (
-	ErrCodeAuthFailed        ErrorCode = "AUTH_FAILED"
-	ErrCodeInvalidMessage    ErrorCode = "INVALID_MESSAGE"
-	ErrCodeUnknownFlow       ErrorCode = "UNKNOWN_FLOW"
-	ErrCodeFlowTimeout       ErrorCode = "FLOW_TIMEOUT"
-	ErrCodeOfferParseError   ErrorCode = "OFFER_PARSE_ERROR"
-	ErrCodeOfferFetchError   ErrorCode = "OFFER_FETCH_ERROR"
+	ErrCodeAuthFailed ErrorCode = "AUTH_FAILED"
+	// ErrCodeForbidden is a permission (tac) rejection, distinct from
+	// ErrCodeAuthorizationFail below despite the similar name - that one is
+	// specifically an OAuth authorization *flow* failure (bad redirect_uri,
+	// state mismatch, etc.), not a token-permission check.
+	ErrCodeForbidden       ErrorCode = "FORBIDDEN"
+	ErrCodeInvalidMessage  ErrorCode = "INVALID_MESSAGE"
+	ErrCodeUnknownFlow     ErrorCode = "UNKNOWN_FLOW"
+	ErrCodeFlowTimeout     ErrorCode = "FLOW_TIMEOUT"
+	ErrCodeOfferParseError ErrorCode = "OFFER_PARSE_ERROR"
+	ErrCodeOfferFetchError ErrorCode = "OFFER_FETCH_ERROR"
+	// ErrCodeRequestParseError is OID4VP's counterpart to ErrCodeOfferParseError -
+	// distinct so a failure to parse/fetch an *authorization* request never
+	// surfaces the OID4VCI-flavored "credential offer" wording on a presentation
+	// flow.
+	ErrCodeRequestParseError ErrorCode = "REQUEST_PARSE_ERROR"
+	// ErrCodeRequestFetchError is OID4VP's counterpart to ErrCodeOfferFetchError -
+	// a request_uri that couldn't be retrieved (network error, non-200
+	// status - e.g. an already-expired/consumed reference) is a distinct,
+	// more actionable condition from one that WAS retrieved but failed to
+	// parse.
+	ErrCodeRequestFetchError ErrorCode = "REQUEST_FETCH_ERROR"
 	ErrCodeMetadataFetchErr  ErrorCode = "METADATA_FETCH_ERROR"
 	ErrCodeUntrustedIssuer   ErrorCode = "UNTRUSTED_ISSUER"
 	ErrCodeUntrustedVerifier ErrorCode = "UNTRUSTED_VERIFIER"
@@ -107,6 +123,8 @@ func (c ErrorCode) UserFacingMessage() string {
 	switch c {
 	case ErrCodeAuthFailed:
 		return "Authentication failed"
+	case ErrCodeForbidden:
+		return "Insufficient permissions"
 	case ErrCodeInvalidMessage:
 		return "Invalid message format"
 	case ErrCodeUnknownFlow:
@@ -117,6 +135,10 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Could not parse credential offer"
 	case ErrCodeOfferFetchError:
 		return "Could not fetch credential offer"
+	case ErrCodeRequestParseError:
+		return "Could not parse the presentation request"
+	case ErrCodeRequestFetchError:
+		return "Could not fetch the presentation request"
 	case ErrCodeMetadataFetchErr:
 		return "Could not fetch issuer metadata"
 	case ErrCodeUntrustedIssuer:
@@ -152,8 +174,18 @@ func (c ErrorCode) UserFacingMessage() string {
 type SignAction string
 
 const (
-	SignActionGenerateProof    SignAction = "generate_proof"
-	SignActionSignPresentation SignAction = "sign_presentation"
+	SignActionGenerateProof      SignAction = "generate_proof"
+	SignActionSignPresentation   SignAction = "sign_presentation"
+	SignActionRequestAttestation SignAction = "request_attestation"
+	// SignActionSignClientAuth asks the client to authenticate one outbound
+	// request with its own key: a DPoP proof (RFC 9449) when htm/htu are set,
+	// and a WIA + fresh attestation PoP when audience is set. The client
+	// holds the key that is both the WIA cnf key and the DPoP key, so the
+	// engine never sees a DPoP private key (go-wallet-backend#317). A client
+	// that supports the action always returns dpop_key_id; an empty response
+	// means it does not, and the engine falls back to its own DPoP key plus
+	// a single SignActionRequestAttestation.
+	SignActionSignClientAuth SignAction = "sign_client_auth"
 )
 
 // Message is the base message envelope for all WebSocket messages
@@ -197,9 +229,78 @@ type FlowStartMessage struct {
 	ClientAttestation    string `json:"client_attestation,omitempty"`
 	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
 
+	// AuthorizationDetails is the OID4VCI `authorization_details` the client
+	// wants sent on the Authorization Request (OID4VCI 1.0 §5.1.1). DIIP
+	// requires a Wallet to be able to ask for a credential configuration this
+	// way as well as by `scope`.
+	//
+	// Supplied by the client rather than derived here, on purpose. The engine
+	// builds the Authorization Request for every transport, so the wallet
+	// cannot add the parameter itself - but the *decision* is the Wallet's,
+	// which is where DIIP puts it and where wallet-frontend and the native
+	// SDKs keep it. The engine forwards what it is given.
+	//
+	// Absent means "do not ask this way", not "ask with nothing": the
+	// parameter is omitted entirely and the `scope` path is unchanged, so a
+	// client that never sends this behaves exactly as before.
+	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
+
+	// Renewal fields (credential re-issuance/renewal plan, Phase 1 Slice 2).
+	// When RefreshToken is set, this FlowStart is a renewal request rather
+	// than a fresh issuance: Offer/CredentialOfferURI are not used (there is
+	// no fresh offer - the client already knows the issuer and credential
+	// type from the credential being renewed), CredentialIssuer and
+	// SelectedCredentialConfigurationID are required instead, and the token
+	// step performs a refresh_token grant against the issuer's token
+	// endpoint instead of any authorization/pre-authorized_code grant.
+	RefreshToken                      string `json:"refresh_token,omitempty"`
+	CredentialIssuer                  string `json:"credential_issuer,omitempty"`
+	SelectedCredentialConfigurationID string `json:"selected_credential_configuration_id,omitempty"`
+	// ReissuanceKid, when set, is threaded through to
+	// SignRequestParams.ReissuanceKid so the client signs the renewal's
+	// holder-binding proof with the original credential's key rather than a
+	// fresh one (see that field's doc comment for the full rationale).
+	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+	// DPoPJWK, when set on a renewal request, is the private JWK the backend
+	// previously exported at FlowCompleteMessage.DPoPJWK for the flow that
+	// issued RefreshToken. The issuer's refresh_token grant binds the token
+	// to the exact DPoP key used at initial issuance (RFC 9449/ARF 3.0
+	// §6.6.6.2.2), so the renewal must reuse that same key rather than the
+	// fresh ephemeral one Execute() would otherwise generate. The backend
+	// never persists this key itself; the client (via privatedata) is the
+	// only durable custodian - see feedback_backend_key_persistence_principle.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID, when set on a renewal request, is the identifier the client
+	// returned at FlowCompleteMessage.DPoPKeyID for the flow that issued
+	// RefreshToken: the client-held key the token is bound to. The engine
+	// passes it back as SignRequestParams.KeyID on every
+	// SignActionSignClientAuth of the renewal so the client signs with that
+	// same key. Takes precedence over DPoPJWK.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+// authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
+// §5.1.1 defines for a credential authorization detail.
+const authorizationDetailTypeOpenIDCredential = "openid_credential"
+
+// AuthorizationDetail is one OID4VCI `authorization_details` entry.
+//
+// Only the `credential_configuration_id` form is carried: DIIP requires that
+// one, and it is what the `format`-based alternative was replaced by.
+//
+// CredentialIdentifiers is populated only on the way back - an Authorization
+// Server that honours `authorization_details` echoes the details in its token
+// response with the identifiers it granted (OID4VCI 1.0 §6), and the
+// Credential Request must then name one of those instead of the configuration
+// id.
+type AuthorizationDetail struct {
+	Type                      string   `json:"type"`
+	CredentialConfigurationID string   `json:"credential_configuration_id,omitempty"`
+	CredentialIdentifiers     []string `json:"credential_identifiers,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -235,6 +336,29 @@ type FlowCompleteMessage struct {
 	TypeMetadata                      json.RawMessage    `json:"type_metadata,omitempty"`
 	CredentialIssuer                  string             `json:"credential_issuer,omitempty"`
 	SelectedCredentialConfigurationID string             `json:"selected_credential_configuration_id,omitempty"`
+	// RefreshToken is the OAuth refresh_token the issuer's token endpoint
+	// returned alongside this batch, if any (OID4VCI issuance only - never
+	// set for OID4VP). The backend does not persist this itself (see the
+	// credential re-issuance/renewal plan); the client is expected to store
+	// it durably (e.g. via privatedata) and present it back on a future
+	// renewal request for this credential_configuration_id.
+	RefreshToken string `json:"refresh_token,omitempty"`
+	// DPoPJWK is the private JWK of the ephemeral DPoP key this flow used for
+	// its token exchange, present only alongside RefreshToken. The issuer
+	// binds RefreshToken to this exact key (RFC 9449/ARF 3.0 §6.6.6.2.2), so
+	// a later renewal must present it back as FlowStartMessage.DPoPJWK
+	// instead of Execute() generating a fresh one - see that field's doc
+	// comment. The backend only ever holds this key ephemerally in memory
+	// for the current flow and never persists it; relaying it here makes
+	// the client (via privatedata) the sole durable custodian.
+	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID is the client-chosen identifier of the client-held key this
+	// flow used for DPoP (SignActionSignClientAuth), present only alongside
+	// RefreshToken and only when the flow ran in client-held mode, in which
+	// case DPoPJWK is absent because the engine never had the private key.
+	// The client stores it with RefreshToken and presents it back as
+	// FlowStartMessage.DPoPKeyID on renewal.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -310,9 +434,38 @@ type SignRequestParams struct {
 	// verifier's encryption key (for direct_post.jwt). Empty for other response modes.
 	// The frontend uses this to build the OID4VP 1.0 OpenID4VPHandover session transcript.
 	VerifierJwkThumbprint string `json:"verifier_jwk_thumbprint,omitempty"`
+	// VerifierSessionID is the verifier-assigned session id for this specific
+	// presentation (see AuthorizationRequest.VerifierSessionID) - needed by
+	// a ZK/PPID pseudonym's verifier_context derivation, which binds to the
+	// session rather than the verifier's static identity. Empty for
+	// non-ZK presentations.
+	VerifierSessionID string `json:"verifier_session_id,omitempty"`
 	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
 	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// ReissuanceKid, when set (a renewal request - credential re-issuance/
+	// renewal plan, Phase 1 Slice 2), asks the client to sign this
+	// generate_proof request with the EXISTING keypair identified by this
+	// kid rather than generating a fresh one, so the issuer can match the
+	// proof's public key against the original credential's cnf.jwk as
+	// same-wallet-unit evidence (ARF ISSU_65) - mirrors
+	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
+	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
+	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
+	// DPoP proof over that HTTP method and URL; DPoPNonce is the
+	// server-provided DPoP nonce to include (RFC 9449 §8), ATH the
+	// base64url(SHA-256(access_token)) claim for resource requests (empty
+	// for the token endpoint). KeyID, when set (a renewal), names the key
+	// the client returned as dpop_key_id at the original issuance and must
+	// sign with again. Audience and Issuer double as the attestation PoP
+	// aud/iss when the request also needs client attestation.
+	HTM       string `json:"htm,omitempty"`
+	HTU       string `json:"htu,omitempty"`
+	DPoPNonce string `json:"dpop_nonce,omitempty"`
+	ATH       string `json:"ath,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
 }
 
 // CredentialRef references a credential for signing
@@ -337,6 +490,22 @@ type SignResponseMessage struct {
 	VPToken  string `json:"vp_token,omitempty"`
 	// Proofs contains the OID4VCI proof objects generated by the frontend.
 	Proofs []ProofObject `json:"proofs,omitempty"`
+	// ClientAttestation and ClientAttestationPoP carry the response to a
+	// SignActionRequestAttestation request: the WIA (oauth-client-attestation+jwt)
+	// and the flow-specific PoP (oauth-client-attestation-pop+jwt) the client
+	// signed with its instance key. Both empty means the client declined or
+	// could not attest - the flow proceeds without wallet attestation (Tier 3).
+	ClientAttestation    string `json:"client_attestation,omitempty"`
+	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
+	// DPoPKeyID and DPoPProof answer a SignActionSignClientAuth request.
+	// DPoPKeyID is the client's opaque identifier for the key it uses for
+	// DPoP in this flow and is set whenever the client supports the action,
+	// even when no proof was asked for; empty means unsupported. DPoPProof is
+	// the DPoP proof JWT when htm/htu were given. ClientAttestation and
+	// ClientAttestationPoP carry the WIA and a fresh PoP when audience was
+	// given.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+	DPoPProof string `json:"dpop_proof,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.

@@ -20,8 +20,9 @@ attestation-rooted identity.
 | 3 | Verifier attestation scheme | **Merged** | go-wallet-backend #238 |
 | 3a | SUNET/vc federation entity config | In progress | SUNET/vc (separate session) |
 | 3b | SUNET/vc DID-based identity | In progress | SUNET/vc (separate session) |
-| 3c | SUNET/vc eliminate static client map | In progress | SUNET/vc (separate session) |
+| 3c | SUNET/vc eliminate static client map | **Implemented** (via WIA, see Phase 4a) | SUNET/vc #556 |
 | 4 | Server-side issuer trust evaluation | **Merged** | go-wallet-backend #239 |
+| 4a | WIA + KA issuer auth (no pre-registration) | **Implemented, verified E2E against a live issuer** | go-wallet-backend #259, wallet-frontend #196, SUNET/vc #556 |
 | 5 | Deprecate pre-registration | Operational | go-trust config change only |
 | 6 | Native SDK typed TrustResult | **Merged** | Kotlin #46, Swift #44 |
 | 7 | ClientIdScheme parsing + audience validation | **Merged** | Kotlin #47/#48, Swift #45/#46 |
@@ -87,9 +88,13 @@ wire; OIDF determines how trust in that identity is evaluated.
 DPoP (RFC 9449) is always used. The `attestation` proof type is preferred when
 the issuer supports it (per `openid4vciProofTypePrecedence`).
 
-**In progress**: A PR on go-wallet-backend implements full WIA (Wallet Instance
-Attestation) + KA (Key Attestation) support. Corresponding code paths are being
-added to wallet-frontend (limited support) and the native SDKs.
+**Implemented and verified end-to-end**: go-wallet-backend #259 implements full
+WIA (Wallet Instance Attestation) + KA (Key Attestation) issuance, with a
+matching client-side path in wallet-frontend (#196) and issuer-side
+verification in SUNET/vc (#556). Verified against a live issuer with real
+Playwright browser tests, with no pre-registered `client_id` involved at any
+point. Native SDK support is still outstanding. See
+`docs/wallet-instance-attestation.md` for the implementation reference.
 
 ### SUNET/vc — Issuer and Verifier Service
 
@@ -400,7 +405,18 @@ addition to (or instead of) `x509_san_dns`.
 **Goal**: Replace `apigw.oauth_server.clients` YAML map with attestation-based
 wallet identification.
 
-**Components**:
+> **Update: implemented, differently from the sketch below.** The actual
+> mechanism (SUNET/vc #556, go-wallet-backend #259, wallet-frontend #196) uses
+> HTTP headers (`OAuth-Client-Attestation` / `OAuth-Client-Attestation-PoP`),
+> not a `client_assertion_type: jwt-bearer` body parameter, and config lives
+> under `apigw.trust.wallet_attestation` (delegating the trust *decision* to
+> the existing go-trust PDP whitelist/OIDF registries), not a separate
+> `wallet_provider_trust` map. See go-wallet-backend's
+> `docs/wallet-instance-attestation.md` and SUNET/vc's
+> `docs/TRUST_AND_IDENTITY.md` for what actually shipped; the components below
+> are left as the original planning sketch for context.
+
+**Components** (original plan, superseded — see note above):
 
 1. **Accept wallet attestation in token requests**:
    - Add `client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"`
@@ -460,11 +476,14 @@ trust dynamically.
    - The wallet-provider key attestation (`attestation` proof type) is the primary
      proof of wallet identity — no `client_id` needed beyond the spec-mandated
      parameter
-   - When `client_id` must be sent (spec compliance): use the wallet instance's
-     DID or the redirect_uri as a stable identifier derived from attestation
-   - **Note**: WIA (Wallet Instance Attestation) + KA (Key Attestation) support
-     is currently being implemented — PR in progress on go-wallet-backend with
-     corresponding paths being added to wallet-frontend (limited) and native SDKs
+   - When `client_id` must be sent (spec compliance): the wallet's own
+     `redirect_uri` (OID4VCI §7.1 unregistered-client convention) — this is
+     what actually shipped; see below, DID-based `client_id` for this purpose
+     was not pursued
+   - **Implemented**: WIA (Wallet Instance Attestation) + KA (Key Attestation)
+     support shipped in go-wallet-backend #259, wallet-frontend #196, and
+     SUNET/vc #556, verified end-to-end against a live issuer with no
+     pre-registered `client_id`. See `docs/wallet-instance-attestation.md`.
 
 3. **Issuer-side OpenID Federation**:
    - Wallet resolves `{issuer_url}/.well-known/openid-federation` to discover

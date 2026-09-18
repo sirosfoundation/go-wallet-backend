@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -10,8 +11,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/metadata"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // issuerMetadataCache provides a simple TTL cache for issuer metadata keyed by
@@ -123,7 +126,68 @@ func (h *Handlers) GetIssuerMetadata(c *gin.Context) {
 		return
 	}
 
+	h.embedIssuerMetadataImages(c.Request.Context(), result.Metadata)
+
 	h.metadataCache.put(issuerURL, result.Metadata)
 
 	c.JSON(http.StatusOK, result.Metadata)
+}
+
+// newIssuerMetadataImageEmbedder builds the embedder GetIssuerMetadata uses.
+// Separate from the registry role's own embedder: this one runs against
+// issuer-supplied documents on the request path, so it reuses the shared
+// outbound HTTP client (proxy/TLS settings) rather than a bare default one.
+func newIssuerMetadataImageEmbedder(cfg *config.Config, logger *zap.Logger) *embed.ImageEmbedder {
+	embedCfg := embed.DefaultConfig()
+	return embed.NewImageEmbedder(&embedCfg, logger.Named("issuer-metadata-embed"),
+		embed.WithHTTPClient(cfg.HTTPClient.NewHTTPClient(embedCfg.Timeout)))
+}
+
+// embedIssuerMetadataImages inlines the images an issuer's own metadata
+// points at as data: URIs, leaving every other byte of the issuer's
+// .well-known response untouched.
+//
+// This deliberately does NOT substitute anything from the VCTM registry. An
+// issuer is authoritative for what it says about the credentials it issues,
+// and mixing a registry-published display array into a response otherwise
+// assembled from the issuer's .well-known produces a document that is
+// neither one thing nor the other - the point made in review on
+// sirosfoundation/go-wallet-backend#284. The one benefit that motivated
+// reaching for the registry in the first place is asset delivery, and that
+// is obtainable directly: a logo or SVG template hosted somewhere that sends
+// no Access-Control-Allow-Origin is unusable by a browser wallet, which
+// fetches the SVG to substitute claim values into it, so it renders as a
+// broken image. Embedding removes the cross-origin fetch entirely.
+//
+// Doing it here rather than via the registry also means it applies in every
+// deployment: the registry-backed version could only ever act when the
+// registry role happened to run in the same process (--mode=all).
+//
+// Failure is soft by construction. embed.ImageEmbedder leaves any individual
+// URL alone when it is too large (MaxImageSize), too slow (Timeout), or
+// unreachable, so the worst case is exactly the behaviour before this
+// existed: the client receives the issuer's original URL.
+//
+// One boundary worth knowing: embed.IsImageURL accepts https:// only, so an
+// issuer serving its logos over plain HTTP gets no embedding at all. That is
+// deliberate on the embedder's side and not worked around here - it means the
+// benefit lands in real deployments but not in an all-HTTP local dev stack,
+// where the assets are same-origin and reachable anyway.
+//
+// Only credential_configurations_supported is processed - that is where
+// display/logo/background_image/svg_templates live, and it is already held
+// as a raw JSON message, so nothing else in the document is re-serialized.
+func (h *Handlers) embedIssuerMetadataImages(ctx context.Context, m *metadata.IssuerMetadata) {
+	if h.imageEmbedder == nil || m == nil || len(m.CredentialConfigurationsSupported) == 0 {
+		return
+	}
+
+	embedded, err := h.imageEmbedder.EmbedImages(ctx, m.CredentialConfigurationsSupported)
+	if err != nil {
+		// EmbedImages returns the input unchanged alongside its error, so the
+		// issuer's own metadata still reaches the client.
+		h.logger.Warn("Failed to embed images in issuer credential metadata", zap.Error(err))
+		return
+	}
+	m.CredentialConfigurationsSupported = embedded
 }

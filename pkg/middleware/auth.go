@@ -191,8 +191,16 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			)
 		}
 
-		c.Set("user_id", userID)
-		c.Set("did", did)
+		// user_id/did are only set when non-empty — see the matching comment
+		// in TokenAuthMiddleware for why (an always-true c.Set makes the
+		// common `val, exists := c.Get(...)` idiom unable to tell "no
+		// identity" apart from "identity is the empty string").
+		if userID != "" {
+			c.Set("user_id", userID)
+		}
+		if did != "" {
+			c.Set("did", did)
+		}
 		c.Set("token", tokenString)
 		c.Set("tenant_id", tenantID)   // Set tenant from JWT for security
 		c.Set("tenant", tenant)        // Set full tenant object for handlers

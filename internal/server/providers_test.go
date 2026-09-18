@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -13,14 +14,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	gojose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-tokenauth/claims"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -94,6 +102,9 @@ func (b *memoryBackend) Verifiers() storage.VerifierStore         { return b.sto
 func (b *memoryBackend) Invites() storage.InviteStore             { return b.store.Invites() }
 func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
+}
+func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
+	return b.store.KeyAttestations()
 }
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return b.store.Close() }
@@ -351,6 +362,7 @@ func (m *mockBackend) Issuers() storage.IssuerStore                 { return nil
 func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil }
 func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
 func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
+func (m *mockBackend) KeyAttestations() storage.KeyAttestationStore { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
@@ -429,6 +441,386 @@ func TestBackendProvider_RegisterRoutes_WithoutAuthZENHandler(t *testing.T) {
 	}
 	if hasRoute(routes, http.MethodPost, "/v1/resolve") {
 		t.Error("expected POST /v1/resolve NOT to be registered when authzenHandler is nil")
+	}
+}
+
+// TestBackendProvider_RegisterRoutes_RegistersJWKS is a regression test:
+// co-hosted (BackendProvider) mode must expose /.well-known/jwks.json when a
+// wallet-provider signing key is configured, so relying parties resolving
+// trust via an iss-based WIA (WalletProvider.WIA.Mode == config.WIAModeIETF) can fetch it.
+func TestBackendProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	store := newTestMemoryBackend(t)
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+
+	provider := &BackendProvider{
+		auth:    authProvider,
+		storage: storageProvider,
+		store:   store,
+		cfg:     cfg,
+		logger:  logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if !hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected GET /.well-known/jwks.json to be registered when a wallet-provider signing key is configured")
+	}
+}
+
+// TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey documents the
+// no-op counterpart: without a configured wallet-provider signing key, the
+// route must not be registered at all.
+func TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	store := newTestMemoryBackend(t)
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+
+	provider := &BackendProvider{
+		auth:    authProvider,
+		storage: storageProvider,
+		store:   store,
+		cfg:     cfg,
+		logger:  logger,
+	}
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected /.well-known/jwks.json NOT to be registered without a wallet-provider signing key")
+	}
+}
+
+// =============================================================================
+// RequireAudience wiring tests: confirm the anonymous ("wallet-registry")
+// audience restriction added in providers.go actually takes effect end to
+// end, not just that the middleware function itself works in isolation
+// (that's covered separately in pkg/middleware).
+// =============================================================================
+
+// setupServerTokenValidatorTest starts a local JWKS server and a go-tokenauth
+// validator pointed at it, mirroring pkg/middleware's setupTokenAuthTest.
+func setupServerTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ecdsa.PrivateKey, string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwk := gojose.JSONWebKey{Key: &key.PublicKey, KeyID: "test-key", Algorithm: string(gojose.ES256)}
+	jwks := gojose.JSONWebKeySet{Keys: []gojose.JSONWebKey{jwk}}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(jwks) //nolint:errcheck
+	}))
+	t.Cleanup(srv.Close)
+
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: srv.URL,
+		Issuer:  "test-issuer",
+	})
+	v.Start(context.Background())
+	t.Cleanup(v.Stop)
+
+	// Poll until the validator has actually fetched the JWKS, rather than
+	// sleeping a fixed duration (flaky under slow/contended CI runners).
+	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := v.Validate(context.Background(), probe); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("validator did not fetch JWKS in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return v, key, "test-issuer"
+}
+
+func signServerToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl claims.AccessTokenClaims) string {
+	t.Helper()
+
+	signer, err := gojose.NewSigner(
+		gojose.SigningKey{Algorithm: gojose.ES256, Key: key},
+		(&gojose.SignerOptions{}).WithType("JWT").WithHeader("kid", "test-key"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	cl.Claims = jwt.Claims{
+		Issuer:    issuer,
+		Subject:   cl.Claims.Subject,
+		Audience:  cl.Claims.Audience,
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Second)),
+		Expiry:    jwt.NewNumericDate(now.Add(5 * time.Minute)),
+	}
+
+	raw, err := jwt.Signed(signer).Claims(cl).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// newTestBackendProviderWithValidator builds a BackendProvider with a real
+// go-tokenauth validator and a seeded "default" tenant, wired the same way
+// NewBackendProvider wires it when cfg.AS.Enabled is true - so RequireAudience
+// gets added to the AuthZEN proxy routes exactly like it does in production.
+func newTestBackendProviderWithValidator(t *testing.T, v *tokenvalidator.Validator) *BackendProvider {
+	t.Helper()
+
+	// memory.NewStore() pre-seeds an enabled "default" tenant.
+	store := newTestMemoryBackend(t)
+
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+
+	authProvider := NewAuthProvider(cfg, store, logger, nil)
+	authProvider.tokenValidator = v
+	storageProvider := NewStorageProvider(cfg, store, logger, nil)
+	storageProvider.tokenValidator = v
+
+	return &BackendProvider{
+		auth:           authProvider,
+		storage:        storageProvider,
+		store:          store,
+		cfg:            cfg,
+		authzenHandler: newTestAuthZENHandler(cfg, logger),
+		tokenValidator: v,
+		logger:         logger,
+	}
+}
+
+func TestBackendProvider_RequireAudience_AuthZENProxy_AllowsWalletRegistry(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Audience: jwt.Audience{"wallet-registry"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/evaluate", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
+		t.Fatalf("expected a wallet-registry-audience token to pass RequireAudience, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("route not registered - test would false-pass on a routing regression")
+	}
+}
+
+func TestBackendProvider_RequireAudience_AuthZENProxy_RejectsOtherAudience(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Audience: jwt.Audience{"some-other-audience"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/evaluate", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a token whose audience is neither wallet-registry nor wallet-backend, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthProvider_RequireAudience_RejectsWalletRegistryOnlyToken(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+
+	// A wallet-registry-only (anonymous) token must not be usable on general
+	// user-facing routes such as /issuer/all - only on the narrow-purpose
+	// routes it's actually scoped to (AuthZEN proxy, engine transport).
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Audience: jwt.Audience{"wallet-registry"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/issuer/all", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a wallet-registry-only token on a general route, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthProvider_RequireAudience_AllowsWalletBackendToken(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rwl",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/issuer/all", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
+		t.Fatalf("expected a wallet-backend-audience token to pass RequireAudience, got %d: %s", w.Code, w.Body.String())
+	}
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("route not registered - test would false-pass on a routing regression")
+	}
+}
+
+// =============================================================================
+// requireTACIfEnforced / route-level TAC enforcement tests
+// =============================================================================
+
+func TestRequireTACIfEnforced_NoOpWhenValidatorNil(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	// No tokenauth_result set at all - if this enforced anything, it would
+	// 401, matching the legacy AuthMiddleware path having no TAC concept.
+	r.Use(requireTACIfEnforced(nil, "w"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 200 {
+		t.Fatalf("expected no-op (200) when tokenValidator is nil, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireTACIfEnforced_EnforcesWhenValidatorSet(t *testing.T) {
+	v, _, _ := setupServerTokenValidatorTest(t)
+
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(func(c *gin.Context) {
+		c.Set("tokenauth_result", &claims.Result{TAC: "rl"})
+		c.Next()
+	})
+	r.Use(requireTACIfEnforced(v, "w"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (tac 'rl' lacks 'w') when tokenValidator is set, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestStorageProvider_RequireTAC_RejectsInsufficientPermission is an
+// end-to-end proof that requireTACIfEnforced is actually wired into a real
+// route, not just correct in isolation: a token with tac "rl" (read/list,
+// no delete) must be rejected on DELETE /storage/vc/:id.
+func TestStorageProvider_RequireTAC_RejectsInsufficientPermission(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rl",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/storage/vc/some-id", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a tac=rl token on a delete route, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestStorageProvider_RequireTAC_AllowsSufficientPermission is the
+// counterpart: a token with 'd' must reach the handler (not be blocked by
+// requireTACIfEnforced). It still 404s here - DeleteCredential's own
+// business logic correctly reports "no such credential" for an id that was
+// never stored in this bare test fixture - so this asserts the response
+// body is that handler-level not-found, not gin's router-level "no route
+// matches" (which reuses the same status code but a different body).
+func TestStorageProvider_RequireTAC_AllowsSufficientPermission(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+
+	token := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rwld",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/storage/vc/some-id", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden {
+		t.Fatalf("expected a tac=rwld token to pass the TAC gate on a delete route, got 403: %s", w.Body.String())
+	}
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "Credential not found") {
+		t.Fatalf("expected DeleteCredential's own not-found response for a nonexistent id, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -596,6 +988,48 @@ func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) 
 		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
 	}
 }
+
+// TestWalletProviderProvider_RegisterRoutes_RegistersJWKS is a regression
+// test: standalone wallet-provider mode (RoleWalletProvider without
+// RoleBackend) must expose the same /.well-known/jwks.json as the co-hosted
+// BackendProvider does, or relying parties resolving trust via an iss-based
+// WIA (WalletProvider.WIA.Mode == config.WIAModeIETF) have nowhere to fetch the key when this
+// role runs as its own standalone microservice.
+func TestWalletProviderProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	router := gin.New()
+	p.RegisterRoutes(router)
+
+	if !hasRoute(router.Routes(), http.MethodGet, "/.well-known/jwks.json") {
+		t.Error("expected GET /.well-known/jwks.json to be registered in standalone wallet-provider mode")
+	}
+}
+
+// Unlike BackendProvider (see TestBackendProvider_RegisterRoutes_NoJWKSWithoutSigningKey),
+// there's no "standalone wallet-provider without a signing key" case to test
+// here: NewWalletProviderProvider itself refuses to construct without a
+// supported signing key (see its "wallet-provider signing keys not
+// configured or not supported" error), so the no-op path in
+// RegisterWalletProviderJWKSRoute is unreachable through this provider and
+// is already covered directly at the service level (see
+// TestRegisterWalletProviderJWKSRoute_NoOpWhenNoSigningKey).
 
 // TestAuthProvider_WIARoutes_NotRegisteredWhenServiceNilDespiteEnabled is a
 // regression test for a review finding: in co-hosted (AuthProvider) mode,
