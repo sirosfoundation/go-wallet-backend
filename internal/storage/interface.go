@@ -294,6 +294,12 @@ type WalletInstanceStore interface {
 
 	// UpdateStatus revokes a wallet instance. Revocation is the only status
 	// change there is, and it is terminal (domain.ValidateStatusTransition).
+	//
+	// The id alone identifies the record, with no tenant argument, and that
+	// is safe rather than an oversight: an instance's tenant is fixed when
+	// it is inserted and no write ever moves it, so a caller that read the
+	// record in its own tenant cannot have it turn into another tenant's
+	// before this call. Every caller does read and check first.
 	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
