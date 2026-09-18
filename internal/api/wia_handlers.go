@@ -60,6 +60,10 @@ type WIAGenerateRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID is the base64url WebAuthn credential id of the passkey this
+	// wallet instance logs in with, so that revoking the instance also
+	// refuses login with that passkey (SID-AUTH-06). Optional.
+	CredentialID string `json:"credential_id,omitempty"`
 }
 
 // WIAGenerate handles POST /wallet-provider/wia/generate
@@ -93,6 +97,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		Challenge:         req.Challenge,
 		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
+		CredentialID:      req.CredentialID,
 	})
 	if err != nil {
 		switch {
@@ -101,17 +106,35 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "CHALLENGE_INVALID",
 				"message": "Challenge is invalid",
 			})
+		case errors.Is(err, service.ErrWIACredentialNotOwned):
+			h.logger.Warn("WIA request claimed a passkey the caller does not own", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "CREDENTIAL_NOT_OWNED",
+				"message": "credential_id must be one of your own registered passkeys",
+			})
 		case errors.Is(err, service.ErrWIAPopInvalid):
 			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
 			})
+		case errors.Is(err, service.ErrWIAUnknownUser):
+			h.logger.Warn("WIA generation refused: the token names a user that does not exist", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "UNKNOWN_USER",
+				"message": "This account no longer exists",
+			})
 		case errors.Is(err, service.ErrWIAInstanceDeactivated):
 			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":   "INSTANCE_DEACTIVATED",
-				"message": "This wallet instance has been suspended or revoked",
+				"message": "This wallet instance is not active",
+			})
+		case errors.Is(err, service.ErrWIAInstanceNotOwned):
+			h.logger.Warn("WIA generation refused: instance bound to another tenant or user", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "INSTANCE_NOT_OWNED",
+				"message": "This wallet instance is registered to another tenant or user",
 			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))

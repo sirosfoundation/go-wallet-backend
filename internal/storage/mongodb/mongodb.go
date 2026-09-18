@@ -209,6 +209,12 @@ func (s *Store) createIndexes(ctx context.Context) error {
 	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
+		// user_id alone, for the cross-tenant lookups. The compound index
+		// above cannot serve them: tenant_id leads it, so a query that does
+		// not name a tenant would scan the whole collection. Account
+		// deletion and the erasure decision both ask "every instance of this
+		// user, wherever it is" (WalletInstanceStore.GetAllByUser).
+		{Keys: bson.D{{Key: "user_id", Value: 1}}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
@@ -341,12 +347,27 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
+	// Whole-document replace, guarded so a copy loaded before a lifecycle
+	// write (InvalidateAuthBefore, EraseWalletData) cannot write the old
+	// cut-off - or the erased wallet data - back: the filter only matches
+	// while the stored fence has not advanced past the caller's copy.
+	filter := bson.M{
+		"_id.id":     user.UUID.String(),
+		"auth_fence": bson.M{"$not": bson.M{"$gt": user.AuthFence}},
+	}
+	result, err := s.collection.ReplaceOne(ctx, filter, user)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
+		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": user.UUID.String()})
+		if err != nil {
+			return fmt.Errorf("failed to update user: %w", err)
+		}
+		if n == 0 {
+			return storage.ErrNotFound
+		}
+		return storage.ErrStaleWrite
 	}
 	return nil
 }
@@ -360,6 +381,65 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 		return storage.ErrNotFound
 	}
 	return nil
+}
+
+// cutoffStage is the update-pipeline stage behind both lifecycle writes: it
+// advances auth_invalid_before to t when t is later ($max, so a delayed older
+// event cannot roll a newer cut-off back) and always advances auth_fence, so
+// UserStore.Update refuses any record loaded before this write - including
+// one carrying the same cut-off timestamp.
+func cutoffStage(t time.Time, extra bson.D) bson.D {
+	set := bson.D{
+		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
+		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
+	}
+	set = append(set, extra...)
+	return bson.D{{Key: "$set", Value: set}}
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{cutoffStage(t, nil)})
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
+	// One pipeline update: the erasure and the fence advance land together,
+	// so no record loaded before this write can pass Update's stale check.
+	stage := cutoffStage(fence, bson.D{
+		{Key: "private_data", Value: "$$REMOVE"},
+		{Key: "private_data_etag", Value: "$$REMOVE"},
+		{Key: "keys", Value: "$$REMOVE"},
+		{Key: "updated_at", Value: time.Now()},
+	})
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{stage})
+	if err != nil {
+		return fmt.Errorf("failed to erase wallet data: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	var doc struct {
+		Cutoff time.Time `bson:"auth_invalid_before"`
+	}
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()},
+		options.FindOne().SetProjection(bson.M{"auth_invalid_before": 1})).Decode(&doc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return time.Time{}, storage.ErrNotFound
+		}
+		return time.Time{}, fmt.Errorf("failed to read auth cut-off: %w", err)
+	}
+	return doc.Cutoff, nil
 }
 
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {

@@ -263,7 +263,10 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		ACR:       "urn:siros:acr:oidc",
 		MaxTAC:    maxTAC,
 		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		// The OIDC exchange just completed, so the authentication instant is
+		// now (see Session.AuthenticatedAt).
+		AuthenticatedAt: now,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {

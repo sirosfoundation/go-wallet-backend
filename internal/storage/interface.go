@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -13,6 +14,11 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrStaleWrite is returned by UserStore.Update when the stored record's
+	// lifecycle cut-off (User.AuthInvalidBefore) advanced after the caller
+	// loaded the record: writing the stale copy back would undo a wallet
+	// suspension/revocation. Callers reload and re-check the lifecycle state.
+	ErrStaleWrite = errors.New("stale write: the user's authorization changed since the record was loaded")
 )
 
 // TenantStore defines the interface for tenant storage operations
@@ -71,7 +77,10 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
+	// Update updates a user. It refuses (ErrStaleWrite) a record whose
+	// AuthFence is behind the stored one, so a copy loaded before a
+	// suspension, revocation or erasure cannot roll back the cut-off or
+	// restore erased wallet data.
 	Update(ctx context.Context, user *domain.User) error
 
 	// Delete deletes a user
@@ -79,6 +88,24 @@ type UserStore interface {
 
 	// UpdatePrivateData updates user's private data with optimistic locking
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+
+	// InvalidateAuthBefore records that bearer tokens issued before t are no
+	// longer accepted for the user (see internal/tokengate). The cut-off only
+	// moves forward, so a delayed older event cannot roll it back. Touches no
+	// other field.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+
+	// EraseWalletData erases the user's wallet key material - PrivateData,
+	// PrivateDataETag and Keys - and, in the same write, advances the auth
+	// cut-off to fence (see Update). Field-scoped, so a concurrent change to
+	// other fields (e.g. a passkey registration) is not overwritten, and
+	// atomic, so no record loaded before the erasure can pass the fence
+	// afterwards.
+	EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error
+
+	// GetAuthCutoff returns only the user's token cut-off, for the
+	// per-request gate check (a narrow read, not the whole record).
+	GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error)
 }
 
 // CredentialStore defines the interface for credential storage operations
@@ -240,6 +267,8 @@ type InviteStore interface {
 // WalletInstanceStore defines the interface for wallet instance storage
 type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	// An existing instance keeps its Status (only UpdateStatus changes it) and its first
+	// non-empty CredentialID (the passkey link is client-supplied and must not be moved).
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.
@@ -251,7 +280,26 @@ type WalletInstanceStore interface {
 	// GetByUser retrieves all wallet instances belonging to a specific user.
 	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
 
-	// UpdateStatus updates the status of a wallet instance (activate, suspend, revoke).
+	// GetAllByUser retrieves every wallet instance of a user, in every
+	// tenant, without being told which tenants to look in.
+	//
+	// Account deletion needs this. Deriving the tenants from the user's
+	// memberships misses any tenant whose membership was removed while an
+	// instance of it was left behind - which the admin API does, since
+	// DELETE /admin/tenants/{id}/users/{user_id} removes a membership and
+	// nothing else. A missed instance is permanent: records are keyed by
+	// instance-key thumbprint and the passkey link is write-once, so
+	// re-enrolling that device would be refused for good.
+	GetAllByUser(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, error)
+
+	// UpdateStatus revokes a wallet instance. Revocation is the only status
+	// change there is, and it is terminal (domain.ValidateStatusTransition).
+	//
+	// The id alone identifies the record, with no tenant argument, and that
+	// is safe rather than an oversight: an instance's tenant is fixed when
+	// it is inserted and no write ever moves it, so a caller that read the
+	// record in its own tenant cannot have it turn into another tenant's
+	// before this call. Every caller does read and check first.
 	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
@@ -259,6 +307,19 @@ type WalletInstanceStore interface {
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteIfRemovable hard-deletes a wallet instance only while it is
+	// still removable: live, or bound to no user. It returns
+	// domain.ErrInvalidStatusTransition when the record exists but has
+	// become a lifecycle tombstone, and storage.ErrNotFound when it is gone
+	// or belongs to another tenant.
+	//
+	// The admin delete checks removability and then deletes, and a
+	// revocation landing between the two would otherwise have its fresh
+	// tombstone deleted - which is the record that keeps login and new
+	// attestations refused, so that device would look never-enrolled on its
+	// next attestation. The condition travels with the delete instead.
+	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2

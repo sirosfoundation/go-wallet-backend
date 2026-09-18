@@ -175,6 +175,50 @@ func TestPasskeyLoginFinish_AuthError(t *testing.T) {
 	}
 }
 
+// SID-AUTH-06: a revoked wallet instance is a distinct 403 with a stable
+// code, not the generic 401, so the client can explain instead of retry.
+func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+		// scope distinguishes one revoked instance from a deactivated
+		// wallet, which needs a new enrollment: they share the
+		// WALLET_REVOKED code, and scope is the machine-readable field that
+		// tells them apart.
+		scope string
+		// msg says the same thing for a human, and is display-only.
+		msg string
+	}{
+		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", service.LifecycleScopeInstance, "other devices enrolled to this wallet keep their own status"},
+		{service.ErrWalletDeactivated, "WALLET_REVOKED", service.LifecycleScopeWallet, "a new enrollment is required"},
+	} {
+		router, _ := setupPasskeyHandlers(&mockWebAuthn{finishLoginErr: tc.err})
+		body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s: expected 403, got %d", tc.code, w.Code)
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(tc.code)) {
+			t.Errorf("expected body to carry %s, got %s", tc.code, w.Body.String())
+		}
+		if !bytes.Contains(w.Body.Bytes(), []byte(tc.msg)) {
+			t.Errorf("expected body to carry %q, got %s", tc.msg, w.Body.String())
+		}
+		var got struct {
+			Scope string `json:"scope"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s: body is not JSON: %v", tc.code, err)
+		}
+		if got.Scope != tc.scope {
+			t.Errorf("%s: expected scope %q, got %q", tc.code, tc.scope, got.Scope)
+		}
+	}
+}
+
 func TestPasskeyLoginFinish_BadRequest(t *testing.T) {
 	mock := &mockWebAuthn{}
 	router, _ := setupPasskeyHandlers(mock)

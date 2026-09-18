@@ -849,7 +849,14 @@ paths:
       tags:
         - Wallet Instances
       summary: Delete a wallet instance
-      description: Hard-deletes a wallet instance. Emits an audit event.
+      description: |
+        Hard-deletes a wallet instance and emits an audit event. An instance
+        that belongs to a user and is no longer live is retained as a
+        lifecycle record - it is what keeps the login gate and WIA issuance
+        refusing that device - and cannot be deleted. That covers a revoked
+        instance and a legacy `suspended` one alike. What can be removed is a
+        live instance, or a record with no user behind it (a stray
+        attestation record).
       operationId: deleteWalletInstance
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -859,6 +866,18 @@ paths:
           description: Instance deleted
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            A user's instance that is no longer live is retained as a
+            lifecycle record and cannot be deleted (`error` is
+            `INSTANCE_RETAINED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "INSTANCE_RETAINED"
+                message: "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted"
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -868,10 +887,31 @@ paths:
     put:
       tags:
         - Wallet Instances
-      summary: Update wallet instance status
+      summary: Revoke a wallet instance
       description: |
-        Changes the status of a wallet instance (active, suspended, or revoked).
-        Emits an audit event for the status transition.
+        Revokes a wallet instance. `revoked` is the only status this accepts:
+        a wallet instance is active from the moment it is registered, and
+        revocation cannot be undone, so there is nothing else to set it to.
+        That is the ARF's model - a Wallet Unit can only be revoked, and
+        suspension in the ARF applies to Wallet Solutions and to provider and
+        Relying Party registrations, never to a unit.
+
+        An instance left in the legacy `suspended` state by an earlier release
+        can be revoked here too. That is the only transition it has; it counts
+        as blocked, not live, until then.
+
+        Emits an audit event for the revocation and runs the same lifecycle
+        cascade as self-service (session drop, token cut-off, wallet-data
+        erasure on the last revocation). If the cascade does not complete,
+        the revocation is still recorded and the response is 409
+        `ERASURE_INCOMPLETE`; repeat the request to finish it.
+
+        Two scopes of the cascade are wider than the status change itself and
+        are deliberate SIROS decisions rather than requirements: the token
+        cut-off and session drop apply to the whole user, not just the
+        affected instance, and revoking the last non-revoked instance erases
+        the wallet data. Both are explained in docs/API.md under "Wallet
+        instance lifecycle (SID-AUTH-06)".
       operationId: updateWalletInstanceStatus
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -887,10 +927,10 @@ paths:
               properties:
                 status:
                   type: string
-                  enum: [active, suspended, revoked]
+                  enum: [revoked]
                 reason:
                   type: string
-                  description: Optional reason for the status change
+                  description: Optional reason, recorded on the instance and in the audit event
       responses:
         '200':
           description: Status updated
@@ -904,15 +944,46 @@ paths:
                   status:
                     type: string
         '400':
-          description: Invalid status value
+          description: |
+            The body did not carry `"status": "revoked"`. Anything else,
+            `"active"` included, is refused here rather than as a transition
+            conflict: revocation is the only status change there is.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "invalid request: status must be revoked"
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The revocation was recorded but the lifecycle cascade did not
+            complete (`error` is `ERASURE_INCOMPLETE`; repeat the request to
+            finish it).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                erasureIncomplete:
+                  value:
+                    error: "ERASURE_INCOMPLETE"
+                    id: "instance-jkt"
+                    status: "revoked"
+                    message: "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: |
+            `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
+            revocation did not happen. It is never applied partially: a status
+            written without the token cut-off, the session drop and the
+            erasure would report a device stopped that was still working.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -937,6 +1008,80 @@ paths:
                   $ref: '#/components/schemas/WalletInstance'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tenants/{tenantId}/users/{userId}/instances/revoke-all:
+    post:
+      tags:
+        - Wallet Instances
+      summary: Revoke every wallet instance of a user
+      description: >
+        Revokes all of the user's non-revoked wallet instances in this tenant
+        (SID-AUTH-06). Revoking the last live one deactivates the wallet: its
+        sessions are dropped, the bearer tokens already issued to the user are
+        refused, and the wallet's key material, credentials, presentations and
+        pending challenges are erased. Revocation is terminal, so the user
+        needs a new enrollment afterwards.
+
+
+        This is a provider action. A user cannot revoke their own instances,
+        because only a provider could undo it; what a user can do to their own
+        account is log out everywhere or remove it outright.
+      operationId: revokeAllWalletInstancesForUser
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/userId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Recorded on each instance and in the audit event.
+                  example: "device reported stolen"
+      responses:
+        '200':
+          description: The instances were revoked and the cleanup completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: integer
+                    description: How many instances changed status.
+                    example: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: >
+            The revocations were persisted but part of the cleanup did not
+            complete. Repeat the request to finish it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: ERASURE_INCOMPLETE
+                  revoked:
+                    type: integer
+                    example: 2
+                  message:
+                    type: string
+        '503':
+          description: |
+            `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
+            revocation did not happen. It is never applied partially: a status
+            written without the token cut-off, the session drop and the
+            erasure would report a device stopped that was still working.
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1519,7 +1664,13 @@ components:
           type: string
         status:
           type: string
-          enum: [active, suspended, revoked]
+          # "suspended" is never accepted on a request and never written. It
+          # appears here because a record left in that state by a release
+          # that still had it is returned unchanged by the list and get
+          # paths, and a client validating against this schema must not
+          # reject it. Such a record counts as blocked, not live, and its
+          # only transition is revocation.
+          enum: [active, revoked, suspended]
         wscd_type:
           type: string
           enum: [web_crypto, remote, native_ios, native_android]

@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
@@ -20,7 +21,13 @@ type AdminHandlers struct {
 	store  storage.Store
 	logger *zap.Logger
 	audit  *audit.Emitter
+	// lifecycle, when set, handles wallet instance status changes so the
+	// admin path shares the self-service cascade (SID-AUTH-06).
+	lifecycle *service.WalletLifecycleService
 }
+
+// SetLifecycle wires the shared wallet lifecycle service.
+func (h *AdminHandlers) SetLifecycle(l *service.WalletLifecycleService) { h.lifecycle = l }
 
 // NewAdminHandlers creates a new AdminHandlers instance
 func NewAdminHandlers(store storage.Store, logger *zap.Logger, auditor *audit.Emitter) *AdminHandlers {
@@ -1083,6 +1090,7 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.PUT("/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 		tenants.DELETE("/:id/instances/:instance_id", h.DeleteWalletInstance)
 		tenants.GET("/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
+		tenants.POST("/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
 
 		// User detail
 		tenants.GET("/:id/users/:user_id/detail", h.GetUserDetail)

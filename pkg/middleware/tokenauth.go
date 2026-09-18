@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
@@ -36,7 +37,11 @@ type TenantLookup interface {
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
+//
+// users may be nil; when set, tokens issued before the user's SID-AUTH-06
+// authorization cut-off (User.AuthInvalidBefore) are refused with 401.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
+	gate := tokengate.New(users)
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -55,47 +60,14 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			return
 		}
 
-		// Tenant validation: look up and check enabled
-		tenantID := result.TenantID
-		if tenantID == "" {
-			tenantID = "default"
-		}
-
-		tenant, err := tenants.GetByID(c.Request.Context(), domain.TenantID(tenantID))
-		if err != nil {
-			if err == storage.ErrNotFound {
-				logger.Warn("Token contains invalid tenant_id",
-					zap.String("tenant_id", tenantID),
-					zap.String("mode", string(result.Mode)),
-				)
-				c.JSON(401, gin.H{"error": "Invalid tenant in token"})
-			} else {
-				logger.Error("Failed to lookup tenant from token",
-					zap.String("tenant_id", tenantID),
-					zap.Error(err),
-				)
-				c.JSON(500, gin.H{"error": "Internal server error"})
-			}
-			c.Abort()
+		// SID-AUTH-06 token cut-off (anonymous tokens have no user and pass).
+		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
 
-		if !tenant.Enabled {
-			logger.Warn("Token tenant is disabled",
-				zap.String("tenant_id", tenantID),
-				zap.String("mode", string(result.Mode)),
-			)
-			c.JSON(403, gin.H{"error": "Tenant is disabled"})
-			c.Abort()
+		tenant, tenantID, ok := resolveTokenTenant(c, tenants, result, logger)
+		if !ok {
 			return
-		}
-
-		// Log header mismatch (JWT is authoritative)
-		if h := c.GetHeader("X-Tenant-ID"); h != "" && h != tenantID {
-			logger.Warn("X-Tenant-ID header mismatches token tenant_id — using token (authoritative)",
-				zap.String("header_tenant_id", h),
-				zap.String("token_tenant_id", tenantID),
-			)
 		}
 
 		// Populate context keys for existing handlers.
@@ -123,6 +95,56 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 
 		c.Next()
 	}
+}
+
+// resolveTokenTenant looks up the token's tenant (an empty tenant_id means
+// "default") and refuses the request when the tenant is unknown (401) or
+// disabled (403). On refusal the response has been written and the request
+// aborted, and ok is false. The JWT's tenant_id is authoritative; a
+// mismatching X-Tenant-ID header is only logged.
+func resolveTokenTenant(c *gin.Context, tenants TenantLookup, result *claims.Result, logger *zap.Logger) (tenant *domain.Tenant, tenantID string, ok bool) {
+	tenantID = result.TenantID
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	tenant, err := tenants.GetByID(c.Request.Context(), domain.TenantID(tenantID))
+	if err != nil {
+		if err == storage.ErrNotFound {
+			logger.Warn("Token contains invalid tenant_id",
+				zap.String("tenant_id", tenantID),
+				zap.String("mode", string(result.Mode)),
+			)
+			c.JSON(401, gin.H{"error": "Invalid tenant in token"})
+		} else {
+			logger.Error("Failed to lookup tenant from token",
+				zap.String("tenant_id", tenantID),
+				zap.Error(err),
+			)
+			c.JSON(500, gin.H{"error": "Internal server error"})
+		}
+		c.Abort()
+		return nil, "", false
+	}
+
+	if !tenant.Enabled {
+		logger.Warn("Token tenant is disabled",
+			zap.String("tenant_id", tenantID),
+			zap.String("mode", string(result.Mode)),
+		)
+		c.JSON(403, gin.H{"error": "Tenant is disabled"})
+		c.Abort()
+		return nil, "", false
+	}
+
+	// Log header mismatch (JWT is authoritative)
+	if h := c.GetHeader("X-Tenant-ID"); h != "" && h != tenantID {
+		logger.Warn("X-Tenant-ID header mismatches token tenant_id — using token (authoritative)",
+			zap.String("header_tenant_id", h),
+			zap.String("token_tenant_id", tenantID),
+		)
+	}
+	return tenant, tenantID, true
 }
 
 // MustHaveTAC returns middleware that requires the token to contain all

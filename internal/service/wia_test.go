@@ -60,15 +60,36 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil)
+	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil, nil)
 
 	return svc, privKey
 }
 
 // newTestWIAServiceWithInstances is like newTestWIAService but wires a real
 // (in-memory) wallet instance store, needed for tests that exercise
-// suspend/revoke enforcement.
+// revocation enforcement.
 func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletInstanceStore) {
+	t.Helper()
+	instances := memory.NewStore().WalletInstances()
+	return newTestWIAServiceUsing(t, instances), instances
+}
+
+// newTestWIAServiceWithUsers builds a service over one memory store, so a
+// test can register passkeys for the caller (credential_id ownership).
+func newTestWIAServiceWithUsers(t *testing.T) (*WIAService, storage.Store) {
+	t.Helper()
+	store := memory.NewStore()
+	return newTestWIAServiceUsingStores(t, store.WalletInstances(), store.Users()), store
+}
+
+// newTestWIAServiceUsing builds a WIA service over the given instance store,
+// so tests can inject a failing or racing store.
+func newTestWIAServiceUsing(t *testing.T, instances storage.WalletInstanceStore) *WIAService {
+	t.Helper()
+	return newTestWIAServiceUsingStores(t, instances, nil)
+}
+
+func newTestWIAServiceUsingStores(t *testing.T, instances storage.WalletInstanceStore, users storage.UserStore) *WIAService {
 	t.Helper()
 
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -99,10 +120,7 @@ func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletIn
 	if err != nil {
 		t.Fatal(err)
 	}
-	instances := memory.NewStore().WalletInstances()
-	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, nil, nil)
-
-	return svc, instances
+	return NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, users, nil, nil)
 }
 
 // createTestPop creates a WIA-PoP JWT for testing.
@@ -114,6 +132,13 @@ func createTestPop(t *testing.T, nonce string) (string, *ecdsa.PrivateKey) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return createTestPopWithKey(t, nonce, instanceKey), instanceKey
+}
+
+// createTestPopWithKey creates a WIA-PoP JWT for an existing instance key, so
+// a test can re-attest the same instance.
+func createTestPopWithKey(t *testing.T, nonce string, instanceKey *ecdsa.PrivateKey) string {
+	t.Helper()
 
 	// Build JWK for the public key
 	xBytes := instanceKey.PublicKey.X.Bytes()
@@ -151,7 +176,7 @@ func createTestPop(t *testing.T, nonce string) (string, *ecdsa.PrivateKey) {
 		t.Fatal(err)
 	}
 
-	return popStr, instanceKey
+	return popStr
 }
 
 func TestWIAService_CreateChallenge(t *testing.T) {
@@ -505,7 +530,7 @@ func TestWIAService_GenerateWIA_RecordsUserID(t *testing.T) {
 }
 
 // TestWIAService_GenerateWIA_RefusesRevokedInstance is a regression test for the
-// bug where a revoked/suspended wallet instance could obtain a fresh, fully valid
+// bug where a revoked wallet instance could obtain a fresh, fully valid
 // WIA simply by requesting a new challenge/PoP with the same instance key —
 // silently bypassing admin revocation.
 func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {

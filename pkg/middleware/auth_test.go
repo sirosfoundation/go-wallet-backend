@@ -344,3 +344,44 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 		t.Errorf("Expected status %d with lowercase bearer, got %d", http.StatusOK, w.Code)
 	}
 }
+
+// SID-AUTH-06: a legacy token issued before the user's wallet was
+// or revoked is refused even though it has not expired.
+func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := createTestConfig("test-secret")
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
+	uid := domain.NewUserID()
+	if err := store.Users().Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	mint := func(iat time.Time) string {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": uid.String(), "iat": iat.Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		s, _ := tok.SignedString([]byte("test-secret"))
+		return s
+	}
+	call := func(token string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	old := mint(time.Now().Add(-2 * time.Minute))
+	if got := call(old); got != http.StatusOK {
+		t.Fatalf("before any cut-off the token is fine, got %d", got)
+	}
+	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := call(old); got != http.StatusUnauthorized {
+		t.Fatalf("token issued before the cut-off must be refused, got %d", got)
+	}
+	if got := call(mint(time.Now())); got != http.StatusOK {
+		t.Fatalf("token issued after the cut-off must pass, got %d", got)
+	}
+}
