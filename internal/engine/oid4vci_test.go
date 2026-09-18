@@ -3258,6 +3258,20 @@ func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
 	}
 }
 
+// TestParseOffer_OfferURIWithoutEitherParameter covers the branch's own failure
+// message: an offer URI that carries neither parameter has to say so, rather
+// than fall through and be reported as broken JSON.
+func TestParseOffer_OfferURIWithoutEitherParameter(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	_, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?state=xyz",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither a credential_offer nor a credential_offer_uri")
+}
+
 // TestHasOfferURIScheme pins the scheme match itself: case-insensitive per
 // RFC 3986 section 3.1, authority optional, and nothing else accepted.
 func TestHasOfferURIScheme(t *testing.T) {

@@ -1042,7 +1042,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 			// Extract credential_offer parameter
 			u, err := url.Parse(offerStr)
 			if err != nil {
-				return nil, fmt.Errorf("invalid offer URL: %w", err)
+				return nil, fmt.Errorf("invalid credential offer URI: %w", err)
 			}
 			offerStr = u.Query().Get("credential_offer")
 			if offerStr == "" {
@@ -1051,7 +1051,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 				if offerURI != "" {
 					return h.fetchOfferFromURI(ctx, offerURI)
 				}
-				return nil, errors.New("offer URL missing credential_offer parameter")
+				return nil, errors.New("credential offer URI carries neither a credential_offer nor a credential_offer_uri parameter")
 			}
 		}
 	} else if msg.CredentialOfferURI != "" {
