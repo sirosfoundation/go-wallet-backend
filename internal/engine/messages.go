@@ -113,13 +113,13 @@ const (
 	ErrCodeMatchTimeout      ErrorCode = "MATCH_TIMEOUT"
 	ErrCodeMatchError        ErrorCode = "MATCH_ERROR"
 	ErrCodePresentationError ErrorCode = "PRESENTATION_ERROR"
-	// ErrCodeNoMatchingCredential is returned when the wallet holds nothing
+	// ErrCodeNoMatchingCredentials is returned when the wallet holds nothing
 	// that satisfies the verifier's query. Distinct from a decline: the user
-	// was never asked, so reporting this as "declined" would be wrong both to
-	// the user and to the verifier.
-	ErrCodeNoMatchingCredential ErrorCode = "NO_MATCHING_CREDENTIAL"
-	ErrCodeInternalError        ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests      ErrorCode = "TOO_MANY_REQUESTS"
+	// was never asked, so reporting this to the wallet as "declined" would be
+	// wrong. The verifier is told neither apart - see submitErrorResponse.
+	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
+	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -166,8 +166,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Credential matching failed"
 	case ErrCodePresentationError:
 		return "Presentation failed"
-	case ErrCodeNoMatchingCredential:
-		return "You do not have a credential that matches this request"
+	case ErrCodeNoMatchingCredentials:
+		return "You do not have any credentials that match this request"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:

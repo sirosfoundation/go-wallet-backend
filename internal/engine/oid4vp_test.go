@@ -2407,22 +2407,30 @@ func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
 	assert.Nil(t, selected)
 	assert.Contains(t, err.Error(), "no credential matches")
 
-	// The verifier is told, so its session ends instead of expiring.
+	// The verifier is told, so its session ends instead of expiring - with
+	// access_denied, which OpenID4VP 1.0 defines for "the Wallet did not have
+	// the requested Credentials" and for "the End-User did not give consent"
+	// alike. The description must not name what was missing: that would tell
+	// the verifier which of the two happened, and so whether this holder has
+	// the credential it asked about.
 	select {
 	case form := <-posted:
 		assert.Equal(t, "access_denied", form.Get("error"))
 		assert.Equal(t, "state-123", form.Get("state"))
-		assert.Contains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
+		assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
+		assert.NotContains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
 	case <-time.After(5 * time.Second):
 		t.Fatal("verifier was never notified")
 	}
 
-	// And so is the client, with everything it needs to explain the failure.
+	// The client is told what it needs to explain the failure to its user: a
+	// code it can translate and the requested types as data, not an English
+	// sentence it would have to re-parse.
 	msg := awaitMessage(t, received, string(TypeFlowError))
 	flowErr, ok := msg["error"].(map[string]any)
 	require.True(t, ok, "flow error must carry an error object, got %v", msg["error"])
-	assert.Equal(t, string(ErrCodeNoMatchingCredential), flowErr["code"])
-	assert.Contains(t, flowErr["message"], "urn:eudi:pid:arf-1.8:1")
+	assert.Equal(t, string(ErrCodeNoMatchingCredentials), flowErr["code"])
+	assert.Equal(t, ErrCodeNoMatchingCredentials.UserFacingMessage(), flowErr["message"])
 	details, ok := flowErr["details"].(map[string]any)
 	require.True(t, ok, "flow error must carry details, got %v", flowErr["details"])
 	assert.Equal(t, []any{"urn:eudi:pid:arf-1.8:1"}, details["requested_types"])

@@ -1050,7 +1050,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", "User declined the request")
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 		if redirectURI != "" {
 			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
 				map[string]interface{}{"redirect_uri": redirectURI})
@@ -1120,6 +1120,14 @@ func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq
 	}
 }
 
+// verifierRefusedDescription is the error_description every refusal sends to
+// the verifier, whether the user declined or the wallet held nothing that
+// matched. OpenID4VP answers both with access_denied so a verifier cannot
+// learn which happened - and therefore cannot probe what a holder has by
+// asking and watching the reason. Two different descriptions would hand that
+// distinction straight back.
+const verifierRefusedDescription = "The wallet did not fulfil the request"
+
 // failNoMatchingCredential ends the flow when the wallet holds nothing the
 // verifier asked for. The verifier is told as well, so its session ends now
 // rather than expiring: OpenID4VP has no dedicated code for "holder has no
@@ -1127,11 +1135,6 @@ func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq
 // provides for a request the wallet will not fulfil.
 func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *AuthorizationRequest, reason string) error {
 	requested := requestedCredentialTypes(authReq.DCQLQuery)
-
-	message := "You do not have a credential that matches this request"
-	if len(requested) > 0 {
-		message = "This request needs a credential you do not have: " + strings.Join(requested, ", ")
-	}
 
 	h.Logger.Info("no credential matches the verifier's query",
 		zap.Strings("requested_types", requested), zap.String("client_reason", reason))
@@ -1143,11 +1146,23 @@ func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *A
 	if reason != "" {
 		details["no_match_reason"] = reason
 	}
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", message); redirectURI != "" {
+	// The verifier gets the same description a decline sends, not this
+	// message: naming what the wallet does not hold would tell the verifier
+	// whether the holder has a credential it asked about, which is exactly
+	// what one access_denied for both outcomes is there to prevent. The
+	// detailed text is for the wallet, which is showing it to its own user.
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
 		details["redirect_uri"] = redirectURI
 	}
 
-	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredential, message, details)
+	// The wallet is the one showing this to a person, and it is the only
+	// party that knows their language, so it gets the code and the requested
+	// types and composes its own sentence. The string here is the same
+	// per-code English fallback every other flow error carries; an
+	// interpolated one would be worse than useless, since a client cannot
+	// translate a sentence it did not build.
+	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredentials,
+		ErrCodeNoMatchingCredentials.UserFacingMessage(), details)
 
 	return errors.New("no credential matches the verifier's query")
 }
