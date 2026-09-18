@@ -932,7 +932,7 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("name", req.Name))
-	h.emitAudit(set.EventVerifierCreated, req.Name, map[string]any{"tenant_id": string(tenantID)})
+	h.emitAudit(set.EventVerifierCreated, verifier.URL, map[string]any{"tenant_id": string(tenantID), "verifier_id": verifier.ID, "name": verifier.Name})
 	c.JSON(http.StatusCreated, verifierToResponse(verifier))
 }
 
@@ -1083,6 +1083,12 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.PUT("/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 		tenants.DELETE("/:id/instances/:instance_id", h.DeleteWalletInstance)
 		tenants.GET("/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
+
+		// User detail
+		tenants.GET("/:id/users/:user_id/detail", h.GetUserDetail)
+
+		// Tenant statistics
+		tenants.GET("/:id/stats", h.GetTenantStats)
 	}
 }
 

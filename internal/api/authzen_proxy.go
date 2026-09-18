@@ -180,7 +180,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 	)
 	// Propagate the HTTP client's allow_http setting so that logo and
 	// jwks_uri fetches respect the same policy as metadata resolution.
-	handler.allowHTTP = cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify
+	handler.allowHTTP = cfg.HTTPClient.AllowsPlaintext()
 
 	logger.Info("AuthZEN proxy initialized",
 		zap.String("pdp_url", pdpURL),

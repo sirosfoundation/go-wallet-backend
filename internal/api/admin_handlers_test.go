@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
@@ -42,6 +43,26 @@ func TestNewAdminHandlers(t *testing.T) {
 	if handlers.logger == nil {
 		t.Error("Expected logger to be set")
 	}
+}
+
+func TestEmitAudit_WithAuditorConfigured(t *testing.T) {
+	logger := zap.NewNop()
+	store := memory.NewStore()
+	handlers := NewAdminHandlers(store, logger, testAuditEmitter(t))
+
+	// Should not panic and should reach the emitter (the emitter itself is
+	// tested independently in pkg/audit; here we only need to exercise the
+	// non-nil branch of emitAudit).
+	handlers.emitAudit(set.EventTenantCreated, "tenant-1", map[string]any{"name": "test"})
+}
+
+func TestEmitAudit_NilAuditorIsNoOp(t *testing.T) {
+	logger := zap.NewNop()
+	store := memory.NewStore()
+	handlers := NewAdminHandlers(store, logger, nil)
+
+	// Should not panic when no auditor is configured.
+	handlers.emitAudit(set.EventTenantCreated, "tenant-1", nil)
 }
 
 func TestAdminHandlers_AdminStatus(t *testing.T) {
@@ -1005,4 +1026,30 @@ func TestTenantToResponse(t *testing.T) {
 	_ = handlers // Just to ensure setup works
 
 	// tenantToResponse is tested implicitly through the handlers
+}
+
+func TestAdminHandlers_RegisterRoutes(t *testing.T) {
+	handlers, router := setupAdminTestHandlers(t)
+	adminGroup := router.Group("/admin")
+	handlers.RegisterRoutes(adminGroup)
+
+	wantPaths := map[string]bool{
+		"/admin/tenants":                           false,
+		"/admin/tenants/:id":                       false,
+		"/admin/tenants/:id/users":                 false,
+		"/admin/tenants/:id/users/:user_id":        false,
+		"/admin/tenants/:id/users/:user_id/detail": false,
+		"/admin/tenants/:id/stats":                 false,
+		"/admin/tenants/:id/invites":               false,
+	}
+	for _, ri := range router.Routes() {
+		if _, ok := wantPaths[ri.Path]; ok {
+			wantPaths[ri.Path] = true
+		}
+	}
+	for path, found := range wantPaths {
+		if !found {
+			t.Errorf("expected route %q to be registered", path)
+		}
+	}
 }
