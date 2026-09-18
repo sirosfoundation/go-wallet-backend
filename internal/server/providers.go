@@ -300,9 +300,15 @@ func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 
 // EngineProvider provides WebSocket engine routes
 type EngineProvider struct {
-	cfg     *config.Config
-	logger  *zap.Logger
-	manager *wsengine.Manager
+	cfg    *config.Config
+	logger *zap.Logger
+	// metadataResolver is the resolver the flow handlers were registered with,
+	// kept the way BackendProvider keeps its own: once it is handed to a
+	// handler factory it is otherwise unreachable, and the policy it was built
+	// with - AllowsPlaintext - is then only assertable by rebuilding it, which
+	// is a restatement of the rule rather than a check of it.
+	metadataResolver *issuermetadata.Resolver
+	manager          *wsengine.Manager
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -359,9 +365,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
 	return &EngineProvider{
-		cfg:     cfg,
-		logger:  logger,
-		manager: manager,
+		cfg:              cfg,
+		logger:           logger,
+		metadataResolver: metadataResolver,
+		manager:          manager,
 	}, nil
 }
 

@@ -161,11 +161,16 @@ func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
 }
 
 // TestNewEngineProvider_AllowHTTPWiring verifies that NewEngineProvider wires
-// the plaintext policy to the metadata resolver correctly. The resolver below
-// is built with the same expression the provider uses - config.AllowsPlaintext,
-// which is the point of that helper existing: spelling the rule out a second
-// time here is what let this test keep passing while the provider's own rule
-// changed underneath it.
+// the plaintext policy to the metadata resolver correctly.
+//
+// It resolves through the provider's own resolver, not a copy built here. An
+// earlier version of this test constructed an equivalent resolver and asserted
+// on that, which made it a test of issuermetadata and AllowsPlaintext rather
+// than of the wiring: it passed while the provider's rule changed underneath
+// it, and it would have gone on passing if providers.go regressed to the old
+// AllowHTTP || InsecureSkipVerify expression, because the copy was calling
+// AllowsPlaintext directly. Reproducing the expression under test is not a
+// check of it.
 func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -212,18 +217,11 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}
 
-			// Reproduce the wiring to verify behavior.
-			client := tc.httpCfg.NewHTTPClient(10 * time.Second)
-			resolver, err := issuermetadata.New(issuermetadata.Config{
-				AllowHTTP:  tc.httpCfg.AllowsPlaintext(),
-				HTTPClient: client,
-			})
-			if err != nil {
-				t.Fatalf("failed to create equivalent resolver: %v", err)
+			if provider.metadataResolver == nil {
+				t.Fatal("the provider registered its flow handlers without a metadata resolver")
 			}
-			_ = provider
 
-			_, resolveErr := resolver.Resolve(context.Background(), srv.URL)
+			_, resolveErr := provider.metadataResolver.Resolve(context.Background(), srv.URL)
 			if tc.wantAllow && resolveErr != nil {
 				t.Errorf("expected successful resolution, got: %v", resolveErr)
 			}
