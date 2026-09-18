@@ -378,7 +378,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// the one step of this cleanup whose residue is permanent, and the user
 	// record is not deleted while any of it is outstanding, so the caller
 	// can still authenticate and repeat the request.
-	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
+	instanceErrs = s.deleteWalletInstances(ctx, userID)
 
 	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
@@ -409,7 +409,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// lock - an attestation landing after this check still gets through, and
 	// serializing lifecycle work with attestation is go-wallet-backend#330 -
 	// but it closes the window that a slow sweep leaves wide.
-	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
+	//
+	// The second pass decides, and does not inherit the first. A delete that
+	// failed once and succeeded now leaves nothing behind, so answering
+	// DELETION_INCOMPLETE over a stale error would cost the caller a request
+	// for work that is already done. The first pass's failures are logged
+	// so a transient storage problem is still visible.
+	if len(instanceErrs) > 0 {
+		s.logger.Warn("wallet instance cleanup failed on the first pass, retrying before the user record is removed",
+			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
+	}
+	instanceErrs = s.deleteWalletInstances(ctx, userID)
 
 	if len(instanceErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: wallet instances remain",

@@ -217,7 +217,7 @@ refusal is about:
 
 | `scope` | meaning |
 | --- | --- |
-| `instance` | This device is revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
+| `instance` | This device is revoked. The wallet still exists and the user's other devices answer for themselves at their own login. Server-side data may not be untouched: if this was the last live instance *in this tenant*, that tenant's stored credentials and presentations are already erased, and only the shared user-level data is kept because a live instance remains elsewhere. |
 | `wallet` | The wallet is deactivated: no live instance of it is left, its credentials and presentations here have been erased, and a new enrollment is required. |
 
 `WALLET_REVOKED` means both cases, because it has since the first release, so

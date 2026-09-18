@@ -209,6 +209,12 @@ func (s *Store) createIndexes(ctx context.Context) error {
 	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
+		// user_id alone, for the cross-tenant lookups. The compound index
+		// above cannot serve them: tenant_id leads it, so a query that does
+		// not name a tenant would scan the whole collection. Account
+		// deletion and the erasure decision both ask "every instance of this
+		// user, wherever it is" (WalletInstanceStore.GetAllByUser).
+		{Keys: bson.D{{Key: "user_id", Value: 1}}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)

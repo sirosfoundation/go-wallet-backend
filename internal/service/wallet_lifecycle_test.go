@@ -413,3 +413,79 @@ func TestDeleteUser_KeepsMembershipWhenAnInstanceSurvives(t *testing.T) {
 	assert.Contains(t, tenants, domain.TenantID("acme"),
 		"the membership must survive so the retry can still find this tenant")
 }
+
+// An instance can outlive the membership of its tenant: the admin
+// DELETE /admin/tenants/{id}/users/{user_id} removes a membership and
+// nothing else. The erasure decision must still see it. Missing it would
+// declare the wallet deactivated and erase the user's shared key material
+// while that instance could still log in.
+func TestWalletLifecycle_OrphanedTenantInstanceKeepsSharedDataAlive(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{
+		UUID: userID, DID: "did:example:" + userID.String(),
+		PrivateData: []byte("encrypted-vault"), PrivateDataETag: "e1",
+	}))
+	// The only instance in the default tenant, plus one in a tenant the user
+	// has no membership row for.
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-default", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-orphan", TenantID: "orphaned-tenant", UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-default", domain.InstanceStatusRevoked, "stolen")
+	require.NoError(t, err)
+
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.NotNil(t, user.PrivateData,
+		"a live instance remains in a tenant with no membership, so the shared key material must survive")
+}
+
+// The cut-off is advanced twice: once before the status write and once after
+// it. If the second one failed, the recorded cut-off predates the revocation
+// and every token minted in between stays valid. The idempotent retry has to
+// repair that, not just re-run the cascade, whose ensureCutoff leaves an
+// existing cut-off alone.
+func TestWalletLifecycle_RetryRepairsACutOffOlderThanTheRevocation(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{
+		UUID: userID, DID: "did:example:" + userID.String(), PrivateData: []byte("vault"),
+	}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-a", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-b", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+
+	// The state a half-finished first attempt leaves: a cut-off recorded
+	// before the revocation, and the revocation persisted after it.
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
+	stale, err := store.Users().GetAuthCutoff(ctx, userID)
+	require.NoError(t, err)
+	time.Sleep(1100 * time.Millisecond)
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-a", domain.InstanceStatusRevoked, "stolen"))
+	revoked, err := store.WalletInstances().GetByID(ctx, "inst-a")
+	require.NoError(t, err)
+	require.True(t, stale.Before(*revoked.DeactivatedAt), "fixture must leave the cut-off behind the revocation")
+
+	// Repeating the request must move the cut-off past the revocation.
+	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "stolen")
+	require.NoError(t, err)
+
+	repaired, err := store.Users().GetAuthCutoff(ctx, userID)
+	require.NoError(t, err)
+	assert.False(t, repaired.Before(*revoked.DeactivatedAt),
+		"cut-off %s still predates the revocation at %s, so tokens minted in between stay valid",
+		repaired, revoked.DeactivatedAt)
+}

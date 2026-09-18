@@ -114,8 +114,19 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	if inst.Status == target {
 		if target != domain.InstanceStatusActive {
 			// Idempotent retry: finish a cascade (token cut-off, session
-			// drop, erasure) that did not complete last time - for a
-			// suspension as much as for a revocation.
+			// drop, erasure) that did not complete last time.
+			//
+			// cascade's ensureCutoff only establishes a cut-off that is
+			// missing, which is not enough here. The first attempt may have
+			// recorded its pre-write cut-off, persisted the revocation, and
+			// then failed to advance the cut-off past that write - leaving
+			// one that predates the revocation, and with it any token minted
+			// in between. So a cut-off older than the revocation is advanced
+			// now. A cut-off already after it is left alone, which keeps a
+			// retry after a complete cascade the no-op it should be.
+			if err := s.advanceCutoffIfStale(ctx, inst, actor); err != nil {
+				return inst, errors.Join(err, s.cascade(ctx, tenantID, inst, actor))
+			}
 			return inst, s.cascade(ctx, tenantID, inst, actor)
 		}
 		return inst, nil
@@ -158,6 +169,34 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		return inst, s.cascade(ctx, tenantID, inst, actor)
 	}
 	return inst, nil
+}
+
+// advanceCutoffIfStale re-cuts the user's tokens when the recorded cut-off
+// is older than the revocation it belongs to. That happens when the cut-off
+// after the status write failed on an earlier attempt: tokens minted between
+// the pre-write cut-off and the write itself would otherwise stay valid
+// forever, since nothing later looks at them again.
+//
+// Instances with no user, and revocations with no recorded time, have nothing
+// to compare and are left alone.
+func (s *WalletLifecycleService) advanceCutoffIfStale(ctx context.Context, inst *domain.WalletInstance, actor LifecycleActor) error {
+	if inst.UserID == nil || inst.DeactivatedAt == nil {
+		return nil
+	}
+	cutoff, err := s.store.Users().GetAuthCutoff(ctx, *inst.UserID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("%w: read token cut-off on retry: %w", ErrErasureIncomplete, err)
+	}
+	if !cutoff.Before(*inst.DeactivatedAt) {
+		return nil
+	}
+	if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+		return fmt.Errorf("%w: re-cut stale tokens on retry: %w", ErrErasureIncomplete, err)
+	}
+	return nil
 }
 
 // cutOffTokens records the SID-AUTH-06 token cut-off for the instance's
@@ -458,12 +497,31 @@ func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.
 	if err != nil {
 		return nil, fmt.Errorf("list tenant memberships: %w", err)
 	}
+	// The instances are asked as well, because a membership can be gone
+	// while an instance of that tenant is not: the admin
+	// DELETE /admin/tenants/{id}/users/{user_id} removes a membership and
+	// nothing else. Missing such a tenant here is the worst kind of miss on
+	// this path - liveInstanceIn would not see a live instance there, the
+	// wallet would be declared deactivated, and the user's shared key
+	// material would be erased while that instance could still log in. A
+	// failed lookup is an error for the same reason a failed membership
+	// lookup is: erasing on a guess could destroy a wallet still in use.
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("list wallet instances: %w", err)
+	}
 	seen := map[domain.TenantID]bool{}
 	var out []domain.TenantID
 	for _, tid := range append([]domain.TenantID{include, domain.DefaultTenantID}, memberships...) {
 		if !seen[tid] {
 			seen[tid] = true
 			out = append(out, tid)
+		}
+	}
+	for _, inst := range instances {
+		if !seen[inst.TenantID] {
+			seen[inst.TenantID] = true
+			out = append(out, inst.TenantID)
 		}
 	}
 	return out, nil
