@@ -1746,31 +1746,39 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	// (see FlowStartMessage.AuthorizationDetails); this forwards it. Both may
 	// be present - OID4VCI allows it, and an AS that understands only one
 	// still gets what it needs.
-	if len(h.authorizationDetails) > 0 {
-		if encoded, err := json.Marshal(requestAuthorizationDetails(h.authorizationDetails)); err == nil {
+	if requested := requestAuthorizationDetails(h.authorizationDetails); len(requested) > 0 {
+		if encoded, err := json.Marshal(requested); err == nil {
 			params.Set("authorization_details", string(encoded))
 		} else {
-			h.Logger.Warn("could not encode authorization_details; falling back to scope only",
+			h.Logger.Warn("could not encode authorization_details; continuing without it",
 				zap.Error(err))
 		}
 	}
-	if params.Get("scope") == "" && params.Get("authorization_details") == "" {
-		// Neither way of naming the credential is available, so the AS has
-		// nothing to act on. Failing here names the cause; letting it through
-		// produces an opaque rejection from the AS, or worse, an arbitrary
-		// credential.
-		err := errors.New("credential configuration declares no scope and the wallet sent no authorization_details")
+	// An issuer-initiated offer carries the issuance session in `issuer_state`,
+	// which identifies the credential server-side just as `scope` and
+	// `authorization_details` do. Parsed here rather than below the guard so
+	// the guard can see it: an offer with `issuer_state`, for a configuration
+	// declaring no `scope`, from a client that has not adopted
+	// `authorization_details` yet, is a working flow and must stay one.
+	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
+		if issuerState, ok := grant["issuer_state"].(string); ok && issuerState != "" {
+			params.Set("issuer_state", issuerState)
+		}
+	}
+	if !authorizationRequestNamesACredential(params) {
+		// Nothing names the credential, so the AS has nothing to act on.
+		// Failing here names the cause; letting it through produces an opaque
+		// rejection from the AS, or worse, an arbitrary credential.
+		err := errors.New(
+			"credential configuration declares no scope, the wallet sent no authorization_details " +
+				"naming a configuration, and the offer carries no issuer_state",
+		)
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, err.Error())
 		return nil, err
 	}
 	if pkceEnabled {
 		params.Set("code_challenge", codeChallenge)
 		params.Set("code_challenge_method", "S256")
-	}
-	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
-		if issuerState, ok := grant["issuer_state"].(string); ok {
-			params.Set("issuer_state", issuerState)
-		}
 	}
 
 	var authURL string
@@ -2084,6 +2092,22 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	return resp.Proofs, nil
 }
 
+// authorizationRequestNamesACredential reports whether an Authorization
+// Request says which credential it is for.
+//
+// Three parameters can say it, and any one is enough: `scope` (what a
+// configuration declares), `authorization_details` (what the Wallet asked for,
+// which DIIP requires be possible), and `issuer_state` (an issuer-initiated
+// offer, where the issuance session identifies the credential server-side).
+//
+// Sending none of them asks the AS for nothing, which comes back as an opaque
+// rejection - or, from an AS that picks something, an arbitrary credential.
+func authorizationRequestNamesACredential(params url.Values) bool {
+	return params.Get("scope") != "" ||
+		params.Get("authorization_details") != "" ||
+		params.Get("issuer_state") != ""
+}
+
 // requestAuthorizationDetails projects client-supplied details down to the
 // fields that belong in an Authorization Request.
 //
@@ -2096,8 +2120,20 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 func requestAuthorizationDetails(details []AuthorizationDetail) []AuthorizationDetail {
 	projected := make([]AuthorizationDetail, 0, len(details))
 	for _, detail := range details {
+		// An entry naming no configuration identifies nothing. Forwarding it
+		// would ask the AS for nothing while still satisfying the guard in
+		// startAuthorizationFlow, which only tests that the parameter is set.
+		if detail.CredentialConfigurationID == "" {
+			continue
+		}
+		detailType := detail.Type
+		if detailType == "" {
+			// OID4VCI 1.0 §5.1.1 requires this value; the client not saying so
+			// is not a reason to send the AS something it must reject.
+			detailType = authorizationDetailTypeOpenIDCredential
+		}
 		projected = append(projected, AuthorizationDetail{
-			Type:                      detail.Type,
+			Type:                      detailType,
 			CredentialConfigurationID: detail.CredentialConfigurationID,
 		})
 	}
@@ -2115,14 +2151,35 @@ func grantedCredentialIdentifier(token *TokenResponse, configID string) string {
 	if token == nil || len(token.AuthorizationDetails) == 0 {
 		return ""
 	}
+
+	// With no configuration to match on, only a sole entry is unambiguous.
+	// Matching "" against the entries would pick whichever unlabelled one came
+	// first, which is a guess dressed up as a match - the ambiguity this is
+	// meant to refuse.
+	if configID == "" {
+		only := token.AuthorizationDetails[0]
+		if len(token.AuthorizationDetails) == 1 &&
+			only.CredentialConfigurationID == "" &&
+			len(only.CredentialIdentifiers) > 0 {
+			return only.CredentialIdentifiers[0]
+		}
+		return ""
+	}
+
 	for _, detail := range token.AuthorizationDetails {
 		if len(detail.CredentialIdentifiers) == 0 {
 			continue
 		}
 		if detail.CredentialConfigurationID == configID {
+			// One credential per request: the remaining identifiers name
+			// further credentials the AS granted for this configuration, which
+			// would each need their own Credential Request.
 			return detail.CredentialIdentifiers[0]
 		}
 	}
+
+	// An entry naming no configuration is accepted only when it is the sole
+	// one, since then there is nothing to confuse it with.
 	if len(token.AuthorizationDetails) == 1 &&
 		token.AuthorizationDetails[0].CredentialConfigurationID == "" &&
 		len(token.AuthorizationDetails[0].CredentialIdentifiers) > 0 {

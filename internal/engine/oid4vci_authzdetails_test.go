@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -119,4 +120,74 @@ func TestProjectionPreservesEveryRequestedConfiguration(t *testing.T) {
 	require.Len(t, projected, 2)
 	assert.Equal(t, "pid", projected[0].CredentialConfigurationID)
 	assert.Equal(t, "mdl", projected[1].CredentialConfigurationID)
+}
+
+func TestAnEntryNamingNoConfigurationIsNotForwarded(t *testing.T) {
+	// It identifies nothing, but would still produce a non-empty
+	// authorization_details and so satisfy a guard that only tests presence.
+	projected := requestAuthorizationDetails([]AuthorizationDetail{
+		{Type: "openid_credential"},
+		{Type: "openid_credential", CredentialConfigurationID: "pid"},
+	})
+
+	require.Len(t, projected, 1)
+	assert.Equal(t, "pid", projected[0].CredentialConfigurationID)
+}
+
+func TestAMissingTypeIsFilledInRatherThanSentEmpty(t *testing.T) {
+	// OID4VCI 1.0 §5.1.1 requires this value; the client not saying so is not
+	// a reason to send the AS something it must reject.
+	projected := requestAuthorizationDetails([]AuthorizationDetail{
+		{CredentialConfigurationID: "pid"},
+	})
+
+	require.Len(t, projected, 1)
+	assert.Equal(t, "openid_credential", projected[0].Type)
+}
+
+func TestProjectingNothingUsableYieldsNothing(t *testing.T) {
+	assert.Empty(t, requestAuthorizationDetails(nil))
+	assert.Empty(t, requestAuthorizationDetails([]AuthorizationDetail{}))
+	assert.Empty(t, requestAuthorizationDetails([]AuthorizationDetail{{Type: "openid_credential"}}))
+}
+
+func TestSeveralUnlabelledEntriesAreAmbiguousRatherThanTheFirstOne(t *testing.T) {
+	// Matching "" against the entries would pick whichever unlabelled one came
+	// first - a guess dressed up as a match.
+	token := &TokenResponse{AuthorizationDetails: []AuthorizationDetail{
+		{Type: "openid_credential", CredentialIdentifiers: []string{"cid-1"}},
+		{Type: "openid_credential", CredentialIdentifiers: []string{"cid-2"}},
+	}}
+	assert.Equal(t, "", grantedCredentialIdentifier(token, ""))
+
+	// And one labelled entry is not reachable without naming it either.
+	labelled := &TokenResponse{AuthorizationDetails: []AuthorizationDetail{
+		{Type: "openid_credential", CredentialConfigurationID: "pid", CredentialIdentifiers: []string{"cid-1"}},
+	}}
+	assert.Equal(t, "", grantedCredentialIdentifier(labelled, ""))
+	assert.Equal(t, "cid-1", grantedCredentialIdentifier(labelled, "pid"))
+}
+
+func TestAnAuthorizationRequestMustNameACredential(t *testing.T) {
+	// Any one of the three is enough; none of them asks the AS for nothing.
+	named := func(pairs ...string) url.Values {
+		params := url.Values{}
+		for i := 0; i < len(pairs); i += 2 {
+			params.Set(pairs[i], pairs[i+1])
+		}
+		return params
+	}
+
+	assert.True(t, authorizationRequestNamesACredential(named("scope", "pid")))
+	assert.True(t, authorizationRequestNamesACredential(
+		named("authorization_details", `[{"type":"openid_credential","credential_configuration_id":"pid"}]`)))
+	// An issuer-initiated offer names the credential server-side. A
+	// configuration with no scope, from a client that has not adopted
+	// authorization_details, is a working flow and must stay one.
+	assert.True(t, authorizationRequestNamesACredential(named("issuer_state", "sess-1")))
+
+	assert.False(t, authorizationRequestNamesACredential(named()))
+	assert.False(t, authorizationRequestNamesACredential(
+		named("scope", "", "authorization_details", "", "issuer_state", "")))
+	assert.False(t, authorizationRequestNamesACredential(named("response_type", "code")))
 }
