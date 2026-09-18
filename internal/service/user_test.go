@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -930,4 +932,49 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 			t.Error("Expected error for non-existent user")
 		}
 	})
+}
+
+// DeleteUser must sweep the default tenant even when the user has explicit
+// memberships elsewhere. A wallet instance that outlives the account is
+// permanent: records are keyed by instance-key thumbprint and the passkey
+// link is write-once, so re-enrolling on the same device would be refused
+// for good.
+func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+		UserID: userID, TenantID: "acme", Role: "user",
+	}); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+
+	// One instance in the tenant the user is a member of, one left in the
+	// default tenant from before that membership existed.
+	for id, tenant := range map[string]domain.TenantID{
+		"inst-acme":    "acme",
+		"inst-default": domain.DefaultTenantID,
+	} {
+		if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: id, TenantID: tenant, UserID: &userID, Status: domain.InstanceStatusActive,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	for _, id := range []string{"inst-acme", "inst-default"} {
+		if _, err := store.WalletInstances().GetByID(ctx, id); !errors.Is(err, storage.ErrNotFound) {
+			t.Errorf("%s must not outlive the account, got err=%v", id, err)
+		}
+	}
 }

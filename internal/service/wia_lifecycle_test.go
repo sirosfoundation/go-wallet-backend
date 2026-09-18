@@ -699,3 +699,42 @@ func TestWIAService_GenerateWIA_RefusesADifferentPasskeyThanRecorded(t *testing.
 		t.Fatalf("claiming no passkey stays fine: %v", err)
 	}
 }
+
+// A caller who is not the owner must not learn the lifecycle state of an
+// instance. Instance records are keyed by the instance-key thumbprint alone,
+// so anyone holding that key reaches the record; ownership is therefore
+// checked before status, and the answer is INSTANCE_NOT_OWNED either way.
+func TestWIAService_GenerateWIA_OwnershipCheckedBeforeLifecycle(t *testing.T) {
+	ctx := context.Background()
+	owner := domain.UserIDFromString("owner")
+	intruder := domain.UserIDFromString("intruder")
+
+	for _, tc := range []struct {
+		name   string
+		status domain.InstanceStatus
+	}{
+		{"revoked instance", domain.InstanceStatusRevoked},
+		{"live instance", domain.InstanceStatusActive},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, instances := newTestWIAServiceWithInstances(t)
+
+			challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+			if err != nil {
+				t.Fatalf("CreateChallenge: %v", err)
+			}
+			pop, instanceKey := createTestPop(t, challenge)
+			// The record the attestation will land on is keyed by this key's
+			// thumbprint, and it already belongs to someone else.
+			seedWIAInstance(t, instances, expectedThumbprint(t, &instanceKey.PublicKey), owner, tc.status)
+
+			_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &intruder, &WIARequest{Pop: pop, Challenge: challenge})
+			if !errors.Is(err, ErrWIAInstanceNotOwned) {
+				t.Fatalf("got %v, want ErrWIAInstanceNotOwned - another user's instance status must not leak", err)
+			}
+			if errors.Is(err, ErrWIAInstanceDeactivated) {
+				t.Error("the refusal must not reveal the instance's lifecycle state")
+			}
+		})
+	}
+}

@@ -289,16 +289,26 @@ func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID
 
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
 	// Get all tenants the user belongs to
-	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
 		s.logger.Warn("Failed to get user tenants for cleanup", zap.Error(err))
-		// Continue with user deletion even if we can't get tenants
-		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+		// Continue with user deletion even if we can't get tenants.
+		memberships = nil
 	}
-	if len(tenantIDs) == 0 {
-		// User may have been registered without an explicit tenant membership;
-		// always clean up the default tenant as a fallback.
-		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+	// The default tenant is always swept, not only when the membership list
+	// is empty. A user registered there before any explicit membership
+	// existed keeps data and wallet instances in it, and an instance that
+	// outlives the account is permanent: records are keyed by instance-key
+	// thumbprint and the passkey link is write-once, so re-enrolling on the
+	// same device would be refused for good. WalletLifecycleService.userTenants
+	// sweeps the same set for the same reason.
+	seen := map[domain.TenantID]bool{}
+	tenantIDs := make([]domain.TenantID, 0, len(memberships)+1)
+	for _, tid := range append([]domain.TenantID{domain.DefaultTenantID}, memberships...) {
+		if !seen[tid] {
+			seen[tid] = true
+			tenantIDs = append(tenantIDs, tid)
+		}
 	}
 
 	// Delete any legacy server-side stored credentials and presentations from

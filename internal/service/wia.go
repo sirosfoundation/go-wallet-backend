@@ -348,7 +348,19 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
 		case err == nil:
-			if existing.Status != domain.InstanceStatusActive {
+			// Ownership first, then lifecycle. Instance records are keyed by
+			// the instance-key thumbprint alone, so a caller from another
+			// tenant or another user can name any instance that exists.
+			// Answering such a caller with INSTANCE_DEACTIVATED would tell
+			// them the lifecycle state of a wallet that is not theirs; they
+			// get INSTANCE_NOT_OWNED and learn nothing beyond the fact that
+			// the key is not theirs to use. recheckLifecycleAfterWrite reads
+			// the record back in the same order.
+			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
+				s.emitAuditFailure("instance_binding_mismatch", err)
+				return "", err
+			}
+			if !existing.Status.IsLive() {
 				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
@@ -365,10 +377,6 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
 					return "", err
 				}
-			}
-			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
-				s.emitAuditFailure("instance_binding_mismatch", err)
-				return "", err
 			}
 		case errors.Is(err, storage.ErrNotFound):
 			firstAttestation = true
@@ -747,10 +755,10 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	if err != nil {
 		return fmt.Errorf("re-check wallet instance status: %w", err)
 	}
-	if inst.Status != domain.InstanceStatusActive {
-		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
-		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
-	}
+	// Ownership before lifecycle, the same order GenerateWIA uses, so a
+	// caller who lost a race for this instance key is told the key is not
+	// theirs rather than the lifecycle state of someone else's wallet.
+	//
 	// Upsert fixes tenant_id at insert and binds user_id only while the
 	// record has none, so if two first attestations of the same key raced
 	// (two tenants, or two users for an anonymous instance) the loser finds
@@ -762,6 +770,10 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
 		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
 		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
+	if !inst.Status.IsLive() {
+		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
+		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
 	}
 	// The link is permanent (first link wins), so a request asking for a
 	// different passkey than the one recorded must not walk away with a WIA:

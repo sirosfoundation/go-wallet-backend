@@ -941,29 +941,28 @@ paths:
                   status:
                     type: string
         '400':
-          description: Invalid status value
+          description: |
+            The body did not carry `"status": "revoked"`. Anything else,
+            `"active"` included, is refused here rather than as a transition
+            conflict: revocation is the only status change there is.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "invalid request: status must be revoked"
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           description: |
-            Either the transition is not allowed from the current status
-            (`error` is `invalid status transition`; revoked is terminal), or
-            the status change was recorded but the lifecycle cascade did not
-            complete (`error` is `ERASURE_INCOMPLETE`; repeat the request).
+            The revocation was recorded but the lifecycle cascade did not
+            complete (`error` is `ERASURE_INCOMPLETE`; repeat the request to
+            finish it).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               examples:
-                invalidTransition:
-                  value:
-                    error: "invalid status transition"
-                    current: "revoked"
-                    target: "active"
                 erasureIncomplete:
                   value:
                     error: "ERASURE_INCOMPLETE"
