@@ -255,10 +255,6 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	return user.PrivateDataETag, nil
 }
 
-// DeleteUser deletes a user and all associated data across ALL tenants.
-// Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
-// which may leave orphaned data in other tenants. This is a best-effort cleanup
-// that prioritizes completing the user deletion over strict data consistency.
 // LogoutEverywhere ends every session the user has, on the device that asked
 // and on any other, and refuses the bearer tokens already issued to them
 // (SID-AUTH-06). The caller's own token is refused too, which is what "log
@@ -297,8 +293,40 @@ func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID
 // WalletLifecycleService's ErrErasureIncomplete.
 var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 
+// DeleteUser removes a user and everything of theirs, in every tenant: stored
+// credentials and presentations, wallet instances, pending challenges, live
+// sessions, tenant memberships, and finally the user record with its
+// passkeys.
+//
+// It is not best-effort about the wallet instances. An instance that outlives
+// its account is permanent damage rather than residue, so a failure to remove
+// one answers ErrDeletionIncomplete and leaves the account in place, which is
+// what lets the caller authenticate and repeat the request. A failure to read
+// the user's tenant memberships is fatal for the same reason: sweeping on a
+// guess could leave an instance in a tenant this never looked at.
+//
+// The instances themselves say which tenants to sweep, rather than the
+// memberships, because a membership can be gone while an instance of that
+// tenant is not.
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
 	var instanceErrs []error
+
+	// Resolve the holder key from the user record rather than trusting the
+	// argument. Credentials and presentations are stored under User.DID,
+	// which registration sets to "did:key:<uuid>", while the wallet API's
+	// handler passes the bare uuid. Deleting under the uuid matches nothing,
+	// so the account went and the user's credentials stayed - reported as a
+	// success. WalletLifecycleService.eraseWalletData resolves it the same
+	// way, including the fallback for users that have no DID.
+	if user, err := s.store.Users().GetByID(ctx, userID); err == nil {
+		if user.DID != "" {
+			holderDID = user.DID
+		} else {
+			holderDID = userID.String()
+		}
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("%w: load user: %w", ErrDeletionIncomplete, err)
+	}
 	// Get all tenants the user belongs to
 	// A failed membership lookup is fatal to the request rather than a
 	// warning to sweep past. Deleting the user record while instances in an
@@ -345,27 +373,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Delete any legacy server-side stored credentials and presentations from
 	// each tenant, regardless of whether credential/VC endpoints are currently enabled.
 	for _, tenantID := range tenantIDs {
-		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, cred := range credentials {
-			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
-				s.logger.Warn("Failed to delete credential", zap.Error(err))
-			}
-		}
-
-		// Delete any server-side stored presentations (VPs) for GDPR compliance
-		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, pres := range presentations {
-			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
-				s.logger.Warn("Failed to delete presentation", zap.Error(err))
-			}
-		}
-
+		s.eraseHolderData(ctx, tenantID, holderDID)
 	}
 
 	// Remove the user's wallet instances, in every tenant at once. Without
@@ -419,7 +427,19 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Warn("wallet instance cleanup failed on the first pass, retrying before the user record is removed",
 			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
 	}
-	instanceErrs = s.deleteWalletInstances(ctx, userID)
+	late, lateErrs := s.listWalletInstances(ctx, userID)
+	instanceErrs = lateErrs
+	// An instance discovered only now can be in a tenant the holder-data
+	// loop never visited, so that tenant's credentials and presentations
+	// would survive the account. Sweep those tenants before committing.
+	for _, inst := range late {
+		if seen[inst.TenantID] {
+			continue
+		}
+		seen[inst.TenantID] = true
+		s.eraseHolderData(ctx, inst.TenantID, holderDID)
+	}
+	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
 
 	if len(instanceErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: wallet instances remain",
@@ -450,16 +470,51 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	return nil
 }
 
+// listWalletInstances lists every wallet instance of the user across all
+// tenants. Split out so account deletion can look at what it found - a late
+// instance may be in a tenant whose holder data was never swept - rather than
+// only at what it failed to delete.
+func (s *UserService) listWalletInstances(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, []error) {
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, []error{fmt.Errorf("list wallet instances: %w", err)}
+	}
+	return instances, nil
+}
+
+// eraseHolderData removes the holder's credentials and presentations in one
+// tenant, logging what it could not remove. Used by the account-deletion
+// sweep, including for a tenant discovered late.
+func (s *UserService) eraseHolderData(ctx context.Context, tenantID domain.TenantID, holderDID string) {
+	credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+	}
+	for _, cred := range credentials {
+		if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
+			s.logger.Warn("Failed to delete credential", zap.Error(err))
+		}
+	}
+	presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+	}
+	for _, pres := range presentations {
+		if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
+			s.logger.Warn("Failed to delete presentation", zap.Error(err))
+		}
+	}
+}
+
 // deleteWalletInstances removes every wallet instance of the user, in every
 // tenant, and returns what it could not do. Used twice by DeleteUser: once
 // with the rest of the cleanup, and once more just before the user record is
 // removed, to catch an attestation that bound an instance meanwhile.
 func (s *UserService) deleteWalletInstances(ctx context.Context, userID domain.UserID) []error {
-	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return []error{fmt.Errorf("list wallet instances: %w", err)}
+	instances, errs := s.listWalletInstances(ctx, userID)
+	if len(errs) > 0 {
+		return errs
 	}
-	var errs []error
 	for _, inst := range instances {
 		if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
 			errs = append(errs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))

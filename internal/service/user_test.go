@@ -1175,3 +1175,51 @@ func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
 		t.Errorf("an instance in a tenant with no membership must not outlive the account, got %v", err)
 	}
 }
+
+// Credentials and presentations are stored under User.DID, which registration
+// sets to "did:key:<uuid>", while the wallet API's handler passes the bare
+// uuid as the holder. Deleting under the uuid matched nothing, so the account
+// went and the user's credentials stayed, reported as a success.
+func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:key:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: domain.DefaultTenantID, HolderDID: did,
+		CredentialIdentifier: "cred-1", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+	if err := store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+		TenantID: domain.DefaultTenantID, HolderDID: did,
+		PresentationIdentifier: "pres-1", Presentation: "jwt",
+	}); err != nil {
+		t.Fatalf("seed presentation: %v", err)
+	}
+
+	// The handler passes the bare user id, as it does in production.
+	if err := svc.DeleteUser(ctx, userID, userID.String()); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	creds, err := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetAllByHolder: %v", err)
+	}
+	if len(creds) != 0 {
+		t.Errorf("the user's credentials must not outlive the account, %d remain", len(creds))
+	}
+	pres, err := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetAllByHolder: %v", err)
+	}
+	if len(pres) != 0 {
+		t.Errorf("the user's presentations must not outlive the account, %d remain", len(pres))
+	}
+}
