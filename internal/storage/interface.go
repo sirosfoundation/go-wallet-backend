@@ -280,6 +280,18 @@ type WalletInstanceStore interface {
 	// GetByUser retrieves all wallet instances belonging to a specific user.
 	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
 
+	// GetAllByUser retrieves every wallet instance of a user, in every
+	// tenant, without being told which tenants to look in.
+	//
+	// Account deletion needs this. Deriving the tenants from the user's
+	// memberships misses any tenant whose membership was removed while an
+	// instance of it was left behind - which the admin API does, since
+	// DELETE /admin/tenants/{id}/users/{user_id} removes a membership and
+	// nothing else. A missed instance is permanent: records are keyed by
+	// instance-key thumbprint and the passkey link is write-once, so
+	// re-enrolling that device would be refused for good.
+	GetAllByUser(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, error)
+
 	// UpdateStatus revokes a wallet instance. Revocation is the only status
 	// change there is, and it is terminal (domain.ValidateStatusTransition).
 	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error

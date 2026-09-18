@@ -1065,9 +1065,9 @@ func (f failTenantLookups) GetUserTenants(context.Context, domain.UserID) ([]dom
 	return nil, errors.New("storage is down")
 }
 
-// lateInstanceStore is empty on the first listing of a tenant and produces an
-// undeletable instance on every listing after it, standing in for an
-// attestation that binds an instance while the sweep is already running.
+// lateInstanceStore is empty on the first listing and produces an undeletable
+// instance on every listing after it, standing in for an attestation that
+// binds an instance while the sweep is already running.
 type lateInstanceStore struct {
 	storage.Store
 	userID domain.UserID
@@ -1083,13 +1083,16 @@ type lateInstances struct {
 	parent *lateInstanceStore
 }
 
-func (l *lateInstances) GetByUser(_ context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error) {
-	l.parent.seen[tenantID]++
-	if l.parent.seen[tenantID] == 1 {
+func (l *lateInstances) GetAllByUser(_ context.Context, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	l.parent.seen["all"]++
+	// Nothing on the first look, so the account-deletion sweep believes it
+	// is finished; then an instance appears, as an attestation binding one
+	// mid-sweep would make it.
+	if l.parent.seen["all"] == 1 {
 		return nil, nil
 	}
 	return []*domain.WalletInstance{{
-		ID: "inst-late-" + string(tenantID), TenantID: tenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+		ID: "inst-late", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
 	}}, nil
 }
 
@@ -1097,11 +1100,11 @@ func (l *lateInstances) Delete(context.Context, string) error {
 	return errors.New("storage is down")
 }
 
-// The first pass can find a tenant empty and the final re-list can then
-// discover an instance bound to it after the fact. If removing that instance
-// fails, the membership must still be there: the retry rebuilds its tenant
-// list from the memberships, and without this one it would never look at that
-// tenant again and would delete the account over the top of the orphan.
+// The first pass can come back empty and the final re-list can then discover
+// an instance bound to the user after the fact. If removing that instance
+// fails, the membership must still be there: it is what tells a later sweep
+// which tenants hold this user's holder data, and the account must not be
+// deleted over the top of the orphan.
 func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -1139,5 +1142,36 @@ func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testin
 	}
 	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
 		t.Errorf("the user record must survive, got %v", err)
+	}
+}
+
+// An admin can remove a tenant membership without removing that tenant's
+// wallet instances (DELETE /admin/tenants/{id}/users/{user_id} does exactly
+// that). Account deletion must still find the instance: it asks the instances
+// which tenant they are in rather than deriving the tenants from memberships.
+func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// No membership for "orphaned-tenant": an admin removed it and left the
+	// instance behind.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-orphan", TenantID: "orphaned-tenant", UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	if _, err := store.WalletInstances().GetByID(ctx, "inst-orphan"); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("an instance in a tenant with no membership must not outlive the account, got %v", err)
 	}
 }

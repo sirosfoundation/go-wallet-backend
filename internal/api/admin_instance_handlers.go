@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -263,12 +264,15 @@ func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	userID := domain.UserIDFromString(c.Param("user_id"))
 
+	// The body is optional, so an absent one is fine and a malformed one is
+	// not. Content-Length cannot make that distinction: a chunked request
+	// reports -1 however much it carries, so keying on it silently dropped
+	// the reason from any client that streams its body. Bind unconditionally
+	// and treat only "there was nothing to read" as absent.
 	var req revokeAllInstancesRequest
-	if c.Request.ContentLength > 0 {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-			return
-		}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
 	}
 
 	n, err := h.lifecycle.RevokeAllForUser(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, userID, req.Reason)

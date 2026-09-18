@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -482,5 +483,68 @@ func TestUpdateWalletInstanceStatus_FailsClosedWithoutLifecycle(t *testing.T) {
 	}
 	if got.Status != domain.InstanceStatusActive {
 		t.Errorf("status = %s, want it untouched - a refused revocation must change nothing", got.Status)
+	}
+}
+
+// The revoke-all body is optional, but a client that streams it sends no
+// Content-Length. Keying the parse on that header silently dropped the reason
+// for such a client, so the reason never reached the audit trail.
+func TestRevokeAllWalletInstancesForUser_ReadsAChunkedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:example:chunked"}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-chunked", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	// An io.Reader with no known length is what makes net/http choose
+	// chunked encoding and leaves ContentLength at -1.
+	body := io.NopCloser(strings.NewReader(`{"reason":"device reported stolen"}`))
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", body)
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(ctx, "inst-chunked")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.DeactivationReason != "device reported stolen" {
+		t.Errorf("reason = %q, want it read from the chunked body", got.DeactivationReason)
+	}
+}
+
+// And an entirely absent body is still accepted.
+func TestRevokeAllWalletInstancesForUser_AcceptsNoBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an absent body, got %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -103,6 +103,21 @@ func (s *WalletInstanceStore) GetByUser(_ context.Context, tenantID domain.Tenan
 	return result, nil
 }
 
+// GetAllByUser lists every instance of the user across all tenants. See the
+// interface for why account deletion cannot use the per-tenant listing.
+func (s *WalletInstanceStore) GetAllByUser(_ context.Context, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*domain.WalletInstance
+	for _, instance := range s.data {
+		if instance.UserID != nil && *instance.UserID == userID {
+			result = append(result, instance)
+		}
+	}
+	return result, nil
+}
+
 func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

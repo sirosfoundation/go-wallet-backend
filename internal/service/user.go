@@ -317,12 +317,28 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// thumbprint and the passkey link is write-once, so re-enrolling on the
 	// same device would be refused for good. WalletLifecycleService.userTenants
 	// sweeps the same set for the same reason.
+	//
+	// The instances themselves are asked too, and their tenants added. A
+	// membership can be gone while an instance of that tenant is not - the
+	// admin DELETE /admin/tenants/{id}/users/{user_id} removes a membership
+	// and nothing else - and the holder data in such a tenant would
+	// otherwise be missed along with the instance.
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("%w: list wallet instances: %w", ErrDeletionIncomplete, err)
+	}
 	seen := map[domain.TenantID]bool{}
-	tenantIDs := make([]domain.TenantID, 0, len(memberships)+1)
+	tenantIDs := make([]domain.TenantID, 0, len(memberships)+len(instances)+1)
 	for _, tid := range append([]domain.TenantID{domain.DefaultTenantID}, memberships...) {
 		if !seen[tid] {
 			seen[tid] = true
 			tenantIDs = append(tenantIDs, tid)
+		}
+	}
+	for _, inst := range instances {
+		if !seen[inst.TenantID] {
+			seen[inst.TenantID] = true
+			tenantIDs = append(tenantIDs, inst.TenantID)
 		}
 	}
 
@@ -350,26 +366,19 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 			}
 		}
 
-		// Remove the user's wallet instances. Without this they outlive the
-		// account: the records are keyed by instance-key thumbprint and keep
-		// pointing at a user that no longer exists, so re-enrolling on the
-		// same device finds an instance bound to someone else and is refused
-		// for good (WIAService.checkInstanceBinding).
-		//
-		// A failure here is collected rather than logged and forgotten. It is
-		// the one step of this cleanup whose residue is permanent, and the
-		// user record is not deleted while any of it is outstanding, so the
-		// caller can still authenticate and repeat the request.
-		instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			instanceErrs = append(instanceErrs, fmt.Errorf("list wallet instances in tenant %s: %w", tenantID, err))
-		}
-		for _, inst := range instances {
-			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
-				instanceErrs = append(instanceErrs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
-			}
-		}
 	}
+
+	// Remove the user's wallet instances, in every tenant at once. Without
+	// this they outlive the account: the records are keyed by instance-key
+	// thumbprint and keep pointing at a user that no longer exists, so
+	// re-enrolling on the same device finds an instance bound to someone
+	// else and is refused for good (WIAService.checkInstanceBinding).
+	//
+	// A failure here is collected rather than logged and forgotten. It is
+	// the one step of this cleanup whose residue is permanent, and the user
+	// record is not deleted while any of it is outstanding, so the caller
+	// can still authenticate and repeat the request.
+	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
 
 	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
@@ -399,19 +408,8 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// new record exactly as a failed delete would. One more pass is not a
 	// lock - an attestation landing after this check still gets through, and
 	// serializing lifecycle work with attestation is go-wallet-backend#330 -
-	// but it closes the window that a slow multi-tenant sweep leaves wide.
-	for _, tenantID := range tenantIDs {
-		remaining, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			instanceErrs = append(instanceErrs, fmt.Errorf("re-list wallet instances in tenant %s: %w", tenantID, err))
-			continue
-		}
-		for _, inst := range remaining {
-			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
-				instanceErrs = append(instanceErrs, fmt.Errorf("delete wallet instance %s on the second pass: %w", inst.ID, err))
-			}
-		}
-	}
+	// but it closes the window that a slow sweep leaves wide.
+	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
 
 	if len(instanceErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: wallet instances remain",
@@ -440,6 +438,24 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 	s.logger.Info("User deleted")
 	return nil
+}
+
+// deleteWalletInstances removes every wallet instance of the user, in every
+// tenant, and returns what it could not do. Used twice by DeleteUser: once
+// with the rest of the cleanup, and once more just before the user record is
+// removed, to catch an attestation that bound an instance meanwhile.
+func (s *UserService) deleteWalletInstances(ctx context.Context, userID domain.UserID) []error {
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return []error{fmt.Errorf("list wallet instances: %w", err)}
+	}
+	var errs []error
+	for _, inst := range instances {
+		if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
+		}
+	}
+	return errs
 }
 
 // DeleteWebAuthnCredential deletes a WebAuthn credential
