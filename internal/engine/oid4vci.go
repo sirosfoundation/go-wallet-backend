@@ -1008,10 +1008,10 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 // and the bare form are accepted; see parseOffer.
 const offerURIScheme = "openid-credential-offer"
 
-// hasOfferURIScheme reports whether s is a credential-offer URI, i.e. whether
-// it starts with the offer scheme followed by ":". Scheme names are
-// case-insensitive (RFC 3986 section 3.1), so the comparison is too - an
-// issuer emitting OPENID-CREDENTIAL-OFFER:?... names the same scheme.
+// hasOfferURIScheme reports whether s is a credential-offer URI: whether it
+// starts with the offer scheme, followed by ":". Scheme names are
+// case-insensitive (RFC 3986 section 3.1), so this comparison is too. An
+// issuer that emits OPENID-CREDENTIAL-OFFER:?... names the same scheme.
 func hasOfferURIScheme(s string) bool {
 	return len(s) > len(offerURIScheme) &&
 		s[len(offerURIScheme)] == ':' &&
