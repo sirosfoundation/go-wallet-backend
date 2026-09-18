@@ -52,12 +52,17 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 
 // ClientIDScheme constants for OID4VP client identification
 const (
-	ClientIDSchemeRedirectURI         = "redirect_uri"
-	ClientIDSchemeDID                 = "did"
-	ClientIDSchemeX509SANDNS          = "x509_san_dns"
-	ClientIDSchemeX509SANURI          = "x509_san_uri"
-	ClientIDSchemeX509Hash            = "x509_hash"
-	ClientIDSchemeVerifierAttestation = "verifier_attestation"
+	ClientIDSchemeRedirectURI = "redirect_uri"
+	ClientIDSchemeDID         = "did"
+	// ClientIDSchemeDecentralizedIdentifier is OpenID4VP 1.0's name for the
+	// scheme the drafts called "did". Verifiers built against the final
+	// specification send this one, and it means exactly the same thing, so
+	// everything below treats the two as one scheme.
+	ClientIDSchemeDecentralizedIdentifier = "decentralized_identifier"
+	ClientIDSchemeX509SANDNS              = "x509_san_dns"
+	ClientIDSchemeX509SANURI              = "x509_san_uri"
+	ClientIDSchemeX509Hash                = "x509_hash"
+	ClientIDSchemeVerifierAttestation     = "verifier_attestation"
 )
 
 // Response mode constants
@@ -555,14 +560,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	var attestationContext map[string]interface{}
 
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeDID:
+	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
 		// DID scheme: request MUST be JWT-secured
-		// Resolve DID document server-side via go-trust, then verify JWT
-		if !strings.HasPrefix(authReq.ClientID, "did:") {
-			return nil, errors.New("client_id_scheme=did but client_id is not a DID")
+		// Resolve DID document server-side via go-trust, then verify JWT.
+		// Under OpenID4VP 1.0 the client_id carries its scheme as a prefix,
+		// so resolution uses the DID itself while trust evaluation keeps the
+		// client_id exactly as the verifier sent it.
+		did := didFromClientID(authReq.ClientID)
+		if !strings.HasPrefix(did, "did:") {
+			return nil, fmt.Errorf("client_id_scheme=%s but client_id is not a DID", authReq.ClientIDScheme)
 		}
 		if authReq.RequestJWT == "" {
-			return nil, errors.New("client_id_scheme=did requires a signed request JWT")
+			return nil, fmt.Errorf("client_id_scheme=%s requires a signed request JWT", authReq.ClientIDScheme)
 		}
 
 		// Resolve DID document to get verification method keys
@@ -572,14 +581,14 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		resolvedKeys, err := h.TrustSvc.ResolveDID(
 			trust.ContextWithTenant(ctx, tenantID),
-			authReq.ClientID,
+			did,
 			"", // use default verifier PDP endpoint
 		)
 		if err != nil {
-			return nil, fmt.Errorf("DID resolution failed for %s: %w", authReq.ClientID, err)
+			return nil, fmt.Errorf("DID resolution failed for %s: %w", did, err)
 		}
 		if len(resolvedKeys) == 0 {
-			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", authReq.ClientID)
+			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", did)
 		}
 
 		// Verify JWT signature against resolved DID keys
@@ -589,7 +598,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		h.Logger.Debug("DID request JWT verified",
-			zap.String("did", authReq.ClientID),
+			zap.String("did", did),
 			zap.Any("matched_kid", matchedJWK["kid"]))
 
 		keyMaterial = &KeyMaterial{
@@ -825,13 +834,15 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 // The frontend resolves the DID document to get keys and verifies the JWT.
 // This function is kept for reference but should not be used.
 func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMaterial, error) {
-	// Validate client_id is a valid DID
-	if !strings.HasPrefix(authReq.ClientID, "did:") {
+	// Validate client_id is a valid DID, allowing OpenID4VP 1.0's
+	// decentralized_identifier: prefix in front of it.
+	did := didFromClientID(authReq.ClientID)
+	if !strings.HasPrefix(did, "did:") {
 		return nil, errors.New("client_id_scheme=did but client_id is not a DID")
 	}
-	parts := strings.SplitN(authReq.ClientID, ":", 3)
+	parts := strings.SplitN(did, ":", 3)
 	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
-		return nil, fmt.Errorf("invalid DID format: %s", authReq.ClientID)
+		return nil, fmt.Errorf("invalid DID format: %s", did)
 	}
 
 	// Request must be JWT-secured
@@ -1249,8 +1260,19 @@ func (h *OID4VPHandler) buildQueryRedirect(endpoint string, authReq *Authorizati
 
 // inferClientIDScheme infers the client_id_scheme from the client_id format
 // when the verifier does not provide it explicitly.
+// didFromClientID returns the DID a client_id names, with OpenID4VP 1.0's
+// decentralized_identifier: prefix removed when present. The prefix is part of
+// the identifier the verifier signs and is trusted under, so it is stripped
+// only where a DID itself is needed - resolution and format checks - never
+// where the client_id is compared or evaluated.
+func didFromClientID(clientID string) string {
+	return strings.TrimPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":")
+}
+
 func inferClientIDScheme(clientID string) string {
 	switch {
+	case strings.HasPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":"):
+		return ClientIDSchemeDecentralizedIdentifier
 	case strings.HasPrefix(clientID, "did:"):
 		return ClientIDSchemeDID
 	case strings.HasPrefix(clientID, "x509_san_dns:"):
@@ -1347,8 +1369,9 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 
 	// OID4VP §5: Validate client_id_scheme prefix is recognized
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
-		ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
+	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier,
+		ClientIDSchemeX509SANDNS, ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash,
+		ClientIDSchemeVerifierAttestation:
 		// Known scheme
 	default:
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)

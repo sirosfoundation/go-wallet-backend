@@ -2048,3 +2048,53 @@ func buildMinimalJWT(t *testing.T, key *ecdsa.PrivateKey, certB64 string) string
 	s.FillBytes(sig[n:])
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
+
+// --- OpenID4VP 1.0 client_id scheme naming ---
+//
+// The drafts called the DID scheme "did"; the final specification calls it
+// "decentralized_identifier" and carries it as a prefix on the client_id. A
+// verifier built against the final spec was rejected outright with
+// "unsupported client_id_scheme: decentralized_identifier" before its request
+// was ever read - seen live against a third-party verifier whose client_id is
+// decentralized_identifier:did:web:<host>.
+
+func TestInferClientIDScheme_DecentralizedIdentifier(t *testing.T) {
+	assert.Equal(t, ClientIDSchemeDecentralizedIdentifier,
+		inferClientIDScheme("decentralized_identifier:did:web:verifier.example"))
+	// The draft spelling still infers as before.
+	assert.Equal(t, ClientIDSchemeDID, inferClientIDScheme("did:web:verifier.example"))
+}
+
+func TestValidateAuthorizationRequest_AcceptsDecentralizedIdentifier(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "n",
+		ClientID:       "decentralized_identifier:did:web:verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		ResponseMode:   ResponseModeDirectPostJWT,
+		ResponseURI:    "https://verifier.example/response",
+	}
+	require.NoError(t, h.validateAuthorizationRequest(authReq, nil))
+}
+
+func TestDIDFromClientID(t *testing.T) {
+	// Resolution needs the DID itself...
+	assert.Equal(t, "did:web:verifier.example",
+		didFromClientID("decentralized_identifier:did:web:verifier.example"))
+	// ...and an unprefixed client_id is already one.
+	assert.Equal(t, "did:web:verifier.example", didFromClientID("did:web:verifier.example"))
+	// Anything else is left alone, so a non-DID client_id still fails its own check.
+	assert.Equal(t, "https://verifier.example", didFromClientID("https://verifier.example"))
+}
+
+func TestVerifyDIDRequest_AcceptsPrefixedClientID(t *testing.T) {
+	h := &OID4VPHandler{}
+	// No request JWT: the point is that it gets past the DID-shape check and
+	// fails on the missing signature instead of on the prefix.
+	_, err := h.verifyDIDRequest(&AuthorizationRequest{
+		ClientID:       "decentralized_identifier:did:web:verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a signed request JWT")
+}
