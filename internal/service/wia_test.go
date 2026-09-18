@@ -252,9 +252,9 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 }
 
 // "ietf" mode lets a deployment opt into the IETF-draft iss/JWKS identity
-// format instead of ETSI TS 119 472-3's x5c-derived identity - needed when
-// relying parties can't resolve trust via a self-signed x5c chain but can
-// fetch a JWKS from a real iss URL (see RegisterWalletProviderJWKSRoute).
+// format instead of ETSI TS 119 472-3's x5c-derived identity. For
+// interoperability we still include x5c when certificate material is
+// configured, while retaining kid+iss for JWKS-based resolution.
 func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
@@ -280,16 +280,14 @@ func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
 		t.Fatalf("Parse WIA: %v", err)
 	}
 
-	if token.Header["x5c"] != nil {
-		t.Error("x5c header should be omitted in ietf mode")
+	if token.Header["x5c"] == nil {
+		t.Error("x5c header should be present in ietf mode when certificate material is configured")
 	}
 
-	// Regression: without a kid header, a relying party has no self-contained
-	// key material (no x5c, no embedded jwk) and no way to know which of the
-	// wallet provider's published JWKS keys to use for signature
-	// verification (confirmed against a real relying party: SUNET/vc's
-	// pkg/trust JWT verification requires kid to resolve via JWKS). Must
-	// match RegisterWalletProviderJWKSRoute's hardcoded KeyID.
+	// Regression: even when x5c is present for interoperability, relying
+	// parties that resolve via the issuer's JWKS still need kid to know which
+	// published key to use for verification. Must match
+	// RegisterWalletProviderJWKSRoute's hardcoded KeyID.
 	if token.Header["kid"] != "wallet-provider" {
 		t.Errorf("kid = %v, want %q (must match RegisterWalletProviderJWKSRoute's KeyID)", token.Header["kid"], "wallet-provider")
 	}
@@ -297,6 +295,46 @@ func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
 	claims := token.Claims.(jwt.MapClaims)
 	if claims["iss"] != "https://wallet-provider.example" {
 		t.Errorf("iss = %v, want https://wallet-provider.example", claims["iss"])
+	}
+}
+
+func TestWIAService_GenerateWIA_IETFMode_WithoutCertificate(t *testing.T) {
+	svc, privKey := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+	svc.certChain = nil
+
+	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
+	if err != nil {
+		t.Fatalf("NewCryptoSignerES256: %v", err)
+	}
+	svc.jwtSigner = jwtSigner
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] != nil {
+		t.Error("x5c header should be omitted in ietf mode when no certificate material is configured")
+	}
+	if token.Header["kid"] != "wallet-provider" {
+		t.Errorf("kid = %v, want %q", token.Header["kid"], "wallet-provider")
 	}
 }
 

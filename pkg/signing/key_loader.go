@@ -47,9 +47,10 @@ func loadFromPKCS11(cfg *KeyConfig) (*KeyMaterial, error) {
 	}
 
 	// CertificatePath is optional: a signer alone is enough for "ietf"-mode
-	// WIA issuance (JWKS-based trust, no x5c). Callers that need x5c (KA
-	// generation, "etsi"-mode WIA) must configure a certificate and enforce
-	// that themselves — this loader doesn't know which mode a caller wants.
+	// WIA issuance (JWKS-based trust; x5c is only included when a certificate
+	// is configured). Callers that always need x5c (KA generation,
+	// "etsi"-mode WIA) must configure a certificate and enforce that
+	// themselves — this loader doesn't know which mode a caller wants.
 	if cfg.CertificatePath == "" {
 		return &KeyMaterial{Signer: signer}, nil
 	}
