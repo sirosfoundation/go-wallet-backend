@@ -850,11 +850,13 @@ paths:
         - Wallet Instances
       summary: Delete a wallet instance
       description: |
-        Hard-deletes a wallet instance and emits an audit event. A revoked
-        instance that belongs to a user is retained as a lifecycle record
-        (it keeps the login gate and WIA issuance refusing that wallet) and
-        cannot be deleted; only instances without a user or non-revoked
-        instances may be removed.
+        Hard-deletes a wallet instance and emits an audit event. An instance
+        that belongs to a user and is no longer live is retained as a
+        lifecycle record - it is what keeps the login gate and WIA issuance
+        refusing that device - and cannot be deleted. That covers a revoked
+        instance and a legacy `suspended` one alike. What can be removed is a
+        live instance, or a record with no user behind it (a stray
+        attestation record).
       operationId: deleteWalletInstance
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -866,15 +868,16 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: |
-            Revoked instance of a user is retained as a lifecycle record and
-            cannot be deleted (`error` is `REVOKED_INSTANCE_RETAINED`).
+            A user's instance that is no longer live is retained as a
+            lifecycle record and cannot be deleted (`error` is
+            `INSTANCE_RETAINED`).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
-                error: "REVOKED_INSTANCE_RETAINED"
-                message: "revoked wallet instances are retained as lifecycle records and cannot be deleted"
+                error: "INSTANCE_RETAINED"
+                message: "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted"
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':

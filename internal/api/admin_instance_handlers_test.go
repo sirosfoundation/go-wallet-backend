@@ -435,8 +435,8 @@ func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/owned-revoked", nil))
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeRevokedInstanceRetained) {
-		t.Fatalf("expected 409 %s, got %d %s", errCodeRevokedInstanceRetained, w.Code, w.Body.String())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceRetained) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeInstanceRetained, w.Code, w.Body.String())
 	}
 	if _, err := store.WalletInstances().GetByID(context.Background(), "owned-revoked"); err != nil {
 		t.Fatalf("the tombstone must still exist: %v", err)

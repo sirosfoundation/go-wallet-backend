@@ -138,6 +138,23 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	inst.UpdatedAt = time.Now().UTC()
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
+		// Cut the tokens off again, now that the status is persisted. The
+		// first cut-off had to happen before the write (fail closed: a
+		// blocked instance must never be the one with working tokens), but
+		// it leaves a sliver open. A login already past its own lifecycle
+		// check still sees a live instance, mints a token whose iat is after
+		// that first cut-off, and every gate then accepts it - the
+		// post-mint re-check only catches the revocation once it is
+		// visible, and here it is not yet. Advancing the cut-off after the
+		// write closes the sliver by refusing anything minted inside it.
+		//
+		// It costs a re-login to a device that logged in during those
+		// milliseconds, which is the right side to err on and the same side
+		// the user-wide scope of the cut-off already errs on. Serializing
+		// lifecycle changes with login outright is go-wallet-backend#330.
+		if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+			return inst, errors.Join(fmt.Errorf("%w: re-cut tokens after the status write: %w", ErrErasureIncomplete, err), s.cascade(ctx, tenantID, inst, actor))
+		}
 		return inst, s.cascade(ctx, tenantID, inst, actor)
 	}
 	return inst, nil

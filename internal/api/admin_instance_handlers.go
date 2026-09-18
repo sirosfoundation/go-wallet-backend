@@ -32,9 +32,15 @@ const (
 )
 
 const (
-	errMsgInstanceUpdateFailed     = "failed to update wallet instance"
-	errMsgInvalidStatusTransition  = "invalid status transition"
-	errCodeRevokedInstanceRetained = "REVOKED_INSTANCE_RETAINED"
+	errMsgInstanceUpdateFailed    = "failed to update wallet instance"
+	errMsgInvalidStatusTransition = "invalid status transition"
+	// errCodeInstanceRetained refuses the hard delete of a user-owned
+	// instance that is not live. The record is the tombstone the login gate
+	// and the WIA guard read, so deleting it would make the next attestation
+	// on that device look like a first enrollment. It is status-neutral
+	// because a legacy suspended record is retained for the same reason a
+	// revoked one is.
+	errCodeInstanceRetained = "INSTANCE_RETAINED"
 )
 
 // ListWalletInstances returns all wallet instances for a tenant.
@@ -187,8 +193,8 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	// a user (stray attestation records) or non-revoked ones may be removed.
 	if !instance.Status.IsLive() && instance.UserID != nil {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":   errCodeRevokedInstanceRetained,
-			"message": "revoked wallet instances are retained as lifecycle records and cannot be deleted",
+			"error":   errCodeInstanceRetained,
+			"message": "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted",
 		})
 		return
 	}

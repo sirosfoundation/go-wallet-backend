@@ -362,3 +362,54 @@ func TestWalletLifecycle_RevokeAllRefusesAnotherUsersWallet(t *testing.T) {
 	assert.ErrorIs(t, err, ErrWalletInstanceNotOwned)
 	assert.Zero(t, n)
 }
+
+// The cut-off is recorded before the status write, so a login already past
+// its own lifecycle check can mint a token in between: it sees a live
+// instance, and its fresh iat clears that first cut-off. Advancing the
+// cut-off again after the write is what refuses such a token.
+func TestWalletLifecycle_CutOffIsAdvancedAfterTheStatusWrite(t *testing.T) {
+	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
+	ctx := context.Background()
+
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "stolen")
+	require.NoError(t, err)
+
+	// The status write is the moment the sliver closes: a login that got its
+	// lifecycle check in before it saw a live instance. So the cut-off has
+	// to sit at or after that write, not before it. With only the pre-write
+	// cut-off this is false, and a token minted in between survives.
+	revoked, err := store.WalletInstances().GetByID(ctx, "inst-a")
+	require.NoError(t, err)
+	cutoff, err := store.Users().GetAuthCutoff(ctx, userID)
+	require.NoError(t, err)
+	assert.False(t, cutoff.Before(revoked.UpdatedAt),
+		"cut-off %s predates the status write at %s, so a token minted in between would still pass",
+		cutoff, revoked.UpdatedAt)
+}
+
+// The account-deletion retry has to be able to find the tenant again. A
+// membership removed while one of its instances is still there would hide
+// that instance from the next attempt, which would then find nothing
+// outstanding and delete the account over the top of the orphan.
+func TestDeleteUser_KeepsMembershipWhenAnInstanceSurvives(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	svc := NewUserService(failInstanceDeleteStore{Store: inner}, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	require.NoError(t, inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}))
+	require.NoError(t, inner.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+		UserID: userID, TenantID: "acme", Role: "user",
+	}))
+	require.NoError(t, inner.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-acme", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+
+	require.ErrorIs(t, svc.DeleteUser(ctx, userID, did), ErrDeletionIncomplete)
+
+	tenants, err := inner.UserTenants().GetUserTenants(ctx, userID)
+	require.NoError(t, err)
+	assert.Contains(t, tenants, domain.TenantID("acme"),
+		"the membership must survive so the retry can still find this tenant")
+}

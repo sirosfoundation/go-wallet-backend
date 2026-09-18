@@ -333,11 +333,13 @@ nothing would say so. A deployment that does not want the dependency leaves
 `storage.type` empty or `memory`, which is the documented unenforced case
 above.
 
-Revoked instances of a user are retained as lifecycle records: they are what
-keeps login and new attestations refused for that wallet. The admin API
-answers `409 REVOKED_INSTANCE_RETAINED` to `DELETE
-/admin/tenants/{id}/instances/{instance_id}` for such an instance; records
-without a user (stray attestation records) can still be deleted.
+A user's instances that are no longer live are retained as lifecycle
+records: they are what keeps login and new attestations refused for that
+device. The admin API answers `409 INSTANCE_RETAINED` to `DELETE
+/admin/tenants/{id}/instances/{instance_id}` for one of them, which covers a
+revoked instance and a legacy `suspended` one alike. A live instance, and a
+record with no user behind it (a stray attestation record), can still be
+deleted.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
 credential id as `credential_id` to `POST /wallet-provider/wia/generate`. It
