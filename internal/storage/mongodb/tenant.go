@@ -165,10 +165,13 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 }
 
 func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
-	count, err := s.collection.CountDocuments(ctx, bson.M{
-		"user_id":   userID.String(),
-		"tenant_id": string(tenantID),
-	})
+	// False positive: bson.M is a typed document builder, not a query string.
+	// Both map keys ("user_id", "tenant_id") are fixed literals; userID and
+	// tenantID are only ever used as plain field VALUES, BSON-encoded as
+	// strings and compared by equality. A string value can never be
+	// interpreted as a Mongo query operator (only "$"-prefixed map KEYS are),
+	// so untrusted input reaching this call site cannot inject query semantics.
+	count, err := s.collection.CountDocuments(ctx, bson.M{"user_id": userID.String(), "tenant_id": string(tenantID)}) // codeql[go/sql-injection]
 	if err != nil {
 		return false, fmt.Errorf("failed to check membership: %w", err)
 	}

@@ -3213,3 +3213,109 @@ func TestDpopJWKForRefreshToken_ExportsWhenRefreshTokenPresent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, key.D.Cmp(parsed.D))
 }
+
+// TestParseOffer_AcceptsBothOfferURIForms covers the two spellings of an
+// OpenID4VCI credential offer URI.
+//
+// The authority component of this scheme is always empty, and RFC 3986 lets it
+// be left out entirely, so issuers emit either of:
+//
+//	openid-credential-offer://?credential_offer=...
+//	openid-credential-offer:?credential_offer=...
+//
+// This deployment's own issuer gateway emits the second. Matching on
+// "openid-credential-offer://" therefore skipped the extraction branch and
+// handed the whole URI to json.Unmarshal, which failed instantly with
+// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed at all.
+func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["pid_1_8"],"grants":{"authorization_code":{}}}`
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"with authority", "openid-credential-offer://?credential_offer="},
+		{"without authority", "openid-credential-offer:?credential_offer="},
+		// Scheme names are case-insensitive (RFC 3986 section 3.1), so an
+		// issuer is free to emit the scheme in any case and still name this
+		// one.
+		{"uppercase scheme", "OPENID-CREDENTIAL-OFFER:?credential_offer="},
+		{"mixed case scheme with authority", "OpenID-Credential-Offer://?credential_offer="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+			defer cleanup()
+
+			offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+				Offer: tc.prefix + url.QueryEscape(offerJSON),
+			})
+			require.NoError(t, err)
+			require.NotNil(t, offer)
+			assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
+			assert.Equal(t, []string{"pid_1_8"}, offer.CredentialConfigurationIDs)
+		})
+	}
+}
+
+// TestParseOffer_OfferURIWithoutEitherParameter covers the branch's own failure
+// message: an offer URI that carries neither parameter has to say so, rather
+// than fall through and be reported as broken JSON.
+func TestParseOffer_OfferURIWithoutEitherParameter(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	_, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?state=xyz",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither a credential_offer nor a credential_offer_uri")
+}
+
+// TestHasOfferURIScheme pins the scheme match itself: case-insensitive per
+// RFC 3986 section 3.1, authority optional, and nothing else accepted.
+func TestHasOfferURIScheme(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"openid-credential-offer://?credential_offer=%7B%7D", true},
+		{"openid-credential-offer:?credential_offer=%7B%7D", true},
+		{"OPENID-CREDENTIAL-OFFER:?credential_offer=%7B%7D", true},
+		{"OpenID-Credential-Offer://?credential_offer=%7B%7D", true},
+		// A bare JSON offer is not a URI and must fall through to the parser.
+		{`{"credential_issuer":"https://issuer.example.com"}`, false},
+		// Neither a different scheme nor a longer name that merely starts the
+		// same way is this scheme.
+		{"openid-credential-offer-v2:?credential_offer=%7B%7D", false},
+		{"haip://?credential_offer=%7B%7D", false},
+		// The scheme alone, with no ":", is not a URI either.
+		{"openid-credential-offer", false},
+	} {
+		assert.Equal(t, tc.want, hasOfferURIScheme(tc.in), tc.in)
+	}
+}
+
+// TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam is the same fix seen
+// from the credential_offer_uri side: the by-reference form has to be followed
+// for both spellings too, not just the "//" one.
+func TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["eucc"],"grants":{"authorization_code":{}}}`
+
+	offerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(offerJSON))
+	}))
+	defer offerServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, offerServer.Client())
+	defer cleanup()
+
+	offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?credential_offer_uri=" + url.QueryEscape(offerServer.URL),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, offer)
+	assert.Equal(t, []string{"eucc"}, offer.CredentialConfigurationIDs)
+}

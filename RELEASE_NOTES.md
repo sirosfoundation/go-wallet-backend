@@ -4,6 +4,22 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.21.0:start -->
+## [v0.21.0] - 2026-09-16
+
+### Added
+- Authorization Server cookie sessions can now be persisted in MongoDB instead of only in-process memory, enabling session survival across restarts and multi-instance deployments. Configure via `as.session_store` / `WALLET_AS_SESSION_STORE` (defaults to `mongodb` when MongoDB is the storage backend). (#325)
+
+### Fixed
+- MongoDB-backed issuer, verifier, credential, and presentation stores now correctly mint unique IDs on a fresh database. Previously, the first two entities created would collide on ID 1, causing `already exists` errors. (#327)
+- Status list test suite now correctly decodes zlib-compressed status lists, matching the production implementation changed in v0.20.0. (#326)
+- Key Attestation certification field is now an absolute URL as required by the specification. (#331)
+
+### Changed
+- Dependency updates: `github.com/gin-contrib/cors` 1.7.7→1.7.8, `github.com/go-webauthn/webauthn` 0.18.0→0.18.1, `github.com/sirosfoundation/go-trust` 0.20.5→0.20.6, `golang.org/x/crypto` 0.56.0→0.57.0, `golang.org/x/sync` 0.22.0→0.23.0, `golang.org/x/time` 0.15.0→0.16.0, `github.com/go-jose/go-jose/v4` 4.1.4→4.1.5. (#323)
+- CI tooling updated to golangci-lint v2.13.2 for Go 1.26 compatibility. (#321)
+<!-- release-notes:v0.21.0:end -->
+
 <!-- release-notes:v0.20.0:start -->
 ## [v0.20.0] - 2026-09-10
 

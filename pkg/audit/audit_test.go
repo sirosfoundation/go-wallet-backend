@@ -1,13 +1,16 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/sirosfoundation/go-siros-set/set"
@@ -192,4 +195,55 @@ func TestEmit_Success(t *testing.T) {
 	// Should not panic — just verify it runs without error.
 	e.Emit(set.EventWIAIssued, map[string]any{"test": true})
 	e.EmitWithSubject(set.EventWIAIssued, "test-subject", map[string]any{"test": true})
+}
+
+func TestNew_WithLogger(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	joseSigner, err := set.NewSigner(key, "ES256", "test-kid")
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	e := New("https://test.example.com", joseSigner, logger)
+	if e == nil {
+		t.Fatal("expected non-nil emitter")
+	}
+
+	e.Emit(set.EventWIAIssued, map[string]any{"test": true})
+	if !strings.Contains(buf.String(), "secevent") {
+		t.Fatalf("expected the supplied logger to receive the SET record, got %q", buf.String())
+	}
+}
+
+func TestEmit_ErrorIsLoggedNotPropagated(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	joseSigner, err := set.NewSigner(key, "ES256", "test-kid")
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+
+	var buf bytes.Buffer
+	e := New("https://test.example.com", joseSigner, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	// A func value can't be JSON-marshaled, so signing the record fails.
+	// The failure must be logged rather than silently discarded, and must
+	// not panic or propagate to the caller.
+	e.Emit(set.EventWIAIssued, map[string]any{"bad": func() {}})
+	e.EmitWithSubject(set.EventWIAIssued, "test-subject", map[string]any{"bad": func() {}})
+
+	out := buf.String()
+	if strings.Count(out, "audit emit failed") != 2 {
+		t.Fatalf("expected both emit failures to be logged, got %q", out)
+	}
+	if !strings.Contains(out, "subject=test-subject") {
+		t.Fatalf("expected the subject in the failure log, got %q", out)
+	}
 }
