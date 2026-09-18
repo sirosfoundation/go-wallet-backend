@@ -138,6 +138,7 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -296,6 +297,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
 	h := NewAdminHandlers(store, zap.NewNop(), auditor)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), auditor))
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -444,5 +446,41 @@ func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/stray-revoked", nil))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("a revoked record without a user may be deleted, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A revocation must never be answered 200 by a handler that has no lifecycle
+// service behind it: the status would be written straight to the store, with
+// no token cut-off, no session drop and no erasure, so the device it was
+// meant to stop would keep working. Both providers wire the service, so this
+// is unreachable in a built server; the test is what keeps it that way.
+func TestUpdateWalletInstanceStatus_FailsClosedWithoutLifecycle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil) // deliberately no SetLifecycle
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "no-lifecycle", "acme", nil)
+
+	body := `{"status":"revoked","reason":"stolen"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/no-lifecycle/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), errCodeLifecycleNotSupported) {
+		t.Errorf("expected %s, got %s", errCodeLifecycleNotSupported, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(context.Background(), "no-lifecycle")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusActive {
+		t.Errorf("status = %s, want it untouched - a refused revocation must change nothing", got.Status)
 	}
 }

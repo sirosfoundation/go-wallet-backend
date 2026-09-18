@@ -802,6 +802,20 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	// A standalone admin deployment gets the same lifecycle service the
+	// backend uses, so a revocation here is a real revocation: transition
+	// rules, audit, the SID-AUTH-06 token cut-off, and the erasure of a
+	// wallet whose last live instance is gone. Without it the handler would
+	// write the status straight to the store and answer 200 while the
+	// device's tokens still worked - which, for the one operation a wallet
+	// instance has and cannot undo, is the worst possible half-measure.
+	//
+	// No session cleaner is wired: in --mode=admin the AS and the engine run
+	// in other processes, so there are no session records this one can
+	// close. Their live sessions end at the cut-off instead, which every
+	// gate consults - both HTTP middlewares, the WebSocket handshake and
+	// each flow start - rather than at an immediate drop.
+	adminHandlers.SetLifecycle(service.NewWalletLifecycleService(p.store, p.logger, p.auditor))
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 

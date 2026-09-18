@@ -971,6 +971,16 @@ paths:
                     message: "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: |
+            `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
+            revocation did not happen. It is never applied partially: a status
+            written without the token cut-off, the session drop and the
+            erasure would report a device stopped that was still working.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1064,7 +1074,11 @@ paths:
                   message:
                     type: string
         '503':
-          description: The wallet lifecycle service is not configured
+          description: |
+            `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
+            revocation did not happen. It is never applied partially: a status
+            written without the token cut-off, the session drop and the
+            erasure would report a device stopped that was still working.
         '500':
           $ref: '#/components/responses/InternalError'
 

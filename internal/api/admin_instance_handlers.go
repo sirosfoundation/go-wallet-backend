@@ -21,7 +21,11 @@ import (
 // the cleanup.
 const (
 	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
-	errMsgErasureIncomplete  = "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
+	// errCodeLifecycleNotSupported is returned when a lifecycle operation is
+	// reached without a lifecycle service behind it. It means the operation
+	// did not happen, not that it half happened.
+	errCodeLifecycleNotSupported = "LIFECYCLE_NOT_SUPPORTED"
+	errMsgErasureIncomplete      = "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
 )
 
 const (
@@ -137,26 +141,19 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.WalletInstances().UpdateStatus(c.Request.Context(), instanceID, status, req.Reason); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
-			return
-		}
-		if errors.Is(err, domain.ErrInvalidStatusTransition) {
-			c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition})
-			return
-		}
-		h.logger.Error("failed to update wallet instance status", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": errMsgInstanceUpdateFailed})
-		return
-	}
-
-	// Emit audit event
-	if h.audit != nil {
-		h.emitInstanceAuditEvent(c, instanceID, status, req.Reason)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"id": instanceID, "status": req.Status})
+	// No lifecycle service: fail closed. Writing the status straight to the
+	// store would skip the token cut-off, the session drop and the erasure,
+	// and answer 200 for a revocation that left the device's tokens working.
+	// For the one operation a wallet instance has, and one that cannot be
+	// undone, that is the worst possible half-measure.
+	//
+	// Both providers wire the service (server.BackendProvider and
+	// server.AdminProvider), so this is unreachable in a built server. It is
+	// here so that a future one cannot reintroduce a silent partial
+	// revocation by forgetting to.
+	h.logger.Error("wallet instance revocation refused: no lifecycle service is wired",
+		zap.String("instance_id", instanceID), zap.String("tenant_id", string(tenantID)))
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": errCodeLifecycleNotSupported})
 }
 
 // DeleteWalletInstance hard-deletes a wallet instance.
@@ -251,7 +248,7 @@ type revokeAllInstancesRequest struct {
 // revocation.
 func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 	if h.lifecycle == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "LIFECYCLE_NOT_SUPPORTED"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errCodeLifecycleNotSupported})
 		return
 	}
 	tenantID := domain.TenantID(c.Param("id"))
