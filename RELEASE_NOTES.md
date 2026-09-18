@@ -15,7 +15,7 @@
 
 - **Audit events for invite lifecycle.** The admin API now emits `invite:created`, `invite:updated` (with `renew`/`revoke` action), and `invite:deleted` events to the SET audit trail. (#249)
 
-- **Empty credential match handling.** When a presentation request cannot be satisfied because the wallet holds no matching credentials, the flow now ends immediately with a `NO_MATCHING_CREDENTIAL` error naming the requested types and the client's reason, rather than waiting for a 5-minute timeout. Non-empty match sets remain informational. (#336)
+- **Empty credential match handling.** When a presentation request cannot be satisfied because the wallet holds no matching credentials, the flow now ends immediately instead of waiting for the 5-minute timeout. The wallet client receives a `NO_MATCHING_CREDENTIALS` flow error carrying the requested credential types as data, so it can phrase the explanation in the user's own language. The verifier receives `access_denied` with the same `error_description` a user decline sends: OpenID4VP 1.0 answers "the Wallet did not have the requested Credentials" and "the End-User did not give consent" with one code precisely so the two cannot be told apart, and naming the missing types would have let a verifier probe what a holder has. Non-empty match sets remain informational. (#336)
 
 ### Fixed
 
