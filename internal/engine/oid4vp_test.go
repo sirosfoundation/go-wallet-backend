@@ -2317,3 +2317,291 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *t
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "client_id is not a DID")
 }
+
+// --- no-matching-credential fast fail ---
+
+// feedAction queues a client action on the session, the way the websocket
+// reader does when a real client answers a credential_selection message.
+func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	s.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flowID},
+		Action:  action,
+		Payload: raw,
+	}
+}
+
+// newSelectionTestHandler returns a handler whose session writes to a real
+// socket, plus the channel of messages the client end receives, so a test can
+// assert what the wallet app would actually be told.
+func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, chan map[string]any, func()) {
+	t.Helper()
+	received := make(chan map[string]any, 20)
+	conn, cleanup := wsTestServer(t, func(c *websocket.Conn) {
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			if json.Unmarshal(data, &msg) == nil {
+				received <- msg
+			}
+		}
+	})
+	session := testSession(conn)
+	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
+	session.flows[flow.ID] = flow
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}
+	h.httpClient = &http.Client{Timeout: 5 * time.Second}
+	return h, session, received, cleanup
+}
+
+// awaitMessage returns the first received message of the given type.
+func awaitMessage(t *testing.T, received chan map[string]any, msgType string) map[string]any {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-received:
+			if msg["type"] == msgType {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("no %q message arrived", msgType)
+		}
+	}
+}
+
+func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
+	h, session, received, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// The verifier's response_uri, so the test can assert it is told.
+	posted := make(chan url.Values, 1)
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		posted <- r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer verifier.Close()
+
+	authReq := &AuthorizationRequest{
+		DCQLQuery:   json.RawMessage(`{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1"]}}]}`),
+		ResponseURI: verifier.URL,
+		State:       "state-123",
+	}
+
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		NoMatchReason: "no credential with vct urn:eudi:pid:arf-1.8:1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
+
+	require.Error(t, err, "an empty match set must end the flow, not wait for consent")
+	assert.Nil(t, selected)
+	assert.Contains(t, err.Error(), "no credential matches")
+
+	// The verifier is told, so its session ends instead of expiring - with
+	// access_denied, which OpenID4VP 1.0 defines for "the Wallet did not have
+	// the requested Credentials" and for "the End-User did not give consent"
+	// alike. The description must not name what was missing: that would tell
+	// the verifier which of the two happened, and so whether this holder has
+	// the credential it asked about.
+	select {
+	case form := <-posted:
+		assert.Equal(t, "access_denied", form.Get("error"))
+		assert.Equal(t, "state-123", form.Get("state"))
+		assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
+		assert.NotContains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifier was never notified")
+	}
+
+	// The client is told what it needs to explain the failure to its user: a
+	// code it can translate and the requested types as data, not an English
+	// sentence it would have to re-parse.
+	msg := awaitMessage(t, received, string(TypeFlowError))
+	flowErr, ok := msg["error"].(map[string]any)
+	require.True(t, ok, "flow error must carry an error object, got %v", msg["error"])
+	assert.Equal(t, string(ErrCodeNoMatchingCredentials), flowErr["code"])
+	assert.Equal(t, ErrCodeNoMatchingCredentials.UserFacingMessage(), flowErr["message"])
+	details, ok := flowErr["details"].(map[string]any)
+	require.True(t, ok, "flow error must carry details, got %v", flowErr["details"])
+	assert.Equal(t, []any{"urn:eudi:pid:arf-1.8:1"}, details["requested_types"])
+	assert.Equal(t, "no credential with vct urn:eudi:pid:arf-1.8:1", details["no_match_reason"])
+	assert.Equal(t, "https://verifier.example/done", details["redirect_uri"])
+}
+
+func TestSubmitErrorResponse_QueryModeRedirectsInsteadOfPosting(t *testing.T) {
+	// A verifier using query/fragment gives a redirect_uri and no
+	// response_uri; it must still learn the request failed.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect, "query mode must yield a redirect for the user agent")
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+	assert.Equal(t, "state-123", u.Query().Get("state"))
+	assert.Equal(t, "nothing to present", u.Query().Get("error_description"))
+}
+
+func TestSubmitErrorResponse_FragmentModePutsErrorInFragment(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeFragment,
+		State:        "s",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Empty(t, u.RawQuery)
+	frag, err := url.ParseQuery(u.Fragment)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", frag.Get("error"))
+	assert.Equal(t, "s", frag.Get("state"))
+}
+
+func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testing.T) {
+	h, session, _, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that reports its matches first and then asks the user must
+	// behave exactly like one that only sends consent.
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+	})
+	feedAction(t, session, h.Flow.ID, ActionConsent, ConsentPayload{
+		SelectedCredentials: []ConsentSelection{{CredentialID: "cred-1"}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
+
+	require.NoError(t, err)
+	require.Len(t, selected, 1)
+	assert.Equal(t, "cred-1", selected[0].CredentialID)
+}
+
+func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {
+	h, session, _, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that keeps sending the informational credentials_matched action
+	// must not be able to hold the flow open: each wait used to start a fresh
+	// UserInteractionTimeout, so the deadline never arrived. Without one
+	// deadline across the loop this call never returns and the test hangs.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		raw, _ := json.Marshal(CredentialsMatchedPayload{
+			Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+		})
+		for {
+			select {
+			case <-stop:
+				return
+			case session.actionCh <- &FlowActionMessage{
+				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+				Action:  ActionCredentialsMatched,
+				Payload: raw,
+			}:
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	action, err := h.waitForSelectionActionUntil(ctx, &AuthorizationRequest{}, start.Add(300*time.Millisecond))
+
+	require.ErrorIs(t, err, ErrFlowTimeout, "the deadline must survive repeated informational actions")
+	assert.Nil(t, action)
+	assert.Less(t, time.Since(start), 10*time.Second, "the wait must end at the original deadline")
+}
+
+func TestSubmitErrorResponse_QueryModePrefersResponseURILikeSubmitResponse(t *testing.T) {
+	// validateAuthorizationRequest only forbids redirect_uri for the
+	// direct_post modes, so a query/fragment request may carry both. The
+	// failure has to go where submitResponse would have sent the vp_token -
+	// response_uri first - or the verifier is left waiting on the endpoint
+	// that was never told.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		ResponseURI:  "https://verifier.example/response",
+		RedirectURI:  "https://verifier.example/redirect",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/response", u.Path, "the error must go to the endpoint submitResponse would have used")
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+
+	// And redirect_uri is still the fallback when response_uri is absent.
+	authReq.ResponseURI = ""
+	redirect = h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+	u, err = url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/redirect", u.Path)
+}
+
+func TestRequestedCredentialTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		dcql string
+		want []string
+	}{
+		{
+			name: "sd-jwt vct values",
+			dcql: `{"credentials":[{"id":"pid","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1","urn:eudi:pid:arf-1.5:1"]}}]}`,
+			want: []string{"urn:eudi:pid:arf-1.8:1", "urn:eudi:pid:arf-1.5:1"},
+		},
+		{
+			name: "mdoc doctype",
+			dcql: `{"credentials":[{"id":"mdl","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}`,
+			want: []string{"org.iso.18013.5.1.mDL"},
+		},
+		{
+			name: "falls back to the credential id when the query names no type",
+			dcql: `{"credentials":[{"id":"some-credential","meta":{}}]}`,
+			want: []string{"some-credential"},
+		},
+		{
+			name: "deduplicates across credentials",
+			dcql: `{"credentials":[{"id":"a","meta":{"vct_values":["urn:x"]}},{"id":"b","meta":{"vct_values":["urn:x"]}}]}`,
+			want: []string{"urn:x"},
+		},
+		{name: "empty query", dcql: ``, want: nil},
+		{name: "unparseable query", dcql: `not json`, want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, requestedCredentialTypes(json.RawMessage(tt.dcql)))
+		})
+	}
+}
