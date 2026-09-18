@@ -35,7 +35,8 @@ info:
     Verifiers may carry an optional `client_id` and `client_id_scheme` that the wallet uses
     when matching incoming OID4VP authorization requests to a trusted verifier. Supported
     schemes follow the OID4VP specification: `redirect_uri`, `pre-registered`, `x509_san_dns`,
-    `x509_san_uri`, `verifier_attestation`, and `did`.
+    `x509_san_uri`, `verifier_attestation`, and `did` - which OpenID4VP 1.0 renamed to
+    `decentralized_identifier`. Both names for that scheme are accepted and mean the same thing.
     
     ## Security
     
@@ -1184,6 +1185,7 @@ components:
             - x509_san_uri
             - verifier_attestation
             - did
+            - decentralized_identifier
           description: |
             OID4VP `client_id_scheme` associated with `client_id`. Must be one
             of the values defined in the OID4VP specification. When provided,
@@ -1229,6 +1231,7 @@ components:
             - x509_san_uri
             - verifier_attestation
             - did
+            - decentralized_identifier
           description: OID4VP client_id_scheme for this verifier (omitted when not set)
           example: "did"
         trust_status:
