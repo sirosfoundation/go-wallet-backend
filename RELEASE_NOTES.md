@@ -4,6 +4,36 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.22.0:start -->
+## [v0.22.0] - 2026-09-18
+
+### Added
+
+- **Authorization details support for DIIP credential issuance.** The engine now forwards `authorization_details` from `flow_start` to the Authorization Request alongside `scope`, and honours the `credential_identifier` echoed by the AS in the token response. This enables wallets to request specific credential configurations when the issuer requires it, without clients needing to construct Authorization Requests themselves. (#341)
+
+- **Admin user detail endpoint** at `GET /admin/tenants/:id/users/:user_id/detail` returns non-PII user information including passkeys, DID, and wallet type. A stub tenant statistics endpoint at `GET /admin/tenants/:id/stats` returns 501. (#250)
+
+- **Audit events for invite lifecycle.** The admin API now emits `invite:created`, `invite:updated` (with `renew`/`revoke` action), and `invite:deleted` events to the SET audit trail. (#249)
+
+- **Empty credential match handling.** When a presentation request cannot be satisfied because the wallet holds no matching credentials, the flow now ends immediately instead of waiting for the 5-minute timeout. The wallet client receives a `NO_MATCHING_CREDENTIALS` flow error carrying the requested credential types as data, so it can phrase the explanation in the user's own language. The verifier receives `access_denied` with the same `error_description` a user decline sends: OpenID4VP 1.0 answers "the Wallet did not have the requested Credentials" and "the End-User did not give consent" with one code precisely so the two cannot be told apart, and naming the missing types would have let a verifier probe what a holder has. Non-empty match sets remain informational. (#336)
+
+### Fixed
+
+- **SSRF protection gaps in outbound HTTP client.** The dialer now connects to an address that was actually checked (closing a DNS rebinding window), applies address policy when requests are proxied (where the dialer cannot see the target), and refuses plaintext HTTP for all fetches unless explicitly configured. Deployments with `allow_private_ips`, `allow_http`, or `insecure_skip_verify` are unaffected; those without any of the three will now reject plaintext public hosts with an error naming the flag to set. (#338)
+
+- **IETF-mode wallet instance attestations missing `x5c`.** WIA JWTs in IETF mode now include the `x5c` header when certificate material is configured, preserving JWKS-based resolution while adding certificate-chain resolution for consumers that require it. Deployments without a certificate chain continue to work with `kid`-only headers. (#346)
+
+- **Native wallet credential offers failing to parse.** The engine now accepts credential offer URIs with no authority component (`openid-credential-offer:?credential_offer=...`), matching RFC 3986 and the output of the issuer gateway's native chooser. Previously only the double-slash form was recognised. (#345)
+
+- **OpenID4VP 1.0 verifiers rejected for unrecognised `client_id_scheme`.** The engine now accepts `decentralized_identifier` (the final specification's name for the DID scheme) alongside the draft spelling `did`, and strips the prefix when resolving the DID document. Verifiers using the 1.0 identifier format can now be verified. (#343)
+
+### Changed
+
+- **Audit emit failures are now logged** rather than silently dropped, using the logger the emitter was constructed with. (#249)
+
+- **`verifier:created` audit events now use the verifier URL as subject** (matching `issuer:created`), with `verifier_id` and `name` in the event data, so create events can be correlated with later updates and deletes. (#249)
+<!-- release-notes:v0.22.0:end -->
+
 <!-- release-notes:v0.21.0:start -->
 ## [v0.21.0] - 2026-09-16
 
