@@ -595,6 +595,41 @@ Client → Server:
 }
 ```
 
+##### `request_uri_method=post`
+
+OpenID4VP 1.0 §5.10 lets a verifier ask the wallet to POST to the request
+URI, sending its capabilities and a `wallet_nonce` the returned request
+object must echo back. The parameter rides on the authorization request next
+to `request_uri`, so a client that forwards the whole URI in `request_uri`
+needs to do nothing - the backend reads it there. A client that extracted
+`request_uri_ref` itself has dropped the query string it arrived in, and must
+pass it on:
+
+```
+Client → Server:
+{
+  "type": "flow_start",
+  "flow_id": "<uuid>",
+  "protocol": "oid4vp",
+  "request_uri_ref": "https://verifier.example.com/requests/456",
+  "request_uri_method": "post",
+  "wallet_metadata": {"vp_formats_supported": {"dc+sd-jwt": {"sd-jwt_alg_values": ["ES256"]}}}
+}
+```
+
+`request_uri_method` is absent or `"get"` for RFC 9101's GET (the default);
+any other value fails the flow with `INVALID_REQUEST_URI_METHOD`. A request
+object that does not echo the `wallet_nonce` fails it with
+`WALLET_NONCE_MISMATCH`, per §5.10's MUST.
+
+`wallet_metadata` is optional and sent verbatim when present. The client is
+the better source for it - matching and VP token construction both happen
+there - but the backend falls back to a conservative default
+(`vp_formats_supported` for `dc+sd-jwt` and `mso_mdoc`, ES256) when it is
+omitted. The per-format shape is OpenID4VP 1.0 Annex B's: `sd-jwt_alg_values`
+/ `kb-jwt_alg_values` with JOSE names for SD-JWT VC, `issuerauth_alg_values` /
+`deviceauth_alg_values` with COSE algorithm identifiers for mdoc.
+
 #### Request Processing
 
 ```
@@ -876,6 +911,8 @@ Server → Client:
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |
+| `INVALID_REQUEST_URI_METHOD` | Verifier asked for a `request_uri_method` this wallet does not implement |
+| `WALLET_NONCE_MISMATCH` | Request object fetched by POST did not echo the `wallet_nonce` (OpenID4VP §5.10) |
 | `INTERNAL_ERROR` | Server-side error |
 
 ## Protocol Extensibility
