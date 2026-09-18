@@ -42,15 +42,16 @@ type LifecycleActor struct {
 // changes with validated transitions, audit events, and the cascade a
 // deactivation implies.
 //
-// Suspension is reversible and only blocks: sessions are dropped, new WIAs are
-// refused (WIAService), and login with the linked passkey is refused
-// (WebAuthnService.checkWalletLifecycle). Revocation is terminal. Revoking the
-// last non-revoked instance of a user deactivates the wallet: the encrypted
-// private data - the only durable custodian of the user's keys - and any
-// server-side credentials, presentations and pending WebAuthn challenges are
-// erased, and login is refused for every passkey of that user, so re-activation
-// requires a full new enrollment. Data is never erased while an instance the
-// user could still reactivate remains.
+// Revocation is the only status change there is and it is terminal: sessions
+// are dropped, new WIAs are refused (WIAService), and login with the linked
+// passkey is refused (WebAuthnService.checkWalletLifecycle). Revoking the last
+// live instance of a user deactivates the wallet: the encrypted private data -
+// the only durable custodian of the user's keys - and any server-side
+// credentials, presentations and pending WebAuthn challenges are erased, and
+// login is refused for every passkey of that user, so a new enrollment is
+// required. Data is never erased while a live instance remains. A record left
+// in the legacy "suspended" state is not live and can only be revoked; see
+// domain.InstanceStatus.
 //
 // Erasing on the last revocation rather than only on an explicit "deactivate
 // my wallet" is a SIROS decision, not a requirement: ARF v3 lets a Wallet

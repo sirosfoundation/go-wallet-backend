@@ -119,6 +119,16 @@ func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status 
 	if status != domain.InstanceStatusRevoked {
 		return fmt.Errorf("%w: cannot set wallet instance status to %q", domain.ErrInvalidStatusTransition, status)
 	}
+	// An already-revoked record is refused rather than re-stamped.
+	// ValidateStatusTransition treats a same-state write as a no-op, which is
+	// right for a caller asking "may this transition happen"; it is wrong
+	// here, because Mongo's conditional filter matches nothing and answers
+	// ErrInvalidStatusTransition. Callers depend on that answer - the WIA
+	// compensating path reads it as "someone else already revoked this" -
+	// so the two stores must not disagree.
+	if instance.Status == domain.InstanceStatusRevoked {
+		return fmt.Errorf("%w: wallet instance is already revoked", domain.ErrInvalidStatusTransition)
+	}
 	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
 		return err
 	}

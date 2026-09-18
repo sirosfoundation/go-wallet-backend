@@ -21,6 +21,9 @@ import (
 // the cleanup.
 const (
 	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
+	// errCodeDeletionIncomplete is returned when account deletion left a
+	// wallet instance behind. The account still exists; repeat the request.
+	errCodeDeletionIncomplete = "DELETION_INCOMPLETE"
 	// errCodeLifecycleNotSupported is returned when a lifecycle operation is
 	// reached without a lifecycle service behind it. It means the operation
 	// did not happen, not that it half happened.
@@ -182,7 +185,7 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	// make the user look never-enrolled and re-open both. Revocation is
 	// terminal, so the record stays as a tombstone; only instances without
 	// a user (stray attestation records) or non-revoked ones may be removed.
-	if instance.Status == domain.InstanceStatusRevoked && instance.UserID != nil {
+	if !instance.Status.IsLive() && instance.UserID != nil {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   errCodeRevokedInstanceRetained,
 			"message": "revoked wallet instances are retained as lifecycle records and cannot be deleted",

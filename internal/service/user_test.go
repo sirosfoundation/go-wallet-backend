@@ -978,3 +978,89 @@ func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
 		}
 	}
 }
+
+// failInstanceDeleteStore fails every wallet-instance Delete, standing in for
+// a storage problem during account deletion.
+type failInstanceDeleteStore struct {
+	storage.Store
+}
+
+func (s failInstanceDeleteStore) WalletInstances() storage.WalletInstanceStore {
+	return failInstanceDeletes{WalletInstanceStore: s.Store.WalletInstances()}
+}
+
+type failInstanceDeletes struct {
+	storage.WalletInstanceStore
+}
+
+func (f failInstanceDeletes) Delete(context.Context, string) error {
+	return errors.New("storage is down")
+}
+
+// An account deletion that cannot remove a wallet instance must not report
+// success and must not delete the user record. An instance that outlives its
+// account is permanent: records are keyed by instance-key thumbprint and the
+// passkey link is write-once, so re-enrolling on that device would be refused
+// for good, and a deleted user cannot authenticate to ask again.
+func TestDeleteUser_IncompleteWhenAnInstanceSurvives(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	svc := NewUserService(failInstanceDeleteStore{Store: inner}, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := inner.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-stuck", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	err := svc.DeleteUser(ctx, userID, did)
+	if !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive so the request can be repeated, got %v", err)
+	}
+}
+
+// Tenant discovery failing is fatal for the same reason: instances in a
+// tenant this never looked at would be stranded by deleting the account.
+func TestDeleteUser_IncompleteWhenTenantDiscoveryFails(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	svc := NewUserService(failTenantLookupStore{Store: inner}, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	err := svc.DeleteUser(ctx, userID, did)
+	if !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive, got %v", err)
+	}
+}
+
+type failTenantLookupStore struct {
+	storage.Store
+}
+
+func (s failTenantLookupStore) UserTenants() storage.UserTenantStore {
+	return failTenantLookups{UserTenantStore: s.Store.UserTenants()}
+}
+
+type failTenantLookups struct {
+	storage.UserTenantStore
+}
+
+func (f failTenantLookups) GetUserTenants(context.Context, domain.UserID) ([]domain.TenantID, error) {
+	return nil, errors.New("storage is down")
+}

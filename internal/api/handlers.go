@@ -886,6 +886,17 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		domain.UserIDFromString(userID.(string)),
 		holderDID,
 	); err != nil {
+		if errors.Is(err, service.ErrDeletionIncomplete) {
+			// The account still exists on purpose, so the caller can repeat
+			// the request rather than be left with a stranded wallet
+			// instance and no way to authenticate.
+			h.logger.Error("Account deletion incomplete", zap.Error(err))
+			c.JSON(409, gin.H{
+				"error":   errCodeDeletionIncomplete,
+				"message": "part of the account data could not be removed; the account still exists, repeat the request to finish it",
+			})
+			return
+		}
 		h.logger.Error("Failed to delete user", zap.Error(err))
 		c.JSON(400, gin.H{"error": err.Error()})
 		return

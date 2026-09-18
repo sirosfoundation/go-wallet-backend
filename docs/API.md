@@ -293,13 +293,14 @@ erasing data then fails, the status change stands and the request answers
 `409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
 re-runs the cleanup, so the administrator retries until it gets `200`.
 
-Any change away from `active` also cuts off bearer tokens issued before it:
-legacy access and refresh tokens, and access tokens validated by the backend
-or accepted for a WebSocket handshake, are refused with `401` when their `iat`
+Revoking an instance also cuts off bearer tokens issued before it: legacy
+access and refresh tokens, and access tokens validated by the backend or
+accepted for a WebSocket handshake, are refused with `401` when their `iat`
 is not after the cut-off, even if they have not expired. No token is exempt.
-The cut-off is recorded before the status change is persisted, so a blocked
-instance never keeps working tokens. Tokens obtained after a reactivation work
-normally. A login or token refresh that races with a lifecycle change is
+The cut-off is recorded before the status change is persisted, so a revoked
+instance never keeps working tokens. The user's other devices log in again
+afterwards and their new tokens work normally; the revoked instance has no
+way back, since revocation cannot be undone. A login or token refresh that races with a lifecycle change is
 refused rather than handed a token that would be rejected on first use; the
 comparison is at whole seconds, and a token that would fall into the cut-off's
 own second is simply minted in the next one. The same cut-off applies at
@@ -374,6 +375,14 @@ The irreversible operation a user does own is removing the account, `DELETE
 /user/session`: it drops every session, erases the wallet data, stored
 credentials and presentations, deletes the user's wallet instances so the same
 device can enrol again, and removes the user record with its passkeys.
+
+If a wallet instance cannot be removed, the answer is `409
+DELETION_INCOMPLETE` and **the account still exists**. That is deliberate. An
+instance that outlives its account is permanent damage rather than residue:
+records are keyed by the instance-key thumbprint and the passkey link is
+write-once, so re-enrolling on that device would be refused for good, and a
+deleted user cannot authenticate to ask again. Repeat the request to finish
+it, as with `ERASURE_INCOMPLETE` on the lifecycle endpoints.
 
 ### Credential Management
 

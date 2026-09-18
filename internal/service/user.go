@@ -287,13 +287,28 @@ func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID
 	return nil
 }
 
+// ErrDeletionIncomplete is returned when account deletion could not remove
+// every wallet instance of the user. The user record is deliberately left in
+// place: an instance that outlives its account is permanent damage - the
+// records are keyed by instance-key thumbprint and the passkey link is
+// write-once, so re-enrolling on that device would be refused for good - and
+// keeping the account means the caller can still authenticate and repeat the
+// request. Repeating it is the documented recovery, as for
+// WalletLifecycleService's ErrErasureIncomplete.
+var ErrDeletionIncomplete = errors.New("account deletion incomplete")
+
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
+	var instanceErrs []error
 	// Get all tenants the user belongs to
+	// A failed membership lookup is fatal to the request rather than a
+	// warning to sweep past. Deleting the user record while instances in an
+	// undiscovered tenant keep pointing at them is not partial cleanup, it
+	// is permanent damage: the record survives, the caller can no longer
+	// authenticate to ask again, and the write-once binding blocks
+	// re-enrolment on that device for good.
 	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
-		s.logger.Warn("Failed to get user tenants for cleanup", zap.Error(err))
-		// Continue with user deletion even if we can't get tenants.
-		memberships = nil
+		return fmt.Errorf("%w: list tenant memberships: %w", ErrDeletionIncomplete, err)
 	}
 	// The default tenant is always swept, not only when the membership list
 	// is empty. A user registered there before any explicit membership
@@ -340,13 +355,18 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		// pointing at a user that no longer exists, so re-enrolling on the
 		// same device finds an instance bound to someone else and is refused
 		// for good (WIAService.checkInstanceBinding).
+		//
+		// A failure here is collected rather than logged and forgotten. It is
+		// the one step of this cleanup whose residue is permanent, and the
+		// user record is not deleted while any of it is outstanding, so the
+		// caller can still authenticate and repeat the request.
 		instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to list wallet instances for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+			instanceErrs = append(instanceErrs, fmt.Errorf("list wallet instances in tenant %s: %w", tenantID, err))
 		}
 		for _, inst := range instances {
 			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
-				s.logger.Warn("Failed to delete wallet instance", zap.Error(err), zap.String("instance_id", inst.ID))
+				instanceErrs = append(instanceErrs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
 			}
 		}
 
@@ -371,6 +391,16 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
 		}
+	}
+
+	// Stop short of deleting the user record when a wallet instance was left
+	// behind. Removing it now would strand that instance for good and take
+	// away the caller's only way to ask again; leaving it means the request
+	// can simply be repeated, the way an incomplete lifecycle cascade is.
+	if len(instanceErrs) > 0 {
+		s.logger.Error("Account deletion incomplete: wallet instances remain",
+			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(instanceErrs...))
 	}
 
 	// Delete the user
