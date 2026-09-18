@@ -1008,6 +1008,16 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 // and the bare form are accepted; see parseOffer.
 const offerURIScheme = "openid-credential-offer"
 
+// hasOfferURIScheme reports whether s is a credential-offer URI, i.e. whether
+// it starts with the offer scheme followed by ":". Scheme names are
+// case-insensitive (RFC 3986 section 3.1), so the comparison is too - an
+// issuer emitting OPENID-CREDENTIAL-OFFER:?... names the same scheme.
+func hasOfferURIScheme(s string) bool {
+	return len(s) > len(offerURIScheme) &&
+		s[len(offerURIScheme)] == ':' &&
+		strings.EqualFold(s[:len(offerURIScheme)], offerURIScheme)
+}
+
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
 	_ = h.ProgressMessage(StepParsingOffer, "Parsing credential offer")
 
@@ -1028,7 +1038,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 		// whole to json.Unmarshal below, which failed instantly with
 		// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed.
 		offerStr = msg.Offer
-		if strings.HasPrefix(offerStr, offerURIScheme+":") {
+		if hasOfferURIScheme(offerStr) {
 			// Extract credential_offer parameter
 			u, err := url.Parse(offerStr)
 			if err != nil {

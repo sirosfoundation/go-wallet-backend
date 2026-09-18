@@ -3237,6 +3237,11 @@ func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
 	}{
 		{"with authority", "openid-credential-offer://?credential_offer="},
 		{"without authority", "openid-credential-offer:?credential_offer="},
+		// Scheme names are case-insensitive (RFC 3986 section 3.1), so an
+		// issuer is free to emit the scheme in any case and still name this
+		// one.
+		{"uppercase scheme", "OPENID-CREDENTIAL-OFFER:?credential_offer="},
+		{"mixed case scheme with authority", "OpenID-Credential-Offer://?credential_offer="},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
@@ -3250,6 +3255,30 @@ func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
 			assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
 			assert.Equal(t, []string{"pid_1_8"}, offer.CredentialConfigurationIDs)
 		})
+	}
+}
+
+// TestHasOfferURIScheme pins the scheme match itself: case-insensitive per
+// RFC 3986 section 3.1, authority optional, and nothing else accepted.
+func TestHasOfferURIScheme(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"openid-credential-offer://?credential_offer=%7B%7D", true},
+		{"openid-credential-offer:?credential_offer=%7B%7D", true},
+		{"OPENID-CREDENTIAL-OFFER:?credential_offer=%7B%7D", true},
+		{"OpenID-Credential-Offer://?credential_offer=%7B%7D", true},
+		// A bare JSON offer is not a URI and must fall through to the parser.
+		{`{"credential_issuer":"https://issuer.example.com"}`, false},
+		// Neither a different scheme nor a longer name that merely starts the
+		// same way is this scheme.
+		{"openid-credential-offer-v2:?credential_offer=%7B%7D", false},
+		{"haip://?credential_offer=%7B%7D", false},
+		// The scheme alone, with no ":", is not a URI either.
+		{"openid-credential-offer", false},
+	} {
+		assert.Equal(t, tc.want, hasOfferURIScheme(tc.in), tc.in)
 	}
 }
 
