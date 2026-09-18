@@ -1013,19 +1013,46 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 	})
 }
 
+// offerURIScheme is the URI scheme of an OpenID4VCI credential offer. It is
+// matched without an authority component so that both the "//"-prefixed form
+// and the bare form are accepted; see parseOffer.
+const offerURIScheme = "openid-credential-offer"
+
+// hasOfferURIScheme reports whether s is a credential-offer URI: whether it
+// starts with the offer scheme, followed by ":". Scheme names are
+// case-insensitive (RFC 3986 section 3.1), so this comparison is too. An
+// issuer that emits OPENID-CREDENTIAL-OFFER:?... names the same scheme.
+func hasOfferURIScheme(s string) bool {
+	return len(s) > len(offerURIScheme) &&
+		s[len(offerURIScheme)] == ':' &&
+		strings.EqualFold(s[:len(offerURIScheme)], offerURIScheme)
+}
+
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
 	_ = h.ProgressMessage(StepParsingOffer, "Parsing credential offer")
 
 	var offerStr string
 
 	if msg.Offer != "" {
-		// Parse from openid-credential-offer:// URL
+		// Parse from an openid-credential-offer URI.
+		//
+		// Match on the scheme alone, not on "openid-credential-offer://".
+		// The authority component is empty either way, and RFC 3986 lets it
+		// be omitted entirely, so issuers emit both
+		//
+		//	openid-credential-offer://?credential_offer=...
+		//	openid-credential-offer:?credential_offer=...
+		//
+		// The second is what this deployment's own issuer gateway produces.
+		// Requiring the "//" made it fall past this branch and be handed
+		// whole to json.Unmarshal below, which failed instantly with
+		// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed.
 		offerStr = msg.Offer
-		if strings.HasPrefix(offerStr, "openid-credential-offer://") {
+		if hasOfferURIScheme(offerStr) {
 			// Extract credential_offer parameter
 			u, err := url.Parse(offerStr)
 			if err != nil {
-				return nil, fmt.Errorf("invalid offer URL: %w", err)
+				return nil, fmt.Errorf("invalid credential offer URI: %w", err)
 			}
 			offerStr = u.Query().Get("credential_offer")
 			if offerStr == "" {
@@ -1034,7 +1061,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 				if offerURI != "" {
 					return h.fetchOfferFromURI(ctx, offerURI)
 				}
-				return nil, errors.New("offer URL missing credential_offer parameter")
+				return nil, errors.New("credential offer URI carries neither a credential_offer nor a credential_offer_uri parameter")
 			}
 		}
 	} else if msg.CredentialOfferURI != "" {
