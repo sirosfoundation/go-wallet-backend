@@ -1062,9 +1062,27 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 // terminates the flow; with a non-empty one it is informational and the wait
 // continues, so a client that reports its matches before asking the user
 // behaves exactly as one that does not.
+//
+// The user-interaction deadline is taken once, before the first wait, and each
+// later wait gets only what is left of it. WaitForAction starts a fresh
+// UserInteractionTimeout per call, so without this a client repeating the
+// informational action would reset the clock every time and could hold a
+// pending flow slot open indefinitely without ever obtaining consent.
 func (h *OID4VPHandler) waitForSelectionAction(ctx context.Context, authReq *AuthorizationRequest) (*FlowActionMessage, error) {
+	return h.waitForSelectionActionUntil(ctx, authReq, time.Now().Add(UserInteractionTimeout))
+}
+
+// waitForSelectionActionUntil is waitForSelectionAction against an explicit
+// deadline, so a test can exercise the loop without waiting five minutes.
+func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq *AuthorizationRequest, deadline time.Time) (*FlowActionMessage, error) {
 	for {
-		action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline, ActionCredentialsMatched)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrFlowTimeout
+		}
+
+		action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, remaining,
+			ActionConsent, ActionDecline, ActionCredentialsMatched)
 		if err != nil {
 			return nil, err
 		}
@@ -1435,10 +1453,16 @@ func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *Author
 	// URL to redirect to and nothing is sent from here. Only looking at
 	// response_uri, which these verifiers do not set, meant they were never
 	// told and sat waiting for a response that was never coming.
+	//
+	// The endpoint is chosen exactly as submitResponse chooses it - response_uri
+	// first, redirect_uri otherwise. validateAuthorizationRequest only forbids
+	// redirect_uri for the direct_post modes, so a query/fragment request may
+	// carry both; picking differently here would deliver the vp_token to one
+	// endpoint and the failure to the other, leaving the verifier waiting.
 	if authReq.ResponseMode == ResponseModeQuery || authReq.ResponseMode == ResponseModeFragment {
-		target := authReq.RedirectURI
+		target := authReq.ResponseURI
 		if target == "" {
-			target = authReq.ResponseURI
+			target = authReq.RedirectURI
 		}
 		if target == "" {
 			return ""

@@ -2223,6 +2223,75 @@ func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testi
 	assert.Equal(t, "cred-1", selected[0].CredentialID)
 }
 
+func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {
+	h, session, _, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that keeps sending the informational credentials_matched action
+	// must not be able to hold the flow open: each wait used to start a fresh
+	// UserInteractionTimeout, so the deadline never arrived. Without one
+	// deadline across the loop this call never returns and the test hangs.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		raw, _ := json.Marshal(CredentialsMatchedPayload{
+			Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+		})
+		for {
+			select {
+			case <-stop:
+				return
+			case session.actionCh <- &FlowActionMessage{
+				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+				Action:  ActionCredentialsMatched,
+				Payload: raw,
+			}:
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	action, err := h.waitForSelectionActionUntil(ctx, &AuthorizationRequest{}, start.Add(300*time.Millisecond))
+
+	require.ErrorIs(t, err, ErrFlowTimeout, "the deadline must survive repeated informational actions")
+	assert.Nil(t, action)
+	assert.Less(t, time.Since(start), 10*time.Second, "the wait must end at the original deadline")
+}
+
+func TestSubmitErrorResponse_QueryModePrefersResponseURILikeSubmitResponse(t *testing.T) {
+	// validateAuthorizationRequest only forbids redirect_uri for the
+	// direct_post modes, so a query/fragment request may carry both. The
+	// failure has to go where submitResponse would have sent the vp_token -
+	// response_uri first - or the verifier is left waiting on the endpoint
+	// that was never told.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		ResponseURI:  "https://verifier.example/response",
+		RedirectURI:  "https://verifier.example/redirect",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/response", u.Path, "the error must go to the endpoint submitResponse would have used")
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+
+	// And redirect_uri is still the fallback when response_uri is absent.
+	authReq.ResponseURI = ""
+	redirect = h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+	u, err = url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/redirect", u.Path)
+}
+
 func TestRequestedCredentialTypes(t *testing.T) {
 	tests := []struct {
 		name string
