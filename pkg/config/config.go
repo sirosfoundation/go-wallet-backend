@@ -220,9 +220,12 @@ type HTTPClientConfig struct {
 	// Set to true when issuers are hosted on internal networks (dev/staging environments).
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
-	// AllowHTTP permits non-TLS (plain HTTP) for every outbound fetch this
-	// backend makes - request objects, issuer and verifier metadata, JWKS,
-	// logos, registry and proxy calls - not only for metadata resolution.
+	// AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through
+	// the client this configuration builds - request objects, issuer and
+	// verifier metadata, JWKS, logos, registry and proxy calls - not only for
+	// metadata resolution, which was its scope while the resolver was the sole
+	// consumer. Code that builds its own client rather than taking this one is
+	// not governed by it; see NewHTTPClient for which paths those are.
 	// Default: false (HTTPS required). Use only for local development.
 	// It is not the only setting that permits plaintext: see AllowsPlaintext,
 	// which is what every check in the codebase actually consults.
@@ -245,6 +248,20 @@ type HTTPClientConfig struct {
 //   - plain HTTP is refused unless AllowsPlaintext says otherwise, so a fetch
 //     cannot be downgraded to a network any observer on the path can read or
 //     rewrite.
+//
+// Both guards reach only what is fetched through this client. Two production
+// paths build their own and are governed by neither:
+//
+//   - internal/service.HelperService.GetCertificateChain, which dials TLS
+//     directly to read a certificate chain, so no http.Client is involved. It
+//     requires https itself but applies no address policy, and it is reachable
+//     from an authenticated endpoint with a caller-supplied URL.
+//   - internal/as's OIDC discovery and token exchange, which construct a bare
+//     http.Client, so neither the address nor the scheme policy applies.
+//
+// Bringing those under this configuration is separate work: the first is not an
+// http.Client at all, and the second would change which IdP addresses an
+// existing deployment can reach.
 //
 // When a proxy is in use the dialer only ever sees the proxy, so the address
 // policy is applied to the request's own host before it is sent. That check is
@@ -509,7 +526,14 @@ type ssrfGuard struct {
 
 func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	if g.httpsOnly && req.URL.Scheme != "https" {
-		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only (set http_client.allow_http, or allow_private_ips for an internal deployment)",
+		// Naming all three keys AllowsPlaintext consults, since an operator
+		// who reads only one of them is told to change a setting that may
+		// already be set. insecure_skip_verify is listed last and with the
+		// warning it deserves: it permits plaintext as a side effect of
+		// giving up certificate verification, which is not a reason to set it.
+		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only "+
+			"(set http_client.allow_http, or http_client.allow_private_ips for an internal deployment; "+
+			"http_client.insecure_skip_verify also permits plaintext, but do not enable it for that)",
 			req.URL.Scheme, req.URL.Host)
 	}
 

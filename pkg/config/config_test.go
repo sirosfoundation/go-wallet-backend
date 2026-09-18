@@ -2454,4 +2454,18 @@ func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
 	if !strings.Contains(err.Error(), "https only") {
 		t.Fatalf("error %q does not explain the refusal", err)
 	}
+
+	// The diagnostic has to name every key AllowsPlaintext consults, each with
+	// the prefix it is configured under. Naming only one of the three sends an
+	// operator to change a setting that may already be set, and an unprefixed
+	// key is not one that can be looked up in the configuration reference.
+	for _, key := range []string{
+		"http_client.allow_http",
+		"http_client.allow_private_ips",
+		"http_client.insecure_skip_verify",
+	} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("error %q does not mention %s", err, key)
+		}
+	}
 }
