@@ -19,7 +19,8 @@ import (
 
 // Emitter wraps the SET emit.Emitter for audit trail generation.
 type Emitter struct {
-	e *emit.Emitter
+	e      *emit.Emitter
+	logger *slog.Logger
 }
 
 // New creates a new audit Emitter. If signer is nil, returns nil (audit disabled).
@@ -30,8 +31,10 @@ func New(issuer string, signer jose.Signer, logger *slog.Logger) *Emitter {
 	var opts []emit.Option
 	if logger != nil {
 		opts = append(opts, emit.WithLogger(logger))
+	} else {
+		logger = slog.Default()
 	}
-	return &Emitter{e: emit.New(issuer, signer, opts...)}
+	return &Emitter{e: emit.New(issuer, signer, opts...), logger: logger}
 }
 
 // NewFromFile creates an Emitter from a PEM-encoded EC private key file.
@@ -115,7 +118,7 @@ func (a *Emitter) Emit(event set.EventURI, data map[string]any) {
 		return
 	}
 	if err := a.e.Emit(event, data); err != nil {
-		slog.Error("audit emit failed", "event", string(event), "error", err)
+		a.logger.Error("audit emit failed", "event", string(event), "error", err)
 	}
 }
 
@@ -125,6 +128,6 @@ func (a *Emitter) EmitWithSubject(event set.EventURI, subject string, data map[s
 		return
 	}
 	if err := a.e.EmitWithSubject(event, subject, data); err != nil {
-		slog.Error("audit emit failed", "event", string(event), "subject", subject, "error", err)
+		a.logger.Error("audit emit failed", "event", string(event), "subject", subject, "error", err)
 	}
 }

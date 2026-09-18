@@ -2,15 +2,9 @@ package api
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -18,7 +12,6 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
 
 func init() {
@@ -50,32 +43,6 @@ func TestNewAdminHandlers(t *testing.T) {
 	if handlers.logger == nil {
 		t.Error("Expected logger to be set")
 	}
-}
-
-func testAuditEmitter(t *testing.T) *audit.Emitter {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.CreateTemp(t.TempDir(), "audit-key-*.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-
-	e, err := audit.NewFromFile("https://test.example.com", f.Name(), "test-kid")
-	if err != nil {
-		t.Fatalf("audit.NewFromFile: %v", err)
-	}
-	return e
 }
 
 func TestEmitAudit_WithAuditorConfigured(t *testing.T) {
