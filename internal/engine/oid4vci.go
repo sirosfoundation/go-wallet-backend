@@ -54,14 +54,10 @@ type OID4VCIHandler struct {
 	// Authorization Request - see FlowStartMessage.AuthorizationDetails for
 	// why the Wallet decides this and the engine only forwards it.
 	authorizationDetails []AuthorizationDetail
-	// grantedAuthorizationDetails is what the Authorization Server echoed back
-	// in the token response (OID4VCI 1.0 §6), carrying the credential
-	// identifiers it actually granted.
-	grantedAuthorizationDetails []AuthorizationDetail
-	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
-	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
-	clientKID        string            // key ID from client JWK (for JWT kid header)
-	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
+	clientID             string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientJWK            *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
+	clientKID            string            // key ID from client JWK (for JWT kid header)
+	authServerIssuer     string            // AS issuer URL (for private_key_jwt aud claim)
 
 	// Client attestation provider for OAuth-Client-Attestation-based auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
@@ -1751,7 +1747,7 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	// be present - OID4VCI allows it, and an AS that understands only one
 	// still gets what it needs.
 	if len(h.authorizationDetails) > 0 {
-		if encoded, err := json.Marshal(h.authorizationDetails); err == nil {
+		if encoded, err := json.Marshal(requestAuthorizationDetails(h.authorizationDetails)); err == nil {
 			params.Set("authorization_details", string(encoded))
 		} else {
 			h.Logger.Warn("could not encode authorization_details; falling back to scope only",
@@ -2086,6 +2082,26 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	}
 
 	return resp.Proofs, nil
+}
+
+// requestAuthorizationDetails projects client-supplied details down to the
+// fields that belong in an Authorization Request.
+//
+// AuthorizationDetail is one type for both directions, and
+// credential_identifiers is response-only: the Authorization Server grants
+// those in its token response (OID4VCI 1.0 §6). Marshaling the client's value
+// straight through would let a client put them in flow_start and have the
+// engine send them as a request parameter, which is not a thing a Wallet may
+// ask for. The engine forwards intent, not whatever it was handed.
+func requestAuthorizationDetails(details []AuthorizationDetail) []AuthorizationDetail {
+	projected := make([]AuthorizationDetail, 0, len(details))
+	for _, detail := range details {
+		projected = append(projected, AuthorizationDetail{
+			Type:                      detail.Type,
+			CredentialConfigurationID: detail.CredentialConfigurationID,
+		})
+	}
+	return projected
 }
 
 // grantedCredentialIdentifier returns the credential identifier the

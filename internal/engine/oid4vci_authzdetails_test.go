@@ -86,3 +86,37 @@ func TestTokenResponseParsesTheAuthorizationDetailsEcho(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(raw), &token))
 	assert.Equal(t, "cid-1", grantedCredentialIdentifier(&token, "pid"))
 }
+
+func TestResponseOnlyFieldsNeverReachTheAuthorizationRequest(t *testing.T) {
+	// credential_identifiers is granted by the Authorization Server in its
+	// token response. A client that puts them in flow_start must not have the
+	// engine send them as a request parameter - the engine forwards intent,
+	// not whatever it was handed.
+	projected := requestAuthorizationDetails([]AuthorizationDetail{
+		{
+			Type:                      "openid_credential",
+			CredentialConfigurationID: "pid",
+			CredentialIdentifiers:     []string{"smuggled"},
+		},
+	})
+
+	require.Len(t, projected, 1)
+	assert.Equal(t, "openid_credential", projected[0].Type)
+	assert.Equal(t, "pid", projected[0].CredentialConfigurationID)
+	assert.Empty(t, projected[0].CredentialIdentifiers)
+
+	encoded, err := json.Marshal(projected)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "credential_identifiers")
+	assert.NotContains(t, string(encoded), "smuggled")
+}
+
+func TestProjectionPreservesEveryRequestedConfiguration(t *testing.T) {
+	projected := requestAuthorizationDetails([]AuthorizationDetail{
+		{Type: "openid_credential", CredentialConfigurationID: "pid"},
+		{Type: "openid_credential", CredentialConfigurationID: "mdl"},
+	})
+	require.Len(t, projected, 2)
+	assert.Equal(t, "pid", projected[0].CredentialConfigurationID)
+	assert.Equal(t, "mdl", projected[1].CredentialConfigurationID)
+}
