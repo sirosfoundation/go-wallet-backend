@@ -78,16 +78,17 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
 		// SID-AUTH-06: a suspended or revoked wallet instance is a distinct,
 		// stable refusal so the client can tell the user what happened
-		// instead of retrying a login that can never succeed. The code and
-		// message come from service.LifecycleRefusal, the same mapping the
-		// wallet API's login handler uses, so a deactivated wallet - which
-		// needs a new enrollment - is not reported as an ordinary instance
-		// revocation, where the user's other devices are unaffected.
+		// instead of retrying a login that can never succeed. The code,
+		// scope and message come from service.LifecycleRefusalDetails, the
+		// same mapping the wallet API's login handler uses, so a deactivated
+		// wallet - scope "wallet", which needs a new enrollment - is not
+		// reported as an ordinary instance revocation, where the user's
+		// other devices answer for themselves at their own login.
 		switch {
 		case errors.Is(err, service.ErrWalletInstanceSuspended),
 			errors.Is(err, service.ErrWalletInstanceRevoked):
-			code, message := service.LifecycleRefusal(err)
-			c.JSON(http.StatusForbidden, gin.H{"error": code, "message": message})
+			d := service.LifecycleRefusalDetails(err)
+			c.JSON(http.StatusForbidden, gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message})
 		default:
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		}

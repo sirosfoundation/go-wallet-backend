@@ -181,14 +181,17 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		code string
-		// msg distinguishes one revoked instance from a deactivated wallet,
-		// which needs a new enrollment - they share the WALLET_REVOKED code,
-		// so the message is the only thing that tells them apart.
+		// scope distinguishes one revoked instance from a deactivated
+		// wallet, which needs a new enrollment: they share the
+		// WALLET_REVOKED code, and scope is the machine-readable field that
+		// tells them apart.
+		scope string
+		// msg says the same thing for a human, and is display-only.
 		msg string
 	}{
-		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED", "has been suspended"},
-		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", "other devices enrolled to this wallet keep their own status"},
-		{service.ErrWalletDeactivated, "WALLET_REVOKED", "a new enrollment is required"},
+		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED", service.LifecycleScopeInstance, "has been suspended"},
+		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", service.LifecycleScopeInstance, "other devices enrolled to this wallet keep their own status"},
+		{service.ErrWalletDeactivated, "WALLET_REVOKED", service.LifecycleScopeWallet, "a new enrollment is required"},
 	} {
 		router, _ := setupPasskeyHandlers(&mockWebAuthn{finishLoginErr: tc.err})
 		body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
@@ -204,6 +207,15 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 		}
 		if !bytes.Contains(w.Body.Bytes(), []byte(tc.msg)) {
 			t.Errorf("expected body to carry %q, got %s", tc.msg, w.Body.String())
+		}
+		var got struct {
+			Scope string `json:"scope"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s: body is not JSON: %v", tc.code, err)
+		}
+		if got.Scope != tc.scope {
+			t.Errorf("%s: expected scope %q, got %q", tc.code, tc.scope, got.Scope)
 		}
 	}
 }

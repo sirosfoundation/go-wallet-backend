@@ -891,6 +891,13 @@ paths:
         wallet-data erasure on the last revocation). If the cascade does not
         complete, the status change is still recorded and the response is
         409 `ERASURE_INCOMPLETE`; repeat the request to finish it.
+
+        Two scopes of the cascade are wider than the status change itself and
+        are deliberate SIROS decisions rather than requirements: the token
+        cut-off and session drop apply to the whole user, not just the
+        affected instance, and revoking the last non-revoked instance erases
+        the wallet data. Both are explained in docs/API.md under "Wallet
+        instance lifecycle (SID-AUTH-06)".
       operationId: updateWalletInstanceStatus
       parameters:
         - $ref: '#/components/parameters/tenantId'

@@ -156,14 +156,120 @@ the passkey linked to a suspended or revoked instance is refused with `403
 WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
 still log in.
 
+##### Scope of the cut-off
+
+A lifecycle change is about one wallet instance, but the token cut-off and the
+session drop it triggers are about the whole user: every device of that user
+is signed out and has to authenticate again. The other, non-revoked devices
+log in again immediately - that is the "still log in" above - but they do not
+keep the session they had.
+
+This is wider than the change that caused it, and deliberately so rather than
+by oversight. A bearer token carries the user, the tenant, an `iat` and a
+`jti`, and a session record carries the user and the tenant; neither says
+which wallet instance it belongs to, and the gate has one cut-off instant per
+user to compare them against. Narrowing the cut-off to the affected device
+with no such identity would simply stop cutting it off: its already-issued
+token would keep working until it expired, and no check after login looks at
+instance status, so that device could keep starting issuance and presentation
+flows. Signing the user out everywhere is the only sound approximation the
+data supports.
+
+Narrowing it properly needs the instance identity to survive login - carried
+on the session and in the token, with the cut-off recorded per instance - at
+which point revoking one device would leave the others' sessions alone. That
+is a design change, not a bug fix, and it is open.
+
 Wallet instances are per tenant. Revoking the last non-revoked instance of a
 user in a tenant deactivates the wallet in that tenant: the credentials and
 presentations held there are erased, every passkey of the user is refused at
 login in that tenant (`403 WALLET_REVOKED`), and a new enrollment is required.
-The `message` field of the 403 tells the two cases apart for the user. The
-user-level data shared across tenants - the encrypted private data (the
+The user-level data shared across tenants - the encrypted private data (the
 custodian of the wallet's keys) and pending challenges - is erased once no
 non-revoked instance remains in any tenant the user belongs to.
+
+A login refusal carries three fields, and only two of them are for the client
+to act on:
+
+```json
+{ "error": "WALLET_REVOKED", "scope": "instance", "message": "..." }
+```
+
+`error` is the stable code (`WALLET_SUSPENDED` or `WALLET_REVOKED`) and
+`scope` says what the refusal is about:
+
+| `scope` | meaning |
+| --- | --- |
+| `instance` | This device is suspended or revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
+| `wallet` | The wallet is deactivated: no instance of it is left to reactivate, its credentials and presentations here have been erased, and a new enrollment is required. Only `WALLET_REVOKED` carries this scope. |
+
+`WALLET_REVOKED` means both cases, because it has since the first release, so
+`scope` is what separates them. `message` is for display only: no client
+decision may depend on reading it.
+
+Both scopes are about the tenant the login was for, since wallet instances
+are per tenant and so is the refusal. For a user who belongs to more than one
+tenant, `scope: "wallet"` says this wallet cannot be opened in this tenant; it
+does not say that nothing of the user's remains anywhere. The data shared
+across tenants - the private data that holds the wallet's keys, and pending
+challenges - is erased only once no non-revoked instance remains in any of
+that user's tenants, so a user still live in another tenant keeps it and
+keeps logging in there.
+
+##### Why the login gate is where a blocked instance is stopped
+
+Refusing login for the passkey linked to a suspended or revoked instance is
+the only enforcement in the backend that knows *which* wallet instance is
+acting. It is not a duplicate of the WIA gate, and removing it as one would
+open a hole.
+
+A wallet instance is identified by its key, and the backend sees that
+identity when the instance asks for a WIA - and at login, through the passkey
+linked to it. Nowhere else: an access token carries the user, the tenant, an
+`iat` and a `jti`, a WebSocket session carries the user, the tenant and the
+handshake token's `iat`, and no issuance or presentation flow checks instance
+status. The WIA gate refuses a blocked instance an attestation, which
+external parties that require client attestation act on, but this backend
+never demands a WIA of its own. A blocked instance that could log in would
+therefore still be able to open a session and run issuance and presentation
+flows here.
+
+ARF v3 puts a revoked Wallet Unit in a state where the user can still view
+what it holds and loses only issuance and presentation, which would mean
+refusing at login only for a deactivated wallet. Getting there means carrying
+the instance identity past login and refusing issuance and presentation where
+they happen - the same prerequisite as scoping the cut-off, above. Until then
+the gate stays where it is, and the cost is stated plainly: the user cannot
+log in from a revoked device to look at what it holds.
+
+##### Why revoking the last instance erases (a SIROS decision)
+
+Erasing the wallet data when the last non-revoked instance goes is a product
+decision, not a requirement. ARF v3 has a Wallet Unit reach its terminal
+Revoked state without losing anything: the user can still view the
+attestations and the transaction log they hold, and what they lose is
+issuance and presentation. Erasure goes further than that, so it is recorded
+here rather than presented as conformance.
+
+It is kept because in this backend erasure is not what ends the user's
+access - the login gate is. Once no non-revoked instance remains, every
+passkey of that user is refused at login and a new attestation is refused as
+well, so nothing can read the data any more whichever way the wallet got
+there. Keeping it would retain key material and credentials for a wallet that
+can never be opened again, which is a liability and no benefit to anyone.
+
+Tying erasure to an explicit "deactivate my wallet" alone would also make
+retention depend on the order of clicks: a user who revokes three devices one
+at a time would end in exactly the same unusable state as a user who pressed
+revoke-all, with the data kept in one case and erased in the other. There is
+no distinction there worth holding data for.
+
+The trade-off is real and is tied to the login gate: if login is ever
+narrowed to refuse only a deactivated wallet - so a revoked instance could
+still log in and read what it holds, which is what the ARF's Revoked state
+describes - then this trigger has to be revisited in the same change, because
+erasure would then be taking away something the user could otherwise still
+see.
 
 The status change is recorded before the cascade runs. If dropping sessions or
 erasing data then fails, the status change stands and the request answers

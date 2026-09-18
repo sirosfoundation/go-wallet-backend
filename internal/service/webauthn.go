@@ -69,28 +69,76 @@ var (
 	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
 )
 
-// LifecycleRefusal maps a SID-AUTH-06 login refusal to its stable error code
-// and a user-facing message. The code only says suspended or revoked (that is
-// what clients switch on); the message tells the user whether the other
-// devices keep their own status (a suspended sibling still needs
-// reactivation, so it does not promise they all log in) or the whole wallet
-// is gone and must be re-enrolled. ErrWalletDeactivated wraps
-// ErrWalletInstanceRevoked, so it is matched first.
+// LifecycleScopeInstance and LifecycleScopeWallet are the values of the
+// `scope` field of a SID-AUTH-06 login refusal: whether the refusal is about
+// this one wallet instance, or about the whole wallet the login was for.
+//
+// The distinction decides what a client does next, so it must be readable
+// without parsing prose: with scope "instance" the wallet still exists and
+// the user's other devices answer for themselves at their own login, while
+// with scope "wallet" no instance of it is left to reactivate and a new
+// enrollment is required. The error codes cannot carry it - WALLET_REVOKED
+// has meant both since the first release - so it is exposed alongside them.
+//
+// Both scopes are about the tenant the login was for, because that is what
+// checkWalletLifecycle looks at (WalletInstanceStore.GetByUser is per
+// tenant) and what the refusal governs. For a user who belongs to more than
+// one tenant, scope "wallet" therefore says this wallet cannot be opened
+// here and not that nothing of the user's is left anywhere: the data shared
+// across tenants - the private data that holds the wallet's keys, and the
+// pending challenges - is erased only when no live instance remains in any
+// of the user's tenants, see WalletLifecycleService.eraseWalletData.
+const (
+	LifecycleScopeInstance = "instance"
+	LifecycleScopeWallet   = "wallet"
+)
+
+// LifecycleRefusalDetail is one SID-AUTH-06 login refusal as it appears on
+// the wire: the stable error code clients switch on, the scope that says
+// whether the wallet still exists, and a user-facing message.
+type LifecycleRefusalDetail struct {
+	// Code is WALLET_SUSPENDED or WALLET_REVOKED.
+	Code string
+	// Scope is LifecycleScopeInstance or LifecycleScopeWallet, and is
+	// about the tenant the refused login was for.
+	Scope string
+	// Message is the user-facing explanation. It is for display only:
+	// nothing a client decides may depend on reading it.
+	Message string
+}
+
+// LifecycleRefusalDetails maps a SID-AUTH-06 login refusal to its wire form.
+// The code only says suspended or revoked (that is what existing clients
+// switch on) and the scope says whether one instance or the whole wallet is
+// refused; the message says the same thing for a human. ErrWalletDeactivated
+// wraps ErrWalletInstanceRevoked, so it is matched first.
 //
 // Every login handler answers with this, so the wallet API and the AS passkey
 // endpoint cannot disagree about what a refusal means.
-func LifecycleRefusal(err error) (code, message string) {
+func LifecycleRefusalDetails(err error) LifecycleRefusalDetail {
 	switch {
 	case errors.Is(err, ErrWalletInstanceSuspended):
-		return "WALLET_SUSPENDED", "This wallet instance has been suspended"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_SUSPENDED",
+			Scope:   LifecycleScopeInstance,
+			Message: "This wallet instance has been suspended",
+		}
 	case errors.Is(err, ErrWalletDeactivated):
-		return "WALLET_REVOKED", "This wallet has been deactivated; a new enrollment is required"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeWallet,
+			Message: "This wallet has been deactivated; a new enrollment is required",
+		}
 	default:
 		// Not "other devices are not affected": this refusal is about this
 		// instance, and another device may well be suspended or revoked in
 		// its own right. It says what this revocation did, and leaves the
 		// others to answer for themselves at their own login.
-		return "WALLET_REVOKED", "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status"
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeInstance,
+			Message: "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status",
+		}
 	}
 }
 
@@ -1974,6 +2022,29 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 // linked to this passkey does not block login - it is still blocked from
 // obtaining a WIA (WIAService), and the user must be able to log in from
 // another device to manage it. A user with no instances yet is unaffected.
+//
+// This gate is load-bearing, not a second copy of the WIA gate, and it is
+// worth saying why before someone removes it as redundant. It is the only
+// check in the backend that knows which wallet instance is acting: the
+// instance is identified by its key, and after login nothing carries that
+// identity - an access token carries the user, the tenant, an iat and a jti,
+// and an engine session carries the user, the tenant and the handshake
+// token's iat. The WIA gate refuses a blocked instance an attestation, which
+// external parties that require client attestation will act on, but this
+// backend never requires a WIA of its own: a token is enough to open a
+// WebSocket and start an issuance or presentation flow, and no flow checks
+// instance status. So a blocked instance that could log in could still issue
+// and present here.
+//
+// ARF v3 would have a revoked Wallet Unit keep reading what it holds and
+// lose only issuance and presentation, which would mean refusing at login
+// only for a deactivated wallet. Narrowing this gate to that is the right
+// shape, and it needs the instance identity to survive login first - the
+// same prerequisite as scoping the token cut-off (see
+// WalletLifecycleService.cutOffTokens) - so that issuance and presentation
+// can be refused where they happen. Until then this is where a blocked
+// instance is stopped, and the cost is the one the ARF would not pay: the
+// user cannot log in to look at what that device holds.
 func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID string) error {
 	instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
 	if err != nil {

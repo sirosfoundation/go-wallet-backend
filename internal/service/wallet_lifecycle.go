@@ -59,6 +59,16 @@ type LifecycleActor struct {
 // erased, and login is refused for every passkey of that user, so re-activation
 // requires a full new enrollment. Data is never erased while an instance the
 // user could still reactivate remains.
+//
+// Erasing on the last revocation rather than only on an explicit "deactivate
+// my wallet" is a SIROS decision, not a requirement: ARF v3 lets a Wallet
+// Unit sit in its terminal Revoked state with the user still able to view
+// what it holds. It is kept because here the login gate, not the erasure,
+// is what ends that access - once nothing live remains every passkey of the
+// user is refused and a new attestation is refused too - so the data could
+// only be retained, never read. See docs/API.md, "Why revoking the last
+// instance erases"; if the login gate is ever narrowed to deactivation
+// alone, this trigger has to be revisited with it.
 type WalletLifecycleService struct {
 	store          storage.Store
 	logger         *zap.Logger
@@ -144,6 +154,17 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 // user (see internal/tokengate): bearer tokens issued before now stop
 // working, except the one carrying this request. Instances without a user
 // have no tokens to cut off.
+//
+// The cut-off is user-wide even when one instance changed, because a bearer
+// token carries no instance identity: its claims are the user, the tenant,
+// an iat and a jti (UserService.generateToken), and the gate has nothing
+// finer than User.AuthInvalidBefore to compare them against. Cutting off the
+// user is the only sound over-approximation available - narrowing it to the
+// affected device would leave that device's already-issued token working
+// until it expires, and nothing downstream of login checks instance status,
+// so it could keep running issuance and presentation flows. Narrowing this
+// needs an instance identity to survive login; see the note in
+// docs/API.md under "Scope of the cut-off".
 func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.WalletInstance, actor LifecycleActor) error {
 	if inst.UserID == nil {
 		return nil
@@ -266,6 +287,12 @@ func (s *WalletLifecycleService) unsweptErr(ctx context.Context, tenantID domain
 // decision is taken per tenant. It returns ErrErasureIncomplete (wrapping the
 // underlying failures) when any step did not complete; the status change
 // itself is already persisted at that point.
+//
+// The session drop is user-wide for the same reason the cut-off is (see
+// cutOffTokens): a session record carries the user and the tenant and
+// nothing that says which wallet instance authenticated it. Scoping it alone
+// would change nothing a user could observe anyway, since the user-wide
+// cut-off already forces every device to authenticate again.
 func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
 	if inst.UserID == nil {
 		return nil
