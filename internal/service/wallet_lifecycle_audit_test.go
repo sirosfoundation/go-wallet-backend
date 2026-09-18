@@ -28,7 +28,7 @@ func TestWalletLifecycle_EmitAudit(t *testing.T) {
 	actor := LifecycleActor{Kind: "admin"}
 
 	for _, status := range []domain.InstanceStatus{
-		domain.InstanceStatusRevoked, domain.InstanceStatusSuspended, domain.InstanceStatusActive, domain.InstanceStatus("unknown"),
+		domain.InstanceStatusRevoked, domain.InstanceStatusActive, domain.InstanceStatus("unknown"),
 	} {
 		require.NotPanics(t, func() { withAudit.emitAudit("inst-1", status, "test", actor) }, string(status))
 		require.NotPanics(t, func() { withoutAudit.emitAudit("inst-1", status, "test", actor) }, string(status))

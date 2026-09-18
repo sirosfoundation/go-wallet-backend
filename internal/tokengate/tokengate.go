@@ -1,7 +1,7 @@
 // Package tokengate refuses bearer tokens that were issued before a user's
 // authorization was cut off by a wallet lifecycle event (SID-AUTH-06).
 //
-// Suspending or revoking a wallet instance drops the user's live sessions,
+// Revoking a wallet instance drops the user's live sessions,
 // but a stateless bearer token that was already issued stays valid until it
 // expires - up to a day for legacy HMAC tokens, longer for refresh tokens.
 // The lifecycle service therefore records User.AuthInvalidBefore, and every

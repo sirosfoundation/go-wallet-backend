@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -46,14 +47,14 @@ func TestWalletInstanceStore_Upsert_Existing(t *testing.T) {
 		t.Fatalf("Upsert first: %v", err)
 	}
 
-	// Upsert again with updated fields. Status is deliberately set to Suspended
+	// Upsert again with updated fields. Status is deliberately set to Revoked
 	// here to verify Upsert does NOT apply it — lifecycle changes only happen
 	// through UpdateStatus (see TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated).
 	uid := domain.UserIDFromString("user-1")
 	inst2 := &domain.WalletInstance{
 		ID:                "inst-up",
 		TenantID:          "acme",
-		Status:            domain.InstanceStatusSuspended,
+		Status:            domain.InstanceStatusRevoked,
 		UserID:            &uid,
 		AttestationSource: "backend_attested",
 		DeviceInfo:        &domain.DeviceInfo{Platform: "web"},
@@ -81,7 +82,7 @@ func TestWalletInstanceStore_Upsert_Existing(t *testing.T) {
 }
 
 // TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated is a regression test:
-// a suspended/revoked instance must stay that way across subsequent Upsert calls
+// a revoked instance must stay that way across subsequent Upsert calls
 // (i.e. subsequent WIA re-attestations), since Upsert is what WIAService.signWIA
 // calls on every successful attestation.
 func TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated(t *testing.T) {
@@ -201,13 +202,13 @@ func TestWalletInstanceStore_IncrementAttestation_NotFound(t *testing.T) {
 	}
 }
 
-func TestWalletInstanceStore_UpdateStatus_Suspend(t *testing.T) {
+func TestWalletInstanceStore_UpdateStatus_Revoke(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
 	wis := store.WalletInstances()
 
 	inst := &domain.WalletInstance{
-		ID:       "inst-sus",
+		ID:       "inst-rev",
 		TenantID: "acme",
 		Status:   domain.InstanceStatusActive,
 	}
@@ -215,32 +216,36 @@ func TestWalletInstanceStore_UpdateStatus_Suspend(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	if err := wis.UpdateStatus(ctx, "inst-sus", domain.InstanceStatusSuspended, "policy violation"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-rev", domain.InstanceStatusRevoked, "policy violation"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
 	}
 
-	got, err := wis.GetByID(ctx, "inst-sus")
+	got, err := wis.GetByID(ctx, "inst-rev")
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	if got.Status != domain.InstanceStatusSuspended {
-		t.Errorf("status = %s, want suspended", got.Status)
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, want revoked", got.Status)
 	}
 	if got.DeactivatedAt == nil {
-		t.Error("deactivated_at should be set for suspended")
+		t.Error("deactivated_at should be set for a revoked instance")
 	}
 	if got.DeactivationReason != "policy violation" {
 		t.Errorf("deactivation_reason = %q, want %q", got.DeactivationReason, "policy violation")
 	}
 }
 
-func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
+// TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal pins the shape of
+// the state machine: there is no way back from revoked, and "active" is not a
+// status this method will write at all. An instance is active from the moment
+// it is inserted, so accepting it here could only ever mean reactivation.
+func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
 	wis := store.WalletInstances()
 
 	inst := &domain.WalletInstance{
-		ID:       "inst-react",
+		ID:       "inst-term",
 		TenantID: "acme",
 		Status:   domain.InstanceStatusActive,
 	}
@@ -248,28 +253,30 @@ func TestWalletInstanceStore_UpdateStatus_Reactivate(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// Suspend first
-	if err := wis.UpdateStatus(ctx, "inst-react", domain.InstanceStatusSuspended, "temp"); err != nil {
-		t.Fatalf("Suspend: %v", err)
+	// Reactivating an active instance is refused before it is even a
+	// transition question.
+	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatus(active) on an active instance = %v, want ErrInvalidStatusTransition", err)
 	}
 
-	// Reactivate
-	if err := wis.UpdateStatus(ctx, "inst-react", domain.InstanceStatusActive, ""); err != nil {
-		t.Fatalf("Reactivate: %v", err)
+	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusRevoked, "stolen"); err != nil {
+		t.Fatalf("Revoke: %v", err)
 	}
 
-	got, err := wis.GetByID(ctx, "inst-react")
+	// And there is no way back out of revoked.
+	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatus(active) on a revoked instance = %v, want ErrInvalidStatusTransition", err)
+	}
+
+	got, err := wis.GetByID(ctx, "inst-term")
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	if got.Status != domain.InstanceStatusActive {
-		t.Errorf("status = %s, want active", got.Status)
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, want revoked", got.Status)
 	}
-	if got.DeactivatedAt != nil {
-		t.Error("deactivated_at should be nil after reactivation")
-	}
-	if got.DeactivationReason != "" {
-		t.Errorf("deactivation_reason should be empty, got %q", got.DeactivationReason)
+	if got.DeactivationReason != "stolen" {
+		t.Errorf("deactivation_reason = %q, want %q", got.DeactivationReason, "stolen")
 	}
 }
 
@@ -280,7 +287,7 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	if err := store.WalletInstances().Upsert(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", domain.InstanceStatusSuspended, "x"); err != nil {
+	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", domain.InstanceStatusRevoked, "x"); err != nil {
 		t.Fatal(err)
 	}
 	// A later attestation that now names the passkey records the link but
@@ -295,7 +302,7 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	if got.CredentialID != "pk-1" {
 		t.Errorf("credential id not recorded: %q", got.CredentialID)
 	}
-	if got.Status != domain.InstanceStatusSuspended {
+	if got.Status != domain.InstanceStatusRevoked {
 		t.Errorf("status must be untouched by upsert, got %s", got.Status)
 	}
 	// An attestation without the id keeps the recorded link.

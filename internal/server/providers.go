@@ -158,13 +158,16 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			// reads, and gating a listing on it would let a read-only token
 			// enumerate instances a list-only token cannot see.
 			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.ListMyWalletInstances)
-			// `w` covers suspend/reactivate; the handler additionally requires
-			// `d` when the target status is `revoked` (terminal, may erase).
-			// Changing an instance's status is a provider action: it is
-			// reversible only by a provider, so a user doing it to the
+			// `w`: logging out everywhere changes server-side state (it
+			// advances the token cut-off and drops live sessions) but
+			// destroys nothing, so it is a write and not a delete.
+			//
+			// There is no self-service route that revokes an instance.
+			// Revocation cannot be undone, so a user who revoked the
 			// instance behind their last passkey would lock themselves out
-			// (SID-AUTH-06, admin_instance_handlers.go). What a user owns is
-			// logging out everywhere, and removing the account outright.
+			// with no way back (SID-AUTH-06, admin_instance_handlers.go).
+			// What a user owns is logging out everywhere, and removing the
+			// account outright.
 			session.POST("/logout-all", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.LogoutEverywhere)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)

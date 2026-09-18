@@ -47,18 +47,21 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	}
 	require.NoError(t, wis.Upsert(ctx, inst))
 
-	require.NoError(t, wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusSuspended, "policy violation"))
-	got, err := wis.GetByID(ctx, "inst-valid-transitions")
-	require.NoError(t, err)
-	require.Equal(t, domain.InstanceStatusSuspended, got.Status)
-	require.NotNil(t, got.DeactivatedAt)
+	// "active" is refused outright: an instance is active from insert, so
+	// writing it could only ever mean reactivation.
+	err := wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 
 	require.NoError(t, wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusRevoked, "compromised"))
-	got, err = wis.GetByID(ctx, "inst-valid-transitions")
+	got, err := wis.GetByID(ctx, "inst-valid-transitions")
 	require.NoError(t, err)
 	require.Equal(t, domain.InstanceStatusRevoked, got.Status)
+	require.NotNil(t, got.DeactivatedAt)
+	require.Equal(t, "compromised", got.DeactivationReason)
 
 	// Revoked is terminal: attempting to reactivate must fail.
 	err = wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
 	require.Error(t, err)
+	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 }

@@ -61,8 +61,8 @@ type WIAGenerateRequest struct {
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
 	// CredentialID is the base64url WebAuthn credential id of the passkey this
-	// wallet instance logs in with, so that suspending or revoking the instance
-	// also refuses login with that passkey (SID-AUTH-06). Optional.
+	// wallet instance logs in with, so that revoking the instance also
+	// refuses login with that passkey (SID-AUTH-06). Optional.
 	CredentialID string `json:"credential_id,omitempty"`
 }
 
@@ -122,7 +122,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":   "INSTANCE_DEACTIVATED",
-				"message": "This wallet instance has been suspended or revoked",
+				"message": "This wallet instance has been revoked",
 			})
 		case errors.Is(err, service.ErrWIAInstanceNotOwned):
 			h.logger.Warn("WIA generation refused: instance bound to another tenant or user", zap.Error(err))

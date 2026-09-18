@@ -67,7 +67,7 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 
 // newTestWIAServiceWithInstances is like newTestWIAService but wires a real
 // (in-memory) wallet instance store, needed for tests that exercise
-// suspend/revoke enforcement.
+// revocation enforcement.
 func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletInstanceStore) {
 	t.Helper()
 	instances := memory.NewStore().WalletInstances()
@@ -530,7 +530,7 @@ func TestWIAService_GenerateWIA_RecordsUserID(t *testing.T) {
 }
 
 // TestWIAService_GenerateWIA_RefusesRevokedInstance is a regression test for the
-// bug where a revoked/suspended wallet instance could obtain a fresh, fully valid
+// bug where a revoked wallet instance could obtain a fresh, fully valid
 // WIA simply by requesting a new challenge/PoP with the same instance key —
 // silently bypassing admin revocation.
 func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {

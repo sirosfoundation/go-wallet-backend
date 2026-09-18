@@ -148,8 +148,8 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		}
 
 		// SID-AUTH-06: refuse tokens issued before the user's wallet was
-		// suspended or revoked (sessions are dropped, but a stateless token
-		// would otherwise stay valid until it expires).
+		// revoked (sessions are dropped, but a stateless token would
+		// otherwise stay valid until it expires).
 		if !checkTokenGate(c, gate, userID, tokengate.IssuedAtFromClaims(claims), logger) {
 			return
 		}

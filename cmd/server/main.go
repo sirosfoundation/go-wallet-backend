@@ -272,7 +272,7 @@ func main() {
 	// Wire session cleaners into UserService so DeleteUser purges AS cookie
 	// sessions and, when the engine runs in this process, live engine
 	// (WebSocket) sessions alike, and into the wallet lifecycle service so
-	// suspending or revoking a wallet instance drops the same sessions
+	// revoking a wallet instance drops the same sessions
 	// (SID-AUTH-06). The AS cleaner is wired regardless of the engine role:
 	// a --mode=backend deployment has AS sessions to drop too. The engine
 	// cleaner is the Manager, which closes the open WebSocket as well as

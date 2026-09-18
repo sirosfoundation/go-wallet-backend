@@ -20,7 +20,7 @@ import (
 var ErrWalletInstanceNotOwned = errors.New("wallet instance does not belong to this user")
 
 // ErrErasureIncomplete is returned by ChangeStatus and RevokeAllForUser when
-// the status change was persisted (the instance *is* suspended or revoked)
+// the status change was persisted (the instance *is* revoked)
 // but part of the cascade - dropping sessions, erasing wallet data - failed.
 // Handlers map it to 409: the client repeats the request to finish the
 // erasure. It wraps the underlying failures.
@@ -73,7 +73,7 @@ func NewWalletLifecycleService(store storage.Store, logger *zap.Logger, auditor 
 	return &WalletLifecycleService{store: store, logger: logger.Named("wallet-lifecycle"), audit: auditor}
 }
 
-// SetSessionCleaner wires the engine session store so suspend/revoke drop the
+// SetSessionCleaner wires the engine session store so revocation drops the
 // user's live sessions.
 func (s *WalletLifecycleService) SetSessionCleaner(sc SessionCleaner) { s.sessionCleaner = sc }
 
@@ -384,11 +384,10 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// of the user's tenants) and the pending challenges, then the user-level
 	// key material. That last write also advances the token cut-off (one
 	// atomic update, see UserStore.EraseWalletData) so a record loaded
-	// before it is fenced out of Update. When everything succeeded the
-	// acting token's exemption is dropped as well: a deactivated wallet
-	// needs a new enrollment, and the session that deactivated it must not
-	// be able to write new wallet data afterwards. When something failed the
-	// exemption stays so the same session can repeat the request.
+	// before it is fenced out of Update. The cut-off catches every token of
+	// the user, the one the request arrived on included: a deactivated
+	// wallet needs a new enrollment, and the session that deactivated it
+	// must not be able to write new wallet data afterwards.
 	for _, tid := range tenants {
 		if tid != tenantID {
 			errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
@@ -401,12 +400,12 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		errs = append(errs, fmt.Errorf("delete webauthn challenges: %w", err))
 	}
-	// The acting session's exemption exists to retry the erasure, so it ends
-	// with the erasure: once the vault is gone the wallet is deactivated and
-	// needs a new enrollment, and that session must not be able to write new
-	// wallet data (private data, credentials) with its pre-cut-off token.
-	// When this write fails the exemption stays as it was, so the same
-	// session can repeat the request.
+	// This is the write that erases the user-level key material, and it
+	// advances the token cut-off in the same atomic update. Once the vault
+	// is gone the wallet is deactivated and needs a new enrollment; no
+	// pre-cut-off token can write new wallet data (private data,
+	// credentials) after it. A failure here leaves the cut-off as it was and
+	// is reported as ERASURE_INCOMPLETE, so the request can be repeated.
 	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now()); err != nil {
 		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
@@ -496,16 +495,12 @@ func (s *WalletLifecycleService) emitAudit(instanceID string, status domain.Inst
 	if s.audit == nil {
 		return
 	}
-	var event set.EventURI
-	switch status {
-	case domain.InstanceStatusRevoked:
+	// Revocation is the only status change there is; anything else reaching
+	// here is a caller that got past the store, so it is recorded as a
+	// deactivation rather than dropped.
+	event := set.EventWIDeactivated
+	if status == domain.InstanceStatusRevoked {
 		event = set.EventWIRevoked
-	case domain.InstanceStatusSuspended:
-		event = set.EventWISuspended
-	case domain.InstanceStatusActive:
-		event = set.EventWICreated // re-activation
-	default:
-		event = set.EventWIDeactivated
 	}
 	s.audit.EmitWithSubject(event, instanceID, map[string]any{
 		"status": string(status),

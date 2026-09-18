@@ -345,7 +345,7 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: a legacy token issued before the user's wallet was suspended
+// SID-AUTH-06: a legacy token issued before the user's wallet was
 // or revoked is refused even though it has not expired.
 func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	logger := zap.NewNop()

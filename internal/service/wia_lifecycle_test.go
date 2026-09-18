@@ -70,14 +70,14 @@ func TestWIAService_GenerateWIA_RefusesNewKeyForDeactivatedWallet(t *testing.T) 
 	}
 }
 
-// A suspended instance is reactivatable, so the wallet is not deactivated and
-// the user may still enroll another device.
-func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsSuspended(t *testing.T) {
+// One live instance is enough: the wallet is not deactivated and the user may
+// still enroll another device.
+func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsLive(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
-	uid := domain.UserIDFromString("user-suspended")
+	uid := domain.UserIDFromString("user-partly-revoked")
 	seedWIAInstance(t, instances, "old-key-1", uid, domain.InstanceStatusRevoked)
-	seedWIAInstance(t, instances, "old-key-2", uid, domain.InstanceStatusSuspended)
+	seedWIAInstance(t, instances, "old-key-2", uid, domain.InstanceStatusActive)
 
 	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsSuspended(t *testin
 	pop, _ := createTestPop(t, challenge)
 
 	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
-		t.Fatalf("GenerateWIA with a suspended (live) instance remaining: %v", err)
+		t.Fatalf("GenerateWIA with a live instance remaining: %v", err)
 	}
 	byUser, err := instances.GetByUser(ctx, domain.DefaultTenantID, uid)
 	if err != nil {
@@ -659,7 +659,7 @@ func TestWIAService_GenerateWIA_RevokesBoundKeyWhenWalletDeactivatedMeanwhile(t 
 
 // The passkey link is permanent (first link wins), so a request asking to
 // link a different passkey than the one recorded must not walk away with a
-// WIA: suspending the instance would gate the recorded passkey while this
+// WIA: revoking the instance would gate the recorded passkey while this
 // caller keeps using the one it asked for.
 func TestWIAService_GenerateWIA_RefusesADifferentPasskeyThanRecorded(t *testing.T) {
 	svc, store := newTestWIAServiceWithUsers(t)

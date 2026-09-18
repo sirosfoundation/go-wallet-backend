@@ -34,7 +34,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		// Status is only ever set here for a brand-new document (via $setOnInsert).
 		// An existing instance's status must only change through UpdateStatus —
 		// otherwise a routine re-attestation would silently reactivate a
-		// suspended/revoked instance. The tenant is fixed at insert as well:
+		// revoked instance. The tenant is fixed at insert as well:
 		// wallet instances are per tenant, and a later attestation from
 		// another tenant must not move the lifecycle record (callers read the
 		// record back and refuse a mismatch, see WIAService.signWIA).
@@ -90,7 +90,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// authenticated attestation further to the user the record ended up bound
 	// to (the bind just above ran, so that is either this caller or the
 	// winner of a race it lost). "First link wins" is permanent and decides
-	// whether suspending the instance also locks that passkey out
+	// whether revoking the instance also locks that passkey out
 	// (SID-AUTH-06), so a racer whose own bind lost must not be able to write
 	// its credential id onto the winner's record. An unauthenticated
 	// attestation carries no user to check against and keeps the plain
@@ -162,24 +162,20 @@ func (s *WalletInstanceStore) GetByUser(ctx context.Context, tenantID domain.Ten
 func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
 	now := time.Now().UTC()
 
-	// Use a conditional filter to enforce valid state transitions atomically.
-	// Revoked instances cannot transition to any other state.
+	// Use a conditional filter to enforce the state transition atomically.
+	// There is one legal transition, active → revoked, and revocation is
+	// terminal.
 	filter := bson.M{"_id": id}
 	switch status {
-	case domain.InstanceStatusActive:
-		// Only suspended → active is allowed (not revoked → active).
-		filter["status"] = domain.InstanceStatusSuspended
-	case domain.InstanceStatusSuspended:
-		// Only active → suspended is allowed.
-		filter["status"] = domain.InstanceStatusActive
 	case domain.InstanceStatusRevoked:
-		// active → revoked and suspended → revoked are both allowed.
-		filter["status"] = bson.M{"$in": []domain.InstanceStatus{domain.InstanceStatusActive, domain.InstanceStatusSuspended}}
+		filter["status"] = domain.InstanceStatusActive
 	default:
-		// Reject anything other than the three known statuses — otherwise the
-		// filter above stays unconstrained ({_id: id} only) and this would
-		// write an arbitrary status with no transition check at all.
-		return fmt.Errorf("%w: unknown wallet instance status %q", domain.ErrInvalidStatusTransition, status)
+		// Anything else is refused here rather than left to run with an
+		// unconstrained filter ({_id: id} alone), which would write the
+		// status with no transition check at all. That covers an unknown
+		// value and "active": an instance is active from the moment it is
+		// inserted and can never be returned to it.
+		return fmt.Errorf("%w: cannot set wallet instance status to %q", domain.ErrInvalidStatusTransition, status)
 	}
 
 	update := bson.M{
@@ -189,11 +185,8 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 			"updated_at":          now,
 		},
 	}
-	if status == domain.InstanceStatusSuspended || status == domain.InstanceStatusRevoked {
-		update["$set"].(bson.M)["deactivated_at"] = now
-	} else {
-		update["$unset"] = bson.M{"deactivated_at": "", "deactivation_reason": ""}
-	}
+	// Only revocation reaches this point, so the timestamp is always set.
+	update["$set"].(bson.M)["deactivated_at"] = now
 
 	res, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {

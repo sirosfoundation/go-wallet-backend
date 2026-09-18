@@ -56,26 +56,20 @@ func TestCheckWalletLifecycle(t *testing.T) {
 			"the same user keeps logging in where they still have a live instance")
 	})
 
-	t.Run("linked instance suspended: refused with suspended", func(t *testing.T) {
-		s := &WebAuthnService{store: memory.NewStore()}
-		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusSuspended)
-		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
-		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceSuspended)
-		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2"), "the other device still logs in")
-	})
-
 	t.Run("linked instance revoked: refused with revoked", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)
 		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
 		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceRevoked)
+		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2"), "the other device still logs in")
 	})
 
-	t.Run("unlinked suspended instance does not block other passkeys", func(t *testing.T) {
+	t.Run("unlinked revoked instance does not block other passkeys", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
-		seedLifecycleInstance(t, s, "i1", userID, "", domain.InstanceStatusSuspended)
+		seedLifecycleInstance(t, s, "i1", userID, "", domain.InstanceStatusRevoked)
+		seedLifecycleInstance(t, s, "i2", userID, "", domain.InstanceStatusActive)
 		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"),
-			"the user must be able to log in from another device to manage a suspended one")
+			"a revoked instance this passkey is not linked to must not block the login")
 	})
 
 	t.Run("every instance revoked: wallet deactivated, any passkey refused", func(t *testing.T) {
@@ -104,10 +98,6 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceRevoked,
 			"an active duplicate link must not let a passkey of a revoked instance log in")
 
-		s = &WebAuthnService{store: memory.NewStore()}
-		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-		seedLifecycleInstance(t, s, "i2", userID, "pk-1", domain.InstanceStatusSuspended)
-		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceSuspended)
 	})
 
 	t.Run("linked instance revoked while another is live is not deactivation", func(t *testing.T) {
@@ -249,9 +239,9 @@ func TestPersistLoginState_ReloadKeepsOtherPasskeySignCounts(t *testing.T) {
 
 // The cut-off is recorded before the new status is persisted, so a login that
 // passed its lifecycle check earlier in the flow mints a token whose fresh
-// iat clears the cut-off while the instance is being suspended. mintTokens
+// iat clears the cut-off while the instance is being revoked. mintTokens
 // runs the caller's check again over the post-mint state, so that login is
-// refused rather than handed a working token for a suspended wallet.
+// refused rather than handed a working token for a revoked wallet.
 func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -263,12 +253,12 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
 
 	// No cut-off at all: the minted token is unimpeachable by iat alone, so
-	// only the recheck can see the suspension that landed meanwhile.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusSuspended, "racing"))
+	// only the recheck can see the revocation that landed meanwhile.
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "racing"))
 	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
 		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
 	}, ErrVerificationFailed)
-	assert.ErrorIs(t, err, ErrWalletInstanceSuspended)
+	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 }
 
 // Two logins on the same passkey can interleave: the one that reloads after

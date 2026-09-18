@@ -74,7 +74,7 @@ func TestListMyWalletInstances_OnlyMine(t *testing.T) {
 }
 
 // The self-service routes no longer offer a status change or a revoke-all:
-// a user who suspended or revoked the instance behind their last passkey
+// a user who revoked the instance behind their last passkey
 // could not undo it without an administrator. What a user can do to
 // themselves is log out everywhere, which a new login undoes, and remove the
 // account, which is meant to be final.

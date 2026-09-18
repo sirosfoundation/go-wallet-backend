@@ -235,11 +235,10 @@ func handleAnonymousTokenRequest(
 }
 
 // sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
-// token cut-off, so a session that outlived a suspension or revocation - the
-// lifecycle cascade drops sessions, but that can fail and is reported as
-// ERASURE_INCOMPLETE - cannot mint a fresh bearer token. A session carries no
-// token id, so the acting token's exemption does not apply to it: minting new
-// tokens after a lifecycle change always requires a new login. It writes the
+// token cut-off, so a session that outlived a revocation - the lifecycle
+// cascade drops sessions, but that can fail and is reported as
+// ERASURE_INCOMPLETE - cannot mint a fresh bearer token. Minting new tokens
+// after a lifecycle change always requires a new login. It writes the
 // response and returns false when the session is refused.
 func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
 	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant())
@@ -281,10 +280,9 @@ func handleDelegationTokenRequest(
 	}
 
 	// SID-AUTH-06: a delegating token issued before the user's wallet was
-	// suspended or revoked must not mint a fresh (post-cut-off) token. The
-	// acting token's exemption is deliberately not passed here (see
-	// cutoffSubject): a child token would carry a new jti and a fresh iat,
-	// so it would be neither exempt nor caught by the cut-off.
+	// revoked must not mint a fresh (post-cut-off) token. The parent is what
+	// gets judged (see cutoffSubject): a child token would carry a fresh iat
+	// and so would clear the cut-off on its own.
 	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
 	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
@@ -347,15 +345,13 @@ func handleDelegationTokenRequest(
 // re-check the SID-AUTH-06 cut-off after minting: the new token's own iat is
 // necessarily fresh, so only the credential behind it can still be judged.
 //
-// It carries no token id, because /auth/token never honours the acting
-// token's exemption. That exemption exists so the session that made a
-// lifecycle request can repeat it (409 ERASURE_INCOMPLETE) or reactivate a
-// suspended instance - not so it can mint credentials. A token minted from it
-// would carry a new jti and a fresh iat: not exempt, but past the cut-off,
-// so every gate in the system would accept it and the one narrowly exempt
-// token would have laundered itself into an unrestricted one for a wallet
-// that was just suspended or revoked. Minting after a lifecycle change always
-// requires a new login, for a delegating bearer token as for a session cookie.
+// What it carries is the issuing instant of the token or session that asked,
+// which is the only thing a cut-off can be applied to. A token minted here
+// would carry a fresh iat, so every gate in the system would accept it and a
+// pre-cut-off credential would have laundered itself into an unrestricted one
+// for a wallet that was just revoked. Minting after a lifecycle change always
+// requires a new login, for a delegating bearer token as for a session
+// cookie.
 type cutoffSubject struct {
 	userID   string
 	issuedAt time.Time

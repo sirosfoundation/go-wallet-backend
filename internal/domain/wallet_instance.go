@@ -9,32 +9,31 @@ import (
 type InstanceStatus string
 
 const (
-	InstanceStatusActive    InstanceStatus = "active"
-	InstanceStatusSuspended InstanceStatus = "suspended"
-	InstanceStatusRevoked   InstanceStatus = "revoked"
+	InstanceStatusActive  InstanceStatus = "active"
+	InstanceStatusRevoked InstanceStatus = "revoked"
 )
 
 // ErrInvalidStatusTransition is returned when a status transition is not allowed.
 var ErrInvalidStatusTransition = errors.New("invalid status transition")
 
 // ValidateStatusTransition checks whether transitioning from current to target
-// is a legal state change. Revocation is terminal; suspended instances may be
-// reactivated or revoked; active instances may be suspended or revoked.
+// is a legal state change. There is one: active to revoked. Revocation is
+// terminal, so nothing leaves the revoked state.
+//
+// A wallet instance has no reversible state, and that is deliberate. The ARF
+// gives a Wallet Unit four states - Installed, Operational, Valid, Revoked -
+// and says "Wallet Units can only be revoked" and "Revocation cannot be
+// undone". Suspension exists in the ARF, but for Wallet Solutions, for PID
+// and Attestation Provider registrations and for Relying Party registrations,
+// never for a unit. A suspended instance state would therefore mean nothing
+// to a relying party, and the status lists the ARF defines for Wallet
+// Instance Attestations carry no value it could be published as.
 func ValidateStatusTransition(current, target InstanceStatus) error {
 	if current == target {
 		return nil // no-op
 	}
-	switch current {
-	case InstanceStatusRevoked:
-		return ErrInvalidStatusTransition // revocation is terminal
-	case InstanceStatusSuspended:
-		if target == InstanceStatusActive || target == InstanceStatusRevoked {
-			return nil
-		}
-	case InstanceStatusActive:
-		if target == InstanceStatusSuspended || target == InstanceStatusRevoked {
-			return nil
-		}
+	if current == InstanceStatusActive && target == InstanceStatusRevoked {
+		return nil
 	}
 	return ErrInvalidStatusTransition
 }
@@ -72,7 +71,7 @@ const (
 // In the web frontend, there is a 1:1 mapping between a passkey and a wallet
 // instance. The passkey's PRF extension output is used to derive an AES-GCM key
 // that encrypts the wallet vault (credentials + signing keys). When the backend
-// suspends/revokes an instance, the frontend must treat the corresponding passkey
+// revokes an instance, the frontend must treat the corresponding passkey
 // as unusable — new WIA requests will be rejected.
 //
 // In native SDKs (iOS/Android), the hardware attestation key serves the same role
@@ -91,7 +90,8 @@ type WalletInstance struct {
 	// UserID is the user who owns this instance (if known).
 	UserID *UserID `json:"user_id,omitempty" bson:"user_id,omitempty"`
 
-	// Status is the lifecycle state: active, suspended, revoked.
+	// Status is the lifecycle state: active or revoked. Revocation is
+	// terminal (see ValidateStatusTransition).
 	Status InstanceStatus `json:"status" bson:"status"`
 
 	// WSCDType identifies the type of WSCD backing this instance.
@@ -102,7 +102,7 @@ type WalletInstance struct {
 	// started out as a correlation aid for the admin on WSCDTypeWebCrypto,
 	// but SID-AUTH-06 made it the key of the per-instance login gate
 	// (WebAuthnService.checkWalletLifecycle), which a native iOS or Android
-	// wallet needs as much as a Web Crypto one - suspending a device's
+	// wallet needs as much as a Web Crypto one - revoking a device's
 	// instance has to refuse that device's passkey. The wallet supplies it
 	// at WIA generation and it must be one of the caller's own passkeys in
 	// the caller's tenant, or the request is refused with
@@ -138,10 +138,12 @@ type WalletInstance struct {
 	// UpdatedAt tracks the last modification time.
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 
-	// DeactivatedAt is set when the instance is suspended or revoked.
+	// DeactivatedAt is set when the instance is revoked. The stored field
+	// keeps its name because it is persisted; revocation is the only thing
+	// that sets it.
 	DeactivatedAt *time.Time `json:"deactivated_at,omitempty" bson:"deactivated_at,omitempty"`
 
-	// DeactivationReason provides context for suspension/revocation.
+	// DeactivationReason provides context for the revocation.
 	DeactivationReason string `json:"deactivation_reason,omitempty" bson:"deactivation_reason,omitempty"`
 }
 

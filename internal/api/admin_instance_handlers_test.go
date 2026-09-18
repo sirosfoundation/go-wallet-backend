@@ -143,7 +143,7 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 
 	seedInstance(t, h, "inst-1", "acme", nil)
 
-	body := `{"status":"suspended","reason":"compliance review"}`
+	body := `{"status":"revoked","reason":"compliance review"}`
 	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -157,8 +157,8 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp["status"] != "suspended" {
-		t.Errorf("expected status suspended, got %s", resp["status"])
+	if resp["status"] != "revoked" {
+		t.Errorf("expected status revoked, got %s", resp["status"])
 	}
 }
 
@@ -312,28 +312,10 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	}
 }
 
-func TestUpdateWalletInstanceStatus_WithAudit_Suspended(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := memory.NewStore()
-	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor)
-	router := gin.New()
-	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
-
-	seedInstance(t, h, "suspend-inst", "acme", nil)
-
-	body := `{"status":"suspended","reason":"under review"}`
-	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/suspend-inst/status", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
+// "active" is not a status this endpoint accepts. Revocation is the only
+// lifecycle change a wallet instance has and it cannot be undone, so a
+// request to reactivate one is a 400 at the binding, never a state change.
+func TestUpdateWalletInstanceStatus_RejectsReactivation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
@@ -349,8 +331,16 @@ func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(context.Background(), "reactivate-inst")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusActive {
+		t.Errorf("status = %s, want it untouched", got.Status)
 	}
 }
 
@@ -407,13 +397,19 @@ func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
 		t.Errorf("revoking the last instance must erase the wallet's private data")
 	}
 
-	// Revoked is terminal, also via the lifecycle path.
+	// Revoked is terminal: reactivation is refused at the binding, before it
+	// is even a transition question, because "revoked" is the only status
+	// this endpoint accepts.
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"active"}`))
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d", w.Code)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	inst, err = store.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil || inst.Status != domain.InstanceStatusRevoked {
+		t.Fatalf("status must still be revoked, got %v %v", err, inst)
 	}
 }
 

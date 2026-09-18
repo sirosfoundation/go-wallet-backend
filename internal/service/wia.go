@@ -28,7 +28,7 @@ var (
 	ErrWIAChallengeExpired     = errors.New("WIA challenge expired or invalid")
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
-	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
+	ErrWIAInstanceDeactivated  = errors.New("wallet instance is revoked")
 	ErrWIAInstanceNotOwned     = errors.New("wallet instance is bound to another tenant or user")
 	// ErrWIACredentialNotOwned refuses a credential_id that is not one of the
 	// caller's own passkeys. The link is what makes suspension and revocation
@@ -293,7 +293,7 @@ type WIARequest struct {
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
 	// CredentialID, when provided, is the base64url WebAuthn credential id of
 	// the passkey this wallet instance logs in with. Recorded as
-	// WalletInstance.CredentialID so suspending or revoking the instance also
+	// WalletInstance.CredentialID so revoking the instance also
 	// refuses login with that passkey (SID-AUTH-06). Optional: without it the
 	// login gate still enforces whole-wallet deactivation.
 	CredentialID string `json:"credential_id,omitempty"`
@@ -339,7 +339,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	// Step 2.5: Reject issuance for instances an admin has suspended or revoked.
+	// Step 2.5: Reject issuance for instances an admin has revoked.
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
@@ -638,7 +638,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
 	// Status is only ever set here for a brand-new instance (defaults to Active on
 	// insert); Upsert must not overwrite the status of an existing instance — that
-	// would silently undo an admin suspend/revoke the next time this instance
+	// would silently undo an admin revocation the next time this instance
 	// successfully re-attests. See the guard in GenerateWIA above.
 	if s.instances != nil {
 		now := time.Now().UTC()
@@ -765,7 +765,7 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 	}
 	// The link is permanent (first link wins), so a request asking for a
 	// different passkey than the one recorded must not walk away with a WIA:
-	// suspending the instance would gate the recorded passkey while this
+	// revoking the instance would gate the recorded passkey while this
 	// caller keeps logging in with the one it asked for.
 	if credentialID != "" && inst.CredentialID != "" && inst.CredentialID != credentialID {
 		s.emitAuditFailure("credential_not_owned", errors.New("wallet instance is linked to a different passkey"))
@@ -777,8 +777,8 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 // refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
 // has wallet instances in the tenant and every one of them is revoked - the
 // same "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
-// login for. A user with no instances yet, or with a suspended (reactivatable)
-// one, may attest a new key; an anonymous attestation (nil userID) has no
+// login for. A user with no instances yet, or with at least one that is not
+// revoked, may attest a new key; an anonymous attestation (nil userID) has no
 // wallet to check.
 func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
 	if userID == nil {

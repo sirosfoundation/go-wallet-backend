@@ -282,8 +282,7 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
-		case errors.Is(err, service.ErrWalletInstanceSuspended),
-			errors.Is(err, service.ErrWalletInstanceRevoked):
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
 			c.JSON(403, lifecycleRefusalBody(err))
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})

@@ -175,8 +175,8 @@ func TestPasskeyLoginFinish_AuthError(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: a suspended or revoked wallet instance is a distinct 403 with a
-// stable code, not the generic 401, so the client can explain instead of retry.
+// SID-AUTH-06: a revoked wallet instance is a distinct 403 with a stable
+// code, not the generic 401, so the client can explain instead of retry.
 func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
@@ -189,7 +189,6 @@ func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 		// msg says the same thing for a human, and is display-only.
 		msg string
 	}{
-		{service.ErrWalletInstanceSuspended, "WALLET_SUSPENDED", service.LifecycleScopeInstance, "has been suspended"},
 		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", service.LifecycleScopeInstance, "other devices enrolled to this wallet keep their own status"},
 		{service.ErrWalletDeactivated, "WALLET_REVOKED", service.LifecycleScopeWallet, "a new enrollment is required"},
 	} {

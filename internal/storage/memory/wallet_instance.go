@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -30,8 +31,8 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		// Status and tenant are intentionally left untouched here — lifecycle
 		// changes only happen through UpdateStatus, and an instance never
 		// moves tenant (see the Mongo implementation). Otherwise a routine
-		// re-attestation would silently reactivate a suspended/revoked
-		// instance or re-parent it.
+		// re-attestation would silently reactivate a revoked instance or
+		// re-parent it.
 		existing.AttestationSource = instance.AttestationSource
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
@@ -111,20 +112,22 @@ func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status 
 		return storage.ErrNotFound
 	}
 
+	// Revocation is the only status this writes, exactly as the Mongo
+	// implementation does: an instance is active from insert and can never
+	// be returned to it, so "active" is refused here rather than treated as
+	// a no-op that would still stamp a revocation time.
+	if status != domain.InstanceStatusRevoked {
+		return fmt.Errorf("%w: cannot set wallet instance status to %q", domain.ErrInvalidStatusTransition, status)
+	}
 	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
 		return err
 	}
 
 	instance.Status = status
-	instance.UpdatedAt = time.Now().UTC()
-	if status == domain.InstanceStatusSuspended || status == domain.InstanceStatusRevoked {
-		now := time.Now().UTC()
-		instance.DeactivatedAt = &now
-		instance.DeactivationReason = reason
-	} else {
-		instance.DeactivatedAt = nil
-		instance.DeactivationReason = ""
-	}
+	now := time.Now().UTC()
+	instance.UpdatedAt = now
+	instance.DeactivatedAt = &now
+	instance.DeactivationReason = reason
 	return nil
 }
 

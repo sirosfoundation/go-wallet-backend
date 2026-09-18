@@ -250,12 +250,12 @@ func TestWalletLifecycle_ChangeStatus_NoOpAndInvalid(t *testing.T) {
 	_, err = svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatus("bogus"), "")
 	assert.ErrorIs(t, err, domain.ErrInvalidStatusTransition)
 
-	_, err = svc.ChangeStatus(ctx, userActor(userID), "other-tenant", "inst-a", domain.InstanceStatusSuspended, "")
+	_, err = svc.ChangeStatus(ctx, userActor(userID), "other-tenant", "inst-a", domain.InstanceStatusRevoked, "")
 	assert.ErrorIs(t, err, storage.ErrNotFound, "an instance of another tenant is not found")
 
 	failing := NewWalletLifecycleService(newFailStore("instances.UpdateStatus"), zap.NewNop(), nil)
 	uid := seedWalletUser(t, failing.store)
-	_, err = failing.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusSuspended, "")
+	_, err = failing.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusRevoked, "")
 	assert.ErrorIs(t, err, errBoom)
 }
 
@@ -456,7 +456,7 @@ func TestWalletLifecycle_CutoffFailureLeavesStatusUnchanged(t *testing.T) {
 	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
 	id := "inst-" + uid.String()
 
-	_, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusSuspended, "x")
+	_, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "x")
 	assert.ErrorIs(t, err, errBoom)
 	inst, _ := fs.Store.WalletInstances().GetByID(ctx, id)
 	assert.Equal(t, domain.InstanceStatusActive, inst.Status, "status untouched when the cut-off cannot be recorded")
@@ -530,14 +530,20 @@ func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 	uid := seedWalletUser(t, store, domain.DefaultTenantID)
 	id := "inst-" + uid.String()
+	// A second live instance, so the cascade stops short of the erasure:
+	// EraseWalletData advances the cut-off as part of its atomic fence, and
+	// this test is about the path that only has to establish one.
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: id + "-b", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
 	// Persisted directly, as another process would have.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, id, domain.InstanceStatusSuspended, "elsewhere"))
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, id, domain.InstanceStatusRevoked, "elsewhere"))
 	cutoff, err := store.Users().GetAuthCutoff(ctx, uid)
 	require.NoError(t, err)
 	require.True(t, cutoff.IsZero(), "no cut-off was recorded by that path")
 
 	actor := userActor(uid)
-	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, id, domain.InstanceStatusSuspended, "retry")
+	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "retry")
 	require.NoError(t, err)
 	cutoff, err = store.Users().GetAuthCutoff(ctx, uid)
 	require.NoError(t, err)
@@ -545,7 +551,7 @@ func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 
 	// A second retry must not advance it (that would cut off tokens issued
 	// since, for no reason).
-	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, id, domain.InstanceStatusSuspended, "retry again")
+	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "retry again")
 	require.NoError(t, err)
 	again, _ := store.Users().GetAuthCutoff(ctx, uid)
 	assert.True(t, again.Equal(cutoff), "an established cut-off stays put")

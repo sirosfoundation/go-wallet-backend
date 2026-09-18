@@ -148,13 +148,22 @@ Finish WebAuthn registration.
 A wallet instance is one wallet installation, identified by the JWK thumbprint of
 its instance key and registered when it first obtains a Wallet Instance
 Attestation. A user can inspect and manage their own instances; a provider
-manages them through the admin API (`/admin/tenants/{id}/instances`). Both paths
-share one lifecycle: `active` → `suspended` (reversible) or `revoked`
-(terminal), `suspended` → `active` or `revoked`. Any change away from `active`
-drops the user's live sessions and refuses new WIAs for that instance. Login with
-the passkey linked to a suspended or revoked instance is refused with `403
-WALLET_SUSPENDED` / `WALLET_REVOKED`; the user's other, non-revoked devices
-still log in.
+manages them through the admin API (`/admin/tenants/{id}/instances`). There is
+one lifecycle and one transition in it: `active` → `revoked`. Revocation cannot
+be undone.
+
+That is the ARF's model, not a simplification of it. The ARF gives a Wallet
+Unit four states - Installed, Operational, Valid, Revoked - and says "Wallet
+Units can only be revoked" and "Revocation cannot be undone". Suspension
+exists in the ARF for Wallet Solutions, for PID and Attestation Provider
+registrations and for Relying Party registrations, never for a unit, and the
+status lists defined for Wallet Instance Attestations carry no value other
+than `revoked`. A reversible instance state would therefore mean nothing to a
+relying party.
+
+Revoking an instance drops the user's live sessions and refuses new WIAs for
+it. Login with the passkey linked to a revoked instance is refused with `403
+WALLET_REVOKED`; the user's other, non-revoked devices still log in.
 
 ##### Scope of the cut-off
 
@@ -195,13 +204,13 @@ to act on:
 { "error": "WALLET_REVOKED", "scope": "instance", "message": "..." }
 ```
 
-`error` is the stable code (`WALLET_SUSPENDED` or `WALLET_REVOKED`) and
-`scope` says what the refusal is about:
+`error` is the stable code (`WALLET_REVOKED`) and `scope` says what the
+refusal is about:
 
 | `scope` | meaning |
 | --- | --- |
-| `instance` | This device is suspended or revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
-| `wallet` | The wallet is deactivated: no instance of it is left to reactivate, its credentials and presentations here have been erased, and a new enrollment is required. Only `WALLET_REVOKED` carries this scope. |
+| `instance` | This device is revoked. The wallet still exists; the user's other devices answer for themselves at their own login, and what this device holds is untouched on the server. |
+| `wallet` | The wallet is deactivated: no live instance of it is left, its credentials and presentations here have been erased, and a new enrollment is required. |
 
 `WALLET_REVOKED` means both cases, because it has since the first release, so
 `scope` is what separates them. `message` is for display only: no client
@@ -218,7 +227,7 @@ keeps logging in there.
 
 ##### Why the login gate is where a blocked instance is stopped
 
-Refusing login for the passkey linked to a suspended or revoked instance is
+Refusing login for the passkey linked to a revoked instance is
 the only enforcement in the backend that knows *which* wallet instance is
 acting. It is not a duplicate of the WIA gate, and removing it as one would
 open a hole.
@@ -338,14 +347,19 @@ afterwards. Nothing is erased.
 **Response:** `204`; `401` when unauthenticated; `404` when the user no longer
 exists.
 
-##### Changing an instance's status
+##### Revoking an instance
 
-There is no self-service endpoint for it. Suspending or revoking an instance
-is reversible only by a provider, so a user who did it to the instance holding
-their last passkey would be locked out of their own account with no way back
-(SID-AUTH-06). Providers do it through `PUT
-/admin/tenants/{tenantId}/instances/{instanceId}/status`, and can revoke every
-instance a user has with `POST
+There is no self-service endpoint for it. Revocation cannot be undone, so a
+user who revoked the instance holding their last passkey would be locked out
+of their own account with no way back (SID-AUTH-06).
+
+This is where the ARF puts it too. The User has a right to obtain revocation
+and a channel to ask for it - Art. 5a(9)(a) of Regulation (EU) 2024/1183,
+`WURevocation_10`, and `WIAM_06`, which requires the channel to work without
+the device - and the Wallet Provider is the party that performs it, after
+authenticating the User. Providers do it through `PUT
+/admin/tenants/{tenantId}/instances/{instanceId}/status` with
+`{"status": "revoked"}`, and can revoke every instance a user has with `POST
 /admin/tenants/{tenantId}/users/{userId}/instances/revoke-all`.
 
 The irreversible operation a user does own is removing the account, `DELETE

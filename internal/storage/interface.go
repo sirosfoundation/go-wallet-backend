@@ -280,7 +280,8 @@ type WalletInstanceStore interface {
 	// GetByUser retrieves all wallet instances belonging to a specific user.
 	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
 
-	// UpdateStatus updates the status of a wallet instance (activate, suspend, revoke).
+	// UpdateStatus revokes a wallet instance. Revocation is the only status
+	// change there is, and it is terminal (domain.ValidateStatusTransition).
 	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.

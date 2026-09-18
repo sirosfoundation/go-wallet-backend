@@ -84,7 +84,7 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 		t.Fatalf("without a cut-off the session mints a token, got %d", got)
 	}
 
-	// The wallet is suspended: the cut-off lands, but the session survives
+	// The wallet is revoked: the cut-off lands, but the session survives
 	// (the cascade's session drop failed and returned ERASURE_INCOMPLETE).
 	if err := users.InvalidateAuthBefore(context.Background(), uid, cutoff); err != nil {
 		t.Fatal(err)

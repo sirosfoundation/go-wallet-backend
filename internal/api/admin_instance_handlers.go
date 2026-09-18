@@ -70,18 +70,25 @@ func (h *AdminHandlers) GetWalletInstance(c *gin.Context) {
 }
 
 type updateInstanceStatusRequest struct {
-	Status string `json:"status" binding:"required,oneof=active suspended revoked"`
+	// Status is "revoked", the only status change a wallet instance has.
+	// The field is kept rather than dropped for a bare revoke endpoint so
+	// that a client always says what it means to happen, and so a future
+	// state does not need a second URL.
+	Status string `json:"status" binding:"required,oneof=revoked"`
 	Reason string `json:"reason"`
 }
 
-// UpdateWalletInstanceStatus changes the lifecycle state of a wallet instance.
+// UpdateWalletInstanceStatus revokes a wallet instance. Revocation is the only
+// lifecycle change there is and it cannot be undone, which is why it is a
+// provider action: a user who revoked the instance behind their last passkey
+// would have no way back without an admin.
 func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	instanceID := c.Param("instance_id")
 
 	var req updateInstanceStatusRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: status must be active, suspended, or revoked"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: status must be revoked"})
 		return
 	}
 
@@ -218,16 +225,12 @@ func (h *AdminHandlers) ListWalletInstancesByUser(c *gin.Context) {
 }
 
 func (h *AdminHandlers) emitInstanceAuditEvent(_ *gin.Context, instanceID string, status domain.InstanceStatus, reason string) {
-	var event set.EventURI
-	switch status {
-	case domain.InstanceStatusRevoked:
+	// Revocation is the only status this endpoint accepts; anything else
+	// reaching here got past the binding, so it is recorded rather than
+	// dropped.
+	event := set.EventWIDeactivated
+	if status == domain.InstanceStatusRevoked {
 		event = set.EventWIRevoked
-	case domain.InstanceStatusSuspended:
-		event = set.EventWISuspended
-	case domain.InstanceStatusActive:
-		event = set.EventWICreated // re-activation
-	default:
-		event = set.EventWIDeactivated
 	}
 	h.audit.EmitWithSubject(event, instanceID, map[string]any{
 		"status": string(status),

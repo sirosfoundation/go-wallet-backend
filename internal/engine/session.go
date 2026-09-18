@@ -185,11 +185,11 @@ func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 }
 
 // SetTokenGate wires the SID-AUTH-06 token cut-off check into handshake
-// authentication: a token issued before the user's wallet was suspended or
-// revoked cannot open a new engine session. The same check runs again at
-// every flow start, because a socket held by another engine process survives
-// the cascade's DeleteByUser and an issuance or a presentation is exactly
-// what a suspended or revoked wallet must not perform.
+// authentication: a token issued before the user's wallet was revoked cannot
+// open a new engine session. The same check runs again at every flow start,
+// because a socket held by another engine process survives the cascade's
+// DeleteByUser and an issuance or a presentation is exactly what a revoked
+// wallet must not perform.
 func (m *Manager) SetTokenGate(g *tokengate.Gate) {
 	m.tokenGate = g
 }
@@ -686,7 +686,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		// No exemption at the engine, see SetTokenGate.
+		// See SetTokenGate for why the engine checks at all.
 		if err := m.tokenGate.Check(context.Background(), result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
 			return "", "", "", err
 		}
@@ -715,7 +715,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
-		// No exemption at the engine, see SetTokenGate.
+		// See SetTokenGate for why the engine checks at all.
 		if err := m.tokenGate.Check(context.Background(), userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
 			return "", "", "", err
 		}
@@ -776,7 +776,7 @@ func (m *Manager) GetSessionByUser(userID string) (*Session, error) {
 // alone only forgets the SessionData, while the Manager keeps the
 // authenticated Session and its socket in sessions/userIndex and would let an
 // already-connected client continue flows after its wallet instance was
-// suspended or revoked (SID-AUTH-06). Closing the connection ends the read
+// revoked (SID-AUTH-06). Closing the connection ends the read
 // loop, which unregisters the session; the maps are cleared here as well so
 // the user is gone from the Manager the moment this returns.
 func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {

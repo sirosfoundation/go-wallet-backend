@@ -15,7 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// SID-AUTH-06: a refresh token issued before the wallet was suspended or
+// SID-AUTH-06: a refresh token issued before the wallet was
 // revoked must not mint new access tokens.
 func TestRefreshAccessToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	ctx := context.Background()

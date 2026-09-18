@@ -92,9 +92,8 @@ type User struct {
 	OpenIDRefreshTokenMaxAge int64 `json:"openid_refresh_token_max_age,omitempty" bson:"openid_refresh_token_max_age,omitempty"`
 
 	// AuthInvalidBefore cuts off bearer tokens issued at or before this
-	// instant (SID-AUTH-06): set when a wallet instance is suspended or
-	// revoked, so stateless tokens that outlive the dropped sessions stop
-	// working too. Checked by internal/tokengate. Zero means no cut-off.
+	// instant (SID-AUTH-06): set when a wallet instance is revoked, so
+	// stateless tokens that outlive the dropped sessions stop working too. Checked by internal/tokengate. Zero means no cut-off.
 	AuthInvalidBefore time.Time `json:"-" bson:"auth_invalid_before,omitempty"`
 	// AuthFence counts the lifecycle writes (cut-offs and erasures) applied
 	// to this user. It only ever increases, and UserStore.Update refuses a

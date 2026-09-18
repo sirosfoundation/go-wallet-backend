@@ -14,12 +14,15 @@ import (
 // Self-service wallet instance endpoints (SID-AUTH-06,
 // go-wallet-backend#195). A user can see their own wallet instances and can
 // log out everywhere, and can remove the account outright (DeleteUser). What
-// a user cannot do is change an instance's lifecycle status: suspending or
-// revoking is reversible only by a provider, so a user who did it to the
-// instance holding their last passkey would be locked out of their own
-// account with no self-service way back. Those transitions live on the admin
-// API (admin_instance_handlers.go); the irreversible path a user does own is
-// removing the account, which erases the data and the passkeys with it.
+// a user cannot do is revoke an instance. Revocation cannot be undone, so a
+// user who revoked the instance holding their last passkey would be locked
+// out of their own account with no self-service way back; it lives on the
+// admin API (admin_instance_handlers.go). This matches where the ARF puts
+// it: the User has a right to obtain revocation and a channel to ask for it
+// (Art. 5a(9)(a), WURevocation_10, WIAM_06), and the Wallet Provider is the
+// party that performs it after authenticating them. The irreversible path a
+// user does own is removing the account, which erases the data and the
+// passkeys with it.
 
 // ListMyWalletInstances handles GET /user/session/instances.
 func (h *Handlers) ListMyWalletInstances(c *gin.Context) {

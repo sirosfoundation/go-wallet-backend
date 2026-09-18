@@ -884,14 +884,20 @@ paths:
     put:
       tags:
         - Wallet Instances
-      summary: Update wallet instance status
+      summary: Revoke a wallet instance
       description: |
-        Changes the status of a wallet instance (active, suspended, or revoked).
-        Emits an audit event for the status transition and runs the same
-        lifecycle cascade as self-service (session drop, token cut-off,
-        wallet-data erasure on the last revocation). If the cascade does not
-        complete, the status change is still recorded and the response is
-        409 `ERASURE_INCOMPLETE`; repeat the request to finish it.
+        Revokes a wallet instance. `revoked` is the only status this accepts:
+        a wallet instance is active from the moment it is registered, and
+        revocation cannot be undone, so there is nothing else to set it to.
+        That is the ARF's model - a Wallet Unit can only be revoked, and
+        suspension in the ARF applies to Wallet Solutions and to provider and
+        Relying Party registrations, never to a unit.
+
+        Emits an audit event for the revocation and runs the same lifecycle
+        cascade as self-service (session drop, token cut-off, wallet-data
+        erasure on the last revocation). If the cascade does not complete,
+        the revocation is still recorded and the response is 409
+        `ERASURE_INCOMPLETE`; repeat the request to finish it.
 
         Two scopes of the cascade are wider than the status change itself and
         are deliberate SIROS decisions rather than requirements: the token
@@ -914,10 +920,10 @@ paths:
               properties:
                 status:
                   type: string
-                  enum: [active, suspended, revoked]
+                  enum: [revoked]
                 reason:
                   type: string
-                  description: Optional reason for the status change
+                  description: Optional reason, recorded on the instance and in the audit event
       responses:
         '200':
           description: Status updated
@@ -1638,7 +1644,7 @@ components:
           type: string
         status:
           type: string
-          enum: [active, suspended, revoked]
+          enum: [active, revoked]
         wscd_type:
           type: string
           enum: [web_crypto, remote, native_ios, native_android]

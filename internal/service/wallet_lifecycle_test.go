@@ -87,35 +87,38 @@ func lifecycleFixture(t *testing.T, statuses ...domain.InstanceStatus) (*WalletL
 
 func userActor(id domain.UserID) LifecycleActor { return LifecycleActor{Kind: "user", UserID: &id} }
 
-func TestWalletLifecycle_SuspendBlocksWithoutErasing(t *testing.T) {
-	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive)
+// Revoking one instance of several drops the user's sessions but erases
+// nothing: the wallet is only deactivated when no live instance is left
+// anywhere. There is no reversible state to test here - revocation is the
+// only status change a wallet instance has, and it cannot be undone.
+func TestWalletLifecycle_RevokingOneOfSeveralBlocksWithoutErasing(t *testing.T) {
+	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
 
-	inst, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	inst, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "lost phone")
 	require.NoError(t, err)
-	assert.Equal(t, domain.InstanceStatusSuspended, inst.Status)
+	assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
 	assert.Equal(t, []string{userID.String()}, sc.users, "live sessions are dropped")
 
 	user, err := store.Users().GetByID(ctx, userID)
 	require.NoError(t, err)
-	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "suspension is reversible: nothing is erased")
+	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "another instance is still live; nothing is erased")
 
-	// Reactivation by the owner is a valid transition.
-	inst, err = svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusActive, "found it")
-	require.NoError(t, err)
-	assert.Equal(t, domain.InstanceStatusActive, inst.Status)
+	// And there is no way back.
+	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusActive, "found it")
+	require.Error(t, err, "revocation cannot be undone")
 }
 
 func TestWalletLifecycle_RevokingLastInstanceErasesWalletData(t *testing.T) {
-	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusSuspended)
+	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
 
-	// One live (suspended, reactivatable) instance remains: no erasure yet.
+	// One live instance remains: no erasure yet.
 	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "compromised")
 	require.NoError(t, err)
 	user, err := store.Users().GetByID(ctx, userID)
 	require.NoError(t, err)
-	assert.NotNil(t, user.PrivateData, "a suspended instance could still be reactivated; data must stay")
+	assert.NotNil(t, user.PrivateData, "another instance is still live; data must stay")
 
 	// Revoking the last one deactivates the wallet.
 	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-b", domain.InstanceStatusRevoked, "compromised")
@@ -207,38 +210,40 @@ func TestWalletLifecycle_OwnershipAndTransitions(t *testing.T) {
 	assert.Nil(t, user.PrivateData, "the single instance was revoked, so the wallet is deactivated")
 }
 
-// SID-AUTH-06: any change away from active also cuts off bearer tokens that
-// were issued before it, since dropping sessions does not invalidate them.
+// SID-AUTH-06: revoking an instance also cuts off bearer tokens that were
+// issued before it, since dropping sessions does not invalidate them.
 func TestWalletLifecycle_StatusChangeCutsOffIssuedTokens(t *testing.T) {
-	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
 	before := time.Now()
 
-	_, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "lost phone")
 	require.NoError(t, err)
 	user, err := store.Users().GetByID(ctx, userID)
 	require.NoError(t, err)
-	assert.False(t, user.AuthInvalidBefore.IsZero(), "suspension records a token cut-off")
+	assert.False(t, user.AuthInvalidBefore.IsZero(), "revocation records a token cut-off")
 	assert.False(t, user.AuthInvalidBefore.Before(before))
-	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "suspension still erases nothing")
+	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "another instance is live, so nothing is erased")
 }
 
-// A suspension whose cascade failed answers ErrErasureIncomplete; repeating
+// A revocation whose cascade failed answers ErrErasureIncomplete; repeating
 // the same request (same target status) must re-run the cascade, not answer
-// success while the old sessions are still live.
-func TestWalletLifecycle_SuspendedRetryRerunsCascade(t *testing.T) {
-	svc, _, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive)
+// success while the old sessions are still live. Revocation is idempotent
+// for exactly this reason: the retry finds the instance already revoked and
+// still has to finish the work the first attempt left undone.
+func TestWalletLifecycle_FailedCascadeRetryRerunsCascade(t *testing.T) {
+	svc, _, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
 	sc.err = errors.New("session store down")
 
-	inst, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	inst, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "lost phone")
 	require.True(t, errors.Is(err, ErrErasureIncomplete), "got %v", err)
 	require.NotNil(t, inst)
-	assert.Equal(t, domain.InstanceStatusSuspended, inst.Status, "the status change itself is persisted")
+	assert.Equal(t, domain.InstanceStatusRevoked, inst.Status, "the status change itself is persisted")
 	assert.Empty(t, sc.users)
 
 	sc.err = nil
-	_, err = svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "lost phone")
 	require.NoError(t, err)
 	assert.Equal(t, []string{userID.String()}, sc.users, "the retry dropped the sessions")
 }
@@ -262,7 +267,7 @@ func TestWalletLifecycle_RevokeAllPartialFailureStillCascades(t *testing.T) {
 }
 
 // TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped pins the documented
-// scope of the cut-off: suspending one device of a two-device user cuts off
+// scope of the cut-off: revoking one device of a two-device user cuts off
 // that user's tokens and drops that user's sessions, so the other device is
 // signed out too and has to authenticate again.
 //
@@ -277,12 +282,12 @@ func TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped(t *testing.T) {
 	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
 
-	_, err := svc.ChangeStatus(ctx, userActor(userID), domain.DefaultTenantID, "inst-a", domain.InstanceStatusSuspended, "lost phone")
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "lost phone")
 	require.NoError(t, err)
 
 	cutoff, err := store.Users().GetAuthCutoff(ctx, userID)
 	require.NoError(t, err)
-	assert.False(t, cutoff.IsZero(), "the user's tokens are cut off, not just the suspended instance's")
+	assert.False(t, cutoff.IsZero(), "the user's tokens are cut off, not just the revoked instance's")
 	assert.Equal(t, []string{userID.String()}, sc.users, "and every session of the user is dropped, not just that device's")
 
 	other, err := store.WalletInstances().GetByID(ctx, "inst-b")

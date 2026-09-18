@@ -54,19 +54,19 @@ type WebAuthnService struct {
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
 var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
 
-// ErrWalletInstanceSuspended and ErrWalletInstanceRevoked refuse a login whose
-// passkey belongs to a suspended or revoked wallet instance - SID-AUTH-06
-// login gate, see checkWalletLifecycle and WalletLifecycleService.
+// ErrWalletInstanceRevoked refuses a login whose passkey belongs to a revoked
+// wallet instance - SID-AUTH-06 login gate, see checkWalletLifecycle and
+// WalletLifecycleService.
 //
 // ErrWalletDeactivated refuses every passkey of a wallet whose instances have
 // all been revoked (the wallet data has been erased and a new enrollment is
-// required). It wraps ErrWalletInstanceRevoked, so callers that only tell
-// "suspended" from "revoked" keep working; callers that want to tell the user
-// whether other devices can still log in check for ErrWalletDeactivated first.
+// required). It wraps ErrWalletInstanceRevoked, so a caller that only needs
+// to know the login was refused for lifecycle reasons matches the one error;
+// a caller that wants to tell the user whether other devices can still log in
+// checks for ErrWalletDeactivated first.
 var (
-	ErrWalletInstanceSuspended = errors.New("wallet instance suspended")
-	ErrWalletInstanceRevoked   = errors.New("wallet instance revoked")
-	ErrWalletDeactivated       = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
+	ErrWalletInstanceRevoked = errors.New("wallet instance revoked")
+	ErrWalletDeactivated     = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
 )
 
 // LifecycleScopeInstance and LifecycleScopeWallet are the values of the
@@ -97,7 +97,7 @@ const (
 // the wire: the stable error code clients switch on, the scope that says
 // whether the wallet still exists, and a user-facing message.
 type LifecycleRefusalDetail struct {
-	// Code is WALLET_SUSPENDED or WALLET_REVOKED.
+	// Code is WALLET_REVOKED.
 	Code string
 	// Scope is LifecycleScopeInstance or LifecycleScopeWallet, and is
 	// about the tenant the refused login was for.
@@ -108,21 +108,15 @@ type LifecycleRefusalDetail struct {
 }
 
 // LifecycleRefusalDetails maps a SID-AUTH-06 login refusal to its wire form.
-// The code only says suspended or revoked (that is what existing clients
-// switch on) and the scope says whether one instance or the whole wallet is
-// refused; the message says the same thing for a human. ErrWalletDeactivated
-// wraps ErrWalletInstanceRevoked, so it is matched first.
+// The code says the wallet was revoked (that is what existing clients switch
+// on) and the scope says whether one instance or the whole wallet is refused;
+// the message says the same thing for a human. ErrWalletDeactivated wraps
+// ErrWalletInstanceRevoked, so it is matched first.
 //
 // Every login handler answers with this, so the wallet API and the AS passkey
 // endpoint cannot disagree about what a refusal means.
 func LifecycleRefusalDetails(err error) LifecycleRefusalDetail {
 	switch {
-	case errors.Is(err, ErrWalletInstanceSuspended):
-		return LifecycleRefusalDetail{
-			Code:    "WALLET_SUSPENDED",
-			Scope:   LifecycleScopeInstance,
-			Message: "This wallet instance has been suspended",
-		}
 	case errors.Is(err, ErrWalletDeactivated):
 		return LifecycleRefusalDetail{
 			Code:    "WALLET_REVOKED",
@@ -131,8 +125,7 @@ func LifecycleRefusalDetails(err error) LifecycleRefusalDetail {
 		}
 	default:
 		// Not "other devices are not affected": this refusal is about this
-		// instance, and another device may well be suspended or revoked in
-		// its own right. It says what this revocation did, and leaves the
+		// instance, and another device may well be revoked in its own right. It says what this revocation did, and leaves the
 		// others to answer for themselves at their own login.
 		return LifecycleRefusalDetail{
 			Code:    "WALLET_REVOKED",
@@ -1163,7 +1156,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// SID-AUTH-06 login gate: a suspended or revoked wallet instance must not
+	// SID-AUTH-06 login gate: a revoked wallet instance must not
 	// be able to log in, and a deactivated wallet (all instances revoked) must
 	// require a fresh enrollment. Checked only after the assertion verified,
 	// so an attacker cannot probe lifecycle state with a forged assertion.
@@ -1414,8 +1407,8 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		return nil, ErrInvalidRefreshToken
 	}
 
-	// SID-AUTH-06: a refresh token issued before the wallet was suspended or
-	// revoked must not mint new access tokens.
+	// SID-AUTH-06: a refresh token issued before the wallet was revoked
+	// must not mint new access tokens.
 	srcIssuedAt := tokengate.IssuedAtFromClaims(claims)
 	if err := s.refuseIfSourceCutOff(ctx, userID, srcIssuedAt); err != nil {
 		return nil, err
@@ -1873,7 +1866,7 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 // because writing it back would roll back the token cut-off and could
 // restore erased wallet data. The gate is then re-run on the fresh record:
 // a refusal aborts the login (no token is issued for a wallet that was just
-// suspended or revoked); otherwise the sign counts are re-applied to the
+// revoked); otherwise the sign counts are re-applied to the
 // fresh record. Other persistence failures do not fail the login.
 func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.User, tenantID domain.TenantID, credentialID string) error {
 	err := s.store.Users().Update(ctx, user)
@@ -1920,12 +1913,11 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 // revocation landing mid-request cannot be beaten by the freshly minted
 // timestamps.
 //
-// The acting token's exemption is not honoured here: like /auth/token (see
-// as.cutoffSubject), a minting path never is. The minted access and refresh
-// tokens carry new ids and fresh iats, so they would be past the cut-off and
-// exempt from nothing - the one narrowly exempt token would have laundered
-// itself into unrestricted ones. Refreshing after a lifecycle change requires
-// a new login.
+// The source token is judged, not the minted ones: the access and refresh
+// tokens this mints carry fresh iats, so they would sail past the cut-off on
+// their own. Judging the token that asked is what stops a pre-cut-off refresh
+// token laundering itself into unrestricted ones. Refreshing after a
+// lifecycle change requires a new login.
 func (s *WebAuthnService) refuseIfSourceCutOff(ctx context.Context, userID domain.UserID, issuedAt time.Time) error {
 	cutoff, err := s.store.Users().GetAuthCutoff(ctx, userID)
 	if err != nil {
@@ -1953,7 +1945,7 @@ func (s *WebAuthnService) refuseIfSourceCutOff(ctx context.Context, userID domai
 // The comparison is at whole seconds (tokengate.IssuedBeforeCutoff), so a
 // token minted in the same second as a cut-off is refused too. When that is
 // the only problem (recheck passes) the tokens are minted again in the next
-// second, so a second device logging in right after suspending another is
+// second, so a second device logging in right after revoking another is
 // not turned away. If the cut-off is older, recheck (when given) supplies
 // the precise lifecycle refusal; otherwise the request fails with refusal
 // and the client simply tries again.
@@ -1987,7 +1979,7 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 			// login that passed its lifecycle check earlier in the flow
 			// (WebAuthn verification, sign-count save, OIDC checks) mints a
 			// token whose fresh iat is past that cut-off while the instance
-			// is being suspended. Running the caller's check once more, on
+			// is being revoked. Running the caller's check once more, on
 			// the state as it is after the mint, cuts the exposure down to
 			// the gap between those two writes (go-wallet-backend#330).
 			if recheck != nil {
@@ -2014,14 +2006,13 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 // checkWalletLifecycle enforces wallet instance status at login (SID-AUTH-06).
 //
 // Two rules. The instance linked to this passkey (WalletInstance.CredentialID,
-// recorded when the wallet supplies credential_id at WIA generation) must be
-// active. And if the user has instances at all, at least one must be
+// recorded when the wallet supplies credential_id at WIA generation) must not
+// be revoked. And if the user has instances at all, at least one must be
 // non-revoked: when every instance is revoked the wallet has been deactivated
 // and WalletLifecycleService already erased its data, so every passkey of the
-// user is refused until a new enrollment. A suspended instance that is not
-// linked to this passkey does not block login - it is still blocked from
-// obtaining a WIA (WIAService), and the user must be able to log in from
-// another device to manage it. A user with no instances yet is unaffected.
+// user is refused until a new enrollment. A revoked instance that is not
+// linked to this passkey does not block login - the user must be able to log
+// in from another device. A user with no instances yet is unaffected.
 //
 // This gate is load-bearing, not a second copy of the WIA gate, and it is
 // worth saying why before someone removes it as redundant. It is the only
@@ -2064,10 +2055,10 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	// The store does not enforce that a passkey is linked to at most one
 	// instance, so every instance linked to this passkey is considered and
 	// the most restrictive status wins: a passkey that is also linked to a
-	// suspended or revoked instance is refused even if an active duplicate
-	// exists, rather than letting store ordering decide.
+	// revoked instance is refused even if an active duplicate exists, rather
+	// than letting store ordering decide.
 	anyLive := false
-	linkedSuspended, linkedRevoked := false, false
+	linkedRevoked := false
 	for _, inst := range instances {
 		if inst.Status != domain.InstanceStatusRevoked {
 			anyLive = true
@@ -2075,10 +2066,7 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 		if inst.CredentialID == "" || inst.CredentialID != credentialID {
 			continue
 		}
-		switch inst.Status {
-		case domain.InstanceStatusSuspended:
-			linkedSuspended = true
-		case domain.InstanceStatusRevoked:
+		if inst.Status == domain.InstanceStatusRevoked {
 			linkedRevoked = true
 		}
 	}
@@ -2087,9 +2075,6 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	}
 	if linkedRevoked {
 		return ErrWalletInstanceRevoked
-	}
-	if linkedSuspended {
-		return ErrWalletInstanceSuspended
 	}
 	return nil
 }

@@ -798,7 +798,7 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
 }
 
-// SID-AUTH-06: a token issued before the user's wallet was suspended or
+// SID-AUTH-06: a token issued before the user's wallet was
 // revoked cannot open a new engine session.
 func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
@@ -826,7 +826,7 @@ func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	assert.NoError(t, err, "a token issued after the cut-off opens a session")
 }
 
-// Suspending or revoking a wallet instance must end the user's *live*
+// Revoking a wallet instance must end the user's *live*
 // WebSocket session, not just forget its persisted record: the Manager is the
 // service.SessionCleaner precisely so an already-connected client cannot keep
 // running flows after the token gate would refuse a new handshake.
