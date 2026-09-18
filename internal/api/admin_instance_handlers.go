@@ -200,9 +200,20 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.WalletInstances().Delete(c.Request.Context(), instanceID); err != nil {
+	// The condition travels with the delete. The check above reads a
+	// snapshot, and a revocation landing between the two would have its
+	// fresh tombstone deleted here - the very record that keeps login and
+	// new attestations refused for that device.
+	if err := h.store.WalletInstances().DeleteIfRemovable(c.Request.Context(), instanceID, tenantID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			return
+		}
+		if errors.Is(err, domain.ErrInvalidStatusTransition) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   errCodeInstanceRetained,
+				"message": "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted",
+			})
 			return
 		}
 		h.logger.Error("failed to delete wallet instance", zap.Error(err))

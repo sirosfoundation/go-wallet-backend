@@ -794,6 +794,19 @@ func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {
 	defer m.sessionsMu.Unlock()
 	if live, ok := m.userIndex[userID]; ok {
 		m.logger.Info("Closing live session for user", zap.String("user_id", userID))
+		// Cancel the flows here rather than leaving it to handleSession's
+		// deferred cleanup. That cleanup does run, but only once the read
+		// loop notices the closed connection, so this call would otherwise
+		// return while an issuance or presentation started before the
+		// revocation was still working. Each flow runs on its own context,
+		// not the connection's, so closing the socket does not reach it.
+		live.flowsMu.Lock()
+		for _, flow := range live.flows {
+			if flow.Handler != nil {
+				flow.Handler.Cancel()
+			}
+		}
+		live.flowsMu.Unlock()
 		_ = live.conn.Close()
 		delete(m.sessions, live.ID)
 		delete(m.userIndex, userID)

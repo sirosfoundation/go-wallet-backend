@@ -744,11 +744,20 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store   backend.Backend
-	auditor *audit.Emitter
-	cfg     *config.Config
-	logger  *zap.Logger
+	store          backend.Backend
+	auditor        *audit.Emitter
+	cfg            *config.Config
+	logger         *zap.Logger
+	sessionCleaner service.SessionCleaner
 }
+
+// SetSessionCleaner gives the standalone admin API a way to drop live
+// sessions when it revokes an instance. It is wired only when something in
+// this process owns sessions, which for --mode=admin means the engine is
+// co-hosted (--mode=admin,engine). Without it a revocation still cuts the
+// user's tokens off, and their sessions end at the next gate check rather
+// than immediately.
+func (p *AdminProvider) SetSessionCleaner(sc service.SessionCleaner) { p.sessionCleaner = sc }
 
 // NewAdminProvider creates a standalone admin route provider
 func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, error) {
@@ -810,12 +819,16 @@ func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	// device's tokens still worked - which, for the one operation a wallet
 	// instance has and cannot undo, is the worst possible half-measure.
 	//
-	// No session cleaner is wired: in --mode=admin the AS and the engine run
-	// in other processes, so there are no session records this one can
-	// close. Their live sessions end at the cut-off instead, which every
-	// gate consults - both HTTP middlewares, the WebSocket handshake and
-	// each flow start - rather than at an immediate drop.
-	adminHandlers.SetLifecycle(service.NewWalletLifecycleService(p.store, p.logger, p.auditor))
+	lifecycle := service.NewWalletLifecycleService(p.store, p.logger, p.auditor)
+	// A session cleaner is wired only when this process owns sessions, which
+	// for --mode=admin means the engine is co-hosted. Otherwise the AS and
+	// the engine are other processes and there is nothing here to close:
+	// their sessions end at the cut-off, which every gate consults, rather
+	// than at an immediate drop.
+	if p.sessionCleaner != nil {
+		lifecycle.SetSessionCleaner(p.sessionCleaner)
+	}
+	adminHandlers.SetLifecycle(lifecycle)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 

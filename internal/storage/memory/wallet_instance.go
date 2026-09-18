@@ -171,6 +171,23 @@ func (s *WalletInstanceStore) IncrementAttestation(_ context.Context, id string)
 	return nil
 }
 
+// DeleteIfRemovable deletes only while the instance is still removable. See
+// the interface for why a tombstone must survive a racing revocation.
+func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, tenantID domain.TenantID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inst, ok := s.data[id]
+	if !ok || inst.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	if !inst.Status.IsLive() && inst.UserID != nil {
+		return domain.ErrInvalidStatusTransition
+	}
+	delete(s.data, id)
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

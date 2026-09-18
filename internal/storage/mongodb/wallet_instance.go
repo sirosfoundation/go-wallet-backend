@@ -242,6 +242,34 @@ func (s *WalletInstanceStore) IncrementAttestation(ctx context.Context, id strin
 	return nil
 }
 
+// DeleteIfRemovable deletes only while the instance is still removable, so a
+// revocation landing between the caller's check and this delete keeps its
+// tombstone. See the interface for why that record must survive.
+func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID) error {
+	filter := bson.M{
+		"_id":       id,
+		"tenant_id": tenantID,
+		"$or": []bson.M{
+			{"status": domain.InstanceStatusActive},
+			{"user_id": bson.M{"$in": []interface{}{nil, ""}}},
+			{"user_id": bson.M{"$exists": false}},
+		},
+	}
+	res, err := s.collection.DeleteOne(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		// Tell "gone or another tenant's" apart from "became a tombstone".
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+		if cerr != nil || count == 0 {
+			return storage.ErrNotFound
+		}
+		return domain.ErrInvalidStatusTransition
+	}
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(ctx context.Context, id string) error {
 	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
 	if err != nil {

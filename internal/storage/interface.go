@@ -301,6 +301,19 @@ type WalletInstanceStore interface {
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteIfRemovable hard-deletes a wallet instance only while it is
+	// still removable: live, or bound to no user. It returns
+	// domain.ErrInvalidStatusTransition when the record exists but has
+	// become a lifecycle tombstone, and storage.ErrNotFound when it is gone
+	// or belongs to another tenant.
+	//
+	// The admin delete checks removability and then deletes, and a
+	// revocation landing between the two would otherwise have its fresh
+	// tombstone deleted - which is the record that keeps login and new
+	// attestations refused, so that device would look never-enrolled on its
+	// next attestation. The condition travels with the delete instead.
+	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2

@@ -293,6 +293,13 @@ func main() {
 		if err != nil {
 			logger.Fatal("Failed to create admin provider", zap.Error(err))
 		}
+		// --mode=admin,engine is a valid combination, and then the live
+		// WebSocket sessions an admin revocation has to drop are in this
+		// process after all. Without this the cascade would cut the user's
+		// tokens off but leave the socket open until its next gate check.
+		if engineProvider != nil {
+			provider.SetSessionCleaner(engineProvider.SessionCleaner())
+		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
 	}

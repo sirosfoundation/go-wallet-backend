@@ -1223,3 +1223,34 @@ func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
 		t.Errorf("the user's presentations must not outlive the account, %d remain", len(pres))
 	}
 }
+
+// failSessionCleaner stands in for a session store that will not drop a
+// user's sessions.
+type failSessionCleaner struct{}
+
+func (failSessionCleaner) DeleteByUser(context.Context, string) error {
+	return errors.New("session store is down")
+}
+
+// A session that outlives account deletion is not a cosmetic failure: the
+// user record carries the token cut-off, so deleting it means the gate can
+// no longer refuse that session's tokens at all.
+func TestDeleteUser_IncompleteWhenSessionsSurvive(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+	svc.SetSessionCleaner(failSessionCleaner{})
+
+	userID := domain.NewUserID()
+	did := "did:key:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := store.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive so the cut-off still applies, got %v", err)
+	}
+}

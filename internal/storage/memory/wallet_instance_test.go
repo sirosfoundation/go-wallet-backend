@@ -406,3 +406,60 @@ func TestInstanceStatus_IsLive(t *testing.T) {
 		}
 	}
 }
+
+// A revocation can land between an admin's removability check and the delete
+// itself. The tombstone it creates is the record that keeps login and new
+// attestations refused, so the delete must carry its own condition rather
+// than trust the caller's snapshot.
+func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+	uid := domain.UserIDFromString("owner")
+
+	// A live, user-owned instance is removable.
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-live", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.DeleteIfRemovable(ctx, "inst-live", "acme"); err != nil {
+		t.Fatalf("a live instance must be removable: %v", err)
+	}
+
+	// A revoked, user-owned instance is a tombstone and is not.
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-tomb", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.UpdateStatus(ctx, "inst-tomb", domain.InstanceStatusRevoked, "stolen"); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.DeleteIfRemovable(ctx, "inst-tomb", "acme"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("a tombstone must survive, got %v", err)
+	}
+	if _, err := wis.GetByID(ctx, "inst-tomb"); err != nil {
+		t.Errorf("the tombstone must still be there, got %v", err)
+	}
+
+	// A stray record with no user is removable whatever its status.
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-stray", TenantID: "acme", Status: domain.InstanceStatusRevoked,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.DeleteIfRemovable(ctx, "inst-stray", "acme"); err != nil {
+		t.Fatalf("a record with no user must be removable: %v", err)
+	}
+
+	// Another tenant's record is not found.
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-other", TenantID: "other", UserID: &uid, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.DeleteIfRemovable(ctx, "inst-other", "acme"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("another tenant's record must not be reachable, got %v", err)
+	}
+}

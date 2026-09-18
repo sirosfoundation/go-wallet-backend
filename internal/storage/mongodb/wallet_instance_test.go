@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 func TestWalletInstanceStore_UpdateStatus_RejectsUnknownStatus(t *testing.T) {
@@ -91,4 +92,38 @@ func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.
 	// And it is terminal from there like any other revocation.
 	err = wis.UpdateStatus(ctx, "inst-legacy-suspended", domain.InstanceStatusRevoked, "again")
 	require.Error(t, err, "revoking an already-revoked instance matches nothing")
+}
+
+// The Mongo store must agree with the memory one about what is removable, so
+// a racing revocation keeps its tombstone in both.
+func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	uid := domain.UserIDFromString("owner")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "del-live", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, wis.DeleteIfRemovable(ctx, "del-live", "acme"))
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "del-tomb", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, wis.UpdateStatus(ctx, "del-tomb", domain.InstanceStatusRevoked, "stolen"))
+	err := wis.DeleteIfRemovable(ctx, "del-tomb", "acme")
+	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition), "got %v", err)
+	_, err = wis.GetByID(ctx, "del-tomb")
+	require.NoError(t, err, "the tombstone must survive")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "del-stray", TenantID: "acme", Status: domain.InstanceStatusRevoked,
+	}))
+	require.NoError(t, wis.DeleteIfRemovable(ctx, "del-stray", "acme"), "a record with no user is removable")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "del-other", TenantID: "other", UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
+	err = wis.DeleteIfRemovable(ctx, "del-other", "acme")
+	require.True(t, errors.Is(err, storage.ErrNotFound), "got %v", err)
 }
