@@ -2060,13 +2060,13 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	anyLive := false
 	linkedRevoked := false
 	for _, inst := range instances {
-		if inst.Status != domain.InstanceStatusRevoked {
+		if inst.Status.IsLive() {
 			anyLive = true
 		}
 		if inst.CredentialID == "" || inst.CredentialID != credentialID {
 			continue
 		}
-		if inst.Status == domain.InstanceStatusRevoked {
+		if !inst.Status.IsLive() {
 			linkedRevoked = true
 		}
 	}

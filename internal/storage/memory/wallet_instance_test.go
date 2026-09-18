@@ -362,3 +362,47 @@ func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 		t.Fatalf("no metadata of another tenant's record may be touched: %+v", got)
 	}
 }
+
+// The memory store must agree with Mongo about legacy records: a "suspended"
+// instance written by an earlier release can be revoked, and nothing else.
+func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-legacy", TenantID: "acme", Status: domain.InstanceStatusLegacySuspended,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	if err := wis.UpdateStatus(ctx, "inst-legacy", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatus(active) = %v, want ErrInvalidStatusTransition", err)
+	}
+	if err := wis.UpdateStatus(ctx, "inst-legacy", domain.InstanceStatusRevoked, "cleanup"); err != nil {
+		t.Fatalf("revoke a legacy suspended instance: %v", err)
+	}
+	got, err := wis.GetByID(ctx, "inst-legacy")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, want revoked", got.Status)
+	}
+	if got.DeactivatedAt == nil {
+		t.Error("deactivated_at should be set")
+	}
+}
+
+func TestInstanceStatus_IsLive(t *testing.T) {
+	for st, want := range map[domain.InstanceStatus]bool{
+		domain.InstanceStatusActive:          true,
+		domain.InstanceStatusRevoked:         false,
+		domain.InstanceStatusLegacySuspended: false,
+		domain.InstanceStatus("something-新"): false,
+	} {
+		if got := st.IsLive(); got != want {
+			t.Errorf("InstanceStatus(%q).IsLive() = %v, want %v", st, got, want)
+		}
+	}
+}

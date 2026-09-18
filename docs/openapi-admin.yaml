@@ -893,6 +893,10 @@ paths:
         suspension in the ARF applies to Wallet Solutions and to provider and
         Relying Party registrations, never to a unit.
 
+        An instance left in the legacy `suspended` state by an earlier release
+        can be revoked here too. That is the only transition it has; it counts
+        as blocked, not live, until then.
+
         Emits an audit event for the revocation and runs the same lifecycle
         cascade as self-service (session drop, token cut-off, wallet-data
         erasure on the last revocation). If the cascade does not complete,

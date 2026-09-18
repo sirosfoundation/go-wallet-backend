@@ -295,3 +295,70 @@ func TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped(t *testing.T) {
 	assert.Equal(t, domain.InstanceStatusActive, other.Status,
 		"the other instance keeps its status: it can log in again, it just cannot keep its session")
 }
+
+// seedLegacySuspended inserts an instance already in the pre-removal
+// "suspended" state, the way a record written by an earlier release sits in
+// the database. It goes in through Upsert because the stores refuse to write
+// that status any more - which is the point: it can be read, not created.
+func seedLegacySuspended(t *testing.T, store storage.Store, id string, userID domain.UserID) {
+	t.Helper()
+	require.NoError(t, store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
+		ID: id, TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusLegacySuspended,
+	}))
+}
+
+// TestWalletLifecycle_LegacySuspendedIsNotLive covers records written before
+// suspension was removed. A suspended instance must be closable by an
+// operator, must not count as a live instance of the wallet, and must not
+// keep the wallet's data alive - otherwise removing the state would have
+// silently upgraded every suspended device back to a working one.
+func TestWalletLifecycle_LegacySuspendedIsNotLive(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a suspended record can still be revoked", func(t *testing.T) {
+		svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+		seedLegacySuspended(t, store, "inst-legacy", userID)
+
+		inst, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-legacy", domain.InstanceStatusRevoked, "cleanup")
+		require.NoError(t, err)
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
+	})
+
+	t.Run("a suspended record does not keep the wallet alive", func(t *testing.T) {
+		svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+		seedLegacySuspended(t, store, "inst-legacy", userID)
+
+		// Revoking the only live instance deactivates the wallet: the
+		// suspended one cannot log in or attest, so nothing is left to use
+		// the data.
+		_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "compromised")
+		require.NoError(t, err)
+		user, err := store.Users().GetByID(ctx, userID)
+		require.NoError(t, err)
+		assert.Nil(t, user.PrivateData, "no live instance remains, so the wallet data is erased")
+	})
+
+	t.Run("revoke-all sweeps a suspended record", func(t *testing.T) {
+		svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+		seedLegacySuspended(t, store, "inst-legacy", userID)
+
+		n, err := svc.RevokeAllForUser(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, userID, "cleanup")
+		require.NoError(t, err)
+		assert.Equal(t, 2, n, "both the active and the suspended instance are revoked")
+		for _, id := range []string{"inst-a", "inst-legacy"} {
+			got, err := store.WalletInstances().GetByID(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, domain.InstanceStatusRevoked, got.Status, id)
+		}
+	})
+}
+
+// A user actor may only sweep their own wallet.
+func TestWalletLifecycle_RevokeAllRefusesAnotherUsersWallet(t *testing.T) {
+	svc, _, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
+	other := domain.NewUserID()
+
+	n, err := svc.RevokeAllForUser(context.Background(), userActor(other), domain.DefaultTenantID, userID, "")
+	assert.ErrorIs(t, err, ErrWalletInstanceNotOwned)
+	assert.Zero(t, n)
+}

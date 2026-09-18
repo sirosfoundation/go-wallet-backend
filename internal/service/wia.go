@@ -775,11 +775,11 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 }
 
 // refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
-// has wallet instances in the tenant and every one of them is revoked - the
-// same "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
-// login for. A user with no instances yet, or with at least one that is not
-// revoked, may attest a new key; an anonymous attestation (nil userID) has no
-// wallet to check.
+// has wallet instances in the tenant and none of them is live - the same
+// "wallet deactivated" state WebAuthnService.checkWalletLifecycle refuses
+// login for. A user with no instances yet, or with at least one live one,
+// may attest a new key; an anonymous attestation (nil userID) has no wallet
+// to check.
 func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
 	if userID == nil {
 		return nil
@@ -795,12 +795,12 @@ func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID dom
 		return nil
 	}
 	for _, inst := range instances {
-		if inst.Status != domain.InstanceStatusRevoked {
+		if inst.Status.IsLive() {
 			return nil
 		}
 	}
-	s.emitAuditFailure("wallet_deactivated", errors.New("every wallet instance of the user is revoked"))
-	return fmt.Errorf("%w: wallet deactivated, every instance is revoked", ErrWIAInstanceDeactivated)
+	s.emitAuditFailure("wallet_deactivated", errors.New("no live wallet instance remains for the user"))
+	return fmt.Errorf("%w: wallet deactivated, no live instance remains", ErrWIAInstanceDeactivated)
 }
 
 // revokeIfWalletDeactivatedMeanwhile is the post-insert half of the
@@ -827,7 +827,7 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 			continue
 		}
 		others++
-		if inst.Status != domain.InstanceStatusRevoked {
+		if inst.Status.IsLive() {
 			return nil
 		}
 	}

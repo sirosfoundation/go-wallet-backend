@@ -163,7 +163,15 @@ relying party.
 
 Revoking an instance drops the user's live sessions and refuses new WIAs for
 it. Login with the passkey linked to a revoked instance is refused with `403
-WALLET_REVOKED`; the user's other, non-revoked devices still log in.
+WALLET_REVOKED`; the user's other, live devices still log in.
+
+Deployments upgraded from a release that still had the reversible `suspended`
+state keep those records: nothing writes that status any more, but one already
+in the database is read as **blocked, not live**. Its passkey does not log in,
+it cannot obtain a WIA, and it does not keep a wallet from being deactivated.
+Revoking it is allowed - it is the only way to move it - so an operator can
+close it individually or with a revoke-all. Reading it as live instead would
+have handed every suspended device back the login a provider took away.
 
 ##### Scope of the cut-off
 

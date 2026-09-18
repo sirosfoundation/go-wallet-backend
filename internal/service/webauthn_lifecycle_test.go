@@ -295,3 +295,35 @@ func TestPersistLoginState_ReloadNeverRollsBackTheSamePasskey(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 10, u.WebauthnCredentials[0].Authenticator.SignCount, "the counter only moves forward")
 }
+
+// A record left in the pre-removal "suspended" state must still be refused at
+// login. Reading it as live would hand its passkey back the login a provider
+// had taken away.
+func TestCheckWalletLifecycle_LegacySuspended(t *testing.T) {
+	ctx := context.Background()
+	userID := domain.NewUserID()
+
+	seedLegacy := func(t *testing.T, s *WebAuthnService, id, credentialID string) {
+		t.Helper()
+		require.NoError(t, s.store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: id, TenantID: domain.DefaultTenantID, UserID: &userID, CredentialID: credentialID,
+			Status: domain.InstanceStatusLegacySuspended,
+		}))
+	}
+
+	t.Run("the linked passkey is refused", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedLegacy(t, s, "i1", "pk-1")
+		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
+		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"), ErrWalletInstanceRevoked)
+		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2"), "the other device still logs in")
+	})
+
+	t.Run("it does not count as a live instance", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedLegacy(t, s, "i1", "pk-1")
+		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusRevoked)
+		assert.ErrorIs(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-new"), ErrWalletDeactivated,
+			"nothing live is left, so every passkey is refused as a deactivated wallet")
+	})
+}

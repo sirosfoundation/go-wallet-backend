@@ -174,6 +174,14 @@ func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.
 // revocations were persisted but the erasure did not complete; calling it
 // again with everything already revoked re-runs the erasure.
 func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor LifecycleActor, tenantID domain.TenantID, userID domain.UserID, reason string) (int, error) {
+	// A user actor may only sweep their own wallet. No route reaches this
+	// with a user actor today - revoking is a provider action and the
+	// self-service surface is list, logout-everywhere and account removal -
+	// but ChangeStatus checks the same thing and the asymmetry is the sort
+	// that gets noticed by whoever wires the next caller, not before.
+	if actor.UserID != nil && *actor.UserID != userID {
+		return 0, ErrWalletInstanceNotOwned
+	}
 	changed := 0
 	var last *domain.WalletInstance
 	// A first attestation can insert a new instance while this sweep runs
@@ -311,8 +319,8 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 		return s.incomplete(userID, errs)
 	}
 	for _, other := range remaining {
-		if other.Status != domain.InstanceStatusRevoked {
-			return s.incomplete(userID, errs) // something is still active or reactivatable
+		if other.Status.IsLive() {
+			return s.incomplete(userID, errs) // the wallet still has a usable instance
 		}
 	}
 	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
@@ -457,7 +465,7 @@ func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []d
 			return true
 		}
 		for _, inst := range instances {
-			if inst.Status != domain.InstanceStatusRevoked {
+			if inst.Status.IsLive() {
 				return true
 			}
 		}

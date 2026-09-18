@@ -168,7 +168,11 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 	filter := bson.M{"_id": id}
 	switch status {
 	case domain.InstanceStatusRevoked:
-		filter["status"] = domain.InstanceStatusActive
+		// Anything not already revoked may be revoked, which is what makes a
+		// legacy suspended record reachable at all: it can no longer be
+		// created, but one written by an earlier release must still be
+		// closable by an operator.
+		filter["status"] = bson.M{"$ne": domain.InstanceStatusRevoked}
 	default:
 		// Anything else is refused here rather than left to run with an
 		// unconstrained filter ({_id: id} alone), which would write the

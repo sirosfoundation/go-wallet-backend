@@ -11,14 +11,40 @@ type InstanceStatus string
 const (
 	InstanceStatusActive  InstanceStatus = "active"
 	InstanceStatusRevoked InstanceStatus = "revoked"
+
+	// InstanceStatusLegacySuspended is the reversible "suspended" state an
+	// instance could be put in before suspension was removed. Nothing enters
+	// it any more; it is named here because records written by an earlier
+	// release are still in the database and have to mean something definite.
+	//
+	// They mean "blocked": a suspended instance is not live, so it does not
+	// keep a wallet from being deactivated and its passkey does not log in.
+	// Reading it as live instead would hand back the login a provider had
+	// taken away, which is the opposite of what they asked for. Revoking one
+	// is a legal transition (see ValidateStatusTransition) so an operator can
+	// finish what they started, and a revoke-all sweeps them with everything
+	// else.
+	InstanceStatusLegacySuspended InstanceStatus = "suspended"
 )
+
+// IsLive reports whether an instance counts as a live instance of the wallet:
+// whether its passkey may log in, whether it may obtain a Wallet Instance
+// Attestation, and whether its existence keeps the wallet from being
+// deactivated and its data erased.
+//
+// Only "active" is live. This is deliberately not "anything but revoked":
+// a legacy suspended record is neither, and counting it as live would both
+// restore a login a provider removed and stop the erasure of a wallet that
+// has nothing left to use it.
+func (s InstanceStatus) IsLive() bool { return s == InstanceStatusActive }
 
 // ErrInvalidStatusTransition is returned when a status transition is not allowed.
 var ErrInvalidStatusTransition = errors.New("invalid status transition")
 
 // ValidateStatusTransition checks whether transitioning from current to target
-// is a legal state change. There is one: active to revoked. Revocation is
-// terminal, so nothing leaves the revoked state.
+// is a legal state change. Revocation is the only one, and it is terminal, so
+// nothing leaves the revoked state. A legacy suspended record may be revoked,
+// which is the only way to move it at all.
 //
 // A wallet instance has no reversible state, and that is deliberate. The ARF
 // gives a Wallet Unit four states - Installed, Operational, Valid, Revoked -
@@ -32,7 +58,7 @@ func ValidateStatusTransition(current, target InstanceStatus) error {
 	if current == target {
 		return nil // no-op
 	}
-	if current == InstanceStatusActive && target == InstanceStatusRevoked {
+	if target == InstanceStatusRevoked && current != InstanceStatusRevoked {
 		return nil
 	}
 	return ErrInvalidStatusTransition
@@ -90,8 +116,9 @@ type WalletInstance struct {
 	// UserID is the user who owns this instance (if known).
 	UserID *UserID `json:"user_id,omitempty" bson:"user_id,omitempty"`
 
-	// Status is the lifecycle state: active or revoked. Revocation is
-	// terminal (see ValidateStatusTransition).
+	// Status is the lifecycle state: active or revoked, or the legacy
+	// "suspended" of a record written before suspension was removed. Use
+	// IsLive rather than comparing against revoked.
 	Status InstanceStatus `json:"status" bson:"status"`
 
 	// WSCDType identifies the type of WSCD backing this instance.
