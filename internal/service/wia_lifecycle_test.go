@@ -738,3 +738,46 @@ func TestWIAService_GenerateWIA_OwnershipCheckedBeforeLifecycle(t *testing.T) {
 		})
 	}
 }
+
+// An account that has been removed must not attest itself a new wallet. The
+// token cut-off cannot stop this on its own: it lives on the user record, so
+// DELETE /user/session deletes the cut-off along with the account, and it
+// also deletes the wallet instances - leaving exactly the empty wallet that
+// a first attestation is allowed to enroll into.
+func TestWIAService_GenerateWIA_RefusesADeletedAccount(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newTestWIAServiceWithUsers(t)
+
+	// A user who existed and was removed: nothing of theirs is left, which
+	// is indistinguishable from a first enrollment without this check.
+	gone := domain.UserIDFromString("deleted-account")
+	_, err := store.Users().GetByID(ctx, gone)
+	if err == nil {
+		t.Fatal("the fixture must not have this user")
+	}
+
+	challenge, _, cerr := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if cerr != nil {
+		t.Fatalf("CreateChallenge: %v", cerr)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &gone, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAUnknownUser) {
+		t.Fatalf("GenerateWIA for a deleted account = %v, want ErrWIAUnknownUser", err)
+	}
+
+	// A user who does exist is unaffected.
+	live := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: live, DID: "did:example:live"}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	challenge2, _, cerr := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if cerr != nil {
+		t.Fatalf("CreateChallenge: %v", cerr)
+	}
+	pop2, _ := createTestPop(t, challenge2)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &live, &WIARequest{Pop: pop2, Challenge: challenge2}); err != nil {
+		t.Fatalf("GenerateWIA for a live user: %v", err)
+	}
+}

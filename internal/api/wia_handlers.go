@@ -118,6 +118,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
 			})
+		case errors.Is(err, service.ErrWIAUnknownUser):
+			h.logger.Warn("WIA generation refused: the token names a user that does not exist", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "UNKNOWN_USER",
+				"message": "This account no longer exists",
+			})
 		case errors.Is(err, service.ErrWIAInstanceDeactivated):
 			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
 			c.JSON(http.StatusForbidden, gin.H{

@@ -397,6 +397,27 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// behind. Removing it now would strand that instance for good and take
 	// away the caller's only way to ask again; leaving it means the request
 	// can simply be repeated, the way an incomplete lifecycle cascade is.
+	// Re-list before committing. The sweep above works from a snapshot and
+	// is not serialized with WIA generation, so an attestation that was
+	// already in flight can bind a new instance to this user between the
+	// listing and here. Deleting the account on top of that would strand the
+	// new record exactly as a failed delete would. One more pass is not a
+	// lock - an attestation landing after this check still gets through, and
+	// serializing lifecycle work with attestation is go-wallet-backend#330 -
+	// but it closes the window that a slow multi-tenant sweep leaves wide.
+	for _, tenantID := range tenantIDs {
+		remaining, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			instanceErrs = append(instanceErrs, fmt.Errorf("re-list wallet instances in tenant %s: %w", tenantID, err))
+			continue
+		}
+		for _, inst := range remaining {
+			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
+				instanceErrs = append(instanceErrs, fmt.Errorf("delete wallet instance %s on the second pass: %w", inst.ID, err))
+			}
+		}
+	}
+
 	if len(instanceErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: wallet instances remain",
 			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))

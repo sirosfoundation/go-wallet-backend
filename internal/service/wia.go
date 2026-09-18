@@ -37,6 +37,15 @@ var (
 	// client point its instance at someone else's passkey - or at nothing -
 	// and keep the real passkey out of the per-instance login gate for good.
 	ErrWIACredentialNotOwned = errors.New("credential_id is not one of the caller's passkeys")
+	// ErrWIAUnknownUser refuses an attestation whose token names a user that
+	// is not there - in practice one whose account was removed. The token
+	// cut-off cannot catch this: it lives on the user record, so deleting
+	// the account deletes the cut-off with it, and internal/tokengate is
+	// deliberately not an existence check. Without this an old bearer token
+	// would attest a fresh instance for a deleted account, which is the one
+	// state in which a first attestation is always allowed, because no
+	// instance remains to say the wallet was deactivated.
+	ErrWIAUnknownUser = errors.New("attestation names a user that does not exist")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -795,6 +804,20 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
 	if userID == nil {
 		return nil
+	}
+	// The named user must still exist. A deleted account takes its token
+	// cut-off with it, so an already-issued bearer token still passes every
+	// gate; and DeleteUser removes the wallet instances, so the check below
+	// would see an empty wallet and read it as a first enrollment. Together
+	// those would let a removed account attest itself a new wallet.
+	if s.users != nil {
+		if _, err := s.users.GetByID(ctx, *userID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				s.emitAuditFailure("unknown_user", errors.New("attestation names a user that does not exist"))
+				return ErrWIAUnknownUser
+			}
+			return fmt.Errorf("check attesting user: %w", err)
+		}
 	}
 	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
 	if err != nil {

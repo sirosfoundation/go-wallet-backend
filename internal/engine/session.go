@@ -783,14 +783,21 @@ func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {
 	if userID == "" {
 		return nil
 	}
+	// The persisted delete runs under the same lock as the in-memory one.
+	// Releasing it first left a window in which a session registering for
+	// this user wrote its record and then had it deleted by this call,
+	// leaving a live socket with nothing in the store and nothing to restore
+	// after a restart. registerSession already holds this lock across its
+	// own store writes, so serializing here costs no more than it does
+	// there and makes the two operations agree on an order.
 	m.sessionsMu.Lock()
+	defer m.sessionsMu.Unlock()
 	if live, ok := m.userIndex[userID]; ok {
 		m.logger.Info("Closing live session for user", zap.String("user_id", userID))
 		_ = live.conn.Close()
 		delete(m.sessions, live.ID)
 		delete(m.userIndex, userID)
 	}
-	m.sessionsMu.Unlock()
 	if m.sessionStore == nil {
 		return nil
 	}

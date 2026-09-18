@@ -296,7 +296,18 @@ re-runs the cleanup, so the administrator retries until it gets `200`.
 Revoking an instance also cuts off bearer tokens issued before it: legacy
 access and refresh tokens, and access tokens validated by the backend or
 accepted for a WebSocket handshake, are refused with `401` when their `iat`
-is not after the cut-off, even if they have not expired. No token is exempt.
+is not after the cut-off, even if they have not expired. No token of that
+user is exempt, the one carrying the request included.
+
+Two tokens are outside the cut-off's reach rather than exempt from it, both
+because it is recorded against a user and they name none. An **anonymous** AS
+token carries no subject to look it up by; reaching those needs a subject
+they do not have, which is go-wallet-backend#333. And a token naming a user
+whose **account has been removed** outlives the cut-off, because the cut-off
+was stored on the record that was deleted. Wallet Instance Attestation
+generation refuses that case explicitly (`403 UNKNOWN_USER`), since it is the
+one that could re-animate a wallet: account removal deletes the instances
+too, so without the check an old token would look like a first enrollment.
 The cut-off is recorded before the status change is persisted, so a revoked
 instance never keeps working tokens. The user's other devices log in again
 afterwards and their new tokens work normally; the revoked instance has no

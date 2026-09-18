@@ -1661,7 +1661,13 @@ components:
           type: string
         status:
           type: string
-          enum: [active, revoked]
+          # "suspended" is never accepted on a request and never written. It
+          # appears here because a record left in that state by a release
+          # that still had it is returned unchanged by the list and get
+          # paths, and a client validating against this schema must not
+          # reject it. Such a record counts as blocked, not live, and its
+          # only transition is revocation.
+          enum: [active, revoked, suspended]
         wscd_type:
           type: string
           enum: [web_crypto, remote, native_ios, native_android]
