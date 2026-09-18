@@ -360,31 +360,14 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		// the one step of this cleanup whose residue is permanent, and the
 		// user record is not deleted while any of it is outstanding, so the
 		// caller can still authenticate and repeat the request.
-		tenantFailed := false
 		instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			instanceErrs = append(instanceErrs, fmt.Errorf("list wallet instances in tenant %s: %w", tenantID, err))
-			tenantFailed = true
 		}
 		for _, inst := range instances {
 			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
 				instanceErrs = append(instanceErrs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
-				tenantFailed = true
 			}
-		}
-
-		// The membership is what makes this tenant findable. Removing it
-		// while an instance of the tenant is still there would hide that
-		// instance from the retry - the next attempt rebuilds its tenant
-		// list from the memberships, would not look here again, and would
-		// find nothing outstanding and delete the account over the top of
-		// the orphan. So the membership outlives the failure and goes on
-		// the pass that succeeds.
-		if tenantFailed {
-			continue
-		}
-		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
-			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
 		}
 	}
 
@@ -434,6 +417,20 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Error("Account deletion incomplete: wallet instances remain",
 			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
 		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(instanceErrs...))
+	}
+
+	// Memberships come last, once nothing is outstanding anywhere. They are
+	// what makes a non-default tenant findable at all: the retry after a
+	// DELETION_INCOMPLETE rebuilds its tenant list from them, so a
+	// membership dropped while any instance is unaccounted for - including
+	// one the final re-list above only just discovered in a different
+	// tenant - would hide that tenant from every later attempt, and the next
+	// call would find nothing outstanding and delete the account over the
+	// top of the orphan.
+	for _, tenantID := range tenantIDs {
+		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
+			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
 	}
 
 	// Delete the user

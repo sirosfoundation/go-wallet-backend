@@ -1064,3 +1064,80 @@ type failTenantLookups struct {
 func (f failTenantLookups) GetUserTenants(context.Context, domain.UserID) ([]domain.TenantID, error) {
 	return nil, errors.New("storage is down")
 }
+
+// lateInstanceStore is empty on the first listing of a tenant and produces an
+// undeletable instance on every listing after it, standing in for an
+// attestation that binds an instance while the sweep is already running.
+type lateInstanceStore struct {
+	storage.Store
+	userID domain.UserID
+	seen   map[domain.TenantID]int
+}
+
+func (s *lateInstanceStore) WalletInstances() storage.WalletInstanceStore {
+	return &lateInstances{WalletInstanceStore: s.Store.WalletInstances(), parent: s}
+}
+
+type lateInstances struct {
+	storage.WalletInstanceStore
+	parent *lateInstanceStore
+}
+
+func (l *lateInstances) GetByUser(_ context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	l.parent.seen[tenantID]++
+	if l.parent.seen[tenantID] == 1 {
+		return nil, nil
+	}
+	return []*domain.WalletInstance{{
+		ID: "inst-late-" + string(tenantID), TenantID: tenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}}, nil
+}
+
+func (l *lateInstances) Delete(context.Context, string) error {
+	return errors.New("storage is down")
+}
+
+// The first pass can find a tenant empty and the final re-list can then
+// discover an instance bound to it after the fact. If removing that instance
+// fails, the membership must still be there: the retry rebuilds its tenant
+// list from the memberships, and without this one it would never look at that
+// tenant again and would delete the account over the top of the orphan.
+func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	store := &lateInstanceStore{Store: inner, seen: map[domain.TenantID]int{}}
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	store.userID = userID
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := inner.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+		UserID: userID, TenantID: "acme", Role: "user",
+	}); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+
+	tenants, err := inner.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUserTenants: %v", err)
+	}
+	found := false
+	for _, tid := range tenants {
+		if tid == "acme" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the acme membership must survive so the retry can find that tenant, got %v", tenants)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive, got %v", err)
+	}
+}
