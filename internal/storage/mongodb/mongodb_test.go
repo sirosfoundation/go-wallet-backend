@@ -645,13 +645,13 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 
 	t2 := time.Now().Truncate(time.Millisecond)
 	t1 := t2.Add(-time.Hour)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2, ""))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1, ""), "an older cut-off is a no-op ($max)")
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1), "an older cut-off is a no-op ($max)")
 	u, err := store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.True(t, u.AuthInvalidBefore.Equal(t2), "cut-off only moves forward: %v vs %v", u.AuthInvalidBefore, t2)
 
-	require.NoError(t, store.Users().EraseWalletData(ctx, uid, t2, ""))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, t2))
 	u, err = store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
 	assert.Nil(t, u.PrivateData)
@@ -660,8 +660,8 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	assert.Equal(t, "did:x", u.DID, "other fields untouched")
 	assert.True(t, u.AuthInvalidBefore.Equal(t2))
 
-	assert.ErrorIs(t, store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now(), ""), storage.ErrNotFound)
-	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2, ""), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now()), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2), storage.ErrNotFound)
 }
 
 func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
@@ -676,8 +676,8 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	stale.DID = "did:y"
 	require.NoError(t, store.Users().Update(ctx, stale))
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond), ""))
-	require.NoError(t, store.Users().EraseWalletData(ctx, uid, time.Now(), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Truncate(time.Millisecond)))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, time.Now()))
 	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite)
 	u, err := store.Users().GetByID(ctx, uid)
 	require.NoError(t, err)
@@ -687,21 +687,6 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	u.DID = "did:z"
 	require.NoError(t, store.Users().Update(ctx, u), "the fresh copy carries the cut-off and updates fine")
 	assert.ErrorIs(t, store.Users().Update(ctx, &domain.User{UUID: domain.NewUserID()}), storage.ErrNotFound)
-}
-
-func TestUserStore_InvalidateAuthBefore_ExemptJTI(t *testing.T) {
-	store := skipIfNoMongo(t)
-	ctx := context.Background()
-	uid := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid}))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), "jti-1"))
-	u, err := store.Users().GetByID(ctx, uid)
-	require.NoError(t, err)
-	assert.Equal(t, "jti-1", u.AuthCutoffExemptJTI)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now(), ""))
-	u, err = store.Users().GetByID(ctx, uid)
-	require.NoError(t, err)
-	assert.Empty(t, u.AuthCutoffExemptJTI, "an admin change clears the exemption")
 }
 
 // On a fresh database the counter must hand out 1, 2, 3, ...: with the
@@ -724,42 +709,6 @@ func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
 	}
 }
 
-func TestUserStore_ExemptionChangesOnlyWhenCutoffAdvances(t *testing.T) {
-	store := skipIfNoMongo(t)
-	ctx := context.Background()
-	uid := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v")}))
-	newer := time.Now().Truncate(time.Millisecond)
-	older := newer.Add(-time.Minute)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, newer, "new-jti"))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, older, "old-jti"))
-	cutoff, exempt, err := store.Users().GetAuthCutoff(ctx, uid)
-	require.NoError(t, err)
-	assert.True(t, cutoff.Equal(newer), "cut-off stays at the newer value")
-	assert.Equal(t, "new-jti", exempt, "a delayed older event must not replace the newer exemption")
-
-	// An erasure is not an ordinary cut-off event: it destroys the vault
-	// whichever way its fence orders. It therefore keeps the newer cut-off
-	// but must not leave the newer event's exempt token behind - that token
-	// would go on writing wallet data over an erased wallet.
-	require.NoError(t, store.Users().EraseWalletData(ctx, uid, older, ""), "erase with an older fence")
-	u, err := store.Users().GetByID(ctx, uid)
-	require.NoError(t, err)
-	assert.Nil(t, u.PrivateData, "data erased")
-	assert.True(t, u.AuthInvalidBefore.Equal(newer))
-	assert.Empty(t, u.AuthCutoffExemptJTI, "the vault is gone: the losing erasure still drops the exemption")
-
-	later := newer.Add(time.Second)
-	require.NoError(t, store.Users().EraseWalletData(ctx, uid, later, ""))
-	cutoff, exempt, err = store.Users().GetAuthCutoff(ctx, uid)
-	require.NoError(t, err)
-	assert.True(t, cutoff.Equal(later))
-	assert.Empty(t, exempt, "advancing with no exemption clears it")
-
-	_, _, err = store.Users().GetAuthCutoff(ctx, domain.NewUserID())
-	assert.ErrorIs(t, err, storage.ErrNotFound)
-}
-
 func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
@@ -769,8 +718,8 @@ func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
 	require.NoError(t, err)
 
 	ts := time.Now().Truncate(time.Millisecond)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, ts, "acting"))
-	require.NoError(t, store.Users().EraseWalletData(ctx, uid, ts, ""), "same instant, second lifecycle write")
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, ts))
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, ts), "same instant, second lifecycle write")
 
 	assert.ErrorIs(t, store.Users().Update(ctx, stale), storage.ErrStaleWrite, "equal cut-off but a later fence")
 	u, err := store.Users().GetByID(ctx, uid)

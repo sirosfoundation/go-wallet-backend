@@ -61,7 +61,7 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, users tok
 		}
 
 		// SID-AUTH-06 token cut-off (anonymous tokens have no user and pass).
-		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), result.JTI, logger) {
+		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
 

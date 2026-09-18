@@ -4,17 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -42,172 +41,119 @@ func seedUserInstance(t *testing.T, h *Handlers, id string, userID domain.UserID
 	}
 }
 
-func TestMyWalletInstances_ListUpdateRevokeAll(t *testing.T) {
-	handlers, router := setupLifecycleHandlers(t)
+// A user sees their own instances and nobody else's. Listing is all the
+// self-service surface does with them: changing a status is a provider
+// action (SID-AUTH-06), because it is reversible only by a provider.
+func TestListMyWalletInstances_OnlyMine(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
 	me := domain.UserIDFromString("user-123")
 	other := domain.UserIDFromString("user-456")
-	if err := handlers.store.Users().Create(context.Background(), &domain.User{UUID: me, PrivateData: []byte("vault")}); err != nil {
-		t.Fatalf("create user: %v", err)
-	}
 	seedUserInstance(t, handlers, "mine-1", me)
 	seedUserInstance(t, handlers, "mine-2", me)
 	seedUserInstance(t, handlers, "theirs", other)
 
-	auth := authMiddleware("user-123", "did:example:123")
-	router.GET("/user/session/instances", auth, handlers.ListMyWalletInstances)
-	router.PUT("/user/session/instances/:instance_id/status", auth, handlers.UpdateMyWalletInstanceStatus)
-	router.POST("/user/session/instances/revoke-all", auth, handlers.RevokeAllMyWalletInstances)
-
-	// List: only my instances.
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/user/session/instances", nil))
+	r := instanceRoutes(handlers, authMiddleware("user-123", "did:example:123"))
+	w := doJSON(r, http.MethodGet, "/user/session/instances", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("list: %d %s", w.Code, w.Body.String())
 	}
-	var listed struct {
+	var body struct {
 		Instances []domain.WalletInstance `json:"instances"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Instances) != 2 {
-		t.Fatalf("expected 2 instances, got %d", len(listed.Instances))
+	if len(body.Instances) != 2 {
+		t.Fatalf("expected my two instances, got %d", len(body.Instances))
+	}
+	for _, inst := range body.Instances {
+		if inst.ID == "theirs" {
+			t.Fatal("another user's instance must not be listed")
+		}
+	}
+}
+
+// The self-service routes no longer offer a status change or a revoke-all:
+// a user who suspended or revoked the instance behind their last passkey
+// could not undo it without an administrator. What a user can do to
+// themselves is log out everywhere, which a new login undoes, and remove the
+// account, which is meant to be final.
+func TestSelfServiceOffersNoInstanceStatusChange(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
+	r := instanceRoutes(handlers, authMiddleware("user-123", "did:example:123"))
+
+	for _, c := range []struct{ method, path string }{
+		{http.MethodPut, "/user/session/instances/mine-1/status"},
+		{http.MethodPost, "/user/session/instances/revoke-all"},
+	} {
+		w := doJSON(r, c.method, c.path, `{"status":"revoked"}`)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s %s: expected the route to be gone (404), got %d", c.method, c.path, w.Code)
+		}
+	}
+}
+
+// Logging out everywhere ends the user's sessions and refuses the tokens
+// already issued to them, including the one that asked.
+func TestLogoutEverywhere(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
+	ctx := context.Background()
+	me := domain.NewUserID()
+	if err := handlers.store.Users().Create(ctx, &domain.User{UUID: me, PrivateData: []byte("vault")}); err != nil {
+		t.Fatal(err)
+	}
+	cleaner := &recordingCleaner{}
+	handlers.services.User.SetSessionCleaner(cleaner)
+
+	r := instanceRoutes(handlers, authMiddleware(me.String(), "did:example:1"))
+	w := doJSON(r, http.MethodPost, "/user/session/logout-all", "")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("logout-all: %d %s", w.Code, w.Body.String())
+	}
+	if len(cleaner.users) != 1 || cleaner.users[0] != me.String() {
+		t.Fatalf("the user's sessions must be dropped, got %v", cleaner.users)
 	}
 
-	// Suspend my own instance.
-	w = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/user/session/instances/mine-1/status", strings.NewReader(`{"status":"suspended","reason":"lost"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"suspended"`) {
-		t.Fatalf("suspend: %d %s", w.Code, w.Body.String())
+	gate := tokengate.New(handlers.store.Users())
+	issued := time.Now().Add(-time.Minute)
+	if err := gate.Check(ctx, me.String(), issued); err == nil {
+		t.Fatal("a token issued before the logout must be refused afterwards")
+	}
+	if err := gate.Check(ctx, me.String(), time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("a token issued after it must still work: %v", err)
 	}
 
-	// Someone else's instance reads as not found.
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/user/session/instances/theirs/status", strings.NewReader(`{"status":"revoked"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("not owned: expected 404, got %d %s", w.Code, w.Body.String())
-	}
-
-	// Invalid status value is a 400.
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/user/session/instances/mine-1/status", strings.NewReader(`{"status":"deleted"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("bad status: expected 400, got %d", w.Code)
-	}
-
-	// Deactivate the wallet: everything of mine revoked, data erased, theirs untouched.
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", strings.NewReader(`{"reason":"device stolen"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":2`) {
-		t.Fatalf("revoke-all: %d %s", w.Code, w.Body.String())
-	}
-	user, err := handlers.store.Users().GetByID(context.Background(), me)
+	// Nothing is erased: logging in again restores the account as it was.
+	user, err := handlers.store.Users().GetByID(ctx, me)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if user.PrivateData != nil {
-		t.Errorf("private data must be erased once every instance is revoked")
-	}
-	theirs, err := handlers.store.WalletInstances().GetByID(context.Background(), "theirs")
-	if err != nil || theirs.Status != domain.InstanceStatusActive {
-		t.Errorf("another user's instance must be untouched: %v %v", err, theirs)
-	}
-
-	// Revoked is terminal.
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPut, "/user/session/instances/mine-1/status", strings.NewReader(`{"status":"active"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("reactivate revoked: expected 409, got %d %s", w.Code, w.Body.String())
+	if user.PrivateData == nil {
+		t.Fatal("logging out everywhere must not erase the wallet data")
 	}
 }
 
-// The revoke-all body is optional, but "optional" means an empty body: a
-// malformed payload must not be mistaken for "no options" on a destructive
-// endpoint.
-func TestRevokeAllMyWalletInstances_OptionalBody(t *testing.T) {
-	handlers, router := setupLifecycleHandlers(t)
-	me := domain.UserIDFromString("user-123")
-	if err := handlers.store.Users().Create(context.Background(), &domain.User{UUID: me}); err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	seedUserInstance(t, handlers, "mine-1", me)
-	router.POST("/user/session/instances/revoke-all", authMiddleware("user-123", "did:example:123"), handlers.RevokeAllMyWalletInstances)
-
-	// Malformed JSON is a 400 and revokes nothing.
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", strings.NewReader(`{"reason":"trunc`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("malformed body: expected 400, got %d %s", w.Code, w.Body.String())
-	}
-	inst, err := handlers.store.WalletInstances().GetByID(context.Background(), "mine-1")
-	if err != nil || inst.Status != domain.InstanceStatusActive {
-		t.Fatalf("malformed body must not revoke: %v %v", err, inst)
-	}
-
-	// No body at all is fine.
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/user/session/instances/revoke-all", nil))
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"revoked":1`) {
-		t.Fatalf("empty body: %d %s", w.Code, w.Body.String())
+func TestLogoutEverywhere_Unauthorized(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
+	r := instanceRoutes(handlers) // no auth middleware
+	if w := doJSON(r, http.MethodPost, "/user/session/logout-all", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
 	}
 }
 
-// Revoking an instance is terminal and can erase the wallet, so under
-// go-tokenauth it needs TAC `d` on top of the route's `w`; suspend and
-// reactivate stay `w`-only, and legacy auth (no tokenauth_result) is unaffected.
-func TestUpdateMyWalletInstanceStatus_RevokeNeedsDeleteTAC(t *testing.T) {
-	handlers, router := setupLifecycleHandlers(t)
-	me := domain.UserIDFromString("user-123")
-	if err := handlers.store.Users().Create(context.Background(), &domain.User{UUID: me}); err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	seedUserInstance(t, handlers, "mine-1", me)
-	seedUserInstance(t, handlers, "mine-2", me)
-	withTAC := func(tac string) gin.HandlerFunc {
-		return func(c *gin.Context) {
-			c.Set("user_id", "user-123")
-			c.Set("tokenauth_result", &claims.Result{UserID: "user-123", TAC: claims.TAC(tac)})
-			c.Next()
-		}
-	}
-	put := func(mw gin.HandlerFunc, id, status string) *httptest.ResponseRecorder {
-		r := gin.New()
-		r.PUT("/user/session/instances/:instance_id/status", mw, handlers.UpdateMyWalletInstanceStatus)
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPut, "/user/session/instances/"+id+"/status", strings.NewReader(`{"status":"`+status+`"}`))
-		req.Header.Set("Content-Type", "application/json")
-		r.ServeHTTP(w, req)
-		return w
-	}
-	_ = router
-
-	if w := put(withTAC("rw"), "mine-1", "suspended"); w.Code != http.StatusOK {
-		t.Fatalf("suspend with w: expected 200, got %d %s", w.Code, w.Body.String())
-	}
-	if w := put(withTAC("rw"), "mine-1", "revoked"); w.Code != http.StatusForbidden {
-		t.Fatalf("revoke with w only: expected 403, got %d %s", w.Code, w.Body.String())
-	}
-	inst, err := handlers.store.WalletInstances().GetByID(context.Background(), "mine-1")
-	if err != nil || inst.Status != domain.InstanceStatusSuspended {
-		t.Fatalf("a refused revocation must leave the instance untouched: %v %v", err, inst)
-	}
-	if w := put(withTAC("rwd"), "mine-1", "revoked"); w.Code != http.StatusOK {
-		t.Fatalf("revoke with d: expected 200, got %d %s", w.Code, w.Body.String())
-	}
-	// Legacy auth never sets tokenauth_result: no TAC concept, no extra gate.
-	if w := put(authMiddleware("user-123", "did:example:123"), "mine-2", "revoked"); w.Code != http.StatusOK {
-		t.Fatalf("revoke under legacy auth: expected 200, got %d %s", w.Code, w.Body.String())
+func TestLogoutEverywhere_UnknownUser(t *testing.T) {
+	handlers, _ := setupLifecycleHandlers(t)
+	r := instanceRoutes(handlers, authMiddleware(domain.NewUserID().String(), "did:example:gone"))
+	if w := doJSON(r, http.MethodPost, "/user/session/logout-all", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+type recordingCleaner struct{ users []string }
+
+func (r *recordingCleaner) DeleteByUser(_ context.Context, userID string) error {
+	r.users = append(r.users, userID)
+	return nil
+}
+
+var _ service.SessionCleaner = (*recordingCleaner)(nil)

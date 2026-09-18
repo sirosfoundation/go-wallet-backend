@@ -160,8 +160,12 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.ListMyWalletInstances)
 			// `w` covers suspend/reactivate; the handler additionally requires
 			// `d` when the target status is `revoked` (terminal, may erase).
-			session.PUT("/instances/:instance_id/status", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateMyWalletInstanceStatus)
-			session.POST("/instances/revoke-all", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.RevokeAllMyWalletInstances)
+			// Changing an instance's status is a provider action: it is
+			// reversible only by a provider, so a user doing it to the
+			// instance behind their last passkey would lock themselves out
+			// (SID-AUTH-06, admin_instance_handlers.go). What a user owns is
+			// logging out everywhere, and removing the account outright.
+			session.POST("/logout-all", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.LogoutEverywhere)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 

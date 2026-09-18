@@ -35,14 +35,6 @@ type LifecycleActor struct {
 	Kind string
 	// UserID is set for self-service changes: the instance must belong to it.
 	UserID *domain.UserID
-	// TokenJTI is the id of the bearer token that carries the request, for
-	// self-service changes. It stays valid across the token cut-off the
-	// change triggers, so the user can reactivate a suspended instance or
-	// repeat the request after 409 ERASURE_INCOMPLETE from the same session.
-	// It buys nothing else: the exemption ends with the key material (see
-	// eraseWalletData) and no token-minting path honours it (see
-	// domain.User.AuthCutoffExemptJTI).
-	TokenJTI string
 }
 
 // WalletLifecycleService implements SID-AUTH-06 wallet lifecycle management on
@@ -169,7 +161,7 @@ func (s *WalletLifecycleService) cutOffTokens(ctx context.Context, inst *domain.
 	if inst.UserID == nil {
 		return nil
 	}
-	if err := s.store.Users().InvalidateAuthBefore(ctx, *inst.UserID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
+	if err := s.store.Users().InvalidateAuthBefore(ctx, *inst.UserID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("cut off issued tokens: %w", err)
 	}
 	return nil
@@ -305,7 +297,7 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	// whose cut-off never landed. Establish the cut-off when the user has
 	// none, without advancing one that is already set (that would need-
 	// lessly invalidate tokens issued since).
-	if err := s.ensureCutoff(ctx, userID, actor); err != nil {
+	if err := s.ensureCutoff(ctx, userID); err != nil {
 		errs = append(errs, err)
 	}
 	if s.sessionCleaner != nil {
@@ -329,8 +321,8 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 
 // ensureCutoff records a token cut-off for a user that has none. Used by
 // cascade for statuses persisted outside ChangeStatus/RevokeAllForUser.
-func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID, actor LifecycleActor) error {
-	cutoff, _, err := s.store.Users().GetAuthCutoff(ctx, userID)
+func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID) error {
+	cutoff, err := s.store.Users().GetAuthCutoff(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil
@@ -340,7 +332,7 @@ func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain
 	if !cutoff.IsZero() {
 		return nil
 	}
-	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), actor.TokenJTI); err != nil && !errors.Is(err, storage.ErrNotFound) {
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("cut off issued tokens: %w", err)
 	}
 	return nil
@@ -415,7 +407,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// wallet data (private data, credentials) with its pre-cut-off token.
 	// When this write fails the exemption stays as it was, so the same
 	// session can repeat the request.
-	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now(), ""); err != nil {
+	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now()); err != nil {
 		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
 	// Only claim the erasure happened when every step of it did: an

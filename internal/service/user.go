@@ -259,6 +259,34 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 // Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
 // which may leave orphaned data in other tenants. This is a best-effort cleanup
 // that prioritizes completing the user deletion over strict data consistency.
+// LogoutEverywhere ends every session the user has, on the device that asked
+// and on any other, and refuses the bearer tokens already issued to them
+// (SID-AUTH-06). The caller's own token is refused too, which is what "log
+// out everywhere" means. Nothing is erased: this is the destructive-looking
+// thing a user can safely do to themselves, because logging in again undoes
+// all of it.
+func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID) error {
+	if _, err := s.store.Users().GetByID(ctx, userID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("failed to load user: %w", err)
+	}
+	// The cut-off first: if it fails nothing has changed, whereas dropping
+	// the sessions first would leave the already-issued tokens working while
+	// reporting an error.
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil {
+		return fmt.Errorf("failed to cut off issued tokens: %w", err)
+	}
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			return fmt.Errorf("failed to drop sessions: %w", err)
+		}
+	}
+	s.logger.Info("User logged out everywhere", zap.String("user_id", userID.String()))
+	return nil
+}
+
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
 	// Get all tenants the user belongs to
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
@@ -294,6 +322,21 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		for _, pres := range presentations {
 			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
 				s.logger.Warn("Failed to delete presentation", zap.Error(err))
+			}
+		}
+
+		// Remove the user's wallet instances. Without this they outlive the
+		// account: the records are keyed by instance-key thumbprint and keep
+		// pointing at a user that no longer exists, so re-enrolling on the
+		// same device finds an instance bound to someone else and is refused
+		// for good (WIAService.checkInstanceBinding).
+		instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("Failed to list wallet instances for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
+		}
+		for _, inst := range instances {
+			if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
+				s.logger.Warn("Failed to delete wallet instance", zap.Error(err), zap.String("instance_id", inst.ID))
 			}
 		}
 

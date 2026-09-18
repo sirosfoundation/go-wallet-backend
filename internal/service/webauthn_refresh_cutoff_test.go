@@ -12,7 +12,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -33,7 +32,7 @@ func TestRefreshAccessToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	require.NoError(t, err, "no cut-off yet")
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, user.UUID, time.Now().Add(time.Second), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, user.UUID, time.Now().Add(time.Second)))
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken)
 }
@@ -47,15 +46,15 @@ type cutoffAfterFirstRead struct {
 	fired bool
 }
 
-func (u *cutoffAfterFirstRead) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, string, error) {
-	cutoff, exempt, err := u.UserStore.GetAuthCutoff(ctx, id)
+func (u *cutoffAfterFirstRead) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	cutoff, err := u.UserStore.GetAuthCutoff(ctx, id)
 	if err == nil && !u.fired {
 		u.fired = true
-		if err := u.UserStore.InvalidateAuthBefore(ctx, u.uid, time.Now(), ""); err != nil {
-			return time.Time{}, "", err
+		if err := u.UserStore.InvalidateAuthBefore(ctx, u.uid, time.Now()); err != nil {
+			return time.Time{}, err
 		}
 	}
-	return cutoff, exempt, err
+	return cutoff, err
 }
 
 type racingUserStore struct {
@@ -81,27 +80,4 @@ func TestRefreshAccessToken_CutoffDuringRefreshIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "the source refresh token predates the cut-off that landed mid-request")
-}
-
-// The acting token's exemption is an exemption from the cut-off, not a
-// licence to mint: a refresh token that is somehow the exempt one still
-// cannot mint a fresh access token, which would carry a new id and an iat
-// past the cut-off and so escape it entirely.
-func TestRefreshAccessToken_ExemptSourceStillCannotMint(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "s", ExpiryHours: 1, RefreshDays: 7, Issuer: "t"}}
-	svc := &WebAuthnService{store: store, cfg: cfg, logger: zap.NewNop()}
-	user := &domain.User{UUID: domain.NewUserID(), DID: "did:x"}
-	require.NoError(t, store.Users().Create(ctx, user))
-
-	refresh, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
-	require.NoError(t, err)
-	require.NotEmpty(t, refresh)
-
-	cutoff := tokengate.IssuedAt(refresh).Add(time.Second)
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, user.UUID, cutoff, tokengate.JTI(refresh)))
-
-	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
-	assert.ErrorIs(t, err, ErrInvalidRefreshToken)
 }

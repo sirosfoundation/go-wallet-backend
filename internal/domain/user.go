@@ -102,16 +102,6 @@ type User struct {
 	// before a lifecycle write can never restore what it replaced - even
 	// when both carry the same AuthInvalidBefore timestamp.
 	AuthFence int64 `json:"-" bson:"auth_fence,omitempty"`
-	// AuthCutoffExemptJTI is the id of the one bearer token exempt from
-	// AuthInvalidBefore: the token that performed the lifecycle change. The
-	// user keeps that session to reactivate a suspended instance or to
-	// repeat a request after 409 ERASURE_INCOMPLETE; every other token
-	// issued before the cut-off is refused. The exemption is dropped once
-	// the wallet's key material is erased, and it is never honoured by a
-	// path that mints a new token (as.cutoffSubject,
-	// WebAuthnService.refuseIfSourceCutOff) - a minted token would carry a
-	// fresh iat and a new id, so it would escape the cut-off entirely.
-	AuthCutoffExemptJTI string `json:"-" bson:"auth_cutoff_exempt_jti,omitempty"`
 
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`

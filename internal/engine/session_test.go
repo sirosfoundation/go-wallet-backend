@@ -819,7 +819,7 @@ func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	_, _, _, err := m.validateToken(old)
 	require.NoError(t, err, "no cut-off yet")
 
-	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)))
 	_, _, _, err = m.validateToken(old)
 	assert.ErrorIs(t, err, tokengate.ErrRevoked)
 	_, _, _, err = m.validateToken(mint(time.Now()))
@@ -890,20 +890,17 @@ func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T)
 
 	// The wallet is revoked by a request carrying "acting-jti", which the
 	// backend keeps exempt so that request can be repeated.
-	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now(), "acting-jti"))
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now()))
 	assert.ErrorIs(t, m.recheckToken(session), tokengate.ErrRevoked, "the handshake token predates the cut-off")
 
-	// That exemption does reach the backend's gate - and deliberately not
-	// the engine's. A flow is an issuance or a presentation, not the
-	// lifecycle retry the exemption exists for, and a socket held by another
-	// engine process is exactly what the cascade's session drop cannot
-	// reach. Session keeps no jti at all, so the divergence holds by
-	// construction rather than by an argument at the call site.
+	// No token is exempt anywhere: the backend's gate refuses the same token
+	// the engine just refused, so a socket held by another engine process
+	// cannot outlive the cut-off either.
 	gate := tokengate.New(store.Users())
-	assert.NoError(t, gate.Check(context.Background(), uid.String(), session.tokenIssuedAt, "acting-jti"),
-		"the backend gate honours the exemption")
+	assert.ErrorIs(t, gate.Check(context.Background(), uid.String(), session.tokenIssuedAt), tokengate.ErrRevoked,
+		"the backend gate refuses it too")
 	assert.ErrorIs(t, m.recheckToken(&Session{ID: "s2", UserID: uid.String(), tokenIssuedAt: session.tokenIssuedAt}),
-		tokengate.ErrRevoked, "the engine does not, whoever holds the socket")
+		tokengate.ErrRevoked, "whoever holds the socket")
 
 	anon := &Session{ID: "s3", UserID: ""}
 	assert.NoError(t, m.recheckToken(anon), "anonymous sessions are not gated")

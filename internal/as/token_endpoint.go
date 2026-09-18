@@ -242,7 +242,7 @@ func handleAnonymousTokenRequest(
 // tokens after a lifecycle change always requires a new login. It writes the
 // response and returns false when the session is refused.
 func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
-	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant(), "")
+	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant())
 	switch {
 	case err == nil:
 		return true
@@ -286,7 +286,7 @@ func handleDelegationTokenRequest(
 	// cutoffSubject): a child token would carry a new jti and a fresh iat,
 	// so it would be neither exempt nor caught by the cut-off.
 	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
-	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt, ""); err != nil {
+	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
 		} else {
@@ -410,7 +410,7 @@ func issueToken(
 	// SID-AUTH-06: the cut-off was checked before the policy evaluation and
 	// the signing above; a suspension or revocation landing in between must
 	// not be handed a token whose fresh iat the resource gate would accept.
-	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt, ""); err != nil {
+	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})
 		} else {

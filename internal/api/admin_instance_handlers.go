@@ -15,6 +15,15 @@ import (
 
 // Error strings shared by the admin instance handlers (kept identical to the
 // self-service handlers so clients see one vocabulary).
+// errCodeErasureIncomplete reports a lifecycle change that was persisted but
+// whose cascade (dropping sessions, cutting off tokens, erasing wallet data)
+// did not complete. The status change stands; repeating the request resumes
+// the cleanup.
+const (
+	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
+	errMsgErasureIncomplete  = "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
+)
+
 const (
 	errMsgInstanceUpdateFailed     = "failed to update wallet instance"
 	errMsgInvalidStatusTransition  = "invalid status transition"
@@ -224,4 +233,45 @@ func (h *AdminHandlers) emitInstanceAuditEvent(_ *gin.Context, instanceID string
 		"status": string(status),
 		"reason": reason,
 	})
+}
+
+// revokeAllInstancesRequest is the optional body of the admin revoke-all.
+type revokeAllInstancesRequest struct {
+	Reason string `json:"reason"`
+}
+
+// RevokeAllWalletInstancesForUser handles
+// POST /admin/tenants/:id/users/:user_id/instances/revoke-all: revoke every
+// instance the user has in the tenant. SID-AUTH-06 requires a provider to be
+// able to act on one instance, several, or all of them; this is the "all"
+// case, and revoking the last live one runs the same cascade as a single
+// revocation.
+func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
+	if h.lifecycle == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "LIFECYCLE_NOT_SUPPORTED"})
+		return
+	}
+	tenantID := domain.TenantID(c.Param("id"))
+	userID := domain.UserIDFromString(c.Param("user_id"))
+
+	var req revokeAllInstancesRequest
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+	}
+
+	n, err := h.lifecycle.RevokeAllForUser(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, userID, req.Reason)
+	if err != nil {
+		if errors.Is(err, service.ErrErasureIncomplete) {
+			h.logger.Error("wallet instances revoked but cascade incomplete", zap.Error(err))
+			c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "revoked": n, "message": errMsgErasureIncomplete})
+			return
+		}
+		h.logger.Error("failed to revoke wallet instances", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke wallet instances"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revoked": n})
 }

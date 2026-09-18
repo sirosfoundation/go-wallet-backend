@@ -147,8 +147,8 @@ func TestPersistLoginState_LifecycleChangeDuringLogin(t *testing.T) {
 
 	t.Run("revoked during login: refused, erased data stays erased", func(t *testing.T) {
 		require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
-		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
-		require.NoError(t, store.Users().EraseWalletData(ctx, userID, time.Now(), ""))
+		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
+		require.NoError(t, store.Users().EraseWalletData(ctx, userID, time.Now()))
 		copyOf := stale // loaded before the revocation
 		err := s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1")
 		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
@@ -179,10 +179,10 @@ func TestMintTokens(t *testing.T) {
 
 	// Cut-off in the same second as minting: the tokens are minted again in
 	// the next second and pass.
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
 	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
 	require.NoError(t, err)
-	cutoff, _, _ := store.Users().GetAuthCutoff(ctx, userID)
+	cutoff, _ := store.Users().GetAuthCutoff(ctx, userID)
 	// Both handed-out tokens have to postdate the cut-off, not just the last
 	// one minted: the access token is minted first, so gating on the refresh
 	// token alone would let an access token the token gate already refuses
@@ -195,7 +195,7 @@ func TestMintTokens(t *testing.T) {
 	// be, relative to the minted iat) with the passkey's instance revoked:
 	// the precise lifecycle refusal.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second)))
 	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 
@@ -238,7 +238,7 @@ func TestPersistLoginState_ReloadKeepsOtherPasskeySignCounts(t *testing.T) {
 	require.NoError(t, err)
 	fresh.WebauthnCredentials[1].Authenticator.SignCount = 42
 	require.NoError(t, store.Users().Update(ctx, fresh))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
 
 	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
 	u, err := store.Users().GetByID(ctx, userID)
@@ -298,7 +298,7 @@ func TestPersistLoginState_ReloadNeverRollsBackTheSamePasskey(t *testing.T) {
 	require.NoError(t, err)
 	fresh.WebauthnCredentials[0].Authenticator.SignCount = 10
 	require.NoError(t, store.Users().Update(ctx, fresh))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now(), ""))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
 
 	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
 	u, err := store.Users().GetByID(ctx, userID)

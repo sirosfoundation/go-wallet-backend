@@ -1927,7 +1927,7 @@ func (s *WebAuthnService) persistLoginState(ctx context.Context, user *domain.Us
 // itself into unrestricted ones. Refreshing after a lifecycle change requires
 // a new login.
 func (s *WebAuthnService) refuseIfSourceCutOff(ctx context.Context, userID domain.UserID, issuedAt time.Time) error {
-	cutoff, _, err := s.store.Users().GetAuthCutoff(ctx, userID)
+	cutoff, err := s.store.Users().GetAuthCutoff(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return ErrInvalidRefreshToken
@@ -1964,7 +1964,7 @@ func (s *WebAuthnService) mintTokens(ctx context.Context, user *domain.User, ten
 			return "", "", fmt.Errorf("failed to generate token: %w", err)
 		}
 		refresh, _ := s.generateRefreshToken(user, tenantID) // refresh is optional
-		cutoff, _, err := s.store.Users().GetAuthCutoff(ctx, user.UUID)
+		cutoff, err := s.store.Users().GetAuthCutoff(ctx, user.UUID)
 		if err != nil {
 			return "", "", fmt.Errorf("re-check user after token issuance: %w", err)
 		}

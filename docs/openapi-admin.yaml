@@ -988,6 +988,76 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/tenants/{tenantId}/users/{userId}/instances/revoke-all:
+    post:
+      tags:
+        - Wallet Instances
+      summary: Revoke every wallet instance of a user
+      description: >
+        Revokes all of the user's non-revoked wallet instances in this tenant
+        (SID-AUTH-06). Revoking the last live one deactivates the wallet: its
+        sessions are dropped, the bearer tokens already issued to the user are
+        refused, and the wallet's key material, credentials, presentations and
+        pending challenges are erased. Revocation is terminal, so the user
+        needs a new enrollment afterwards.
+
+
+        This is a provider action. A user cannot revoke their own instances,
+        because only a provider could undo it; what a user can do to their own
+        account is log out everywhere or remove it outright.
+      operationId: revokeAllWalletInstancesForUser
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/userId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Recorded on each instance and in the audit event.
+                  example: "device reported stolen"
+      responses:
+        '200':
+          description: The instances were revoked and the cleanup completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: integer
+                    description: How many instances changed status.
+                    example: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: >
+            The revocations were persisted but part of the cleanup did not
+            complete. Repeat the request to finish it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: ERASURE_INCOMPLETE
+                  revoked:
+                    type: integer
+                    example: 2
+                  message:
+                    type: string
+        '503':
+          description: The wallet lifecycle service is not configured
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
   parameters:
     tenantId:

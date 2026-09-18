@@ -90,24 +90,22 @@ type UserStore interface {
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
 
 	// InvalidateAuthBefore records that bearer tokens issued before t are no
-	// longer accepted for the user (see internal/tokengate), except the token
-	// with id exemptJTI (the one performing the lifecycle change; may be
-	// empty). The cut-off only moves forward, and the exemption is replaced
-	// only when it does, so a delayed older event cannot swap the exemption
-	// of a newer cut-off. Touches no other field.
-	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error
+	// longer accepted for the user (see internal/tokengate). The cut-off only
+	// moves forward, so a delayed older event cannot roll it back. Touches no
+	// other field.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
 
 	// EraseWalletData erases the user's wallet key material - PrivateData,
 	// PrivateDataETag and Keys - and, in the same write, advances the auth
-	// cut-off to fence (see Update) with the same exemption rule as
-	// InvalidateAuthBefore. Field-scoped, so a concurrent change to other
-	// fields (e.g. a passkey registration) is not overwritten, and atomic,
-	// so no record loaded before the erasure can pass the fence afterwards.
-	EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error
+	// cut-off to fence (see Update). Field-scoped, so a concurrent change to
+	// other fields (e.g. a passkey registration) is not overwritten, and
+	// atomic, so no record loaded before the erasure can pass the fence
+	// afterwards.
+	EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error
 
-	// GetAuthCutoff returns only the user's token cut-off and exempt token id,
-	// for the per-request gate check (a narrow read, not the whole record).
-	GetAuthCutoff(ctx context.Context, id domain.UserID) (cutoff time.Time, exemptJTI string, err error)
+	// GetAuthCutoff returns only the user's token cut-off, for the
+	// per-request gate check (a narrow read, not the whole record).
+	GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error)
 }
 
 // CredentialStore defines the interface for credential storage operations

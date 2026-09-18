@@ -436,7 +436,7 @@ func TestTokenAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	}
 	// The cut-off is in the future relative to the token's iat (signToken
 	// uses "now"), so every token minted below predates it.
-	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(time.Minute), ""); err != nil {
+	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{

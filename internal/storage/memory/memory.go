@@ -318,29 +318,25 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time, exemptJTI string) error {
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, exists := s.data[id.String()]
 	if !exists {
 		return storage.ErrNotFound
 	}
-	advanceCutoff(user, t, exemptJTI)
+	advanceCutoff(user, t)
 	return nil
 }
 
-// advanceCutoff moves the cut-off forward and replaces the exemption unless
-// t is older than the stored cut-off, so a delayed older event cannot swap a
-// newer cut-off's exemption (equal timestamps do replace it, matching the
-// Mongo implementation's millisecond granularity). The fence counter always
-// advances, so every lifecycle write invalidates records loaded before it.
-func advanceCutoff(user *domain.User, t time.Time, exemptJTI string) {
+// advanceCutoff moves the cut-off forward, ignoring a delayed older event so
+// it cannot roll one back. The fence counter always advances, so every
+// lifecycle write invalidates records loaded before it.
+func advanceCutoff(user *domain.User, t time.Time) {
 	user.AuthFence++
-	if t.Before(user.AuthInvalidBefore) {
-		return
+	if t.After(user.AuthInvalidBefore) {
+		user.AuthInvalidBefore = t
 	}
-	user.AuthInvalidBefore = t
-	user.AuthCutoffExemptJTI = exemptJTI
 }
 
 // cloneUser returns an independent copy, so a caller that loaded a user
@@ -359,7 +355,7 @@ func cloneUser(u *domain.User) *domain.User {
 	return &c
 }
 
-func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time, exemptJTI string) error {
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, exists := s.data[id.String()]
@@ -370,25 +366,18 @@ func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence
 	user.PrivateDataETag = ""
 	user.Keys = nil
 	user.UpdatedAt = time.Now()
-	// The vault is gone whichever way this fence orders against a concurrent
-	// lifecycle event, so no token may stay exempt from the cut-off. Clearing
-	// it first and letting advanceCutoff install this erasure's own exemption
-	// only when its fence is the newer one means a delayed erasure cannot
-	// leave a newer event's exempt token usable over an erased wallet, and
-	// cannot install an older event's exemption over a newer cut-off either.
-	user.AuthCutoffExemptJTI = ""
-	advanceCutoff(user, fence, exemptJTI)
+	advanceCutoff(user, fence)
 	return nil
 }
 
-func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, string, error) {
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	user, exists := s.data[id.String()]
 	if !exists {
-		return time.Time{}, "", storage.ErrNotFound
+		return time.Time{}, storage.ErrNotFound
 	}
-	return user.AuthInvalidBefore, user.AuthCutoffExemptJTI, nil
+	return user.AuthInvalidBefore, nil
 }
 
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {

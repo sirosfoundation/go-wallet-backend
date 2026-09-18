@@ -86,7 +86,7 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 
 	// The wallet is suspended: the cut-off lands, but the session survives
 	// (the cascade's session drop failed and returned ERASURE_INCOMPLETE).
-	if err := users.InvalidateAuthBefore(context.Background(), uid, cutoff, "acting-token"); err != nil {
+	if err := users.InvalidateAuthBefore(context.Background(), uid, cutoff); err != nil {
 		t.Fatal(err)
 	}
 	if got := post("before", `{"aud":"wallet-backend"}`); got != http.StatusUnauthorized {
@@ -115,7 +115,7 @@ type cutoffOnEvaluate struct {
 func (p *cutoffOnEvaluate) Evaluate(string) (bool, error) {
 	if !p.fired {
 		p.fired = true
-		if err := p.users.InvalidateAuthBefore(context.Background(), p.uid, time.Now(), ""); err != nil {
+		if err := p.users.InvalidateAuthBefore(context.Background(), p.uid, time.Now()); err != nil {
 			return false, err
 		}
 	}
@@ -192,75 +192,5 @@ func TestSession_AuthInstantIsTheAuthenticationNotTheRecord(t *testing.T) {
 	fresh := &Session{CreatedAt: cutoff.Add(time.Second), AuthenticatedAt: cutoff.Add(time.Second)}
 	if tokengate.IssuedBeforeCutoff(fresh.authInstant(), cutoff) {
 		t.Fatal("an authentication after the cut-off is fine")
-	}
-}
-
-// The exemption is an exemption from the cut-off, not a licence to mint. A
-// delegating token that is the acting lifecycle token - past the cut-off but
-// exempt - must not be able to mint a child token: the child would carry a
-// new jti and a fresh iat, so it would be neither exempt nor caught by the
-// cut-off, and the one narrowly exempt token would have laundered itself into
-// an unrestricted one for a wallet that was just suspended or revoked.
-func TestTokenEndpoint_ExemptDelegatingTokenCannotMint(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPath := filepath.Join(t.TempDir(), "ec.pem")
-	f, err := os.Create(keyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
-	f.Close()
-	km, err := NewKeyManager(keyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ttl := func(string) time.Duration { return 2 * time.Minute }
-	issuer := NewTokenIssuer(km, "test-issuer", ttl)
-
-	users := memory.NewStore().Users()
-	uid := domain.NewUserID()
-	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
-		t.Fatal(err)
-	}
-	router := gin.New()
-	RegisterTokenEndpoint(router.Group("/auth"), NewMemorySessionStore(), issuer, AllowAllPolicy{}, ttl, true, tokengate.New(users), zap.NewNop())
-
-	// The token that made the lifecycle request: it carries 'k', so it could
-	// delegate, and it is the one recorded as exempt.
-	parent, err := issuer.Issue(uid.String(), "wallet-backend", "tenant-1", TAC("rwk"), "urn:siros:acr:passkey")
-	if err != nil {
-		t.Fatal(err)
-	}
-	post := func() int {
-		req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader(`{"aud":"wallet-backend"}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+parent)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-		return w.Code
-	}
-	if got := post(); got != http.StatusOK {
-		t.Fatalf("without a cut-off the delegating token mints a child, got %d", got)
-	}
-
-	// The wallet is revoked by this very token: it stays valid for the
-	// lifecycle request itself, but it must not mint anything.
-	cutoff := tokengate.IssuedAt(parent).Add(time.Second)
-	if err := users.InvalidateAuthBefore(context.Background(), uid, cutoff, tokengate.JTI(parent)); err != nil {
-		t.Fatal(err)
-	}
-	if _, exempt, err := users.GetAuthCutoff(context.Background(), uid); err != nil || exempt != tokengate.JTI(parent) {
-		t.Fatalf("the parent is the exempt token: exempt=%q err=%v", exempt, err)
-	}
-	if got := post(); got != http.StatusUnauthorized {
-		t.Fatalf("the exempt token must not mint a child that outlives the cut-off, got %d", got)
 	}
 }

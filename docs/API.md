@@ -274,40 +274,22 @@ see.
 The status change is recorded before the cascade runs. If dropping sessions or
 erasing data then fails, the status change stands and the request answers
 `409 ERASURE_INCOMPLETE` (with the new `status`); repeating the same request
-re-runs the erasure, so the client retries until it gets `200`. The one case
-the client cannot retry is a `409` in which the key material *was* erased and
-only some other step failed (stored credentials of another tenant, pending
-challenges): the exemption below ends with the key material, so the acting
-token is cut off from that point on. The wallet is deactivated and its keys
-are gone either way; the residual data is cleaned up by an administrator
-re-sending the same status with `PUT
-/admin/tenants/{tenantId}/instances/{instanceId}/status`, which re-runs the
-same cascade (admin changes exempt no token, so nothing is needed from the
-user's session).
+re-runs the cleanup, so the administrator retries until it gets `200`.
 
 Any change away from `active` also cuts off bearer tokens issued before it:
 legacy access and refresh tokens, and access tokens validated by the backend
 or accepted for a WebSocket handshake, are refused with `401` when their `iat`
-is not after the cut-off, even if they have not expired. The one exception is
-the token that made the self-service request: it stays valid, so the user can
-reactivate a suspended instance or repeat a request after `409
-ERASURE_INCOMPLETE` from the same session; it is dropped as soon as the key
-material is erased, so it can never be used to write wallet data back into a
-deactivated wallet. It is an exemption from the cut-off only, never a licence
-to mint: `POST /auth/token` and the legacy token refresh refuse it like any
-other pre-cut-off credential, so a new token after a lifecycle change always
-needs a new login. Admin-initiated
-changes exempt no token. The cut-off is recorded before the status change is
-persisted, so a blocked instance never keeps working tokens. Tokens obtained
-after a reactivation work normally. A login or token refresh that races with
-a lifecycle change is refused rather than handed a token that would be
-rejected on first use; the comparison is at whole seconds, and a token that
-would fall into the cut-off's own second is simply minted in the next one.
-The same cut-off applies at `POST /auth/token` - to a delegating bearer token
-and to the session cookie itself, so a session that outlived the change
-cannot mint a fresh token - and is re-checked for an established WebSocket
-session at every flow start, so it also holds across separate engine
-processes or instances.
+is not after the cut-off, even if they have not expired. No token is exempt.
+The cut-off is recorded before the status change is persisted, so a blocked
+instance never keeps working tokens. Tokens obtained after a reactivation work
+normally. A login or token refresh that races with a lifecycle change is
+refused rather than handed a token that would be rejected on first use; the
+comparison is at whole seconds, and a token that would fall into the cut-off's
+own second is simply minted in the next one. The same cut-off applies at
+`POST /auth/token` - to a delegating bearer token and to the session cookie
+itself, so a session that outlived the change cannot mint a fresh token - and
+is re-checked for an established WebSocket session at every flow start, so it
+also holds across separate engine processes or instances.
 
 An engine deployed without the backend role in the same process enforces the
 cut-off only when persistent storage is configured; with memory storage it
@@ -346,34 +328,30 @@ token's TAC, like the other collection endpoints (`/issuer/all`,
 { "instances": [ { "id": "<jkt>", "status": "active", "wscd_type": "native_android", "last_attested_at": "..." } ] }
 ```
 
-##### PUT /user/session/instances/{instance_id}/status
+##### POST /user/session/logout-all
 
-Change the status of one of the caller's instances.
+End every session of the caller, on this device and on any other, and refuse
+the bearer tokens already issued to them. The caller's own token is refused
+too - that is what logging out everywhere means - so the client logs in again
+afterwards. Nothing is erased.
 
-**Request:**
-```json
-{ "status": "suspended", "reason": "lost phone" }
-```
+**Response:** `204`; `401` when unauthenticated; `404` when the user no longer
+exists.
 
-**Response:** `200 {"id": "<jkt>", "status": "suspended"}`; `403` when the
-token's TAC lacks `d` and the target status is `revoked` (suspend and
-reactivate need `w`; revocation is terminal and may erase the wallet, so it
-needs `d` like `revoke-all`); `404` if the instance
-is not the caller's; `409 {"error": "invalid status transition"}` for an invalid
-transition (e.g. reactivating a revoked instance); `409 {"error":
-"ERASURE_INCOMPLETE", "id": ..., "status": "revoked"}` when the change was
-recorded but the erasure must be retried.
+##### Changing an instance's status
 
-##### POST /user/session/instances/revoke-all
+There is no self-service endpoint for it. Suspending or revoking an instance
+is reversible only by a provider, so a user who did it to the instance holding
+their last passkey would be locked out of their own account with no way back
+(SID-AUTH-06). Providers do it through `PUT
+/admin/tenants/{tenantId}/instances/{instanceId}/status`, and can revoke every
+instance a user has with `POST
+/admin/tenants/{tenantId}/users/{userId}/instances/revoke-all`.
 
-Deactivate the wallet: revoke every instance of the caller and erase the wallet
-data.
-
-**Request (optional):** `{ "reason": "device stolen" }`
-
-**Response:** `200 {"revoked": 2}`; `409 {"error": "ERASURE_INCOMPLETE",
-"revoked": 2}` when the instances were revoked but the erasure must be retried
-(repeat the request; it answers `200 {"revoked": 0}` once complete).
+The irreversible operation a user does own is removing the account, `DELETE
+/user/session`: it drops every session, erases the wallet data, stored
+credentials and presentations, deletes the user's wallet instances so the same
+device can enrol again, and removes the user record with its passkeys.
 
 ### Credential Management
 
