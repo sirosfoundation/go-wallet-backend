@@ -63,6 +63,7 @@ attestation-rooted identity.
 | `x509_san_uri:uri` | JAR signed with X.509 cert; URI SAN must match | Parsed, partially validated |
 | `x509_hash` | SHA-256 of leaf cert | Supported in wallet-common generation |
 | `did:web:*` / `did:webvh:*` | DID document resolution; JWT verified against DID keys | Scheme inferred; resolution delegated to go-trust `didweb` registry |
+| `decentralized_identifier:did:*` | OpenID4VP 1.0's name for the `did` scheme, carried as a prefix on the `client_id` | Same path as `did`; the prefix is stripped for resolution only, the `client_id` is evaluated as sent |
 | `verifier_attestation` | Third-party attestation JWT | Parsed in scheme inference; **not validated end-to-end** |
 | `https://url` | URL-based (unsigned DC API fallback) | Works; no strong trust binding |
 | `pre-registered` | Admin whitelist fallback | Catch-all in `parseClientIdScheme` |

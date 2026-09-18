@@ -936,7 +936,13 @@ func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifi
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).
+//
+// OpenID4VP 1.0's decentralized_identifier: prefix is stripped first: it makes
+// the client_id an opaque URI with no authority, so without this the very same
+// verifier would show a domain under the draft spelling and none under the
+// final one (see didFromClientID).
 func extractDomain(clientID string) string {
+	clientID = didFromClientID(clientID)
 	if strings.HasPrefix(clientID, "did:web:") {
 		// did:web:example.com → example.com (colons become dots in full spec, but the host is the 3rd segment)
 		parts := strings.SplitN(clientID, ":", 4)
