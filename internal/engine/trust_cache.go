@@ -33,6 +33,11 @@ type TrustCache struct {
 }
 
 // NewTrustCache creates a new in-memory trust cache with the given TTL.
+//
+// A non-positive ttl disables the cache: Get always misses and Set never
+// stores, so every evaluation reaches the PDP. That is one meaning for the
+// value rather than an entry that expires the instant it is written, which
+// would still be a cache hit for any caller racing it.
 func NewTrustCache(ttl time.Duration) *TrustCache {
 	return &TrustCache{
 		entries: make(map[string]*TrustCacheEntry),
@@ -48,6 +53,9 @@ func trustCacheKey(tenantID domain.TenantID, verifierURL string) string {
 // Get retrieves a cached trust record for the given tenant and verifier URL.
 // Returns nil if not found or expired.
 func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCacheRecord {
+	if c == nil || c.ttl <= 0 {
+		return nil
+	}
 	key := trustCacheKey(tenantID, verifierURL)
 
 	c.mu.RLock()
@@ -70,6 +78,9 @@ func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCac
 // Set stores a trust evaluation result in the cache.
 // Also sweeps expired entries to prevent unbounded growth.
 func (c *TrustCache) Set(tenantID domain.TenantID, verifierURL string, record *TrustCacheRecord) {
+	if c == nil || c.ttl <= 0 {
+		return
+	}
 	key := trustCacheKey(tenantID, verifierURL)
 	now := c.now()
 

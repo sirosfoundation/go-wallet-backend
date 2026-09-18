@@ -1082,6 +1082,21 @@ type TrustConfig struct {
 	// TLS certificate. Set this when the PDP is signed by an internal/private CA.
 	CACertPath string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 
+	// CacheDisabled turns the engine's in-memory verifier trust cache off, so
+	// every flow asks the PDP again.
+	//
+	// For testing, not for production. A trust decision - including a denial -
+	// is otherwise reused for CacheTTLSeconds, which makes iterating on trust
+	// configuration nearly impossible: fix the whitelist or the keys, redeploy
+	// the PDP, retry, and the wallet is still refused by a cached answer, with
+	// nothing in any log to say the answer was stale. It also means a PDP that
+	// is briefly unreachable takes a verifier down for the rest of the TTL.
+	CacheDisabled bool `yaml:"cache_disabled" envconfig:"CACHE_DISABLED"`
+
+	// CacheTTLSeconds is how long a verifier trust decision is reused.
+	// Zero selects the default of one hour. Ignored when CacheDisabled.
+	CacheTTLSeconds int `yaml:"cache_ttl_seconds" envconfig:"CACHE_TTL_SECONDS"`
+
 	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
 	// When not set, inherits the global trust configuration.
 	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
@@ -1089,6 +1104,26 @@ type TrustConfig struct {
 	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
 	// When not set, inherits the global trust configuration.
 	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
+}
+
+// DefaultTrustCacheTTL is how long a verifier trust decision is reused when
+// TrustConfig.CacheTTLSeconds says nothing.
+const DefaultTrustCacheTTL = time.Hour
+
+// VerifierCacheTTL is how long the engine may reuse a verifier trust decision.
+//
+// Zero means "do not cache at all", which is what CacheDisabled selects; the
+// engine's cache treats a non-positive TTL as off rather than as an instantly
+// expiring entry, so there is one meaning for the value and one place that
+// decides it.
+func (t TrustConfig) VerifierCacheTTL() time.Duration {
+	if t.CacheDisabled {
+		return 0
+	}
+	if t.CacheTTLSeconds > 0 {
+		return time.Duration(t.CacheTTLSeconds) * time.Second
+	}
+	return DefaultTrustCacheTTL
 }
 
 // NewPDPHTTPClient creates an *http.Client for use with operator-configured PDP endpoints.
