@@ -2126,14 +2126,17 @@ func requestAuthorizationDetails(details []AuthorizationDetail) []AuthorizationD
 		if detail.CredentialConfigurationID == "" {
 			continue
 		}
-		detailType := detail.Type
-		if detailType == "" {
-			// OID4VCI 1.0 §5.1.1 requires this value; the client not saying so
-			// is not a reason to send the AS something it must reject.
-			detailType = authorizationDetailTypeOpenIDCredential
-		}
+		// `type` is not a client choice. OID4VCI 1.0 §5.1.1 fixes it at
+		// "openid_credential" for a credential authorization detail, and this
+		// struct can express no other kind - it carries
+		// credential_configuration_id and nothing else. So an absent value is
+		// filled in and a different one is normalised rather than forwarded:
+		// either way the alternative is an Authorization Request the AS must
+		// reject, for a detail whose actual intent - which configuration is
+		// wanted - is carried by credential_configuration_id and is preserved
+		// exactly as given.
 		projected = append(projected, AuthorizationDetail{
-			Type:                      detailType,
+			Type:                      authorizationDetailTypeOpenIDCredential,
 			CredentialConfigurationID: detail.CredentialConfigurationID,
 		})
 	}

@@ -145,6 +145,23 @@ func TestAMissingTypeIsFilledInRatherThanSentEmpty(t *testing.T) {
 	assert.Equal(t, "openid_credential", projected[0].Type)
 }
 
+func TestAnyOtherTypeIsNormalisedRatherThanForwarded(t *testing.T) {
+	// §5.1.1 fixes `type` at "openid_credential" for a credential
+	// authorization detail, and AuthorizationDetail can express no other kind.
+	// Forwarding anything else produces a request the AS must reject, while
+	// the detail's actual intent - the configuration - is untouched.
+	projected := requestAuthorizationDetails([]AuthorizationDetail{
+		{Type: "openid_credential_v2", CredentialConfigurationID: "pid"},
+		{Type: "urn:example:something-else", CredentialConfigurationID: "mdl"},
+	})
+
+	require.Len(t, projected, 2)
+	assert.Equal(t, "openid_credential", projected[0].Type)
+	assert.Equal(t, "pid", projected[0].CredentialConfigurationID)
+	assert.Equal(t, "openid_credential", projected[1].Type)
+	assert.Equal(t, "mdl", projected[1].CredentialConfigurationID)
+}
+
 func TestProjectingNothingUsableYieldsNothing(t *testing.T) {
 	assert.Empty(t, requestAuthorizationDetails(nil))
 	assert.Empty(t, requestAuthorizationDetails([]AuthorizationDetail{}))
