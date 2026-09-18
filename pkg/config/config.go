@@ -710,9 +710,10 @@ type WIAConfig struct {
 	//     ARF-conformant PID/EAA Providers.
 	//
 	//   - "ietf": the generic IETF draft-ietf-oauth-attestation-based-client-auth
-	//     model, with no ARF/ETSI counterpart. The WIA omits `x5c` and
-	//     instead carries a `kid` header plus the `iss` claim (required);
-	//     relying parties resolve trust via JWKS discovery at
+	//     model, with no ARF/ETSI counterpart. The WIA always carries a
+	//     `kid` header plus the `iss` claim (required), and also includes
+	//     `x5c` when a certificate chain is configured so consumers can
+	//     resolve trust either from the header or via JWKS discovery at
 	//     "<issuer>/.well-known/jwks.json" (see
 	//     RegisterWalletProviderJWKSRoute). Only meaningful for non-EUDI,
 	//     generic-OAuth ecosystems — an ARF-conformant PID/EAA Provider has
@@ -720,8 +721,8 @@ type WIAConfig struct {
 	//
 	// Note SUNET/vc's parseAttestationIdentity treats x5c as authoritative
 	// and `iss` as a secondary consistency check only when both are present,
-	// so "etsi" mode (no iss) and "ietf" mode (no x5c) are both unambiguous
-	// to that consumer.
+	// so "etsi" mode (no iss) remains unambiguous and "ietf" mode can offer
+	// both trust-resolution paths to that consumer.
 	Mode string `yaml:"mode" envconfig:"MODE"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`
