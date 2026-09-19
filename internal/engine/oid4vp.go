@@ -53,18 +53,27 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 
 // ClientIDScheme constants for OID4VP client identification
 const (
-	ClientIDSchemeRedirectURI         = "redirect_uri"
-	ClientIDSchemeDID                 = "did"
-	ClientIDSchemeX509SANDNS          = "x509_san_dns"
-	ClientIDSchemeX509SANURI          = "x509_san_uri"
-	ClientIDSchemeX509Hash            = "x509_hash"
-	ClientIDSchemeVerifierAttestation = "verifier_attestation"
+	ClientIDSchemeRedirectURI = "redirect_uri"
+	ClientIDSchemeDID         = "did"
+	// ClientIDSchemeDecentralizedIdentifier is OpenID4VP 1.0's name for the
+	// scheme the drafts called "did". Verifiers built against the final
+	// specification send this one, and it means exactly the same thing, so
+	// everything below treats the two as one scheme.
+	ClientIDSchemeDecentralizedIdentifier = "decentralized_identifier"
+	ClientIDSchemeX509SANDNS              = "x509_san_dns"
+	ClientIDSchemeX509SANURI              = "x509_san_uri"
+	ClientIDSchemeX509Hash                = "x509_hash"
+	ClientIDSchemeVerifierAttestation     = "verifier_attestation"
 )
 
 // Response mode constants
 const (
 	ResponseModeDirectPost    = "direct_post"
 	ResponseModeDirectPostJWT = "direct_post.jwt"
+	// Modes that hand the result back through the user agent rather than a
+	// POST from the wallet (previously spelled inline in submitResponse).
+	ResponseModeQuery    = "query"
+	ResponseModeFragment = "fragment"
 )
 
 // HTTP header/content type constants
@@ -727,14 +736,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	var attestationContext map[string]interface{}
 
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeDID:
+	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
 		// DID scheme: request MUST be JWT-secured
-		// Resolve DID document server-side via go-trust, then verify JWT
-		if !strings.HasPrefix(authReq.ClientID, "did:") {
-			return nil, errors.New("client_id_scheme=did but client_id is not a DID")
+		// Resolve DID document server-side via go-trust, then verify JWT.
+		// Under OpenID4VP 1.0 the client_id carries its scheme as a prefix,
+		// so resolution uses the DID itself while trust evaluation keeps the
+		// client_id exactly as the verifier sent it.
+		did := didFromClientID(authReq.ClientID)
+		if !strings.HasPrefix(did, "did:") {
+			return nil, fmt.Errorf("client_id_scheme=%s but client_id is not a DID", authReq.ClientIDScheme)
 		}
 		if authReq.RequestJWT == "" {
-			return nil, errors.New("client_id_scheme=did requires a signed request JWT")
+			return nil, fmt.Errorf("client_id_scheme=%s requires a signed request JWT", authReq.ClientIDScheme)
 		}
 
 		// Resolve DID document to get verification method keys
@@ -744,14 +757,14 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		resolvedKeys, err := h.TrustSvc.ResolveDID(
 			trust.ContextWithTenant(ctx, tenantID),
-			authReq.ClientID,
+			did,
 			"", // use default verifier PDP endpoint
 		)
 		if err != nil {
-			return nil, fmt.Errorf("DID resolution failed for %s: %w", authReq.ClientID, err)
+			return nil, fmt.Errorf("DID resolution failed for %s: %w", did, err)
 		}
 		if len(resolvedKeys) == 0 {
-			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", authReq.ClientID)
+			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", did)
 		}
 
 		// Verify JWT signature against resolved DID keys
@@ -761,7 +774,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		h.Logger.Debug("DID request JWT verified",
-			zap.String("did", authReq.ClientID),
+			zap.String("did", did),
 			zap.Any("matched_kid", matchedJWK["kid"]))
 
 		keyMaterial = &KeyMaterial{
@@ -997,13 +1010,15 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 // The frontend resolves the DID document to get keys and verifies the JWT.
 // This function is kept for reference but should not be used.
 func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMaterial, error) {
-	// Validate client_id is a valid DID
-	if !strings.HasPrefix(authReq.ClientID, "did:") {
+	// Validate client_id is a valid DID, allowing OpenID4VP 1.0's
+	// decentralized_identifier: prefix in front of it.
+	did := didFromClientID(authReq.ClientID)
+	if !strings.HasPrefix(did, "did:") {
 		return nil, errors.New("client_id_scheme=did but client_id is not a DID")
 	}
-	parts := strings.SplitN(authReq.ClientID, ":", 3)
+	parts := strings.SplitN(did, ":", 3)
 	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
-		return nil, fmt.Errorf("invalid DID format: %s", authReq.ClientID)
+		return nil, fmt.Errorf("invalid DID format: %s", did)
 	}
 
 	// Request must be JWT-secured
@@ -1097,7 +1112,13 @@ func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifi
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).
+//
+// OpenID4VP 1.0's decentralized_identifier: prefix is stripped first: it makes
+// the client_id an opaque URI with no authority, so without this the very same
+// verifier would show a domain under the draft spelling and none under the
+// final one (see didFromClientID).
 func extractDomain(clientID string) string {
+	clientID = didFromClientID(clientID)
 	if strings.HasPrefix(clientID, "did:web:") {
 		// did:web:example.com → example.com (colons become dots in full spec, but the host is the 3rd segment)
 		parts := strings.SplitN(clientID, ":", 4)
@@ -1178,13 +1199,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
 // credential_selection progress message and waits for the user to consent or decline.
 // The frontend is responsible for local credential matching and the consent UI.
+//
+// A client that finds nothing to present answers with credentials_matched and
+// an empty match set instead, which ends the flow here. Without that answer
+// the only ways out were a decline - untrue, the user was never asked - or
+// silence until the user-interaction timeout, which is what a wallet missing
+// the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
 	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
 	})
 
-	action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline)
+	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
 		return nil, err
 	}
@@ -1195,7 +1222,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", "User declined the request")
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 		if redirectURI != "" {
 			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
 				map[string]interface{}{"redirect_uri": redirectURI})
@@ -1217,6 +1244,144 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	}
 
 	return payload.SelectedCredentials, nil
+}
+
+// waitForSelectionAction waits for the client's answer to a
+// credential_selection message. credentials_matched with an empty match set
+// terminates the flow; with a non-empty one it is informational and the wait
+// continues, so a client that reports its matches before asking the user
+// behaves exactly as one that does not.
+//
+// The user-interaction deadline is taken once, before the first wait, and each
+// later wait gets only what is left of it. WaitForAction starts a fresh
+// UserInteractionTimeout per call, so without this a client repeating the
+// informational action would reset the clock every time and could hold a
+// pending flow slot open indefinitely without ever obtaining consent.
+func (h *OID4VPHandler) waitForSelectionAction(ctx context.Context, authReq *AuthorizationRequest) (*FlowActionMessage, error) {
+	return h.waitForSelectionActionUntil(ctx, authReq, time.Now().Add(UserInteractionTimeout))
+}
+
+// waitForSelectionActionUntil is waitForSelectionAction against an explicit
+// deadline, so a test can exercise the loop without waiting five minutes.
+func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq *AuthorizationRequest, deadline time.Time) (*FlowActionMessage, error) {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrFlowTimeout
+		}
+
+		action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, remaining,
+			ActionConsent, ActionDecline, ActionCredentialsMatched)
+		if err != nil {
+			return nil, err
+		}
+		if action.Action != ActionCredentialsMatched {
+			return action, nil
+		}
+
+		var matched CredentialsMatchedPayload
+		if err := json.Unmarshal(action.Payload, &matched); err != nil {
+			_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid credentials_matched payload")
+			return nil, fmt.Errorf("invalid credentials_matched payload: %w", err)
+		}
+		if len(matched.Matches) > 0 {
+			continue
+		}
+
+		return nil, h.failNoMatchingCredential(ctx, authReq, matched.NoMatchReason)
+	}
+}
+
+// verifierRefusedDescription is the error_description every refusal sends to
+// the verifier, whether the user declined or the wallet held nothing that
+// matched. OpenID4VP answers both with access_denied so a verifier cannot
+// learn which happened - and therefore cannot probe what a holder has by
+// asking and watching the reason. Two different descriptions would hand that
+// distinction straight back.
+const verifierRefusedDescription = "The wallet did not fulfil the request"
+
+// failNoMatchingCredential ends the flow when the wallet holds nothing the
+// verifier asked for. The verifier is told as well, so its session ends now
+// rather than expiring: OpenID4VP has no dedicated code for "holder has no
+// such credential", and access_denied is the response the specification
+// provides for a request the wallet will not fulfil.
+func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *AuthorizationRequest, reason string) error {
+	requested := requestedCredentialTypes(authReq.DCQLQuery)
+
+	h.Logger.Info("no credential matches the verifier's query",
+		zap.Strings("requested_types", requested), zap.String("client_reason", reason))
+
+	details := map[string]interface{}{}
+	if len(requested) > 0 {
+		details["requested_types"] = requested
+	}
+	if reason != "" {
+		details["no_match_reason"] = reason
+	}
+	// The verifier gets the same description a decline sends, not this
+	// message: naming what the wallet does not hold would tell the verifier
+	// whether the holder has a credential it asked about, which is exactly
+	// what one access_denied for both outcomes is there to prevent. The
+	// detailed text is for the wallet, which is showing it to its own user.
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
+		details["redirect_uri"] = redirectURI
+	}
+
+	// The wallet is the one showing this to a person, and it is the only
+	// party that knows their language, so it gets the code and the requested
+	// types and composes its own sentence. The string here is the same
+	// per-code English fallback every other flow error carries; an
+	// interpolated one would be worse than useless, since a client cannot
+	// translate a sentence it did not build.
+	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredentials,
+		ErrCodeNoMatchingCredentials.UserFacingMessage(), details)
+
+	return errors.New("no credential matches the verifier's query")
+}
+
+// requestedCredentialTypes lists the credential types a DCQL query asks for,
+// so the error can name what is missing rather than say "nothing matched".
+// Best-effort: an unparseable or exotic query simply yields no names.
+func requestedCredentialTypes(dcql json.RawMessage) []string {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var query struct {
+		Credentials []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				VCTValues     []string `json:"vct_values"`
+				DoctypeValue  string   `json:"doctype_value"`
+				DoctypeValues []string `json:"doctype_values"`
+			} `json:"meta"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &query); err != nil {
+		return nil
+	}
+
+	var types []string
+	seen := map[string]bool{}
+	add := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		types = append(types, v)
+	}
+	for _, c := range query.Credentials {
+		for _, vct := range c.Meta.VCTValues {
+			add(vct)
+		}
+		add(c.Meta.DoctypeValue)
+		for _, dt := range c.Meta.DoctypeValues {
+			add(dt)
+		}
+		if len(c.Meta.VCTValues) == 0 && c.Meta.DoctypeValue == "" && len(c.Meta.DoctypeValues) == 0 {
+			add(c.ID)
+		}
+	}
+	return types
 }
 
 func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
@@ -1350,9 +1515,9 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
 		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
-	case "fragment":
+	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
-	case "query":
+	case ResponseModeQuery:
 		return h.buildQueryRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	default:
 		return "", fmt.Errorf("unsupported response_mode: %s", responseMode)
@@ -1397,6 +1562,32 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	return "", fmt.Errorf("response submission failed with status %d: %s", resp.StatusCode, string(body))
 }
 
+// buildErrorRedirect returns the URL the user agent is sent to when a
+// query/fragment-mode request ends in an error rather than a vp_token.
+func buildErrorRedirect(endpoint, state, errCode, errDesc string, inFragment bool) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	params := u.Query()
+	if inFragment {
+		params = url.Values{}
+	}
+	params.Set("error", errCode)
+	if errDesc != "" {
+		params.Set("error_description", errDesc)
+	}
+	if state != "" {
+		params.Set("state", state)
+	}
+	if inFragment {
+		u.Fragment = params.Encode()
+	} else {
+		u.RawQuery = params.Encode()
+	}
+	return u.String()
+}
+
 func (h *OID4VPHandler) buildFragmentRedirect(endpoint string, authReq *AuthorizationRequest, vpToken string) string {
 	u, _ := url.Parse(endpoint)
 	fragment := url.Values{}
@@ -1421,8 +1612,19 @@ func (h *OID4VPHandler) buildQueryRedirect(endpoint string, authReq *Authorizati
 
 // inferClientIDScheme infers the client_id_scheme from the client_id format
 // when the verifier does not provide it explicitly.
+// didFromClientID returns the DID a client_id names, with OpenID4VP 1.0's
+// decentralized_identifier: prefix removed when present. The prefix is part of
+// the identifier the verifier signs and is trusted under, so it is stripped
+// only where a DID itself is needed - resolution and format checks - never
+// where the client_id is compared or evaluated.
+func didFromClientID(clientID string) string {
+	return strings.TrimPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":")
+}
+
 func inferClientIDScheme(clientID string) string {
 	switch {
+	case strings.HasPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":"):
+		return ClientIDSchemeDecentralizedIdentifier
 	case strings.HasPrefix(clientID, "did:"):
 		return ClientIDSchemeDID
 	case strings.HasPrefix(clientID, "x509_san_dns:"):
@@ -1457,9 +1659,42 @@ func inferClientIDScheme(clientID string) string {
 // verifier's own page even on decline/error - returned as a best-effort
 // string, empty if the verifier didn't provide one or the POST failed.
 func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) string {
-	if authReq == nil || authReq.ResponseURI == "" {
+	if authReq == nil {
 		return ""
 	}
+
+	// query and fragment carry the error back through the user agent, the
+	// way submitResponse carries a vp_token in those modes: the caller gets a
+	// URL to redirect to and nothing is sent from here. Only looking at
+	// response_uri, which these verifiers do not set, meant they were never
+	// told and sat waiting for a response that was never coming.
+	//
+	// The endpoint is chosen exactly as submitResponse chooses it - response_uri
+	// first, redirect_uri otherwise. validateAuthorizationRequest only forbids
+	// redirect_uri for the direct_post modes, so a query/fragment request may
+	// carry both; picking differently here would deliver the vp_token to one
+	// endpoint and the failure to the other, leaving the verifier waiting.
+	if authReq.ResponseMode == ResponseModeQuery || authReq.ResponseMode == ResponseModeFragment {
+		target := authReq.ResponseURI
+		if target == "" {
+			target = authReq.RedirectURI
+		}
+		if target == "" {
+			return ""
+		}
+		endpoint, err := sanitizeEndpointURL(target)
+		if err != nil {
+			h.Logger.Debug("refusing to build an error redirect for an unusable endpoint", zap.Error(err))
+			return ""
+		}
+		return buildErrorRedirect(endpoint, authReq.State, errCode, errDesc,
+			authReq.ResponseMode == ResponseModeFragment)
+	}
+
+	if authReq.ResponseURI == "" {
+		return ""
+	}
+
 	data := url.Values{}
 	data.Set("error", errCode)
 	if errDesc != "" {
@@ -1519,8 +1754,9 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 
 	// OID4VP §5: Validate client_id_scheme prefix is recognized
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
-		ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
+	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier,
+		ClientIDSchemeX509SANDNS, ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash,
+		ClientIDSchemeVerifierAttestation:
 		// Known scheme
 	default:
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)

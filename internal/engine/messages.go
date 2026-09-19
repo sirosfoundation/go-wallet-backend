@@ -125,8 +125,13 @@ const (
 	// the POST buys nothing - the nonce is the only thing binding the
 	// returned request object to this request rather than an earlier one.
 	ErrCodeWalletNonceMismatch ErrorCode = "WALLET_NONCE_MISMATCH"
-	ErrCodeInternalError       ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests     ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeNoMatchingCredentials is returned when the wallet holds nothing
+	// that satisfies the verifier's query. Distinct from a decline: the user
+	// was never asked, so reporting this to the wallet as "declined" would be
+	// wrong. The verifier is told neither apart - see submitErrorResponse.
+	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
+	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -177,6 +182,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "This request uses a method this wallet does not support"
 	case ErrCodeWalletNonceMismatch:
 		return "The verifier's request could not be verified"
+	case ErrCodeNoMatchingCredentials:
+		return "You do not have any credentials that match this request"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
@@ -258,6 +265,22 @@ type FlowStartMessage struct {
 	ClientAttestation    string `json:"client_attestation,omitempty"`
 	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
 
+	// AuthorizationDetails is the OID4VCI `authorization_details` the client
+	// wants sent on the Authorization Request (OID4VCI 1.0 §5.1.1). DIIP
+	// requires a Wallet to be able to ask for a credential configuration this
+	// way as well as by `scope`.
+	//
+	// Supplied by the client rather than derived here, on purpose. The engine
+	// builds the Authorization Request for every transport, so the wallet
+	// cannot add the parameter itself - but the *decision* is the Wallet's,
+	// which is where DIIP puts it and where wallet-frontend and the native
+	// SDKs keep it. The engine forwards what it is given.
+	//
+	// Absent means "do not ask this way", not "ask with nothing": the
+	// parameter is omitted entirely and the `scope` path is unchanged, so a
+	// client that never sends this behaves exactly as before.
+	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -294,6 +317,26 @@ type FlowStartMessage struct {
 	// SignActionSignClientAuth of the renewal so the client signs with that
 	// same key. Takes precedence over DPoPJWK.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+// authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
+// §5.1.1 defines for a credential authorization detail.
+const authorizationDetailTypeOpenIDCredential = "openid_credential"
+
+// AuthorizationDetail is one OID4VCI `authorization_details` entry.
+//
+// Only the `credential_configuration_id` form is carried: DIIP requires that
+// one, and it is what the `format`-based alternative was replaced by.
+//
+// CredentialIdentifiers is populated only on the way back - an Authorization
+// Server that honours `authorization_details` echoes the details in its token
+// response with the identifiers it granted (OID4VCI 1.0 §6), and the
+// Credential Request must then name one of those instead of the configuration
+// id.
+type AuthorizationDetail struct {
+	Type                      string   `json:"type"`
+	CredentialConfigurationID string   `json:"credential_configuration_id,omitempty"`
+	CredentialIdentifiers     []string `json:"credential_identifiers,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client

@@ -542,13 +542,15 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claims["client_status"] = cs
 	}
 
-	// iss: only set in "ietf" mode, where it's the only way a relying party
-	// locates the JWKS needed to verify the WIA (see the header switch
-	// below). config.Validate() enforces Issuer being set whenever Mode is
-	// "ietf" and signing keys are configured, so no WalletProviderURI
-	// fallback here - WalletProviderService.Issuer() (used by
-	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata) computes the
-	// same value the same way, so both stay consistent with what Validate()
+	// iss: only set in "ietf" mode, where relying parties resolve trust via
+	// this wallet provider's JWKS. Even when we also embed x5c in the header
+	// (for interoperability with consumers/test suites that expect it), iss
+	// remains the identifier for JWKS discovery. config.Validate() enforces
+	// Issuer being set whenever Mode is "ietf" and signing keys are
+	// configured, so no WalletProviderURI fallback here -
+	// WalletProviderService.Issuer() (used by
+	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata) computes the same
+	// value the same way, so both stay consistent with what Validate()
 	// actually requires.
 	//
 	// In "etsi" mode, no iss is set at all: EC TS03 v1.5.2 removed `iss`
@@ -565,16 +567,19 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 
 	switch s.cfg.WalletProvider.WIA.Mode {
 	case config.WIAModeIETF:
-		// No x5c: relying parties resolve the wallet provider's signing key
-		// from its own JWKS (RegisterWalletProviderJWKSRoute, served at the
-		// WIA's own iss URL). That resolution is kid-keyed (standard
-		// practice for multi-key JWKS, and what existing JWT
-		// trust-verification code elsewhere already expects), so the WIA
-		// itself must carry a kid header matching the JWKS entry's KeyID
-		// ("wallet-provider", hardcoded there since this deployment
-		// publishes exactly one signing key) - without it, a relying party
-		// has no way to know which of the issuer's published keys to use.
+		// Relying parties resolve the wallet provider's signing key from its
+		// own JWKS (RegisterWalletProviderJWKSRoute, served at the WIA's own
+		// iss URL). That resolution is kid-keyed (standard practice for
+		// multi-key JWKS, and what existing JWT trust-verification code
+		// elsewhere already expects), so the WIA itself must carry a kid
+		// header matching the JWKS entry's KeyID ("wallet-provider",
+		// hardcoded there since this deployment publishes exactly one signing
+		// key) - without it, a relying party has no way to know which of the
+		// issuer's published keys to use.
 		token.Header["kid"] = "wallet-provider"
+		if len(s.certChain) > 0 {
+			token.Header["x5c"] = s.certChain
+		}
 	default: // config.WIAModeETSI
 		token.Header["x5c"] = s.certChain
 	}

@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func TestInferClientIDScheme(t *testing.T) {
@@ -151,6 +153,10 @@ func TestExtractDomain(t *testing.T) {
 		{"did:web", "did:web:verifier.example.com", "verifier.example.com"},
 		{"did:web with path", "did:web:verifier.example.com:path:to", "verifier.example.com"},
 		{"did:key", "did:key:z6MkhaXg", ""},
+		// OpenID4VP 1.0 spells the same client_id with its scheme in front;
+		// the domain must not depend on which spelling the verifier chose.
+		{"prefixed did:web", "decentralized_identifier:did:web:verifier.example.com", "verifier.example.com"},
+		{"prefixed did:key", "decentralized_identifier:did:key:z6MkhaXg", ""},
 		{"https URL", "https://verifier.example.com/callback", "verifier.example.com"},
 		{"http URL with port", "http://localhost:8080/auth", "localhost:8080"},
 		{"plain string", "my-verifier", ""},
@@ -2327,4 +2333,555 @@ func TestParseRequestURIMethod(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, http.MethodPost, stub.method)
 	})
+}
+
+// --- OpenID4VP 1.0 client_id scheme naming ---
+//
+// The drafts called the DID scheme "did"; the final specification calls it
+// "decentralized_identifier" and carries it as a prefix on the client_id. A
+// verifier built against the final spec was rejected outright with
+// "unsupported client_id_scheme: decentralized_identifier" before its request
+// was ever read - seen live against a third-party verifier whose client_id is
+// decentralized_identifier:did:web:<host>.
+
+func TestInferClientIDScheme_DecentralizedIdentifier(t *testing.T) {
+	assert.Equal(t, ClientIDSchemeDecentralizedIdentifier,
+		inferClientIDScheme("decentralized_identifier:did:web:verifier.example"))
+	// The draft spelling still infers as before.
+	assert.Equal(t, ClientIDSchemeDID, inferClientIDScheme("did:web:verifier.example"))
+}
+
+func TestValidateAuthorizationRequest_AcceptsDecentralizedIdentifier(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "n",
+		ClientID:       "decentralized_identifier:did:web:verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		ResponseMode:   ResponseModeDirectPostJWT,
+		ResponseURI:    "https://verifier.example/response",
+	}
+	require.NoError(t, h.validateAuthorizationRequest(authReq, nil))
+}
+
+func TestDIDFromClientID(t *testing.T) {
+	// Resolution needs the DID itself...
+	assert.Equal(t, "did:web:verifier.example",
+		didFromClientID("decentralized_identifier:did:web:verifier.example"))
+	// ...and an unprefixed client_id is already one.
+	assert.Equal(t, "did:web:verifier.example", didFromClientID("did:web:verifier.example"))
+	// Anything else is left alone, so a non-DID client_id still fails its own check.
+	assert.Equal(t, "https://verifier.example", didFromClientID("https://verifier.example"))
+}
+
+func TestVerifyDIDRequest_AcceptsPrefixedClientID(t *testing.T) {
+	h := &OID4VPHandler{}
+	// No request JWT: the point is that it gets past the DID-shape check and
+	// fails on the missing signature instead of on the prefix.
+	_, err := h.verifyDIDRequest(&AuthorizationRequest{
+		ClientID:       "decentralized_identifier:did:web:verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a signed request JWT")
+}
+
+// --- the active trust path, not just the deprecated one ---
+//
+// Execute never calls verifyDIDRequest; it goes through evaluateVerifierTrust,
+// which resolves the DID and verifies the request JWT against the resolved
+// verification methods. The tests above would all pass with that path broken,
+// so this one drives it end to end with a stub resolver and pins the split the
+// OpenID4VP 1.0 prefix forces: the bare DID is what gets resolved and what the
+// displayed domain comes from, while trust evaluation sees the client_id
+// exactly as the verifier sent it, prefix and all, because that is what the
+// verifier signs and is trusted under.
+
+// stubDIDResolver is a trust.TrustEvaluator that also resolves DIDs, standing
+// in for the AuthZEN PDP. It records every subject it is asked to resolve.
+type stubDIDResolver struct {
+	didDoc   map[string]interface{}
+	resolved []string
+}
+
+func (s *stubDIDResolver) Evaluate(_ context.Context, _ *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
+	return &trust.EvaluationResponse{Decision: true}, nil
+}
+
+func (s *stubDIDResolver) Resolve(_ context.Context, subjectID string) (*trust.EvaluationResponse, error) {
+	s.resolved = append(s.resolved, subjectID)
+	return &trust.EvaluationResponse{Decision: true, TrustMetadata: s.didDoc}, nil
+}
+
+func (s *stubDIDResolver) Name() string { return "stub-did-resolver" }
+
+func (s *stubDIDResolver) SupportedResourceTypes() []trust.ResourceType {
+	return []trust.ResourceType{trust.ResourceTypeJWK}
+}
+
+func (s *stubDIDResolver) Healthy() bool { return true }
+
+// ecPublicJWK renders an EC P-256 public key as a JWK with the given kid, the
+// shape a DID document's verificationMethod carries.
+func ecPublicJWK(pub *ecdsa.PublicKey, kid string) map[string]interface{} {
+	return map[string]interface{}{
+		"kty": "EC",
+		"crv": "P-256",
+		"x":   base64.RawURLEncoding.EncodeToString(padBytes(pub.X.Bytes(), 32)),
+		"y":   base64.RawURLEncoding.EncodeToString(padBytes(pub.Y.Bytes(), 32)),
+		"kid": kid,
+	}
+}
+
+// buildKidSignedJWT builds an ES256 request JWT identifying its key by kid, the
+// way a DID-identified verifier signs its request object.
+func buildKidSignedJWT(t *testing.T, key *ecdsa.PrivateKey, kid string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","kid":"` + kid + `"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"nonce":"n"}`))
+	signingInput := header + "." + payload
+	sum := crypto.SHA256.New()
+	sum.Write([]byte(signingInput))
+	r, s, err := ecdsa.Sign(rand.Reader, key, sum.Sum(nil))
+	require.NoError(t, err)
+	n := (key.Curve.Params().BitSize + 7) / 8
+	sig := make([]byte, 2*n)
+	r.FillBytes(sig[:n])
+	s.FillBytes(sig[n:])
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// trustEvaluationSubject returns the subject_id of the trust evaluation request
+// the handler pushed to the frontend, from the progress messages the test's
+// websocket peer collected.
+func trustEvaluationSubject(t *testing.T, messages <-chan []byte) string {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case raw := <-messages:
+			var msg FlowProgressMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				continue
+			}
+			var payload struct {
+				Request *TrustEvaluationRequest `json:"request"`
+			}
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.Request == nil {
+				continue
+			}
+			return payload.Request.SubjectID
+		case <-deadline:
+			t.Fatal("no trust evaluation request was sent to the frontend")
+			return ""
+		}
+	}
+}
+
+func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
+	const (
+		did      = "did:web:verifier.example"
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kid      = did + "#jwk-1"
+	)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	stub := &stubDIDResolver{didDoc: map[string]interface{}{
+		"id": did,
+		"verificationMethod": []interface{}{
+			map[string]interface{}{
+				"id":           kid,
+				"type":         "JsonWebKey2020",
+				"controller":   did,
+				"publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+			},
+		},
+	}}
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+
+	// The frontend side of the websocket: collect what the handler sends so the
+	// trust evaluation request can be inspected.
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// The frontend's verdict, queued up front: the handler blocks on it.
+	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: result,
+	}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow:     flow,
+		Config:   cfg,
+		Logger:   zap.NewNop(),
+		TrustSvc: trustSvc,
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       clientID,
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example/response",
+		RequestJWT:     buildKidSignedJWT(t, key, kid),
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted)
+
+	// Resolution asks for the DID, not the client_id that carries it.
+	assert.Equal(t, []string{did}, stub.resolved)
+	// The domain shown to the user is the DID's either way.
+	assert.Equal(t, "verifier.example", verifier.Domain)
+	// Trust evaluation sees the client_id exactly as the verifier sent it.
+	assert.Equal(t, clientID, trustEvaluationSubject(t, messages))
+}
+
+func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()}}
+
+	// An unsigned request under the new spelling is refused in the active path
+	// for the same reason as under the old one - the prefix does not buy a way
+	// past the JWT requirement.
+	_, err := h.evaluateVerifierTrust(context.Background(), &AuthorizationRequest{
+		ClientID:       ClientIDSchemeDecentralizedIdentifier + ":did:web:verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example/response",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a signed request JWT")
+
+	// A client_id that is not a DID under the prefix is still not a DID.
+	_, err = h.evaluateVerifierTrust(context.Background(), &AuthorizationRequest{
+		ClientID:       ClientIDSchemeDecentralizedIdentifier + ":https://verifier.example",
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example/response",
+		RequestJWT:     "a.b.c",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "client_id is not a DID")
+}
+
+// --- no-matching-credential fast fail ---
+
+// feedAction queues a client action on the session, the way the websocket
+// reader does when a real client answers a credential_selection message.
+func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	s.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flowID},
+		Action:  action,
+		Payload: raw,
+	}
+}
+
+// newSelectionTestHandler returns a handler whose session writes to a real
+// socket, plus the channel of messages the client end receives, so a test can
+// assert what the wallet app would actually be told.
+func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, chan map[string]any, func()) {
+	t.Helper()
+	received := make(chan map[string]any, 20)
+	conn, cleanup := wsTestServer(t, func(c *websocket.Conn) {
+		for {
+			_, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			if json.Unmarshal(data, &msg) == nil {
+				received <- msg
+			}
+		}
+	})
+	session := testSession(conn)
+	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
+	session.flows[flow.ID] = flow
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}
+	h.httpClient = &http.Client{Timeout: 5 * time.Second}
+	return h, session, received, cleanup
+}
+
+// awaitMessage returns the first received message of the given type.
+func awaitMessage(t *testing.T, received chan map[string]any, msgType string) map[string]any {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-received:
+			if msg["type"] == msgType {
+				return msg
+			}
+		case <-deadline:
+			t.Fatalf("no %q message arrived", msgType)
+		}
+	}
+}
+
+func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
+	h, session, received, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// The verifier's response_uri, so the test can assert it is told.
+	posted := make(chan url.Values, 1)
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		posted <- r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer verifier.Close()
+
+	authReq := &AuthorizationRequest{
+		DCQLQuery:   json.RawMessage(`{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1"]}}]}`),
+		ResponseURI: verifier.URL,
+		State:       "state-123",
+	}
+
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		NoMatchReason: "no credential with vct urn:eudi:pid:arf-1.8:1",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
+
+	require.Error(t, err, "an empty match set must end the flow, not wait for consent")
+	assert.Nil(t, selected)
+	assert.Contains(t, err.Error(), "no credential matches")
+
+	// The verifier is told, so its session ends instead of expiring - with
+	// access_denied, which OpenID4VP 1.0 defines for "the Wallet did not have
+	// the requested Credentials" and for "the End-User did not give consent"
+	// alike. The description must not name what was missing: that would tell
+	// the verifier which of the two happened, and so whether this holder has
+	// the credential it asked about.
+	select {
+	case form := <-posted:
+		assert.Equal(t, "access_denied", form.Get("error"))
+		assert.Equal(t, "state-123", form.Get("state"))
+		assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
+		assert.NotContains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifier was never notified")
+	}
+
+	// The client is told what it needs to explain the failure to its user: a
+	// code it can translate and the requested types as data, not an English
+	// sentence it would have to re-parse.
+	msg := awaitMessage(t, received, string(TypeFlowError))
+	flowErr, ok := msg["error"].(map[string]any)
+	require.True(t, ok, "flow error must carry an error object, got %v", msg["error"])
+	assert.Equal(t, string(ErrCodeNoMatchingCredentials), flowErr["code"])
+	assert.Equal(t, ErrCodeNoMatchingCredentials.UserFacingMessage(), flowErr["message"])
+	details, ok := flowErr["details"].(map[string]any)
+	require.True(t, ok, "flow error must carry details, got %v", flowErr["details"])
+	assert.Equal(t, []any{"urn:eudi:pid:arf-1.8:1"}, details["requested_types"])
+	assert.Equal(t, "no credential with vct urn:eudi:pid:arf-1.8:1", details["no_match_reason"])
+	assert.Equal(t, "https://verifier.example/done", details["redirect_uri"])
+}
+
+func TestSubmitErrorResponse_QueryModeRedirectsInsteadOfPosting(t *testing.T) {
+	// A verifier using query/fragment gives a redirect_uri and no
+	// response_uri; it must still learn the request failed.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect, "query mode must yield a redirect for the user agent")
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+	assert.Equal(t, "state-123", u.Query().Get("state"))
+	assert.Equal(t, "nothing to present", u.Query().Get("error_description"))
+}
+
+func TestSubmitErrorResponse_FragmentModePutsErrorInFragment(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		RedirectURI:  "https://verifier.example/cb",
+		ResponseMode: ResponseModeFragment,
+		State:        "s",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Empty(t, u.RawQuery)
+	frag, err := url.ParseQuery(u.Fragment)
+	require.NoError(t, err)
+	assert.Equal(t, "access_denied", frag.Get("error"))
+	assert.Equal(t, "s", frag.Get("state"))
+}
+
+func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testing.T) {
+	h, session, _, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that reports its matches first and then asks the user must
+	// behave exactly like one that only sends consent.
+	feedAction(t, session, h.Flow.ID, ActionCredentialsMatched, CredentialsMatchedPayload{
+		Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+	})
+	feedAction(t, session, h.Flow.ID, ActionConsent, ConsentPayload{
+		SelectedCredentials: []ConsentSelection{{CredentialID: "cred-1"}},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	selected, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
+
+	require.NoError(t, err)
+	require.Len(t, selected, 1)
+	assert.Equal(t, "cred-1", selected[0].CredentialID)
+}
+
+func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {
+	h, session, _, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	// A client that keeps sending the informational credentials_matched action
+	// must not be able to hold the flow open: each wait used to start a fresh
+	// UserInteractionTimeout, so the deadline never arrived. Without one
+	// deadline across the loop this call never returns and the test hangs.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		raw, _ := json.Marshal(CredentialsMatchedPayload{
+			Matches: []CredentialMatch{{CredentialID: "cred-1"}},
+		})
+		for {
+			select {
+			case <-stop:
+				return
+			case session.actionCh <- &FlowActionMessage{
+				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+				Action:  ActionCredentialsMatched,
+				Payload: raw,
+			}:
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	action, err := h.waitForSelectionActionUntil(ctx, &AuthorizationRequest{}, start.Add(300*time.Millisecond))
+
+	require.ErrorIs(t, err, ErrFlowTimeout, "the deadline must survive repeated informational actions")
+	assert.Nil(t, action)
+	assert.Less(t, time.Since(start), 10*time.Second, "the wait must end at the original deadline")
+}
+
+func TestSubmitErrorResponse_QueryModePrefersResponseURILikeSubmitResponse(t *testing.T) {
+	// validateAuthorizationRequest only forbids redirect_uri for the
+	// direct_post modes, so a query/fragment request may carry both. The
+	// failure has to go where submitResponse would have sent the vp_token -
+	// response_uri first - or the verifier is left waiting on the endpoint
+	// that was never told.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		ResponseURI:  "https://verifier.example/response",
+		RedirectURI:  "https://verifier.example/redirect",
+		ResponseMode: ResponseModeQuery,
+		State:        "state-123",
+	}
+
+	redirect := h.submitErrorResponse(context.Background(), authReq, "access_denied", "nothing to present")
+	require.NotEmpty(t, redirect)
+
+	u, err := url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/response", u.Path, "the error must go to the endpoint submitResponse would have used")
+	assert.Equal(t, "access_denied", u.Query().Get("error"))
+
+	// And redirect_uri is still the fallback when response_uri is absent.
+	authReq.ResponseURI = ""
+	redirect = h.submitErrorResponse(context.Background(), authReq, "access_denied", "")
+	require.NotEmpty(t, redirect)
+	u, err = url.Parse(redirect)
+	require.NoError(t, err)
+	assert.Equal(t, "/redirect", u.Path)
+}
+
+func TestRequestedCredentialTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		dcql string
+		want []string
+	}{
+		{
+			name: "sd-jwt vct values",
+			dcql: `{"credentials":[{"id":"pid","meta":{"vct_values":["urn:eudi:pid:arf-1.8:1","urn:eudi:pid:arf-1.5:1"]}}]}`,
+			want: []string{"urn:eudi:pid:arf-1.8:1", "urn:eudi:pid:arf-1.5:1"},
+		},
+		{
+			name: "mdoc doctype",
+			dcql: `{"credentials":[{"id":"mdl","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}`,
+			want: []string{"org.iso.18013.5.1.mDL"},
+		},
+		{
+			name: "falls back to the credential id when the query names no type",
+			dcql: `{"credentials":[{"id":"some-credential","meta":{}}]}`,
+			want: []string{"some-credential"},
+		},
+		{
+			name: "deduplicates across credentials",
+			dcql: `{"credentials":[{"id":"a","meta":{"vct_values":["urn:x"]}},{"id":"b","meta":{"vct_values":["urn:x"]}}]}`,
+			want: []string{"urn:x"},
+		},
+		{name: "empty query", dcql: ``, want: nil},
+		{name: "unparseable query", dcql: `not json`, want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, requestedCredentialTypes(json.RawMessage(tt.dcql)))
+		})
+	}
 }
