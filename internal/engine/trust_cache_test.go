@@ -221,12 +221,19 @@ func TestTrustCache_DisabledDoesNotCacheDenials(t *testing.T) {
 	}
 }
 
-// A nil cache is what a handler holds when the manager never set one; it must
-// behave like a disabled one rather than panic.
+// A nil cache is what a handler holds when the manager never set one; every
+// exported method must behave like a disabled one rather than panic. Get and
+// Set guard the receiver explicitly; Len does not touch any field before
+// acquiring c.mu, so a bare nil check is required there too - c.mu.RLock()
+// on a nil *TrustCache panics on the implicit dereference of c, and nothing
+// else in this file was exercising Len on a nil receiver to catch that.
 func TestTrustCache_NilIsSafe(t *testing.T) {
 	var c *TrustCache
 	c.Set(domain.DefaultTenantID, "https://verifier.example", &TrustCacheRecord{Trusted: true})
 	if got := c.Get(domain.DefaultTenantID, "https://verifier.example"); got != nil {
 		t.Fatalf("expected nil from a nil cache, got %+v", got)
+	}
+	if got := c.Len(); got != 0 {
+		t.Fatalf("expected 0 from a nil cache, got %d", got)
 	}
 }

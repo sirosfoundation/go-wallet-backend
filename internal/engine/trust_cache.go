@@ -100,6 +100,9 @@ func (c *TrustCache) Set(tenantID domain.TenantID, verifierURL string, record *T
 
 // Len returns the number of entries (including potentially expired ones).
 func (c *TrustCache) Len() int {
+	if c == nil {
+		return 0
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.entries)
