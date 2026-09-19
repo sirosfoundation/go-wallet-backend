@@ -79,7 +79,12 @@ const (
 // HTTP header/content type constants
 const (
 	hdrContentType     = "Content-Type"
+	hdrAccept          = "Accept"
 	mimeFormURLEncoded = "application/x-www-form-urlencoded"
+	// mimeOAuthAuthzReqJWT is the media type OpenID4VP 1.0 5.10.1 defines
+	// for a request object served from a request_uri: a signed, optionally
+	// encrypted JWT.
+	mimeOAuthAuthzReqJWT = "application/oauth-authz-req+jwt"
 )
 
 // TransactionData represents a single transaction data object from
@@ -456,17 +461,38 @@ func (e *requestCodedError) Unwrap() error { return e.err }
 // the parameter on the authorization request URI when it carries one,
 // otherwise whatever the client passed on the FlowStart message.
 func requestURIMethod(u *url.URL, msg *FlowStartMessage) string {
-	// Presence, not emptiness: "request_uri_method=" with no value is still
-	// the authorization request speaking, and it means the GET it asks for -
-	// falling through to the client's value there would turn a request the
-	// verifier wrote as a GET into a POST.
+	clientMethod := ""
+	if msg != nil {
+		clientMethod = msg.RequestURIMethod
+	}
+
+	// A client that asked for POST cannot be talked out of it by the URI.
+	// The authorization request is unauthenticated at this point - it is a
+	// QR code or a deep link, and anyone able to rewrite it can rewrite
+	// request_uri_method=post to get. That downgrade is not cosmetic: the
+	// GET path sends no wallet_nonce, so the check that binds the returned
+	// request object to this request becomes a no-op and the whole point of
+	// 5.10 is switched off by an attacker-supplied query parameter. The
+	// same downgrade was reported against eudi-lib-ios-openid4vp-swift
+	// (their issue #226).
+	//
+	// Honouring the client and failing loudly against a verifier that only
+	// speaks GET is the better error: the client asked for a guarantee this
+	// verifier cannot give, which is worth surfacing rather than silently
+	// dropping.
+	if clientMethod == "post" {
+		return "post"
+	}
+
+	// Otherwise the authorization request decides, by presence rather than
+	// emptiness: "request_uri_method=" with no value is still the request
+	// speaking, and it means the GET it asks for - falling through to the
+	// client's value there would turn a request the verifier wrote as a GET
+	// into a POST.
 	if q := u.Query(); q.Has("request_uri_method") {
 		return q.Get("request_uri_method")
 	}
-	if msg != nil {
-		return msg.RequestURIMethod
-	}
-	return ""
+	return clientMethod
 }
 
 // usePostForRequestURI maps request_uri_method to the HTTP method to use.
@@ -485,30 +511,23 @@ func usePostForRequestURI(method string) (bool, error) {
 	}
 }
 
-// defaultWalletMetadata is the wallet_metadata sent with a
-// request_uri_method=post request when the client supplies none of its own.
-// The engine is deliberately format-agnostic everywhere else - matching and
-// VP token construction both happen client-side - so this is an assertion
-// about the clients this backend serves rather than something it can derive
-// from anything it holds, which is why FlowStartMessage.WalletMetadata
-// overrides it wholesale. It stays at vp_formats_supported because that is
-// what lets a verifier tailor the request object it returns; every further
-// field would be one more claim made on the client's behalf. ES256 is the
-// one signature algorithm every WSCD in this stack produces.
-//
-// The two formats are spelled as OpenID4VP 1.0 Annex B defines them, which
-// is not the same shape twice: SD-JWT VC takes sd-jwt_alg_values and
-// kb-jwt_alg_values with JOSE names, while mdoc takes issuerauth_alg_values
-// and deviceauth_alg_values with COSE algorithm identifiers. -7 is the ES256
-// this stack puts in the COSE header, -9 the same thing named as a
-// fully-specified algorithm; a verifier matching either way finds us.
-var defaultWalletMetadata = json.RawMessage(`{"vp_formats_supported":{` +
-	`"dc+sd-jwt":{"sd-jwt_alg_values":["ES256"],"kb-jwt_alg_values":["ES256"]},` +
-	`"mso_mdoc":{"issuerauth_alg_values":[-7,-9],"deviceauth_alg_values":[-7,-9]}}}`)
-
 // walletMetadataToSend picks the wallet_metadata for a request_uri_method=post
-// request: the client's own when it supplied one, the engine's list when it
-// did not.
+// request. It returns the client's own when it supplied one, and nothing at
+// all when it did not.
+//
+// The engine deliberately does not substitute a list of its own. wallet_metadata
+// is OPTIONAL in OpenID4VP, so omitting it is both honest and safe, whereas a
+// default asserts capabilities on the client's behalf that the engine cannot
+// derive from anything it holds - matching and VP token construction both
+// happen client-side. Claiming mso_mdoc for a client that only does SD-JWT
+// invites a request object the client then cannot satisfy, and that failure
+// lands after the user has consented, which is the worst place for it.
+//
+// There is a second-order reason. Sending wallet_metadata is what signals
+// dynamic discovery, and under dynamic discovery the request object's aud
+// must equal its iss, where under static discovery it must be
+// https://self-issued.me/v2. A synthesized blob carries no issuer, so a
+// verifier that switches modes on its presence has nothing to key aud to.
 //
 // Clients serialize the whole flow start message with their nulls included
 // (the Kotlin and Swift SDKs both encode defaults), so a field the client
@@ -523,7 +542,7 @@ var defaultWalletMetadata = json.RawMessage(`{"vp_formats_supported":{` +
 func walletMetadataToSend(md json.RawMessage) (json.RawMessage, error) {
 	trimmed := strings.TrimSpace(string(md))
 	if trimmed == "" || trimmed == "null" {
-		return defaultWalletMetadata, nil
+		return nil, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
@@ -581,13 +600,20 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 			return nil, mdErr
 		}
 		form := url.Values{}
-		form.Set("wallet_metadata", string(metadata))
+		if len(metadata) > 0 {
+			form.Set("wallet_metadata", string(metadata))
+		}
 		form.Set("wallet_nonce", walletNonce)
 		req, err = http.NewRequestWithContext(ctx, "POST", uri, strings.NewReader(form.Encode()))
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set(hdrContentType, mimeFormURLEncoded)
+		// OpenID4VP 1.0 5.10 requires this Accept header on the POST, and
+		// 5.10.1 requires the response to be a signed request object of that
+		// media type. Asking for it is what lets a verifier that can serve
+		// both shapes pick the right one.
+		req.Header.Set(hdrAccept, mimeOAuthAuthzReqJWT)
 	} else {
 		req, err = http.NewRequestWithContext(ctx, "GET", uri, nil)
 		if err != nil {
@@ -595,7 +621,24 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 		}
 	}
 
-	resp, err := h.httpClient.Do(req)
+	client := h.httpClient
+	if usePost {
+		// Go's client follows a 302 or 303 on a POST by reissuing it as a
+		// GET with no body, so a verifier behind a redirect would receive
+		// neither wallet_nonce nor wallet_metadata and answer a request
+		// object that echoes no nonce. That fails closed at the check below,
+		// but as WALLET_NONCE_MISMATCH - which points at the verifier's
+		// integrity rather than at its redirect. Refuse the redirect instead
+		// and say so. The copy is shallow on purpose: it shares the
+		// transport, and with it the SSRF address and scheme policy.
+		redirectSafe := *client
+		redirectSafe.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+			return fmt.Errorf("request_uri redirected (%d hop(s)); a redirect would drop the wallet_nonce POST body", len(via))
+		}
+		client = &redirectSafe
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
@@ -641,6 +684,19 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 		// misclassify it as a JWT and fail to parse. JSON always starts with
 		// '{' or '[' once whitespace is trimmed, and a JWT never does, so
 		// check that instead.
+		//
+		// On the POST path a plain JSON body is refused outright. OpenID4VP
+		// 1.0 5.10.1 requires the response to be a signed request object,
+		// and without that signature the wallet_nonce check below proves
+		// nothing: anyone who can observe or intercept the POST can echo the
+		// nonce back. The nonce binds the response to this request only once
+		// something has vouched for who produced it. Accepting unsigned JSON
+		// here would leave the POST path weaker than the GET path it was
+		// added to strengthen.
+		if usePost {
+			return nil, &requestCodedError{ErrCodeInvalidRequestObject,
+				errors.New("request object fetched with request_uri_method=post is not a signed JWT")}
+		}
 		authReq = &AuthorizationRequest{}
 		err = json.Unmarshal([]byte(bodyStr), authReq)
 		if err != nil {

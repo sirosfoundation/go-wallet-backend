@@ -125,6 +125,11 @@ const (
 	// the POST buys nothing - the nonce is the only thing binding the
 	// returned request object to this request rather than an earlier one.
 	ErrCodeWalletNonceMismatch ErrorCode = "WALLET_NONCE_MISMATCH"
+	// ErrCodeInvalidRequestObject reports a request object that is not the
+	// shape the spec requires - in practice an unsigned JSON body returned
+	// from a request_uri_method=post fetch, which OpenID4VP 1.0 5.10.1
+	// requires to be a signed JWT.
+	ErrCodeInvalidRequestObject ErrorCode = "INVALID_REQUEST_OBJECT"
 	// ErrCodeNoMatchingCredentials is returned when the wallet holds nothing
 	// that satisfies the verifier's query. Distinct from a decline: the user
 	// was never asked, so reporting this to the wallet as "declined" would be
@@ -181,6 +186,8 @@ func (c ErrorCode) UserFacingMessage() string {
 	case ErrCodeInvalidRequestURIMethod:
 		return "This request uses a method this wallet does not support"
 	case ErrCodeWalletNonceMismatch:
+		return "The verifier's request could not be verified"
+	case ErrCodeInvalidRequestObject:
 		return "The verifier's request could not be verified"
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
@@ -251,7 +258,10 @@ type FlowStartMessage struct {
 	// parameter of a request_uri_method=post request. The client is the
 	// honest source for it: credential matching and VP token construction
 	// both happen there, so it - not the engine - knows what this wallet can
-	// actually present. The engine falls back to defaultWalletMetadata.
+	// actually present. When it is unset the engine sends no wallet_metadata
+	// at all rather than substituting a list of its own; the parameter is
+	// optional, and see walletMetadataToSend for why a default is worse than
+	// nothing.
 	WalletMetadata json.RawMessage `json:"wallet_metadata,omitempty"`
 	VCT            string          `json:"vct,omitempty"`          // VCTM lookup
 	RedirectURI    string          `json:"redirect_uri,omitempty"` // OAuth redirect URI for authorization code flow

@@ -620,14 +620,30 @@ Client → Server:
 `request_uri_method` is absent or `"get"` for RFC 9101's GET (the default);
 any other value fails the flow with `INVALID_REQUEST_URI_METHOD`. A request
 object that does not echo the `wallet_nonce` fails it with
-`WALLET_NONCE_MISMATCH`, per §5.10's MUST.
+`WALLET_NONCE_MISMATCH`, per §5.10's MUST, and one that is not a signed JWT
+fails it with `INVALID_REQUEST_OBJECT`, per §5.10.1.
 
-`wallet_metadata` is optional and sent verbatim when present. The client is
-the better source for it - matching and VP token construction both happen
-there - but the backend falls back to a conservative default
-(`vp_formats_supported` for `dc+sd-jwt` and `mso_mdoc`, ES256) when it is
-omitted. The per-format shape is OpenID4VP 1.0 Annex B's: `sd-jwt_alg_values`
-/ `kb-jwt_alg_values` with JOSE names for SD-JWT VC, `issuerauth_alg_values` /
+**A client that asks for `post` gets `post`.** The authorization request is
+unauthenticated - a QR code or a deep link - so anyone able to rewrite it can
+rewrite `request_uri_method=post` to `get`. A GET sends no `wallet_nonce`, so
+that downgrade would silently switch off the binding the client asked for.
+The URI therefore decides only when the client expressed no preference; it
+cannot talk a client out of `post`. Against a verifier that only speaks GET
+this fails the flow, which is the honest outcome: the client asked for a
+guarantee that verifier cannot give.
+
+`wallet_metadata` is optional and sent verbatim when present. When the client
+sends none, **the backend sends none** - it does not substitute a list of its
+own. The parameter is optional in OpenID4VP, and the engine cannot know what
+a given client can present, since matching and VP token construction both
+happen client-side; claiming `mso_mdoc` for an SD-JWT-only client invites a
+request object it cannot satisfy, and that failure lands after the user has
+consented. Sending `wallet_metadata` is also what signals dynamic discovery,
+under which the request object's `aud` must equal its `iss` rather than
+`https://self-issued.me/v2`, so a synthesized blob with no issuer leaves a
+verifier nothing to key `aud` to. The per-format shape, when a client does
+send it, is OpenID4VP 1.0 Annex B's: `sd-jwt_alg_values` / `kb-jwt_alg_values`
+with JOSE names for SD-JWT VC, `issuerauth_alg_values` /
 `deviceauth_alg_values` with COSE algorithm identifiers for mdoc.
 
 #### Request Processing
@@ -913,6 +929,7 @@ Server → Client:
 | `PRESENTATION_ERROR` | VP creation or submission failed |
 | `INVALID_REQUEST_URI_METHOD` | Verifier asked for a `request_uri_method` this wallet does not implement |
 | `WALLET_NONCE_MISMATCH` | Request object fetched by POST did not echo the `wallet_nonce` (OpenID4VP §5.10) |
+| `INVALID_REQUEST_OBJECT` | Request object fetched by POST was not a signed JWT (OpenID4VP §5.10.1) |
 | `INTERNAL_ERROR` | Server-side error |
 
 ## Protocol Extensibility
