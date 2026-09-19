@@ -2469,3 +2469,27 @@ func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
 		}
 	}
 }
+
+// TestTrustConfig_VerifierCacheTTL pins the one place that decides how long a
+// verifier trust decision may be reused, including the "off" case the engine
+// reads as "do not cache at all".
+func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  TrustConfig
+		want time.Duration
+	}{
+		{"unset means the default", TrustConfig{}, DefaultTrustCacheTTL},
+		{"explicit seconds win", TrustConfig{CacheTTLSeconds: 30}, 30 * time.Second},
+		{"disabled means zero", TrustConfig{CacheDisabled: true}, 0},
+		{"disabled beats an explicit ttl", TrustConfig{CacheDisabled: true, CacheTTLSeconds: 30}, 0},
+		{"a negative ttl falls back to the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.VerifierCacheTTL(); got != tt.want {
+				t.Fatalf("VerifierCacheTTL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
