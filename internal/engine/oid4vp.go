@@ -69,6 +69,10 @@ const (
 const (
 	ResponseModeDirectPost    = "direct_post"
 	ResponseModeDirectPostJWT = "direct_post.jwt"
+	// Modes that hand the result back through the user agent rather than a
+	// POST from the wallet (previously spelled inline in submitResponse).
+	ResponseModeQuery    = "query"
+	ResponseModeFragment = "fragment"
 )
 
 // HTTP header/content type constants
@@ -1023,13 +1027,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
 // credential_selection progress message and waits for the user to consent or decline.
 // The frontend is responsible for local credential matching and the consent UI.
+//
+// A client that finds nothing to present answers with credentials_matched and
+// an empty match set instead, which ends the flow here. Without that answer
+// the only ways out were a decline - untrue, the user was never asked - or
+// silence until the user-interaction timeout, which is what a wallet missing
+// the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
 	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
 	})
 
-	action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline)
+	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
 		return nil, err
 	}
@@ -1040,7 +1050,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", "User declined the request")
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 		if redirectURI != "" {
 			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
 				map[string]interface{}{"redirect_uri": redirectURI})
@@ -1062,6 +1072,144 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	}
 
 	return payload.SelectedCredentials, nil
+}
+
+// waitForSelectionAction waits for the client's answer to a
+// credential_selection message. credentials_matched with an empty match set
+// terminates the flow; with a non-empty one it is informational and the wait
+// continues, so a client that reports its matches before asking the user
+// behaves exactly as one that does not.
+//
+// The user-interaction deadline is taken once, before the first wait, and each
+// later wait gets only what is left of it. WaitForAction starts a fresh
+// UserInteractionTimeout per call, so without this a client repeating the
+// informational action would reset the clock every time and could hold a
+// pending flow slot open indefinitely without ever obtaining consent.
+func (h *OID4VPHandler) waitForSelectionAction(ctx context.Context, authReq *AuthorizationRequest) (*FlowActionMessage, error) {
+	return h.waitForSelectionActionUntil(ctx, authReq, time.Now().Add(UserInteractionTimeout))
+}
+
+// waitForSelectionActionUntil is waitForSelectionAction against an explicit
+// deadline, so a test can exercise the loop without waiting five minutes.
+func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq *AuthorizationRequest, deadline time.Time) (*FlowActionMessage, error) {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrFlowTimeout
+		}
+
+		action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, remaining,
+			ActionConsent, ActionDecline, ActionCredentialsMatched)
+		if err != nil {
+			return nil, err
+		}
+		if action.Action != ActionCredentialsMatched {
+			return action, nil
+		}
+
+		var matched CredentialsMatchedPayload
+		if err := json.Unmarshal(action.Payload, &matched); err != nil {
+			_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid credentials_matched payload")
+			return nil, fmt.Errorf("invalid credentials_matched payload: %w", err)
+		}
+		if len(matched.Matches) > 0 {
+			continue
+		}
+
+		return nil, h.failNoMatchingCredential(ctx, authReq, matched.NoMatchReason)
+	}
+}
+
+// verifierRefusedDescription is the error_description every refusal sends to
+// the verifier, whether the user declined or the wallet held nothing that
+// matched. OpenID4VP answers both with access_denied so a verifier cannot
+// learn which happened - and therefore cannot probe what a holder has by
+// asking and watching the reason. Two different descriptions would hand that
+// distinction straight back.
+const verifierRefusedDescription = "The wallet did not fulfil the request"
+
+// failNoMatchingCredential ends the flow when the wallet holds nothing the
+// verifier asked for. The verifier is told as well, so its session ends now
+// rather than expiring: OpenID4VP has no dedicated code for "holder has no
+// such credential", and access_denied is the response the specification
+// provides for a request the wallet will not fulfil.
+func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *AuthorizationRequest, reason string) error {
+	requested := requestedCredentialTypes(authReq.DCQLQuery)
+
+	h.Logger.Info("no credential matches the verifier's query",
+		zap.Strings("requested_types", requested), zap.String("client_reason", reason))
+
+	details := map[string]interface{}{}
+	if len(requested) > 0 {
+		details["requested_types"] = requested
+	}
+	if reason != "" {
+		details["no_match_reason"] = reason
+	}
+	// The verifier gets the same description a decline sends, not this
+	// message: naming what the wallet does not hold would tell the verifier
+	// whether the holder has a credential it asked about, which is exactly
+	// what one access_denied for both outcomes is there to prevent. The
+	// detailed text is for the wallet, which is showing it to its own user.
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
+		details["redirect_uri"] = redirectURI
+	}
+
+	// The wallet is the one showing this to a person, and it is the only
+	// party that knows their language, so it gets the code and the requested
+	// types and composes its own sentence. The string here is the same
+	// per-code English fallback every other flow error carries; an
+	// interpolated one would be worse than useless, since a client cannot
+	// translate a sentence it did not build.
+	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredentials,
+		ErrCodeNoMatchingCredentials.UserFacingMessage(), details)
+
+	return errors.New("no credential matches the verifier's query")
+}
+
+// requestedCredentialTypes lists the credential types a DCQL query asks for,
+// so the error can name what is missing rather than say "nothing matched".
+// Best-effort: an unparseable or exotic query simply yields no names.
+func requestedCredentialTypes(dcql json.RawMessage) []string {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var query struct {
+		Credentials []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				VCTValues     []string `json:"vct_values"`
+				DoctypeValue  string   `json:"doctype_value"`
+				DoctypeValues []string `json:"doctype_values"`
+			} `json:"meta"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &query); err != nil {
+		return nil
+	}
+
+	var types []string
+	seen := map[string]bool{}
+	add := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		types = append(types, v)
+	}
+	for _, c := range query.Credentials {
+		for _, vct := range c.Meta.VCTValues {
+			add(vct)
+		}
+		add(c.Meta.DoctypeValue)
+		for _, dt := range c.Meta.DoctypeValues {
+			add(dt)
+		}
+		if len(c.Meta.VCTValues) == 0 && c.Meta.DoctypeValue == "" && len(c.Meta.DoctypeValues) == 0 {
+			add(c.ID)
+		}
+	}
+	return types
 }
 
 func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
@@ -1195,9 +1343,9 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
 		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
-	case "fragment":
+	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
-	case "query":
+	case ResponseModeQuery:
 		return h.buildQueryRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	default:
 		return "", fmt.Errorf("unsupported response_mode: %s", responseMode)
@@ -1240,6 +1388,32 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	return "", fmt.Errorf("response submission failed with status %d: %s", resp.StatusCode, string(body))
+}
+
+// buildErrorRedirect returns the URL the user agent is sent to when a
+// query/fragment-mode request ends in an error rather than a vp_token.
+func buildErrorRedirect(endpoint, state, errCode, errDesc string, inFragment bool) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	params := u.Query()
+	if inFragment {
+		params = url.Values{}
+	}
+	params.Set("error", errCode)
+	if errDesc != "" {
+		params.Set("error_description", errDesc)
+	}
+	if state != "" {
+		params.Set("state", state)
+	}
+	if inFragment {
+		u.Fragment = params.Encode()
+	} else {
+		u.RawQuery = params.Encode()
+	}
+	return u.String()
 }
 
 func (h *OID4VPHandler) buildFragmentRedirect(endpoint string, authReq *AuthorizationRequest, vpToken string) string {
@@ -1313,9 +1487,42 @@ func inferClientIDScheme(clientID string) string {
 // verifier's own page even on decline/error - returned as a best-effort
 // string, empty if the verifier didn't provide one or the POST failed.
 func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) string {
-	if authReq == nil || authReq.ResponseURI == "" {
+	if authReq == nil {
 		return ""
 	}
+
+	// query and fragment carry the error back through the user agent, the
+	// way submitResponse carries a vp_token in those modes: the caller gets a
+	// URL to redirect to and nothing is sent from here. Only looking at
+	// response_uri, which these verifiers do not set, meant they were never
+	// told and sat waiting for a response that was never coming.
+	//
+	// The endpoint is chosen exactly as submitResponse chooses it - response_uri
+	// first, redirect_uri otherwise. validateAuthorizationRequest only forbids
+	// redirect_uri for the direct_post modes, so a query/fragment request may
+	// carry both; picking differently here would deliver the vp_token to one
+	// endpoint and the failure to the other, leaving the verifier waiting.
+	if authReq.ResponseMode == ResponseModeQuery || authReq.ResponseMode == ResponseModeFragment {
+		target := authReq.ResponseURI
+		if target == "" {
+			target = authReq.RedirectURI
+		}
+		if target == "" {
+			return ""
+		}
+		endpoint, err := sanitizeEndpointURL(target)
+		if err != nil {
+			h.Logger.Debug("refusing to build an error redirect for an unusable endpoint", zap.Error(err))
+			return ""
+		}
+		return buildErrorRedirect(endpoint, authReq.State, errCode, errDesc,
+			authReq.ResponseMode == ResponseModeFragment)
+	}
+
+	if authReq.ResponseURI == "" {
+		return ""
+	}
+
 	data := url.Values{}
 	data.Set("error", errCode)
 	if errDesc != "" {
