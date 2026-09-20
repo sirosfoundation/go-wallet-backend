@@ -2525,3 +2525,29 @@ func TestConfig_Validate_RejectsANegativeTrustCacheTTL(t *testing.T) {
 		t.Errorf("a positive ttl must be accepted: %v", err)
 	}
 }
+
+// A TTL past the int64 nanosecond range wraps to a negative time.Duration,
+// which the cache reads as "off" - so a number meant to cache for centuries
+// would disable caching instead. Same silent inversion as a negative value,
+// from the opposite end.
+func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
+	cfg := validBaseConfig()
+
+	// The boundary itself still converts to a positive duration.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the largest representable ttl must be accepted: %v", err)
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got <= 0 {
+		t.Fatalf("the boundary must still be a positive duration, got %v", got)
+	}
+
+	// One past it does not.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a ttl that overflows time.Duration must be refused")
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got > 0 {
+		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -1110,6 +1111,13 @@ type TrustConfig struct {
 // TrustConfig.CacheTTLSeconds says nothing.
 const DefaultTrustCacheTTL = time.Hour
 
+// MaxTrustCacheTTLSeconds is the largest CacheTTLSeconds that survives the
+// conversion to a time.Duration, which counts nanoseconds in an int64 - about
+// 292 years. Anything larger wraps to a negative duration, which the cache
+// reads as "off", so a number meant to say "cache for a very long time" would
+// silently mean the opposite. Config.Validate refuses those.
+const MaxTrustCacheTTLSeconds = int(math.MaxInt64 / int64(time.Second))
+
 // VerifierCacheTTL is how long the engine may reuse a verifier trust decision.
 //
 // Zero means "do not cache at all", which is what CacheDisabled selects; the
@@ -1943,6 +1951,14 @@ func (c *Config) Validate() error {
 	// to say off.
 	if c.Trust.CacheTTLSeconds < 0 {
 		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not be negative (set trust.cache_disabled to turn the cache off)", c.Trust.CacheTTLSeconds)
+	}
+	// And not so large that it wraps. A value past the int64 nanosecond
+	// range becomes a negative duration, which the cache reads as "off" -
+	// so without this, a number meant to cache for centuries would disable
+	// caching instead, which is the same silent inversion as the negative
+	// case above.
+	if c.Trust.CacheTTLSeconds > MaxTrustCacheTTLSeconds {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not exceed %d (a larger value overflows time.Duration and would silently disable the cache)", c.Trust.CacheTTLSeconds, MaxTrustCacheTTLSeconds)
 	}
 
 	return nil

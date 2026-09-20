@@ -4,7 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 func TestTrustCache_SetAndGet(t *testing.T) {
@@ -236,4 +241,35 @@ func TestTrustCache_NilIsSafe(t *testing.T) {
 	if got := c.Len(); got != 0 {
 		t.Fatalf("expected 0 from a nil cache, got %d", got)
 	}
+}
+
+// NewManager must wire the configured TTL into the cache it builds. Every
+// other test here exercises TrustCache and VerifierCacheTTL directly, so all
+// of them would still pass if the constructor went back to a hardcoded hour
+// and quietly ignored the configuration - which is the only way this feature
+// can break without anything noticing.
+func TestNewManager_WiresTheConfiguredTrustCacheTTL(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cfg  config.TrustConfig
+		want time.Duration
+	}{
+		{"disabled", config.TrustConfig{CacheDisabled: true}, 0},
+		{"custom ttl", config.TrustConfig{CacheTTLSeconds: 42}, 42 * time.Second},
+		{"unset means the default", config.TrustConfig{}, config.DefaultTrustCacheTTL},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(&config.Config{Trust: tt.cfg}, zap.NewNop())
+			require.NotNil(t, m.trustCache)
+			assert.Equal(t, tt.want, m.trustCache.ttl,
+				"the manager's cache must use the configured TTL, not a literal of its own")
+		})
+	}
+
+	// And the disabled one really is off, not an instantly-expiring entry:
+	// Set must store nothing at all.
+	m := NewManager(&config.Config{Trust: config.TrustConfig{CacheDisabled: true}}, zap.NewNop())
+	m.trustCache.Set("tenant", "https://verifier.example", &TrustCacheRecord{Trusted: true})
+	assert.Zero(t, m.trustCache.Len(), "a disabled cache must not store")
+	assert.Nil(t, m.trustCache.Get("tenant", "https://verifier.example"))
 }
