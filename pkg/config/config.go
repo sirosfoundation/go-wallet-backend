@@ -1116,6 +1116,11 @@ const DefaultTrustCacheTTL = time.Hour
 // engine's cache treats a non-positive TTL as off rather than as an instantly
 // expiring entry, so there is one meaning for the value and one place that
 // decides it.
+//
+// A negative CacheTTLSeconds reads as the default here, but Config.Validate
+// refuses it before a process gets this far: it is the one value whose intent
+// ("off") differs from what this returns, so it is rejected at startup rather
+// than guessed at.
 func (t TrustConfig) VerifierCacheTTL() time.Duration {
 	if t.CacheDisabled {
 		return 0
@@ -1928,6 +1933,16 @@ func (c *Config) Validate() error {
 		if c.Audit.KeyID == "" {
 			return fmt.Errorf("audit.key_id is required when audit is enabled")
 		}
+	}
+
+	// A negative TTL is refused rather than quietly rounded up to the
+	// default. Someone who writes -1 here means "off", and silently giving
+	// them an hour of cached trust decisions is the exact failure this
+	// setting exists to cure: an answer that is not what the operator asked
+	// for, with nothing anywhere saying so. trust.cache_disabled is the way
+	// to say off.
+	if c.Trust.CacheTTLSeconds < 0 {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not be negative (set trust.cache_disabled to turn the cache off)", c.Trust.CacheTTLSeconds)
 	}
 
 	return nil

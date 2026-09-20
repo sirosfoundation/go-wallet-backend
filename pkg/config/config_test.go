@@ -2483,7 +2483,11 @@ func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
 		{"explicit seconds win", TrustConfig{CacheTTLSeconds: 30}, 30 * time.Second},
 		{"disabled means zero", TrustConfig{CacheDisabled: true}, 0},
 		{"disabled beats an explicit ttl", TrustConfig{CacheDisabled: true, CacheTTLSeconds: 30}, 0},
-		{"a negative ttl falls back to the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
+		// Negative never reaches here in a running process - Validate
+		// refuses it at startup - but the function still has to answer
+		// something, and the default is the safe answer for a value that
+		// should have been rejected.
+		{"a negative ttl reads as the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2491,5 +2495,33 @@ func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
 				t.Fatalf("VerifierCacheTTL() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// A negative trust.cache_ttl_seconds is refused at startup. Someone who
+// writes -1 means "off", and quietly giving them an hour of cached trust
+// decisions is the exact failure this setting exists to cure: an answer that
+// is not the one the operator asked for, with nothing saying so.
+func TestConfig_Validate_RejectsANegativeTrustCacheTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Trust.CacheTTLSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a negative trust.cache_ttl_seconds must be refused")
+	}
+	if !strings.Contains(err.Error(), "cache_disabled") {
+		t.Errorf("the error should point at the way to turn the cache off, got %v", err)
+	}
+
+	// Zero and positive are both fine: zero means the default, and
+	// cache_disabled is the separate switch.
+	cfg.Trust.CacheTTLSeconds = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero must be accepted (it selects the default): %v", err)
+	}
+	cfg.Trust.CacheTTLSeconds = 30
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a positive ttl must be accepted: %v", err)
 	}
 }
