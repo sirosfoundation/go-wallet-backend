@@ -293,8 +293,7 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	// public HTTPS endpoints is inherent to OpenID4VCI issuer metadata
 	// discovery — the issuer URL comes from a user-presented credential and
 	// can be any public HTTPS endpoint; there is no known-good allowlist.
-	// codeql[go/request-forgery]
-	resp, err := r.httpClient.Do(req)
+	resp, err := r.httpClient.Do(req) // codeql[go/request-forgery]
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
