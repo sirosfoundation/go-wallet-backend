@@ -4,6 +4,22 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.22.1:start -->
+## [v0.22.1] - 2026-09-22
+
+### Security
+
+- Fixed SSRF vulnerability in `POST /helper/get-cert` endpoint that allowed authenticated users to probe internal network services and retrieve their TLS certificates, disclosing service topology and internal CA details. The endpoint now applies the same address guard (blocking private/loopback/link-local ranges and cloud metadata endpoints) used by all other outbound fetches. (#358)
+- Fixed crash-loop DoS in WebSocket flow handling where a client-controlled `flow_id` shorter than 8 characters would panic before the recovery handler registered, killing the process. In combined-role deployments (`-mode=all`), this could take down backend, engine, registry, and admin services simultaneously. (#357)
+- Updated MongoDB driver to 1.17.10 to address CVE-2026-88031, a GridFS vulnerability where delete methods could match file IDs more loosely than intended, potentially causing unintended deletions. (#356)
+- 
+- Kudos to @kushaldas
+
+### Changed
+
+- Dependency updates: `github.com/fxamacker/cbor/v2` and `github.com/sirosfoundation/go-cryptoutil/pkcs11pool`. (#356)
+<!-- release-notes:v0.22.1:end -->
+
 <!-- release-notes:v0.22.0:start -->
 ## [v0.22.0] - 2026-09-18
 
