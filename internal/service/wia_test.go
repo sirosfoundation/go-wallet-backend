@@ -8,18 +8,19 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
 
-	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	jwkpkg "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -52,7 +53,6 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	}
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		LifetimeSeconds: 3600,
-		StatusListMode:  "never",
 	}
 
 	logger := zap.NewNop()
@@ -63,6 +63,46 @@ func newTestWIAService(t *testing.T) (*WIAService, *ecdsa.PrivateKey) {
 	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, nil, nil, nil)
 
 	return svc, privKey
+}
+
+// newTestWIAServiceWithInstances is like newTestWIAService but wires a real
+// (in-memory) wallet instance store, needed for tests that exercise
+// suspend/revoke enforcement.
+func newTestWIAServiceWithInstances(t *testing.T) (*WIAService, storage.WalletInstanceStore) {
+	t.Helper()
+
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+	}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+
+	cfg := &config.Config{}
+	cfg.WalletProvider.WIA = config.WIAConfig{
+		Enabled:             true,
+		WalletName:          "Test Wallet",
+		MaxExpirySeconds:    86400,
+		ChallengeTTLSeconds: 300,
+	}
+	cfg.WalletProvider.Attestation = config.AttestationConfig{
+		LifetimeSeconds: 3600,
+	}
+
+	logger := zap.NewNop()
+	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := memory.NewStore().WalletInstances()
+	svc := NewWIAService(cfg, logger, jwtSigner, []string{certB64}, instances, nil, nil)
+
+	return svc, instances
 }
 
 // createTestPop creates a WIA-PoP JWT for testing.
@@ -117,7 +157,7 @@ func createTestPop(t *testing.T, nonce string) (string, *ecdsa.PrivateKey) {
 func TestWIAService_CreateChallenge(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
-	challenge, expiresAt, err := svc.CreateChallenge(context.Background())
+	challenge, expiresAt, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge failed: %v", err)
 	}
@@ -134,7 +174,7 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
 	// Create challenge
-	challenge, _, err := svc.CreateChallenge(context.Background())
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
@@ -143,7 +183,7 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	pop, _ := createTestPop(t, challenge)
 
 	// Generate WIA
-	wiaJWT, err := svc.GenerateWIA(context.Background(), &WIARequest{
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -200,12 +240,350 @@ func TestWIAService_GenerateWIA_Success(t *testing.T) {
 	if claims["iss"] != nil {
 		t.Error("WIA should not have iss claim (identity from x5c)")
 	}
+
+	// sub falls back to the instance identifier (jkt) when no client_id is
+	// supplied - draft-ietf-oauth-attestation-based-client-auth-10 only
+	// requires sub=client_id when the WIA is actually used for OAuth client
+	// authentication (see TestWIAService_GenerateWIA_SubEqualsClientID).
+	jkt, _ := cnf["jkt"].(string)
+	if claims["sub"] != jkt {
+		t.Errorf("sub = %v, want jkt %v (no client_id supplied)", claims["sub"], jkt)
+	}
+}
+
+// "ietf" mode lets a deployment opt into the IETF-draft iss/JWKS identity
+// format instead of ETSI TS 119 472-3's x5c-derived identity. For
+// interoperability we still include x5c when certificate material is
+// configured, while retaining kid+iss for JWKS-based resolution.
+func TestWIAService_GenerateWIA_IETFMode(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] == nil {
+		t.Error("x5c header should be present in ietf mode when certificate material is configured")
+	}
+
+	// Regression: even when x5c is present for interoperability, relying
+	// parties that resolve via the issuer's JWKS still need kid to know which
+	// published key to use for verification. Must match
+	// RegisterWalletProviderJWKSRoute's hardcoded KeyID.
+	if token.Header["kid"] != "wallet-provider" {
+		t.Errorf("kid = %v, want %q (must match RegisterWalletProviderJWKSRoute's KeyID)", token.Header["kid"], "wallet-provider")
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	if claims["iss"] != "https://wallet-provider.example" {
+		t.Errorf("iss = %v, want https://wallet-provider.example", claims["iss"])
+	}
+}
+
+func TestWIAService_GenerateWIA_IETFMode_WithoutCertificate(t *testing.T) {
+	svc, privKey := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example"
+	svc.certChain = nil
+
+	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
+	if err != nil {
+		t.Fatalf("NewCryptoSignerES256: %v", err)
+	}
+	svc.jwtSigner = jwtSigner
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] != nil {
+		t.Error("x5c header should be omitted in ietf mode when no certificate material is configured")
+	}
+	if token.Header["kid"] != "wallet-provider" {
+		t.Errorf("kid = %v, want %q", token.Header["kid"], "wallet-provider")
+	}
+}
+
+// TestWIAService_GenerateWIA_IETFMode_NoFallbackToWalletProviderURI is a
+// regression test: WalletProviderURI is a different identifier for a
+// different purpose (the WIA-PoP's expected aud, not this wallet provider's
+// own issuer identity - see docs/wallet-instance-attestation.md), and
+// config.Validate() requires WIA.Issuer to be explicitly set whenever Mode
+// is "ietf". signWIA must not silently substitute WalletProviderURI for iss
+// when Issuer itself is unset (e.g. because a caller bypassed Validate()).
+func TestWIAService_GenerateWIA_IETFMode_NoFallbackToWalletProviderURI(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.Mode = config.WIAModeIETF
+	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://fallback.example.com"
+	// WIA.Issuer intentionally left unset.
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	// WalletProviderURI being set means validatePop now requires a matching
+	// aud claim (see TestValidatePop_AudValidation) - unrelated to what this
+	// test checks, but must still be satisfied.
+	pop := newTestPopBuilder(t, challenge).withAudience("https://fallback.example.com").build()
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be set without an explicit issuer, got %v", claims["iss"])
+	}
+}
+
+// TestWIAService_GenerateWIA_ETSIMode is the mirror of the ietf-mode test
+// above: the default ("etsi") mode must always carry x5c and never iss/kid.
+func TestWIAService_GenerateWIA_ETSIMode(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	// Mode left at its zero value ("") — signWIA's mode switch treats that
+	// the same as explicit "etsi" (config.Validate() would normalize it,
+	// but these unit tests construct WIAService directly, bypassing Validate).
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+
+	if token.Header["x5c"] == nil {
+		t.Error("x5c header should be present in etsi mode")
+	}
+	if token.Header["kid"] != nil {
+		t.Error("kid header should not be present in etsi mode")
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be present in etsi mode, got %v", claims["iss"])
+	}
+}
+
+// draft-ietf-oauth-attestation-based-client-auth-10: "the sub claim MUST
+// specify client_id value of the OAuth Client" - when the caller (the OID4VCI
+// engine, via BackendApiClient.generateWIA) supplies its client_id, the WIA's
+// sub must reflect it instead of the instance identifier (jkt) - confirmed
+// against a real geneva2026.mdoc.online conformance run that flagged sub=jkt
+// as a FAIL ("must specify client_id value").
+func TestWIAService_GenerateWIA_SubEqualsClientID(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	wiaJWT, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
+		Pop:       pop,
+		Challenge: challenge,
+		ClientID:  "siros-sample://callback",
+	})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("Parse WIA: %v", err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	if claims["sub"] != "siros-sample://callback" {
+		t.Errorf("sub = %v, want siros-sample://callback (the supplied client_id)", claims["sub"])
+	}
+}
+
+// TestWIAService_GenerateWIA_RecordsUserID is a regression test: the
+// WalletInstance.UserID field existed and was queryable via GetByUser /
+// the admin ListWalletInstancesByUser endpoint, but nothing in the WIA
+// issuance path ever populated it — so that endpoint always returned an
+// empty list in practice. GenerateWIA must now record the caller's user ID
+// on the resulting instance when the caller passes one.
+func TestWIAService_GenerateWIA_RecordsUserID(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	uid := domain.UserIDFromString("user-42")
+	wiaJWT, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if err != nil {
+		t.Fatalf("GenerateWIA: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(wiaJWT, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parse WIA: %v", err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+	cnf := claims["cnf"].(map[string]interface{})
+	jkt := cnf["jkt"].(string)
+
+	got, err := instances.GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.UserID == nil || *got.UserID != uid {
+		t.Errorf("instance UserID = %v, want %v", got.UserID, uid)
+	}
+
+	byUser, err := instances.GetByUser(ctx, domain.DefaultTenantID, uid)
+	if err != nil {
+		t.Fatalf("GetByUser: %v", err)
+	}
+	if len(byUser) != 1 || byUser[0].ID != jkt {
+		t.Errorf("GetByUser returned %v, want exactly the instance %q", byUser, jkt)
+	}
+}
+
+// TestWIAService_GenerateWIA_RefusesRevokedInstance is a regression test for the
+// bug where a revoked/suspended wallet instance could obtain a fresh, fully valid
+// WIA simply by requesting a new challenge/PoP with the same instance key —
+// silently bypassing admin revocation.
+func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+
+	// First attestation succeeds and creates the wallet instance record.
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, instanceKey := createTestPop(t, challenge)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("first GenerateWIA: %v", err)
+	}
+
+	// Compute the same jkt the service would have used, to revoke that instance.
+	xBytes := instanceKey.PublicKey.X.Bytes()
+	yBytes := instanceKey.PublicKey.Y.Bytes()
+	for len(xBytes) < 32 {
+		xBytes = append([]byte{0}, xBytes...)
+	}
+	for len(yBytes) < 32 {
+		yBytes = append([]byte{0}, yBytes...)
+	}
+	jwk := map[string]interface{}{
+		"kty": "EC", "crv": "P-256",
+		"x": base64.RawURLEncoding.EncodeToString(xBytes),
+		"y": base64.RawURLEncoding.EncodeToString(yBytes),
+	}
+	jkt, err := jwkpkg.Thumbprint(jwk)
+	if err != nil {
+		t.Fatalf("jwk.Thumbprint: %v", err)
+	}
+	if err := instances.UpdateStatus(ctx, jkt, domain.InstanceStatusRevoked, "compromised device"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	// Same instance key requests a fresh challenge/PoP — must be refused.
+	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatalf("CreateChallenge 2: %v", err)
+	}
+	// Sign pop2 with the SAME instance key as the first attestation.
+	claims := &WIAPopClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "urn:wallet:instance:test-123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+		Nonce: challenge2,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["typ"] = "oauth-client-attestation-pop+jwt"
+	token.Header["jwk"] = jwk
+	pop2, err := token.SignedString(instanceKey)
+	if err != nil {
+		t.Fatalf("sign pop2: %v", err)
+	}
+
+	_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop2, Challenge: challenge2})
+	if !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("GenerateWIA for revoked instance: got err=%v, want ErrWIAInstanceDeactivated", err)
+	}
+
+	got, err := instances.GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("instance status = %s, want revoked (must not be reactivated by the refused attempt)", got.Status)
+	}
 }
 
 func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
-	challenge, _, err := svc.CreateChallenge(context.Background())
+	challenge, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +591,7 @@ func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 	pop, _ := createTestPop(t, challenge)
 
 	// First use should succeed
-	_, err = svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -223,7 +601,7 @@ func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 
 	// Second use should fail (single-use)
 	pop2, _ := createTestPop(t, challenge)
-	_, err = svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err = svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop2,
 		Challenge: challenge,
 	})
@@ -235,12 +613,12 @@ func TestWIAService_ChallengeIsSingleUse(t *testing.T) {
 func TestWIAService_InvalidNonce(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	// PoP with wrong nonce
 	pop, _ := createTestPop(t, "wrong-nonce")
 
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -253,18 +631,54 @@ func TestWIAService_ChallengeCapacityLimit(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 300
 
-	// Fill up the challenge store
+	// Fill up the global challenge store capacity, spread across enough
+	// distinct tenants that no single tenant hits its own per-tenant cap
+	// (maxChallengesPerTenant) first.
+	tenantCount := maxChallenges / maxChallengesPerTenant
 	for i := 0; i < maxChallenges; i++ {
-		_, _, err := svc.CreateChallenge(context.Background())
+		tenant := domain.TenantID(fmt.Sprintf("tenant-%d", i%tenantCount))
+		_, _, err := svc.CreateChallenge(context.Background(), tenant)
 		if err != nil {
 			t.Fatalf("CreateChallenge(%d) failed: %v", i, err)
 		}
 	}
 
-	// Next one should fail
-	_, _, err := svc.CreateChallenge(context.Background())
+	// Next one, for yet another tenant with room in its own per-tenant cap,
+	// should still fail because the global pool is full.
+	_, _, err := svc.CreateChallenge(context.Background(), domain.TenantID("one-more-tenant"))
 	if err == nil {
-		t.Fatal("should fail when capacity exceeded")
+		t.Fatal("should fail when global capacity exceeded")
+	}
+}
+
+// TestWIAService_ChallengeCapacityLimit_PerTenant is a regression test for
+// issue #224's "bounded capacity per tenant to prevent abuse" acceptance
+// criterion: a single tenant filling its own per-tenant cap must be rejected
+// well before the global pool is full, and a different tenant must be
+// unaffected.
+func TestWIAService_ChallengeCapacityLimit_PerTenant(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 300
+
+	busyTenant := domain.TenantID("busy-tenant")
+	for i := 0; i < maxChallengesPerTenant; i++ {
+		_, _, err := svc.CreateChallenge(context.Background(), busyTenant)
+		if err != nil {
+			t.Fatalf("CreateChallenge(%d) for busyTenant failed: %v", i, err)
+		}
+	}
+
+	// busyTenant is now at its own cap — rejected, even though the global
+	// pool (maxChallenges) is nowhere near full.
+	_, _, err := svc.CreateChallenge(context.Background(), busyTenant)
+	if err == nil {
+		t.Fatal("should fail once a tenant is at its own per-tenant cap")
+	}
+
+	// A different tenant must be unaffected.
+	_, _, err = svc.CreateChallenge(context.Background(), domain.TenantID("other-tenant"))
+	if err != nil {
+		t.Fatalf("a different tenant should not be blocked by busyTenant's cap: %v", err)
 	}
 }
 
@@ -274,7 +688,7 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 	// Set TTL to 1 second
 	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 1
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	// Manually expire the challenge (test-only: access in-memory store directly)
 	memStore := svc.challenges.(*memoryWIAChallengeStore)
@@ -284,7 +698,7 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 
 	pop, _ := createTestPop(t, challenge)
 
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 	})
@@ -293,86 +707,9 @@ func TestWIAService_ExpiredChallenge(t *testing.T) {
 	}
 }
 
-func TestComputeJKT(t *testing.T) {
-	// Known test vector
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   "test-x-value",
-		"y":   "test-y-value",
-	}
-
-	jkt, err := computeJKT(jwk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if jkt == "" {
-		t.Fatal("JKT should not be empty")
-	}
-
-	// Verify deterministic
-	jkt2, _ := computeJKT(jwk)
-	if jkt != jkt2 {
-		t.Fatal("JKT should be deterministic")
-	}
-}
-
-func TestParseECPublicKeyFromJWK(t *testing.T) {
-	// Generate a key and round-trip through JWK
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	xBytes := key.PublicKey.X.Bytes()
-	yBytes := key.PublicKey.Y.Bytes()
-	for len(xBytes) < 32 {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < 32 {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
-		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
-	}
-
-	parsed, err := parseECPublicKeyFromJWK(jwk)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if parsed.X.Cmp(key.PublicKey.X) != 0 || parsed.Y.Cmp(key.PublicKey.Y) != 0 {
-		t.Fatal("parsed key doesn't match original")
-	}
-}
-
-func TestEllipticCurveForName(t *testing.T) {
-	tests := []struct {
-		name  string
-		curve elliptic.Curve
-	}{
-		{"P-256", elliptic.P256()},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ellipticCurveForName(tt.name)
-			if got != tt.curve {
-				t.Errorf("ellipticCurveForName(%q) mismatch", tt.name)
-			}
-		})
-	}
-	// Unsupported curves should return nil
-	for _, name := range []string{"P-384", "P-521", "unsupported"} {
-		if c := ellipticCurveForName(name); c != nil {
-			t.Errorf("expected nil for %q curve", name)
-		}
-	}
-}
+// computeJKT/parseECPublicKeyFromJWK/ellipticCurveForName moved to pkg/jwk
+// (Thumbprint/ParseECPublicKey/CurveForName) — see pkg/jwk/jwk_test.go for
+// their unit tests.
 
 func TestChallengeStoreLen(t *testing.T) {
 	svc, _ := newTestWIAService(t)
@@ -384,7 +721,7 @@ func TestChallengeStoreLen(t *testing.T) {
 	}
 
 	// Create a challenge
-	_, _, err := svc.CreateChallenge(ctx)
+	_, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
@@ -399,7 +736,7 @@ func TestCleanupExpiredChallenges(t *testing.T) {
 
 	// Insert a challenge, then immediately clean up (shouldn't remove it since it's not expired)
 	ctx := context.Background()
-	_, _, err := svc.CreateChallenge(ctx)
+	_, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
@@ -415,7 +752,7 @@ func TestWIAChallenge_Success(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 
 	ctx := context.Background()
-	challenge, expiresAt, err := svc.CreateChallenge(ctx)
+	challenge, expiresAt, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
@@ -439,7 +776,7 @@ func TestWIAGenerateEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
 	// 1) Create challenge
-	challenge, _, err := svc.CreateChallenge(ctx)
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
 	}
@@ -481,7 +818,7 @@ func TestWIAGenerateEndToEnd(t *testing.T) {
 	}
 
 	// 3) Generate WIA
-	wia, err := svc.GenerateWIA(ctx, &WIARequest{
+	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       popString,
 		Challenge: challenge,
 	})
@@ -513,7 +850,7 @@ func TestWIAGenerateDuplicateChallenge(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	ctx := context.Background()
 
-	challenge, _, err := svc.CreateChallenge(ctx)
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,41 +865,6 @@ func TestWIAGenerateDuplicateChallenge(t *testing.T) {
 	ok, _ = svc.challenges.Consume(ctx, challenge)
 	if ok {
 		t.Fatal("expected failure on second consume")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_InvalidCurve(t *testing.T) {
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-999",
-		"x":   base64.RawURLEncoding.EncodeToString([]byte{1, 2, 3}),
-		"y":   base64.RawURLEncoding.EncodeToString([]byte{4, 5, 6}),
-	}
-	_, err := parseECPublicKeyFromJWK(jwk)
-	if err == nil {
-		t.Error("expected error for unsupported curve")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_MissingFields(t *testing.T) {
-	// Missing x
-	_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"y":   "AAAA",
-	})
-	if err == nil {
-		t.Error("expected error for missing x")
-	}
-
-	// Missing crv
-	_, err = parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "EC",
-		"x":   "AAAA",
-		"y":   "BBBB",
-	})
-	if err == nil {
-		t.Error("expected error for missing crv")
 	}
 }
 
@@ -646,10 +948,10 @@ func (b *testPopBuilder) build() string {
 
 func TestValidatePop_MissingIat(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withoutIssuedAt().build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing iat")
 	}
@@ -660,10 +962,10 @@ func TestValidatePop_MissingIat(t *testing.T) {
 
 func TestValidatePop_IatTooOld(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withIssuedAt(time.Now().Add(-15 * time.Minute)).build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for old iat")
 	}
@@ -671,10 +973,10 @@ func TestValidatePop_IatTooOld(t *testing.T) {
 
 func TestValidatePop_ExpTooFarFuture(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withExpiresAt(time.Now().Add(30 * time.Minute)).build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for exp too far in future")
 	}
@@ -682,10 +984,10 @@ func TestValidatePop_ExpTooFarFuture(t *testing.T) {
 
 func TestValidatePop_MissingExp(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withoutExpiresAt().build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing exp")
 	}
@@ -693,10 +995,10 @@ func TestValidatePop_MissingExp(t *testing.T) {
 
 func TestValidatePop_MissingIssuer(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withoutIssuer().build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing issuer")
 	}
@@ -704,10 +1006,10 @@ func TestValidatePop_MissingIssuer(t *testing.T) {
 
 func TestValidatePop_InvalidTyp(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withTyp("wrong-typ").build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for wrong typ")
 	}
@@ -715,10 +1017,10 @@ func TestValidatePop_InvalidTyp(t *testing.T) {
 
 func TestValidatePop_MissingJWK(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 
 	pop := newTestPopBuilder(t, challenge).withoutJWK().build()
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err == nil {
 		t.Fatal("expected error for missing jwk header")
 	}
@@ -729,36 +1031,36 @@ func TestValidatePop_AudValidation(t *testing.T) {
 	svc.cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
 
 	t.Run("missing aud when required", func(t *testing.T) {
-		challenge, _, _ := svc.CreateChallenge(context.Background())
+		challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 		pop := newTestPopBuilder(t, challenge).build() // no aud set
-		_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err == nil {
 			t.Fatal("expected error for missing aud")
 		}
 	})
 
 	t.Run("wrong aud", func(t *testing.T) {
-		challenge, _, _ := svc.CreateChallenge(context.Background())
+		challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 		pop := newTestPopBuilder(t, challenge).withAudience("https://wrong.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err == nil {
 			t.Fatal("expected error for wrong aud")
 		}
 	})
 
 	t.Run("correct aud", func(t *testing.T) {
-		challenge, _, _ := svc.CreateChallenge(context.Background())
+		challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 		pop := newTestPopBuilder(t, challenge).withAudience("https://wallet.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err != nil {
 			t.Fatalf("should succeed with correct aud: %v", err)
 		}
 	})
 
 	t.Run("correct aud among multiple", func(t *testing.T) {
-		challenge, _, _ := svc.CreateChallenge(context.Background())
+		challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 		pop := newTestPopBuilder(t, challenge).withAudience("https://other.example.com", "https://wallet.example.com").build()
-		_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+		_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 		if err != nil {
 			t.Fatalf("should succeed with correct aud in list: %v", err)
 		}
@@ -769,9 +1071,9 @@ func TestValidatePop_AudSkippedWhenNotConfigured(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	// WalletProviderURI not set — aud validation should be skipped
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop := newTestPopBuilder(t, challenge).build() // no aud
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("should succeed without aud when not configured: %v", err)
 	}
@@ -781,7 +1083,7 @@ func TestGenerateWIA_NotSupported(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.jwtSigner = nil // make unsupported
 
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: "x", Challenge: "y"})
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: "x", Challenge: "y"})
 	if !errors.Is(err, ErrWIANotSupported) {
 		t.Errorf("expected ErrWIANotSupported, got %v", err)
 	}
@@ -794,11 +1096,11 @@ func TestGenerateWIA_NativeAttestationFailure(t *testing.T) {
 	svc.cfg.WalletProvider.Attestation.NativeAttestation.AppleAppID = "com.example.app"
 	svc.nativeAttSvc = NewNativeAttestationService(svc.cfg, zap.NewNop())
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
 	// Native attestation with invalid token should fail (not silently fallback)
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 		NativeAttestation: &NativeAttestationRequest{
@@ -818,10 +1120,10 @@ func TestGenerateWIA_NativeAttestationChallengeMismatch(t *testing.T) {
 	svc.cfg.WalletProvider.Attestation.NativeAttestation.Enabled = true
 	svc.nativeAttSvc = NewNativeAttestationService(svc.cfg, zap.NewNop())
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	_, err := svc.GenerateWIA(context.Background(), &WIARequest{
+	_, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{
 		Pop:       pop,
 		Challenge: challenge,
 		NativeAttestation: &NativeAttestationRequest{
@@ -842,10 +1144,10 @@ func TestSignWIA_EmptyWalletNameVersion(t *testing.T) {
 	svc.cfg.WalletProvider.WIA.WalletVersion = ""
 	svc.cfg.WalletProvider.WIA.WalletLink = ""
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -875,10 +1177,10 @@ func TestSignWIA_CertificationInfo(t *testing.T) {
 		"assurance_level": "substantial",
 	}
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -903,10 +1205,10 @@ func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.WalletProvider.WIA.CertificationInfo = nil
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -920,15 +1222,18 @@ func TestSignWIA_CertificationInfoOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestSignWIA_StatusListAlways(t *testing.T) {
+// TestSignWIA_NoClientStatus covers the full GenerateWIA path (not just
+// signWIA, which TestWIAService_ClientStatusDisabled exercises) with
+// attestation.status_list disabled: no client_status claim, and in
+// particular no reference to a status list this deployment isn't
+// publishing.
+func TestSignWIA_NoClientStatus(t *testing.T) {
 	svc, _ := newTestWIAService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://status.example.com/list"
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -937,47 +1242,8 @@ func TestSignWIA_StatusListAlways(t *testing.T) {
 	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
 	claims := token.Claims.(jwt.MapClaims)
 
-	clientStatus, ok := claims["client_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status claim missing when StatusListMode=always")
-	}
-	statusObj, ok := clientStatus["status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status.status missing")
-	}
-	sl, ok := statusObj["status_list"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status.status.status_list missing")
-	}
-	if sl["uri"] != "https://status.example.com/list" {
-		t.Errorf("status_list.uri = %v", sl["uri"])
-	}
-}
-
-func TestSignWIA_StatusListAlwaysWithExpiry(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://status.example.com/list"
-	svc.cfg.WalletProvider.Attestation.StatusListExpiry = 3600
-
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-	pop, _ := createTestPop(t, challenge)
-
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
-	if err != nil {
-		t.Fatalf("GenerateWIA: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(wia, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	clientStatus, ok := claims["client_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("client_status claim missing")
-	}
-	if _, ok := clientStatus["exp"]; !ok {
-		t.Error("client_status.exp should be present when StatusListExpiry > 0")
+	if _, ok := claims["client_status"]; ok {
+		t.Error("client_status emitted while attestation.status_list is disabled")
 	}
 }
 
@@ -986,10 +1252,10 @@ func TestSignWIA_MaxExpiryDefault(t *testing.T) {
 	svc.cfg.WalletProvider.WIA.MaxExpirySeconds = 0 // trigger default
 	svc.cfg.WalletProvider.Attestation.LifetimeSeconds = 0
 
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	pop, _ := createTestPop(t, challenge)
 
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
+	wia, err := svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
 	if err != nil {
 		t.Fatalf("GenerateWIA: %v", err)
 	}
@@ -1014,7 +1280,7 @@ func TestWIAService_StartStop(t *testing.T) {
 	svc.Start()
 
 	// Create a challenge and manually expire it
-	challenge, _, _ := svc.CreateChallenge(context.Background())
+	challenge, _, _ := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	memStore := svc.challenges.(*memoryWIAChallengeStore)
 	memStore.store.mu.Lock()
 	memStore.store.items[challenge].ExpiresAt = time.Now().Add(-1 * time.Second)
@@ -1031,41 +1297,11 @@ func TestWIAService_StartStop(t *testing.T) {
 	svc.Stop()
 }
 
-func TestComputeJKT_UnsupportedKeyType(t *testing.T) {
-	_, err := computeJKT(map[string]interface{}{
-		"kty": "RSA",
-		"n":   "test",
-	})
-	if err == nil {
-		t.Error("expected error for RSA key type")
-	}
-}
-
-func TestComputeJKT_IncompleteJWK(t *testing.T) {
-	_, err := computeJKT(map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		// missing x and y
-	})
-	if err == nil {
-		t.Error("expected error for incomplete EC JWK")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_WrongKeyType(t *testing.T) {
-	_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-		"kty": "RSA",
-	})
-	if err == nil {
-		t.Error("expected error for RSA key type")
-	}
-}
-
 func TestCreateChallenge_NotSupported(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.jwtSigner = nil
 
-	_, _, err := svc.CreateChallenge(context.Background())
+	_, _, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	if !errors.Is(err, ErrWIANotSupported) {
 		t.Errorf("expected ErrWIANotSupported, got %v", err)
 	}
@@ -1075,7 +1311,7 @@ func TestCreateChallenge_DefaultTTL(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	svc.cfg.WalletProvider.WIA.ChallengeTTLSeconds = 0 // trigger default 5min
 
-	_, expiresAt, err := svc.CreateChallenge(context.Background())
+	_, expiresAt, err := svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1084,458 +1320,5 @@ func TestCreateChallenge_DefaultTTL(t *testing.T) {
 	diff := expiresAt.Sub(expected)
 	if diff < -2*time.Second || diff > 2*time.Second {
 		t.Errorf("default TTL should be ~5min, got expiry diff %v", diff)
-	}
-}
-
-// TestWscdTypeFromAttestation covers all branches of wscdTypeFromAttestation,
-// which maps an attestation_source string to the WSCD type recorded on the
-// wallet instance.
-func TestWscdTypeFromAttestation(t *testing.T) {
-	tests := []struct {
-		source string
-		want   domain.WSCDType
-	}{
-		{"ios_app_attest", domain.WSCDTypeNativeIOS},
-		{"android_play_integrity", domain.WSCDTypeNativeAndroid},
-		{"backend_attested", domain.WSCDTypeWebCrypto},
-		{"", domain.WSCDTypeWebCrypto},
-		{"some_unrecognized_source", domain.WSCDTypeWebCrypto},
-	}
-	for _, tt := range tests {
-		t.Run(tt.source, func(t *testing.T) {
-			if got := wscdTypeFromAttestation(tt.source); got != tt.want {
-				t.Errorf("wscdTypeFromAttestation(%q) = %v, want %v", tt.source, got, tt.want)
-			}
-		})
-	}
-}
-
-// TestChallengeStore_RemoveMiddleNode exercises removeLocked with a node that
-// has both a non-nil prev and a non-nil next, hitting the link-repair branches
-// on both sides in a single call (existing tests only ever remove the sole
-// remaining item, where both prev and next are nil).
-func TestChallengeStore_RemoveMiddleNode(t *testing.T) {
-	cs := newChallengeStore(10)
-	base := time.Now().Add(time.Hour)
-
-	c1 := &WIAChallenge{Challenge: "c1", ExpiresAt: base}
-	c2 := &WIAChallenge{Challenge: "c2", ExpiresAt: base.Add(time.Second)}
-	c3 := &WIAChallenge{Challenge: "c3", ExpiresAt: base.Add(2 * time.Second)}
-
-	if !cs.put(c1) || !cs.put(c2) || !cs.put(c3) {
-		t.Fatal("put failed")
-	}
-
-	got, ok := cs.consume("c2")
-	if !ok || got == nil {
-		t.Fatal("expected to consume middle challenge")
-	}
-
-	if n := cs.len(); n != 2 {
-		t.Fatalf("len = %d, want 2", n)
-	}
-	if cs.head != c1 || cs.tail != c3 {
-		t.Fatal("head/tail not as expected after middle removal")
-	}
-	if c1.next != c3 || c3.prev != c1 {
-		t.Fatal("linked list not repaired around removed middle node")
-	}
-}
-
-// TestNewWIAService_WiresNativeAttestation covers the constructor branch that
-// wires up the native attestation service when configured.
-func TestNewWIAService_WiresNativeAttestation(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.WalletProvider.Attestation.NativeAttestation.Enabled = true
-
-	svc := NewWIAService(cfg, zap.NewNop(), nil, nil, nil, nil, nil)
-	if svc.nativeAttSvc == nil {
-		t.Fatal("expected nativeAttSvc to be wired when NativeAttestation.Enabled=true")
-	}
-}
-
-// fakeChallengeStore is a configurable WIAChallengeStore used to exercise
-// store-error paths in CreateChallenge/consumeChallenge that the real
-// in-memory store can't easily produce.
-type fakeChallengeStore struct {
-	putOK      bool
-	putErr     error
-	consumeOK  bool
-	consumeErr error
-	lenVal     int
-	lenErr     error
-}
-
-func (f *fakeChallengeStore) Put(_ context.Context, _ string, _ time.Time) (bool, error) {
-	return f.putOK, f.putErr
-}
-
-func (f *fakeChallengeStore) Consume(_ context.Context, _ string) (bool, error) {
-	return f.consumeOK, f.consumeErr
-}
-
-func (f *fakeChallengeStore) Len(_ context.Context) (int, error) {
-	return f.lenVal, f.lenErr
-}
-
-func TestCreateChallenge_StoreError(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	svc.challenges = &fakeChallengeStore{putErr: errors.New("store unavailable")}
-
-	_, _, err := svc.CreateChallenge(context.Background())
-	if err == nil {
-		t.Fatal("expected error when challenge store Put fails")
-	}
-	if errors.Is(err, ErrWIAChallengeCapacityMax) {
-		t.Error("a store error should not be reported as capacity exceeded")
-	}
-}
-
-func TestConsumeChallenge_StoreError(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	svc.challenges = &fakeChallengeStore{consumeErr: errors.New("store unavailable")}
-
-	err := svc.consumeChallenge(context.Background(), "any-challenge")
-	if err == nil {
-		t.Fatal("expected error when challenge store Consume fails")
-	}
-	if errors.Is(err, ErrWIAChallengeExpired) {
-		t.Error("a store error should not be reported as an expired challenge")
-	}
-}
-
-// ecJWKFromKey builds a JWK map for the public half of an ECDSA P-256 key,
-// zero-padding x/y to 32 bytes as a compliant encoder would.
-func ecJWKFromKey(pub *ecdsa.PublicKey) map[string]interface{} {
-	xBytes := pub.X.Bytes()
-	yBytes := pub.Y.Bytes()
-	for len(xBytes) < 32 {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < 32 {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-	return map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(xBytes),
-		"y":   base64.RawURLEncoding.EncodeToString(yBytes),
-	}
-}
-
-func TestValidatePop_UnparseableJWT(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-
-	_, err := svc.validatePop("this-is-not-a-jwt", "challenge")
-	if err == nil {
-		t.Fatal("expected error for a pop that isn't a parseable JWT")
-	}
-}
-
-func TestValidatePop_JWKHeaderNotObject(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	claims := &WIAPopClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "urn:wallet:instance:test",
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-		Nonce: challenge,
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["typ"] = "oauth-client-attestation-pop+jwt"
-	token.Header["jwk"] = "not-an-object" // present but not a JSON object
-	pop, err := token.SignedString(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = svc.validatePop(pop, challenge)
-	if err == nil {
-		t.Fatal("expected error when jwk header is not a JSON object")
-	}
-}
-
-func TestValidatePop_EmbeddedJWKFailsToParse(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-
-	b := newTestPopBuilder(t, challenge)
-	b.jwk["crv"] = "P-384" // unsupported curve; parseECPublicKeyFromJWK will reject it
-	pop := b.build()
-
-	_, err := svc.validatePop(pop, challenge)
-	if err == nil {
-		t.Fatal("expected error when the embedded JWK fails to parse")
-	}
-}
-
-func TestValidatePop_SignatureMismatch(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-
-	signingKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	claims := &WIAPopClaims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "urn:wallet:instance:test",
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-		Nonce: challenge,
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["typ"] = "oauth-client-attestation-pop+jwt"
-	// The header advertises otherKey's public JWK, but the token is actually
-	// signed with signingKey — signature verification must fail.
-	token.Header["jwk"] = ecJWKFromKey(&otherKey.PublicKey)
-	pop, err := token.SignedString(signingKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = svc.validatePop(pop, challenge)
-	if err == nil {
-		t.Fatal("expected signature verification failure when jwk header key doesn't match the signing key")
-	}
-}
-
-func TestSignWIA_ComputeJKTError(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-
-	_, err := svc.signWIA(map[string]interface{}{"kty": "RSA"}, "backend_attested")
-	if err == nil {
-		t.Fatal("expected error when cnf JWK fails JKT computation")
-	}
-}
-
-// TestSignWIA_SignTokenError exercises signWIA's SignToken error path (e.g.
-// an HSM/PKCS#11-backed signer that becomes unavailable). Reuses the
-// failingSigner helper defined in wallet_provider_test.go.
-func TestSignWIA_SignTokenError(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	badSigner, err := signing.NewCryptoSignerES256(&failingSigner{pub: &key.PublicKey})
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc.jwtSigner = badSigner
-
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-	pop, _ := createTestPop(t, challenge)
-
-	_, err = svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
-	if err == nil {
-		t.Fatal("expected error when jwtSigner.SignToken fails")
-	}
-}
-
-// testAuditEmitter builds a real audit.Emitter backed by an ephemeral ES256
-// key, mirroring the pattern used in internal/api tests.
-func testAuditEmitter(t *testing.T) *audit.Emitter {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
-	if err != nil {
-		t.Fatalf("new signer: %v", err)
-	}
-	return audit.New("test-issuer", signer, nil)
-}
-
-// TestGenerateWIA_RecordsWalletInstanceAndAudit covers signWIA's wallet
-// instance upsert and audit-emission blocks, which are skipped entirely by
-// every other test in this file because they construct the service with
-// instances=nil and audit=nil.
-func TestGenerateWIA_RecordsWalletInstanceAndAudit(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	store := memory.NewStore()
-	svc.instances = store.WalletInstances()
-	svc.audit = testAuditEmitter(t)
-
-	challenge, _, err := svc.CreateChallenge(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	pop, _ := createTestPop(t, challenge)
-
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
-	if err != nil {
-		t.Fatalf("GenerateWIA: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, err := parser.ParseUnverified(wia, jwt.MapClaims{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	claims := token.Claims.(jwt.MapClaims)
-	cnf, ok := claims["cnf"].(map[string]interface{})
-	if !ok {
-		t.Fatal("cnf claim missing")
-	}
-	jkt, ok := cnf["jkt"].(string)
-	if !ok || jkt == "" {
-		t.Fatal("cnf.jkt missing")
-	}
-
-	instance, err := svc.instances.GetByID(context.Background(), jkt)
-	if err != nil {
-		t.Fatalf("GetByID: %v", err)
-	}
-	if instance == nil {
-		t.Fatal("expected wallet instance to be recorded on successful WIA generation")
-	}
-	if instance.WSCDType != domain.WSCDTypeWebCrypto {
-		t.Errorf("WSCDType = %v, want %v", instance.WSCDType, domain.WSCDTypeWebCrypto)
-	}
-	if instance.AttestationSource != "backend_attested" {
-		t.Errorf("AttestationSource = %v, want backend_attested", instance.AttestationSource)
-	}
-}
-
-// fakeFailingInstanceStore always fails Upsert, used to verify that a
-// wallet-instance recording failure is logged but does not fail WIA
-// generation.
-type fakeFailingInstanceStore struct{}
-
-func (fakeFailingInstanceStore) Upsert(context.Context, *domain.WalletInstance) error {
-	return errors.New("db unavailable")
-}
-func (fakeFailingInstanceStore) GetByID(context.Context, string) (*domain.WalletInstance, error) {
-	return nil, nil
-}
-func (fakeFailingInstanceStore) GetAllByTenant(context.Context, domain.TenantID) ([]*domain.WalletInstance, error) {
-	return nil, nil
-}
-func (fakeFailingInstanceStore) GetByUser(context.Context, domain.TenantID, domain.UserID) ([]*domain.WalletInstance, error) {
-	return nil, nil
-}
-func (fakeFailingInstanceStore) UpdateStatus(context.Context, string, domain.InstanceStatus, string) error {
-	return nil
-}
-func (fakeFailingInstanceStore) IncrementAttestation(context.Context, string) error {
-	return nil
-}
-func (fakeFailingInstanceStore) Delete(context.Context, string) error {
-	return nil
-}
-
-func TestGenerateWIA_InstanceUpsertErrorIsNonFatal(t *testing.T) {
-	svc, _ := newTestWIAService(t)
-	svc.instances = fakeFailingInstanceStore{}
-
-	challenge, _, _ := svc.CreateChallenge(context.Background())
-	pop, _ := createTestPop(t, challenge)
-
-	wia, err := svc.GenerateWIA(context.Background(), &WIARequest{Pop: pop, Challenge: challenge})
-	if err != nil {
-		t.Fatalf("GenerateWIA should succeed even if instance upsert fails: %v", err)
-	}
-	if wia == "" {
-		t.Fatal("expected WIA JWT despite instance upsert failure")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_InvalidBase64(t *testing.T) {
-	validComponent := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-
-	t.Run("invalid x", func(t *testing.T) {
-		_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-			"kty": "EC",
-			"crv": "P-256",
-			"x":   "not valid base64!!",
-			"y":   validComponent,
-		})
-		if err == nil {
-			t.Error("expected error for invalid x base64")
-		}
-	})
-
-	t.Run("invalid y", func(t *testing.T) {
-		_, err := parseECPublicKeyFromJWK(map[string]interface{}{
-			"kty": "EC",
-			"crv": "P-256",
-			"x":   validComponent,
-			"y":   "not valid base64!!",
-		})
-		if err == nil {
-			t.Error("expected error for invalid y base64")
-		}
-	})
-}
-
-// TestParseECPublicKeyFromJWK_ShortComponentIsPadded covers the zero-padding
-// loops for x/y coordinates shorter than 32 bytes. Some JWK encoders omit the
-// leading zero byte of a coordinate (since big.Int.Bytes() strips it), so
-// parseECPublicKeyFromJWK must re-pad rather than reject such keys.
-func TestParseECPublicKeyFromJWK_ShortComponentIsPadded(t *testing.T) {
-	var key *ecdsa.PrivateKey
-	for i := 0; i < 5000; i++ {
-		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(k.PublicKey.X.Bytes()) < 32 || len(k.PublicKey.Y.Bytes()) < 32 {
-			key = k
-			break
-		}
-	}
-	if key == nil {
-		t.Fatal("could not find a P-256 key with a short X or Y coordinate")
-	}
-
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		// Deliberately unpadded, as produced by big.Int.Bytes().
-		"x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.Bytes()),
-		"y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.Bytes()),
-	}
-
-	parsed, err := parseECPublicKeyFromJWK(jwk)
-	if err != nil {
-		t.Fatalf("parseECPublicKeyFromJWK: %v", err)
-	}
-	if parsed.X.Cmp(key.PublicKey.X) != 0 || parsed.Y.Cmp(key.PublicKey.Y) != 0 {
-		t.Fatal("parsed key doesn't match original after zero-padding")
-	}
-}
-
-func TestParseECPublicKeyFromJWK_PointNotOnCurve(t *testing.T) {
-	// 32 bytes of 0xFF exceeds the P-256 field prime and cannot be a valid
-	// coordinate for any point on the curve.
-	notOnCurve := make([]byte, 32)
-	for i := range notOnCurve {
-		notOnCurve[i] = 0xFF
-	}
-	jwk := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(notOnCurve),
-		"y":   base64.RawURLEncoding.EncodeToString(notOnCurve),
-	}
-	_, err := parseECPublicKeyFromJWK(jwk)
-	if err == nil {
-		t.Error("expected error for a point not on the curve")
 	}
 }

@@ -36,8 +36,8 @@ func (s *stubTenantStore) GetByID(_ context.Context, id domain.TenantID) (*domai
 	return t, nil
 }
 
-func (s *stubTenantStore) Create(context.Context, *domain.Tenant) error   { return nil }
-func (s *stubTenantStore) Update(context.Context, *domain.Tenant) error   { return nil }
+func (s *stubTenantStore) Create(context.Context, *domain.Tenant) error { return nil }
+func (s *stubTenantStore) Update(context.Context, *domain.Tenant) error { return nil }
 func (s *stubTenantStore) GetAll(context.Context) ([]*domain.Tenant, error) {
 	return nil, nil
 }
@@ -68,8 +68,19 @@ func setupTokenAuthTest(t *testing.T) (*validator.Validator, *ecdsa.PrivateKey, 
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
-	// Wait for JWKS to be fetched
-	time.Sleep(100 * time.Millisecond)
+	// Poll until the validator has actually fetched the JWKS, rather than
+	// sleeping a fixed duration (flaky under slow/contended CI runners).
+	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := v.Validate(context.Background(), probe); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("validator did not fetch JWKS in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	return v, key, "test-issuer"
 }
@@ -288,6 +299,95 @@ func TestMustHaveTAC_NoAuth(t *testing.T) {
 	if w.Code != 401 {
 		t.Fatalf("expected 401, got %d", w.Code)
 	}
+}
+
+func TestRequireAudience_Match(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(func(c *gin.Context) {
+		c.Set("tokenauth_result", &claims.Result{Audience: []string{"wallet-registry"}})
+		c.Next()
+	})
+	r.Use(RequireAudience("wallet-registry", "wallet-backend"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestRequireAudience_NoMatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(func(c *gin.Context) {
+		c.Set("tokenauth_result", &claims.Result{Audience: []string{"wallet-registry"}})
+		c.Next()
+	})
+	r.Use(RequireAudience("wallet-backend"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 403 {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestRequireAudience_EmptyAudience(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(func(c *gin.Context) {
+		c.Set("tokenauth_result", &claims.Result{})
+		c.Next()
+	})
+	r.Use(RequireAudience("wallet-backend"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 403 {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestRequireAudience_NoAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+
+	r.Use(RequireAudience("wallet-backend"))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != 401 {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestRequireAudience_PanicsWithNoAllowedAudiences(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected RequireAudience() with no arguments to panic")
+		}
+	}()
+	RequireAudience()
 }
 
 func TestExtractBearer(t *testing.T) {

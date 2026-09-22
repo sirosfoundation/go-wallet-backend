@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -35,6 +36,26 @@ const (
 
 	// maxConnections is the maximum number of concurrent WebSocket connections.
 	maxConnections = 10000
+
+	// wsMaxMessageSize bounds incoming WebSocket messages from the wallet,
+	// but only once the connection has authenticated. A ZK-wrapped
+	// presentation's sign_presentation response (base64 proof bytes +
+	// CBOR/JSON overhead) can run several hundred KB - a real
+	// pairwise-pseudonym proof measured at ~620KB raw, well past the
+	// previous 64KB cap, confirmed live: exceeding it here causes gorilla to
+	// close the connection with 1009 (message too big) before the verifier
+	// ever sees a complete vp_token - the same class of stale-assumption
+	// bug already fixed at the go-wallet-backend -> verifier HTTP hop via
+	// nginx's client_max_body_size.
+	wsMaxMessageSize = 4 * 1024 * 1024
+
+	// wsHandshakeMaxMessageSize bounds messages from a connection that has
+	// not authenticated yet. The handshake payload (a JWT plus a small
+	// amount of JSON wrapping) is tiny, so this stays at the original 64KB
+	// cap: raising the limit to wsMaxMessageSize before authentication would
+	// let an unauthenticated client force repeated multi-MB allocations,
+	// widening the DoS/memory-exhaustion surface the limit exists to close.
+	wsHandshakeMaxMessageSize = 64 * 1024
 )
 
 // SignatureAction defines the type of signing operation
@@ -102,6 +123,13 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(clients):
+	// clients are only added post-handshake, so counting only clients lets an
+	// attacker open unlimited unauthenticated connections that never complete
+	// the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new WebSocket manager
@@ -120,11 +148,15 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Enforce global connection limit
-	m.clientsMu.RLock()
-	count := len(m.clients)
-	m.clientsMu.RUnlock()
-	if count >= maxConnections {
+	// Reserve a slot atomically before checking the limit. Checking
+	// Load() >= maxConnections and only then incrementing is racy: multiple
+	// concurrent requests can all pass the check before any of them
+	// increments, overshooting maxConnections under load. Add(1) returns the
+	// post-increment value, so only requests that actually push the counter
+	// over the limit roll back.
+	if m.activeConnections.Add(1) > maxConnections {
+		m.activeConnections.Add(-1)
+		m.logger.Warn("Rejecting WebSocket connection", zap.Error(ErrTooManyConnections))
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -136,6 +168,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
@@ -152,10 +185,10 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleClient(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
-	// Limit message size to 64KB to prevent memory exhaustion attacks
-	conn.SetReadLimit(64 * 1024)
+	conn.SetReadLimit(wsHandshakeMaxMessageSize)
 
 	// Configure ping/pong keepalive to detect dead connections.
 	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
@@ -164,7 +197,9 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 		return nil
 	})
 
-	// Start ping loop
+	// Start ping loop.
+	// WriteControl is safe to call concurrently with WriteJSON per gorilla/websocket docs:
+	// "The Close and WriteControl methods can be called concurrently with all other methods."
 	stopPing := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(wsPingInterval)
@@ -233,6 +268,10 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 			}
 			m.clients[userID] = client
 			m.clientsMu.Unlock()
+
+			// Only raise the read limit for connections that have proven
+			// ownership of a valid token - see wsHandshakeMaxMessageSize.
+			conn.SetReadLimit(wsMaxMessageSize)
 
 			m.logger.Info("WebSocket handshake established", zap.String("tenant_id", tenantID))
 			_ = conn.WriteJSON(ServerMessage{Type: "FIN_INIT"})

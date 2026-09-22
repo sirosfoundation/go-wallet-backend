@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"go.uber.org/zap"
@@ -442,6 +443,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 
 	// Extract bearer token from auth object.
 	var userID, tenantID string
+	var tac claims.TAC
 	if params.Auth != nil && params.Auth.Token != "" {
 		if params.Auth.Type != "" && params.Auth.Type != "bearer" {
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -449,7 +451,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 			})
 		}
 		var err error
-		userID, tenantID, err = a.manager.validateToken(params.Auth.Token)
+		userID, tenantID, tac, err = a.manager.validateToken(params.Auth.Token)
 		if err != nil {
 			a.logger.Warn("WMP auth failed", zap.Error(err))
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -495,6 +497,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, body []byte) ([]by
 		ID:            sessionID,
 		UserID:        userID,
 		TenantID:      tenantID,
+		TAC:           tac,
 		transport:     wmpTransport,
 		flows:         make(map[string]*Flow),
 		logger:        a.logger.With(zap.String("session", userID[:min(8, len(userID))])),

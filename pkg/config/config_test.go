@@ -1,7 +1,11 @@
 package config
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1343,6 +1347,212 @@ func TestASConfig_GetTokenTTL(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_FillsDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.JWT.Issuer = "https://issuer.example"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://issuer.example" {
+		t.Errorf("expected Issuer to fall back to JWT.Issuer, got %q", cfg.AS.Issuer)
+	}
+	// SetDefaults should still run (TTLs, DefaultMaxTAC etc.)
+	if cfg.AS.DefaultTokenTTL == 0 {
+		t.Error("expected EnableForRole to also apply ASConfig.SetDefaults defaults")
+	}
+}
+
+func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(t *testing.T) {
+	// Regression test for a real Copilot review finding: a wallet provider
+	// configured with PKCS11 (which WalletProviderService tries first,
+	// independently of whether a file key is ALSO configured as a runtime
+	// fallback) actually signs WIA/KA with the HSM key. If EnableForRole()
+	// still inherited PrivateKeyPath here, AS would silently sign its own
+	// tokens with the weaker on-disk key instead - a security downgrade,
+	// not just an unsupported configuration. SigningKeyPath must stay empty
+	// so Validate() rejects with an actionable error instead.
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/fallback-key.pem"
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "" {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/custom/key.pem"
+	cfg.AS.RulesDir = "/custom/rules"
+	cfg.AS.Issuer = "https://custom-issuer.example"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "/custom/key.pem" {
+		t.Errorf("expected explicit SigningKeyPath to be preserved, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://custom-issuer.example" {
+		t.Errorf("expected explicit Issuer to be preserved, got %q", cfg.AS.Issuer)
+	}
+}
+
+func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_ExplicitRulesDirPreserved(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.RulesDir = "/custom/rules"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_RespectsExplicitFalseInYAML(t *testing.T) {
+	// Regression test: EnableForRole must not override an operator's
+	// explicit `as.enabled: false` - a plain bool can't distinguish that
+	// from "as section never configured" (both are the zero value), which
+	// is why this goes through Load() (the only path that can observe the
+	// raw YAML) rather than constructing a Config{} directly.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if cfg.AS.Enabled {
+		t.Error("expected explicit as.enabled: false in YAML to be preserved, but EnableForRole() overrode it to true")
+	}
+}
+
+func TestConfig_EnableForRole_FillsDefaultsWhenExplicitlyEnabledInYAML(t *testing.T) {
+	// Regression test for EnableForRole()'s own logic: an explicit
+	// as.enabled: true must still get defaults filled in for whatever
+	// fields are empty - only an explicit as.enabled: false should skip
+	// defaulting entirely. Before this fix, EnableForRole() treated ANY
+	// explicit as.enabled (true or false) identically ("fully configured,
+	// don't touch it").
+	//
+	// Constructs Config directly (asEnabledExplicit set as Load() would)
+	// rather than going through Load() itself: Load()'s own Validate() call
+	// requires as.signing_key_path/rules_dir whenever as.enabled: true is
+	// present in YAML, regardless of role - so a YAML fixture reproducing
+	// this scenario would fail at Load() before EnableForRole() ever runs.
+	// That's a separate, pre-existing validation-ordering property (AS
+	// config is validated unconditionally on AS.Enabled, not gated on
+	// whether the auth role was even requested) - out of scope for this fix,
+	// which is specifically about EnableForRole()'s own explicit-true-vs-
+	// false handling.
+	cfg := &Config{asEnabledExplicit: true}
+	cfg.AS.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled to stay true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_FillsInWhenYAMLOmitsASEntirely(t *testing.T) {
+	// Contrast with the test above: when the `as:` section is absent
+	// entirely (not just enabled: false), EnableForRole should still turn
+	// it on for the auth role.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  private_key_path: /wp/key.pem
+  wia:
+    enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true when as: section is absent entirely")
+	}
+}
+
 func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
@@ -1647,5 +1857,615 @@ func TestLoadSecretsFromFiles_JWTSecretBadPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "jwt") {
 		t.Errorf("error should mention jwt: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T) {
+	// WIA.Enabled defaults to true, but with no signing keys configured WIA is
+	// inert (no endpoints registered) — the zero-config default must not fail
+	// validation just because wallet_provider_uri wasn't set.
+	cfg := defaultConfig()
+	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
+	cfg.Storage = StorageConfig{Type: "memory"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error on zero-config default: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWhenKeysConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// WalletProviderURI intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with signing keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWithPKCS11(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with PKCS11 keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresWalletVersion(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	// WalletVersion deliberately left empty.
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wallet_version is required") {
+		t.Errorf("expected wallet_version error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresCertificate(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// CertificatePath deliberately left empty — etsi mode requires x5c.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "certificate_path is required") {
+		t.Errorf("expected certificate_path error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_IETFModeRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = WIAModeIETF
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// No CertificatePath, no Issuer.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wia.issuer is required") {
+		t.Errorf("expected issuer error, got %v", err)
+	}
+
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error once issuer is set: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_InvalidMode(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = "bogus"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid wallet_provider.wia.mode") {
+		t.Errorf("expected invalid mode error, got %v", err)
+	}
+}
+
+// TestConfig_Validate_Audit_* are regression tests for a review finding:
+// Config.Validate() didn't check AuditConfig at all, so audit.enabled=true
+// with a missing issuer/key_path/key_id silently disabled the SET audit
+// emitter at startup (NewFromConfig just returns nil) instead of failing
+// fast on the misconfiguration.
+func TestConfig_Validate_Audit_RequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but issuer is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyPath(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_path is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_path is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyID(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_id is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_id is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_PassesWhenFullyConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_DisabledSkipsValidation(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = false
+	// issuer/key_path/key_id all left empty — must not fail when disabled.
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityKeys(t *testing.T) {
+	dir := t.TempDir()
+	decPath := filepath.Join(dir, "play-integrity-dec")
+	verPath := filepath.Join(dir, "play-integrity-ver")
+	if err := os.WriteFile(decPath, []byte("dec-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verPath, []byte("ver-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = decPath
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = verPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKey; got != "dec-key-b64" {
+		t.Errorf("decryption key = %q, want dec-key-b64", got)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKey; got != "ver-key-b64" {
+		t.Errorf("verification key = %q, want ver-key-b64", got)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityDecryptionKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = "/nonexistent/dec-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad decryption key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_decryption_key_path") {
+		t.Errorf("error should mention google_play_integrity_decryption_key_path: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityVerificationKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = "/nonexistent/ver-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad verification key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_verification_key_path") {
+		t.Errorf("error should mention google_play_integrity_verification_key_path: %v", err)
+	}
+}
+
+// SSRF guard tests
+// =============================================================================
+
+// stubConn is the bare minimum net.Conn a successful dial has to return.
+type stubConn struct{ net.Conn }
+
+// recordingDial records the address it was asked to connect to and succeeds.
+func recordingDial(dialed *[]string) dialFunc {
+	return func(_ context.Context, _, addr string) (net.Conn, error) {
+		*dialed = append(*dialed, addr)
+		return stubConn{}, nil
+	}
+}
+
+func staticLookup(ips ...string) lookupFunc {
+	return func(_ context.Context, _ string) ([]net.IP, error) {
+		out := make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			out = append(out, net.ParseIP(ip))
+		}
+		return out, nil
+	}
+}
+
+// The point of the guard: connect to an address that was actually inspected,
+// never to the hostname again.
+func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443] - dialling the name would resolve a second time", dialed)
+	}
+}
+
+// A resolver that answers differently the second time is the whole attack:
+// public for the check, internal for the connection. Only one lookup happens,
+// and the address dialled is the one from it.
+func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
+	calls := 0
+	rebinding := func(_ context.Context, _ string) ([]net.IP, error) {
+		calls++
+		if calls == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return []net.IP{net.ParseIP("10.0.0.5")}, nil
+	}
+
+	var dialed []string
+	dial := guardedDial(rebinding, recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolved %d times, want 1", calls)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443]", dialed)
+	}
+}
+
+func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
+	tests := []struct {
+		name    string
+		ip      string
+		wantErr string
+	}{
+		{"loopback", "127.0.0.1", "private/loopback"},
+		{"ipv6 loopback", "::1", "private/loopback"},
+		{"rfc1918", "10.0.0.5", "private/loopback"},
+		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
+		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cloud metadata", "169.254.169.254", "cloud metadata"},
+		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed))
+
+			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
+			if err == nil {
+				t.Fatal("expected the dial to be refused")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not mention %q", err, tt.wantErr)
+			}
+			if len(dialed) != 0 {
+				t.Fatalf("connected to %v after refusing", dialed)
+			}
+		})
+	}
+}
+
+// One internal address among public ones still refuses the whole dial: the
+// attacker chooses which answer the client happens to pick otherwise.
+func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
+		t.Fatal("expected the dial to be refused")
+	}
+	if len(dialed) != 0 {
+		t.Fatalf("connected to %v after refusing", dialed)
+	}
+}
+
+func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed))
+
+	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want the IPv4 address for a tcp4 dial", dialed)
+	}
+}
+
+func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
+	var dialed []string
+	failFirst := func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		if len(dialed) == 1 {
+			return nil, fmt.Errorf("connection refused")
+		}
+		return stubConn{}, nil
+	}
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst)
+
+	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 2 {
+		t.Fatalf("dialed %v, want both addresses tried", dialed)
+	}
+}
+
+// A black-holed address must not hold the whole dial. net.Dialer gets this
+// right for a hostname it resolved itself; dialling checked addresses loses
+// that unless the attempts overlap.
+func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
+	dial := guardedDial(
+		staticLookup("2606:2800:220:1::1", "93.184.216.34"),
+		func(ctx context.Context, _, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "[2606:") {
+				<-ctx.Done() // never answers, as a dead route does not
+				return nil, ctx.Err()
+			}
+			return stubConn{}, nil
+		},
+	)
+
+	start := time.Now()
+	conn, err := dial(context.Background(), "tcp", "dual.example.com:443")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("dial returned no connection")
+	}
+	// The second attempt starts one fallback delay in; anything near a dialer
+	// timeout means the attempts were serial.
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %s, want roughly one fallback delay", elapsed)
+	}
+}
+
+// https-only guard
+// =============================================================================
+
+func TestSSRFGuard_RefusesPlaintext(t *testing.T) {
+	var reached bool
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		reached = true
+		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+	})}
+
+	req, err := http.NewRequest(http.MethodGet, "http://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("https request refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the https request never reached the transport")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// A proxy makes the dialer blind: it is handed the proxy's address, and for
+// https the target only appears in a CONNECT. The guard has to check the
+// request's own host in that case, or an ambient HTTP_PROXY would quietly
+// forward exactly what the dialer exists to refuse.
+func TestSSRFGuard_ChecksTheTargetOfAProxiedRequest(t *testing.T) {
+	proxyURL, err := url.Parse("http://egress.example.com:3128")
+	if err != nil {
+		t.Fatalf("parsing proxy url: %v", err)
+	}
+
+	var reached bool
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			reached = true
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy:  func(*http.Request) (*url.URL, error) { return proxyURL, nil },
+		lookup: staticLookup("10.0.0.5"),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://internal.example.com/secret", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the proxied request to an internal host to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	guard.lookup = staticLookup("93.184.216.34")
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("proxied request to a public host refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the request never reached the transport")
+	}
+}
+
+// Without a proxy the dialer does the checking, and it does it better - one
+// lookup, and it connects to what it checked. No second resolution here.
+func TestSSRFGuard_DoesNotResolveWhenThereIsNoProxy(t *testing.T) {
+	lookups := 0
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		lookup: func(context.Context, string) ([]net.IP, error) {
+			lookups++
+			return []net.IP{net.ParseIP("10.0.0.5")}, nil
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("unproxied request refused: %v", err)
+	}
+	if lookups != 0 {
+		t.Fatalf("resolved %d times without a proxy, want 0", lookups)
+	}
+}
+
+func TestHTTPClientConfig_AllowsPlaintext(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  HTTPClientConfig
+		want bool
+	}{
+		{"default", HTTPClientConfig{}, false},
+		{"allow_http", HTTPClientConfig{AllowHTTP: true}, true},
+		// An internal deployment reaches the in-process registry over
+		// http://localhost, so it cannot also be held to https.
+		{"allow_private_ips", HTTPClientConfig{AllowPrivateIPs: true}, true},
+		// The provider wiring has always folded this into AllowHTTP; keeping
+		// it here is what stops a working deployment from breaking.
+		{"insecure_skip_verify", HTTPClientConfig{InsecureSkipVerify: true}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.AllowsPlaintext(); got != tt.want {
+				t.Fatalf("AllowsPlaintext() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The wiring: which guards a configuration ends up with.
+func TestHTTPClientConfig_NewHTTPClient_GuardWiring(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfg           HTTPClientConfig
+		wantGuard     bool
+		wantHTTPSOnly bool
+	}{
+		{"default", HTTPClientConfig{}, true, true},
+		{"allow_http keeps the address guard", HTTPClientConfig{AllowHTTP: true}, true, false},
+		{"insecure_skip_verify keeps the address guard", HTTPClientConfig{InsecureSkipVerify: true}, true, false},
+		{"an internal deployment has neither", HTTPClientConfig{AllowPrivateIPs: true}, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := tt.cfg.NewHTTPClient(0)
+			guard, isGuarded := client.Transport.(ssrfGuard)
+			if isGuarded != tt.wantGuard {
+				t.Fatalf("guard present = %v, want %v", isGuarded, tt.wantGuard)
+			}
+			if isGuarded && guard.httpsOnly != tt.wantHTTPSOnly {
+				t.Fatalf("httpsOnly = %v, want %v", guard.httpsOnly, tt.wantHTTPSOnly)
+			}
+		})
+	}
+}
+
+// A plaintext request must fail before anything is dialled, not after.
+func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
+	client := HTTPClientConfig{}.NewHTTPClient(0)
+
+	_, err := client.Get("http://verifier.example.com/request-object")
+	if err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if !strings.Contains(err.Error(), "https only") {
+		t.Fatalf("error %q does not explain the refusal", err)
+	}
+
+	// The diagnostic has to name every key AllowsPlaintext consults, each with
+	// the prefix it is configured under. Naming only one of the three sends an
+	// operator to change a setting that may already be set, and an unprefixed
+	// key is not one that can be looked up in the configuration reference.
+	for _, key := range []string{
+		"http_client.allow_http",
+		"http_client.allow_private_ips",
+		"http_client.insecure_skip_verify",
+	} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("error %q does not mention %s", err, key)
+		}
 	}
 }

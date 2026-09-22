@@ -3,6 +3,7 @@ package as
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"sync"
@@ -62,6 +63,25 @@ type SessionStore interface {
 
 	// Delete removes a session (for cleanup of expired sessions).
 	Delete(ctx context.Context, jti string) error
+	// DeleteByUser revokes every session of a user. It satisfies
+	// service.SessionCleaner, so whatever holds the cleaner (today
+	// UserService.DeleteUser, via the wiring in cmd/server) drops AS
+	// sessions the same way it drops engine sessions. Sessions are marked
+	// revoked rather than removed, so a lookup for a cookie still in
+	// circulation yields a revoked session rather than a missing one; the
+	// client is refused with 401 either way, the distinction is kept for the
+	// store and for SessionMiddleware's logging.
+	DeleteByUser(ctx context.Context, userID string) error
+}
+
+// HashSessionID returns the storage key for a session identifier:
+// base64url(SHA-256(jti)). The JTI is the bearer credential carried in the
+// cookie, so a persistent store must never hold it in the clear - a read of
+// the database must not yield usable sessions. Lookups hash the presented
+// cookie value and compare keys.
+func HashSessionID(jti string) string {
+	sum := sha256.Sum256([]byte(jti))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // MemorySessionStore is an in-memory SessionStore implementation.
@@ -116,6 +136,18 @@ func (s *MemorySessionStore) Delete(_ context.Context, jti string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, jti)
+	return nil
+}
+
+// DeleteByUser revokes every session belonging to userID.
+func (s *MemorySessionStore) DeleteByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, session := range s.sessions {
+		if session.UserID == userID {
+			session.Revoked = true
+		}
+	}
 	return nil
 }
 

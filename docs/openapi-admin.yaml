@@ -35,7 +35,8 @@ info:
     Verifiers may carry an optional `client_id` and `client_id_scheme` that the wallet uses
     when matching incoming OID4VP authorization requests to a trusted verifier. Supported
     schemes follow the OID4VP specification: `redirect_uri`, `pre-registered`, `x509_san_dns`,
-    `x509_san_uri`, `verifier_attestation`, and `did`.
+    `x509_san_uri`, `verifier_attestation`, and `did` - which OpenID4VP 1.0 renamed to
+    `decentralized_identifier`. Both names for that scheme are accepted and mean the same thing.
     
     ## Security
     
@@ -946,6 +947,7 @@ paths:
       summary: Get user detail
       description: |
         Returns extended user details including passkey information, DID, and wallet type.
+        Only non-PII fields are exposed.
       operationId: getUserDetail
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -956,7 +958,24 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/UserDetailResponse'
+                type: object
+                properties:
+                  uuid:
+                    type: string
+                  did:
+                    type: string
+                  wallet_type:
+                    type: string
+                  passkeys:
+                    type: array
+                    items:
+                      type: object
+                  created_at:
+                    type: string
+                    format: date-time
+                  updated_at:
+                    type: string
+                    format: date-time
         '404':
           $ref: '#/components/responses/NotFound'
         '401':
@@ -982,6 +1001,187 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /admin/r2ps/keys:
+    get:
+      tags:
+        - R2PS
+      summary: List WSCD public keys
+      description: |
+        Lists WSCD public keys known to the configured R2PS service, optionally
+        filtered by client_id. Only registered when an R2PS client is configured.
+      operationId: r2psListKeys
+      parameters:
+        - name: client_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Keys retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  keys:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service query failed
+
+  /admin/r2ps/keys/{kid}:
+    get:
+      tags:
+        - R2PS
+      summary: Get a WSCD public key
+      description: Returns a single WSCD public key by kid.
+      operationId: r2psGetKey
+      parameters:
+        - name: kid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Key retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service query failed
+
+  /admin/r2ps/statuses/{category}:
+    get:
+      tags:
+        - R2PS
+      summary: List status entries for a category
+      description: Lists all Token Status List entries for a given category.
+      operationId: r2psListStatuses
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Status entries retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  category:
+                    type: string
+                  count:
+                    type: integer
+                  entries:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service query failed
+
+  /admin/r2ps/status/{category}/{idx}:
+    get:
+      tags:
+        - R2PS
+      summary: Get a status entry
+      description: Returns the status for a specific index in a category.
+      operationId: r2psGetStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Status entry retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service query failed
+    put:
+      tags:
+        - R2PS
+      summary: Set a status entry
+      description: |
+        Updates the status for a specific index (0=valid, 1=revoked, 2=suspended).
+      operationId: r2psSetStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: integer
+                  enum: [0, 1, 2]
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  category:
+                    type: string
+                  idx:
+                    type: integer
+                  status:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS status update failed
 
 components:
   parameters:
@@ -1228,6 +1428,7 @@ components:
             - x509_san_uri
             - verifier_attestation
             - did
+            - decentralized_identifier
           description: |
             OID4VP `client_id_scheme` associated with `client_id`. Must be one
             of the values defined in the OID4VP specification. When provided,
@@ -1273,6 +1474,7 @@ components:
             - x509_san_uri
             - verifier_attestation
             - did
+            - decentralized_identifier
           description: OID4VP client_id_scheme for this verifier (omitted when not set)
           example: "did"
         trust_status:
@@ -1536,52 +1738,6 @@ components:
           format: date-time
         deactivation_reason:
           type: string
-
-    UserDetailResponse:
-      type: object
-      properties:
-        uuid:
-          type: string
-        did:
-          type: string
-        wallet_type:
-          type: string
-        passkeys:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: string
-              credential_id:
-                type: string
-              tenant_id:
-                type: string
-              attestation_type:
-                type: string
-              transport:
-                type: array
-                items:
-                  type: string
-              prf_capable:
-                type: boolean
-              sign_count:
-                type: integer
-                format: int32
-              nickname:
-                type: string
-              created_at:
-                type: string
-                format: date-time
-              last_use_time:
-                type: string
-                format: date-time
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
 
   responses:
     BadRequest:

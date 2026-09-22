@@ -2,24 +2,25 @@ package service
 
 import (
 	"context"
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
-	"io"
 	"math/big"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -43,7 +44,6 @@ func newTestWalletProviderService(t *testing.T) *WalletProviderService {
 	cfg.Server.BaseURL = "https://wp.example.com"
 	cfg.WalletProvider.Attestation = config.AttestationConfig{
 		KAExpirySeconds: 15,
-		StatusListMode:  "never",
 	}
 
 	jwtSigner, err := signing.NewCryptoSignerES256(privKey)
@@ -60,8 +60,33 @@ func newTestWalletProviderService(t *testing.T) *WalletProviderService {
 	}
 }
 
-func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
+// newTestWalletProviderServiceWithInstances is like newTestWalletProviderService
+// but wires real (in-memory) wallet instance + key attestation stores, needed
+// for tests that exercise the security-properties trust gate in
+// GenerateKeyAttestation.
+func newTestWalletProviderServiceWithInstances(t *testing.T) (*WalletProviderService, storage.WalletInstanceStore, storage.KeyAttestationStore) {
+	t.Helper()
 	svc := newTestWalletProviderService(t)
+	store := memory.NewStore()
+	svc.instances = store.WalletInstances()
+	svc.keyAttestations = store.KeyAttestations()
+	return svc, store.WalletInstances(), store.KeyAttestations()
+}
+
+// TestGenerateKeyAttestation_TopLevelSecurityProperties exercises the
+// trusted path: the wallet instance already has a WIA proving native
+// platform integrity, so the client's security_properties claim is
+// honored (after normalization — already-prefixed iso_18045_* values pass
+// through unchanged).
+func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	jwks := []map[string]interface{}{
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
@@ -76,7 +101,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 		},
 	}
 
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
 	if err != nil {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
@@ -135,7 +160,162 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 	}
 }
 
-func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
+// TestGenerateKeyAttestation_SecurityProperties_TrustedWhenAllBatchKeysHaveEvidence
+// exercises the other half of keyAttestationTrustsBatch: an instance with no
+// native-platform AttestationSource, but where EVERY key in the current KA
+// request's jwks batch has a durably verified FIDO2 hardware-key attestation
+// on file (see FIDO2AttestationService, KeyAttestationStore.MarkKeyAttested,
+// keyed by JWK Thumbprint - NOT by wallet instance), must still be treated
+// as trusted, not clamped.
+func TestGenerateKeyAttestation_SecurityProperties_TrustedWhenAllBatchKeysHaveEvidence(t *testing.T) {
+	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-fido2-hardware"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID: instanceID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+	thumbprint, err := jwk.Thumbprint(jwks[0])
+	if err != nil {
+		t.Fatalf("compute thumbprint: %v", err)
+	}
+	if err := keyAttestations.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{
+		KeyThumbprint:    thumbprint,
+		WalletInstanceID: instanceID,
+		VerifiedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("MarkKeyAttested: %v", err)
+	}
+
+	secProps := &SecurityProperties{
+		KeyStorage: []string{"iso_18045_high"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != "iso_18045_high" {
+		t.Errorf("key_storage = %v, want [iso_18045_high] (batch with verified per-key evidence should not be clamped)", claims["key_storage"])
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysHaveEvidence
+// verifies the "all keys required" policy: a batch is only as trusted as its
+// weakest member - if even one key in a multi-key batch lacks evidence, the
+// whole batch clamps to the K3 floor, even though another key in the same
+// batch IS verified.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysHaveEvidence(t *testing.T) {
+	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-mixed-batch"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "attested-x", "y": "attested-y"},
+		{"kty": "EC", "crv": "P-256", "x": "unattested-x", "y": "unattested-y"},
+	}
+	attestedThumbprint, err := jwk.Thumbprint(jwks[0])
+	if err != nil {
+		t.Fatalf("compute thumbprint: %v", err)
+	}
+	if err := keyAttestations.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{
+		KeyThumbprint:    attestedThumbprint,
+		WalletInstanceID: instanceID,
+		VerifiedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("MarkKeyAttested: %v", err)
+	}
+	// jwks[1] deliberately has no corresponding record.
+
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != "iso_18045_basic" {
+		t.Errorf("key_storage = %v, want [iso_18045_basic] (one unattested key in the batch must clamp the whole batch)", claims["key_storage"])
+	}
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoesNotLeak
+// is the regression test for the original bug: a wallet instance that
+// previously had a DIFFERENT, unrelated credential key verified as
+// hardware-attested must NOT have that evidence leak into a later batch of
+// entirely different (e.g. softkey-generated) keys for the same instance.
+func TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoesNotLeak(t *testing.T) {
+	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-plugin-switch"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An earlier, unrelated key (e.g. this instance's identity key, or a
+	// prior FIDO2-backed credential batch) was verified hardware-attested...
+	priorJWK := map[string]interface{}{"kty": "EC", "crv": "P-256", "x": "prior-x", "y": "prior-y"}
+	priorThumbprint, err := jwk.Thumbprint(priorJWK)
+	if err != nil {
+		t.Fatalf("compute thumbprint: %v", err)
+	}
+	if err := keyAttestations.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{
+		KeyThumbprint:    priorThumbprint,
+		WalletInstanceID: instanceID,
+		VerifiedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("MarkKeyAttested: %v", err)
+	}
+
+	// ...but THIS batch's keys (e.g. softkey-generated) are entirely
+	// different and have no evidence of their own.
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "new-batch-x", "y": "new-batch-y"},
+	}
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := token.Claims.(jwt.MapClaims)
+
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != "iso_18045_basic" {
+		t.Errorf("key_storage = %v, want [iso_18045_basic] (an unrelated prior key's evidence must not leak into this batch)", claims["key_storage"])
+	}
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+}
+
+func TestGenerateKeyAttestation_CertificationStringClampedToFloor(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 
 	jwks := []map[string]interface{}{
@@ -160,11 +340,181 @@ func TestGenerateKeyAttestation_CertificationStringNone(t *testing.T) {
 	if !ok {
 		t.Fatal("certification claim missing")
 	}
-	if cert != "none" {
-		t.Errorf("certification = %v, want \"none\"", cert)
+	if cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
+// TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance is a
+// regression test for a review finding: without this, any caller could
+// self-assert an arbitrary key_storage/certification claim (e.g.
+// iso_18045_high) with no wallet_instance_id and no verification at all,
+// and have it signed straight into the KA JWT. With no walletInstanceID to
+// even attempt a lookup against, the claim must be clamped to the
+// software/K3 floor. The floor still emits all three TS03-required claims
+// (including user_authentication at iso_18045_basic): omitting it caused
+// PID issuers to reject the KA as missing TS03 claims.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedWithoutInstance(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
+	}
+	secProps := &SecurityProperties{
+		KeyStorage:         []string{"iso_18045_high"},
+		UserAuthentication: []string{"iso_18045_high"},
+		Certification: map[string]interface{}{
+			"scheme": "EUCC",
+		},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
+	}
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInstance
+// covers the Tier 3 case: the wallet instance exists but its WIA was
+// backend-attested only (no native platform integrity proof), so an
+// elevated claim still must not be honored.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInstance(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-backend-attested"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "backend_attested",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance
+// covers a wallet_instance_id that doesn't resolve to any known instance
+// (storage.ErrNotFound) — must fail closed (clamp), not fail open.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedForUnknownInstance(t *testing.T) {
+	svc, _, _ := newTestWalletProviderServiceWithInstances(t)
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, "does-not-exist", "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary is a
+// regression test for the other half of the same finding: the SDKs send
+// their raw internal WSCD vocabulary ("software"/"hardware"/
+// "trusted_execution"/"remote_hsm"), not the iso_18045_* enum the KA spec
+// requires, and nothing was mapping it before this fix — even for a
+// trusted (natively-attested) instance.
+func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-2"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "android_play_integrity",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{
+		KeyStorage:         []string{"hardware"},
+		UserAuthentication: []string{"none"},
+	}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_moderate")
+	// omitIfNone drops the "none" entry rather than mapping it to a
+	// placeholder tier, but the claim itself is still emitted at the floor:
+	// CS-04 §7.1.3 requires user_authentication on every KA, so an empty
+	// mapping result falls back to the weakest value rather than omitting
+	// the claim (see normalizeSecurityProperties).
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+}
+
+// TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic
+// covers an unrecognized raw value (not already iso_18045_*, not a known
+// internal vocabulary word) — must default to the safe floor rather than
+// erroring or passing an invalid enum value through into the signed JWT.
+func TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBasic(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-3"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	secProps := &SecurityProperties{KeyStorage: []string{"quantum_vault"}}
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", secProps, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+	assertKeyStorage(t, parseKAClaims(t, ka), "iso_18045_basic")
+}
+
+func parseKAClaims(t *testing.T, ka string) jwt.MapClaims {
+	t.Helper()
+	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+	token, _, err := parser.ParseUnverified(ka, jwt.MapClaims{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token.Claims.(jwt.MapClaims)
+}
+
+func assertKeyStorage(t *testing.T, claims jwt.MapClaims, want string) {
+	t.Helper()
+	ks, ok := claims["key_storage"].([]interface{})
+	if !ok || len(ks) != 1 || ks[0] != want {
+		t.Errorf("key_storage = %v, want [%s]", claims["key_storage"], want)
+	}
+}
+
+func assertUserAuthentication(t *testing.T, claims jwt.MapClaims, want string) {
+	t.Helper()
+	ua, ok := claims["user_authentication"].([]interface{})
+	if !ok || len(ua) != 1 || ua[0] != want {
+		t.Errorf("user_authentication = %v, want [%s]", claims["user_authentication"], want)
+	}
+}
+
+// TestGenerateKeyAttestation_NoSecurityProperties is a regression for PID
+// issuers that require TS03's key_storage / user_authentication /
+// certification on every KA: omitting security_properties must still emit
+// the software floor, not leave the claims absent.
 func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 	svc := newTestWalletProviderService(t)
 
@@ -177,18 +527,41 @@ func TestGenerateKeyAttestation_NoSecurityProperties(t *testing.T) {
 		t.Fatalf("GenerateKeyAttestation: %v", err)
 	}
 
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
+	}
+}
 
-	if _, ok := claims["key_storage"]; ok {
-		t.Error("key_storage should not be present when secProps is nil")
+// TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor
+// verifies that native-platform trust does not invent elevated claims when
+// the client never asserted security_properties.
+func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *testing.T) {
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	instanceID := "test-instance-native-no-secprops"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID:                instanceID,
+		AttestationSource: "ios_app_attest",
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := claims["user_authentication"]; ok {
-		t.Error("user_authentication should not be present when secProps is nil")
+
+	jwks := []map[string]interface{}{
+		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
 	}
-	if _, ok := claims["certification"]; ok {
-		t.Error("certification should not be present when secProps is nil")
+
+	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", nil, instanceID, "")
+	if err != nil {
+		t.Fatalf("GenerateKeyAttestation: %v", err)
+	}
+
+	claims := parseKAClaims(t, ka)
+	assertKeyStorage(t, claims, "iso_18045_basic")
+	assertUserAuthentication(t, claims, "iso_18045_basic")
+	if cert := claims["certification"]; cert != floorCertificationURL {
+		t.Errorf("certification = %v, want %q", cert, floorCertificationURL)
 	}
 }
 
@@ -208,15 +581,23 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
 	claims := token.Claims.(jwt.MapClaims)
 
-	if claims["iss"] != "https://wp.example.com" {
-		t.Errorf("iss = %v, want https://wp.example.com", claims["iss"])
+	if _, ok := claims["iss"]; ok {
+		t.Errorf("iss should not be present on a KA (EC TS03 v1.5.2 removed it), got %v", claims["iss"])
+	}
+	if claims["c_nonce"] != "my-nonce" {
+		t.Errorf("c_nonce = %v, want my-nonce", claims["c_nonce"])
 	}
 	if claims["nonce"] != "my-nonce" {
-		t.Errorf("nonce = %v, want my-nonce", claims["nonce"])
+		t.Errorf("nonce = %v, want my-nonce (sent alongside c_nonce for interop)", claims["nonce"])
 	}
 
-	if token.Header["typ"] != "keyattestation+jwt" {
-		t.Errorf("typ = %v, want keyattestation+jwt", token.Header["typ"])
+	// The JOSE "typ" short form of "application/key-attestation+jwt", the
+	// media type OpenID4VCI 1.0 registers for a Key Attestation JWT. Issuers
+	// pin this string exactly (vc's apigw uses an `eq` validation on it), so a
+	// regression here - the hyphen above all - fails every credential request
+	// that uses the "attestation" proof type.
+	if token.Header["typ"] != "key-attestation+jwt" {
+		t.Errorf("typ = %v, want key-attestation+jwt", token.Header["typ"])
 	}
 
 	if _, ok := claims["iat"]; !ok {
@@ -224,127 +605,6 @@ func TestGenerateKeyAttestation_StandardClaims(t *testing.T) {
 	}
 	if _, ok := claims["exp"]; !ok {
 		t.Error("exp claim missing")
-	}
-}
-
-func TestGenerateKeyAttestation_WalletInstanceIDAndAudience(t *testing.T) {
-	svc := newTestWalletProviderService(t)
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "wallet-instance-123", "https://issuer.example.com/credential")
-	if err != nil {
-		t.Fatalf("GenerateKeyAttestation: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	if claims["sub"] != "wallet-instance-123" {
-		t.Errorf("sub = %v, want wallet-instance-123 (binds KA to wallet instance, CS-04 §7.1.3)", claims["sub"])
-	}
-	if claims["aud"] != "https://issuer.example.com/credential" {
-		t.Errorf("aud = %v, want https://issuer.example.com/credential (scopes KA to target issuer)", claims["aud"])
-	}
-}
-
-func TestGenerateKeyAttestation_NoWalletInstanceIDOrAudience(t *testing.T) {
-	svc := newTestWalletProviderService(t)
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
-	if err != nil {
-		t.Fatalf("GenerateKeyAttestation: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	if _, ok := claims["sub"]; ok {
-		t.Error("sub claim should be absent when walletInstanceID is empty")
-	}
-	if _, ok := claims["aud"]; ok {
-		t.Error("aud claim should be absent when audience is empty")
-	}
-}
-
-func TestGenerateKeyAttestation_DefaultExpiryWhenUnset(t *testing.T) {
-	svc := newTestWalletProviderService(t)
-	svc.cfg.WalletProvider.Attestation.KAExpirySeconds = 0 // triggers 15s default fallback
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
-	if err != nil {
-		t.Fatalf("GenerateKeyAttestation: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	iat, ok := claims["iat"].(float64)
-	if !ok {
-		t.Fatal("iat claim missing or not a number")
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		t.Fatal("exp claim missing or not a number")
-	}
-	if got := exp - iat; got != 15 {
-		t.Errorf("exp-iat = %v, want 15 (default KA expiry when KAExpirySeconds <= 0)", got)
-	}
-}
-
-// failingSigner is a crypto.Signer with a valid P-256 public key (so it
-// passes NewCryptoSignerES256 construction) but always fails to sign, used
-// to exercise GenerateKeyAttestation's signing-error path.
-type failingSigner struct {
-	pub *ecdsa.PublicKey
-}
-
-func (f *failingSigner) Public() crypto.PublicKey { return f.pub }
-
-func (f *failingSigner) Sign(_ io.Reader, _ []byte, _ crypto.SignerOpts) ([]byte, error) {
-	return nil, errors.New("simulated signing failure")
-}
-
-func TestGenerateKeyAttestation_SignError(t *testing.T) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jwtSigner, err := signing.NewCryptoSignerES256(&failingSigner{pub: &key.PublicKey})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &config.Config{}
-	cfg.Server.BaseURL = "https://wp.example.com"
-	cfg.WalletProvider.Attestation = config.AttestationConfig{KAExpirySeconds: 15}
-	svc := &WalletProviderService{
-		cfg:       cfg,
-		logger:    zap.NewNop(),
-		jwtSigner: jwtSigner,
-		certChain: []string{"deadbeef"},
-	}
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	_, err = svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
-	if err == nil {
-		t.Fatal("expected error when the underlying signer fails to sign")
 	}
 }
 
@@ -361,48 +621,12 @@ func TestGenerateKeyAttestation_NotSupported(t *testing.T) {
 	}
 }
 
-func TestGenerateKeyAttestation_KeyStorageStatus(t *testing.T) {
+// TestGenerateKeyAttestation_NoRevocationClaims is a regression test for the
+// no-revocation-chaining design (see AttestationConfig's type-level comment):
+// a KA must never carry key_storage_status or iss, regardless of config —
+// there is no config knob left that could re-enable them.
+func TestGenerateKeyAttestation_NoRevocationClaims(t *testing.T) {
 	svc := newTestWalletProviderService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "always"
-	svc.cfg.WalletProvider.Attestation.StatusListURL = "https://wp.example.com/ka-statuslists/7"
-	svc.cfg.WalletProvider.Attestation.StatusListExpiry = 2678400 // 31 days
-
-	jwks := []map[string]interface{}{
-		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
-	}
-
-	ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "nonce", nil, "", "")
-	if err != nil {
-		t.Fatalf("GenerateKeyAttestation: %v", err)
-	}
-
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, _ := parser.ParseUnverified(ka, jwt.MapClaims{})
-	claims := token.Claims.(jwt.MapClaims)
-
-	ksStatus, ok := claims["key_storage_status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status claim missing")
-	}
-	statusObj, ok := ksStatus["status"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status.status missing")
-	}
-	sl, ok := statusObj["status_list"].(map[string]interface{})
-	if !ok {
-		t.Fatal("key_storage_status.status.status_list missing")
-	}
-	if sl["uri"] != "https://wp.example.com/ka-statuslists/7" {
-		t.Errorf("uri = %v", sl["uri"])
-	}
-	if _, ok := ksStatus["exp"]; !ok {
-		t.Error("key_storage_status.exp missing when StatusListExpiry > 0")
-	}
-}
-
-func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
-	svc := newTestWalletProviderService(t)
-	svc.cfg.WalletProvider.Attestation.StatusListMode = "never"
 
 	jwks := []map[string]interface{}{
 		{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"},
@@ -418,7 +642,16 @@ func TestGenerateKeyAttestation_NoKeyStorageStatusWhenNever(t *testing.T) {
 	claims := token.Claims.(jwt.MapClaims)
 
 	if _, ok := claims["key_storage_status"]; ok {
-		t.Error("key_storage_status should not be present when StatusListMode=never")
+		t.Error("key_storage_status should never be present (no revocation-chaining support)")
+	}
+	if _, ok := claims["iss"]; ok {
+		t.Error("iss should never be present on a KA (EC TS03 v1.5.2 removed it; identity is x5c-only)")
+	}
+	if claims["c_nonce"] != "nonce" {
+		t.Errorf("c_nonce = %v, want %q (TS03 §2.3.2 requires c_nonce, not nonce)", claims["c_nonce"], "nonce")
+	}
+	if claims["nonce"] != "nonce" {
+		t.Errorf("nonce = %v, want %q (sent alongside c_nonce for interop with issuers expecting the base OpenID4VCI claim name)", claims["nonce"], "nonce")
 	}
 }
 
@@ -619,139 +852,6 @@ func TestLoadKeys_WithCACert(t *testing.T) {
 	}
 }
 
-func TestLoadKeys_UnparsableKey(t *testing.T) {
-	// A PEM block with an accepted type but bytes that are valid ASN.1 for
-	// neither SEC1 EC nor PKCS8 — both parse attempts fail and the original
-	// EC parse error should be returned.
-	tmpDir := t.TempDir()
-	keyPath := tmpDir + "/key.pem"
-	kf, _ := os.Create(keyPath)
-	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: []byte("not valid asn.1 der data at all")})
-	kf.Close()
-
-	cfg := &config.Config{}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
-
-	if err := svc.loadKeys(); err == nil {
-		t.Fatal("expected error when neither EC nor PKCS8 parsing succeeds")
-	}
-}
-
-func TestLoadKeys_PKCS8NonECDSAKey(t *testing.T) {
-	// A PKCS8-encoded RSA key should fail with "not an ECDSA private key"
-	// since the wallet provider only supports ES256.
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(rsaKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tmpDir := t.TempDir()
-	keyPath := tmpDir + "/key.pem"
-	kf, _ := os.Create(keyPath)
-	_ = pem.Encode(kf, &pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	kf.Close()
-
-	cfg := &config.Config{}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
-
-	err = svc.loadKeys()
-	if err == nil {
-		t.Fatal("expected error for non-ECDSA PKCS8 key")
-	}
-	if err.Error() != "not an ECDSA private key" {
-		t.Errorf("err = %q, want %q", err.Error(), "not an ECDSA private key")
-	}
-}
-
-func TestLoadKeys_WrongCurve(t *testing.T) {
-	// A valid SEC1 EC key on a non-P256 curve parses fine but must be
-	// rejected when building the ES256 JWT signer (wallet provider only
-	// supports ES256/P-256).
-	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tmpDir := t.TempDir()
-	keyPath := tmpDir + "/key.pem"
-	kf, _ := os.Create(keyPath)
-	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	kf.Close()
-
-	cfg := &config.Config{}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
-
-	if err := svc.loadKeys(); err == nil {
-		t.Fatal("expected error for non-P256 curve key")
-	}
-}
-
-func TestLoadKeys_MissingCertificateFile(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpDir := t.TempDir()
-
-	keyDER, _ := x509.MarshalECPrivateKey(key)
-	keyPath := tmpDir + "/key.pem"
-	kf, _ := os.Create(keyPath)
-	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	kf.Close()
-
-	cfg := &config.Config{}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	cfg.WalletProvider.CertificatePath = "/nonexistent/cert.pem"
-	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
-
-	err := svc.loadKeys()
-	if err == nil {
-		t.Fatal("expected error for missing certificate file")
-	}
-	if svc.jwtSigner == nil {
-		t.Error("jwtSigner should still be set from the key even though cert loading failed")
-	}
-}
-
-func TestLoadKeys_InvalidCACert_LogsWarningButSucceeds(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpDir := t.TempDir()
-
-	keyDER, _ := x509.MarshalECPrivateKey(key)
-	keyPath := tmpDir + "/key.pem"
-	kf, _ := os.Create(keyPath)
-	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	kf.Close()
-
-	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
-	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	certPath := tmpDir + "/cert.pem"
-	cf, _ := os.Create(certPath)
-	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	cf.Close()
-
-	cfg := &config.Config{}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	cfg.WalletProvider.CertificatePath = certPath
-	cfg.WalletProvider.CACertPath = "/nonexistent/ca.pem"
-	svc := &WalletProviderService{cfg: cfg, logger: zap.NewNop()}
-
-	if err := svc.loadKeys(); err != nil {
-		t.Fatalf("loadKeys should succeed despite a bad CA cert path: %v", err)
-	}
-	if len(svc.certChain) != 1 {
-		t.Errorf("expected certChain to contain only the primary cert, got %d entries", len(svc.certChain))
-	}
-}
-
 func TestLoadKeys_MissingKeyFile(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.WalletProvider.PrivateKeyPath = "/nonexistent/key.pem"
@@ -783,32 +883,29 @@ func TestNewWalletProviderService_FileKeys(t *testing.T) {
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
 
-	svc := NewWalletProviderService(cfg, zap.NewNop())
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil, nil)
 	if !svc.IsSupported() {
 		t.Error("service should be supported with valid keys")
 	}
 }
 
-func TestNewWalletProviderService_NoKeys(t *testing.T) {
-	cfg := &config.Config{}
-	svc := NewWalletProviderService(cfg, zap.NewNop())
-	if svc.IsSupported() {
-		t.Error("service should not be supported without keys")
-	}
-}
-
-func TestNewWalletProviderService_FileKeys_LoadFailure(t *testing.T) {
+// TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys is a
+// regression test: when PKCS#11 is configured but fails to load (here,
+// because the test binary isn't built with -tags pkcs11, so
+// signing.LoadKeyMaterial always errors), the service must still fall back
+// to a configured file-based key instead of ending up unsupported. Before
+// this fix, the if/else-if structure meant the file-key branch was never
+// even attempted once the PKCS#11 branch was entered.
+func TestNewWalletProviderService_PKCS11FailureFallsBackToFileKeys(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpDir := t.TempDir()
 
-	// Invalid key content, but paths are set so the file-based branch is taken
-	// and loadKeys() is expected to fail (exercises the constructor's warn
-	// path instead of loadKeys itself).
+	keyDER, _ := x509.MarshalECPrivateKey(key)
 	keyPath := tmpDir + "/key.pem"
-	if err := os.WriteFile(keyPath, []byte("not a pem file"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	kf, _ := os.Create(keyPath)
+	_ = pem.Encode(kf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	kf.Close()
 
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
 	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	certPath := tmpDir + "/cert.pem"
@@ -819,41 +916,47 @@ func TestNewWalletProviderService_FileKeys_LoadFailure(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.PKCS11 = &config.PKCS11SigningConfig{
+		ModulePath: "/nonexistent/pkcs11.so", // fails to load regardless of build tags
+	}
 
-	svc := NewWalletProviderService(cfg, zap.NewNop())
-	if svc.IsSupported() {
-		t.Error("service should not be supported when key loading fails")
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil, nil)
+	if !svc.IsSupported() {
+		t.Error("service should fall back to file-based keys when PKCS#11 fails to load")
 	}
 }
 
-func TestNewWalletProviderService_PKCS11_LoadFailure(t *testing.T) {
-	// PKCS#11 support is only compiled in with the "pkcs11" build tag, so in
-	// the default test build LoadKeyMaterial always fails for a PKCS11
-	// config. The constructor must log a warning and fall back to an
-	// unsupported (no signer) service rather than erroring or panicking.
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	template := &x509.Certificate{SerialNumber: big.NewInt(1)}
-	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	tmpDir := t.TempDir()
-	certPath := tmpDir + "/cert.pem"
-	cf, _ := os.Create(certPath)
-	_ = pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	cf.Close()
-
+func TestNewWalletProviderService_NoKeys(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.WalletProvider.CertificatePath = certPath
-	cfg.WalletProvider.PKCS11 = &config.PKCS11SigningConfig{
-		ModulePath: "/usr/lib/softhsm/libsofthsm2.so",
-		SlotID:     0,
-		PIN:        "1234",
-		KeyLabel:   "wallet-provider",
-	}
-
-	svc := NewWalletProviderService(cfg, zap.NewNop())
+	svc := NewWalletProviderService(cfg, zap.NewNop(), nil, nil)
 	if svc.IsSupported() {
-		t.Error("service should not be supported when PKCS#11 is not compiled in")
+		t.Error("service should not be supported without keys")
 	}
-	if svc.signer != nil {
-		t.Error("signer should remain nil when PKCS#11 load fails")
+}
+
+func TestWalletProviderService_PublicKey(t *testing.T) {
+	svc := newTestWalletProviderService(t)
+
+	pub := svc.PublicKey()
+	if pub == nil {
+		t.Fatal("expected non-nil public key when a signer is configured")
+	}
+	ecPub, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("expected *ecdsa.PublicKey, got %T", pub)
+	}
+	signerKey, ok := svc.signer.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatalf("expected signer to be *ecdsa.PrivateKey, got %T", svc.signer)
+	}
+	if !ecPub.Equal(&signerKey.PublicKey) {
+		t.Error("PublicKey() should return the signer's public key")
+	}
+}
+
+func TestWalletProviderService_PublicKey_NilWithoutSigner(t *testing.T) {
+	svc := &WalletProviderService{cfg: &config.Config{}}
+	if pub := svc.PublicKey(); pub != nil {
+		t.Errorf("expected nil PublicKey() without a configured signer, got %v", pub)
 	}
 }

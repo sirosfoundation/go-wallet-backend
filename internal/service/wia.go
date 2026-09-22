@@ -2,13 +2,9 @@ package service
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,6 +19,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
@@ -31,11 +28,13 @@ var (
 	ErrWIAChallengeExpired     = errors.New("WIA challenge expired or invalid")
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
+	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
 type WIAChallenge struct {
 	Challenge string
+	TenantID  domain.TenantID
 	ExpiresAt time.Time
 	// Linked list pointers for expiry-ordered eviction.
 	prev, next *WIAChallenge
@@ -43,22 +42,31 @@ type WIAChallenge struct {
 
 // challengeStore is a bounded, expiry-ordered map of challenges.
 // Expired entries are evicted in O(1) from the front of the list on insert.
+// Enforces both a global capacity and a per-tenant capacity (issue #224:
+// "bounded capacity per tenant to prevent abuse" — a global-only bound lets
+// a single tenant exhaust the shared pool and deny challenge creation for
+// everyone else).
 type challengeStore struct {
-	mu      sync.Mutex
-	items   map[string]*WIAChallenge
-	head    *WIAChallenge // oldest expiry
-	tail    *WIAChallenge // newest expiry
-	maxSize int
+	mu               sync.Mutex
+	items            map[string]*WIAChallenge
+	head             *WIAChallenge // oldest expiry
+	tail             *WIAChallenge // newest expiry
+	maxSize          int
+	maxSizePerTenant int
+	perTenant        map[domain.TenantID]int
 }
 
-func newChallengeStore(maxSize int) *challengeStore {
+func newChallengeStore(maxSize, maxSizePerTenant int) *challengeStore {
 	return &challengeStore{
-		items:   make(map[string]*WIAChallenge, maxSize),
-		maxSize: maxSize,
+		items:            make(map[string]*WIAChallenge, maxSize),
+		maxSize:          maxSize,
+		maxSizePerTenant: maxSizePerTenant,
+		perTenant:        make(map[domain.TenantID]int),
 	}
 }
 
-// put adds a challenge, evicting expired entries first. Returns false if at capacity.
+// put adds a challenge, evicting expired entries first. Returns false if
+// either the global or the per-tenant capacity is exceeded.
 func (cs *challengeStore) put(c *WIAChallenge) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -68,8 +76,12 @@ func (cs *challengeStore) put(c *WIAChallenge) bool {
 	if len(cs.items) >= cs.maxSize {
 		return false
 	}
+	if cs.maxSizePerTenant > 0 && cs.perTenant[c.TenantID] >= cs.maxSizePerTenant {
+		return false
+	}
 
 	cs.items[c.Challenge] = c
+	cs.perTenant[c.TenantID]++
 
 	// Append to tail (newest expiry)
 	c.prev = cs.tail
@@ -109,10 +121,16 @@ func (cs *challengeStore) evictExpired() {
 	}
 }
 
-// removeLocked removes a challenge from both the map and the linked list.
-// Must hold cs.mu.
+// removeLocked removes a challenge from both the map and the linked list,
+// and decrements its tenant's count. Must hold cs.mu.
 func (cs *challengeStore) removeLocked(c *WIAChallenge) {
 	delete(cs.items, c.Challenge)
+	if cs.perTenant[c.TenantID] > 0 {
+		cs.perTenant[c.TenantID]--
+		if cs.perTenant[c.TenantID] == 0 {
+			delete(cs.perTenant, c.TenantID)
+		}
+	}
 	if c.prev != nil {
 		c.prev.next = c.next
 	} else {
@@ -157,7 +175,7 @@ type WIAService struct {
 // It shares the same signing key as the WalletProviderService (same x5c chain).
 func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
 	if challengeStore == nil {
-		challengeStore = newMemoryWIAChallengeStore(maxChallenges)
+		challengeStore = newMemoryWIAChallengeStore(maxChallenges, maxChallengesPerTenant)
 	}
 	svc := &WIAService{
 		cfg:        cfg,
@@ -177,17 +195,32 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 	return svc
 }
 
-// IsSupported returns true if WIA generation is available.
+// IsSupported returns true if WIA generation is available. Unlike
+// WalletProviderService.IsSupported (which gates Key Attestation and always
+// requires a certificate), a certificate is only required here in "etsi"
+// mode — "ietf" mode issues JWKS-trust WIAs from a signing key alone.
 func (s *WIAService) IsSupported() bool {
-	return s.jwtSigner != nil && len(s.certChain) > 0
+	if s.jwtSigner == nil {
+		return false
+	}
+	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF {
+		return true
+	}
+	return len(s.certChain) > 0
 }
 
-// maxChallenges is the maximum number of concurrent pending challenges.
-// Prevents memory exhaustion from challenge endpoint abuse.
+// maxChallenges is the maximum number of concurrent pending challenges,
+// across all tenants. Prevents memory exhaustion from challenge endpoint abuse.
 const maxChallenges = 10000
 
-// CreateChallenge generates a new single-use challenge nonce.
-func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, error) {
+// maxChallengesPerTenant additionally bounds how many of those may belong to
+// a single tenant at once (issue #224: "bounded capacity per tenant to
+// prevent abuse") — without this, a single tenant can still exhaust the
+// entire global pool and deny challenge creation for every other tenant.
+const maxChallengesPerTenant = maxChallenges / 10
+
+// CreateChallenge generates a new single-use challenge nonce for tenantID.
+func (s *WIAService) CreateChallenge(ctx context.Context, tenantID domain.TenantID) (string, time.Time, error) {
 	if !s.IsSupported() {
 		return "", time.Time{}, ErrWIANotSupported
 	}
@@ -205,7 +238,7 @@ func (s *WIAService) CreateChallenge(ctx context.Context) (string, time.Time, er
 	}
 	expiresAt := time.Now().Add(ttl)
 
-	ok, err := s.challenges.Put(ctx, challenge, expiresAt)
+	ok, err := s.challenges.Put(ctx, tenantID, challenge, expiresAt)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("store challenge: %w", err)
 	}
@@ -239,6 +272,8 @@ type WIARequest struct {
 	Pop string `json:"pop"`
 	// Challenge is the nonce from CreateChallenge
 	Challenge string `json:"challenge"`
+	// ClientID, when provided, is embedded as the WIA JWT's `sub` claim (see signWIA).
+	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
@@ -250,7 +285,11 @@ type WIAPopClaims struct {
 }
 
 // GenerateWIA validates the WIA-PoP and generates a WIA JWT.
-func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, error) {
+// tenantID is the tenant of the authenticated caller (from the request context),
+// recorded against the wallet instance so admin views/ownership checks work correctly.
+// userID is the authenticated caller's user ID, if known (may be nil) — recorded
+// against the instance so GetByUser / ListWalletInstancesByUser can find it.
+func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, req *WIARequest) (string, error) {
 	if !s.IsSupported() {
 		return "", ErrWIANotSupported
 	}
@@ -262,13 +301,40 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
 	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
 	if err := s.consumeChallenge(ctx, req.Challenge); err != nil {
+		s.emitAuditFailure("challenge_invalid", err)
 		return "", err
 	}
 
 	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
 	if err != nil {
+		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+
+	jkt, err := jwk.Thumbprint(cnfJWK)
+	if err != nil {
+		s.emitAuditFailure("jkt_compute_failed", err)
+		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+
+	// Step 2.5: Reject issuance for instances an admin has suspended or revoked.
+	// Without this check, a wallet that still holds its instance key could simply
+	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
+	// bypassing revocation.
+	if s.instances != nil {
+		existing, err := s.instances.GetByID(ctx, jkt)
+		switch {
+		case err == nil:
+			if existing.Status != domain.InstanceStatusActive {
+				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
+				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
+			}
+		case errors.Is(err, storage.ErrNotFound):
+			// First attestation for this instance key — nothing to check yet.
+		default:
+			return "", fmt.Errorf("check wallet instance status: %w", err)
+		}
 	}
 
 	// Step 3: Determine attestation source
@@ -292,7 +358,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, req *WIARequest) (string, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, attestationSource)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -323,7 +389,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 	}
 
 	// Parse the public key from JWK for signature verification
-	pubKey, err := parseECPublicKeyFromJWK(jwkMap)
+	pubKey, err := jwk.ParseECPublicKey(jwkMap)
 	if err != nil {
 		return nil, fmt.Errorf("parse pop jwk: %w", err)
 	}
@@ -389,27 +455,41 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 }
 
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource string) (string, error) {
+// jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
+// so it can also be used for the instance-status guard before signing.
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
 	now := time.Now()
 
-	// Use global attestation lifetime, capped by WIA max expiry
+	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
+	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
+	// client_status/revocation-chaining mechanism (see below); a short
+	// lifetime is the actual mechanism bounding exposure from a
+	// compromised/revoked wallet instance.
 	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
 	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
 	if maxExpiry <= 0 {
 		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
 	}
-	if lifetime > maxExpiry || lifetime == 0 {
+	if lifetime <= 0 {
+		lifetime = maxExpiry
+		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
+			zap.Duration("lifetime", lifetime))
+	}
+	if lifetime > maxExpiry {
 		lifetime = maxExpiry
 	}
 
-	// Build cnf claim with JWK thumbprint and full key
-	jkt, err := computeJKT(cnfJWK)
-	if err != nil {
-		return "", fmt.Errorf("compute jkt: %w", err)
+	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
+	// claim MUST specify client_id value of the OAuth Client" - NOT the
+	// instance identifier (that's what cnf.jkt is for). Falls back to jkt
+	// when the caller doesn't supply a client_id (e.g. a WIA requested for
+	// something other than OID4VCI/OID4VP client authentication).
+	sub := clientID
+	if sub == "" {
+		sub = jkt
 	}
-
 	claims := jwt.MapClaims{
-		"sub": jkt, // wallet instance identifier (JWK Thumbprint)
+		"sub": sub,
 		"jti": uuid.New().String(),
 		"cnf": map[string]interface{}{
 			"jwk": cnfJWK,
@@ -417,11 +497,22 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		},
 		"iat": now.Unix(),
 		"exp": now.Add(lifetime).Unix(),
-		// attestation_source: SIROS extension (WP4 CS-05 Annex C).
-		// Indicates the attestation tier:
-		//   "backend_attested"         — Tier 3: server-side attestation only
-		//   "ios_app_attest"           — Tier 4/5: Apple App Attest verified
-		//   "android_play_integrity"   — Tier 4/5: Google Play Integrity verified
+		// attestation_source: a SIROS extension claim — neither EC TS03 nor
+		// ETSI TS 119 472-3 define a WIA claim for this. Its values are
+		// chosen to mirror the S1/S3 "WIA dimension" tiers from WE BUILD
+		// wp4-architecture PR #229 ("cs-04: Add Annex C — Tiered WUA for
+		// cross-platform Wallet Solutions", open as of 2026-08, branch
+		// cs-04/annex-c-tiered-attestation) — NOT "WP4 CS-05" (Business
+		// Wallet, unrelated); Annex C is a proposed addition to CS-04.
+		// Annex C's own note is explicit that TS-03/CS-04 don't define this
+		// claim: any such signal "may [be conveyed] via the certification
+		// information or via an extension claim, but this is outside the
+		// scope of TS-03 and CS-04" — this claim is that extension.
+		//   "backend_attested"         — Annex C tier S3: backend-only attestation
+		//   "ios_app_attest"           — Annex C tier S1: full client attestation (Apple App Attest)
+		//   "android_play_integrity"   — Annex C tier S1: full client attestation (Google Play Integrity)
+		// Annex C's tier S2 (partial client attestation, e.g. a browser
+		// extension/companion) has no corresponding value yet.
 		// Third-party wallet providers may omit this claim; issuers must handle
 		// both present and absent cases (absent = unknown tier).
 		"attestation_source": attestationSource,
@@ -442,44 +533,56 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
 	}
 
-	// Client status (WIA revocation via Token Status List, Annex C §C.3.2)
-	switch s.cfg.WalletProvider.Attestation.StatusListMode {
-	case "always":
-		clientStatus := map[string]interface{}{
-			"status": map[string]interface{}{
-				"status_list": map[string]interface{}{
-					"uri": s.cfg.WalletProvider.Attestation.StatusListURL,
-					"idx": statusIndexCounter.Add(1),
-				},
-			},
-		}
-		if s.cfg.WalletProvider.Attestation.StatusListExpiry > 0 {
-			clientStatus["exp"] = now.Add(time.Duration(s.cfg.WalletProvider.Attestation.StatusListExpiry) * time.Second).Unix()
-		}
-		claims["client_status"] = clientStatus
-	case "never":
-		// Omit status list for short-lived attestations
-	default:
-		// "auto" or unset: omit (same as "never" for now)
+	// client_status: WIA revocation reference (CS-04 §7.1.2, TS-03 clause
+	// 2.3.1). Required on every WIA by CS-04 — a conformant PID/EAA
+	// Provider rejects one without it. It points at this wallet provider's
+	// own always-VALID status list; see StatusListConfig for why that is
+	// not the mechanism actually bounding exposure here.
+	if cs := statusClaim(s.cfg, statusIndexWIA, now); cs != nil {
+		claims["client_status"] = cs
 	}
 
-	// iss claim: identifies the wallet provider.
-	// Per TS03 §2.2.1, identity is derived from the x5c chain. However, the IETF
-	// draft-ietf-oauth-attestation-based-client-auth §3.1 specifies iss as the
-	// wallet provider identifier. We include both: x5c for EU/EUDI compliance,
-	// iss for efficient PDP routing and non-EU interop.
-	// Falls back to WalletProviderURI if Issuer not explicitly configured.
-	issuer := s.cfg.WalletProvider.WIA.Issuer
-	if issuer == "" {
-		issuer = s.cfg.WalletProvider.WIA.WalletProviderURI
-	}
-	if issuer != "" {
-		claims["iss"] = issuer
+	// iss: only set in "ietf" mode, where relying parties resolve trust via
+	// this wallet provider's JWKS. Even when we also embed x5c in the header
+	// (for interoperability with consumers/test suites that expect it), iss
+	// remains the identifier for JWKS discovery. config.Validate() enforces
+	// Issuer being set whenever Mode is "ietf" and signing keys are
+	// configured, so no WalletProviderURI fallback here -
+	// WalletProviderService.Issuer() (used by
+	// RegisterWalletProviderJWKSRoute's RFC 8414 metadata) computes the same
+	// value the same way, so both stay consistent with what Validate()
+	// actually requires.
+	//
+	// In "etsi" mode, no iss is set at all: EC TS03 v1.5.2 removed `iss`
+	// from the WIA entirely — Wallet Provider identity is inferred solely
+	// from the x5c signing certificate, verified against the Trusted List
+	// for Wallet Providers (ETSI TS 119 472-3 AUTH-REQ-PROC-4.4.3-01 /
+	// TOKEN-REQ-PROC-4.5.2-01).
+	if s.cfg.WalletProvider.WIA.Mode == config.WIAModeIETF && s.cfg.WalletProvider.WIA.Issuer != "" {
+		claims["iss"] = s.cfg.WalletProvider.WIA.Issuer
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["typ"] = "oauth-client-attestation+jwt"
-	token.Header["x5c"] = s.certChain
+
+	switch s.cfg.WalletProvider.WIA.Mode {
+	case config.WIAModeIETF:
+		// Relying parties resolve the wallet provider's signing key from its
+		// own JWKS (RegisterWalletProviderJWKSRoute, served at the WIA's own
+		// iss URL). That resolution is kid-keyed (standard practice for
+		// multi-key JWKS, and what existing JWT trust-verification code
+		// elsewhere already expects), so the WIA itself must carry a kid
+		// header matching the JWKS entry's KeyID ("wallet-provider",
+		// hardcoded there since this deployment publishes exactly one signing
+		// key) - without it, a relying party has no way to know which of the
+		// issuer's published keys to use.
+		token.Header["kid"] = "wallet-provider"
+		if len(s.certChain) > 0 {
+			token.Header["x5c"] = s.certChain
+		}
+	default: // config.WIAModeETSI
+		token.Header["x5c"] = s.certChain
+	}
 
 	tokenString, err := s.jwtSigner.SignToken(token)
 	if err != nil {
@@ -492,11 +595,16 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
+	// Status is only ever set here for a brand-new instance (defaults to Active on
+	// insert); Upsert must not overwrite the status of an existing instance — that
+	// would silently undo an admin suspend/revoke the next time this instance
+	// successfully re-attests. See the guard in GenerateWIA above.
 	if s.instances != nil {
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
 			ID:                jkt,
-			TenantID:          domain.DefaultTenantID,
+			TenantID:          tenantID,
+			UserID:            userID,
 			Status:            domain.InstanceStatusActive,
 			WSCDType:          wscdTypeFromAttestation(attestationSource),
 			AttestationSource: attestationSource,
@@ -519,121 +627,19 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, attestationSource st
 	return tokenString, nil
 }
 
-// computeJKT computes the JWK Thumbprint (RFC 7638) for the given JWK.
-func computeJKT(jwk map[string]interface{}) (string, error) {
-	// For EC keys, thumbprint input is {"crv":"...","kty":"EC","x":"...","y":"..."}
-	kty, _ := jwk["kty"].(string)
-	if kty != "EC" {
-		return "", fmt.Errorf("unsupported key type for JKT: %s", kty)
-	}
-
-	crv, _ := jwk["crv"].(string)
-	x, _ := jwk["x"].(string)
-	y, _ := jwk["y"].(string)
-
-	if crv == "" || x == "" || y == "" {
-		return "", errors.New("incomplete EC JWK (missing crv, x, or y)")
-	}
-
-	// RFC 7638: JSON with lexicographic order of required members.
-	// Using a struct with ordered fields ensures deterministic serialization.
-	thumbprintInput := struct {
-		Crv string `json:"crv"`
-		Kty string `json:"kty"`
-		X   string `json:"x"`
-		Y   string `json:"y"`
-	}{
-		Crv: crv,
-		Kty: kty,
-		X:   x,
-		Y:   y,
-	}
-
-	data, err := json.Marshal(thumbprintInput)
-	if err != nil {
-		return "", fmt.Errorf("marshal JKT input: %w", err)
-	}
-
-	hash := sha256.Sum256(data)
-	return base64.RawURLEncoding.EncodeToString(hash[:]), nil
-}
-
-// parseECPublicKeyFromJWK parses an EC public key from a JWK map.
-// Only P-256 is accepted (consistent with ES256-only PoP validation).
-func parseECPublicKeyFromJWK(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
-	kty, _ := jwk["kty"].(string)
-	if kty != "EC" {
-		return nil, fmt.Errorf("unsupported key type: %s", kty)
-	}
-
-	crv, _ := jwk["crv"].(string)
-	xB64, _ := jwk["x"].(string)
-	yB64, _ := jwk["y"].(string)
-
-	if crv == "" || xB64 == "" || yB64 == "" {
-		return nil, errors.New("incomplete EC JWK")
-	}
-
-	if crv != "P-256" {
-		return nil, fmt.Errorf("unsupported curve %q: only P-256 is accepted for WIA PoP", crv)
-	}
-
-	xBytes, err := base64.RawURLEncoding.DecodeString(xB64)
-	if err != nil {
-		return nil, fmt.Errorf("decode x: %w", err)
-	}
-	yBytes, err := base64.RawURLEncoding.DecodeString(yB64)
-	if err != nil {
-		return nil, fmt.Errorf("decode y: %w", err)
-	}
-
-	curve := ellipticCurveForName(crv)
-	if curve == nil {
-		return nil, fmt.Errorf("unsupported curve: %s", crv)
-	}
-
-	// Build uncompressed point encoding: 0x04 || x || y
-	byteLen := (curve.Params().BitSize + 7) / 8
-	// Pad x and y to the correct length
-	for len(xBytes) < byteLen {
-		xBytes = append([]byte{0}, xBytes...)
-	}
-	for len(yBytes) < byteLen {
-		yBytes = append([]byte{0}, yBytes...)
-	}
-	uncompressed := make([]byte, 1+2*byteLen)
-	uncompressed[0] = 0x04
-	copy(uncompressed[1:1+byteLen], xBytes)
-	copy(uncompressed[1+byteLen:], yBytes)
-
-	pubKey, err := ecdsa.ParseUncompressedPublicKey(curve, uncompressed)
-	if err != nil {
-		return nil, fmt.Errorf("invalid EC point: %w", err)
-	}
-
-	return pubKey, nil
-}
-
-// ellipticCurveForName returns the elliptic curve for the given JWK crv name.
-// Only P-256 is supported (consistent with ES256-only PoP validation).
-func ellipticCurveForName(name string) elliptic.Curve {
-	switch name {
-	case "P-256":
-		return elliptic.P256()
-	default:
-		return nil
-	}
-}
-
 // CleanupExpiredChallenges removes expired challenges from the store.
 // For MongoDB, this is a no-op (TTL indexes handle expiry).
 // For in-memory, this evicts expired entries.
-func (s *WIAService) CleanupExpiredChallenges() {
+func (s *WIAService) CleanupExpiredChallenges() int {
 	if m, ok := s.challenges.(*memoryWIAChallengeStore); ok {
 		m.store.mu.Lock()
+		before := len(m.store.items)
 		m.store.evictExpired()
+		evicted := before - len(m.store.items)
 		m.store.mu.Unlock()
+		return evicted
 	}
+	return 0
 }
 
 // Start begins the periodic challenge cleanup goroutine.
@@ -661,10 +667,21 @@ func (s *WIAService) cleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.CleanupExpiredChallenges()
+			if n := s.CleanupExpiredChallenges(); n > 0 {
+				challengeEvictedTotal.Add(float64(n))
+			}
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// emitAuditFailure emits an audit event for a failed WIA generation attempt.
+func (s *WIAService) emitAuditFailure(reason string, err error) {
+	if s.audit != nil {
+		s.audit.EmitWithSubject(set.EventURI("urn:siros:audit:wia:issuance_failed"), reason, map[string]any{
+			"error": err.Error(),
+		})
 	}
 }
 

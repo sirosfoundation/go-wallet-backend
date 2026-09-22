@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-tokenauth/claims"
 )
 
 // HandleRPC handles POST requests for JSON-RPC style messages over HTTP.
@@ -26,7 +28,7 @@ func (m *Manager) HandleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, tenantID, err := m.validateToken(token)
+	userID, tenantID, tac, err := m.validateToken(token)
 	if err != nil {
 		m.logger.Warn("HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -49,7 +51,7 @@ func (m *Manager) HandleRPC(w http.ResponseWriter, r *http.Request) {
 
 	// Handle session creation (handshake equivalent).
 	if msg.Type == TypeHandshake {
-		m.handleHTTPHandshake(w, userID, tenantID)
+		m.handleHTTPHandshake(w, userID, tenantID, tac)
 		return
 	}
 
@@ -110,7 +112,7 @@ func (m *Manager) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, tenantID, err := m.validateToken(token)
+	userID, tenantID, _, err := m.validateToken(token)
 	if err != nil {
 		m.logger.Warn("SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -150,7 +152,7 @@ func (m *Manager) HandleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHTTPHandshake creates a new session over HTTP+SSE (equivalent to WS handshake).
-func (m *Manager) handleHTTPHandshake(w http.ResponseWriter, userID, tenantID string) {
+func (m *Manager) handleHTTPHandshake(w http.ResponseWriter, userID, tenantID string, tac claims.TAC) {
 	transport := newSSETransport(200)
 
 	sessionLabel := userID
@@ -162,6 +164,7 @@ func (m *Manager) handleHTTPHandshake(w http.ResponseWriter, userID, tenantID st
 		ID:        uuid.New().String(),
 		UserID:    userID,
 		TenantID:  tenantID,
+		TAC:       tac,
 		transport: transport,
 		flows:     make(map[string]*Flow),
 		logger:    m.logger.With(zap.String("session", sessionLabel)),

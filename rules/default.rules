@@ -4,17 +4,68 @@
 ; Additional rules can be added per-deployment by placing .rules files in
 ; the configured rules directory.
 ;
-; Rule format: (token (claim value) ...)
-; A query matches if it is "less permissive" than at least one rule.
+; Rule format (advanced): (token (claim value) ...). A query matches if it
+; is "less permissive" than at least one rule.
+;
+; IMPORTANT - queries are matched positionally, not by field name: SPOCP
+; compares a rule's elements against the query's elements index-by-index (a
+; rule may have fewer elements than the query, in which case trailing query
+; fields are unconstrained, but it may not skip a leading field). Since
+; BuildTokenQuery emits claims sorted alphabetically (acr, aud, sub, tac,
+; tenant_id) and omits any claim that is empty, the set and order of fields
+; actually present varies by request shape. Rules below are therefore
+; duplicated per shape:
+;   - shape A: acr, aud, sub, tac, tenant_id  (passkey-authenticated session)
+;   - shape B: aud, sub, tac, tenant_id        (non-passkey session/delegation)
+;   - shape C: acr, aud, tac, tenant_id        ("anonymous" - identity-free
+;              token for an already-authenticated session; see
+;              handleAnonymousTokenRequest. No shape omits acr: the AS never
+;              mints a token without one, authenticated or not - a session
+;              with no ACR is rejected in code before a query is ever built.)
+;
+; No rule in this file gives the "default" tenant name any special
+; treatment: it is the fallback tenant unspecified requests resolve to and
+; nothing else, and every shape below scopes tenant_id the same way -
+; wildcard here, matched against the caller's own session tenant in code.
 
-; Read-only access (r, l) is always allowed for any authenticated user.
-; This matches any token request that only asks for read/list permissions.
-(5:token (3:tac 1:r))
-(5:token (3:tac 1:l))
-(5:token (3:tac 2:rl))
+; --- Shape A: acr present ---
+(token (acr (*)) (aud (*)) (sub (*)) (tac r))
+(token (acr (*)) (aud (*)) (sub (*)) (tac l))
+(token (acr (*)) (aud (*)) (sub (*)) (tac rl))
+; Any tac for an authenticated user; tenant scoping is enforced at the code
+; level (session.TenantID must match unless cross-tenant).
+(token (acr (*)) (aud (*)) (sub (*)) (tac (*)) (tenant_id (*)))
 
-; Users can get tokens scoped to their own tenant with any valid tac.
-; Tenant scoping is enforced at the code level (session.TenantID must match
-; unless the session is cross-tenant). The wildcard here permits the policy
-; evaluation to pass once code-level tenant enforcement is satisfied.
-(5:token (3:sub (*)) (9:tenant_id (*)))
+; --- Shape B: no acr, sub present ---
+(token (aud (*)) (sub (*)) (tac r))
+(token (aud (*)) (sub (*)) (tac l))
+(token (aud (*)) (sub (*)) (tac rl))
+(token (aud (*)) (sub (*)) (tac (*)) (tenant_id (*)))
+
+; --- Shape C: "anonymous" (acr present, no sub) ---
+; Despite the name, this is not an unauthenticated path: it requires the
+; same valid, already-authenticated session as shape A/B (see
+; handleAnonymousTokenRequest) - "anonymous" only means the issued token
+; omits "sub". tenant_id is a wildcard here
+; too, on exactly the same basis as shape A/B: the code layer already
+; enforces that the requested tenant_id matches the caller's own session
+; tenant (unless the session itself is cross-tenant "*"), so this rule can
+; safely defer to that check. The "default" tenant is not treated specially.
+;
+; Read-only access only - handleAnonymousTokenRequest caps tac to read-only
+; regardless of what the caller's session MaxTAC would otherwise allow, so
+; this rule only ever needs to consider r/l/rl.
+;
+; aud remains a specific enumerated set rather than the (*) wildcard shape
+; A/B use: this is what limits an identity-free token to the specific
+; purposes it's meant for (today: trust evaluation, engine transport) rather
+; than every audience shape A/B could reach.
+;   - wallet-registry: the intended long-term audience for these calls.
+;   - wallet-backend: kept temporarily alongside wallet-registry so that
+;     already-deployed clients requesting the old audience value for these
+;     same calls keep working during the migration. Remove once no client
+;     requests an anonymous wallet-backend token any more (see
+;     TestSPOCPEngine_AnonymousRequestsRejectUnlistedAudience).
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac r) (tenant_id (*)))
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac l) (tenant_id (*)))
+(token (acr (*)) (aud (* set wallet-backend wallet-registry)) (tac rl) (tenant_id (*)))

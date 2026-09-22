@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -334,6 +335,49 @@ func TestFetcher_FetchFromSource_TS11Format(t *testing.T) {
 	assert.Equal(t, []string{"dc+sd-jwt"}, entry.SupportedFormats)
 	assert.JSONEq(t, vctmContent, string(entry.Metadata))
 	assert.False(t, entry.FetchedAt.IsZero())
+}
+
+// TestFetcher_FetchFromSource_TS11_DoesNotDoubleFetchFirstPage guards
+// against a real regression Copilot caught: fetchFromSource already
+// fetches the index body once (for format auto-detection) before handing
+// it to processTS11Response, which must reuse that body for page 1
+// instead of fetching the same URL again.
+func TestFetcher_FetchFromSource_TS11_DoesNotDoubleFetchFirstPage(t *testing.T) {
+	vctmContent := `{"vct":"https://registry.example.org/cred.vctm.json","name":"Demo"}`
+	vctmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(vctmContent))
+	}))
+	defer vctmServer.Close()
+
+	schemas := TS11SchemasResponse{
+		Data: []TS11SchemaMeta{
+			{
+				ID:         "s1",
+				SchemaURIs: []TS11SchemaURI{{FormatIdentifier: "dc+sd-jwt", URI: vctmServer.URL + "/cred.vctm.json"}},
+			},
+		},
+		Total: 1, Limit: 100, Offset: 0,
+	}
+
+	var indexFetchCount atomic.Int64
+	indexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		indexFetchCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(schemas)
+	}))
+	defer indexServer.Close()
+
+	config := DefaultConfig()
+	store := NewStore("")
+	fetcher := NewFetcher(config, store, testLogger(), nil)
+
+	src := RemoteSourceConfig{URL: indexServer.URL, Timeout: 5 * time.Second}
+	entries, err := fetcher.fetchFromSource(context.Background(), src)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, int64(1), indexFetchCount.Load(),
+		"the schemas.json index must be fetched exactly once per source fetch, not once for format auto-detection and again for page 1")
 }
 
 func TestFetcher_FetchFromSource_TS11_FallbackToFirstSchemaURI(t *testing.T) {

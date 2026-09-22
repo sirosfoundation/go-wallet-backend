@@ -20,7 +20,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 	defer s.mu.Unlock()
 
 	if existing, ok := s.data[instance.ID]; ok {
-		existing.Status = instance.Status
+		// Status is intentionally left untouched here — lifecycle changes only
+		// happen through UpdateStatus. Otherwise a routine re-attestation would
+		// silently reactivate a suspended/revoked instance.
 		existing.AttestationSource = instance.AttestationSource
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
@@ -33,6 +35,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 	} else {
 		instance.AttestationCount = 1
+		if instance.CreatedAt.IsZero() {
+			instance.CreatedAt = time.Now().UTC()
+		}
 		s.data[instance.ID] = instance
 	}
 	return nil
@@ -81,6 +86,10 @@ func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status 
 	instance, ok := s.data[id]
 	if !ok {
 		return storage.ErrNotFound
+	}
+
+	if err := domain.ValidateStatusTransition(instance.Status, status); err != nil {
+		return err
 	}
 
 	instance.Status = status

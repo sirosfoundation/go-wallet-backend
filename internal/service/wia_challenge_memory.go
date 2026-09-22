@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
 
 // memoryWIAChallengeStore wraps the existing in-memory challengeStore
@@ -11,15 +13,16 @@ type memoryWIAChallengeStore struct {
 	store *challengeStore
 }
 
-func newMemoryWIAChallengeStore(maxSize int) *memoryWIAChallengeStore {
+func newMemoryWIAChallengeStore(maxSize, maxSizePerTenant int) *memoryWIAChallengeStore {
 	return &memoryWIAChallengeStore{
-		store: newChallengeStore(maxSize),
+		store: newChallengeStore(maxSize, maxSizePerTenant),
 	}
 }
 
-func (m *memoryWIAChallengeStore) Put(_ context.Context, challenge string, expiresAt time.Time) (bool, error) {
+func (m *memoryWIAChallengeStore) Put(_ context.Context, tenantID domain.TenantID, challenge string, expiresAt time.Time) (bool, error) {
 	c := &WIAChallenge{
 		Challenge: challenge,
+		TenantID:  tenantID,
 		ExpiresAt: expiresAt,
 	}
 	return m.store.put(c), nil

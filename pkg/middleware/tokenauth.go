@@ -98,9 +98,23 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			)
 		}
 
-		// Populate context keys for existing handlers
-		c.Set("user_id", result.UserID)
-		c.Set("did", result.DID)
+		// Populate context keys for existing handlers.
+		//
+		// user_id/did are deliberately only set when non-empty: an anonymous
+		// token (see AS's handleAnonymousTokenRequest) validates successfully
+		// with an empty UserID/DID, and the common handler idiom is
+		// `val, exists := c.Get("user_id")`. If we always called c.Set here,
+		// exists would be true even for an anonymous caller — a value of ""
+		// looks like "we know who this is, and it's the empty string" rather
+		// than "no identity at all". Handlers must be able to tell the two
+		// apart via the exists boolean alone, without also remembering to
+		// check for an empty string every time.
+		if result.UserID != "" {
+			c.Set("user_id", result.UserID)
+		}
+		if result.DID != "" {
+			c.Set("did", result.DID)
+		}
 		c.Set("token", rawToken)
 		c.Set("tenant_id", tenantID)
 		c.Set("tenant", tenant)
@@ -131,6 +145,54 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 
 		if !result.TAC.HasAll(required) {
 			c.JSON(403, gin.H{"error": "Insufficient permissions"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// RequireAudience returns middleware that requires the token's "aud" claim
+// to contain at least one of the given values. Must be placed after
+// TokenAuthMiddleware in the middleware chain.
+//
+// This is a separate, narrower check from TokenAuthMiddleware's own
+// audience validation: that only confirms the token's audience is *some*
+// value from the deployment's shared Config.Audiences allowlist (e.g.
+// "wallet-backend" OR "wallet-registry" OR "wallet-engine", whichever the
+// operator configured) - it has no way to restrict a specific route group
+// to a narrower audience than "anything the deployment accepts overall".
+// RequireAudience is that narrower restriction, applied per route group -
+// e.g. the AuthZEN proxy and engine transport only ever need
+// "wallet-registry"/"wallet-backend" (identity-free calls), while general
+// user-facing routes should reject a "wallet-registry"-only token even
+// though the deployment as a whole accepts that audience for other
+// purposes.
+func RequireAudience(allowed ...string) gin.HandlerFunc {
+	if len(allowed) == 0 {
+		// allowed is fixed at route-registration time, not per-request, so
+		// this is always a programming error, never a runtime condition -
+		// panic here (once, at startup) rather than have the match loop
+		// below silently 403 every request forever.
+		panic("middleware: RequireAudience called with no allowed audiences")
+	}
+	return func(c *gin.Context) {
+		v, exists := c.Get("tokenauth_result")
+		if !exists {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+		result, ok := v.(*claims.Result)
+		if !ok || result == nil {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+
+		if !result.HasAudience(allowed...) {
+			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return
 		}

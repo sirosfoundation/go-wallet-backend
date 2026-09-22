@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 )
 
@@ -21,7 +22,8 @@ func (h *Handlers) WIAChallenge(c *gin.Context) {
 		return
 	}
 
-	challenge, expiresAt, err := h.services.WIA.CreateChallenge(c.Request.Context())
+	tenantID, _ := h.getTenantID(c)
+	challenge, expiresAt, err := h.services.WIA.CreateChallenge(c.Request.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, service.ErrWIAChallengeCapacityMax) {
 			c.JSON(http.StatusTooManyRequests, gin.H{
@@ -50,6 +52,12 @@ type WIAGenerateRequest struct {
 	Pop string `json:"pop" binding:"required"`
 	// Challenge is the nonce from the challenge endpoint
 	Challenge string `json:"challenge" binding:"required"`
+	// ClientID is the OAuth client_id this wallet instance uses in OID4VCI/OID4VP
+	// flows (defaults to its redirect_uri, per OID4VCI's unregistered-client
+	// convention - see OID4VCIHandler.clientID). Embedded as the WIA JWT's
+	// `sub` claim: draft-ietf-oauth-attestation-based-client-auth-10 requires
+	// "the sub claim MUST specify client_id value of the OAuth Client".
+	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
 }
@@ -74,23 +82,36 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		return
 	}
 
-	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), &service.WIARequest{
+	tenantID, _ := h.getTenantID(c)
+	var userID *domain.UserID
+	if uid := c.GetString("user_id"); uid != "" {
+		id := domain.UserIDFromString(uid)
+		userID = &id
+	}
+	wia, err := h.services.WIA.GenerateWIA(c.Request.Context(), tenantID, userID, &service.WIARequest{
 		Pop:               req.Pop,
 		Challenge:         req.Challenge,
+		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrWIAChallengeExpired):
 			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "CHALLENGE_EXPIRED",
-				"message": "Challenge is expired or has already been used",
+				"error":   "CHALLENGE_INVALID",
+				"message": "Challenge is invalid",
 			})
 		case errors.Is(err, service.ErrWIAPopInvalid):
 			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
+			})
+		case errors.Is(err, service.ErrWIAInstanceDeactivated):
+			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "INSTANCE_DEACTIVATED",
+				"message": "This wallet instance has been suspended or revoked",
 			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))

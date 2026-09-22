@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -13,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -49,9 +51,15 @@ const (
 
 // Session represents an authenticated session (WebSocket or HTTP+SSE)
 type Session struct {
-	ID          string
-	UserID      string
-	TenantID    string
+	ID       string
+	UserID   string
+	TenantID string
+	// TAC is only ever populated on the go-tokenauth path - see
+	// Manager.validateToken. An empty TAC means "not applicable" (legacy
+	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
+	// per-protocol check must treat it as a no-op, exactly like
+	// requireTACIfEnforced does for HTTP routes.
+	TAC         claims.TAC
 	transport   SessionTransport
 	transportMu sync.RWMutex // guards transport reassignment during session resume
 	flows       map[string]*Flow
@@ -117,6 +125,13 @@ type Manager struct {
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
+
+	// activeConnections counts every upgraded connection, handshaked or not.
+	// The connection limit must be enforced against this, not len(sessions):
+	// sessions are only registered post-handshake, so counting only sessions
+	// lets an attacker open unlimited unauthenticated connections that never
+	// complete the handshake, bypassing the limit entirely.
+	activeConnections atomic.Int64
 }
 
 // NewManager creates a new session manager
@@ -170,11 +185,14 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Enforce global session limit
-	m.sessionsMu.RLock()
-	count := len(m.sessions)
-	m.sessionsMu.RUnlock()
-	if count >= maxConnections {
+	// Reserve a slot atomically before checking the limit. Checking
+	// Load() >= maxConnections and only then incrementing is racy: multiple
+	// concurrent requests can all pass the check before any of them
+	// increments, overshooting maxConnections under load. Add(1) returns the
+	// post-increment value, so only requests that actually push the counter
+	// over the limit roll back.
+	if m.activeConnections.Add(1) > maxConnections {
+		m.activeConnections.Add(-1)
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -185,6 +203,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
 		return
 	}
@@ -199,6 +218,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) handleNewConnection(conn *websocket.Conn) {
+	defer m.activeConnections.Add(-1)
 	transport := newWSTransport(conn)
 	defer func() { _ = transport.Close() }()
 
@@ -229,7 +249,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	userID, tenantID, err := m.validateToken(handshake.AppToken)
+	userID, tenantID, tac, err := m.validateToken(handshake.AppToken)
 	if err != nil {
 		m.logger.Warn("Authentication failed",
 			zap.Error(err),
@@ -259,6 +279,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		ID:            sessionID,
 		UserID:        userID,
 		TenantID:      tenantID,
+		TAC:           tac,
 		transport:     transport,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -440,6 +461,15 @@ func (m *Manager) handleSession(session *Session) {
 	}
 }
 
+// requiredTACForProtocol maps each flow protocol to the TAC permission its
+// action semantically requires: OID4VP shares an existing credential (read),
+// OID4VCI receives a new one (insert). Only enforced when the session
+// actually has a TAC to check - see handleFlowStart.
+var requiredTACForProtocol = map[Protocol]string{
+	ProtocolOID4VP:  "r",
+	ProtocolOID4VCI: "i",
+}
+
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
@@ -464,6 +494,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	if !ok {
 		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Unknown protocol: "+string(msg.Protocol))
 		return
+	}
+
+	// TAC check: only enforced when the session actually has a TAC to check
+	// (empty means legacy auth, which has no TAC concept - see
+	// Manager.validateToken - not "no permissions"), mirroring
+	// requireTACIfEnforced's identical conditional enforcement for HTTP
+	// routes (internal/server/providers.go).
+	if session.TAC != "" {
+		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
+			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
+			logger.Warn("Rejected flow start - insufficient TAC",
+				zap.String("tac", string(session.TAC)),
+				zap.String("required", required),
+			)
+			return
+		}
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
@@ -581,15 +627,25 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed")
 }
 
-func (m *Manager) validateToken(tokenString string) (userID, tenantID string, err error) {
+// validateToken authenticates tokenString and returns its identity.
+// tac is only ever populated on the go-tokenauth path - the legacy HMAC
+// path (below) has no TAC concept at all, so callers must treat an empty
+// tac as "not applicable here", not "no permissions", exactly like
+// requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
+func (m *Manager) validateToken(tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
 		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
+		}
+		// The engine transport, like the AuthZEN proxy, only needs a
+		// wallet-registry or wallet-backend audience - never a broader one.
+		if !result.HasAudience("wallet-registry", "wallet-backend") {
+			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, nil
+		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
 	// Legacy path: direct HMAC validation
@@ -601,23 +657,23 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, er
 	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
 		// Support both "user_id" (go-wallet-backend native) and "uuid" (wallet-backend-server compat)
-		userID, _ = claims["user_id"].(string)
+		userID, _ = mapClaims["user_id"].(string)
 		if userID == "" {
-			userID, _ = claims["uuid"].(string)
+			userID, _ = mapClaims["uuid"].(string)
 		}
-		tenantID, _ = claims["tenant_id"].(string)
+		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
-			return "", "", errors.New("invalid token claims: missing user_id or uuid")
+			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
-		return userID, tenantID, nil
+		return userID, tenantID, "", nil
 	}
 
-	return "", "", errors.New("invalid token")
+	return "", "", "", errors.New("invalid token")
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -746,6 +802,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "")
+}
+
+// SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
+// refresh_token (and the DPoP key it's bound to) to relay to the client -
+// see FlowCompleteMessage.RefreshToken/DPoPJWK.
+func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID)
+}
+
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -756,8 +823,11 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 			FlowID:    flowID,
 			Timestamp: Now(),
 		},
-		Credentials: credentials,
-		RedirectURI: redirectURI,
+		Credentials:  credentials,
+		RedirectURI:  redirectURI,
+		RefreshToken: refreshToken,
+		DPoPJWK:      dpopJWK,
+		DPoPKeyID:    dpopKeyID,
 	}
 	if flow != nil {
 		flow.mu.RLock()
@@ -772,8 +842,11 @@ func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult
 	return s.Send(&msg)
 }
 
-// SendFlowError sends a flow error message
-func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, message string) error {
+// SendFlowError sends a flow error message. An optional details map (e.g. a
+// redirect_uri returned by a verifier's error-response endpoint per OID4VP
+// §8.2/§8.5) can be passed as a trailing argument without touching the many
+// existing 4-arg call sites.
+func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, message string, details ...map[string]interface{}) error {
 	msg := FlowErrorMessage{
 		Message: Message{
 			Type:      TypeFlowError,
@@ -785,6 +858,9 @@ func (s *Session) SendFlowError(flowID string, step FlowStep, code ErrorCode, me
 			Code:    code,
 			Message: message,
 		},
+	}
+	if len(details) > 0 {
+		msg.Error.Details = details[0]
 	}
 	return s.Send(&msg)
 }
@@ -918,12 +994,13 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timeout := time.After(30 * time.Second)
+	timer := time.NewTimer(3 * time.Minute)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-timeout:
+		case <-timer.C:
 			return nil, ErrSignTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")

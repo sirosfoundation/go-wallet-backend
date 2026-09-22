@@ -31,6 +31,12 @@ var (
 		Name:      "challenges_capacity_exceeded_total",
 		Help:      "Total number of challenge creation attempts rejected due to capacity.",
 	})
+	challengeEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "challenges_evicted_total",
+		Help:      "Total number of expired challenges evicted by the cleanup loop.",
+	})
 
 	// WIA generation metrics
 	wiaGeneratedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -88,5 +94,11 @@ var (
 		Subsystem: "wia",
 		Name:      "native_attestation_errors_total",
 		Help:      "Total number of failed native attestation verifications.",
+	})
+	nativeAttestationDevChainBypass = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "native_attestation_dev_chain_bypass_total",
+		Help:      "Total number of App Attest verifications that proceeded despite a failed x5c chain check because apple_app_attest_environment=development. Should be zero in production.",
 	})
 )

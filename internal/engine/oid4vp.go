@@ -52,17 +52,27 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 
 // ClientIDScheme constants for OID4VP client identification
 const (
-	ClientIDSchemeRedirectURI         = "redirect_uri"
-	ClientIDSchemeDID                 = "did"
-	ClientIDSchemeX509SANDNS          = "x509_san_dns"
-	ClientIDSchemeX509SANURI          = "x509_san_uri"
-	ClientIDSchemeVerifierAttestation = "verifier_attestation"
+	ClientIDSchemeRedirectURI = "redirect_uri"
+	ClientIDSchemeDID         = "did"
+	// ClientIDSchemeDecentralizedIdentifier is OpenID4VP 1.0's name for the
+	// scheme the drafts called "did". Verifiers built against the final
+	// specification send this one, and it means exactly the same thing, so
+	// everything below treats the two as one scheme.
+	ClientIDSchemeDecentralizedIdentifier = "decentralized_identifier"
+	ClientIDSchemeX509SANDNS              = "x509_san_dns"
+	ClientIDSchemeX509SANURI              = "x509_san_uri"
+	ClientIDSchemeX509Hash                = "x509_hash"
+	ClientIDSchemeVerifierAttestation     = "verifier_attestation"
 )
 
 // Response mode constants
 const (
 	ResponseModeDirectPost    = "direct_post"
 	ResponseModeDirectPostJWT = "direct_post.jwt"
+	// Modes that hand the result back through the user agent rather than a
+	// POST from the wallet (previously spelled inline in submitResponse).
+	ResponseModeQuery    = "query"
+	ResponseModeFragment = "fragment"
 )
 
 // HTTP header/content type constants
@@ -103,6 +113,15 @@ type AuthorizationRequest struct {
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
+	// VerifierSessionID is the verifier-assigned "sessionId" query parameter
+	// carried on the request_uri we fetched the signed request object from
+	// (e.g. ".../openid4vpRequest?sessionId=X"). A real ZK/PPID pseudonym's
+	// verifier_context binds to THIS specific presentation session (per
+	// zk-cred-longfellow's V8/PPID reference implementation), not to the
+	// verifier's static identity - confirmed 2026-08-17 via direct report
+	// from that implementation's author. Empty for non-ZK presentations or
+	// request URIs that never carried a sessionId to begin with.
+	VerifierSessionID string `json:"-"`
 }
 
 // ClientMetadata represents verifier/client metadata
@@ -146,7 +165,12 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	authReq, err := h.parseRequest(ctx, msg)
 	if err != nil {
 		h.Logger.Debug("failed to parse request", zap.Error(err))
-		_ = h.Error(StepParsingRequest, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
+		var fetchErr *requestFetchError
+		if errors.As(err, &fetchErr) {
+			_ = h.Error(StepParsingRequest, ErrCodeRequestFetchError, ErrCodeRequestFetchError.UserFacingMessage())
+		} else {
+			_ = h.Error(StepParsingRequest, ErrCodeRequestParseError, ErrCodeRequestParseError.UserFacingMessage())
+		}
 		return err
 	}
 
@@ -201,12 +225,28 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage) (*AuthorizationRequest, error) {
 	_ = h.ProgressMessage(StepParsingRequest, "Parsing authorization request")
 
+	h.Logger.Debug("parsing authorization request",
+		zap.String("request_uri", redactURIForLogging(msg.RequestURI)),
+		zap.String("request_uri_ref", redactURIForLogging(msg.RequestURIRef)))
+
 	var authReq AuthorizationRequest
 
 	if msg.RequestURI != "" {
-		// Parse from openid4vp:// URL or direct URL
+		// Parse from openid4vp://, haip://, haip-vp://, mdoc-openid4vp://, or
+		// a direct https:// URL. HAIP (OpenID4VC High Assurance
+		// Interoperability Profile) and ISO 18013-7 Annex B's mdoc-specific
+		// scheme both use the same openid4vp://?client_id=...&request_uri=...
+		// wire shape as plain OID4VP, just under their own scheme(s) - treat
+		// them all identically. "haip://" was HAIP's early-draft (1-3)
+		// scheme; HAIP 1.0 final replaced it with "haip-vp://" (presentation)
+		// - real verifiers (e.g. Multipaz) already emit the new one, and
+		// omitting it here fell through to the raw-https-URL branch below,
+		// which treats the whole thing as either an inline query string or a
+		// fetchable reference URL - neither is right for a haip-vp:// link
+		// carrying its own request_uri query param, so it never dereferenced
+		// that reference and failed with a generic "invalid message format".
 		requestStr := msg.RequestURI
-		if strings.HasPrefix(requestStr, "openid4vp://") {
+		if strings.HasPrefix(requestStr, "openid4vp://") || strings.HasPrefix(requestStr, "haip://") || strings.HasPrefix(requestStr, "haip-vp://") || strings.HasPrefix(requestStr, "mdoc-openid4vp://") {
 			u, err := url.Parse(requestStr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid request URL: %w", err)
@@ -219,13 +259,87 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			// Parse inline parameters
 			return h.parseRequestFromURL(u)
 		}
-		// Direct URL
-		return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
+		// requestStr may be a raw query string with no scheme at all (e.g.
+		// "client_id=foo&nonce=bar", as validateResponseURIOrigin already
+		// anticipates) rather than a URL. Anything that doesn't itself start
+		// with a URL scheme is a raw query string - parse it as inline
+		// params directly, the same as before this fix. This check must
+		// come before ever calling url.Parse on requestStr: a raw query
+		// string can contain a "://" inside a parameter value (e.g.
+		// client_id=https://verifier...), which url.Parse rejects with
+		// "first path segment ... cannot contain colon" since the string
+		// itself has no leading scheme.
+		if !hasURLScheme(requestStr) {
+			return h.parseRequestFromURL(&url.URL{RawQuery: requestStr})
+		}
+		// Direct https:// URL: either a by-value request with inline query
+		// parameters, or a bare reference URL (no query at all) that must be
+		// fetched to obtain the actual request object - e.g. a QR/link that
+		// itself IS the request_uri, with no openid4vp://... wrapper. A
+		// query-less URL can't carry inline params, so treating requestStr as
+		// a literal RawQuery in that case silently yields every field empty
+		// (this is exactly what broke: a bare https://.../haip-vp link with
+		// no "=" characters parsed to nonce="" and failed on "missing
+		// required 'nonce' parameter", never even attempting to fetch it).
+		u, err := url.Parse(requestStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request URL: %w", err)
+		}
+		if u.RawQuery == "" {
+			return h.fetchRequestFromURI(ctx, requestStr)
+		}
+		return h.parseRequestFromURL(u)
 	} else if msg.RequestURIRef != "" {
 		return h.fetchRequestFromURI(ctx, msg.RequestURIRef)
 	}
 
 	return &authReq, errors.New("no request provided")
+}
+
+// hasURLScheme reports whether s begins with a URL scheme ("scheme://...",
+// per RFC 3986: a letter followed by letters/digits/+/-/. up to "://").
+// Used to tell an actual URL apart from a raw query string that happens to
+// contain "://" inside a parameter value.
+func hasURLScheme(s string) bool {
+	idx := strings.Index(s, "://")
+	if idx <= 0 {
+		return false
+	}
+	scheme := s[:idx]
+	for i := 0; i < len(scheme); i++ {
+		c := scheme[i]
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		isDigit := c >= '0' && c <= '9'
+		if !isLetter && !isDigit && c != '+' && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// redactURIForLogging returns a form of uri safe to log: scheme and host
+// only. The query string (and, for a bare raw-query value, the entire
+// string) may carry sensitive material - nonces, reference tokens, embedded
+// JWTs - so neither is ever included.
+func redactURIForLogging(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme == "" {
+		return "<non-url>"
+	}
+	// Host is legitimately empty for some valid, non-sensitive requests -
+	// e.g. "haip://?client_id=..." (no callback/authority segment) parses
+	// with an empty Host. Requiring a non-empty Host here would misclassify
+	// those as "<non-url>" instead of the more informative "haip://".
+	return u.Scheme + "://" + u.Host
 }
 
 func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, error) {
@@ -293,7 +407,29 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 	return &authReq, nil
 }
 
+// requestFetchError distinguishes a failure to retrieve the request object
+// (network error, non-200 status) from a failure to parse it once
+// retrieved, so Execute() can report ErrCodeRequestFetchError instead of the
+// generic ErrCodeRequestParseError for what's really a connectivity/lookup
+// problem against the verifier's request_uri (e.g. an already-expired
+// reference), not a malformed request.
+type requestFetchError struct{ err error }
+
+func (e *requestFetchError) Error() string { return e.err.Error() }
+func (e *requestFetchError) Unwrap() error { return e.err }
+
 func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
+	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
+
+	// The verifier assigns this session id itself (it's the query param on
+	// the request_uri it handed us) - extract it up front from the URI
+	// string directly, rather than from the fetched request object, since
+	// it never appears inside the JWT/JSON body itself.
+	var verifierSessionID string
+	if parsedURI, err := url.Parse(uri); err == nil {
+		verifierSessionID = parsedURI.Query().Get("sessionId")
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, err
@@ -305,12 +441,24 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	// attacker-supplied request_uri is inherent to OID4VP §5.10.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch request: %w", err)
+		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request fetch returned status %d", resp.StatusCode)
+		// Only the length is logged, not the body itself: the body comes from
+		// a verifier-controlled endpoint and could contain session tokens,
+		// diagnostic detail, or embedded JWTs - the same class of concern
+		// redactURIForLogging already avoids for request_uri query strings.
+		// A bare status code alone can't tell a dead/expired request_uri
+		// apart from a wrong path or an unrelated server error, but the
+		// content length is enough of a differential signal for that
+		// without echoing untrusted content into logs.
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+		h.Logger.Debug("request fetch returned non-200 status",
+			zap.Int("status", resp.StatusCode),
+			zap.Int64("body_length", n))
+		return nil, &requestFetchError{fmt.Errorf("request fetch returned status %d", resp.StatusCode)}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
@@ -329,17 +477,29 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		}
 	}
 
-	if strings.Count(bodyStr, ".") == 2 {
+	var authReq *AuthorizationRequest
+	if strings.HasPrefix(bodyStr, "{") || strings.HasPrefix(bodyStr, "[") {
+		// A dot count can't reliably distinguish JWT from JSON: a JSON
+		// request object can easily contain exactly two '.' characters (for
+		// example a response_uri like "https://a.b.c/path"), which would
+		// misclassify it as a JWT and fail to parse. JSON always starts with
+		// '{' or '[' once whitespace is trimmed, and a JWT never does, so
+		// check that instead.
+		authReq = &AuthorizationRequest{}
+		err = json.Unmarshal([]byte(bodyStr), authReq)
+		if err != nil {
+			err = fmt.Errorf("failed to parse request: %w", err)
+		}
+	} else {
 		// Likely a JWT
-		return h.parseRequestJWT(bodyStr)
+		authReq, err = h.parseRequestJWT(bodyStr)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	var authReq AuthorizationRequest
-	if err := json.Unmarshal([]byte(bodyStr), &authReq); err != nil {
-		return nil, fmt.Errorf("failed to parse request: %w", err)
-	}
-
-	return &authReq, nil
+	authReq.VerifierSessionID = verifierSessionID
+	return authReq, nil
 }
 
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
@@ -408,14 +568,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	var attestationContext map[string]interface{}
 
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeDID:
+	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
 		// DID scheme: request MUST be JWT-secured
-		// Resolve DID document server-side via go-trust, then verify JWT
-		if !strings.HasPrefix(authReq.ClientID, "did:") {
-			return nil, errors.New("client_id_scheme=did but client_id is not a DID")
+		// Resolve DID document server-side via go-trust, then verify JWT.
+		// Under OpenID4VP 1.0 the client_id carries its scheme as a prefix,
+		// so resolution uses the DID itself while trust evaluation keeps the
+		// client_id exactly as the verifier sent it.
+		did := didFromClientID(authReq.ClientID)
+		if !strings.HasPrefix(did, "did:") {
+			return nil, fmt.Errorf("client_id_scheme=%s but client_id is not a DID", authReq.ClientIDScheme)
 		}
 		if authReq.RequestJWT == "" {
-			return nil, errors.New("client_id_scheme=did requires a signed request JWT")
+			return nil, fmt.Errorf("client_id_scheme=%s requires a signed request JWT", authReq.ClientIDScheme)
 		}
 
 		// Resolve DID document to get verification method keys
@@ -425,14 +589,14 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		resolvedKeys, err := h.TrustSvc.ResolveDID(
 			trust.ContextWithTenant(ctx, tenantID),
-			authReq.ClientID,
+			did,
 			"", // use default verifier PDP endpoint
 		)
 		if err != nil {
-			return nil, fmt.Errorf("DID resolution failed for %s: %w", authReq.ClientID, err)
+			return nil, fmt.Errorf("DID resolution failed for %s: %w", did, err)
 		}
 		if len(resolvedKeys) == 0 {
-			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", authReq.ClientID)
+			return nil, fmt.Errorf("DID %s resolved but contains no verification method keys", did)
 		}
 
 		// Verify JWT signature against resolved DID keys
@@ -442,7 +606,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		h.Logger.Debug("DID request JWT verified",
-			zap.String("did", authReq.ClientID),
+			zap.String("did", did),
 			zap.Any("matched_kid", matchedJWK["kid"]))
 
 		keyMaterial = &KeyMaterial{
@@ -462,6 +626,25 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 		if km.Type != "x5c" {
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
+		}
+		keyMaterial = km
+
+	case ClientIDSchemeX509Hash:
+		// X.509 hash scheme: client_id is the leaf cert's own digest rather
+		// than a SAN entry, so (unlike x509_san_dns) there's no domain/origin
+		// to check here at all - go-trust's PDP already has the client_id-vs-
+		// cert-hash comparison (added alongside its x509_hash skip-chain-
+		// validation support), so this case only needs to verify the request
+		// JWT's signature against its embedded x5c, same as x509_san_dns.
+		if authReq.RequestJWT == "" {
+			return nil, errors.New("x509_hash scheme requires a signed request JWT")
+		}
+		km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if verifyErr != nil {
+			return nil, fmt.Errorf("x509_hash JWT verification failed: %w", verifyErr)
+		}
+		if km.Type != "x5c" {
+			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
 
@@ -659,13 +842,15 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 // The frontend resolves the DID document to get keys and verifies the JWT.
 // This function is kept for reference but should not be used.
 func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMaterial, error) {
-	// Validate client_id is a valid DID
-	if !strings.HasPrefix(authReq.ClientID, "did:") {
+	// Validate client_id is a valid DID, allowing OpenID4VP 1.0's
+	// decentralized_identifier: prefix in front of it.
+	did := didFromClientID(authReq.ClientID)
+	if !strings.HasPrefix(did, "did:") {
 		return nil, errors.New("client_id_scheme=did but client_id is not a DID")
 	}
-	parts := strings.SplitN(authReq.ClientID, ":", 3)
+	parts := strings.SplitN(did, ":", 3)
 	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
-		return nil, fmt.Errorf("invalid DID format: %s", authReq.ClientID)
+		return nil, fmt.Errorf("invalid DID format: %s", did)
 	}
 
 	// Request must be JWT-secured
@@ -759,7 +944,13 @@ func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifi
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).
+//
+// OpenID4VP 1.0's decentralized_identifier: prefix is stripped first: it makes
+// the client_id an opaque URI with no authority, so without this the very same
+// verifier would show a domain under the draft spelling and none under the
+// final one (see didFromClientID).
 func extractDomain(clientID string) string {
+	clientID = didFromClientID(clientID)
 	if strings.HasPrefix(clientID, "did:web:") {
 		// did:web:example.com → example.com (colons become dots in full spec, but the host is the 3rd segment)
 		parts := strings.SplitN(clientID, ":", 4)
@@ -844,13 +1035,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
 // credential_selection progress message and waits for the user to consent or decline.
 // The frontend is responsible for local credential matching and the consent UI.
+//
+// A client that finds nothing to present answers with credentials_matched and
+// an empty match set instead, which ends the flow here. Without that answer
+// the only ways out were a decline - untrue, the user was never asked - or
+// silence until the user-interaction timeout, which is what a wallet missing
+// the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
 	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
 	})
 
-	action, err := h.WaitForAction(ctx, ActionConsent, ActionDecline)
+	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
 		return nil, err
 	}
@@ -861,7 +1058,13 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		}
 		_ = json.Unmarshal(action.Payload, &decline)
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
-		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+		if redirectURI != "" {
+			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
+				map[string]interface{}{"redirect_uri": redirectURI})
+		} else {
+			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
+		}
 		return nil, errors.New("user declined presentation")
 	}
 
@@ -877,6 +1080,144 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	}
 
 	return payload.SelectedCredentials, nil
+}
+
+// waitForSelectionAction waits for the client's answer to a
+// credential_selection message. credentials_matched with an empty match set
+// terminates the flow; with a non-empty one it is informational and the wait
+// continues, so a client that reports its matches before asking the user
+// behaves exactly as one that does not.
+//
+// The user-interaction deadline is taken once, before the first wait, and each
+// later wait gets only what is left of it. WaitForAction starts a fresh
+// UserInteractionTimeout per call, so without this a client repeating the
+// informational action would reset the clock every time and could hold a
+// pending flow slot open indefinitely without ever obtaining consent.
+func (h *OID4VPHandler) waitForSelectionAction(ctx context.Context, authReq *AuthorizationRequest) (*FlowActionMessage, error) {
+	return h.waitForSelectionActionUntil(ctx, authReq, time.Now().Add(UserInteractionTimeout))
+}
+
+// waitForSelectionActionUntil is waitForSelectionAction against an explicit
+// deadline, so a test can exercise the loop without waiting five minutes.
+func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq *AuthorizationRequest, deadline time.Time) (*FlowActionMessage, error) {
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, ErrFlowTimeout
+		}
+
+		action, err := h.Flow.Session.WaitForActionWithTimeout(ctx, h.Flow.ID, remaining,
+			ActionConsent, ActionDecline, ActionCredentialsMatched)
+		if err != nil {
+			return nil, err
+		}
+		if action.Action != ActionCredentialsMatched {
+			return action, nil
+		}
+
+		var matched CredentialsMatchedPayload
+		if err := json.Unmarshal(action.Payload, &matched); err != nil {
+			_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid credentials_matched payload")
+			return nil, fmt.Errorf("invalid credentials_matched payload: %w", err)
+		}
+		if len(matched.Matches) > 0 {
+			continue
+		}
+
+		return nil, h.failNoMatchingCredential(ctx, authReq, matched.NoMatchReason)
+	}
+}
+
+// verifierRefusedDescription is the error_description every refusal sends to
+// the verifier, whether the user declined or the wallet held nothing that
+// matched. OpenID4VP answers both with access_denied so a verifier cannot
+// learn which happened - and therefore cannot probe what a holder has by
+// asking and watching the reason. Two different descriptions would hand that
+// distinction straight back.
+const verifierRefusedDescription = "The wallet did not fulfil the request"
+
+// failNoMatchingCredential ends the flow when the wallet holds nothing the
+// verifier asked for. The verifier is told as well, so its session ends now
+// rather than expiring: OpenID4VP has no dedicated code for "holder has no
+// such credential", and access_denied is the response the specification
+// provides for a request the wallet will not fulfil.
+func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *AuthorizationRequest, reason string) error {
+	requested := requestedCredentialTypes(authReq.DCQLQuery)
+
+	h.Logger.Info("no credential matches the verifier's query",
+		zap.Strings("requested_types", requested), zap.String("client_reason", reason))
+
+	details := map[string]interface{}{}
+	if len(requested) > 0 {
+		details["requested_types"] = requested
+	}
+	if reason != "" {
+		details["no_match_reason"] = reason
+	}
+	// The verifier gets the same description a decline sends, not this
+	// message: naming what the wallet does not hold would tell the verifier
+	// whether the holder has a credential it asked about, which is exactly
+	// what one access_denied for both outcomes is there to prevent. The
+	// detailed text is for the wallet, which is showing it to its own user.
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
+		details["redirect_uri"] = redirectURI
+	}
+
+	// The wallet is the one showing this to a person, and it is the only
+	// party that knows their language, so it gets the code and the requested
+	// types and composes its own sentence. The string here is the same
+	// per-code English fallback every other flow error carries; an
+	// interpolated one would be worse than useless, since a client cannot
+	// translate a sentence it did not build.
+	_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodeNoMatchingCredentials,
+		ErrCodeNoMatchingCredentials.UserFacingMessage(), details)
+
+	return errors.New("no credential matches the verifier's query")
+}
+
+// requestedCredentialTypes lists the credential types a DCQL query asks for,
+// so the error can name what is missing rather than say "nothing matched".
+// Best-effort: an unparseable or exotic query simply yields no names.
+func requestedCredentialTypes(dcql json.RawMessage) []string {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var query struct {
+		Credentials []struct {
+			ID   string `json:"id"`
+			Meta struct {
+				VCTValues     []string `json:"vct_values"`
+				DoctypeValue  string   `json:"doctype_value"`
+				DoctypeValues []string `json:"doctype_values"`
+			} `json:"meta"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &query); err != nil {
+		return nil
+	}
+
+	var types []string
+	seen := map[string]bool{}
+	add := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		types = append(types, v)
+	}
+	for _, c := range query.Credentials {
+		for _, vct := range c.Meta.VCTValues {
+			add(vct)
+		}
+		add(c.Meta.DoctypeValue)
+		for _, dt := range c.Meta.DoctypeValues {
+			add(dt)
+		}
+		if len(c.Meta.VCTValues) == 0 && c.Meta.DoctypeValue == "" && len(c.Meta.DoctypeValues) == 0 {
+			add(c.ID)
+		}
+	}
+	return types
 }
 
 func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
@@ -902,6 +1243,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		CredentialsToInclude:  credRefs,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
+		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
 	})
 	if err != nil {
@@ -1009,9 +1351,9 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
 		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
-	case "fragment":
+	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
-	case "query":
+	case ResponseModeQuery:
 		return h.buildQueryRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	default:
 		return "", fmt.Errorf("unsupported response_mode: %s", responseMode)
@@ -1061,6 +1403,32 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	return "", fmt.Errorf("response submission failed with status %d: %s", resp.StatusCode, string(body))
 }
 
+// buildErrorRedirect returns the URL the user agent is sent to when a
+// query/fragment-mode request ends in an error rather than a vp_token.
+func buildErrorRedirect(endpoint, state, errCode, errDesc string, inFragment bool) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	params := u.Query()
+	if inFragment {
+		params = url.Values{}
+	}
+	params.Set("error", errCode)
+	if errDesc != "" {
+		params.Set("error_description", errDesc)
+	}
+	if state != "" {
+		params.Set("state", state)
+	}
+	if inFragment {
+		u.Fragment = params.Encode()
+	} else {
+		u.RawQuery = params.Encode()
+	}
+	return u.String()
+}
+
 func (h *OID4VPHandler) buildFragmentRedirect(endpoint string, authReq *AuthorizationRequest, vpToken string) string {
 	u, _ := url.Parse(endpoint)
 	fragment := url.Values{}
@@ -1085,8 +1453,19 @@ func (h *OID4VPHandler) buildQueryRedirect(endpoint string, authReq *Authorizati
 
 // inferClientIDScheme infers the client_id_scheme from the client_id format
 // when the verifier does not provide it explicitly.
+// didFromClientID returns the DID a client_id names, with OpenID4VP 1.0's
+// decentralized_identifier: prefix removed when present. The prefix is part of
+// the identifier the verifier signs and is trusted under, so it is stripped
+// only where a DID itself is needed - resolution and format checks - never
+// where the client_id is compared or evaluated.
+func didFromClientID(clientID string) string {
+	return strings.TrimPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":")
+}
+
 func inferClientIDScheme(clientID string) string {
 	switch {
+	case strings.HasPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":"):
+		return ClientIDSchemeDecentralizedIdentifier
 	case strings.HasPrefix(clientID, "did:"):
 		return ClientIDSchemeDID
 	case strings.HasPrefix(clientID, "x509_san_dns:"):
@@ -1115,11 +1494,48 @@ func inferClientIDScheme(clientID string) string {
 // submitErrorResponse posts an OAuth 2.0 error response to the verifier's
 // response_uri per OID4VP §8.2 / §8.5. This allows the conformance suite
 // (and real verifiers) to learn why the wallet rejected the request instead
-// of timing out waiting for a response.
-func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) {
-	if authReq == nil || authReq.ResponseURI == "" {
-		return
+// of timing out waiting for a response. Some verifiers (e.g. multipaz-based
+// ones, mirroring their direct_post.jwt success response) return a
+// redirect_uri here too, so the user can still be sent back to the
+// verifier's own page even on decline/error - returned as a best-effort
+// string, empty if the verifier didn't provide one or the POST failed.
+func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *AuthorizationRequest, errCode, errDesc string) string {
+	if authReq == nil {
+		return ""
 	}
+
+	// query and fragment carry the error back through the user agent, the
+	// way submitResponse carries a vp_token in those modes: the caller gets a
+	// URL to redirect to and nothing is sent from here. Only looking at
+	// response_uri, which these verifiers do not set, meant they were never
+	// told and sat waiting for a response that was never coming.
+	//
+	// The endpoint is chosen exactly as submitResponse chooses it - response_uri
+	// first, redirect_uri otherwise. validateAuthorizationRequest only forbids
+	// redirect_uri for the direct_post modes, so a query/fragment request may
+	// carry both; picking differently here would deliver the vp_token to one
+	// endpoint and the failure to the other, leaving the verifier waiting.
+	if authReq.ResponseMode == ResponseModeQuery || authReq.ResponseMode == ResponseModeFragment {
+		target := authReq.ResponseURI
+		if target == "" {
+			target = authReq.RedirectURI
+		}
+		if target == "" {
+			return ""
+		}
+		endpoint, err := sanitizeEndpointURL(target)
+		if err != nil {
+			h.Logger.Debug("refusing to build an error redirect for an unusable endpoint", zap.Error(err))
+			return ""
+		}
+		return buildErrorRedirect(endpoint, authReq.State, errCode, errDesc,
+			authReq.ResponseMode == ResponseModeFragment)
+	}
+
+	if authReq.ResponseURI == "" {
+		return ""
+	}
+
 	data := url.Values{}
 	data.Set("error", errCode)
 	if errDesc != "" {
@@ -1132,20 +1548,31 @@ func (h *OID4VPHandler) submitErrorResponse(ctx context.Context, authReq *Author
 	req, err := http.NewRequestWithContext(ctx, "POST", authReq.ResponseURI, strings.NewReader(data.Encode()))
 	if err != nil {
 		h.Logger.Debug("failed to create error response request", zap.Error(err))
-		return
+		return ""
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		h.Logger.Debug("failed to send error response to response_uri", zap.Error(err))
-		return
+		return ""
 	}
 	defer resp.Body.Close() //nolint:errcheck
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 	h.Logger.Debug("sent error response to response_uri",
 		zap.String("response_uri", authReq.ResponseURI),
 		zap.String("error", errCode),
-		zap.Int("status", resp.StatusCode))
+		zap.Int("status", resp.StatusCode),
+		zap.String("body", string(respBody)))
+
+	var result struct {
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := json.Unmarshal(respBody, &result); err == nil {
+		return result.RedirectURI
+	}
+	return ""
 }
 
 // validateAuthorizationRequest performs OID4VP 1.0 Final spec-mandated validation
@@ -1168,8 +1595,9 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 
 	// OID4VP §5: Validate client_id_scheme prefix is recognized
 	switch authReq.ClientIDScheme {
-	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeX509SANDNS,
-		ClientIDSchemeX509SANURI, ClientIDSchemeVerifierAttestation:
+	case ClientIDSchemeRedirectURI, ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier,
+		ClientIDSchemeX509SANDNS, ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash,
+		ClientIDSchemeVerifierAttestation:
 		// Known scheme
 	default:
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
@@ -1195,6 +1623,21 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		}
 		if km.Type != "x5c" {
 			return fmt.Errorf("x509_san_dns scheme requires x5c in JWT header, got %q", km.Type)
+		}
+	}
+
+	// x509_hash has the same trust-cache-bypass risk as x509_san_dns above -
+	// verify the JWT signature against its embedded x5c before anything else,
+	// rather than only inside evaluateVerifierTrust's scheme switch (which
+	// runs after the in-memory trust cache check and so would never fire for
+	// a client_id already cached as trusted under a tampered request).
+	if authReq.ClientIDScheme == ClientIDSchemeX509Hash && authReq.RequestJWT != "" {
+		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if err != nil {
+			return fmt.Errorf("x509_hash JWT signature verification failed: %w", err)
+		}
+		if km.Type != "x5c" {
+			return fmt.Errorf("x509_hash scheme requires x5c in JWT header, got %q", km.Type)
 		}
 	}
 
@@ -1233,7 +1676,7 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 		return nil
 	}
 	requestURL := msg.RequestURI
-	if strings.HasPrefix(requestURL, "openid4vp://") {
+	if strings.HasPrefix(requestURL, "openid4vp://") || strings.HasPrefix(requestURL, "haip://") || strings.HasPrefix(requestURL, "haip-vp://") || strings.HasPrefix(requestURL, "mdoc-openid4vp://") {
 		if u, err := url.Parse(requestURL); err == nil {
 			requestURL = u.Query().Get("request_uri")
 		}
@@ -1334,28 +1777,48 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	// This allows interoperability with verifiers that embed their key in the request
 	// JWT x5c header but do not explicitly declare JARM encryption parameters.
 	if encAlg == "" {
-		inferredKey, _, keyErr := h.extractVerifierEncryptionKey(authReq)
+		inferredKey, _, jwkAlg, keyErr := h.extractVerifierEncryptionKey(authReq)
 		if keyErr != nil {
 			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
 		}
-		switch inferredKey.(type) {
-		case *ecdsa.PublicKey:
-			encAlg = "ECDH-ES"
-		case *rsa.PublicKey:
-			encAlg = "RSA-OAEP"
-		default:
-			return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
+		// Only honor the JWK's declared "alg" when it is a JARM key-management
+		// algorithm we support.
+		if jwkAlg != "" {
+			if _, err := mapKeyAlgorithm(jwkAlg); err == nil {
+				encAlg = jwkAlg
+			}
 		}
-		h.Logger.Info("direct_post.jwt: inferred encryption algorithm from key material",
+		if encAlg == "" {
+			switch inferredKey.(type) {
+			case *ecdsa.PublicKey:
+				encAlg = "ECDH-ES"
+			case *rsa.PublicKey:
+				encAlg = "RSA-OAEP"
+			default:
+				return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
+			}
+		}
+		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
 			zap.String("alg", encAlg),
 			zap.String("verifier", authReq.ClientID))
 	}
 	if encEnc == "" {
-		encEnc = "A128CBC-HS256"
+		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
+		// "enc" algorithm, but it is not universally implemented in
+		// practice: confirmed live against verifier.multipaz.org, whose
+		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
+		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
+		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
+		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
+		// despite not declaring encrypted_response_enc_values_supported to
+		// signal that restriction. GCM is an equally spec-valid default
+		// choice absent an explicit verifier preference and has broader
+		// real-world interop, so prefer it.
+		encEnc = "A128GCM"
 	}
 
 	// Extract verifier's public key for encryption
-	verifierKey, kid, err := h.extractVerifierEncryptionKey(authReq)
+	verifierKey, kid, _, err := h.extractVerifierEncryptionKey(authReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract verifier encryption key: %w", err)
 	}
@@ -1411,12 +1874,18 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	h.Logger.Debug("direct_post.jwt: verifier response received",
+		zap.String("endpoint", endpoint),
+		zap.Int("status", resp.StatusCode),
+		zap.String("body", string(respBody)))
+
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		var result struct {
 			RedirectURI                string `json:"redirect_uri"`
 			PresentationDuringIssuance string `json:"presentation_during_issuance_session"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+		if err := json.Unmarshal(respBody, &result); err == nil {
 			if result.RedirectURI != "" {
 				return result.RedirectURI, nil
 			}
@@ -1428,11 +1897,10 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 		return resp.Header.Get("Location"), nil
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(body))
+	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
 }
 
-func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, error) {
+func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, string, error) {
 	// Prefer client_metadata.jwks — this is where verifiers put their
 	// ephemeral encryption key for JARM (ECDH-ES key agreement).
 	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
@@ -1440,8 +1908,10 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 			Keys []json.RawMessage `json:"keys"`
 		}
 		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
-			// Select the best key for encryption: prefer use="enc", then
-			// matching alg, then fall back to first parseable key.
+			// Select the best key for encryption: prefer use="enc", else fall
+			// back to the first parseable key. The JWK's own "alg" is returned
+			// so the caller can honor the verifier's declared algorithm instead
+			// of inferring one from the key type.
 			var fallbackKey *jose.JSONWebKey
 			for _, raw := range jwks.Keys {
 				var jwk jose.JSONWebKey
@@ -1449,7 +1919,7 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 					continue
 				}
 				if jwk.Use == "enc" {
-					return jwk.Key, jwk.KeyID, nil
+					return jwk.Key, jwk.KeyID, jwk.Algorithm, nil
 				}
 				if fallbackKey == nil {
 					k := jwk // copy
@@ -1457,13 +1927,15 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 				}
 			}
 			if fallbackKey != nil {
-				return fallbackKey.Key, fallbackKey.KeyID, nil
+				return fallbackKey.Key, fallbackKey.KeyID, fallbackKey.Algorithm, nil
 			}
 		}
 	}
 
 	// Fallback: x5c from request JWT header (signing key, used when no
-	// dedicated encryption key is provided in client_metadata)
+	// dedicated encryption key is provided in client_metadata). The x5c
+	// certificate carries no JARM key-management alg, so none is returned
+	// and the caller infers one from the key type.
 	if authReq.RequestJWT != "" {
 		parts := strings.Split(authReq.RequestJWT, ".")
 		var kid string
@@ -1484,18 +1956,18 @@ func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationReque
 			if err != nil {
 				certDER, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to decode x5c certificate: %w", err)
+					return nil, "", "", fmt.Errorf("failed to decode x5c certificate: %w", err)
 				}
 			}
 			cert, err := x509.ParseCertificate(certDER)
 			if err != nil {
-				return nil, "", fmt.Errorf("failed to parse x5c certificate: %w", err)
+				return nil, "", "", fmt.Errorf("failed to parse x5c certificate: %w", err)
 			}
-			return cert.PublicKey, kid, nil
+			return cert.PublicKey, kid, "", nil
 		}
 	}
 
-	return nil, "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
+	return nil, "", "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
 }
 
 // Returns the verifier's encryption key as a JSONWebKey.

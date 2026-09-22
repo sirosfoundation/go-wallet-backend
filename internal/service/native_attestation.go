@@ -162,9 +162,14 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		Intermediates: intermediates,
 	})
 	if err != nil {
-		// In development environment, log warning but continue
 		if nativeCfg.AppleAppAttestEnvironment == "development" {
-			s.logger.Warn("App Attest x5c chain verification failed (development mode)", zap.Error(err))
+			// Development-only bypass for test harnesses without a genuine Apple
+			// attestation chain. Logged at Error (not Warn) and counted in a
+			// dedicated metric so an accidental "development" setting in a
+			// production deployment is loud, not silent. The nonce check below
+			// is NOT bypassed even in development — see that check for why.
+			nativeAttestationDevChainBypass.Inc()
+			s.logger.Error("App Attest x5c chain verification failed — proceeding because apple_app_attest_environment=development; this must never be set in production", zap.Error(err))
 		} else {
 			return nil, fmt.Errorf("%w: x5c chain verification: %v", ErrNativeAttestationInvalid, err)
 		}
@@ -198,12 +203,13 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		}
 	}
 	if !expectedNonceFound {
-		// In development mode, log and continue
-		if nativeCfg.AppleAppAttestEnvironment == "development" {
-			s.logger.Warn("App Attest nonce mismatch (development mode)")
-		} else {
-			return nil, fmt.Errorf("%w: nonce mismatch in leaf certificate", ErrNativeAttestationInvalid)
-		}
+		// Always enforced, including in development: the nonce is what binds this
+		// attestation to the specific single-use WIA challenge. Unlike the x5c
+		// chain (which legitimately can't be produced without real Apple hardware
+		// in dev/test), a dev/test harness can always compute this correctly, so
+		// there's no legitimate reason to skip it — doing so would let a forged
+		// attestation with an arbitrary nonce through.
+		return nil, fmt.Errorf("%w: nonce mismatch in leaf certificate", ErrNativeAttestationInvalid)
 	}
 
 	// Step 5: Verify rpIdHash matches configured App ID

@@ -6,7 +6,9 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -24,6 +26,7 @@ type Services struct {
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
+	FIDO2Attestation *FIDO2AttestationService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	AAGUIDValidator  *AAGUIDValidator
@@ -40,25 +43,42 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Continue without WebAuthn - it will be nil
 	}
 
-	wpSvc := NewWalletProviderService(cfg, logger)
+	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
 
-	// WIA shares the same signing key as the wallet provider
+	// WIA shares the same signing key as the wallet provider. Uses
+	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
+	// signing key, not a certificate — IsSupported additionally requires a
+	// certificate chain, which is only mandatory for Key Attestation and
+	// "etsi"-mode WIA.
 	var wiaSvc *WIAService
-	if cfg.WalletProvider.WIA.Enabled && wpSvc.IsSupported() {
+	if cfg.WalletProvider.WIA.Enabled && wpSvc.HasSigningKey() {
 		var challengeStore WIAChallengeStore
 		// Use MongoDB-backed challenge store if the underlying storage is MongoDB.
 		type databaseProvider interface {
 			Database() *mongo.Database
 		}
 		if dbp, ok := store.(databaseProvider); ok {
-			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges)
+			cs, err := NewMongoWIAChallengeStore(context.Background(), dbp.Database(), maxChallenges, maxChallengesPerTenant)
 			if err != nil {
 				logger.Warn("Failed to create MongoDB WIA challenge store, falling back to memory", zap.Error(err))
 			} else {
 				challengeStore = cs
 			}
 		}
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), nil, challengeStore)
+		// Use the shared SET audit emitter constructor so WIA issuance events are
+		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
+		wiaAuditor := audit.NewFromConfig(cfg, logger)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		// A signing key alone is enough to construct WIAService, but "etsi"
+		// mode additionally requires a certificate chain (see IsSupported).
+		// Leaving wiaSvc non-nil here would register the WIA routes, but
+		// every actual call would fail with ErrWIANotSupported, which the
+		// handlers map to a generic 500 rather than the clean 503
+		// WIA_NOT_SUPPORTED they already return for services.WIA == nil -
+		// nil it out here so that existing check covers this case too.
+		if !wiaSvc.IsSupported() {
+			wiaSvc = nil
+		}
 	}
 
 	return &Services{
@@ -74,6 +94,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
+		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
 		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
@@ -103,5 +124,8 @@ func (s *Services) Stop() {
 	}
 	if s.TokenBlacklist != nil {
 		s.TokenBlacklist.Stop()
+	}
+	if s.WalletProvider != nil {
+		s.WalletProvider.Close()
 	}
 }

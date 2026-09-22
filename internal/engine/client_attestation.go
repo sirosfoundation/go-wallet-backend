@@ -9,18 +9,20 @@ import (
 // per draft-ietf-oauth-attestation-based-client-auth-04 §3.1.
 //
 // This interface is transport-independent: the wallet frontend/SDK always
-// manages the instance key (in passkey-PRF-encrypted private data) and
-// generates both the WIA and PoP. The backend simply forwards them as
-// HTTP headers to the issuer's PAR/token endpoint.
+// manages the instance key and generates both the WIA and PoP. The backend
+// simply forwards them as HTTP headers to the issuer's PAR/token endpoint.
 //
 // The two HTTP headers set are:
 //   - OAuth-Client-Attestation: the WIA JWT (typ: oauth-client-attestation+jwt)
 //   - OAuth-Client-Attestation-PoP: the PoP JWT (typ: oauth-client-attestation-pop+jwt)
 //
-// Architecture note: The instance key NEVER resides on the backend. It lives in
-// the client's encrypted private data blob (protected by passkey-PRF-derived key).
-// The client obtains the WIA from /wallet-provider/wia/generate and signs the PoP
-// locally before passing both to the backend at flow start.
+// Architecture note: The instance key NEVER resides on the backend. Where it
+// lives depends on the instance's WSCD type (see domain.WSCDType): passkey
+// PRF-derived-key-encrypted private data for the browser/WebCrypto case, iOS
+// Secure Enclave, Android StrongBox/TEE, or an HSM behind R2PS for remote
+// WSCDs. The client obtains the WIA from /wallet-provider/wia/generate and
+// signs the PoP locally (using whichever WSCD backs its instance key) before
+// passing both to the backend at flow start.
 type ClientAttestationProvider interface {
 	// Available reports whether attestation credentials are available for this flow.
 	Available() bool

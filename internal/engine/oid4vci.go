@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -51,15 +50,31 @@ type OID4VCIHandler struct {
 	dpopKey          *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
 	dpopNonce        string                 // server-provided DPoP nonce (RFC 9449 §8)
 	redirectURI      string
-	clientID         string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
-	clientJWK        *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
-	clientKID        string            // key ID from client JWK (for JWT kid header)
-	authServerIssuer string            // AS issuer URL (for private_key_jwt aud claim)
+	// authorizationDetails is what the client asked to be sent on the
+	// Authorization Request - see FlowStartMessage.AuthorizationDetails for
+	// why the Wallet decides this and the engine only forwards it.
+	authorizationDetails []AuthorizationDetail
+	clientID             string            // effective OAuth client_id; defaults to redirectURI, overridden by registered issuer's ClientID
+	clientJWK            *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
+	clientKID            string            // key ID from client JWK (for JWT kid header)
+	authServerIssuer     string            // AS issuer URL (for private_key_jwt aud claim)
 
 	// Client attestation provider for OAuth-Client-Attestation-based auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
 	// When available, takes precedence over private_key_jwt.
+	// Legacy mode only (see clientAuthMode): in client-held mode the WIA and
+	// a fresh PoP arrive with every SignActionSignClientAuth response.
 	attestationProvider ClientAttestationProvider
+	// legacyAttestationRequested records that the one-shot
+	// SignActionRequestAttestation of legacy mode has been sent, so a flow
+	// whose client declined is not asked again on every request.
+	legacyAttestationRequested bool
+
+	// clientAuthMode and dpopKeyID implement engine-requested DPoP signing
+	// (go-wallet-backend#317): see clientauth.go. dpopKey above is only set
+	// in legacy mode.
+	clientAuthMode clientAuthMode
+	dpopKeyID      string
 }
 
 // NewOID4VCIHandlerFactory returns a FlowHandlerFactory that shares the given
@@ -93,6 +108,7 @@ type oauthServerMetadata struct {
 	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
 	TokenEndpoint                      string   `json:"token_endpoint"`
 	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests bool     `json:"require_pushed_authorization_requests"`
 	CodeChallengeMethodsSupported      []string `json:"code_challenge_methods_supported"`
 	codeChallengeMethodsDeclared       bool
 }
@@ -104,6 +120,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 		AuthorizationEndpoint              string    `json:"authorization_endpoint"`
 		TokenEndpoint                      string    `json:"token_endpoint"`
 		PushedAuthorizationRequestEndpoint string    `json:"pushed_authorization_request_endpoint"`
+		RequirePushedAuthorizationRequests bool      `json:"require_pushed_authorization_requests"`
 		CodeChallengeMethodsSupported      *[]string `json:"code_challenge_methods_supported"`
 	}
 	var aux alias
@@ -113,6 +130,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	m.AuthorizationEndpoint = aux.AuthorizationEndpoint
 	m.TokenEndpoint = aux.TokenEndpoint
 	m.PushedAuthorizationRequestEndpoint = aux.PushedAuthorizationRequestEndpoint
+	m.RequirePushedAuthorizationRequests = aux.RequirePushedAuthorizationRequests
 	m.codeChallengeMethodsDeclared = aux.CodeChallengeMethodsSupported != nil
 	if aux.CodeChallengeMethodsSupported != nil {
 		m.CodeChallengeMethodsSupported = *aux.CodeChallengeMethodsSupported
@@ -234,6 +252,11 @@ type TokenResponse struct {
 	RefreshToken    string `json:"refresh_token,omitempty"`
 	CNonce          string `json:"c_nonce,omitempty"`
 	CNonceExpiresIn int    `json:"c_nonce_expires_in,omitempty"`
+	// AuthorizationDetails is what the Authorization Server granted in
+	// response to the ones we asked for (OID4VCI 1.0 §6). When it names
+	// credential identifiers, the Credential Request must use one of them
+	// instead of a credential_configuration_id - see requestCredential.
+	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 }
 
 // CredentialResponse represents credential endpoint response
@@ -307,6 +330,58 @@ func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*Credentia
 // generateDPoPKey creates an ephemeral P-256 key pair for DPoP proofs (RFC 9449).
 func generateDPoPKey() (*ecdsa.PrivateKey, error) {
 	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+}
+
+// dpopPrivateKeyJWK exports the DPoP key as a private JWK so the client can
+// hold onto it (in its own privatedata store) across the renewal boundary.
+// vc's refresh_token grant binds the token to the exact DPoP key used at
+// initial issuance (RFC 9449/ARF 3.0 §6.6.6.2.2 sender-constraining) and a
+// later renewal must present that same key - but this handler generates a
+// fresh ephemeral h.dpopKey per flow and never persists it itself (per this
+// codebase's rule that only the client, via privatedata, holds keys
+// long-term). Round-tripping the JWK through the client is what lets a
+// later renewal reconstruct the identical key in-memory for that one
+// exchange, instead of the backend storing it.
+func dpopPrivateKeyJWK(key *ecdsa.PrivateKey) (string, error) {
+	fields, err := ecPublicKeyJWK(&key.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: %w", err)
+	}
+	raw, err := key.Bytes()
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: %w", err)
+	}
+	fields["d"] = base64.RawURLEncoding.EncodeToString(raw)
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return "", fmt.Errorf("dpopPrivateKeyJWK: marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+// parseDPoPPrivateKeyJWK reconstructs the ecdsa.PrivateKey a client supplies
+// on a renewal request, previously obtained via dpopPrivateKeyJWK.
+func parseDPoPPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, error) {
+	var raw struct {
+		Kty string `json:"kty"`
+		Crv string `json:"crv"`
+		D   string `json:"d"`
+	}
+	if err := json.Unmarshal([]byte(jwkJSON), &raw); err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid JSON: %w", err)
+	}
+	if raw.Kty != "EC" || raw.Crv != "P-256" {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: unsupported kty/crv %q/%q", raw.Kty, raw.Crv)
+	}
+	d, err := base64.RawURLEncoding.DecodeString(raw.D)
+	if err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid d: %w", err)
+	}
+	priv, err := ecdsa.ParseRawPrivateKey(elliptic.P256(), d)
+	if err != nil {
+		return nil, fmt.Errorf("parseDPoPPrivateKeyJWK: invalid key material: %w", err)
+	}
+	return priv, nil
 }
 
 // ecPublicKeyJWK returns the JWK representation of an ECDSA P-256 public key as a map.
@@ -450,26 +525,18 @@ func parseECPrivateKeyJWK(jwkJSON string) (*ecdsa.PrivateKey, string, error) {
 		return nil, "", fmt.Errorf("unsupported curve %q", raw.Crv)
 	}
 
-	xBytes, err := base64.RawURLEncoding.DecodeString(raw.X)
-	if err != nil {
-		return nil, "", fmt.Errorf("decoding x: %w", err)
-	}
-	yBytes, err := base64.RawURLEncoding.DecodeString(raw.Y)
-	if err != nil {
-		return nil, "", fmt.Errorf("decoding y: %w", err)
-	}
 	dBytes, err := base64.RawURLEncoding.DecodeString(raw.D)
 	if err != nil {
 		return nil, "", fmt.Errorf("decoding d: %w", err)
 	}
 
-	key := &ecdsa.PrivateKey{
-		PublicKey: ecdsa.PublicKey{
-			Curve: curve,
-			X:     new(big.Int).SetBytes(xBytes),
-			Y:     new(big.Int).SetBytes(yBytes),
-		},
-		D: new(big.Int).SetBytes(dBytes),
+	// ParseRawPrivateKey derives the public key from d itself rather than
+	// trusting the JWK's own x/y fields (which this function previously
+	// decoded and stuffed in unchecked) - strictly more correct, and drops
+	// the deprecated PublicKey.X/Y/PrivateKey.D field construction.
+	key, err := ecdsa.ParseRawPrivateKey(curve, dBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("parsing raw private key: %w", err)
 	}
 	return key, raw.Kid, nil
 }
@@ -502,14 +569,15 @@ func createClientAssertion(key *ecdsa.PrivateKey, kid, clientID, audience string
 
 // setClientAuth adds client authentication parameters to the request form data.
 // Priority: attestation-based auth (§3.1) > private_key_jwt > client_id only.
-// When attestation is available, client_id is still set in form data (some AS require it)
-// but the actual auth is via HTTP headers set by setAttestationHeaders.
-func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
+// When the request carries attestation (attested, resolved beforehand by
+// resolveClientAuth), client_id is still set in form data (some AS require it)
+// but the actual auth is via the OAuth-Client-Attestation HTTP headers.
+func (h *OID4VCIHandler) setClientAuth(data url.Values, attested bool) error {
 	data.Set("client_id", h.clientID)
 
-	// When attestation provider is available, form-body auth is not used;
-	// the attestation is sent via HTTP headers in setAttestationHeaders.
-	if h.attestationProvider != nil && h.attestationProvider.Available() {
+	// When the request is attested, form-body auth is not used; the
+	// attestation goes in HTTP headers.
+	if attested {
 		return nil
 	}
 
@@ -525,14 +593,58 @@ func (h *OID4VCIHandler) setClientAuth(data url.Values) error {
 	return nil
 }
 
-// setAttestationHeaders sets OAuth-Client-Attestation and OAuth-Client-Attestation-PoP
-// HTTP headers on the request per draft-ietf-oauth-attestation-based-client-auth-04 §3.1.
-// No-op if attestation provider is not available.
-func (h *OID4VCIHandler) setAttestationHeaders(ctx context.Context, req *http.Request) error {
-	if h.attestationProvider == nil || !h.attestationProvider.Available() {
-		return nil
+// attestationRequestTimeout bounds how long requestClientAttestation waits for
+// the client's sign_response. Shorter than Session.RequestSign's 30s default
+// because this step is best-effort and, unlike proof/presentation signing,
+// involves no user interaction: the client only fetches its WIA and signs a
+// PoP. A package var rather than a const so tests can shorten it.
+var attestationRequestTimeout = 10 * time.Second
+
+// requestClientAttestation asks the client to supply a Wallet Instance
+// Attestation (WIA) and matching PoP, then wires up h.attestationProvider so
+// the PAR/token request carries OAuth-Client-Attestation[-PoP] headers
+// (draft-ietf-oauth-attestation-based-client-auth §3.1).
+//
+// It runs here because the PoP audience (h.authServerIssuer) is only known
+// after metadata fetch. The client signs the PoP locally; its instance key
+// never reaches the backend.
+//
+// Any failure leaves h.attestationProvider unchanged and the flow proceeds without
+// client attestation (falling back to private_key_jwt or client_id when
+// configured); an issuer that requires attestation rejects on its own.
+func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
+	// Skip entirely if the context is already done
+	if err := ctx.Err(); err != nil {
+		return
 	}
-	return h.attestationProvider.SetHeaders(ctx, req)
+	// Bound the wait: a client that predates SignActionRequestAttestation
+	// never answers, and Session.RequestSign's default 30s would stall every
+	// such issuance before falling back to other client auth.
+	ctx, cancel := context.WithTimeout(ctx, attestationRequestTimeout)
+	defer cancel()
+	resp, err := h.RequestSign(ctx, SignActionRequestAttestation, SignRequestParams{
+		Audience: h.authServerIssuer, // PoP aud = the AS the token request is sent to
+		Issuer:   h.clientID,         // WIA sub / PoP iss = this flow's effective client_id
+	})
+	if err != nil {
+		h.Logger.Debug("client attestation request skipped",
+			zap.String("client_id", h.clientID),
+			zap.Error(err))
+		return
+	}
+	if resp.ClientAttestation == "" || resp.ClientAttestationPoP == "" {
+		h.Logger.Debug("client returned no attestation; proceeding without",
+			zap.String("client_id", h.clientID))
+		return
+	}
+	h.attestationProvider = &TransportSuppliedAttestation{
+		WIA: resp.ClientAttestation,
+		PoP: resp.ClientAttestationPoP,
+		ID:  h.clientID,
+	}
+	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
+		zap.String("auth_server_issuer", h.authServerIssuer),
+		zap.String("client_id", h.clientID))
 }
 
 // OAuthError represents a structured OAuth 2.0 error response (RFC 6749 §5.2).
@@ -565,6 +677,21 @@ func (h *OID4VCIHandler) setAuthorizationHeader(req *http.Request, token *TokenR
 	}
 }
 
+// buildRenewalOffer synthesizes a single-config CredentialOffer for a renewal
+// request (credential re-issuance/renewal plan, Phase 1 Slice 2) - see
+// Execute's Step 1 doc comment for the full rationale on why a renewal has no
+// fresh credential_offer to parse. Returns an error if either required
+// renewal field is missing from msg.
+func buildRenewalOffer(msg *FlowStartMessage) (*CredentialOffer, error) {
+	if msg.CredentialIssuer == "" || msg.SelectedCredentialConfigurationID == "" {
+		return nil, errors.New("renewal request missing credential_issuer or selected_credential_configuration_id")
+	}
+	return &CredentialOffer{
+		CredentialIssuer:           msg.CredentialIssuer,
+		CredentialConfigurationIDs: []string{msg.SelectedCredentialConfigurationID},
+	}, nil
+}
+
 // Execute runs the OID4VCI flow
 func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -576,16 +703,37 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		ctx = ContextWithTenant(ctx, h.Flow.Session.TenantID)
 	}
 
+	h.authorizationDetails = msg.AuthorizationDetails
 	if msg.RedirectURI != "" {
 		h.redirectURI = msg.RedirectURI
 	}
 
-	// Step 1: Parse credential offer
-	offer, err := h.parseOffer(ctx, msg)
-	if err != nil {
-		h.Logger.Debug("failed to parse offer", zap.Error(err))
-		_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
-		return err
+	// Step 1: Parse credential offer, or synthesize one for a renewal request.
+	//
+	// A renewal (credential re-issuance/renewal plan, Phase 1 Slice 2) has no
+	// fresh credential_offer to parse - the client already knows the issuer
+	// and credential_configuration_id from the credential being renewed, and
+	// supplies a previously-obtained refresh_token instead. Building a
+	// synthetic single-config CredentialOffer lets every downstream step
+	// (metadata fetch, trust evaluation, awaitCredentialSelection's existing
+	// auto-select-when-one path) run completely unchanged; only token
+	// acquisition (Step 5, below) and proof generation (requestProofs) differ.
+	var offer *CredentialOffer
+	if msg.RefreshToken != "" {
+		var err error
+		offer, err = buildRenewalOffer(msg)
+		if err != nil {
+			_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, err.Error())
+			return err
+		}
+	} else {
+		var err error
+		offer, err = h.parseOffer(ctx, msg)
+		if err != nil {
+			h.Logger.Debug("failed to parse offer", zap.Error(err))
+			_ = h.Error(StepParsingOffer, ErrCodeOfferParseError, ErrCodeOfferParseError.UserFacingMessage())
+			return err
+		}
 	}
 	h.SetData("offer", offer)
 	h.SetData("credential_issuer", offer.CredentialIssuer)
@@ -641,13 +789,32 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	// Priority: transport-supplied WIA+PoP > private_key_jwt (already set above).
 	//
 	// The instance key NEVER resides on the backend. The client (frontend/SDK)
-	// holds it in passkey-PRF-encrypted private data and signs the PoP locally.
+	// holds it wherever its WSCD type keeps instance keys (browser passkey
+	// PRF-encrypted storage, iOS Secure Enclave, Android StrongBox/TEE, or a
+	// remote HSM via R2PS — see domain.WSCDType) and signs the PoP locally.
 	// The backend simply forwards the client-supplied WIA + PoP as HTTP headers.
+	//
+	// Two ways the WIA arrives, in priority order:
+	//  1. Supplied up front on FlowStartMessage (a client that already resolved
+	//     the offer/AS itself). Preferred when present.
+	//  2. Engine-requested here via SignActionRequestAttestation.
+	//     Best-effort / Tier 3.
+	//  3. Engine-requested per request via SignActionSignClientAuth, together
+	//     with the DPoP proof (client-held mode, go-wallet-backend#317). This
+	//     is what resolveClientAuth tries first when neither of the above
+	//     applies; it falls back to 2 for clients without the action.
 	if msg.ClientAttestation != "" && msg.ClientAttestationPoP != "" {
 		h.attestationProvider = &TransportSuppliedAttestation{
 			WIA: msg.ClientAttestation,
 			PoP: msg.ClientAttestationPoP,
 			ID:  h.clientID,
+		}
+		// A client that pre-resolved its attestation signed the PoP with a
+		// key the engine cannot ask to sign DPoP proofs with, so the flow is
+		// a legacy one: engine-held DPoP key, replayed WIA + PoP.
+		if err := h.useLegacyClientAuth(); err != nil {
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return err
 		}
 		h.Logger.Info("using OAuth-Client-Attestation authentication (client-signed PoP)",
 			zap.String("issuer", offer.CredentialIssuer),
@@ -671,17 +838,33 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("selected_config", selectedConfig)
 	h.SetData("selected_credential_configuration_id", selectedConfigID)
 
-	// Generate ephemeral DPoP key pair (RFC 9449)
-	h.dpopKey, err = generateDPoPKey()
-	if err != nil {
-		h.Logger.Debug("failed to generate DPoP key", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-		return err
+	// DPoP key (RFC 9449). A renewal must reuse the key its refresh_token
+	// was bound to at issuance (vc's refresh_token grant rejects any other
+	// key per RFC 9449/ARF 3.0 §6.6.6.2.2): the client-held key named by
+	// dpop_key_id, or the engine-held key it relayed as dpop_jwk (see
+	// dpopPrivateKeyJWK's doc comment). Any other flow decides who holds the
+	// key at its first authenticated request - see resolveClientAuth.
+	switch {
+	case msg.RefreshToken != "" && msg.DPoPKeyID != "":
+		h.clientAuthMode = clientAuthClientHeld
+		h.dpopKeyID = msg.DPoPKeyID
+	case msg.RefreshToken != "" && msg.DPoPJWK != "":
+		h.dpopKey, err = parseDPoPPrivateKeyJWK(msg.DPoPJWK)
+		if err != nil {
+			h.Logger.Debug("failed to parse client-supplied DPoP JWK", zap.Error(err))
+			_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return err
+		}
+		h.clientAuthMode = clientAuthLegacy
 	}
 
-	// Step 5: Handle authorization (or resume with provided auth code)
+	// Step 5: Handle authorization (renewal, resumption, or fresh grant)
 	var token *TokenResponse
-	if msg.AuthCode != "" {
+	if msg.RefreshToken != "" {
+		// Renewal: exchange the client-supplied refresh_token instead of
+		// running any authorization/pre-authorized_code grant.
+		token, err = h.exchangeRefreshToken(ctx, metadata, msg.RefreshToken)
+	} else if msg.AuthCode != "" {
 		// Resumption: client already completed OAuth and returned with auth code.
 		// Verify the offer actually supports the authorization_code grant.
 		if _, ok := offer.Grants["authorization_code"]; !ok {
@@ -716,7 +899,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		var proofs []ProofObject
 		if h.needsProof(selectedConfig) {
 			var proofErr error
-			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce)
+			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, msg.ReissuanceKid)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
 				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
@@ -777,13 +960,32 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		// Complete with the issued credential
 		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
 		h.registerNotificationContext(metadata, token, deferredResp)
-		return h.Complete(results, "")
+		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
 	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
 	h.registerNotificationContext(metadata, token, credential)
-	return h.Complete(results, "")
+	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
+}
+
+// dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
+// client alongside a refresh_token, so a later renewal can present the same
+// key back (see FlowStartMessage.DPoPJWK). Returns "" when there's no
+// refresh_token to pair it with, or on export failure - a failure here must
+// not fail the overall flow, since the credential itself already issued
+// successfully; it just means this particular refresh_token won't be
+// renewable later.
+func (h *OID4VCIHandler) dpopJWKForRefreshToken(token *TokenResponse) string {
+	if token.RefreshToken == "" || h.dpopKey == nil {
+		return ""
+	}
+	jwk, err := dpopPrivateKeyJWK(h.dpopKey)
+	if err != nil {
+		h.Logger.Warn("failed to export DPoP key for refresh_token relay", zap.Error(err))
+		return ""
+	}
+	return jwk
 }
 
 // registerNotificationContext captures the ephemeral state needed to forward an
@@ -805,10 +1007,25 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		endpoint:       metadata.NotificationEndpoint,
 		accessToken:    token.AccessToken,
 		tokenType:      token.TokenType,
-		dpopKey:        h.dpopKey,
+		dpopSigner:     h.dpopSigner(),
 		dpopNonce:      h.dpopNonce,
 		notificationID: resp.NotificationID,
 	})
+}
+
+// offerURIScheme is the URI scheme of an OpenID4VCI credential offer. It is
+// matched without an authority component so that both the "//"-prefixed form
+// and the bare form are accepted; see parseOffer.
+const offerURIScheme = "openid-credential-offer"
+
+// hasOfferURIScheme reports whether s is a credential-offer URI: whether it
+// starts with the offer scheme, followed by ":". Scheme names are
+// case-insensitive (RFC 3986 section 3.1), so this comparison is too. An
+// issuer that emits OPENID-CREDENTIAL-OFFER:?... names the same scheme.
+func hasOfferURIScheme(s string) bool {
+	return len(s) > len(offerURIScheme) &&
+		s[len(offerURIScheme)] == ':' &&
+		strings.EqualFold(s[:len(offerURIScheme)], offerURIScheme)
 }
 
 func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) (*CredentialOffer, error) {
@@ -817,13 +1034,25 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 	var offerStr string
 
 	if msg.Offer != "" {
-		// Parse from openid-credential-offer:// URL
+		// Parse from an openid-credential-offer URI.
+		//
+		// Match on the scheme alone, not on "openid-credential-offer://".
+		// The authority component is empty either way, and RFC 3986 lets it
+		// be omitted entirely, so issuers emit both
+		//
+		//	openid-credential-offer://?credential_offer=...
+		//	openid-credential-offer:?credential_offer=...
+		//
+		// The second is what this deployment's own issuer gateway produces.
+		// Requiring the "//" made it fall past this branch and be handed
+		// whole to json.Unmarshal below, which failed instantly with
+		// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed.
 		offerStr = msg.Offer
-		if strings.HasPrefix(offerStr, "openid-credential-offer://") {
+		if hasOfferURIScheme(offerStr) {
 			// Extract credential_offer parameter
 			u, err := url.Parse(offerStr)
 			if err != nil {
-				return nil, fmt.Errorf("invalid offer URL: %w", err)
+				return nil, fmt.Errorf("invalid credential offer URI: %w", err)
 			}
 			offerStr = u.Query().Get("credential_offer")
 			if offerStr == "" {
@@ -832,7 +1061,7 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 				if offerURI != "" {
 					return h.fetchOfferFromURI(ctx, offerURI)
 				}
-				return nil, errors.New("offer URL missing credential_offer parameter")
+				return nil, errors.New("credential offer URI carries neither a credential_offer nor a credential_offer_uri parameter")
 			}
 		}
 	} else if msg.CredentialOfferURI != "" {
@@ -1336,6 +1565,24 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *IssuerMetadata, code, txCode string) (*TokenResponse, error) {
 	_ = h.ProgressMessage(StepExchangingToken, "Exchanging pre-authorized code for token")
 
+	return h.doTokenExchange(ctx, metadata, "token", func(data url.Values) {
+		data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
+		data.Set("pre-authorized_code", code)
+		if txCode != "" {
+			data.Set("tx_code", txCode)
+		}
+	})
+}
+
+// doTokenExchange is the shared OAuth 2.0 token-endpoint scaffold used by
+// every grant type in this file (pre-authorized_code, authorization_code,
+// refresh_token): resolves the token endpoint, lets setGrantParams populate
+// the grant-specific form fields, applies client auth, sends the
+// DPoP-proofed request with a single nonce retry (RFC 9449 §8), and decodes
+// the TokenResponse. logContext prefixes the debug log line on a non-200
+// response and the final retry-exhausted error, so failures from different
+// grants remain distinguishable in logs without duplicating the whole loop.
+func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMetadata, logContext string, setGrantParams func(data url.Values)) (*TokenResponse, error) {
 	tokenEndpoint := metadata.TokenEndpoint
 	if tokenEndpoint == "" {
 		// Try to construct from issuer
@@ -1344,13 +1591,22 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 
 	// Token exchange with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
-		data := url.Values{}
-		data.Set("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
-		data.Set("pre-authorized_code", code)
-		if txCode != "" {
-			data.Set("tx_code", txCode)
+		// Resolve client auth first: whether the request is attested decides
+		// the form-body auth, and each attempt needs a fresh DPoP proof (new
+		// nonce) and, in client-held mode, a fresh attestation PoP.
+		auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
+			attestation: true,
+			dpop:        true,
+			htm:         "POST",
+			htu:         tokenEndpoint,
+		})
+		if err != nil {
+			return nil, err
 		}
-		if err := h.setClientAuth(data); err != nil {
+
+		data := url.Values{}
+		setGrantParams(data)
+		if err := h.setClientAuth(data, auth.attested()); err != nil {
 			return nil, err
 		}
 
@@ -1359,9 +1615,7 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
-			return nil, err
-		}
+		auth.apply(req)
 
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
@@ -1379,7 +1633,7 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
-			h.Logger.Debug("token endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			h.Logger.Debug(logContext+" endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
 			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
@@ -1395,7 +1649,34 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 		return &token, nil
 	}
 
-	return nil, errors.New("token request failed after DPoP nonce retry")
+	return nil, fmt.Errorf("%s request failed after DPoP nonce retry", logContext)
+}
+
+// exchangeRefreshToken performs an OAuth 2.0 refresh_token grant against the
+// issuer's token endpoint - the renewal path (credential re-issuance/renewal
+// plan, Phase 1 Slice 2) taken instead of any authorization/pre-authorized_code
+// grant when FlowStartMessage.RefreshToken is set. Structurally identical to
+// exchangePreAuthCode (same DPoP-nonce-retry/client-auth/error-handling
+// scaffold, same TokenResponse decode) - only the grant_type/parameter differs.
+//
+// This is deliberately a plain OAuth-transport-layer refresh (using this
+// handler's own ephemeral per-flow h.dpopKey, exactly like every other grant
+// in this file) - it does NOT attempt same-wallet-unit continuity itself.
+// That's a separate concern, proven instead via requestProofs' reissuanceKid
+// (see SignRequestParams.ReissuanceKid's doc comment): the client signs the
+// renewal's holder-binding proof with the ORIGINAL credential's key, which
+// the issuer can match against cnf.jwk. Conflating the two would be a
+// design error - see the plan's explicit note on why they answer different
+// questions ("is this OAuth token request from whoever we gave the refresh
+// token to" vs. "is this credential request from whoever holds the original
+// credential's key").
+func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *IssuerMetadata, refreshToken string) (*TokenResponse, error) {
+	_ = h.ProgressMessage(StepExchangingToken, "Exchanging refresh token for a renewed credential batch")
+
+	return h.doTokenExchange(ctx, metadata, "refresh token", func(data url.Values) {
+		data.Set("grant_type", "refresh_token")
+		data.Set("refresh_token", refreshToken)
+	})
 }
 
 // fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
@@ -1491,17 +1772,57 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	if selectedConfig != nil && selectedConfig.Scope != "" {
 		params.Set("scope", selectedConfig.Scope)
 	}
+	// DIIP requires a Wallet to be able to ask for a credential configuration
+	// by `authorization_details` as well as by `scope`. The wallet decides
+	// (see FlowStartMessage.AuthorizationDetails); this forwards it. Both may
+	// be present - OID4VCI allows it, and an AS that understands only one
+	// still gets what it needs.
+	if requested := requestAuthorizationDetails(h.authorizationDetails); len(requested) > 0 {
+		if encoded, err := json.Marshal(requested); err == nil {
+			params.Set("authorization_details", string(encoded))
+		} else {
+			h.Logger.Warn("could not encode authorization_details; continuing without it",
+				zap.Error(err))
+		}
+	}
+	// An issuer-initiated offer carries the issuance session in `issuer_state`,
+	// which identifies the credential server-side just as `scope` and
+	// `authorization_details` do. Parsed here rather than below the guard so
+	// the guard can see it: an offer with `issuer_state`, for a configuration
+	// declaring no `scope`, from a client that has not adopted
+	// `authorization_details` yet, is a working flow and must stay one.
+	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
+		if issuerState, ok := grant["issuer_state"].(string); ok && issuerState != "" {
+			params.Set("issuer_state", issuerState)
+		}
+	}
+	if !authorizationRequestNamesACredential(params) {
+		// Nothing names the credential, so the AS has nothing to act on.
+		// Failing here names the cause; letting it through produces an opaque
+		// rejection from the AS, or worse, an arbitrary credential.
+		err := errors.New(
+			"credential configuration declares no scope, the wallet sent no authorization_details " +
+				"naming a configuration, and the offer carries no issuer_state",
+		)
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, err.Error())
+		return nil, err
+	}
 	if pkceEnabled {
 		params.Set("code_challenge", codeChallenge)
 		params.Set("code_challenge_method", "S256")
 	}
-	if grant, ok := offer.Grants["authorization_code"].(map[string]interface{}); ok {
-		if issuerState, ok := grant["issuer_state"].(string); ok {
-			params.Set("issuer_state", issuerState)
-		}
-	}
 
 	var authURL string
+
+	if oauthMeta.PushedAuthorizationRequestEndpoint == "" && oauthMeta.RequirePushedAuthorizationRequests {
+		// The AS metadata declares PAR mandatory (RFC 9126 "require_pushed_authorization_requests")
+		// but advertises no pushed_authorization_request_endpoint to push to - there is no
+		// non-PAR /authorize path that could succeed. Fail fast instead of building a
+		// doomed authorization URL.
+		err := errors.New("AS metadata requires PAR (require_pushed_authorization_requests) but does not advertise a pushed_authorization_request_endpoint")
+		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, err.Error())
+		return nil, err
+	}
 
 	if oauthMeta.PushedAuthorizationRequestEndpoint != "" {
 		// Use Pushed Authorization Request (RFC 9126)
@@ -1510,14 +1831,37 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		for k, v := range params {
 			parParams[k] = v
 		}
+		// PAR carries client attestation (fresh PoP in client-held mode) but
+		// no DPoP proof: DPoP binds tokens, and PAR issues none.
+		parAuth, parErr := h.resolveClientAuth(ctx, clientAuthNeeds{attestation: true})
+		if parErr != nil {
+			_ = h.Error(StepAuthorizationReq, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+			return nil, parErr
+		}
 		if h.clientJWK != nil {
-			if err := h.setClientAuth(parParams); err != nil {
+			if err := h.setClientAuth(parParams, parAuth.attested()); err != nil {
 				h.Logger.Warn("failed to add client auth to PAR", zap.Error(err))
 			}
 		}
-		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams)
+		requestURI, parErr := h.sendPushedAuthorizationRequest(ctx, oauthMeta.PushedAuthorizationRequestEndpoint, parParams, parAuth)
 		if parErr != nil {
-			// PAR failed — fall back to standard authorization URL
+			// An AS that requires PAR (RFC 9126 §5, "require_pushed_authorization_requests")
+			// has no non-PAR /authorize path at all - falling back to a
+			// "standard" authorization URL here is guaranteed to fail there too,
+			// just later and with a far more confusing error (e.g. a generic
+			// "request_uri is required" binding/validation error on /authorize,
+			// or an invalid_client at the authorization step instead of the real
+			// PAR failure). Surface the actual PAR error immediately instead.
+			if oauthMeta.RequirePushedAuthorizationRequests {
+				h.Logger.Warn("PAR request failed and this AS requires PAR - not falling back",
+					zap.Error(parErr))
+				_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail,
+					fmt.Sprintf("Pushed authorization request failed: %v", parErr))
+				return nil, fmt.Errorf("PAR request failed (AS requires PAR, no fallback available): %w", parErr)
+			}
+			// PAR is merely advertised, not required - fall back to a standard
+			// authorization URL, matching what an AS without a PAR endpoint at
+			// all would have received.
 			h.Logger.Debug("PAR request failed, falling back to standard authorization", zap.Error(parErr))
 			q := authEndpoint.Query()
 			for key, values := range params {
@@ -1612,15 +1956,13 @@ type PARResponse struct {
 
 // sendPushedAuthorizationRequest sends authorization parameters to the PAR endpoint
 // and returns the request_uri to use in the authorization redirect (RFC 9126).
-func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, parEndpoint string, params url.Values) (string, error) {
+func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, parEndpoint string, params url.Values, auth clientAuthHeaders) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", parEndpoint, strings.NewReader(params.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("failed to create PAR request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if err := h.setAttestationHeaders(ctx, req); err != nil {
-		return "", fmt.Errorf("failed to set attestation headers: %w", err)
-	}
+	auth.apply(req)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
@@ -1631,6 +1973,11 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		h.Logger.Debug("PAR endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+
+		var errResp PARResponse
+		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+			return "", fmt.Errorf("PAR endpoint returned status %d: %s %s", resp.StatusCode, errResp.Error, errResp.ErrorDesc)
+		}
 		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
 	}
 
@@ -1653,69 +2000,14 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerMetadata, code, redirectURI, codeVerifier string) (*TokenResponse, error) {
 	_ = h.ProgressMessage(StepExchangingToken, "Exchanging authorization code for token")
 
-	tokenEndpoint := metadata.TokenEndpoint
-	if tokenEndpoint == "" {
-		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
-	}
-
-	// Token exchange with DPoP nonce retry (RFC 9449 §8)
-	for attempt := 0; attempt < 2; attempt++ {
-		data := url.Values{}
+	return h.doTokenExchange(ctx, metadata, "auth code token", func(data url.Values) {
 		data.Set("grant_type", "authorization_code")
 		data.Set("code", code)
 		data.Set("redirect_uri", redirectURI)
 		if codeVerifier != "" {
 			data.Set("code_verifier", codeVerifier)
 		}
-		if err := h.setClientAuth(data); err != nil {
-			return nil, err
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		if err := h.setAttestationHeaders(ctx, req); err != nil {
-			return nil, err
-		}
-		if err := h.setDPoPHeader(req, tokenEndpoint, ""); err != nil {
-			return nil, err
-		}
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("token request failed: %w", err)
-		}
-
-		// Check for DPoP nonce requirement — retry once with server-provided nonce
-		if attempt == 0 && isDPoPNonceError(resp) {
-			h.updateDPoPNonce(resp)
-			_ = resp.Body.Close()
-			continue
-		}
-		h.updateDPoPNonce(resp)
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-			_ = resp.Body.Close()
-			h.Logger.Debug("token endpoint error (auth code)", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
-			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
-			return nil, parseOAuthError(resp.StatusCode, body)
-		}
-
-		var token TokenResponse
-		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("failed to parse token response: %w", err)
-		}
-		_ = resp.Body.Close()
-
-		_ = h.ProgressMessage(StepTokenObtained, "Access token obtained")
-		return &token, nil
-	}
-
-	return nil, errors.New("token request failed after DPoP nonce retry")
+	})
 }
 
 // resumeWithAuthCode handles flow resumption after same-tab redirect.
@@ -1781,7 +2073,14 @@ func credentialBatchSize(metadata *IssuerMetadata) int {
 
 // requestProofs asks the frontend to generate the required OID4VCI proofs and
 // validates that each returned proof type is listed in proof_types_supported.
-func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string) ([]ProofObject, error) {
+//
+// reissuanceKid, when non-empty (a renewal request - credential re-issuance/
+// renewal plan, Phase 1 Slice 2), asks the frontend to sign the proof with
+// the EXISTING keypair identified by that kid instead of generating a fresh
+// one, so the issuer can match it against the original credential's cnf.jwk
+// as same-wallet-unit evidence (mirrors sirosfoundation/wallet-frontend#70's
+// Tier 2 "same-key re-signing" design - see SignRequestParams.ReissuanceKid).
+func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string) ([]ProofObject, error) {
 	count := credentialBatchSize(metadata)
 
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
@@ -1790,6 +2089,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		Issuer:              h.clientID,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
+		ReissuanceKid:       reissuanceKid,
 	})
 	if err != nil {
 		return nil, err
@@ -1823,11 +2123,119 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	return resp.Proofs, nil
 }
 
+// authorizationRequestNamesACredential reports whether an Authorization
+// Request says which credential it is for.
+//
+// Three parameters can say it, and any one is enough: `scope` (what a
+// configuration declares), `authorization_details` (what the Wallet asked for,
+// which DIIP requires be possible), and `issuer_state` (an issuer-initiated
+// offer, where the issuance session identifies the credential server-side).
+//
+// Sending none of them asks the AS for nothing, which comes back as an opaque
+// rejection - or, from an AS that picks something, an arbitrary credential.
+func authorizationRequestNamesACredential(params url.Values) bool {
+	return params.Get("scope") != "" ||
+		params.Get("authorization_details") != "" ||
+		params.Get("issuer_state") != ""
+}
+
+// requestAuthorizationDetails projects client-supplied details down to the
+// fields that belong in an Authorization Request.
+//
+// AuthorizationDetail is one type for both directions, and
+// credential_identifiers is response-only: the Authorization Server grants
+// those in its token response (OID4VCI 1.0 §6). Marshaling the client's value
+// straight through would let a client put them in flow_start and have the
+// engine send them as a request parameter, which is not a thing a Wallet may
+// ask for. The engine forwards intent, not whatever it was handed.
+func requestAuthorizationDetails(details []AuthorizationDetail) []AuthorizationDetail {
+	projected := make([]AuthorizationDetail, 0, len(details))
+	for _, detail := range details {
+		// An entry naming no configuration identifies nothing. Forwarding it
+		// would ask the AS for nothing while still satisfying the guard in
+		// startAuthorizationFlow, which only tests that the parameter is set.
+		if detail.CredentialConfigurationID == "" {
+			continue
+		}
+		// `type` is not a client choice. OID4VCI 1.0 §5.1.1 fixes it at
+		// "openid_credential" for a credential authorization detail, and this
+		// struct can express no other kind - it carries
+		// credential_configuration_id and nothing else. So an absent value is
+		// filled in and a different one is normalised rather than forwarded:
+		// either way the alternative is an Authorization Request the AS must
+		// reject, for a detail whose actual intent - which configuration is
+		// wanted - is carried by credential_configuration_id and is preserved
+		// exactly as given.
+		projected = append(projected, AuthorizationDetail{
+			Type:                      authorizationDetailTypeOpenIDCredential,
+			CredentialConfigurationID: detail.CredentialConfigurationID,
+		})
+	}
+	return projected
+}
+
+// grantedCredentialIdentifier returns the credential identifier the
+// Authorization Server granted for configID, or "" when it granted none.
+//
+// Matching is by credential_configuration_id so a token response covering
+// several configurations picks the right one; an entry that names no
+// configuration is accepted only when it is the sole one, since then there is
+// nothing to confuse it with.
+func grantedCredentialIdentifier(token *TokenResponse, configID string) string {
+	if token == nil || len(token.AuthorizationDetails) == 0 {
+		return ""
+	}
+
+	// With no configuration to match on, only a sole entry is unambiguous.
+	// Matching "" against the entries would pick whichever unlabelled one came
+	// first, which is a guess dressed up as a match - the ambiguity this is
+	// meant to refuse.
+	if configID == "" {
+		only := token.AuthorizationDetails[0]
+		if len(token.AuthorizationDetails) == 1 &&
+			only.CredentialConfigurationID == "" &&
+			len(only.CredentialIdentifiers) > 0 {
+			return only.CredentialIdentifiers[0]
+		}
+		return ""
+	}
+
+	for _, detail := range token.AuthorizationDetails {
+		if len(detail.CredentialIdentifiers) == 0 {
+			continue
+		}
+		if detail.CredentialConfigurationID == configID {
+			// One credential per request: the remaining identifiers name
+			// further credentials the AS granted for this configuration, which
+			// would each need their own Credential Request.
+			return detail.CredentialIdentifiers[0]
+		}
+	}
+
+	// An entry naming no configuration is accepted only when it is the sole
+	// one, since then there is nothing to confuse it with.
+	if len(token.AuthorizationDetails) == 1 &&
+		token.AuthorizationDetails[0].CredentialConfigurationID == "" &&
+		len(token.AuthorizationDetails[0].CredentialIdentifiers) > 0 {
+		return token.AuthorizationDetails[0].CredentialIdentifiers[0]
+	}
+	return ""
+}
+
 func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofs []ProofObject) (*CredentialResponse, error) {
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
 		"credential_configuration_id": configID,
+	}
+	// OID4VCI 1.0 §6: when the AS granted credential identifiers in response
+	// to our authorization_details, the Credential Request names one of those
+	// INSTEAD of the configuration id - an issuer that honours
+	// authorization_details rejects the pair. Our own vc issuer enforces
+	// exactly that.
+	if identifier := grantedCredentialIdentifier(token, configID); identifier != "" {
+		delete(reqBody, "credential_configuration_id")
+		reqBody["credential_identifier"] = identifier
 	}
 	// Always use the "proofs" object (OID4VCI §7.2), even for a single proof
 	if len(proofs) > 0 {
@@ -1907,9 +2315,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		req.Header.Set("Content-Type", "application/json")
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
-			if err := h.setDPoPHeader(req, metadata.CredentialEndpoint, token.AccessToken); err != nil {
+			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: metadata.CredentialEndpoint, accessToken: token.AccessToken})
+			if err != nil {
 				return nil, err
 			}
+			auth.apply(req)
 		}
 
 		resp, err := h.httpClient.Do(req)
@@ -2013,9 +2423,11 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		req.Header.Set("Content-Type", "application/json")
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
-			if err := h.setDPoPHeader(req, deferredEndpoint, token.AccessToken); err != nil {
+			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: deferredEndpoint, accessToken: token.AccessToken})
+			if err != nil {
 				return nil, err
 			}
+			auth.apply(req)
 		}
 
 		resp, err := h.httpClient.Do(req)

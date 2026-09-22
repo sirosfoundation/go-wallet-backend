@@ -178,6 +178,19 @@ func DefaultWalletRules() []sexp.Element {
 			sexp.NewAtom("wallet-provider"),
 			sexp.NewAtom("pid-provider"),
 			sexp.NewAtom("mdl-issuer"),
+			// ISO 18013-5 second-edition RICAL reader-trust evaluation
+			// (siros-sdk-kotlin/swift's proximity-presentation readerAuth
+			// check, proxied to go-trust's `mdocrical` registry) - same
+			// subject/resource shape (key/x5c) as the other actions above.
+			sexp.NewAtom("mdoc-reader-auth"),
+			// VICAL issuer-trust evaluation (siros-sdk-kotlin/swift's
+			// evaluateIssuerTrust, proxied to go-trust's `vical` registry) -
+			// the issuer-side mirror of mdoc-reader-auth above, same
+			// subject/resource shape. Omitted when mdoc-reader-auth was
+			// added here (go-wallet-backend#279); every mdoc issuance since
+			// has had its issuer-trust query denied at this gate before it
+			// ever reaches the PDP.
+			sexp.NewAtom("mdoc-issuer-auth"),
 		},
 	}
 
@@ -188,6 +201,27 @@ func DefaultWalletRules() []sexp.Element {
 			sexp.NewAtom("x5c"),
 			sexp.NewAtom("x509_san_dns"),
 		},
+	}
+
+	// issuerURLRule builds a subject.type="url" resolution rule for the given
+	// URL scheme. HTTPS and plain-HTTP (dev) variants are otherwise identical,
+	// so they share this builder rather than being spelled out twice.
+	issuerURLRule := func(schemePrefix string) sexp.Element {
+		return sexp.NewList("authzen",
+			sexp.NewList("tenant"),
+			sexp.NewList("action"),
+			sexp.NewList("resource",
+				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
+					sexp.NewAtom("credential_issuer"),
+					sexp.NewAtom("credential_offer_uri"),
+				}}),
+				sexp.NewList("id"),
+			),
+			sexp.NewList("subject",
+				sexp.NewList("type", sexp.NewAtom("url")),
+				sexp.NewList("id", &starform.Prefix{Value: schemePrefix}),
+			),
+		)
 	}
 
 	return []sexp.Element{
@@ -255,21 +289,16 @@ func DefaultWalletRules() []sexp.Element {
 
 		// Rule 5: Allow issuer metadata and credential offer URI resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with subject_type="url" to fetch OpenID4VCI issuer metadata or credential offers.
-		sexp.NewList("authzen",
-			sexp.NewList("tenant"),
-			sexp.NewList("action"),
-			sexp.NewList("resource",
-				sexp.NewList("type", &starform.Set{Elements: []sexp.Element{
-					sexp.NewAtom("credential_issuer"),
-					sexp.NewAtom("credential_offer_uri"),
-				}}),
-				sexp.NewList("id"),
-			),
-			sexp.NewList("subject",
-				sexp.NewList("type", sexp.NewAtom("url")),
-				sexp.NewList("id", &starform.Prefix{Value: "https://"}),
-			),
-		),
+		issuerURLRule("https://"),
+
+		// Rule 5b: the HTTP counterpart to Rule 5 (dev environments), following
+		// the same pattern as Rules 3/4 and 6/7. Missing until now:
+		// subject_type="url" resolution against an http:// issuer (e.g.
+		// docker-compose's http://vc-apigw:8080) was denied here even with
+		// the AuthZEN proxy's own allowHTTP escape hatch set, since this
+		// SPOCP authorizer's default rules aren't config-aware and had no
+		// http:// variant for this specific resource/subject shape.
+		issuerURLRule("http://"),
 
 		// Rule 6: Allow OAuth authorization server metadata resolution (subject.type="url", HTTPS URLs)
 		// Used by /v1/resolve with resource_type="oauth-authorization-server" to fetch RFC 8414 metadata.

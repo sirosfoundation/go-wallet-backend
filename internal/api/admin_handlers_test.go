@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -250,6 +251,26 @@ func TestNewAdminHandlers(t *testing.T) {
 	if handlers.logger == nil {
 		t.Error("Expected logger to be set")
 	}
+}
+
+func TestEmitAudit_WithAuditorConfigured(t *testing.T) {
+	logger := zap.NewNop()
+	store := memory.NewStore()
+	handlers := NewAdminHandlers(store, logger, testAuditEmitter(t), nil)
+
+	// Should not panic and should reach the emitter (the emitter itself is
+	// tested independently in pkg/audit; here we only need to exercise the
+	// non-nil branch of emitAudit).
+	handlers.emitAudit(set.EventTenantCreated, "tenant-1", map[string]any{"name": "test"})
+}
+
+func TestEmitAudit_NilAuditorIsNoOp(t *testing.T) {
+	logger := zap.NewNop()
+	store := memory.NewStore()
+	handlers := NewAdminHandlers(store, logger, nil, nil)
+
+	// Should not panic when no auditor is configured.
+	handlers.emitAudit(set.EventTenantCreated, "tenant-1", nil)
 }
 
 func TestAdminHandlers_AdminStatus(t *testing.T) {
