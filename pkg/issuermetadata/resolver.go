@@ -288,13 +288,12 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
-	// DialContext (blocking private/loopback IPs). Fetching arbitrary public
-	// HTTPS endpoints is inherent to OpenID4VCI issuer metadata discovery —
-	// the issuer URL comes from a user-presented credential and can be any
-	// public HTTPS endpoint; there is no known-good allowlist.
-	// codeql[go/request-forgery]: r.httpClient is always constructed via
-	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
-	// loopback/link-local IPs by default (SSRF protection); see pkg/config.
+	// DialContext (blocking private/loopback IPs, always constructed via
+	// cfg.HTTPClient.NewHTTPClient(); see pkg/config). Fetching arbitrary
+	// public HTTPS endpoints is inherent to OpenID4VCI issuer metadata
+	// discovery — the issuer URL comes from a user-presented credential and
+	// can be any public HTTPS endpoint; there is no known-good allowlist.
+	// codeql[go/request-forgery]
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
