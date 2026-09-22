@@ -889,11 +889,12 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	var startMsg FlowStartMessage
 	if params.Params != nil {
 		if err := json.Unmarshal(params.Params, &startMsg); err != nil {
+			logger.Warn("invalid flow_start params", zap.Error(err))
 			h.session.flowsMu.Lock()
 			delete(h.session.flows, flowID)
 			h.session.flowsMu.Unlock()
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
-				"reason": "invalid flow params: " + err.Error(),
+				"reason": "invalid flow params",
 			})
 		}
 	}

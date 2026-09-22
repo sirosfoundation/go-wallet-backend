@@ -45,6 +45,23 @@ func wmpRequest(id string, method string, params interface{}) []byte {
 	return data
 }
 
+// wmpNotification builds a true JSON-RPC 2.0 Notification: no "id" field at
+// all, unlike wmpRequest (which always sets one). go-wmp's peer only treats
+// a message this way - e.g. MethodCredentialNotification's own param
+// validation never produces a synchronous error for it (go-wmp#26/#27) -
+// when the wire shape actually omits "id". Building a "notification" via
+// wmpRequest would silently test a Request instead.
+func wmpNotification(method string, params interface{}) []byte {
+	p, _ := json.Marshal(params)
+	req := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  json.RawMessage(p),
+	}
+	data, _ := json.Marshal(req)
+	return data
+}
+
 // --- HandleRPC: session.create ---
 
 func TestWMP_SessionCreate_Success(t *testing.T) {
@@ -1167,13 +1184,20 @@ func TestWMP_CapabilityList_SessionNotFound(t *testing.T) {
 // notification_ack message on the session's event stream. This also
 // exercises wmpSessionTransport.SendJSON's default/fallback branch, since
 // NotificationAckMessage has no dedicated WMP notification mapping.
+//
+// Must be sent as a true id-less JSON-RPC Notification, not a Request: only
+// then does go-wmp's own peer-level param validation let a rejected message
+// still reach this package's handler at all (go-wmp#26/#27) - a Request
+// with the same invalid params is correctly rejected by go-wmp itself
+// before ever reaching dispatchCredentialNotification, with the standard
+// synchronous -32602 rather than this async notification_ack path.
 func TestWMP_CredentialNotification_MissingID(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
 	sessionID := createWMPSession(t, a)
 
-	body := wmpRequest("2", wmp.MethodCredentialNotification, wmp.CredentialNotificationParams{
+	body := wmpNotification(wmp.MethodCredentialNotification, wmp.CredentialNotificationParams{
 		WMP:    wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
 		FlowID: "flow-1",
 		Event:  "credential_accepted",
@@ -1182,10 +1206,7 @@ func TestWMP_CredentialNotification_MissingID(t *testing.T) {
 
 	resp, err := a.HandleRPC(context.Background(), sessionID, "", "", body)
 	require.NoError(t, err)
-
-	var rpcResp wmp.Response
-	require.NoError(t, json.Unmarshal(resp, &rpcResp))
-	assert.Nil(t, rpcResp.Error)
+	assert.Empty(t, resp, "a Notification must never produce a response body")
 
 	events, err := a.Events(sessionID)
 	require.NoError(t, err)

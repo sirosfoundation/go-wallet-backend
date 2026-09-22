@@ -405,6 +405,11 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	router.GET("/api/v2/wallet/events", func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
+	// GET /.well-known/wmp-configuration — public capability discovery, no auth
+	// (a client needs this before it has a token to authenticate an RPC/SSE call with).
+	router.GET("/.well-known/wmp-configuration", func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPConfiguration(c.Writer, c.Request)
+	})
 }
 
 // Close shuts down the engine manager
