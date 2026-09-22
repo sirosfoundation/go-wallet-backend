@@ -535,9 +535,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		flowID = uuid.New().String()
 	}
 
-	logger := session.logger.With(zap.String("flow_id", flowID[:8]), zap.String("protocol", string(msg.Protocol)))
-
-	// Ensure cleanup happens even on panic
+	// Ensure cleanup happens even on panic. Registered before anything else
+	// touches the client-controlled flowID: a flow_id shorter than the log
+	// truncation below must not be able to panic ahead of this defer.
+	logger := session.logger
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in flow handler", zap.Any("panic", r))
@@ -545,11 +546,21 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		}
 	}()
 
+	loggedFlowID := flowID
+	if len(loggedFlowID) > 8 {
+		loggedFlowID = loggedFlowID[:8]
+	}
+	logger = session.logger.With(zap.String("flow_id", loggedFlowID), zap.String("protocol", string(msg.Protocol)))
+
 	// SID-AUTH-06: an established session keeps running until a flow starts;
 	// re-check the handshake token against the user's cut-off here so a
-	// suspension or revocation that DeleteByUser could not reach - another
-	// engine process or instance in a split or scaled deployment - still
-	// stops the wallet at its next flow. The gate reads the shared store.
+	// revocation that DeleteByUser could not reach - another engine process
+	// or instance in a split or scaled deployment - still stops the wallet
+	// at its next flow. The gate reads the shared store.
+	//
+	// After the logger above, not before it: this is the one refusal on this
+	// path that a reader will go looking for, and it is worth a lot more
+	// with the flow id and protocol attached.
 	if err := m.recheckToken(session); err != nil {
 		logger.Warn("Flow refused: authorization revoked", zap.Error(err))
 		_ = session.SendFlowError(flowID, "", ErrCodeAuthFailed, "Authorization revoked")
