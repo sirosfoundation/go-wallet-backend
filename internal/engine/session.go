@@ -470,15 +470,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		flowID = uuid.New().String()
 	}
 
-	logger := session.logger.With(zap.String("flow_id", flowID[:8]), zap.String("protocol", string(msg.Protocol)))
-
-	// Ensure cleanup happens even on panic
+	// Ensure cleanup happens even on panic. Registered before anything else
+	// touches the client-controlled flowID: a flow_id shorter than the log
+	// truncation below must not be able to panic ahead of this defer.
+	logger := session.logger
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in flow handler", zap.Any("panic", r))
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 		}
 	}()
+
+	loggedFlowID := flowID
+	if len(loggedFlowID) > 8 {
+		loggedFlowID = loggedFlowID[:8]
+	}
+	logger = session.logger.With(zap.String("flow_id", loggedFlowID), zap.String("protocol", string(msg.Protocol)))
 
 	// Get handler factory first (before acquiring flow lock)
 	m.handlersMu.RLock()
