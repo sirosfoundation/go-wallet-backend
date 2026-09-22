@@ -517,6 +517,13 @@ func checkAddresses(host string, ips []net.IP) error {
 		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
+		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
+		// most other stacks) treats an unspecified destination address as
+		// loopback - so left unchecked, this is a plain loopback bypass, not
+		// merely a theoretical gap.
+		if ip.IsUnspecified() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: unspecified address", host, ip)
+		}
 	}
 	return nil
 }
