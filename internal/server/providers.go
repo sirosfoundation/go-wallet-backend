@@ -24,7 +24,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // =============================================================================
@@ -673,7 +672,7 @@ func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor, newR2PSClient(p.cfg))
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -752,7 +751,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
-	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor, newR2PSClient(p.cfg))
+	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -1015,13 +1014,4 @@ func (p *WalletProviderProvider) Close() error {
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
-}
-
-// newR2PSClient creates an R2PS admin client from config.
-// Returns nil if R2PS admin is not configured.
-func newR2PSClient(cfg *config.Config) *r2ps.Client {
-	if cfg.R2PSAdmin.BaseURL == "" {
-		return nil
-	}
-	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL)
 }

@@ -31,7 +31,6 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
-	R2PSAdmin      R2PSAdminConfig      `yaml:"r2ps_admin" envconfig:"R2PS_ADMIN"`
 
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
@@ -1964,10 +1963,4 @@ type AuditConfig struct {
 	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
 	// KeyID is the kid used in SET JWS headers.
 	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
-}
-
-// R2PSAdminConfig configures the R2PS admin API client for WSCD/WSCA status queries.
-type R2PSAdminConfig struct {
-	// BaseURL is the R2PS admin endpoint (e.g. "http://r2ps-admin:8444").
-	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
 }

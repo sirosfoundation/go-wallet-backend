@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -18,7 +17,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 func init() {
@@ -29,7 +27,7 @@ func setupAdminTestHandlers(t *testing.T) (*AdminHandlers, *gin.Engine) {
 	t.Helper()
 	logger := zap.NewNop()
 	store := memory.NewStore()
-	handlers := NewAdminHandlers(store, logger, nil, nil)
+	handlers := NewAdminHandlers(store, logger, nil)
 
 	router := gin.New()
 	return handlers, router
@@ -240,7 +238,7 @@ func TestNewAdminHandlers(t *testing.T) {
 	logger := zap.NewNop()
 	store := memory.NewStore()
 
-	handlers := NewAdminHandlers(store, logger, nil, nil)
+	handlers := NewAdminHandlers(store, logger, nil)
 
 	if handlers == nil {
 		t.Fatal("Expected handlers to not be nil")
@@ -256,7 +254,7 @@ func TestNewAdminHandlers(t *testing.T) {
 func TestEmitAudit_WithAuditorConfigured(t *testing.T) {
 	logger := zap.NewNop()
 	store := memory.NewStore()
-	handlers := NewAdminHandlers(store, logger, testAuditEmitter(t), nil)
+	handlers := NewAdminHandlers(store, logger, testAuditEmitter(t))
 
 	// Should not panic and should reach the emitter (the emitter itself is
 	// tested independently in pkg/audit; here we only need to exercise the
@@ -267,7 +265,7 @@ func TestEmitAudit_WithAuditorConfigured(t *testing.T) {
 func TestEmitAudit_NilAuditorIsNoOp(t *testing.T) {
 	logger := zap.NewNop()
 	store := memory.NewStore()
-	handlers := NewAdminHandlers(store, logger, nil, nil)
+	handlers := NewAdminHandlers(store, logger, nil)
 
 	// Should not panic when no auditor is configured.
 	handlers.emitAudit(set.EventTenantCreated, "tenant-1", nil)
@@ -1237,87 +1235,53 @@ func TestTenantToResponse(t *testing.T) {
 }
 
 func TestAdminHandlers_RegisterRoutes(t *testing.T) {
-	t.Run("without r2ps client", func(t *testing.T) {
-		handlers, _ := setupAdminTestHandlers(t)
-		router := gin.New()
-		group := router.Group("/admin")
-		handlers.RegisterRoutes(group)
+	handlers, _ := setupAdminTestHandlers(t)
+	router := gin.New()
+	group := router.Group("/admin")
+	handlers.RegisterRoutes(group)
 
-		routeSet := make(map[string]bool)
-		for _, r := range router.Routes() {
-			routeSet[r.Method+" "+r.Path] = true
-		}
+	routeSet := make(map[string]bool)
+	for _, r := range router.Routes() {
+		routeSet[r.Method+" "+r.Path] = true
+	}
 
-		expected := []string{
-			"GET /admin/tenants",
-			"POST /admin/tenants",
-			"GET /admin/tenants/:id",
-			"PUT /admin/tenants/:id",
-			"DELETE /admin/tenants/:id",
-			"GET /admin/tenants/:id/users",
-			"POST /admin/tenants/:id/users",
-			"DELETE /admin/tenants/:id/users/:user_id",
-			"GET /admin/tenants/:id/issuers",
-			"POST /admin/tenants/:id/issuers",
-			"GET /admin/tenants/:id/issuers/:issuer_id",
-			"PUT /admin/tenants/:id/issuers/:issuer_id",
-			"DELETE /admin/tenants/:id/issuers/:issuer_id",
-			"GET /admin/tenants/:id/verifiers",
-			"POST /admin/tenants/:id/verifiers",
-			"GET /admin/tenants/:id/verifiers/:verifier_id",
-			"PUT /admin/tenants/:id/verifiers/:verifier_id",
-			"DELETE /admin/tenants/:id/verifiers/:verifier_id",
-			"GET /admin/tenants/:id/invites",
-			"POST /admin/tenants/:id/invites",
-			"GET /admin/tenants/:id/invites/:invite_id",
-			"PUT /admin/tenants/:id/invites/:invite_id",
-			"DELETE /admin/tenants/:id/invites/:invite_id",
-			"GET /admin/tenants/:id/instances",
-			"GET /admin/tenants/:id/instances/:instance_id",
-			"PUT /admin/tenants/:id/instances/:instance_id/status",
-			"DELETE /admin/tenants/:id/instances/:instance_id",
-			"GET /admin/tenants/:id/users/:user_id/instances",
-			"GET /admin/tenants/:id/users/:user_id/detail",
-			"GET /admin/tenants/:id/stats",
+	expected := []string{
+		"GET /admin/tenants",
+		"POST /admin/tenants",
+		"GET /admin/tenants/:id",
+		"PUT /admin/tenants/:id",
+		"DELETE /admin/tenants/:id",
+		"GET /admin/tenants/:id/users",
+		"POST /admin/tenants/:id/users",
+		"DELETE /admin/tenants/:id/users/:user_id",
+		"GET /admin/tenants/:id/issuers",
+		"POST /admin/tenants/:id/issuers",
+		"GET /admin/tenants/:id/issuers/:issuer_id",
+		"PUT /admin/tenants/:id/issuers/:issuer_id",
+		"DELETE /admin/tenants/:id/issuers/:issuer_id",
+		"GET /admin/tenants/:id/verifiers",
+		"POST /admin/tenants/:id/verifiers",
+		"GET /admin/tenants/:id/verifiers/:verifier_id",
+		"PUT /admin/tenants/:id/verifiers/:verifier_id",
+		"DELETE /admin/tenants/:id/verifiers/:verifier_id",
+		"GET /admin/tenants/:id/invites",
+		"POST /admin/tenants/:id/invites",
+		"GET /admin/tenants/:id/invites/:invite_id",
+		"PUT /admin/tenants/:id/invites/:invite_id",
+		"DELETE /admin/tenants/:id/invites/:invite_id",
+		"GET /admin/tenants/:id/instances",
+		"GET /admin/tenants/:id/instances/:instance_id",
+		"PUT /admin/tenants/:id/instances/:instance_id/status",
+		"DELETE /admin/tenants/:id/instances/:instance_id",
+		"GET /admin/tenants/:id/users/:user_id/instances",
+		"GET /admin/tenants/:id/users/:user_id/detail",
+		"GET /admin/tenants/:id/stats",
+	}
+	for _, e := range expected {
+		if !routeSet[e] {
+			t.Errorf("expected route %q to be registered", e)
 		}
-		for _, e := range expected {
-			if !routeSet[e] {
-				t.Errorf("expected route %q to be registered", e)
-			}
-		}
-
-		for _, r := range router.Routes() {
-			if strings.HasPrefix(r.Path, "/admin/r2ps") {
-				t.Errorf("did not expect r2ps route %s to be registered when r2psClient is nil", r.Path)
-			}
-		}
-	})
-
-	t.Run("with r2ps client", func(t *testing.T) {
-		store := memory.NewStore()
-		handlers := NewAdminHandlers(store, zap.NewNop(), nil, r2ps.NewClient("https://r2ps.example.com"))
-		router := gin.New()
-		group := router.Group("/admin")
-		handlers.RegisterRoutes(group)
-
-		routeSet := make(map[string]bool)
-		for _, r := range router.Routes() {
-			routeSet[r.Method+" "+r.Path] = true
-		}
-
-		expected := []string{
-			"GET /admin/r2ps/keys",
-			"GET /admin/r2ps/keys/:kid",
-			"GET /admin/r2ps/statuses/:category",
-			"GET /admin/r2ps/status/:category/:idx",
-			"PUT /admin/r2ps/status/:category/:idx",
-		}
-		for _, e := range expected {
-			if !routeSet[e] {
-				t.Errorf("expected r2ps route %q to be registered when r2psClient is set", e)
-			}
-		}
-	})
+	}
 }
 
 func TestAdminHandlers_ListTenants_StoreError(t *testing.T) {
@@ -1326,7 +1290,7 @@ func TestAdminHandlers_ListTenants_StoreError(t *testing.T) {
 		Store:   base,
 		tenants: &errTenantStore{TenantStore: base.Tenants(), getAllErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants", handlers.ListTenants)
 
@@ -1345,7 +1309,7 @@ func TestAdminHandlers_GetTenant_StoreError(t *testing.T) {
 		Store:   base,
 		tenants: &errTenantStore{TenantStore: base.Tenants(), getByIDErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id", handlers.GetTenant)
 
@@ -1368,7 +1332,7 @@ func TestAdminHandlers_DeleteTenant_DeleteError(t *testing.T) {
 		Store:   base,
 		tenants: &errTenantStore{TenantStore: base.Tenants(), deleteErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id", handlers.DeleteTenant)
 
@@ -1391,7 +1355,7 @@ func TestAdminHandlers_AddUserToTenant_StoreError(t *testing.T) {
 		Store:       base,
 		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), addErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/users", handlers.AddUserToTenant)
 
@@ -1412,7 +1376,7 @@ func TestAdminHandlers_RemoveUserFromTenant_StoreError(t *testing.T) {
 		Store:       base,
 		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), removeErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/users/:user_id", handlers.RemoveUserFromTenant)
 
@@ -1435,7 +1399,7 @@ func TestAdminHandlers_GetTenantUsers_StoreError(t *testing.T) {
 		Store:       base,
 		userTenants: &errUserTenantStore{UserTenantStore: base.UserTenants(), getUsersErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/users", handlers.GetTenantUsers)
 
@@ -1488,7 +1452,7 @@ func TestAdminHandlers_ListIssuers_StoreError(t *testing.T) {
 		Store:   base,
 		issuers: &errIssuerStore{IssuerStore: base.Issuers(), getAllErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/issuers", handlers.ListIssuers)
 
@@ -1511,7 +1475,7 @@ func TestAdminHandlers_ListVerifiers_StoreError(t *testing.T) {
 		Store:     base,
 		verifiers: &errVerifierStore{VerifierStore: base.Verifiers(), getAllErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.GET("/admin/tenants/:id/verifiers", handlers.ListVerifiers)
 
@@ -1534,7 +1498,7 @@ func TestAdminHandlers_CreateVerifier_StoreError(t *testing.T) {
 		Store:     base,
 		verifiers: &errVerifierStore{VerifierStore: base.Verifiers(), createErr: errors.New("boom")},
 	}
-	handlers := NewAdminHandlers(store, zap.NewNop(), nil, nil)
+	handlers := NewAdminHandlers(store, zap.NewNop(), nil)
 	router := gin.New()
 	router.POST("/admin/tenants/:id/verifiers", handlers.CreateVerifier)
 
