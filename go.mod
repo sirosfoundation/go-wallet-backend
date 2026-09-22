@@ -33,7 +33,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.1
 	github.com/sirosfoundation/go-tokenauth v0.4.0
-	github.com/sirosfoundation/go-wmp v0.3.0
+	github.com/sirosfoundation/go-wmp v0.4.0
 )
 
 require go.yaml.in/yaml/v3 v3.0.5 // indirect

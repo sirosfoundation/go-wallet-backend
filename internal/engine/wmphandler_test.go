@@ -15,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -1568,6 +1569,121 @@ func TestWmpSessionTransport_SendJSON_FlowError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for flow.error notification")
 	}
+}
+
+// TestWmpSessionTransport_SendJSON_SignRequest_FieldParity exercises the
+// *SignRequestMessage branch of wmpSessionTransport.SendJSON: every field on
+// the engine's SignRequestParams (the WebSocket wire shape) must survive the
+// translation into the WMP wire shape, openid4x.SignSubFlowParams, or a
+// WMP-only client silently loses data the native WebSocket client gets (e.g.
+// the sign_client_auth DPoP parameters, credential/transaction-data
+// selection, and verifier-session binding).
+func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
+	ct := wmp.NewChannelTransport(5, 5)
+	handler := &wmpEngineHandler{sessionID: "sess-sign"}
+	peer := wmp.NewPeer(ct, handler)
+	transport := newWMPSessionTransport(peer, ct)
+	transport.handler = handler
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go peer.Serve(ctx)
+
+	in := SignRequestMessage{
+		Message: Message{FlowID: "flow-1", MessageID: "msg-1"},
+		Action:  SignActionSignClientAuth,
+		Params: SignRequestParams{
+			Audience:              "aud",
+			Nonce:                 "nonce-1",
+			Issuer:                "https://wallet.example.com/cb",
+			ProofType:             "jwt",
+			ProofTypesSupported:   map[string]interface{}{"jwt": map[string]interface{}{}},
+			Count:                 2,
+			ResponseURI:           "https://verifier.example.com/response",
+			VerifierJwkThumbprint: "thumb-1",
+			VerifierSessionID:     "vsess-1",
+			ReissuanceKid:         "kid-1",
+			HTM:                   "POST",
+			HTU:                   "https://as.example.com/token",
+			DPoPNonce:             "dpop-nonce-1",
+			ATH:                   "ath-1",
+			KeyID:                 "instance-key-1",
+			TransactionData: []TransactionData{{
+				Type:                     "payment",
+				Params:                   map[string]interface{}{"amount": "10"},
+				CredentialIDs:            []string{"cred-1"},
+				HashAlgorithm:            "sha-256",
+				TransactionDataHashesAlg: "sha-256",
+			}},
+			CredentialsToInclude: []CredentialRef{{
+				CredentialQueryID: "q-1",
+				CredentialID:      "cred-1",
+				DisclosedClaims:   []string{"given_name"},
+			}},
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- transport.SendJSON(&in) }()
+
+	var params openid4x.SignSubFlowParams
+	var rpcID json.RawMessage
+	select {
+	case data := <-ct.Out():
+		var req struct {
+			ID     json.RawMessage     `json:"id"`
+			Method string              `json:"method"`
+			Params wmp.FlowStartParams `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(data, &req))
+		require.Equal(t, wmp.MethodFlowStart, req.Method)
+		require.NoError(t, json.Unmarshal(req.Params.Params, &params))
+		rpcID = req.ID
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for wmp.flow.start")
+	}
+
+	// Unblock the Call() by responding to the child flow.start.
+	resultJSON, _ := json.Marshal(wmp.FlowStartResult{
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: "sess-sign"},
+	})
+	rpcResponse, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      rpcID,
+		"result":  json.RawMessage(resultJSON),
+	})
+	require.NoError(t, ct.Push(rpcResponse))
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SendJSON to return")
+	}
+
+	assert.Equal(t, string(in.Action), params.Action)
+	assert.Equal(t, in.Params.Nonce, params.Nonce)
+	assert.Equal(t, in.Params.Audience, params.Audience)
+	assert.Equal(t, in.Params.ProofType, params.ProofType)
+	assert.Equal(t, in.FlowID, params.ParentFlowID)
+	assert.Equal(t, in.Params.Issuer, params.Issuer)
+	assert.Equal(t, in.Params.ProofTypesSupported, params.ProofTypesSupported)
+	assert.Equal(t, in.Params.Count, params.Count)
+	assert.Equal(t, in.Params.ResponseURI, params.ResponseURI)
+	assert.Equal(t, in.Params.VerifierJwkThumbprint, params.VerifierJWKThumbprint)
+	assert.Equal(t, in.Params.VerifierSessionID, params.VerifierSessionID)
+	assert.Equal(t, in.Params.ReissuanceKid, params.ReissuanceKid)
+	assert.Equal(t, in.Params.HTM, params.HTM)
+	assert.Equal(t, in.Params.HTU, params.HTU)
+	assert.Equal(t, in.Params.DPoPNonce, params.DPoPNonce)
+	assert.Equal(t, in.Params.ATH, params.ATH)
+	assert.Equal(t, in.Params.KeyID, params.KeyID)
+	require.Len(t, params.TransactionData, 1)
+	assert.Equal(t, in.Params.TransactionData[0].Type, params.TransactionData[0].Type)
+	assert.Equal(t, in.Params.TransactionData[0].CredentialIDs, params.TransactionData[0].CredentialIDs)
+	require.Len(t, params.CredentialsToInclude, 1)
+	assert.Equal(t, in.Params.CredentialsToInclude[0].CredentialID, params.CredentialsToInclude[0].CredentialID)
+	assert.Equal(t, in.Params.CredentialsToInclude[0].DisclosedClaims, params.CredentialsToInclude[0].DisclosedClaims)
 }
 
 // TestWmpSessionTransport_ReadMessage covers ReadMessage's delegation to the

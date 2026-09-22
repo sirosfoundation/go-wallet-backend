@@ -1253,11 +1253,25 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		t.handler.registerChildFlow(childFlowID, m.FlowID, m.MessageID, "sign")
 
 		subFlowParams := openid4x.SignSubFlowParams{
-			Action:       string(m.Action),
-			Nonce:        m.Params.Nonce,
-			Audience:     m.Params.Audience,
-			ProofType:    m.Params.ProofType,
-			ParentFlowID: m.FlowID,
+			Action:                string(m.Action),
+			Nonce:                 m.Params.Nonce,
+			Audience:              m.Params.Audience,
+			ProofType:             m.Params.ProofType,
+			ParentFlowID:          m.FlowID,
+			TransactionData:       convertTransactionData(m.Params.TransactionData),
+			Issuer:                m.Params.Issuer,
+			ProofTypesSupported:   m.Params.ProofTypesSupported,
+			Count:                 m.Params.Count,
+			ResponseURI:           m.Params.ResponseURI,
+			VerifierJWKThumbprint: m.Params.VerifierJwkThumbprint,
+			VerifierSessionID:     m.Params.VerifierSessionID,
+			CredentialsToInclude:  convertCredentialsToInclude(m.Params.CredentialsToInclude),
+			ReissuanceKid:         m.Params.ReissuanceKid,
+			HTM:                   m.Params.HTM,
+			HTU:                   m.Params.HTU,
+			DPoPNonce:             m.Params.DPoPNonce,
+			ATH:                   m.Params.ATH,
+			KeyID:                 m.Params.KeyID,
 		}
 		paramsJSON, err := json.Marshal(subFlowParams)
 		if err != nil {
@@ -1308,6 +1322,44 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		}
 		return t.ct.WriteMessage(ctx, data)
 	}
+}
+
+// convertTransactionData converts the engine's TransactionData (sent over
+// the native WebSocket transport) to its WMP wire equivalent. The two types
+// are field-for-field identical; this only exists so the two transports
+// don't share a Go type across the engine/wmp package boundary.
+func convertTransactionData(in []TransactionData) []openid4x.TransactionData {
+	if in == nil {
+		return nil
+	}
+	out := make([]openid4x.TransactionData, len(in))
+	for i, td := range in {
+		out[i] = openid4x.TransactionData{
+			Type:                     td.Type,
+			Params:                   td.Params,
+			CredentialIDs:            td.CredentialIDs,
+			HashAlgorithm:            td.HashAlgorithm,
+			TransactionDataHashesAlg: td.TransactionDataHashesAlg,
+		}
+	}
+	return out
+}
+
+// convertCredentialsToInclude converts the engine's CredentialRef (sent over
+// the native WebSocket transport) to its WMP wire equivalent, CredentialSelection.
+func convertCredentialsToInclude(in []CredentialRef) []openid4x.CredentialSelection {
+	if in == nil {
+		return nil
+	}
+	out := make([]openid4x.CredentialSelection, len(in))
+	for i, ref := range in {
+		out[i] = openid4x.CredentialSelection{
+			CredentialID:      ref.CredentialID,
+			CredentialQueryID: ref.CredentialQueryID,
+			DisclosedClaims:   ref.DisclosedClaims,
+		}
+	}
+	return out
 }
 
 func (t *wmpSessionTransport) ReadMessage(ctx context.Context) ([]byte, error) {
