@@ -415,6 +415,83 @@ Client → Server:
 }
 ```
 
+#### Client Authentication (Signing)
+
+Two further `sign_request` actions let the client authenticate the engine's
+outbound requests to the issuer with a key the backend never holds.
+
+**`sign_client_auth`** (preferred). The engine sends one of these for every
+request that needs client authentication: the PAR request, the token request
+(each DPoP-nonce attempt), and every DPoP-bound resource request (credential,
+deferred credential, notification). The client holds one key that is both its
+Wallet Instance Attestation `cnf` key and its DPoP key, and signs exactly what
+the engine asks for:
+
+```
+Server → Client:
+{
+  "type": "sign_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "action": "sign_client_auth",
+  "params": {
+    "audience": "https://as.example.com",      // present: WIA + fresh PoP wanted (aud)
+    "issuer": "https://wallet.example.com/cb", // PoP iss = the flow's client_id
+    "htm": "POST",                             // present with htu: DPoP proof wanted
+    "htu": "https://as.example.com/token",
+    "dpop_nonce": "<server nonce, if any>",
+    "ath": "<base64url(SHA-256(access_token)), resource requests only>",
+    "key_id": "<dpop_key_id from a previous flow, renewals only>"
+  }
+}
+
+Client → Server:
+{
+  "type": "sign_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "dpop_key_id": "<client's identifier for the key>",   // always, when supported
+  "dpop_proof": "eyJ...",                                // when htm/htu were given
+  "client_attestation": "eyJ...",                        // when audience was given
+  "client_attestation_pop": "eyJ..."                     //   and a WIA is available
+}
+```
+
+`dpop_key_id` is mandatory whenever the client supports the action, even when
+no proof was asked for. The first `sign_client_auth` of a flow is a probe: an
+empty response (a client that does not know the action) or no response makes
+the engine fall back to an engine-held DPoP key plus a single
+`request_attestation` for the rest of the flow. Once a client has answered
+with `dpop_key_id` the mode is fixed for the flow, and a later signing failure
+is a flow error. A PoP must be freshly signed (new `jti`) for every request.
+
+**`request_attestation`** (legacy fallback). Sent once per flow, after the
+issuer's authorization server is known. The client returns its WIA and a PoP
+with `aud` = `params.audience`, `iss` = `params.issuer`, and the engine
+replays both on the PAR and token requests:
+
+```
+Server → Client:
+{ "type": "sign_request", "action": "request_attestation",
+  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb" } }
+
+Client → Server:
+{ "type": "sign_response", "client_attestation": "eyJ...", "client_attestation_pop": "eyJ..." }
+```
+
+Both empty means the client cannot attest and the flow proceeds without
+client attestation. A client must answer every `sign_request` it does not
+understand with an empty `sign_response`, or the engine waits out its
+timeout before falling back.
+
+**Renewal.** When the token response carries a `refresh_token`, `flow_complete`
+also carries the key it is bound to: `dpop_key_id` when the client signed
+(client-held mode), or `dpop_jwk` (the engine's private key as a JWK) in the
+legacy mode. The client stores it with the refresh token and sends the same
+field back on the renewal `flow_start`; with `dpop_key_id` the engine puts it
+in `params.key_id` of every `sign_client_auth` so the client signs with the
+original key.
+
 #### Credential Request
 
 ```

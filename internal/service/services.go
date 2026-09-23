@@ -91,7 +91,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Verifier:         NewVerifierService(store, logger),
 		Keystore:         NewKeystoreService(store, cfg, logger),
 		Proxy:            NewProxyService(cfg, logger),
-		Helper:           NewHelperService(logger),
+		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
 		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),

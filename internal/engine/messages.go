@@ -113,8 +113,13 @@ const (
 	ErrCodeMatchTimeout      ErrorCode = "MATCH_TIMEOUT"
 	ErrCodeMatchError        ErrorCode = "MATCH_ERROR"
 	ErrCodePresentationError ErrorCode = "PRESENTATION_ERROR"
-	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeNoMatchingCredentials is returned when the wallet holds nothing
+	// that satisfies the verifier's query. Distinct from a decline: the user
+	// was never asked, so reporting this to the wallet as "declined" would be
+	// wrong. The verifier is told neither apart - see submitErrorResponse.
+	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
+	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -161,6 +166,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Credential matching failed"
 	case ErrCodePresentationError:
 		return "Presentation failed"
+	case ErrCodeNoMatchingCredentials:
+		return "You do not have any credentials that match this request"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
@@ -177,6 +184,15 @@ const (
 	SignActionGenerateProof      SignAction = "generate_proof"
 	SignActionSignPresentation   SignAction = "sign_presentation"
 	SignActionRequestAttestation SignAction = "request_attestation"
+	// SignActionSignClientAuth asks the client to authenticate one outbound
+	// request with its own key: a DPoP proof (RFC 9449) when htm/htu are set,
+	// and a WIA + fresh attestation PoP when audience is set. The client
+	// holds the key that is both the WIA cnf key and the DPoP key, so the
+	// engine never sees a DPoP private key (go-wallet-backend#317). A client
+	// that supports the action always returns dpop_key_id; an empty response
+	// means it does not, and the engine falls back to its own DPoP key plus
+	// a single SignActionRequestAttestation.
+	SignActionSignClientAuth SignAction = "sign_client_auth"
 )
 
 // Message is the base message envelope for all WebSocket messages
@@ -220,6 +236,22 @@ type FlowStartMessage struct {
 	ClientAttestation    string `json:"client_attestation,omitempty"`
 	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
 
+	// AuthorizationDetails is the OID4VCI `authorization_details` the client
+	// wants sent on the Authorization Request (OID4VCI 1.0 §5.1.1). DIIP
+	// requires a Wallet to be able to ask for a credential configuration this
+	// way as well as by `scope`.
+	//
+	// Supplied by the client rather than derived here, on purpose. The engine
+	// builds the Authorization Request for every transport, so the wallet
+	// cannot add the parameter itself - but the *decision* is the Wallet's,
+	// which is where DIIP puts it and where wallet-frontend and the native
+	// SDKs keep it. The engine forwards what it is given.
+	//
+	// Absent means "do not ask this way", not "ask with nothing": the
+	// parameter is omitted entirely and the `scope` path is unchanged, so a
+	// client that never sends this behaves exactly as before.
+	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -249,6 +281,33 @@ type FlowStartMessage struct {
 	// never persists this key itself; the client (via privatedata) is the
 	// only durable custodian - see feedback_backend_key_persistence_principle.
 	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID, when set on a renewal request, is the identifier the client
+	// returned at FlowCompleteMessage.DPoPKeyID for the flow that issued
+	// RefreshToken: the client-held key the token is bound to. The engine
+	// passes it back as SignRequestParams.KeyID on every
+	// SignActionSignClientAuth of the renewal so the client signs with that
+	// same key. Takes precedence over DPoPJWK.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+// authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
+// §5.1.1 defines for a credential authorization detail.
+const authorizationDetailTypeOpenIDCredential = "openid_credential"
+
+// AuthorizationDetail is one OID4VCI `authorization_details` entry.
+//
+// Only the `credential_configuration_id` form is carried: DIIP requires that
+// one, and it is what the `format`-based alternative was replaced by.
+//
+// CredentialIdentifiers is populated only on the way back - an Authorization
+// Server that honours `authorization_details` echoes the details in its token
+// response with the identifiers it granted (OID4VCI 1.0 §6), and the
+// Credential Request must then name one of those instead of the configuration
+// id.
+type AuthorizationDetail struct {
+	Type                      string   `json:"type"`
+	CredentialConfigurationID string   `json:"credential_configuration_id,omitempty"`
+	CredentialIdentifiers     []string `json:"credential_identifiers,omitempty"`
 }
 
 // FlowProgressMessage reports flow progress to client
@@ -300,6 +359,13 @@ type FlowCompleteMessage struct {
 	// for the current flow and never persists it; relaying it here makes
 	// the client (via privatedata) the sole durable custodian.
 	DPoPJWK string `json:"dpop_jwk,omitempty"`
+	// DPoPKeyID is the client-chosen identifier of the client-held key this
+	// flow used for DPoP (SignActionSignClientAuth), present only alongside
+	// RefreshToken and only when the flow ran in client-held mode, in which
+	// case DPoPJWK is absent because the engine never had the private key.
+	// The client stores it with RefreshToken and presents it back as
+	// FlowStartMessage.DPoPKeyID on renewal.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -393,6 +459,20 @@ type SignRequestParams struct {
 	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
+	// DPoP proof over that HTTP method and URL; DPoPNonce is the
+	// server-provided DPoP nonce to include (RFC 9449 §8), ATH the
+	// base64url(SHA-256(access_token)) claim for resource requests (empty
+	// for the token endpoint). KeyID, when set (a renewal), names the key
+	// the client returned as dpop_key_id at the original issuance and must
+	// sign with again. Audience and Issuer double as the attestation PoP
+	// aud/iss when the request also needs client attestation.
+	HTM       string `json:"htm,omitempty"`
+	HTU       string `json:"htu,omitempty"`
+	DPoPNonce string `json:"dpop_nonce,omitempty"`
+	ATH       string `json:"ath,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
 }
 
 // CredentialRef references a credential for signing
@@ -424,6 +504,15 @@ type SignResponseMessage struct {
 	// could not attest - the flow proceeds without wallet attestation (Tier 3).
 	ClientAttestation    string `json:"client_attestation,omitempty"`
 	ClientAttestationPoP string `json:"client_attestation_pop,omitempty"`
+	// DPoPKeyID and DPoPProof answer a SignActionSignClientAuth request.
+	// DPoPKeyID is the client's opaque identifier for the key it uses for
+	// DPoP in this flow and is set whenever the client supports the action,
+	// even when no proof was asked for; empty means unsupported. DPoPProof is
+	// the DPoP proof JWT when htm/htu were given. ClientAttestation and
+	// ClientAttestationPoP carry the WIA and a fresh PoP when audience was
+	// given.
+	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+	DPoPProof string `json:"dpop_proof,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.

@@ -300,9 +300,15 @@ func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 
 // EngineProvider provides WebSocket engine routes
 type EngineProvider struct {
-	cfg     *config.Config
-	logger  *zap.Logger
-	manager *wsengine.Manager
+	cfg    *config.Config
+	logger *zap.Logger
+	// metadataResolver is the resolver the flow handlers were registered with,
+	// kept the way BackendProvider keeps its own: once it is handed to a
+	// handler factory it is otherwise unreachable, and the policy it was built
+	// with - AllowsPlaintext - is then only assertable by rebuilding it, which
+	// is a restatement of the rule rather than a check of it.
+	metadataResolver *issuermetadata.Resolver
+	manager          *wsengine.Manager
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -345,7 +351,7 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	if metadataResolver == nil {
 		r, err := issuermetadata.New(issuermetadata.Config{
 			HTTPClient: cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
+			AllowHTTP:  cfg.HTTPClient.AllowsPlaintext(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -359,9 +365,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
 	return &EngineProvider{
-		cfg:     cfg,
-		logger:  logger,
-		manager: manager,
+		cfg:              cfg,
+		logger:           logger,
+		metadataResolver: metadataResolver,
+		manager:          manager,
 	}, nil
 }
 
@@ -453,7 +460,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
 			HTTPClient: cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify,
+			AllowHTTP:  cfg.HTTPClient.AllowsPlaintext(),
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {
@@ -637,6 +644,16 @@ func (p *BackendProvider) ASModule() *as.ASModule {
 // TokenValidator returns the go-tokenauth validator, or nil if AS is not enabled.
 func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 	return p.tokenValidator
+}
+
+// ASSessionCleaner returns the AS session store as a service.SessionCleaner,
+// or nil if the AS is not enabled, so user deletion can revoke AS cookie
+// sessions alongside engine sessions.
+func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
+	if p.asModule == nil || p.asModule.Sessions == nil {
+		return nil
+	}
+	return p.asModule.Sessions
 }
 
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.

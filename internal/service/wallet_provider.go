@@ -31,6 +31,10 @@ var (
 // Prevents DoS via expensive JWT signing with excessively large arrays.
 const MaxJWKSPerRequest = 20
 
+// The software certification value emitted on the
+// clamped (untrusted or absent security_properties) path.
+const floorCertificationURL = "https://developers.siros.org/wallet/architecture/key-management"
+
 // WalletProviderService handles wallet provider operations like key attestation
 type WalletProviderService struct {
 	cfg             *config.Config
@@ -152,14 +156,15 @@ func (s *WalletProviderService) loadKeys() error {
 	s.jwtSigner = jwtSigner
 
 	// CertificatePath is optional: a signing key alone is enough for
-	// "ietf"-mode WIA issuance (JWKS-based trust, no x5c — see
-	// WIAConfig.Mode). Key Attestation (KA) and "etsi"-mode WIA always
-	// require x5c, which config.Validate() enforces by requiring a
-	// certificate whenever wallet_provider.wia.mode is "etsi"; without one,
-	// IsSupported() (KA) correctly reports unsupported and only WIAService's
-	// own ietf-mode IsSupported() can be true.
+	// "ietf"-mode WIA issuance (JWKS-based trust; x5c is additionally
+	// included only when a certificate is configured — see WIAConfig.Mode).
+	// Key Attestation (KA) and "etsi"-mode WIA always require x5c, which
+	// config.Validate() enforces by requiring a certificate whenever
+	// wallet_provider.wia.mode is "etsi"; without one, IsSupported() (KA)
+	// correctly reports unsupported and only WIAService's own ietf-mode
+	// IsSupported() can be true.
 	if s.cfg.WalletProvider.CertificatePath == "" {
-		s.logger.Info("Loaded wallet provider signing key (no certificate configured; x5c/KA unavailable)")
+		s.logger.Info("Loaded wallet provider signing key (no certificate configured; KA unavailable and ietf-mode WIA will be kid-only)")
 		return nil
 	}
 
@@ -219,8 +224,8 @@ func (s *WalletProviderService) IsSupported() bool {
 
 // HasSigningKey returns true if a signing key (file or PKCS#11) is loaded,
 // regardless of whether a certificate/x5c chain is also configured. Used to
-// gate WIA-only ("ietf" mode) functionality, which doesn't need x5c — unlike
-// IsSupported, which additionally requires a certificate for KA.
+// gate WIA-only ("ietf" mode) functionality, which doesn't require x5c —
+// unlike IsSupported, which additionally requires a certificate for KA.
 func (s *WalletProviderService) HasSigningKey() bool {
 	return s.jwtSigner != nil
 }
@@ -498,7 +503,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		return &SecurityProperties{
 			KeyStorage:         []string{"iso_18045_basic"},
 			UserAuthentication: []string{"iso_18045_basic"},
-			Certification:      "none",
+			Certification:      floorCertificationURL,
 		}
 	}
 
@@ -518,7 +523,7 @@ func normalizeSecurityProperties(secProps *SecurityProperties, trusted bool) *Se
 		out.UserAuthentication = []string{"iso_18045_basic"}
 	}
 	if out.Certification == nil {
-		out.Certification = "none"
+		out.Certification = floorCertificationURL
 	}
 	return out
 }

@@ -79,6 +79,14 @@ type ASConfig struct {
 	// Default: 24h
 	SessionTTL time.Duration `yaml:"session_ttl" envconfig:"SESSION_TTL"`
 
+	// SessionStore selects where AS sessions (the cookie-bound server-side
+	// sessions that mint access tokens) are kept: "mongodb", "memory" or
+	// "auto". "auto" (the default when empty) means "mongodb" when the
+	// storage backend is MongoDB and "memory" otherwise. Memory sessions are
+	// lost on restart and are not shared between instances; use "mongodb" for
+	// high availability.
+	SessionStore string `yaml:"session_store" envconfig:"SESSION_STORE"`
+
 	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
 	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
 	// Default: "rwl" (read, write, list)
@@ -212,8 +220,15 @@ type HTTPClientConfig struct {
 	// Set to true when issuers are hosted on internal networks (dev/staging environments).
 	// Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
-	// AllowHTTP permits non-TLS (plain HTTP) connections for metadata resolution.
+	// AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through
+	// the client this configuration builds - request objects, issuer and
+	// verifier metadata, JWKS, logos, registry and proxy calls - not only for
+	// metadata resolution, which was its scope while the resolver was the sole
+	// consumer. Code that builds its own client rather than taking this one is
+	// not governed by it; see NewHTTPClient for which paths those are.
 	// Default: false (HTTPS required). Use only for local development.
+	// It is not the only setting that permits plaintext: see AllowsPlaintext,
+	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 }
@@ -222,8 +237,37 @@ type HTTPClientConfig struct {
 // timeout, and TLS settings. If timeoutOverride > 0 it is used instead of the
 // configured timeout. A zero-value HTTPClientConfig produces a sensible default
 // (30 s timeout, system proxy, TLS verification enabled).
-// When AllowPrivateIPs is false, a custom dialer blocks connections to private,
-// loopback, and link-local IP ranges to prevent SSRF.
+//
+// When AllowPrivateIPs is false, two guards apply to every request this client
+// makes, including each hop of a redirect. Both exist because much of what this
+// backend fetches is addressed by whoever it is talking to: a verifier picks
+// the request_uri the wallet dereferences, an issuer picks its metadata URLs.
+//
+//   - a dialer that refuses private, loopback, link-local and cloud metadata
+//     addresses, and then connects to an address it checked;
+//   - plain HTTP is refused unless AllowsPlaintext says otherwise, so a fetch
+//     cannot be downgraded to a network any observer on the path can read or
+//     rewrite.
+//
+// Both guards reach only what is fetched through this client. One production
+// path builds its own and is governed by neither:
+//
+//   - internal/as's OIDC discovery and token exchange, which construct a bare
+//     http.Client, so neither the address nor the scheme policy applies.
+//     Bringing it under this configuration is separate work: it would change
+//     which IdP addresses an existing deployment can reach.
+//
+// internal/service.HelperService.GetCertificateChain also dials TLS directly
+// rather than through an http.Client (it reads a certificate chain off a
+// manual handshake), but it is not exempt: it applies the address half of
+// this same policy via GuardedDialContext, since it has no http.Client for
+// this method's own guard to attach to.
+//
+// When a proxy is in use the dialer only ever sees the proxy, so the address
+// policy is applied to the request's own host before it is sent. That check is
+// best effort by nature: the proxy resolves the name itself and may reach an
+// address this process never saw. A deployment that relies on an egress proxy
+// should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
@@ -246,40 +290,302 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		}
 	}
 
+	var roundTripper http.RoundTripper = transport
+
 	if !c.AllowPrivateIPs {
-		// Block connections to private/loopback/link-local IPs to prevent SSRF.
-		// DNS resolution happens inside the dialer so post-DNS rebinding is also blocked.
 		baseDialer := &net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
-			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
-			}
-			for _, ip := range ips {
-				// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-				// before the generic private/link-local check for a clearer message.
-				if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
-					return nil, fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
-				}
-				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-					return nil, fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
-				}
-			}
-			return baseDialer.DialContext(ctx, network, net.JoinHostPort(host, port))
+		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
+		roundTripper = ssrfGuard{
+			base:      transport,
+			proxy:     transport.Proxy,
+			lookup:    defaultLookupIP,
+			httpsOnly: !c.AllowsPlaintext(),
 		}
 	}
 
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: transport,
+		Transport: roundTripper,
 	}
+}
+
+// GuardedDialContext returns a dial function applying the same address policy
+// as NewHTTPClient's transport (private/loopback/link-local/cloud-metadata
+// blocked unless AllowPrivateIPs, dialing the address it checked rather than
+// re-resolving), for a caller that needs a raw net.Conn rather than an
+// *http.Client - e.g. HelperService.GetCertificateChain, which reads a
+// certificate chain off a manual TLS handshake and so has no http.Client for
+// NewHTTPClient's guard to attach to. When AllowPrivateIPs is set, this
+// returns a plain, unchecked dial, matching NewHTTPClient's own behavior.
+func (c HTTPClientConfig) GuardedDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	baseDialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	if c.AllowPrivateIPs {
+		return baseDialer.DialContext
+	}
+	return guardedDial(defaultLookupIP, baseDialer.DialContext)
+}
+
+// AllowsPlaintext reports whether this configuration permits non-TLS (plain
+// HTTP) requests. Three settings say so, and they are consulted together
+// everywhere the policy is applied - this transport, the issuer metadata
+// resolver's URL validation, the AuthZEN proxy - so that a URL one layer
+// accepts is not refused by the next:
+//
+//   - AllowHTTP, which says it directly;
+//   - AllowPrivateIPs, because a deployment reaching its own network is
+//     already reaching services that terminate no TLS, the in-process
+//     registry among them (http://localhost:<registry_port>);
+//   - InsecureSkipVerify, which the provider wiring has always folded into
+//     AllowHTTP: a deployment that has given up certificate verification
+//     altogether is not the one a scheme check is protecting.
+func (c HTTPClientConfig) AllowsPlaintext() bool {
+	return c.AllowHTTP || c.AllowPrivateIPs || c.InsecureSkipVerify
+}
+
+// lookupFunc resolves a host to its addresses. Named so guardedDial can be
+// driven without a resolver in tests.
+type lookupFunc func(ctx context.Context, host string) ([]net.IP, error)
+
+// dialFunc opens a connection to an address, as net.Dialer.DialContext does.
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// guardedDial wraps dial so that it refuses to reach the deployment's own
+// network: private, loopback and link-local ranges, and the cloud metadata
+// endpoints on top of them.
+//
+// It connects to an address it checked rather than handing the hostname back
+// to the dialer, which would resolve it a second time. That second lookup is
+// the hole: a DNS server under the requester's control can answer with a
+// public address for the check and an internal one a moment later for the
+// connection, and the guard above would have inspected an address that is
+// never dialled.
+func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+		ips, err := lookup(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
+		}
+
+		// Every address was checked above, so any of them is safe to use.
+		candidates := make([]string, 0, len(ips))
+		for _, ip := range ips {
+			if matchesNetwork(network, ip) {
+				candidates = append(candidates, net.JoinHostPort(ip.String(), port))
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("no %s address found for %s", network, host)
+		}
+		return dialCandidates(ctx, dial, network, candidates)
+	}
+}
+
+// dialFallbackDelay is how long one connection attempt is given on its own
+// before the next checked address is tried alongside it.
+const dialFallbackDelay = 300 * time.Millisecond
+
+// dialCandidates connects to the first of addrs that answers.
+//
+// The attempts are staggered rather than strictly serial, which is what
+// net.Dialer does for a hostname it resolved itself (RFC 6555, "Happy
+// Eyeballs"). Dialing one after another instead would let a single black-holed
+// address - a dead IPv6 route, most often - hold the whole request for the
+// dialer's full timeout before the working address is ever tried. That
+// behaviour comes free when the dialer is handed a name, and is lost here
+// precisely because this dials addresses it has checked.
+func dialCandidates(ctx context.Context, dial dialFunc, network string, addrs []string) (net.Conn, error) {
+	if len(addrs) == 1 {
+		return dial(ctx, network, addrs[0])
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	// Returning cancels whatever is still in flight. A connection that is
+	// already established is not affected by its dial context being cancelled.
+	defer cancel()
+
+	type attempt struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan attempt, len(addrs))
+
+	// closeLate consumes the attempts still outstanding when a winner has been
+	// picked, so a connection that completes just after the race is closed
+	// rather than left open.
+	closeLate := func(outstanding int) {
+		go func() {
+			for i := 0; i < outstanding; i++ {
+				if a := <-results; a.conn != nil {
+					_ = a.conn.Close()
+				}
+			}
+		}()
+	}
+
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	var firstErr error
+	started, pending := 0, 0
+	for started < len(addrs) || pending > 0 {
+		var nextAttempt <-chan time.Time
+		if started < len(addrs) {
+			nextAttempt = timer.C
+		}
+
+		select {
+		case <-ctx.Done():
+			closeLate(pending)
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return nil, firstErr
+
+		case <-nextAttempt:
+			addr := addrs[started]
+			started++
+			pending++
+			go func() {
+				conn, err := dial(ctx, network, addr)
+				results <- attempt{conn: conn, err: err}
+			}()
+			if started < len(addrs) {
+				timer.Reset(dialFallbackDelay)
+			}
+
+		case a := <-results:
+			pending--
+			if a.err == nil {
+				closeLate(pending)
+				return a.conn, nil
+			}
+			if firstErr == nil {
+				firstErr = a.err
+			}
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no address could be dialled")
+	}
+	return nil, firstErr
+}
+
+// matchesNetwork reports whether ip can be dialled on the requested network.
+// "tcp" (and anything else) takes either family; "tcp4" and "tcp6" do not.
+func matchesNetwork(network string, ip net.IP) bool {
+	switch network {
+	case "tcp4", "udp4", "ip4":
+		return ip.To4() != nil
+	case "tcp6", "udp6", "ip6":
+		return ip.To4() == nil
+	default:
+		return true
+	}
+}
+
+// checkAddresses applies the address policy: nothing that would reach the
+// deployment's own network, and the cloud metadata endpoints named separately
+// so the refusal says which rule was hit.
+func checkAddresses(host string, ips []net.IP) error {
+	if len(ips) == 0 {
+		return fmt.Errorf("no addresses found for %s", host)
+	}
+	for _, ip := range ips {
+		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
+		// before the generic private/link-local check for a clearer message.
+		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+		}
+		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
+		// most other stacks) treats an unspecified destination address as
+		// loopback - so left unchecked, this is a plain loopback bypass, not
+		// merely a theoretical gap.
+		if ip.IsUnspecified() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: unspecified address", host, ip)
+		}
+	}
+	return nil
+}
+
+// ssrfGuard is the half of the protection that has to sit above the transport
+// rather than in its dialer.
+//
+// The scheme is only visible here, and this is the layer every hop of a
+// redirect chain passes through: a fetch that starts at https:// can be sent
+// anywhere by a 302, and the URL it lands on is no more trusted than the one
+// it started from.
+//
+// A proxied request needs the address policy applied here too. http.Transport
+// dials the proxy, not the target - for https the target travels in a CONNECT
+// and never reaches the dialer at all - so without this a configured or
+// ambient (HTTP_PROXY, HTTPS_PROXY) proxy would quietly forward exactly the
+// requests the dialer exists to refuse. The check is weaker than the dialer's:
+// the proxy resolves the name itself, so it can reach an address this process
+// never saw, which is why it is done only where the dialer cannot see.
+type ssrfGuard struct {
+	base      http.RoundTripper
+	proxy     func(*http.Request) (*url.URL, error)
+	lookup    lookupFunc
+	httpsOnly bool
+}
+
+func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
+	if g.httpsOnly && req.URL.Scheme != "https" {
+		// Naming all three keys AllowsPlaintext consults, since an operator
+		// who reads only one of them is told to change a setting that may
+		// already be set. insecure_skip_verify is listed last and with the
+		// warning it deserves: it permits plaintext as a side effect of
+		// giving up certificate verification, which is not a reason to set it.
+		return nil, fmt.Errorf("refusing to send a %s request to %q: this client allows https only "+
+			"(set http_client.allow_http, or http_client.allow_private_ips for an internal deployment; "+
+			"http_client.insecure_skip_verify also permits plaintext, but do not enable it for that)",
+			req.URL.Scheme, req.URL.Host)
+	}
+
+	if g.proxied(req) {
+		host := req.URL.Hostname()
+		ips, err := g.lookup(req.Context(), host)
+		if err != nil {
+			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
+		}
+		if err := checkAddresses(host, ips); err != nil {
+			return nil, err
+		}
+	}
+
+	return g.base.RoundTrip(req)
+}
+
+// proxied reports whether this request would be sent through a proxy, and so
+// whether the dialer below will see the proxy's address instead of the
+// target's.
+func (g ssrfGuard) proxied(req *http.Request) bool {
+	if g.proxy == nil {
+		return false
+	}
+	proxyURL, err := g.proxy(req)
+	return err == nil && proxyURL != nil
 }
 
 // ServerConfig contains HTTP server configuration
@@ -702,9 +1008,10 @@ type WIAConfig struct {
 	//     ARF-conformant PID/EAA Providers.
 	//
 	//   - "ietf": the generic IETF draft-ietf-oauth-attestation-based-client-auth
-	//     model, with no ARF/ETSI counterpart. The WIA omits `x5c` and
-	//     instead carries a `kid` header plus the `iss` claim (required);
-	//     relying parties resolve trust via JWKS discovery at
+	//     model, with no ARF/ETSI counterpart. The WIA always carries a
+	//     `kid` header plus the `iss` claim (required), and also includes
+	//     `x5c` when a certificate chain is configured so consumers can
+	//     resolve trust either from the header or via JWKS discovery at
 	//     "<issuer>/.well-known/jwks.json" (see
 	//     RegisterWalletProviderJWKSRoute). Only meaningful for non-EUDI,
 	//     generic-OAuth ecosystems — an ARF-conformant PID/EAA Provider has
@@ -712,8 +1019,8 @@ type WIAConfig struct {
 	//
 	// Note SUNET/vc's parseAttestationIdentity treats x5c as authoritative
 	// and `iss` as a secondary consistency check only when both are present,
-	// so "etsi" mode (no iss) and "ietf" mode (no x5c) are both unambiguous
-	// to that consumer.
+	// so "etsi" mode (no iss) remains unambiguous and "ietf" mode can offer
+	// both trust-resolution paths to that consumer.
 	Mode string `yaml:"mode" envconfig:"MODE"`
 	// WalletProviderURI is the expected `aud` in WIA-PoP JWTs (wallet provider identifier)
 	WalletProviderURI string `yaml:"wallet_provider_uri" envconfig:"WALLET_PROVIDER_URI"`

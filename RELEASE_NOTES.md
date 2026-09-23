@@ -4,6 +4,83 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.22.1:start -->
+## [v0.22.1] - 2026-09-22
+
+### Security
+
+- Fixed SSRF vulnerability in `POST /helper/get-cert` endpoint that allowed authenticated users to probe internal network services and retrieve their TLS certificates, disclosing service topology and internal CA details. The endpoint now applies the same address guard (blocking private/loopback/link-local ranges and cloud metadata endpoints) used by all other outbound fetches. (#358)
+- Fixed crash-loop DoS in WebSocket flow handling where a client-controlled `flow_id` shorter than 8 characters would panic before the recovery handler registered, killing the process. In combined-role deployments (`-mode=all`), this could take down backend, engine, registry, and admin services simultaneously. (#357)
+- Updated MongoDB driver to 1.17.10 to address CVE-2026-88031, a GridFS vulnerability where delete methods could match file IDs more loosely than intended, potentially causing unintended deletions. (#356)
+- 
+- Kudos to @kushaldas
+
+### Changed
+
+- Dependency updates: `github.com/fxamacker/cbor/v2` and `github.com/sirosfoundation/go-cryptoutil/pkcs11pool`. (#356)
+<!-- release-notes:v0.22.1:end -->
+
+<!-- release-notes:v0.22.0:start -->
+## [v0.22.0] - 2026-09-18
+
+### Added
+
+- **Authorization details support for DIIP credential issuance.** The engine now forwards `authorization_details` from `flow_start` to the Authorization Request alongside `scope`, and honours the `credential_identifier` echoed by the AS in the token response. This enables wallets to request specific credential configurations when the issuer requires it, without clients needing to construct Authorization Requests themselves. (#341)
+
+- **Admin user detail endpoint** at `GET /admin/tenants/:id/users/:user_id/detail` returns non-PII user information including passkeys, DID, and wallet type. A stub tenant statistics endpoint at `GET /admin/tenants/:id/stats` returns 501. (#250)
+
+- **Audit events for invite lifecycle.** The admin API now emits `invite:created`, `invite:updated` (with `renew`/`revoke` action), and `invite:deleted` events to the SET audit trail. (#249)
+
+- **Empty credential match handling.** When a presentation request cannot be satisfied because the wallet holds no matching credentials, the flow now ends immediately instead of waiting for the 5-minute timeout. The wallet client receives a `NO_MATCHING_CREDENTIALS` flow error carrying the requested credential types as data, so it can phrase the explanation in the user's own language. The verifier receives `access_denied` with the same `error_description` a user decline sends: OpenID4VP 1.0 answers "the Wallet did not have the requested Credentials" and "the End-User did not give consent" with one code precisely so the two cannot be told apart, and naming the missing types would have let a verifier probe what a holder has. Non-empty match sets remain informational. (#336)
+
+### Fixed
+
+- **SSRF protection gaps in outbound HTTP client.** The dialer now connects to an address that was actually checked (closing a DNS rebinding window), applies address policy when requests are proxied (where the dialer cannot see the target), and refuses plaintext HTTP for all fetches unless explicitly configured. Deployments with `allow_private_ips`, `allow_http`, or `insecure_skip_verify` are unaffected; those without any of the three will now reject plaintext public hosts with an error naming the flag to set. (#338)
+
+- **IETF-mode wallet instance attestations missing `x5c`.** WIA JWTs in IETF mode now include the `x5c` header when certificate material is configured, preserving JWKS-based resolution while adding certificate-chain resolution for consumers that require it. Deployments without a certificate chain continue to work with `kid`-only headers. (#346)
+
+- **Native wallet credential offers failing to parse.** The engine now accepts credential offer URIs with no authority component (`openid-credential-offer:?credential_offer=...`), matching RFC 3986 and the output of the issuer gateway's native chooser. Previously only the double-slash form was recognised. (#345)
+
+- **OpenID4VP 1.0 verifiers rejected for unrecognised `client_id_scheme`.** The engine now accepts `decentralized_identifier` (the final specification's name for the DID scheme) alongside the draft spelling `did`, and strips the prefix when resolving the DID document. Verifiers using the 1.0 identifier format can now be verified. (#343)
+
+### Changed
+
+- **Audit emit failures are now logged** rather than silently dropped, using the logger the emitter was constructed with. (#249)
+
+- **`verifier:created` audit events now use the verifier URL as subject** (matching `issuer:created`), with `verifier_id` and `name` in the event data, so create events can be correlated with later updates and deletes. (#249)
+<!-- release-notes:v0.22.0:end -->
+
+<!-- release-notes:v0.21.0:start -->
+## [v0.21.0] - 2026-09-16
+
+### Added
+- Authorization Server cookie sessions can now be persisted in MongoDB instead of only in-process memory, enabling session survival across restarts and multi-instance deployments. Configure via `as.session_store` / `WALLET_AS_SESSION_STORE` (defaults to `mongodb` when MongoDB is the storage backend). (#325)
+
+### Fixed
+- MongoDB-backed issuer, verifier, credential, and presentation stores now correctly mint unique IDs on a fresh database. Previously, the first two entities created would collide on ID 1, causing `already exists` errors. (#327)
+- Status list test suite now correctly decodes zlib-compressed status lists, matching the production implementation changed in v0.20.0. (#326)
+- Key Attestation certification field is now an absolute URL as required by the specification. (#331)
+
+### Changed
+- Dependency updates: `github.com/gin-contrib/cors` 1.7.7→1.7.8, `github.com/go-webauthn/webauthn` 0.18.0→0.18.1, `github.com/sirosfoundation/go-trust` 0.20.5→0.20.6, `golang.org/x/crypto` 0.56.0→0.57.0, `golang.org/x/sync` 0.22.0→0.23.0, `golang.org/x/time` 0.15.0→0.16.0, `github.com/go-jose/go-jose/v4` 4.1.4→4.1.5. (#323)
+- CI tooling updated to golangci-lint v2.13.2 for Go 1.26 compatibility. (#321)
+<!-- release-notes:v0.21.0:end -->
+
+<!-- release-notes:v0.20.0:start -->
+## [v0.20.0] - 2026-09-10
+
+### Added
+- **Client-held DPoP keys**: New `sign_client_auth` action allows clients to hold their own DPoP private keys instead of the engine generating them. For each authenticated request, the engine now requests fresh signatures (DPoP proofs and wallet attestation PoPs) from the client with request-specific parameters. This ensures `cnf == DPoP key` because clients use one key for both, and eliminates replay of stale attestations. (#318)
+- **Automatic mode detection**: The engine probes clients at the first authenticated request and adapts per-flow—client-held mode if the client answers `sign_client_auth`, legacy mode (engine-generated keys) if the client doesn't respond or times out. Pre-resolved attestations or renewals with `dpop_jwk` skip the probe and use legacy mode. (#318)
+
+### Changed
+- **Renewal flow**: in client-held mode `flow_complete` returns `dpop_key_id` instead of the private `dpop_jwk`, and a renewal `flow_start` sends `dpop_key_id` back so the engine asks the client to sign with the key the refresh token is bound to. `dpop_jwk` keeps working for tokens issued by older backends. (#318)
+- **Notification endpoint**: DPoP-bound notifications now work in both client-held and legacy modes after flow completion by abstracting the signing mechanism. (#318)
+
+### Fixed
+- **Documentation**: The WebSocket protocol spec now documents `sign_client_auth`, `request_attestation`, and renewal fields that were previously undocumented. (#318)
+<!-- release-notes:v0.20.0:end -->
+
 <!-- release-notes:v0.19.0:start -->
 ## [v0.19.0] - 2026-09-07
 

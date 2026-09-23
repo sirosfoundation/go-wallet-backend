@@ -470,15 +470,22 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		flowID = uuid.New().String()
 	}
 
-	logger := session.logger.With(zap.String("flow_id", flowID[:8]), zap.String("protocol", string(msg.Protocol)))
-
-	// Ensure cleanup happens even on panic
+	// Ensure cleanup happens even on panic. Registered before anything else
+	// touches the client-controlled flowID: a flow_id shorter than the log
+	// truncation below must not be able to panic ahead of this defer.
+	logger := session.logger
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in flow handler", zap.Any("panic", r))
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 		}
 	}()
+
+	loggedFlowID := flowID
+	if len(loggedFlowID) > 8 {
+		loggedFlowID = loggedFlowID[:8]
+	}
+	logger = session.logger.With(zap.String("flow_id", loggedFlowID), zap.String("protocol", string(msg.Protocol)))
 
 	// Get handler factory first (before acquiring flow lock)
 	m.handlersMu.RLock()
@@ -791,17 +798,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "")
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "")
 }
 
 // SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
 // refresh_token (and the DPoP key it's bound to) to relay to the client -
 // see FlowCompleteMessage.RefreshToken/DPoPJWK.
-func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK)
+func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID)
 }
 
-func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string) error {
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -816,6 +823,7 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 		RedirectURI:  redirectURI,
 		RefreshToken: refreshToken,
 		DPoPJWK:      dpopJWK,
+		DPoPKeyID:    dpopKeyID,
 	}
 	if flow != nil {
 		flow.mu.RLock()

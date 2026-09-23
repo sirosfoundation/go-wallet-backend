@@ -97,7 +97,7 @@ func TestSendPushedAuthorizationRequest_Success(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 	assert.Equal(t, "urn:ietf:params:oauth:request_uri:abc123", requestURI)
 }
@@ -118,7 +118,7 @@ func TestSendPushedAuthorizationRequest_ErrorResponse(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 400")
 }
@@ -139,7 +139,7 @@ func TestSendPushedAuthorizationRequest_ErrorInBody(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR error")
 	assert.Contains(t, err.Error(), "bad scope")
@@ -158,7 +158,7 @@ func TestSendPushedAuthorizationRequest_MissingRequestURI(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing request_uri")
 }
@@ -258,7 +258,7 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 
 	// Verify the redirect URL would be built correctly
@@ -342,6 +342,15 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 	}
 	h := &OID4VCIHandler{
 		httpClient: httpClient,
+		// The drain-only server above never answers a sign_client_auth
+		// probe, so settle on legacy mode up front: the handler signs DPoP
+		// with h.dpopKey when a test sets one and sends no proof otherwise,
+		// which is what these tests were written against. Tests of the
+		// probe itself (clientauth_test.go) build their own handler.
+		clientAuthMode: clientAuthLegacy,
+		// Likewise treat the one-shot request_attestation as already done
+		// (declined), as Execute would have before reaching the token step.
+		legacyAttestationRequested: true,
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	return h, cleanup
@@ -593,7 +602,7 @@ func TestSendPushedAuthorizationRequest_NetworkError(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR request failed")
 }
@@ -611,7 +620,7 @@ func TestSendPushedAuthorizationRequest_InvalidJSON(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse PAR response")
 }
@@ -3323,4 +3332,110 @@ func TestDpopJWKForRefreshToken_ExportsWhenRefreshTokenPresent(t *testing.T) {
 	parsed, err := parseDPoPPrivateKeyJWK(jwkJSON)
 	require.NoError(t, err)
 	assert.Equal(t, 0, key.D.Cmp(parsed.D))
+}
+
+// TestParseOffer_AcceptsBothOfferURIForms covers the two spellings of an
+// OpenID4VCI credential offer URI.
+//
+// The authority component of this scheme is always empty, and RFC 3986 lets it
+// be left out entirely, so issuers emit either of:
+//
+//	openid-credential-offer://?credential_offer=...
+//	openid-credential-offer:?credential_offer=...
+//
+// This deployment's own issuer gateway emits the second. Matching on
+// "openid-credential-offer://" therefore skipped the extraction branch and
+// handed the whole URI to json.Unmarshal, which failed instantly with
+// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed at all.
+func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["pid_1_8"],"grants":{"authorization_code":{}}}`
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"with authority", "openid-credential-offer://?credential_offer="},
+		{"without authority", "openid-credential-offer:?credential_offer="},
+		// Scheme names are case-insensitive (RFC 3986 section 3.1), so an
+		// issuer is free to emit the scheme in any case and still name this
+		// one.
+		{"uppercase scheme", "OPENID-CREDENTIAL-OFFER:?credential_offer="},
+		{"mixed case scheme with authority", "OpenID-Credential-Offer://?credential_offer="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+			defer cleanup()
+
+			offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+				Offer: tc.prefix + url.QueryEscape(offerJSON),
+			})
+			require.NoError(t, err)
+			require.NotNil(t, offer)
+			assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
+			assert.Equal(t, []string{"pid_1_8"}, offer.CredentialConfigurationIDs)
+		})
+	}
+}
+
+// TestParseOffer_OfferURIWithoutEitherParameter covers the branch's own failure
+// message: an offer URI that carries neither parameter has to say so, rather
+// than fall through and be reported as broken JSON.
+func TestParseOffer_OfferURIWithoutEitherParameter(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	_, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?state=xyz",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither a credential_offer nor a credential_offer_uri")
+}
+
+// TestHasOfferURIScheme pins the scheme match itself: case-insensitive per
+// RFC 3986 section 3.1, authority optional, and nothing else accepted.
+func TestHasOfferURIScheme(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"openid-credential-offer://?credential_offer=%7B%7D", true},
+		{"openid-credential-offer:?credential_offer=%7B%7D", true},
+		{"OPENID-CREDENTIAL-OFFER:?credential_offer=%7B%7D", true},
+		{"OpenID-Credential-Offer://?credential_offer=%7B%7D", true},
+		// A bare JSON offer is not a URI and must fall through to the parser.
+		{`{"credential_issuer":"https://issuer.example.com"}`, false},
+		// Neither a different scheme nor a longer name that merely starts the
+		// same way is this scheme.
+		{"openid-credential-offer-v2:?credential_offer=%7B%7D", false},
+		{"haip://?credential_offer=%7B%7D", false},
+		// The scheme alone, with no ":", is not a URI either.
+		{"openid-credential-offer", false},
+	} {
+		assert.Equal(t, tc.want, hasOfferURIScheme(tc.in), tc.in)
+	}
+}
+
+// TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam is the same fix seen
+// from the credential_offer_uri side: the by-reference form has to be followed
+// for both spellings too, not just the "//" one.
+func TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["eucc"],"grants":{"authorization_code":{}}}`
+
+	offerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(offerJSON))
+	}))
+	defer offerServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, offerServer.Client())
+	defer cleanup()
+
+	offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?credential_offer_uri=" + url.QueryEscape(offerServer.URL),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, offer)
+	assert.Equal(t, []string{"eucc"}, offer.CredentialConfigurationIDs)
 }

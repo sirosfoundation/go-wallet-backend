@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -220,6 +221,7 @@ func main() {
 		resources = append(resources, provider)
 	}
 
+	var engineProvider *server.EngineProvider
 	if roles.Has(modes.RoleEngine) {
 		// Wire verifier store from backend if available (for trust caching)
 		var verifierStore storage.VerifierStore
@@ -246,11 +248,19 @@ func main() {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
 		mgr.AddProvider(provider)
+		engineProvider = provider
+	}
 
-		// Wire session store into UserService so DeleteUser purges active sessions
-		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+	// Wire session stores into UserService so DeleteUser purges AS cookie
+	// sessions and, when the engine runs in this process, active engine
+	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
+	// engine role: a --mode=backend deployment has AS sessions to drop too.
+	if backendProvider != nil {
+		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
+		if engineProvider != nil {
+			cleaners = append(cleaners, engineProvider.SessionStore())
 		}
+		backendProvider.Services().User.SetSessionCleaner(cleaners)
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.
