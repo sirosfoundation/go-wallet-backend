@@ -646,9 +646,16 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 	// https unless a deployment has explicitly opted out. The shallow copy
 	// above shares that transport, so the redirect guard does not weaken it.
 	// CodeQL cannot follow the client through the struct field to see any of
-	// that, which is the same reason the other alerts of this rule in this
-	// file are suppressed.
-	resp, err := client.Do(req) // codeql[go/request-forgery]
+	// that, so it reports this call and every other fetch in this file.
+	//
+	// There is deliberately no // codeql[go/request-forgery] marker here.
+	// Those markers do not work in this setup: one was added on this line
+	// and the next analysis raised the alert at that exact line two minutes
+	// later. Two such markers elsewhere in the repo look like they work only
+	// because their alerts predate them by six weeks. A marker that
+	// suppresses nothing is worse than none, because it tells the next
+	// reader the finding is handled.
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
