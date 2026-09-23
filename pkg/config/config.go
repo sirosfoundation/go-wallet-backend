@@ -250,19 +250,19 @@ type HTTPClientConfig struct {
 //     cannot be downgraded to a network any observer on the path can read or
 //     rewrite.
 //
-// Both guards reach only what is fetched through this client. Two production
-// paths build their own and are governed by neither:
+// Both guards reach only what is fetched through this client. One production
+// path builds its own and is governed by neither:
 //
-//   - internal/service.HelperService.GetCertificateChain, which dials TLS
-//     directly to read a certificate chain, so no http.Client is involved. It
-//     requires https itself but applies no address policy, and it is reachable
-//     from an authenticated endpoint with a caller-supplied URL.
 //   - internal/as's OIDC discovery and token exchange, which construct a bare
 //     http.Client, so neither the address nor the scheme policy applies.
+//     Bringing it under this configuration is separate work: it would change
+//     which IdP addresses an existing deployment can reach.
 //
-// Bringing those under this configuration is separate work: the first is not an
-// http.Client at all, and the second would change which IdP addresses an
-// existing deployment can reach.
+// internal/service.HelperService.GetCertificateChain also dials TLS directly
+// rather than through an http.Client (it reads a certificate chain off a
+// manual handshake), but it is not exempt: it applies the address half of
+// this same policy via GuardedDialContext, since it has no http.Client for
+// this method's own guard to attach to.
 //
 // When a proxy is in use the dialer only ever sees the proxy, so the address
 // policy is applied to the request's own host before it is sent. That check is
@@ -311,6 +311,25 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 		Timeout:   timeout,
 		Transport: roundTripper,
 	}
+}
+
+// GuardedDialContext returns a dial function applying the same address policy
+// as NewHTTPClient's transport (private/loopback/link-local/cloud-metadata
+// blocked unless AllowPrivateIPs, dialing the address it checked rather than
+// re-resolving), for a caller that needs a raw net.Conn rather than an
+// *http.Client - e.g. HelperService.GetCertificateChain, which reads a
+// certificate chain off a manual TLS handshake and so has no http.Client for
+// NewHTTPClient's guard to attach to. When AllowPrivateIPs is set, this
+// returns a plain, unchecked dial, matching NewHTTPClient's own behavior.
+func (c HTTPClientConfig) GuardedDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	baseDialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	if c.AllowPrivateIPs {
+		return baseDialer.DialContext
+	}
+	return guardedDial(defaultLookupIP, baseDialer.DialContext)
 }
 
 // AllowsPlaintext reports whether this configuration permits non-TLS (plain
@@ -498,6 +517,13 @@ func checkAddresses(host string, ips []net.IP) error {
 		}
 		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
+		}
+		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
+		// most other stacks) treats an unspecified destination address as
+		// loopback - so left unchecked, this is a plain loopback bypass, not
+		// merely a theoretical gap.
+		if ip.IsUnspecified() {
+			return fmt.Errorf("connection to %s (%s) is not allowed: unspecified address", host, ip)
 		}
 	}
 	return nil

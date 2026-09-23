@@ -2186,6 +2186,8 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"link-local", "169.254.10.1", "private/loopback"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
+		{"unspecified", "0.0.0.0", "unspecified"},
+		{"unspecified ipv6", "::", "unspecified"},
 	}
 
 	for _, tt := range tests {
@@ -2441,6 +2443,41 @@ func TestHTTPClientConfig_NewHTTPClient_GuardWiring(t *testing.T) {
 			}
 		})
 	}
+}
+
+// GuardedDialContext is NewHTTPClient's address policy exposed for a caller
+// that dials its own raw connection (HelperService.GetCertificateChain's
+// manual TLS handshake) instead of building an *http.Client. Real addresses
+// are used, not the staticLookup/recordingDial doubles above: unlike
+// guardedDial, GuardedDialContext takes no lookup/dial to inject, matching
+// NewHTTPClient's own use of defaultLookupIP directly.
+func TestHTTPClientConfig_GuardedDialContext(t *testing.T) {
+	t.Run("blocks private/loopback addresses by default", func(t *testing.T) {
+		dial := HTTPClientConfig{}.GuardedDialContext()
+
+		_, err := dial(context.Background(), "tcp", "127.0.0.1:1")
+		if err == nil {
+			t.Fatal("expected the loopback address to be refused")
+		}
+		if !strings.Contains(err.Error(), "private/loopback") {
+			t.Fatalf("error %q does not explain the refusal", err)
+		}
+	})
+
+	t.Run("AllowPrivateIPs skips the address check", func(t *testing.T) {
+		dial := HTTPClientConfig{AllowPrivateIPs: true}.GuardedDialContext()
+
+		// Nothing listens on port 1, so a dial that reaches the OS fails
+		// with a connection error rather than succeeding - the point here
+		// is which error: a policy refusal means the check ran anyway.
+		_, err := dial(context.Background(), "tcp", "127.0.0.1:1")
+		if err == nil {
+			t.Fatal("expected the dial itself to fail (nothing listens on port 1)")
+		}
+		if strings.Contains(err.Error(), "private/loopback") {
+			t.Fatalf("AllowPrivateIPs should skip the address check entirely, got a policy error: %v", err)
+		}
+	})
 }
 
 // A plaintext request must fail before anything is dialled, not after.
