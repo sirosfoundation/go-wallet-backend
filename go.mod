@@ -19,7 +19,7 @@ require (
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
-	go.mongodb.org/mongo-driver v1.17.9
+	go.mongodb.org/mongo-driver v1.17.10
 	go.uber.org/zap v1.28.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
@@ -28,10 +28,10 @@ require (
 )
 
 require (
-	github.com/fxamacker/cbor/v2 v2.9.3
+	github.com/fxamacker/cbor/v2 v2.9.4
 	github.com/getkin/kin-openapi v0.149.0
 	github.com/go-jose/go-jose/v4 v4.1.5
-	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.0
+	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.1
 	github.com/sirosfoundation/go-tokenauth v0.4.0
 )
 

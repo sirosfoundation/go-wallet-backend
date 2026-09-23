@@ -476,6 +476,14 @@ func newManagerWithStubOID4VCIHandler(t *testing.T) *Manager {
 // reading back from the dialer conn.
 func runHandleFlowStart(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol) *FlowErrorMessage {
 	t.Helper()
+	return runHandleFlowStartWithID(t, m, tac, protocol, "")
+}
+
+// runHandleFlowStartWithID is runHandleFlowStart with an explicit flow_id -
+// the field a WS client fully controls - for exercising flow_id-dependent
+// behavior (e.g. the short-flow_id-vs-log-truncation regression below).
+func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID string) *FlowErrorMessage {
+	t.Helper()
 
 	result := make(chan *FlowErrorMessage, 1)
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
@@ -500,7 +508,7 @@ func runHandleFlowStart(t *testing.T, m *Manager, tac claims.TAC, protocol Proto
 	session := testSession(conn)
 	session.TAC = tac
 
-	m.handleFlowStart(session, &FlowStartMessage{Protocol: protocol})
+	m.handleFlowStart(session, &FlowStartMessage{Message: Message{FlowID: flowID}, Protocol: protocol})
 
 	select {
 	case msg := <-result:
@@ -542,6 +550,28 @@ func TestManager_handleFlowStart_NoOpWhenTACEmpty(t *testing.T) {
 	msg := runHandleFlowStart(t, m, "", ProtocolOID4VCI)
 	if msg != nil {
 		t.Fatalf("expected no flow_error, got code %q", msg.Error.Code)
+	}
+}
+
+// TestManager_handleFlowStart_ShortFlowIDDoesNotPanic is a regression test:
+// flow_id is fully client-controlled (any string in the WS flow_start
+// message), and the per-flow logger used to truncate it to 8 characters for
+// log lines must never run ahead of the handler's own recover(). Before the
+// fix, any non-empty flow_id under 8 characters panicked on the slice at
+// that truncation, before defer registered - crashing the goroutine (and,
+// unrecovered, the whole process) instead of returning a flow_error.
+func TestManager_handleFlowStart_ShortFlowIDDoesNotPanic(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+
+	for _, flowID := range []string{"a", "1234567"} {
+		t.Run(flowID, func(t *testing.T) {
+			// Reaching this line at all (rather than crashing the test
+			// binary on an unrecovered panic) is the regression check.
+			msg := runHandleFlowStartWithID(t, m, "i", ProtocolOID4VCI, flowID)
+			if msg != nil {
+				t.Fatalf("expected no flow_error for a valid short flow_id, got code %q", msg.Error.Code)
+			}
+		})
 	}
 }
 

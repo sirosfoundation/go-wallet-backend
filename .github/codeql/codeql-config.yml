@@ -1,16 +1,49 @@
 name: "go-wallet-backend"
 
-# Exclude files that produce verified false-positive CodeQL alerts.
+# Why this file uses query-filters and not paths-ignore
+# ----------------------------------------------------
+# paths-ignore does not work for Go. CodeQL applies path filters only to
+# languages it extracts from source without building; for a compiled language
+# analysed with Autobuild (see .github/workflows/codeql.yml) the filters are
+# accepted by the parser and then have no effect.
 #
-# 1. cookie_dev.go / cookie.go: intentional insecure-cookie dev helper
-#    (overrideCookieSecure clears Secure flag when InsecureCookies config is set;
-#     dev-only, never enabled in production). Alert: go/cookie-secure-not-set.
+# This file used to carry paths-ignore entries for internal/storage/mongodb/**
+# and the cookie helpers, and they never suppressed anything. The evidence is
+# the alert history: 29 go/sql-injection alerts under internal/storage/mongodb
+# were reported by this very workflow and then dismissed by hand, one at a
+# time, over three months. The exclusion looked like it worked because someone
+# kept clearing up after it.
 #
-# 2. MongoDB storage files: CodeQL's go/sql-injection rule fires on BSON filter
-#    construction (e.g. bson.M{"_id.id": id.String()}). These are parameterized
-#    NoSQL queries — not string-interpolated SQL. BSON map values are always
-#    type-safe parameters; no injection path exists.
-paths-ignore:
-  - "internal/as/cookie_dev.go"
-  - "internal/as/cookie.go"
-  - "internal/storage/mongodb/**"
+# query-filters run after analysis, on results, so they apply to every
+# language.
+
+query-filters:
+  # go/sql-injection fires on BSON filter construction, e.g.
+  # bson.M{"_id": id, "tenant_id": tenantID}. These are parameterised NoSQL
+  # queries, not interpolated SQL: the driver encodes a Go string as a BSON
+  # string, and only $-prefixed *map keys* are operators, so a value can never
+  # be reinterpreted as one.
+  #
+  # Excluding the rule outright is safe here because this repository has no
+  # SQL at all - no database/sql, no driver in go.mod, and the only storage
+  # backends are memory and mongodb. The rule therefore has no true positive
+  # available to it, and every alert it can produce is noise.
+  #
+  # If SQL is ever introduced, delete this filter and deal with the Mongo
+  # false positives some other way. Leaving it in place alongside real SQL
+  # would hide the thing the rule exists to catch.
+  - exclude:
+      id: go/sql-injection
+
+# Not filtered, deliberately
+# --------------------------
+# go/cookie-secure-not-set fires on the dev-only helper that clears the Secure
+# flag when InsecureCookies is configured. That rule can have true positives
+# in this codebase, so excluding it outright would cost something real. It
+# needs either a narrower suppression or a change to the helper, and that is
+# its own decision rather than something to fold in here.
+#
+# go/request-forgery fires where the wallet fetches a URL the verifier or
+# issuer supplied, which OpenID4VP requires it to do. Those alerts are judged
+# individually and the SSRF policy in pkg/config is what actually contains
+# them.
