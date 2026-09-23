@@ -638,7 +638,17 @@ func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method stri
 		client = &redirectSafe
 	}
 
-	resp, err := client.Do(req)
+	// The URL is the verifier's request_uri, which OpenID4VP requires this
+	// wallet to dereference, so it is user-provided by construction. What
+	// contains it is the transport: h.httpClient comes from
+	// cfg.HTTPClient.NewHTTPClient, whose DialContext resolves the host and
+	// refuses private, loopback and link-local addresses, and which requires
+	// https unless a deployment has explicitly opted out. The shallow copy
+	// above shares that transport, so the redirect guard does not weaken it.
+	// CodeQL cannot follow the client through the struct field to see any of
+	// that, which is the same reason the other alerts of this rule in this
+	// file are suppressed.
+	resp, err := client.Do(req) // codeql[go/request-forgery]
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
