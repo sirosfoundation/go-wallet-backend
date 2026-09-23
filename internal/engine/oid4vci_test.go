@@ -3090,6 +3090,126 @@ func TestFetchMetadata_MapConversion(t *testing.T) {
 	assert.Equal(t, "urn:credential:pid", meta.Metadata.CredentialConfigurationsSupported["pid"].VCT)
 }
 
+func TestIssuerMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"credential_configurations_supported": {
+			"pid": {"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+			"broken": {"format": {"id": "not-a-string"}, "vct": "urn:example:broken"},
+			"mdl": {"format": "mso_mdoc", "scope": "mdl"}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Equal(t, "https://issuer.example.com/credential", meta.CredentialEndpoint)
+	require.Len(t, meta.CredentialConfigurationsSupported, 2)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["pid"].Format)
+	assert.Equal(t, "urn:eudi:pid:1", meta.CredentialConfigurationsSupported["pid"].VCT)
+	assert.Equal(t, "mso_mdoc", meta.CredentialConfigurationsSupported["mdl"].Format)
+	assert.Equal(t, "mdl", meta.CredentialConfigurationsSupported["mdl"].Scope)
+	_, present := meta.CredentialConfigurationsSupported["broken"]
+	assert.False(t, present)
+}
+
+func TestIssuerMetadata_SkipsCredentialThatFailsToDecode(t *testing.T) {
+	// display.logo must be an object. A string logo makes this one
+	// configuration undecodable; the sibling configuration still loads.
+	raw := []byte(`{
+		"credential_configurations_supported": {
+			"ok": {"format": "dc+sd-jwt", "display": [{"name": "PID", "locale": "en"}]},
+			"bad-logo": {
+				"format": "dc+sd-jwt",
+				"display": [{"name": "Bad", "logo": "https://example.com/logo.png"}]
+			}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	require.Len(t, meta.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["ok"].Format)
+	require.Len(t, meta.CredentialConfigurationsSupported["ok"].Display, 1)
+	assert.Equal(t, "PID", meta.CredentialConfigurationsSupported["ok"].Display[0].Name)
+}
+
+func TestIssuerMetadata_AllBrokenCredentialsYieldEmptyMap(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_configurations_supported": {
+			"broken": {"format": 1}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Empty(t, meta.CredentialConfigurationsSupported)
+}
+
+func TestIssuerMetadata_RejectsNonObjectCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_configurations_supported": [{"format": "dc+sd-jwt"}]}`)
+
+	var meta IssuerMetadata
+	err := json.Unmarshal(raw, &meta)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_configurations_supported")
+}
+
+func TestIssuerMetadata_AbsentCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_endpoint": "https://issuer.example.com/credential"}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Nil(t, meta.CredentialConfigurationsSupported)
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+}
+
+func TestFetchMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{
+					"format": "dc+sd-jwt",
+					"vct":    "urn:eudi:pid:1",
+				},
+				"broken": map[string]interface{}{
+					"format": map[string]interface{}{"id": "not-a-string"},
+					"vct":    "urn:example:broken",
+				},
+			},
+		},
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
+	require.Len(t, meta.Metadata.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.Metadata.CredentialConfigurationsSupported["pid"].Format)
+	assert.NotContains(t, meta.Metadata.CredentialConfigurationsSupported, "broken")
+}
+
 func TestFetchMetadata_ValidatedFlag(t *testing.T) {
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
