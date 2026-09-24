@@ -437,7 +437,7 @@ Server → Client:
   "params": {
     "audience": "https://as.example.com",      // present: WIA + fresh PoP wanted (aud)
     "issuer": "https://wallet.example.com/cb", // PoP iss = the flow's client_id
-    "attestation_challenge": "<server nonce for the attestation PoP, if any>",
+    "attestation_challenge": "<server challenge for the attestation PoP, if any>",
     "htm": "POST",                             // present with htu: DPoP proof wanted
     "htu": "https://as.example.com/token",
     "dpop_nonce": "<server nonce, if any>",
@@ -474,7 +474,7 @@ replays both on the PAR and token requests:
 ```
 Server → Client:
 { "type": "sign_request", "action": "request_attestation",
-  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb", "attestation_challenge": "<server nonce, if any>" } }
+  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb", "attestation_challenge": "<server challenge, if any>" } }
 
 Client → Server:
 { "type": "sign_response", "client_attestation": "eyJ...", "client_attestation_pop": "eyJ..." }
