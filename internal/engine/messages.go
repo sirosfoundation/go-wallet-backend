@@ -473,6 +473,11 @@ type SignRequestParams struct {
 	DPoPNonce string `json:"dpop_nonce,omitempty"`
 	ATH       string `json:"ath,omitempty"`
 	KeyID     string `json:"key_id,omitempty"`
+	// AttestationChallenge, when set, is a server-provided challenge the client
+	// MUST include as the `challenge` claim of the Client Attestation PoP JWT
+	// (draft-ietf-oauth-attestation-based-client-auth). Set after an AS rejects
+	// a PAR/token request with `use_attestation_challenge`.
+	AttestationChallenge string `json:"attestation_challenge,omitempty"`
 }
 
 // CredentialRef references a credential for signing
