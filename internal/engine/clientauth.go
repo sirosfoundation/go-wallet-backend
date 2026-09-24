@@ -224,8 +224,9 @@ func (h *OID4VCIHandler) requestClientAuth(ctx context.Context, needs clientAuth
 	}
 	params := SignRequestParams{KeyID: h.dpopKeyID}
 	if needs.attestation {
-		params.Audience = h.authServerIssuer // PoP aud = the AS the request is sent to
-		params.Issuer = h.clientID           // WIA sub / PoP iss = this flow's effective client_id
+		params.Audience = h.authServerIssuer                 // PoP aud = the AS the request is sent to
+		params.Issuer = h.clientID                           // WIA sub / PoP iss = this flow's effective client_id
+		params.AttestationChallenge = h.attestationChallenge // server challenge for the PoP, when one was demanded
 	}
 	if needs.dpop {
 		params.HTM = needs.htm
