@@ -1608,6 +1608,7 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 			DPoPNonce:             "dpop-nonce-1",
 			ATH:                   "ath-1",
 			KeyID:                 "instance-key-1",
+			AttestationChallenge:  "chal-abc",
 			TransactionData: []TransactionData{{
 				Type:                     "payment",
 				Params:                   map[string]interface{}{"amount": "10"},
@@ -1678,6 +1679,7 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 	assert.Equal(t, in.Params.DPoPNonce, params.DPoPNonce)
 	assert.Equal(t, in.Params.ATH, params.ATH)
 	assert.Equal(t, in.Params.KeyID, params.KeyID)
+	assert.Equal(t, in.Params.AttestationChallenge, params.AttestationChallenge)
 	require.Len(t, params.TransactionData, 1)
 	assert.Equal(t, in.Params.TransactionData[0].Type, params.TransactionData[0].Type)
 	assert.Equal(t, in.Params.TransactionData[0].CredentialIDs, params.TransactionData[0].CredentialIDs)
