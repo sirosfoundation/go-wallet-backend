@@ -1737,6 +1737,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rp_id is required")
 	}
 
+	// Sub-millisecond values are silently unrepresentable on the wire:
+	// HandshakeCompleteMessage.Config reports PingIntervalMs via
+	// time.Duration.Milliseconds(), which truncates a positive
+	// sub-millisecond duration to 0 - the client would then see "unset"
+	// and fall back to its own hardcoded default while the server keeps
+	// pinging at the (much faster) configured cadence, exactly the
+	// client/server disagreement this whole mechanism exists to prevent.
+	// 0 itself is the legitimate "use the default" sentinel (see
+	// Manager.wsKeepalive) and is not rejected here.
+	if c.Server.EngineWSPingInterval != 0 && c.Server.EngineWSPingInterval < time.Millisecond {
+		return fmt.Errorf(
+			"server.engine_ws_ping_interval must be at least 1ms (or 0 to use the default) - got %s",
+			c.Server.EngineWSPingInterval,
+		)
+	}
+	if c.Server.EngineWSPongTimeout != 0 && c.Server.EngineWSPongTimeout < time.Millisecond {
+		return fmt.Errorf(
+			"server.engine_ws_pong_timeout must be at least 1ms (or 0 to use the default) - got %s",
+			c.Server.EngineWSPongTimeout,
+		)
+	}
+
 	if len(c.Server.GetRPOrigins()) == 0 {
 		return fmt.Errorf("rp_origin or rp_origins is required")
 	}

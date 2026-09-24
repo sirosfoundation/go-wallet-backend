@@ -1,14 +1,81 @@
 package engine
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+// dialAndHandshake spins up a real Manager.HandleConnection HTTP handler,
+// dials it as a real WebSocket client, and drives an actual authenticated
+// handshake - unlike this file's other tests (which construct a Session
+// directly with test-chosen intervals), this exercises the full path a real
+// client goes through: Manager.wsKeepalive resolving cfg.Server.EngineWS*
+// into a Session, and that Session's values actually reaching the wire via
+// HandshakeCompleteMessage.Config. A regression in either of those would
+// pass every other test in this file unnoticed.
+func dialAndHandshake(t *testing.T, cfg *config.Config) *HandshakeCompleteMessage {
+	t.Helper()
+
+	m := NewManager(cfg, zap.NewNop())
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Close() })
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   "test-user-123",
+		"tenant_id": "test-tenant",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{
+		Message:  Message{Type: TypeHandshake},
+		AppToken: tokenString,
+	}))
+
+	var complete HandshakeCompleteMessage
+	require.NoError(t, ws.ReadJSON(&complete))
+	return &complete
+}
+
+func TestHandshake_ReportsConfiguredPingInterval(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret"},
+		Server: config.ServerConfig{
+			EngineWSPingInterval: 7 * time.Second,
+		},
+	}
+
+	complete := dialAndHandshake(t, cfg)
+
+	assert.Equal(t, TypeHandshakeComplete, complete.Type)
+	assert.Equal(t, (7 * time.Second).Milliseconds(), complete.Config.PingIntervalMs)
+}
+
+func TestHandshake_ReportsDefaultPingIntervalWhenUnconfigured(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+
+	complete := dialAndHandshake(t, cfg)
+
+	assert.Equal(t, defaultWSPingInterval.Milliseconds(), complete.Config.PingIntervalMs)
+}
 
 func TestPingLoop_SendsPings(t *testing.T) {
 	// Track pings received on the server side.
