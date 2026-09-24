@@ -73,3 +73,25 @@ func TestWellKnownURL(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeIssuerURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no path, no slash", "https://issuer.example.com", "https://issuer.example.com"},
+		{"no path, trailing slash", "https://issuer.example.com/", "https://issuer.example.com"},
+		{"meaningful path, no trailing slash", "https://issuer.example.com/tenant", "https://issuer.example.com/tenant"},
+		{"meaningful path, trailing slash preserved", "https://issuer.example.com/tenant/", "https://issuer.example.com/tenant/"},
+		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeIssuerURL(tt.in)
+			if got != tt.want {
+				t.Errorf("NormalizeIssuerURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

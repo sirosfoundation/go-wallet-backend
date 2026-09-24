@@ -23,6 +23,7 @@ require (
 	github.com/sirosfoundation/go-tokenauth v0.4.0
 	github.com/sirosfoundation/go-trust v0.21.1
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
+	github.com/sirosfoundation/go-wmp v0.5.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.mongodb.org/mongo-driver v1.17.10

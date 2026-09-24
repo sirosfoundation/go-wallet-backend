@@ -309,6 +309,7 @@ type EngineProvider struct {
 	// is a restatement of the rule rather than a check of it.
 	metadataResolver *issuermetadata.Resolver
 	manager          *wsengine.Manager
+	wmpAdapter       *wsengine.WMPAdapter
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -364,11 +365,14 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
+	wmpAdapter := wsengine.NewWMPAdapter(manager, logger)
+
 	return &EngineProvider{
 		cfg:              cfg,
 		logger:           logger,
 		metadataResolver: metadataResolver,
 		manager:          manager,
+		wmpAdapter:       wmpAdapter,
 	}, nil
 }
 
@@ -390,6 +394,21 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
 		p.manager.HandleConnection(c.Writer, c.Request)
+	})
+
+	// WMP JSON-RPC endpoints — same engine, same auth, same security posture.
+	// POST /api/v2/wallet/rpc — JSON-RPC 2.0 request/response (auth via Authorization: Bearer)
+	router.POST("/api/v2/wallet/rpc", func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
+	})
+	// GET /api/v2/wallet/events — SSE stream of WMP notifications (auth via Authorization: Bearer)
+	router.GET("/api/v2/wallet/events", func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
+	})
+	// GET /.well-known/wmp-configuration — public capability discovery, no auth
+	// (a client needs this before it has a token to authenticate an RPC/SSE call with).
+	router.GET("/.well-known/wmp-configuration", func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPConfiguration(c.Writer, c.Request)
 	})
 }
 
