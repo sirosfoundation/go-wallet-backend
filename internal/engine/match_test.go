@@ -47,6 +47,11 @@ func testSession(conn *websocket.Conn) *Session {
 		matchCh:  make(chan *MatchResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
+		// Deliberately much faster than production's real (already-fast)
+		// defaults, so tests exercising pingLoop don't have to wait out a
+		// real production interval to observe a tick.
+		pingInterval: 50 * time.Millisecond,
+		pongTimeout:  500 * time.Millisecond,
 	}
 }
 

@@ -33,20 +33,19 @@ func TestPingLoop_SendsPings(t *testing.T) {
 	session := testSession(conn)
 
 	// Configure pong handler the same way production does.
-	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(session.pingInterval + session.pongTimeout))
 	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(session.pingInterval + session.pongTimeout))
 		return nil
 	})
 
 	go session.pingLoop()
 	defer close(session.stopPing)
 
-	// Wait for at least 2 pings (slightly more than 2 × interval with short intervals).
-	// Override interval isn't possible without changing the constant, so just
-	// wait long enough for the default 30s ticker to fire at least once.
-	// For a fast test, we wait a bit over one interval.
-	time.Sleep(wsPingInterval + 5*time.Second)
+	// Wait for a few ticks of testSession's fast pingInterval - no need to
+	// wait out a real production interval now that it's a Session field
+	// rather than a package constant.
+	time.Sleep(3 * session.pingInterval)
 
 	got := pingCount.Load()
 	assert.GreaterOrEqual(t, got, int32(1), "expected at least 1 ping, got %d", got)
@@ -101,7 +100,7 @@ func TestPongHandler_ExtendsReadDeadline(t *testing.T) {
 	var pongReceived atomic.Bool
 	conn.SetPongHandler(func(string) error {
 		pongReceived.Store(true)
-		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(defaultWSPingInterval + defaultWSPongTimeout))
 		return nil
 	})
 

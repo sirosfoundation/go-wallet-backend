@@ -590,19 +590,37 @@ func (g ssrfGuard) proxied(req *http.Request) bool {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host           string `yaml:"host" envconfig:"HOST"`
-	Port           int    `yaml:"port" envconfig:"PORT"`
-	AdminHost      string `yaml:"admin_host" envconfig:"ADMIN_HOST"`             // Admin API bind address (defaults to Host)
-	AdminPort      int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`             // Internal admin API port (0 to disable)
-	EngineHost     string `yaml:"engine_host" envconfig:"ENGINE_HOST"`           // WebSocket engine bind address (defaults to Host)
-	EnginePort     int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`           // WebSocket engine port (defaults to Port if 0)
-	RegistryHost   string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
-	RegistryPort   int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
-	WPHost         string `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
-	WPPort         int    `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
-	AdminToken     string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
-	AdminTokenPath string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
-	RPID           string `yaml:"rp_id" envconfig:"RP_ID"`
+	Host       string `yaml:"host" envconfig:"HOST"`
+	Port       int    `yaml:"port" envconfig:"PORT"`
+	AdminHost  string `yaml:"admin_host" envconfig:"ADMIN_HOST"`   // Admin API bind address (defaults to Host)
+	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
+	EngineHost string `yaml:"engine_host" envconfig:"ENGINE_HOST"` // WebSocket engine bind address (defaults to Host)
+	EnginePort int    `yaml:"engine_port" envconfig:"ENGINE_PORT"` // WebSocket engine port (defaults to Port if 0)
+	// EngineWSPingInterval is how often the server sends a WebSocket ping to
+	// the client, and (via HandshakeCompleteMessage.Config) the interval the
+	// client is told to use for its own pings - see that message's doc
+	// comment for why both directions need to agree on this rather than
+	// each hardcoding its own guess. Defaults to 3s: found empirically (raw
+	// idle-TLS-connection tests against production Fly.io apps, not
+	// documentation - Fly's own docs don't state a number) that Fly.io's
+	// edge closes a connection with no traffic on it after ~5-6s, far
+	// sooner than the 30s this used to be hardcoded to, which is why every
+	// engine WebSocket on Fly was silently reconnecting every few seconds.
+	// Deployments behind a more permissive proxy/LB can raise this.
+	EngineWSPingInterval time.Duration `yaml:"engine_ws_ping_interval" envconfig:"ENGINE_WS_PING_INTERVAL"`
+	// EngineWSPongTimeout is how long the server waits for a pong after
+	// sending a ping before treating the connection as dead. Unlike
+	// EngineWSPingInterval, this doesn't need to be short to keep an
+	// intermediary from seeing the connection go idle - the ping itself is
+	// what does that - so it stays generous.
+	EngineWSPongTimeout time.Duration `yaml:"engine_ws_pong_timeout" envconfig:"ENGINE_WS_PONG_TIMEOUT"`
+	RegistryHost        string        `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
+	RegistryPort        int           `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	WPHost              string        `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
+	WPPort              int           `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
+	AdminToken          string        `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
+	AdminTokenPath      string        `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
+	RPID                string        `yaml:"rp_id" envconfig:"RP_ID"`
 	// RPOrigin is the legacy single-origin setting. Kept for backward compatibility.
 	// New deployments should use RPOrigins. When both are set, RPOrigin is prepended.
 	RPOrigin  string   `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
@@ -1576,16 +1594,19 @@ func defaultConfig() *Config {
 
 	return &Config{
 		Server: ServerConfig{
-			Host:         "0.0.0.0",
-			Port:         8080,
-			AdminPort:    8081, // Internal admin API port
-			EnginePort:   8082, // WebSocket engine port
-			RegistryPort: 8097, // VCTM registry port
-			RPID:         "localhost",
-			RPOrigin:     "http://localhost:8080",
-			RPOrigins:    nil,
-			RPName:       "Wallet Backend",
-			CORS:         corsConfig,
+			Host:       "0.0.0.0",
+			Port:       8080,
+			AdminPort:  8081, // Internal admin API port
+			EnginePort: 8082, // WebSocket engine port
+			// See EngineWSPingInterval's doc comment for where 3s/5s come from.
+			EngineWSPingInterval: 3 * time.Second,
+			EngineWSPongTimeout:  5 * time.Second,
+			RegistryPort:         8097, // VCTM registry port
+			RPID:                 "localhost",
+			RPOrigin:             "http://localhost:8080",
+			RPOrigins:            nil,
+			RPName:               "Wallet Backend",
+			CORS:                 corsConfig,
 		},
 		Storage: StorageConfig{
 			Type: "memory",
