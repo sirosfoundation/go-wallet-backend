@@ -9,32 +9,57 @@ import (
 type InstanceStatus string
 
 const (
-	InstanceStatusActive    InstanceStatus = "active"
-	InstanceStatusSuspended InstanceStatus = "suspended"
-	InstanceStatusRevoked   InstanceStatus = "revoked"
+	InstanceStatusActive  InstanceStatus = "active"
+	InstanceStatusRevoked InstanceStatus = "revoked"
+
+	// InstanceStatusLegacySuspended is the reversible "suspended" state an
+	// instance could be put in before suspension was removed. Nothing enters
+	// it any more; it is named here because records written by an earlier
+	// release are still in the database and have to mean something definite.
+	//
+	// They mean "blocked": a suspended instance is not live, so it does not
+	// keep a wallet from being deactivated and its passkey does not log in.
+	// Reading it as live instead would hand back the login a provider had
+	// taken away, which is the opposite of what they asked for. Revoking one
+	// is a legal transition (see ValidateStatusTransition) so an operator can
+	// finish what they started, and a revoke-all sweeps them with everything
+	// else.
+	InstanceStatusLegacySuspended InstanceStatus = "suspended"
 )
+
+// IsLive reports whether an instance counts as a live instance of the wallet:
+// whether its passkey may log in, whether it may obtain a Wallet Instance
+// Attestation, and whether its existence keeps the wallet from being
+// deactivated and its data erased.
+//
+// Only "active" is live. This is deliberately not "anything but revoked":
+// a legacy suspended record is neither, and counting it as live would both
+// restore a login a provider removed and stop the erasure of a wallet that
+// has nothing left to use it.
+func (s InstanceStatus) IsLive() bool { return s == InstanceStatusActive }
 
 // ErrInvalidStatusTransition is returned when a status transition is not allowed.
 var ErrInvalidStatusTransition = errors.New("invalid status transition")
 
 // ValidateStatusTransition checks whether transitioning from current to target
-// is a legal state change. Revocation is terminal; suspended instances may be
-// reactivated or revoked; active instances may be suspended or revoked.
+// is a legal state change. Revocation is the only one, and it is terminal, so
+// nothing leaves the revoked state. A legacy suspended record may be revoked,
+// which is the only way to move it at all.
+//
+// A wallet instance has no reversible state, and that is deliberate. The ARF
+// gives a Wallet Unit four states - Installed, Operational, Valid, Revoked -
+// and says "Wallet Units can only be revoked" and "Revocation cannot be
+// undone". Suspension exists in the ARF, but for Wallet Solutions, for PID
+// and Attestation Provider registrations and for Relying Party registrations,
+// never for a unit. A suspended instance state would therefore mean nothing
+// to a relying party, and the status lists the ARF defines for Wallet
+// Instance Attestations carry no value it could be published as.
 func ValidateStatusTransition(current, target InstanceStatus) error {
 	if current == target {
 		return nil // no-op
 	}
-	switch current {
-	case InstanceStatusRevoked:
-		return ErrInvalidStatusTransition // revocation is terminal
-	case InstanceStatusSuspended:
-		if target == InstanceStatusActive || target == InstanceStatusRevoked {
-			return nil
-		}
-	case InstanceStatusActive:
-		if target == InstanceStatusSuspended || target == InstanceStatusRevoked {
-			return nil
-		}
+	if target == InstanceStatusRevoked && current != InstanceStatusRevoked {
+		return nil
 	}
 	return ErrInvalidStatusTransition
 }
@@ -72,7 +97,7 @@ const (
 // In the web frontend, there is a 1:1 mapping between a passkey and a wallet
 // instance. The passkey's PRF extension output is used to derive an AES-GCM key
 // that encrypts the wallet vault (credentials + signing keys). When the backend
-// suspends/revokes an instance, the frontend must treat the corresponding passkey
+// revokes an instance, the frontend must treat the corresponding passkey
 // as unusable — new WIA requests will be rejected.
 //
 // In native SDKs (iOS/Android), the hardware attestation key serves the same role
@@ -91,15 +116,27 @@ type WalletInstance struct {
 	// UserID is the user who owns this instance (if known).
 	UserID *UserID `json:"user_id,omitempty" bson:"user_id,omitempty"`
 
-	// Status is the lifecycle state: active, suspended, revoked.
+	// Status is the lifecycle state: active or revoked, or the legacy
+	// "suspended" of a record written before suspension was removed. Use
+	// IsLive rather than comparing against revoked.
 	Status InstanceStatus `json:"status" bson:"status"`
 
 	// WSCDType identifies the type of WSCD backing this instance.
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey
-	// that created this instance. Only set for WSCDTypeWebCrypto instances.
-	// This allows the admin to correlate instances with passkeys.
+	// that created this instance, recorded whatever backs the instance: it
+	// started out as a correlation aid for the admin on WSCDTypeWebCrypto,
+	// but SID-AUTH-06 made it the key of the per-instance login gate
+	// (WebAuthnService.checkWalletLifecycle), which a native iOS or Android
+	// wallet needs as much as a Web Crypto one - revoking a device's
+	// instance has to refuse that device's passkey. The wallet supplies it
+	// at WIA generation and it must be one of the caller's own passkeys in
+	// the caller's tenant, or the request is refused with
+	// CREDENTIAL_NOT_OWNED; the first link recorded for an instance wins.
+	// Binding it to the passkey that actually authenticated the request -
+	// rather than to any passkey the caller owns - needs a credential id in
+	// the session and the token, tracked in go-wallet-backend#333.
 	CredentialID string `json:"credential_id,omitempty" bson:"credential_id,omitempty"`
 
 	// R2PSClientID is the client_id used in R2PS sessions for this instance.
@@ -128,10 +165,12 @@ type WalletInstance struct {
 	// UpdatedAt tracks the last modification time.
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 
-	// DeactivatedAt is set when the instance is suspended or revoked.
+	// DeactivatedAt is set when the instance is revoked. The stored field
+	// keeps its name because it is persisted; revocation is the only thing
+	// that sets it.
 	DeactivatedAt *time.Time `json:"deactivated_at,omitempty" bson:"deactivated_at,omitempty"`
 
-	// DeactivationReason provides context for suspension/revocation.
+	// DeactivationReason provides context for the revocation.
 	DeactivationReason string `json:"deactivation_reason,omitempty" bson:"deactivation_reason,omitempty"`
 }
 

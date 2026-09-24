@@ -11,16 +11,20 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // ASModule is the top-level authorization server module that wires together
 // all AS components and registers routes.
 type ASModule struct {
-	KeyManager     *KeyManager
-	TokenIssuer    *TokenIssuer
-	LegacyIssuer   *LegacyTokenIssuer
-	Sessions       SessionStore
+	KeyManager   *KeyManager
+	TokenIssuer  *TokenIssuer
+	LegacyIssuer *LegacyTokenIssuer
+	Sessions     SessionStore
+	// TokenGate refuses delegating tokens issued before the user's
+	// SID-AUTH-06 cut-off (see internal/tokengate); nil enforces nothing.
+	TokenGate      *tokengate.Gate
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
 	OIDCHandler    *OIDCHandlers
@@ -95,6 +99,7 @@ func NewASModule(
 		TokenIssuer:    tokenIssuer,
 		LegacyIssuer:   legacyIssuer,
 		Sessions:       sessions,
+		TokenGate:      tokengate.New(store.Users()),
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
 		OIDCHandler:    oidcHandler,
@@ -129,6 +134,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	RegisterTokenEndpoint(auth, m.Sessions, m.TokenIssuer, m.Policy,
 		func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
 		m.Config.InsecureCookies,
+		m.TokenGate,
 		m.Logger,
 	)
 

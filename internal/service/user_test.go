@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -930,4 +932,325 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 			t.Error("Expected error for non-existent user")
 		}
 	})
+}
+
+// DeleteUser must sweep the default tenant even when the user has explicit
+// memberships elsewhere. A wallet instance that outlives the account is
+// permanent: records are keyed by instance-key thumbprint and the passkey
+// link is write-once, so re-enrolling on the same device would be refused
+// for good.
+func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+		UserID: userID, TenantID: "acme", Role: "user",
+	}); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+
+	// One instance in the tenant the user is a member of, one left in the
+	// default tenant from before that membership existed.
+	for id, tenant := range map[string]domain.TenantID{
+		"inst-acme":    "acme",
+		"inst-default": domain.DefaultTenantID,
+	} {
+		if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: id, TenantID: tenant, UserID: &userID, Status: domain.InstanceStatusActive,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	for _, id := range []string{"inst-acme", "inst-default"} {
+		if _, err := store.WalletInstances().GetByID(ctx, id); !errors.Is(err, storage.ErrNotFound) {
+			t.Errorf("%s must not outlive the account, got err=%v", id, err)
+		}
+	}
+}
+
+// failInstanceDeleteStore fails every wallet-instance Delete, standing in for
+// a storage problem during account deletion.
+type failInstanceDeleteStore struct {
+	storage.Store
+}
+
+func (s failInstanceDeleteStore) WalletInstances() storage.WalletInstanceStore {
+	return failInstanceDeletes{WalletInstanceStore: s.Store.WalletInstances()}
+}
+
+type failInstanceDeletes struct {
+	storage.WalletInstanceStore
+}
+
+func (f failInstanceDeletes) Delete(context.Context, string) error {
+	return errors.New("storage is down")
+}
+
+// An account deletion that cannot remove a wallet instance must not report
+// success and must not delete the user record. An instance that outlives its
+// account is permanent: records are keyed by instance-key thumbprint and the
+// passkey link is write-once, so re-enrolling on that device would be refused
+// for good, and a deleted user cannot authenticate to ask again.
+func TestDeleteUser_IncompleteWhenAnInstanceSurvives(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	svc := NewUserService(failInstanceDeleteStore{Store: inner}, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := inner.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-stuck", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	err := svc.DeleteUser(ctx, userID, did)
+	if !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive so the request can be repeated, got %v", err)
+	}
+}
+
+// Tenant discovery failing is fatal for the same reason: instances in a
+// tenant this never looked at would be stranded by deleting the account.
+func TestDeleteUser_IncompleteWhenTenantDiscoveryFails(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	svc := NewUserService(failTenantLookupStore{Store: inner}, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	err := svc.DeleteUser(ctx, userID, did)
+	if !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive, got %v", err)
+	}
+}
+
+type failTenantLookupStore struct {
+	storage.Store
+}
+
+func (s failTenantLookupStore) UserTenants() storage.UserTenantStore {
+	return failTenantLookups{UserTenantStore: s.Store.UserTenants()}
+}
+
+type failTenantLookups struct {
+	storage.UserTenantStore
+}
+
+func (f failTenantLookups) GetUserTenants(context.Context, domain.UserID) ([]domain.TenantID, error) {
+	return nil, errors.New("storage is down")
+}
+
+// lateInstanceStore is empty on the first listing and produces an undeletable
+// instance on every listing after it, standing in for an attestation that
+// binds an instance while the sweep is already running.
+type lateInstanceStore struct {
+	storage.Store
+	userID domain.UserID
+	seen   map[domain.TenantID]int
+}
+
+func (s *lateInstanceStore) WalletInstances() storage.WalletInstanceStore {
+	return &lateInstances{WalletInstanceStore: s.Store.WalletInstances(), parent: s}
+}
+
+type lateInstances struct {
+	storage.WalletInstanceStore
+	parent *lateInstanceStore
+}
+
+func (l *lateInstances) GetAllByUser(_ context.Context, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	l.parent.seen["all"]++
+	// Nothing on the first look, so the account-deletion sweep believes it
+	// is finished; then an instance appears, as an attestation binding one
+	// mid-sweep would make it.
+	if l.parent.seen["all"] == 1 {
+		return nil, nil
+	}
+	return []*domain.WalletInstance{{
+		ID: "inst-late", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
+	}}, nil
+}
+
+func (l *lateInstances) Delete(context.Context, string) error {
+	return errors.New("storage is down")
+}
+
+// The first pass can come back empty and the final re-list can then discover
+// an instance bound to the user after the fact. If removing that instance
+// fails, the membership must still be there: it is what tells a later sweep
+// which tenants hold this user's holder data, and the account must not be
+// deleted over the top of the orphan.
+func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	store := &lateInstanceStore{Store: inner, seen: map[domain.TenantID]int{}}
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	store.userID = userID
+	did := "did:example:" + userID.String()
+	if err := inner.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := inner.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+		UserID: userID, TenantID: "acme", Role: "user",
+	}); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+
+	tenants, err := inner.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		t.Fatalf("GetUserTenants: %v", err)
+	}
+	found := false
+	for _, tid := range tenants {
+		if tid == "acme" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the acme membership must survive so the retry can find that tenant, got %v", tenants)
+	}
+	if _, err := inner.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive, got %v", err)
+	}
+}
+
+// An admin can remove a tenant membership without removing that tenant's
+// wallet instances (DELETE /admin/tenants/{id}/users/{user_id} does exactly
+// that). Account deletion must still find the instance: it asks the instances
+// which tenant they are in rather than deriving the tenants from memberships.
+func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:example:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// No membership for "orphaned-tenant": an admin removed it and left the
+	// instance behind.
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-orphan", TenantID: "orphaned-tenant", UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	if _, err := store.WalletInstances().GetByID(ctx, "inst-orphan"); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("an instance in a tenant with no membership must not outlive the account, got %v", err)
+	}
+}
+
+// Credentials and presentations are stored under User.DID, which registration
+// sets to "did:key:<uuid>", while the wallet API's handler passes the bare
+// uuid as the holder. Deleting under the uuid matched nothing, so the account
+// went and the user's credentials stayed, reported as a success.
+func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+
+	userID := domain.NewUserID()
+	did := "did:key:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: domain.DefaultTenantID, HolderDID: did,
+		CredentialIdentifier: "cred-1", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+	if err := store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+		TenantID: domain.DefaultTenantID, HolderDID: did,
+		PresentationIdentifier: "pres-1", Presentation: "jwt",
+	}); err != nil {
+		t.Fatalf("seed presentation: %v", err)
+	}
+
+	// The handler passes the bare user id, as it does in production.
+	if err := svc.DeleteUser(ctx, userID, userID.String()); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	creds, err := store.Credentials().GetAllByHolder(ctx, domain.DefaultTenantID, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetAllByHolder: %v", err)
+	}
+	if len(creds) != 0 {
+		t.Errorf("the user's credentials must not outlive the account, %d remain", len(creds))
+	}
+	pres, err := store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, did)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("GetAllByHolder: %v", err)
+	}
+	if len(pres) != 0 {
+		t.Errorf("the user's presentations must not outlive the account, %d remain", len(pres))
+	}
+}
+
+// failSessionCleaner stands in for a session store that will not drop a
+// user's sessions.
+type failSessionCleaner struct{}
+
+func (failSessionCleaner) DeleteByUser(context.Context, string) error {
+	return errors.New("session store is down")
+}
+
+// A session that outlives account deletion is not a cosmetic failure: the
+// user record carries the token cut-off, so deleting it means the gate can
+// no longer refuse that session's tokens at all.
+func TestDeleteUser_IncompleteWhenSessionsSurvive(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+	svc.SetSessionCleaner(failSessionCleaner{})
+
+	userID := domain.NewUserID()
+	did := "did:key:" + userID.String()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, userID, did); !errors.Is(err, ErrDeletionIncomplete) {
+		t.Fatalf("DeleteUser = %v, want ErrDeletionIncomplete", err)
+	}
+	if _, err := store.Users().GetByID(ctx, userID); err != nil {
+		t.Errorf("the user record must survive so the cut-off still applies, got %v", err)
+	}
 }

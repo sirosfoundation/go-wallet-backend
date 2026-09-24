@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -74,7 +76,21 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
+		// SID-AUTH-06: a revoked wallet instance is a distinct, stable
+		// refusal so the client can tell the user what happened
+		// instead of retrying a login that can never succeed. The code,
+		// scope and message come from service.LifecycleRefusalDetails, the
+		// same mapping the wallet API's login handler uses, so a deactivated
+		// wallet - scope "wallet", which needs a new enrollment - is not
+		// reported as an ordinary instance revocation, where the user's
+		// other devices answer for themselves at their own login.
+		switch {
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
+			d := service.LifecycleRefusalDetails(err)
+			c.JSON(http.StatusForbidden, gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message})
+		default:
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
+		}
 		return
 	}
 
@@ -87,15 +103,24 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
+	// The login's own token carries the instant FinishLogin checked against
+	// the SID-AUTH-06 cut-off (it re-checks after minting), so the session
+	// inherits it rather than "now": a revocation landing between that check
+	// and here must not be outrun by a fresh session timestamp.
+	authenticatedAt := tokengate.IssuedAt(resp.Token)
+	if authenticatedAt.IsZero() {
+		authenticatedAt = now
+	}
 	session := &Session{
-		JTI:       sessionID,
-		UserID:    resp.UUID,
-		DID:       "", // DID is not in FinishLoginResponse; populated if needed.
-		TenantID:  resp.TenantID,
-		ACR:       "urn:siros:acr:passkey",
-		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
-		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		JTI:             sessionID,
+		UserID:          resp.UUID,
+		DID:             "", // DID is not in FinishLoginResponse; populated if needed.
+		TenantID:        resp.TenantID,
+		ACR:             "urn:siros:acr:passkey",
+		MaxTAC:          TAC(h.cfg.DefaultMaxTAC),
+		CreatedAt:       now,
+		AuthenticatedAt: authenticatedAt,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {

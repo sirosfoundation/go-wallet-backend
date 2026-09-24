@@ -282,6 +282,8 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
+			c.JSON(403, lifecycleRefusalBody(err))
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
 		case errors.Is(err, service.ErrIdentityNotBound):
@@ -884,6 +886,17 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		domain.UserIDFromString(userID.(string)),
 		holderDID,
 	); err != nil {
+		if errors.Is(err, service.ErrDeletionIncomplete) {
+			// The account still exists on purpose, so the caller can repeat
+			// the request rather than be left with a stranded wallet
+			// instance and no way to authenticate.
+			h.logger.Error("Account deletion incomplete", zap.Error(err))
+			c.JSON(409, gin.H{
+				"error":   errCodeDeletionIncomplete,
+				"message": "part of the account data could not be removed; the account still exists, repeat the request to finish it",
+			})
+			return
+		}
 		h.logger.Error("Failed to delete user", zap.Error(err))
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -1312,4 +1325,13 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 		}
 	}
 	return resp
+}
+
+// lifecycleRefusalBody is the 403 body of a SID-AUTH-06 login refusal: the
+// error code and message clients already read, plus the `scope` that says
+// whether the wallet still exists. The AS passkey handler builds the same
+// body from the same mapping, so the two login endpoints cannot disagree.
+func lifecycleRefusalBody(err error) gin.H {
+	d := service.LifecycleRefusalDetails(err)
+	return gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message}
 }

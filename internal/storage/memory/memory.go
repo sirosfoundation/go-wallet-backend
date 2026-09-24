@@ -262,7 +262,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return user, nil
+	return cloneUser(user), nil
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain.User, error) {
@@ -271,7 +271,7 @@ func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain
 
 	for _, user := range s.data {
 		if user.Username != nil && *user.Username == username {
-			return user, nil
+			return cloneUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -283,7 +283,7 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 	for _, user := range s.data {
 		if user.DID == did {
-			return user, nil
+			return cloneUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -293,8 +293,12 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
+	existing, exists := s.data[user.UUID.String()]
+	if !exists {
 		return storage.ErrNotFound
+	}
+	if existing.AuthFence > user.AuthFence {
+		return storage.ErrStaleWrite
 	}
 
 	user.UpdatedAt = time.Now()
@@ -312,6 +316,68 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 
 	delete(s.data, id.String())
 	return nil
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	advanceCutoff(user, t)
+	return nil
+}
+
+// advanceCutoff moves the cut-off forward, ignoring a delayed older event so
+// it cannot roll one back. The fence counter always advances, so every
+// lifecycle write invalidates records loaded before it.
+func advanceCutoff(user *domain.User, t time.Time) {
+	user.AuthFence++
+	if t.After(user.AuthInvalidBefore) {
+		user.AuthInvalidBefore = t
+	}
+}
+
+// cloneUser returns an independent copy, so a caller that loaded a user
+// before a lifecycle write does not silently observe that write through a
+// shared pointer - the persistent stores hand out snapshots, and the
+// stale-write fence relies on the caller's copy staying behind.
+func cloneUser(u *domain.User) *domain.User {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	c.PrivateData = append([]byte(nil), u.PrivateData...)
+	c.Keys = append([]byte(nil), u.Keys...)
+	c.WebauthnCredentials = append([]domain.WebauthnCredential(nil), u.WebauthnCredentials...)
+	c.EnterpriseIdentities = append([]domain.EnterpriseIdentity(nil), u.EnterpriseIdentities...)
+	return &c
+}
+
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+	user.Keys = nil
+	user.UpdatedAt = time.Now()
+	advanceCutoff(user, fence)
+	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return time.Time{}, storage.ErrNotFound
+	}
+	return user.AuthInvalidBefore, nil
 }
 
 func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
