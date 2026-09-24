@@ -1336,6 +1336,39 @@ func TestFetchAttestationChallenge(t *testing.T) {
 		assert.Equal(t, "dnonce", h.dpopNonce)
 	})
 
+	t.Run("challenge in response header, empty body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+			// draft-ietf-oauth-attestation-based-client-auth's challenge
+			// endpoint may return an empty body; the challenge lives in the
+			// header only.
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "hdr-chal", got)
+	})
+
+	t.Run("header takes precedence over JSON body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"attestation_challenge":"body-chal"}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "hdr-chal", got)
+	})
+
 	t.Run("empty challenge is an error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{}`))

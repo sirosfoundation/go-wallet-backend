@@ -578,6 +578,15 @@ func (h *OID4VCIHandler) fetchAttestationChallenge(ctx context.Context, endpoint
 		return "", fmt.Errorf("challenge endpoint returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// draft-ietf-oauth-attestation-based-client-auth's challenge endpoint
+	// returns the fresh challenge in the OAuth-Client-Attestation-Challenge
+	// response header - the body may be empty. A JSON
+	// {"attestation_challenge": ...} body is accepted as a compatibility
+	// fallback for ASes that don't follow that convention.
+	if challenge := resp.Header.Get("OAuth-Client-Attestation-Challenge"); challenge != "" {
+		return challenge, nil
+	}
+
 	var challengeResp struct {
 		AttestationChallenge string `json:"attestation_challenge"`
 	}
