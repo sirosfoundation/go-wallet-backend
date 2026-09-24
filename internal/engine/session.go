@@ -36,18 +36,32 @@ var (
 const MaxPendingFlowsPerSession = 3
 
 const (
-	// wsPingInterval is how often the server sends a WebSocket ping to the client.
-	// Must be shorter than any intermediate proxy/LB idle timeout (typically 60–120s).
-	wsPingInterval = 30 * time.Second
-
-	// wsPongTimeout is how long the server waits for a pong after sending a ping.
-	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
-	// and the connection is considered dead.
-	wsPongTimeout = 10 * time.Second
+	// defaultWSPingInterval/defaultWSPongTimeout are the fallback keepalive
+	// tunables used when config.ServerConfig.EngineWSPingInterval/
+	// EngineWSPongTimeout is unset (zero) - e.g. a Config built directly by a
+	// test rather than through config.Load(), which applies the real
+	// defaults. See EngineWSPingInterval's doc comment in pkg/config for why
+	// these particular numbers.
+	defaultWSPingInterval = 3 * time.Second
+	defaultWSPongTimeout  = 5 * time.Second
 
 	// maxConnections is the maximum concurrent WebSocket sessions allowed.
 	maxConnections = 10000
 )
+
+// wsKeepalive resolves this Manager's configured ping interval and pong
+// timeout, falling back to defaultWSPingInterval/defaultWSPongTimeout for
+// whichever one is unset - see their doc comment.
+func (m *Manager) wsKeepalive() (pingInterval, pongTimeout time.Duration) {
+	pingInterval, pongTimeout = m.cfg.Server.EngineWSPingInterval, m.cfg.Server.EngineWSPongTimeout
+	if pingInterval <= 0 {
+		pingInterval = defaultWSPingInterval
+	}
+	if pongTimeout <= 0 {
+		pongTimeout = defaultWSPongTimeout
+	}
+	return pingInterval, pongTimeout
+}
 
 // Session represents an authenticated WebSocket session
 type Session struct {
@@ -80,6 +94,14 @@ type Session struct {
 
 	// stopPing signals the ping goroutine to exit.
 	stopPing chan struct{}
+
+	// pingInterval/pongTimeout are this session's resolved keepalive
+	// tunables (see Manager.wsKeepalive) - set once at session creation and
+	// used by pingLoop and the read-deadline resets around it, and reported
+	// to the client via HandshakeCompleteMessage.Config so both sides agree
+	// on the same cadence.
+	pingInterval time.Duration
+	pongTimeout  time.Duration
 }
 
 // Flow represents an active credential flow
@@ -262,9 +284,10 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// The pong handler resets the read deadline each time the client responds,
 	// keeping the connection alive across idle periods. Browser WebSocket
 	// implementations respond to protocol-level pings automatically.
-	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	pingInterval, pongTimeout := m.wsKeepalive()
+	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
 	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
 		return nil
 	})
 
@@ -288,6 +311,8 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		closeCh:       make(chan struct{}, 1), // Buffered to prevent deadlock
 		stopPing:      make(chan struct{}),
 		notifications: newNotificationContextStore(),
+		pingInterval:  pingInterval,
+		pongTimeout:   pongTimeout,
 	}
 
 	// Register session
@@ -303,6 +328,9 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		},
 		SessionID:    session.ID,
 		Capabilities: capabilities,
+		Config: SessionConfig{
+			PingIntervalMs: pingInterval.Milliseconds(),
+		},
 	}
 	if err := session.Send(&completeMsg); err != nil {
 		m.logger.Error("Failed to send handshake complete", zap.Error(err))
@@ -311,7 +339,8 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 
 	session.logger.Info("Session established",
 		zap.String("session_id", session.ID),
-		zap.Strings("capabilities", capabilities))
+		zap.Strings("capabilities", capabilities),
+		zap.Duration("ping_interval", pingInterval))
 
 	// Start ping keepalive goroutine
 	go session.pingLoop()
@@ -320,17 +349,17 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	m.handleSession(session)
 }
 
-// pingLoop sends WebSocket ping frames at wsPingInterval.
+// pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
-	ticker := time.NewTicker(wsPingInterval)
+	ticker := time.NewTicker(s.pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			s.sendMu.Lock()
-			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
+			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
 			s.sendMu.Unlock()
 			if err != nil {
 				return // connection is dead; ReadMessage will surface the error

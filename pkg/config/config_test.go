@@ -71,6 +71,37 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_EngineWSKeepaliveSubMillisecond(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  func(*Config)
+	}{
+		{"ping interval 500us", func(c *Config) { c.Server.EngineWSPingInterval = 500 * time.Microsecond }},
+		{"pong timeout 500us", func(c *Config) { c.Server.EngineWSPongTimeout = 500 * time.Microsecond }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tt.cfg(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Expected validation error for a sub-millisecond engine WS keepalive value")
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_EngineWSKeepaliveZeroIsValid(t *testing.T) {
+	// 0 is the "use the default" sentinel (see Manager.wsKeepalive), not an
+	// invalid value - must not be rejected the same way a genuinely too-small
+	// positive value is.
+	cfg := validBaseConfig()
+	cfg.Server.EngineWSPingInterval = 0
+	cfg.Server.EngineWSPongTimeout = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() error = %v, want nil for zero-valued (default) engine WS keepalive settings", err)
+	}
+}
+
 func TestConfig_Validate_MissingRPID(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{

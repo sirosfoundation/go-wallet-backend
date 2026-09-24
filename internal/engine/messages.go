@@ -212,8 +212,34 @@ type HandshakeMessage struct {
 // HandshakeCompleteMessage is sent by server on successful authentication
 type HandshakeCompleteMessage struct {
 	Message
-	SessionID    string   `json:"session_id"`
-	Capabilities []string `json:"capabilities"`
+	SessionID    string        `json:"session_id"`
+	Capabilities []string      `json:"capabilities"`
+	Config       SessionConfig `json:"config"`
+}
+
+// SessionConfig carries server-controlled tunables the client should adopt,
+// delivered via HandshakeCompleteMessage right after authentication succeeds.
+// This is deliberately the seed of a general post-auth config/capability
+// handshake rather than a one-off field: anywhere the client would
+// otherwise have to hardcode a value that only works if it happens to match
+// what the server independently assumes, that value belongs here instead -
+// PingIntervalMs is just the first case (see its own doc comment for why it
+// specifically had to stop being independently guessed by each side).
+// Add new fields as zero-value-safe (a client on an older SDK release
+// ignores fields it doesn't know about; a client talking to an older server
+// that never sends a given field sees its zero value and should fall back
+// to its own hardcoded default).
+type SessionConfig struct {
+	// PingIntervalMs is how often the CLIENT should send its own WebSocket
+	// ping frames, in milliseconds - mirrors the server's own keepalive
+	// cadence (config.ServerConfig.EngineWSPingInterval) so neither side has
+	// to independently guess a value low enough to satisfy whatever
+	// intermediary (Fly.io's edge proxy, in production - see that config
+	// field's doc comment) would otherwise consider the connection idle and
+	// close it. A client that has never received this (e.g. its very first
+	// connection, before any handshake has completed) should use its own
+	// conservative hardcoded default rather than wait for it.
+	PingIntervalMs int64 `json:"ping_interval_ms"`
 }
 
 // FlowStartMessage initiates a credential flow
