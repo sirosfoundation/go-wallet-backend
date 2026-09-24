@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -258,7 +259,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 	// The same JSON object encoded as a JSON string (as some verifiers return it).
 	quotedJSON := `"{\"client_id\":\"verifier\",\"response_type\":\"vp_token\",\"nonce\":\"test-nonce\"}"`
 	// A JSON object containing exactly two '.' characters in a field value
-	// (a response_uri host). fetchRequestFromURI used to classify body type
+	// (a response_uri host). fetchRequestObject used to classify body type
 	// by counting '.' characters and treating exactly two as "must be a
 	// JWT", which misclassified JSON bodies like this one and tried (and
 	// failed) to parse them as a JWT. It now checks for a leading '{'/'['
@@ -337,7 +338,7 @@ func TestFetchRequestFromURI(t *testing.T) {
 				uri += "?" + tt.requestQuery
 			}
 
-			authReq, err := h.fetchRequestFromURI(context.Background(), uri)
+			authReq, err := h.fetchRequestObject(context.Background(), uri, "", nil)
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.wantErrMsg != "" {
@@ -2053,6 +2054,389 @@ func buildMinimalJWT(t *testing.T, key *ecdsa.PrivateKey, certB64 string) string
 	r.FillBytes(sig[:n])
 	s.FillBytes(sig[n:])
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// requestURIPostServer is a stub verifier request-object endpoint for
+// request_uri_method=post (OpenID4VP 1.0 5.10). It records what the wallet
+// sent and answers with a request object built from it, which is what lets
+// the wallet_nonce round-trip be asserted end to end.
+type requestURIPostServer struct {
+	calls       int
+	method      string
+	contentType string
+	accept      string
+	form        url.Values
+	// unsigned, when set, answers with a bare JSON request object instead
+	// of the signed JWT OpenID4VP 1.0 5.10.1 requires.
+	unsigned bool
+	// echoNonce, when set, replaces the wallet_nonce sent back in the
+	// request object - "" omits the claim entirely.
+	echoNonce func(sent string) string
+}
+
+func (s *requestURIPostServer) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		s.calls++
+		s.method = r.Method
+		s.contentType = r.Header.Get("Content-Type")
+		s.accept = r.Header.Get("Accept")
+		s.form = r.PostForm
+
+		sent := r.PostForm.Get("wallet_nonce")
+		echoed := sent
+		if s.echoNonce != nil {
+			echoed = s.echoNonce(sent)
+		}
+		obj := map[string]interface{}{
+			"client_id":     "did:web:verifier",
+			"response_type": "vp_token",
+			"nonce":         "verifier-nonce",
+		}
+		if echoed != "" {
+			obj["wallet_nonce"] = echoed
+		}
+		w.WriteHeader(http.StatusOK)
+		if s.unsigned {
+			require.NoError(t, json.NewEncoder(w).Encode(obj))
+			return
+		}
+		_, err := w.Write([]byte(signRequestObject(t, obj)))
+		require.NoError(t, err)
+	}
+}
+
+// signRequestObject builds the signed request object a request_uri_method=post
+// fetch is required to answer with. The engine parses the JWT without
+// verifying it here - verification is trust evaluation's job - so the key is
+// generated per call and thrown away.
+func signRequestObject(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","typ":"oauth-authz-req+jwt"}`))
+	payloadJSON, err := json.Marshal(claims)
+	require.NoError(t, err)
+	signingInput := header + "." + base64.RawURLEncoding.EncodeToString(payloadJSON)
+	sig, err := jwt.SigningMethodES256.Sign(signingInput, key)
+	require.NoError(t, err)
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+func TestFetchRequestObjectPost(t *testing.T) {
+	t.Run("sends wallet_nonce, and no wallet_metadata of its own", func(t *testing.T) {
+		stub := &requestURIPostServer{}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		authReq, err := h.fetchRequestObject(context.Background(), srv.URL, "post", nil)
+		require.NoError(t, err)
+		assert.Equal(t, "did:web:verifier", authReq.ClientID)
+
+		assert.Equal(t, http.MethodPost, stub.method)
+		assert.Equal(t, mimeFormURLEncoded, stub.contentType)
+		assert.Equal(t, mimeOAuthAuthzReqJWT, stub.accept,
+			"OpenID4VP 1.0 5.10 requires this Accept header on the POST")
+		assert.NotEmpty(t, stub.form.Get("wallet_nonce"))
+
+		// wallet_metadata is OPTIONAL, and the engine cannot know what the
+		// client can present. Asserting formats on its behalf invites a
+		// request object the client cannot satisfy, and its presence is
+		// also what signals dynamic discovery to the verifier.
+		assert.False(t, stub.form.Has("wallet_metadata"),
+			"the engine must not synthesize wallet_metadata the client did not send")
+	})
+
+	// The client knows what it can present, so its own metadata is the only
+	// metadata that goes out.
+	t.Run("client-supplied wallet_metadata is sent verbatim", func(t *testing.T) {
+		stub := &requestURIPostServer{}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		metadata := json.RawMessage(`{"vp_formats_supported":{"mso_mdoc":{"alg_values":["ES256"]}}}`)
+		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", metadata)
+		require.NoError(t, err)
+		assert.JSONEq(t, string(metadata), stub.form.Get("wallet_metadata"))
+	})
+
+	// Clients encode their defaults, so "the client said nothing" arrives as
+	// a JSON null - which means the same as nothing, and must not be
+	// forwarded to the verifier as the string "null".
+	t.Run("a null wallet_metadata sends nothing", func(t *testing.T) {
+		stub := &requestURIPostServer{}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", json.RawMessage(`null`))
+		require.NoError(t, err)
+		assert.False(t, stub.form.Has("wallet_metadata"))
+	})
+
+	// OpenID4VP defines wallet_metadata as a JSON object, and well-formed
+	// JSON that is not one is no more usable to a verifier than a syntax
+	// error - better caught here than at the far end of the presentation.
+	for name, metadata := range map[string]string{
+		"a syntax error": `{not json`,
+		"an array":       `[]`,
+		"a number":       `123`,
+		"a string":       `"metadata"`,
+	} {
+		t.Run("wallet_metadata that is "+name+" is rejected before any request", func(t *testing.T) {
+			stub := &requestURIPostServer{}
+			srv := httptest.NewServer(stub.handler(t))
+			defer srv.Close()
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+			_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", json.RawMessage(metadata))
+			require.Error(t, err)
+			assert.Equal(t, ErrCodeInvalidMessage, codedErrorCode(t, err))
+			assert.Zero(t, stub.calls)
+		})
+	}
+
+	// OpenID4VP 1.0 5.10 makes this a MUST: a request object that does not
+	// carry the nonce back cannot have been produced for this request.
+	t.Run("a missing wallet_nonce terminates request processing", func(t *testing.T) {
+		stub := &requestURIPostServer{echoNonce: func(string) string { return "" }}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", nil)
+		require.Error(t, err)
+		assert.Equal(t, ErrCodeWalletNonceMismatch, codedErrorCode(t, err))
+	})
+
+	t.Run("a different wallet_nonce terminates request processing", func(t *testing.T) {
+		stub := &requestURIPostServer{echoNonce: func(string) string { return "someone-elses-nonce" }}
+		srv := httptest.NewServer(stub.handler(t))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", nil)
+		require.Error(t, err)
+		assert.Equal(t, ErrCodeWalletNonceMismatch, codedErrorCode(t, err))
+	})
+
+	// A nonce reused across requests would let a request object captured
+	// from one presentation be replayed into the next.
+	t.Run("each request gets a fresh wallet_nonce", func(t *testing.T) {
+		var nonces []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.NoError(t, r.ParseForm())
+			sent := r.PostForm.Get("wallet_nonce")
+			nonces = append(nonces, sent)
+			_, _ = fmt.Fprint(w, signRequestObject(t, map[string]interface{}{
+				"client_id":    "did:web:verifier",
+				"nonce":        "n",
+				"wallet_nonce": sent,
+			}))
+		}))
+		defer srv.Close()
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+		for i := 0; i < 2; i++ {
+			_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", nil)
+			require.NoError(t, err)
+		}
+		require.Len(t, nonces, 2)
+		assert.NotEqual(t, nonces[0], nonces[1])
+	})
+}
+
+// OpenID4VP 1.0 5.10.1 requires the request_uri response to be a signed
+// request object. Without the signature the wallet_nonce check proves
+// nothing - anyone who can observe the POST can echo the nonce back - so
+// accepting unsigned JSON would leave the POST path weaker than the GET path
+// it was added to strengthen.
+func TestFetchRequestObjectPost_RejectsAnUnsignedRequestObject(t *testing.T) {
+	stub := &requestURIPostServer{unsigned: true}
+	srv := httptest.NewServer(stub.handler(t))
+	defer srv.Close()
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+	_, err := h.fetchRequestObject(context.Background(), srv.URL, "post", nil)
+	require.Error(t, err)
+
+	var coded *requestCodedError
+	require.ErrorAs(t, err, &coded)
+	assert.Equal(t, ErrCodeInvalidRequestObject, coded.code)
+
+	// The same body over GET is still accepted: by-value JSON request
+	// objects predate this and are not what 5.10.1 governs.
+	_, err = h.fetchRequestObject(context.Background(), srv.URL, "get", nil)
+	require.NoError(t, err)
+}
+
+// Go follows a 302 or 303 on a POST by reissuing it as a bodyless GET, so a
+// verifier behind a redirect would receive neither wallet_nonce nor
+// wallet_metadata. That fails closed at the nonce check, but as
+// WALLET_NONCE_MISMATCH, which points at the verifier's integrity rather
+// than at its redirect.
+func TestFetchRequestObjectPost_RefusesARedirect(t *testing.T) {
+	stub := &requestURIPostServer{}
+	target := httptest.NewServer(stub.handler(t))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusSeeOther)
+	}))
+	defer redirector.Close()
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: redirector.Client()}
+
+	_, err := h.fetchRequestObject(context.Background(), redirector.URL, "post", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect")
+	assert.NotContains(t, err.Error(), "wallet_nonce did not",
+		"the error should name the redirect, not look like verifier misbehaviour")
+	assert.Zero(t, stub.calls, "the POST body must not be replayed as a bodyless GET")
+}
+
+func TestFetchRequestObjectMethodSelection(t *testing.T) {
+	// Absent and "get" are RFC 9101's GET, which is also where a wallet
+	// without POST support is expected to land - no wallet_nonce is sent,
+	// so none is required back.
+	for _, method := range []string{"", "get"} {
+		t.Run("method "+method+" issues a GET", func(t *testing.T) {
+			var gotMethod string
+			var gotBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotBody, _ = io.ReadAll(r.Body)
+				_, _ = fmt.Fprint(w, `{"client_id":"did:web:verifier","nonce":"n"}`)
+			}))
+			defer srv.Close()
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+			authReq, err := h.fetchRequestObject(context.Background(), srv.URL, method, nil)
+			require.NoError(t, err)
+			assert.Equal(t, "did:web:verifier", authReq.ClientID)
+			assert.Equal(t, http.MethodGet, gotMethod)
+			assert.Empty(t, gotBody)
+		})
+	}
+
+	// The values are case-sensitive per the specification, so "POST" is not
+	// "post" - and an unsupported value must not be quietly downgraded to a
+	// GET the verifier did not ask for.
+	for _, method := range []string{"POST", "put", "anything"} {
+		t.Run("method "+method+" is rejected without a request", func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+			_, err := h.fetchRequestObject(context.Background(), srv.URL, method, nil)
+			require.Error(t, err)
+			assert.Equal(t, ErrCodeInvalidRequestURIMethod, codedErrorCode(t, err))
+			assert.Zero(t, calls)
+		})
+	}
+}
+
+// codedErrorCode returns the ErrorCode a request failure carries for the
+// client, failing the test if it carries none.
+func codedErrorCode(t *testing.T, err error) ErrorCode {
+	t.Helper()
+	var coded *requestCodedError
+	require.ErrorAs(t, err, &coded)
+	return coded.code
+}
+
+// TestParseRequestURIMethod covers how request_uri_method reaches the fetch:
+// from the authorization request URI when the client forwards it whole, and
+// from the FlowStart message when the client extracted request_uri itself
+// and with it lost the query string the parameter arrived in.
+func TestParseRequestURIMethod(t *testing.T) {
+	stub := &requestURIPostServer{}
+	srv := httptest.NewServer(stub.handler(t))
+	defer srv.Close()
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	flow := &Flow{ID: "test-flow", Session: testSession(conn), Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}, httpClient: srv.Client()}
+
+	t.Run("read from the authorization request URI", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?client_id=did:web:verifier&request_uri_method=post&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "verifier-nonce", authReq.Nonce)
+		assert.Equal(t, http.MethodPost, stub.method)
+	})
+
+	t.Run("read from the flow start message for a pre-extracted reference", func(t *testing.T) {
+		msg := &FlowStartMessage{RequestURIRef: srv.URL, RequestURIMethod: "post"}
+		authReq, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, "verifier-nonce", authReq.Nonce)
+		assert.Equal(t, http.MethodPost, stub.method)
+	})
+
+	// The authorization request is unauthenticated - a QR code or a deep
+	// link - so anyone who can rewrite it can rewrite request_uri_method to
+	// get. A GET sends no wallet_nonce, which would make the binding check
+	// a no-op and switch off the guarantee the client asked for. A client
+	// that said post therefore cannot be downgraded by the URI.
+	t.Run("the URI cannot downgrade a client that asked for post", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI:       "openid4vp://?client_id=did:web:verifier&request_uri_method=get&request_uri=" + url.QueryEscape(srv.URL),
+			RequestURIMethod: "post",
+		}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, http.MethodPost, stub.method)
+	})
+
+	t.Run("an empty URI parameter cannot downgrade it either", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI:       "openid4vp://?client_id=did:web:verifier&request_uri_method=&request_uri=" + url.QueryEscape(srv.URL),
+			RequestURIMethod: "post",
+		}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, http.MethodPost, stub.method)
+	})
+
+	// The URI still decides when the client expressed no preference: an
+	// empty request_uri_method is the authorization request asking for a
+	// GET, and presence rather than a non-empty value is what makes it
+	// authoritative.
+	t.Run("an empty URI parameter still means GET for a client that asked for nothing", func(t *testing.T) {
+		msg := &FlowStartMessage{
+			RequestURI: "openid4vp://?client_id=did:web:verifier&request_uri_method=&request_uri=" + url.QueryEscape(srv.URL),
+		}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, http.MethodGet, stub.method)
+	})
+
+	// A bare link that is itself the request_uri has no wrapper query to
+	// carry the parameter, so the flow start message is the only source.
+	t.Run("bare reference URL uses the flow start message", func(t *testing.T) {
+		msg := &FlowStartMessage{RequestURI: srv.URL, RequestURIMethod: "post"}
+		_, err := h.parseRequest(context.Background(), msg)
+		require.NoError(t, err)
+		assert.Equal(t, http.MethodPost, stub.method)
+	})
 }
 
 // --- OpenID4VP 1.0 client_id scheme naming ---

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -78,7 +79,12 @@ const (
 // HTTP header/content type constants
 const (
 	hdrContentType     = "Content-Type"
+	hdrAccept          = "Accept"
 	mimeFormURLEncoded = "application/x-www-form-urlencoded"
+	// mimeOAuthAuthzReqJWT is the media type OpenID4VP 1.0 5.10.1 defines
+	// for a request object served from a request_uri: a signed, optionally
+	// encrypted JWT.
+	mimeOAuthAuthzReqJWT = "application/oauth-authz-req+jwt"
 )
 
 // TransactionData represents a single transaction data object from
@@ -110,6 +116,11 @@ type AuthorizationRequest struct {
 	TransactionDataRaw json.RawMessage `json:"transaction_data,omitempty"`
 	// TransactionData holds the decoded transaction data objects (populated during validation).
 	TransactionData []TransactionData `json:"-"`
+	// WalletNonce is the challenge this wallet sent with a
+	// request_uri_method=post request, as echoed back by the verifier inside
+	// the request object it returned. OpenID4VP 1.0 5.10 makes checking it a
+	// MUST - see fetchRequestObject.
+	WalletNonce string `json:"wallet_nonce,omitempty"`
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
@@ -166,9 +177,13 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	if err != nil {
 		h.Logger.Debug("failed to parse request", zap.Error(err))
 		var fetchErr *requestFetchError
-		if errors.As(err, &fetchErr) {
+		var codedErr *requestCodedError
+		switch {
+		case errors.As(err, &codedErr):
+			_ = h.Error(StepParsingRequest, codedErr.code, codedErr.code.UserFacingMessage())
+		case errors.As(err, &fetchErr):
 			_ = h.Error(StepParsingRequest, ErrCodeRequestFetchError, ErrCodeRequestFetchError.UserFacingMessage())
-		} else {
+		default:
 			_ = h.Error(StepParsingRequest, ErrCodeRequestParseError, ErrCodeRequestParseError.UserFacingMessage())
 		}
 		return err
@@ -254,7 +269,13 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			// Check for request_uri parameter
 			requestURIRef := u.Query().Get("request_uri")
 			if requestURIRef != "" {
-				return h.fetchRequestFromURI(ctx, requestURIRef)
+				// request_uri_method rides on the authorization request
+				// next to request_uri, never inside the request object it
+				// points at, so it has to be picked up here: the inline
+				// parameter decoder below is only ever reached for a
+				// by-value request, which by definition carries no
+				// request_uri and therefore no request_uri_method either.
+				return h.fetchRequestObject(ctx, requestURIRef, requestURIMethod(u, msg), msg.WalletMetadata)
 			}
 			// Parse inline parameters
 			return h.parseRequestFromURL(u)
@@ -286,11 +307,16 @@ func (h *OID4VPHandler) parseRequest(ctx context.Context, msg *FlowStartMessage)
 			return nil, fmt.Errorf("invalid request URL: %w", err)
 		}
 		if u.RawQuery == "" {
-			return h.fetchRequestFromURI(ctx, requestStr)
+			// The link IS the request_uri, so it carries no wrapper query
+			// to read request_uri_method from - only the client can say.
+			return h.fetchRequestObject(ctx, requestStr, msg.RequestURIMethod, msg.WalletMetadata)
 		}
 		return h.parseRequestFromURL(u)
 	} else if msg.RequestURIRef != "" {
-		return h.fetchRequestFromURI(ctx, msg.RequestURIRef)
+		// The client extracted the reference itself and with it the query
+		// string request_uri_method would have arrived in, so it has to pass
+		// the parameter on explicitly.
+		return h.fetchRequestObject(ctx, msg.RequestURIRef, msg.RequestURIMethod, msg.WalletMetadata)
 	}
 
 	return &authReq, errors.New("no request provided")
@@ -418,8 +444,140 @@ type requestFetchError struct{ err error }
 func (e *requestFetchError) Error() string { return e.err.Error() }
 func (e *requestFetchError) Unwrap() error { return e.err }
 
-func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*AuthorizationRequest, error) {
-	h.Logger.Debug("fetching authorization request object", zap.String("uri", redactURIForLogging(uri)))
+// requestCodedError is a request fetch/parse failure that already knows which
+// ErrorCode Execute should report, for the conditions that have a more useful
+// answer than "could not fetch" or "could not parse": a request_uri_method
+// this wallet does not implement, and a request object that fails the
+// wallet_nonce check.
+type requestCodedError struct {
+	code ErrorCode
+	err  error
+}
+
+func (e *requestCodedError) Error() string { return e.err.Error() }
+func (e *requestCodedError) Unwrap() error { return e.err }
+
+// requestURIMethod picks the request_uri_method for a by-reference request:
+// the parameter on the authorization request URI when it carries one,
+// otherwise whatever the client passed on the FlowStart message.
+func requestURIMethod(u *url.URL, msg *FlowStartMessage) string {
+	clientMethod := ""
+	if msg != nil {
+		clientMethod = msg.RequestURIMethod
+	}
+
+	// A client that asked for POST cannot be talked out of it by the URI.
+	// The authorization request is unauthenticated at this point - it is a
+	// QR code or a deep link, and anyone able to rewrite it can rewrite
+	// request_uri_method=post to get. That downgrade is not cosmetic: the
+	// GET path sends no wallet_nonce, so the check that binds the returned
+	// request object to this request becomes a no-op and the whole point of
+	// 5.10 is switched off by an attacker-supplied query parameter. The
+	// same downgrade was reported against eudi-lib-ios-openid4vp-swift
+	// (their issue #226).
+	//
+	// Honouring the client and failing loudly against a verifier that only
+	// speaks GET is the better error: the client asked for a guarantee this
+	// verifier cannot give, which is worth surfacing rather than silently
+	// dropping.
+	if clientMethod == "post" {
+		return "post"
+	}
+
+	// Otherwise the authorization request decides, by presence rather than
+	// emptiness: "request_uri_method=" with no value is still the request
+	// speaking, and it means the GET it asks for - falling through to the
+	// client's value there would turn a request the verifier wrote as a GET
+	// into a POST.
+	if q := u.Query(); q.Has("request_uri_method") {
+		return q.Get("request_uri_method")
+	}
+	return clientMethod
+}
+
+// usePostForRequestURI maps request_uri_method to the HTTP method to use.
+// The values are case-sensitive per OpenID4VP 1.0 5.10; absent (RFC 9101's
+// default) and "get" mean GET, "post" means the POST of 5.10, and anything
+// else is a request this wallet cannot honour.
+func usePostForRequestURI(method string) (bool, error) {
+	switch method {
+	case "", "get":
+		return false, nil
+	case "post":
+		return true, nil
+	default:
+		return false, &requestCodedError{ErrCodeInvalidRequestURIMethod,
+			fmt.Errorf("unsupported request_uri_method %q", method)}
+	}
+}
+
+// walletMetadataToSend picks the wallet_metadata for a request_uri_method=post
+// request. It returns the client's own when it supplied one, and nothing at
+// all when it did not.
+//
+// The engine deliberately does not substitute a list of its own. wallet_metadata
+// is OPTIONAL in OpenID4VP, so omitting it is both honest and safe, whereas a
+// default asserts capabilities on the client's behalf that the engine cannot
+// derive from anything it holds - matching and VP token construction both
+// happen client-side. Claiming mso_mdoc for a client that only does SD-JWT
+// invites a request object the client then cannot satisfy, and that failure
+// lands after the user has consented, which is the worst place for it.
+//
+// There is a second-order reason. Sending wallet_metadata is what signals
+// dynamic discovery, and under dynamic discovery the request object's aud
+// must equal its iss, where under static discovery it must be
+// https://self-issued.me/v2. A synthesized blob carries no issuer, so a
+// verifier that switches modes on its presence has nothing to key aud to.
+//
+// Clients serialize the whole flow start message with their nulls included
+// (the Kotlin and Swift SDKs both encode defaults), so a field the client
+// left unset arrives as a literal JSON null rather than as nothing at all,
+// and means the same thing.
+//
+// Anything else has to be an object. OpenID4VP defines wallet_metadata as
+// one, and syntactic validity is not enough: an array, a number or a quoted
+// string is well-formed JSON that no verifier can read as capabilities, so
+// forwarding it would turn a client bug into a failure at the far end of the
+// presentation, where it is much harder to place.
+func walletMetadataToSend(md json.RawMessage) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(string(md))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return nil, &requestCodedError{ErrCodeInvalidMessage,
+			fmt.Errorf("wallet_metadata on the flow start message is not a JSON object: %w", err)}
+	}
+	return json.RawMessage(trimmed), nil
+}
+
+// generateWalletNonce creates the holder-supplied challenge for a
+// request_uri_method=post request. It is generated per request and never
+// stored: it only has to outlive the fetch it is checked against.
+func generateWalletNonce() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate wallet_nonce: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// fetchRequestObject retrieves a by-reference request object from the
+// verifier's request_uri. method is OpenID4VP's request_uri_method: GET (RFC
+// 9101, and the default) unless the verifier asked for the POST of OpenID4VP
+// 1.0 5.10, which additionally carries this wallet's capabilities and a
+// freshly generated wallet_nonce for the verifier to echo back inside the
+// request object.
+func (h *OID4VPHandler) fetchRequestObject(ctx context.Context, uri, method string, walletMetadata json.RawMessage) (*AuthorizationRequest, error) {
+	usePost, err := usePostForRequestURI(method)
+	if err != nil {
+		return nil, err
+	}
+
+	h.Logger.Debug("fetching authorization request object",
+		zap.String("uri", redactURIForLogging(uri)),
+		zap.Bool("post", usePost))
 
 	// The verifier assigns this session id itself (it's the query param on
 	// the request_uri it handed us) - extract it up front from the URI
@@ -430,12 +588,74 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		verifierSessionID = parsedURI.Query().Get("sessionId")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
-	if err != nil {
-		return nil, err
+	var req *http.Request
+	var walletNonce string
+	if usePost {
+		walletNonce, err = generateWalletNonce()
+		if err != nil {
+			return nil, err
+		}
+		metadata, mdErr := walletMetadataToSend(walletMetadata)
+		if mdErr != nil {
+			return nil, mdErr
+		}
+		form := url.Values{}
+		if len(metadata) > 0 {
+			form.Set("wallet_metadata", string(metadata))
+		}
+		form.Set("wallet_nonce", walletNonce)
+		req, err = http.NewRequestWithContext(ctx, "POST", uri, strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set(hdrContentType, mimeFormURLEncoded)
+		// OpenID4VP 1.0 5.10 requires this Accept header on the POST, and
+		// 5.10.1 requires the response to be a signed request object of that
+		// media type. Asking for it is what lets a verifier that can serve
+		// both shapes pick the right one.
+		req.Header.Set(hdrAccept, mimeOAuthAuthzReqJWT)
+	} else {
+		req, err = http.NewRequestWithContext(ctx, "GET", uri, nil)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	resp, err := h.httpClient.Do(req)
+	client := h.httpClient
+	if usePost {
+		// Go's client follows a 302 or 303 on a POST by reissuing it as a
+		// GET with no body, so a verifier behind a redirect would receive
+		// neither wallet_nonce nor wallet_metadata and answer a request
+		// object that echoes no nonce. That fails closed at the check below,
+		// but as WALLET_NONCE_MISMATCH - which points at the verifier's
+		// integrity rather than at its redirect. Refuse the redirect instead
+		// and say so. The copy is shallow on purpose: it shares the
+		// transport, and with it the SSRF address and scheme policy.
+		redirectSafe := *client
+		redirectSafe.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+			return fmt.Errorf("request_uri redirected (%d hop(s)); a redirect would drop the wallet_nonce POST body", len(via))
+		}
+		client = &redirectSafe
+	}
+
+	// The URL is the verifier's request_uri, which OpenID4VP requires this
+	// wallet to dereference, so it is user-provided by construction. What
+	// contains it is the transport: h.httpClient comes from
+	// cfg.HTTPClient.NewHTTPClient, whose DialContext resolves the host and
+	// refuses private, loopback and link-local addresses, and which requires
+	// https unless a deployment has explicitly opted out. The shallow copy
+	// above shares that transport, so the redirect guard does not weaken it.
+	// CodeQL cannot follow the client through the struct field to see any of
+	// that, so it reports this call and every other fetch in this file.
+	//
+	// There is deliberately no // codeql[go/request-forgery] marker here.
+	// Those markers do not work in this setup: one was added on this line
+	// and the next analysis raised the alert at that exact line two minutes
+	// later. Two such markers elsewhere in the repo look like they work only
+	// because their alerts predate them by six weeks. A marker that
+	// suppresses nothing is worse than none, because it tells the next
+	// reader the finding is handled.
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
 	}
@@ -481,6 +701,19 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		// misclassify it as a JWT and fail to parse. JSON always starts with
 		// '{' or '[' once whitespace is trimmed, and a JWT never does, so
 		// check that instead.
+		//
+		// On the POST path a plain JSON body is refused outright. OpenID4VP
+		// 1.0 5.10.1 requires the response to be a signed request object,
+		// and without that signature the wallet_nonce check below proves
+		// nothing: anyone who can observe or intercept the POST can echo the
+		// nonce back. The nonce binds the response to this request only once
+		// something has vouched for who produced it. Accepting unsigned JSON
+		// here would leave the POST path weaker than the GET path it was
+		// added to strengthen.
+		if usePost {
+			return nil, &requestCodedError{ErrCodeInvalidRequestObject,
+				errors.New("request object fetched with request_uri_method=post is not a signed JWT")}
+		}
 		authReq = &AuthorizationRequest{}
 		err = json.Unmarshal([]byte(bodyStr), authReq)
 		if err != nil {
@@ -495,6 +728,18 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 	}
 
 	authReq.VerifierSessionID = verifierSessionID
+
+	// OpenID4VP 1.0 5.10: "If the Wallet passed a wallet_nonce in the POST
+	// request, the Wallet MUST validate whether the request object contains
+	// the respective nonce value in a wallet_nonce claim. If it does not, the
+	// Wallet MUST terminate request processing." A verifier that echoes
+	// nothing back cannot have produced this request object in response to
+	// this request, which is the whole point of sending the nonce.
+	if walletNonce != "" && authReq.WalletNonce != walletNonce {
+		return nil, &requestCodedError{ErrCodeWalletNonceMismatch,
+			errors.New("request object does not echo the wallet_nonce sent with the request_uri POST")}
+	}
+
 	return authReq, nil
 }
 
