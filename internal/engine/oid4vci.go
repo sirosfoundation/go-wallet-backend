@@ -521,17 +521,28 @@ func isAttestationChallengeError(statusCode int, body []byte) bool {
 // resolveAttestationChallenge obtains a fresh Client Attestation PoP challenge
 // after a use_attestation_challenge rejection. It prefers a challenge echoed in
 // the response's OAuth-Client-Attestation-Challenge header and otherwise POSTs
-// the AS challenge endpoint. It stores the challenge and, in legacy mode,
-// discards the previously requested WIA+PoP so the next resolveClientAuth
-// re-requests one bound to it. Returns false when no challenge could be obtained.
-func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *http.Response) bool {
+// the AS challenge endpoint, lazily discovering that endpoint from AS metadata
+// (via metadata, when non-nil) for token-only flows that never fetched it. It
+// stores the challenge and, in legacy mode, discards the previously requested
+// WIA+PoP so the next resolveClientAuth re-requests one bound to it. Returns
+// false when no challenge could be obtained.
+func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *http.Response, metadata *IssuerMetadata) bool {
 	challenge := resp.Header.Get("OAuth-Client-Attestation-Challenge")
-	if challenge == "" && h.challengeEndpoint != "" {
-		var err error
-		challenge, err = h.fetchAttestationChallenge(ctx, h.challengeEndpoint)
-		if err != nil {
-			h.Logger.Debug("failed to obtain attestation challenge", zap.Error(err))
-			return false
+	if challenge == "" {
+		// A spec-conformant AS returns the challenge in the header above; the
+		// endpoint is a fallback. Discover it lazily so token-only flows (which
+		// may skip AS-metadata fetch when token_endpoint is already known) can
+		// still use it.
+		if h.challengeEndpoint == "" && metadata != nil {
+			h.fetchOAuthMetadata(ctx, metadata) // sets h.challengeEndpoint on success
+		}
+		if h.challengeEndpoint != "" {
+			var err error
+			challenge, err = h.fetchAttestationChallenge(ctx, h.challengeEndpoint)
+			if err != nil {
+				h.Logger.Debug("failed to obtain attestation challenge", zap.Error(err))
+				return false
+			}
 		}
 	}
 	if challenge == "" {
@@ -1721,6 +1732,14 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 
 		data := url.Values{}
 		setGrantParams(data)
+		// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
+		// so every grant type (pre-authorized_code, authorization_code,
+		// refresh_token) audience-restricts the access token to the Credential
+		// Issuer, matching the PAR-time decision (both derive it from the same
+		// metadata, as RFC 8707 requires).
+		if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
+			data.Set("resource", metadata.CredentialIssuer)
+		}
 		if err := h.setClientAuth(data, auth.attested()); err != nil {
 			return nil, err
 		}
@@ -1749,7 +1768,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			// Retry with the server-provided challenge in the attestation PoP.
-			if attempt < 2 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp) {
+			if attempt < 2 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, metadata) {
 				h.Logger.Debug(logContext + " endpoint requires attestation challenge, retrying with challenge")
 				continue
 			}
@@ -2119,7 +2138,9 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		h.Logger.Debug("PAR endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
 
 		// Refresh the attestation-PoP challenge and signal a retry.
-		if isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp) {
+		// PAR-time challenge endpoint is already known from AS metadata, so no
+		// lazy discovery is needed here.
+		if isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, nil) {
 			return "", errAttestationChallenge
 		}
 
@@ -2155,11 +2176,6 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 		data.Set("redirect_uri", redirectURI)
 		if codeVerifier != "" {
 			data.Set("code_verifier", codeVerifier)
-		}
-		// RFC 8707: mirror the PAR-time decision (cross-origin AS/issuer only) so
-		// the resource matches what was authorized.
-		if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
-			data.Set("resource", metadata.CredentialIssuer)
 		}
 	})
 }

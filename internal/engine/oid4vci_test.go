@@ -1258,7 +1258,7 @@ func TestResolveAttestationChallenge_FromHeader(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
 	resp.Header.Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
 
-	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
 	assert.Equal(t, "hdr-chal", h.attestationChallenge)
 	// A fresh challenge must invalidate a previously replayed WIA+PoP so the
 	// next resolveClientAuth re-requests one bound to the new challenge.
@@ -1278,8 +1278,35 @@ func TestResolveAttestationChallenge_FromEndpoint(t *testing.T) {
 
 	// No challenge header present, so the endpoint is consulted.
 	resp := &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}}
-	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
 	assert.Equal(t, "ep-chal", h.attestationChallenge)
+}
+
+// TestResolveAttestationChallenge_LazyDiscoversEndpoint covers token-only flows
+// (e.g. pre-authorized_code) where AS metadata was never fetched: with no
+// challenge header and no known endpoint, the endpoint is discovered from AS
+// metadata on demand.
+func TestResolveAttestationChallenge_LazyDiscoversEndpoint(t *testing.T) {
+	mux := http.NewServeMux()
+	var base string
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"challenge_endpoint":"` + base + `/challenge"}`))
+	})
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"attestation_challenge":"lazy-chal"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base = srv.URL
+
+	h := &OID4VCIHandler{httpClient: srv.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	metadata := &IssuerMetadata{AuthorizationServers: []string{srv.URL}}
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, metadata))
+	assert.Equal(t, "lazy-chal", h.attestationChallenge)
+	assert.Equal(t, srv.URL+"/challenge", h.challengeEndpoint)
 }
 
 func TestResolveAttestationChallenge_NoneAvailable(t *testing.T) {
@@ -1287,7 +1314,7 @@ func TestResolveAttestationChallenge_NoneAvailable(t *testing.T) {
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
 	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
-	assert.False(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.False(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
 	assert.Empty(t, h.attestationChallenge)
 }
 
@@ -1388,6 +1415,45 @@ func TestExchangeAuthCode_ResourceIndicator(t *testing.T) {
 			} else {
 				assert.Equal(t, tt.wantResource, gotResource)
 			}
+		})
+	}
+}
+
+// TestDoTokenExchange_ResourceIndicatorAppliesToAllGrants verifies the RFC 8707
+// resource indicator is emitted for every grant type that goes through the
+// shared token-exchange scaffold, not just the authorization_code callback.
+func TestDoTokenExchange_ResourceIndicatorAppliesToAllGrants(t *testing.T) {
+	grants := []struct {
+		name string
+		call func(h *OID4VCIHandler, m *IssuerMetadata) error
+	}{
+		{"pre-authorized_code", func(h *OID4VCIHandler, m *IssuerMetadata) error {
+			_, err := h.exchangePreAuthCode(context.Background(), m, "code", "")
+			return err
+		}},
+		{"refresh_token", func(h *OID4VCIHandler, m *IssuerMetadata) error {
+			_, err := h.exchangeRefreshToken(context.Background(), m, "rt")
+			return err
+		}},
+	}
+	for _, g := range grants {
+		t.Run(g.name, func(t *testing.T) {
+			var gotResource string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				gotResource = r.FormValue("resource")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer"}`))
+			}))
+			defer srv.Close()
+
+			h, cleanup := testOID4VCIHandler(t, srv.Client())
+			defer cleanup()
+			h.authServerIssuer = "https://as.example" // cross-origin with the issuer below
+
+			metadata := &IssuerMetadata{TokenEndpoint: srv.URL, CredentialIssuer: "https://issuer.example"}
+			require.NoError(t, g.call(h, metadata))
+			assert.Equal(t, "https://issuer.example", gotResource)
 		})
 	}
 }
