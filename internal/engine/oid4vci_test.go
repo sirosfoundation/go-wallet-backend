@@ -1205,6 +1205,193 @@ func TestUpdateDPoPNonce(t *testing.T) {
 	assert.Equal(t, "second-nonce", h.dpopNonce)
 }
 
+func TestSameOrigin(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical", "https://a.example", "https://a.example", true},
+		{"path differs, same origin", "https://a.example", "https://a.example/webuild", true},
+		{"default vs explicit https port", "https://a.example", "https://a.example:443", true},
+		{"default vs explicit http port", "http://a.example", "http://a.example:80", true},
+		{"different host", "https://a.example", "https://b.example", false},
+		{"different scheme", "https://a.example", "http://a.example", false},
+		{"different port", "https://a.example:8443", "https://a.example", false},
+		{"malformed url", "://bad", "https://a.example", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, sameOrigin(tt.a, tt.b))
+		})
+	}
+}
+
+func TestIsAttestationChallengeError(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"400 challenge", http.StatusBadRequest, `{"error":"use_attestation_challenge"}`, true},
+		{"401 challenge", http.StatusUnauthorized, `{"error":"use_attestation_challenge"}`, true},
+		{"400 other error", http.StatusBadRequest, `{"error":"invalid_request"}`, false},
+		{"200 with challenge body", http.StatusOK, `{"error":"use_attestation_challenge"}`, false},
+		{"500 with challenge body", http.StatusInternalServerError, `{"error":"use_attestation_challenge"}`, false},
+		{"non-json body", http.StatusBadRequest, `not json`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isAttestationChallengeError(tt.status, []byte(tt.body)))
+		})
+	}
+}
+
+func TestResolveAttestationChallenge_FromHeader(t *testing.T) {
+	h := &OID4VCIHandler{
+		attestationProvider:        &TransportSuppliedAttestation{WIA: "w", PoP: "p"},
+		legacyAttestationRequested: true,
+	}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	resp.Header.Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.Equal(t, "hdr-chal", h.attestationChallenge)
+	// A fresh challenge must invalidate a previously replayed WIA+PoP so the
+	// next resolveClientAuth re-requests one bound to the new challenge.
+	assert.Nil(t, h.attestationProvider)
+	assert.False(t, h.legacyAttestationRequested)
+}
+
+func TestResolveAttestationChallenge_FromEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "POST", r.Method)
+		_, _ = w.Write([]byte(`{"attestation_challenge":"ep-chal"}`))
+	}))
+	defer srv.Close()
+
+	h := &OID4VCIHandler{httpClient: srv.Client(), challengeEndpoint: srv.URL}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	// No challenge header present, so the endpoint is consulted.
+	resp := &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}}
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.Equal(t, "ep-chal", h.attestationChallenge)
+}
+
+func TestResolveAttestationChallenge_NoneAvailable(t *testing.T) {
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	assert.False(t, h.resolveAttestationChallenge(context.Background(), resp))
+	assert.Empty(t, h.attestationChallenge)
+}
+
+func TestFetchAttestationChallenge(t *testing.T) {
+	t.Run("success captures DPoP nonce", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("DPoP-Nonce", "dnonce")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"attestation_challenge":"chal-abc"}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "chal-abc", got)
+		assert.Equal(t, "dnonce", h.dpopNonce)
+	})
+
+	t.Run("empty challenge is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		_, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		assert.Error(t, err)
+	})
+
+	t.Run("non-200 is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		_, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		assert.Error(t, err)
+	})
+}
+
+func TestSendPushedAuthorizationRequest_AttestationChallenge(t *testing.T) {
+	parServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "par-chal")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+	}))
+	defer parServer.Close()
+
+	h := &OID4VCIHandler{httpClient: parServer.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
+	require.ErrorIs(t, err, errAttestationChallenge)
+	assert.Equal(t, "par-chal", h.attestationChallenge)
+}
+
+func TestExchangeAuthCode_ResourceIndicator(t *testing.T) {
+	tests := []struct {
+		name         string
+		authServer   string
+		issuer       string
+		wantResource string // "" means the resource parameter must be absent
+	}{
+		{"cross-origin AS sends resource", "https://as.example", "https://issuer.example", "https://issuer.example"},
+		{"same-origin AS omits resource", "https://issuer.example", "https://issuer.example/webuild", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotResource string
+			var hasResource bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				gotResource = r.FormValue("resource")
+				_, hasResource = r.Form["resource"]
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer"}`))
+			}))
+			defer srv.Close()
+
+			h, cleanup := testOID4VCIHandler(t, srv.Client())
+			defer cleanup()
+			h.authServerIssuer = tt.authServer
+
+			metadata := &IssuerMetadata{TokenEndpoint: srv.URL, CredentialIssuer: tt.issuer}
+			_, err := h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example/cb", "verifier")
+			require.NoError(t, err)
+
+			if tt.wantResource == "" {
+				assert.False(t, hasResource, "resource must be omitted for same-origin AS/issuer")
+			} else {
+				assert.Equal(t, tt.wantResource, gotResource)
+			}
+		})
+	}
+}
+
 func TestExchangePreAuthCode_DPoPNonceRetry(t *testing.T) {
 	attempt := 0
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
