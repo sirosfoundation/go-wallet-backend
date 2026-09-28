@@ -474,6 +474,94 @@ func TestResolve_RejectsNonOKStatus(t *testing.T) {
 	}
 }
 
+// TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON covers issuers that
+// reject the application/jwt Accept with 406 instead of serving the acceptable
+// JSON representation: the resolver retries once requesting unsigned JSON.
+func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if strings.HasPrefix(r.Header.Get("Accept"), "application/jwt") {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://issuer.example.com"}) //nolint:errcheck
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	res, err := r.ResolveWithInfo(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("expected unsigned fallback to succeed, got error: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 requests (signed rejected, unsigned retry), got %d", attempts)
+	}
+	if res.Signed {
+		t.Error("fallback result must be reported as unsigned")
+	}
+	if res.Metadata["credential_issuer"] != "https://issuer.example.com" {
+		t.Errorf("unexpected metadata: %v", res.Metadata)
+	}
+}
+
+// TestResolve_SignedNotAcceptable_BothFail verifies the unsigned retry is not
+// infinite: when the issuer 406s both representations, the error surfaces.
+func TestResolve_SignedNotAcceptable_BothFail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error when both signed and unsigned requests return 406")
+	}
+}
+
+// TestResolve_PreferUnsigned_NoRetryOn406 verifies that when signed metadata is
+// not preferred there is a single request (no unsigned retry).
+func TestResolve_PreferUnsigned_NoRetryOn406(t *testing.T) {
+	pref := false
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{AllowHTTP: true, PreferSigned: &pref})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 406")
+	}
+	if attempts != 1 {
+		t.Errorf("PreferSigned=false must not retry; got %d requests", attempts)
+	}
+}
+
+// TestResolve_NotFound_NoUnsignedRetry verifies that a 404 is terminal: only a
+// 406 ("signed not available") triggers the unsigned retry.
+func TestResolve_NotFound_NoUnsignedRetry(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 404")
+	}
+	if attempts != 1 {
+		t.Errorf("404 must not trigger an unsigned retry; got %d requests", attempts)
+	}
+}
+
 func TestResolve_CacheTTLExpiry(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

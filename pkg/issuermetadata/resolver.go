@@ -274,17 +274,43 @@ func (r *Resolver) preferSigned() bool {
 }
 
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
+	// metadata, some issuers reject the application/jwt Accept with 406 instead
+	// of falling back to JSON; retry once requesting unsigned JSON in that case.
+	accepts := []string{"application/json, application/jwt;q=0.9"}
+	if r.preferSigned() {
+		accepts = []string{"application/jwt, application/json;q=0.9", "application/json"}
 	}
 
-	// Content negotiation per OpenID4VCI §12.2.2
-	if r.preferSigned() {
-		req.Header.Set("Accept", "application/jwt, application/json;q=0.9")
-	} else {
-		req.Header.Set("Accept", "application/json, application/jwt;q=0.9")
+	var lastStatus int
+	for _, accept := range accepts {
+		result, status, err := r.fetchOnce(ctx, issuerURL, metadataURL, accept)
+		if err != nil {
+			return nil, err
+		}
+		if status == http.StatusOK {
+			return result, nil
+		}
+		lastStatus = status
+		// Only a "signed not available" signal warrants an unsigned retry;
+		// any other status is terminal.
+		if status != http.StatusNotAcceptable {
+			break
+		}
 	}
+	return nil, fmt.Errorf("issuer returned HTTP %d", lastStatus)
+}
+
+// fetchOnce performs a single metadata GET with the given Accept header. It
+// returns the parsed result only on HTTP 200; on any other status it returns
+// the status code (and a nil result) so the caller can decide whether to retry
+// with a different Accept.
+func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept string) (*fetchResult, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", accept)
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
@@ -294,37 +320,39 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	// public HTTPS endpoint; there is no known-good allowlist.
 	resp, err := r.httpClient.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, 0, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("issuer returned HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 
 	body, err := readLimitedBody(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("reading response: %w", err)
 	}
 
 	// Determine format from Content-Type header.
 	contentType := resp.Header.Get("Content-Type")
 	mediaType, _, parseErr := mime.ParseMediaType(contentType)
 	if contentType != "" && parseErr != nil {
-		return nil, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
+		return nil, resp.StatusCode, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
 	}
 
 	switch mediaType {
 	case "application/jwt":
 		// Entire response body is a JWS per OpenID4VCI §12.2.3
-		return r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		res, err := r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		return res, resp.StatusCode, err
 
 	case "application/json", "":
 		// Standard JSON response, possibly with legacy signed_metadata field
-		return r.handleJSONResponse(ctx, issuerURL, body)
+		res, err := r.handleJSONResponse(ctx, issuerURL, body)
+		return res, resp.StatusCode, err
 
 	default:
-		return nil, fmt.Errorf("unsupported Content-Type: %s", contentType)
+		return nil, resp.StatusCode, fmt.Errorf("unsupported Content-Type: %s", contentType)
 	}
 }
 
