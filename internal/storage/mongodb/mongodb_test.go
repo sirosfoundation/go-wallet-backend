@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -665,6 +666,25 @@ func TestChallengeStore_ConsumeByID(t *testing.T) {
 	// A second consume of the same, now-deleted ID must fail.
 	_, err = store.Challenges().ConsumeByID(ctx, challenge.ID)
 	assert.Error(t, err)
+}
+
+// TestChallengeStore_ConsumeByID_GenericError exercises ConsumeByID's other
+// error path: a real driver-level failure (as opposed to the "no such
+// document" case covered above). Codecov flagged this exact line
+// (`return nil, fmt.Errorf("failed to consume challenge: %w", err)`) as
+// untested on PR #388 — a cancelled context forces mongo's FindOneAndDelete
+// to fail with something other than mongo.ErrNoDocuments, so ConsumeByID
+// must wrap and return it rather than mistaking it for storage.ErrNotFound.
+func TestChallengeStore_ConsumeByID_GenericError(t *testing.T) {
+	store := skipIfNoMongo(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.Challenges().ConsumeByID(ctx, "any-id")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, storage.ErrNotFound)
+	assert.Contains(t, err.Error(), "failed to consume challenge")
 }
 
 // TestChallengeStore_ConsumeByID_ConcurrentSingleWinner reproduces the W-2 /
