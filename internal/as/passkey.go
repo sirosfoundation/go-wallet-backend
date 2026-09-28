@@ -83,11 +83,22 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
 			email = emailClaim
 		}
-		req.OIDCGateBinding = &service.OIDCGateBinding{
+		binding := &service.OIDCGateBinding{
 			Issuer:  oidcResult.Issuer,
 			Subject: oidcResult.Subject,
 			Email:   email,
 		}
+		// Record which audience this token was actually validated against
+		// (this request's header tenant's LoginOP) so FinishLogin can compare
+		// it against the credential's real tenant's own configured audience -
+		// issuer alone doesn't prove the token was meant for that tenant if
+		// two tenants share an IdP domain. See OIDCGateBinding.Audience.
+		if headerTenant, ok := middleware.GetTenant(c); ok {
+			if loginOP := headerTenant.OIDCGate.GetLoginOP(); loginOP != nil {
+				binding.Audience = loginOP.EffectiveAudience()
+			}
+		}
+		req.OIDCGateBinding = binding
 	}
 
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)

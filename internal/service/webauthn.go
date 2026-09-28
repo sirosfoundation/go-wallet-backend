@@ -415,6 +415,17 @@ type OIDCGateBinding struct {
 	Subject     string
 	Email       string
 	BindingType string // "registration" or "login"
+
+	// Audience, when set, is the audience the presented token was actually
+	// validated against (the tenant whose gate the caller passed - see
+	// AS PasskeyHandlers.LoginFinish). FinishLogin compares it against the
+	// CREDENTIAL's real tenant's LoginOP audience: without this, two tenants
+	// that share an OIDC issuer but use different client IDs/audiences could
+	// have a token valid for tenant A's app satisfy tenant B's login gate,
+	// since only Issuer was previously compared. Left empty (the default for
+	// any caller that doesn't set it, e.g. internal/api/handlers.go's
+	// FinishWebAuthnLogin), no audience check is performed - purely opt-in.
+	Audience string
 }
 
 // FinishRegistrationResponse contains the result of registration
@@ -449,18 +460,22 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		return nil, errors.New("invalid challenge action")
 	}
 
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
-
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
 
 	// SECURITY: reject if the caller's validated tenant context (set by the
-	// handler) doesn't match the tenant this challenge actually belongs to.
-	// See ExpectedTenantID's doc comment.
+	// handler) doesn't match the tenant this challenge actually belongs to -
+	// see ExpectedTenantID's doc comment. Checked BEFORE the challenge is
+	// deleted below: otherwise a caller who merely knows a valid challenge ID
+	// could submit it with a mismatched tenant purely to burn the one-time
+	// challenge, denying the legitimate caller (with the matching tenant)
+	// the ability to ever finish it.
 	if req.ExpectedTenantID != "" && domain.TenantID(req.ExpectedTenantID) != tenantID {
 		return nil, ErrTenantMismatch
 	}
+
+	// Delete challenge (one-time use)
+	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Re-validate invite if one was used at BeginRegistration time.
 	// The invite may have been revoked or expired during the challenge window.
@@ -1147,6 +1162,21 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("expected_issuer", loginOP.Issuer),
 				zap.String("actual_issuer", req.OIDCGateBinding.Issuer))
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for wrong OP
+		}
+
+		// SECURITY: when the caller recorded which audience the token was
+		// actually validated against (see OIDCGateBinding.Audience's doc
+		// comment), it must match this tenant's own configured audience too.
+		// Two tenants can share an issuer (e.g. a shared multi-tenant IdP
+		// domain) while using different client IDs/audiences per app; issuer
+		// alone isn't enough to prove the token was meant for THIS tenant.
+		if req.OIDCGateBinding.Audience != "" && req.OIDCGateBinding.Audience != loginOP.EffectiveAudience() {
+			s.logger.Warn("OIDC binding audience mismatch",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("expected_audience", loginOP.EffectiveAudience()),
+				zap.String("actual_audience", req.OIDCGateBinding.Audience))
+			return nil, ErrOIDCGateRequired // Reject with gate required - token was for the wrong app
 		}
 
 		// If bind_identity is enabled, verify the enterprise identity matches

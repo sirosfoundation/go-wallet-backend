@@ -250,6 +250,55 @@ func TestPasskeyLoginFinish_OIDCGateBindingPopulated(t *testing.T) {
 	}
 }
 
+// TestPasskeyLoginFinish_OIDCGateBinding_AudiencePopulatedFromTenant covers a
+// Copilot review finding: LoginFinish must record which audience the token
+// was actually validated against (the header tenant's LoginOP), so
+// FinishLogin can compare it against the credential's real tenant's own
+// audience - issuer alone isn't enough proof when tenants share an IdP.
+func TestPasskeyLoginFinish_OIDCGateBinding_AudiencePopulatedFromTenant(t *testing.T) {
+	mock := &capturingWebAuthn{
+		mockWebAuthn: mockWebAuthn{
+			finishLoginResp: &service.FinishLoginResponse{UUID: "user-1", TenantID: "tenant-1"},
+		},
+	}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	headerTenant := &domain.Tenant{
+		ID: "header-tenant",
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			LoginOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "header-tenant-client",
+			},
+		},
+	}
+
+	router := gin.New()
+	router.Use(contextInjector(headerTenant, &oidc.ValidationResult{
+		Issuer:  "https://idp.example.com",
+		Subject: "user-1",
+	}))
+	router.POST("/finish", h.LoginFinish)
+
+	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if mock.lastFinishLoginReq.OIDCGateBinding == nil {
+		t.Fatal("expected OIDCGateBinding to be populated")
+	}
+	if mock.lastFinishLoginReq.OIDCGateBinding.Audience != "header-tenant-client" {
+		t.Errorf("expected audience %q (header tenant's LoginOP client ID), got %q",
+			"header-tenant-client", mock.lastFinishLoginReq.OIDCGateBinding.Audience)
+	}
+}
+
 func TestPasskeyLoginFinish_ErrorMapping(t *testing.T) {
 	cases := []struct {
 		name       string

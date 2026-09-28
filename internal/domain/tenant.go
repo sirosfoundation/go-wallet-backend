@@ -98,6 +98,21 @@ func (c *OIDCProviderConfig) EffectiveScopes() string {
 	return c.Scopes
 }
 
+// EffectiveAudience returns the audience tokens must be validated against,
+// defaulting to the client ID when Audience is unset. Mirrors the same
+// default middleware.ValidatorCache.GetOrCreate applies when constructing
+// the actual OIDC validator, so this always reflects what a token was (or
+// must be) checked against for this provider.
+func (c *OIDCProviderConfig) EffectiveAudience() string {
+	if c == nil {
+		return ""
+	}
+	if c.Audience != "" {
+		return c.Audience
+	}
+	return c.ClientID
+}
+
 // EffectiveDisplayName returns the display name, falling back to issuer if not set
 func (c *OIDCProviderConfig) EffectiveDisplayName() string {
 	if c == nil {

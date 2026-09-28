@@ -174,6 +174,15 @@ func TestPasskeyRegisterFinish_RejectsHeaderChallengeTenantMismatch(t *testing.T
 		if !strings.Contains(finishW.Body.String(), "tenant mismatch") {
 			t.Errorf("expected tenant mismatch error, got: %s", finishW.Body.String())
 		}
+
+		// The challenge itself must survive a mismatched attempt (fixing a
+		// second Copilot finding on this PR): the one-time challenge is only
+		// consumed once the tenant check passes, so a caller who merely knows
+		// a valid challenge ID can't burn it by submitting the wrong tenant,
+		// denying the legitimate caller the ability to ever finish it.
+		if _, err := store.Challenges().GetByID(context.Background(), challengeID); err != nil {
+			t.Errorf("challenge should survive a mismatched-tenant attempt (not be consumed), but lookup failed: %v", err)
+		}
 	})
 
 	t.Run("matching header tenant is not rejected as a mismatch", func(t *testing.T) {
@@ -383,7 +392,7 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 	}
 	jwtCfg := &config.JWTConfig{Issuer: "test-issuer"}
 
-	m, err := NewASModule(context.Background(), asCfg, jwtCfg, webauthnSvc, store, zap.NewNop())
+	m, err := NewASModule(context.Background(), asCfg, jwtCfg, webauthnSvc, store, nil, http.DefaultClient, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewASModule: %v", err)
 	}

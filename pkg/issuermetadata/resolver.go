@@ -428,7 +428,7 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	if credentialIssuer == "" {
 		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
 	}
-if credentialIssuer != issuerURL {
+	if credentialIssuer != issuerURL {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
 	}
 	return nil

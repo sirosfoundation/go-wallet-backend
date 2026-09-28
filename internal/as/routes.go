@@ -3,6 +3,7 @@ package as
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -45,6 +46,13 @@ type ASModule struct {
 
 // NewASModule creates and initializes the AS module.
 // The ctx parameter controls the lifecycle of background goroutines (session cleanup).
+// httpClient is used for the passkey OIDC gate's issuer discovery and JWKS
+// fetches (see RegisterRoutes) - callers should pass the same configured,
+// SSRF-guarded client used elsewhere (e.g. cfg.HTTPClient.NewHTTPClient(0)),
+// not nil, or those unauthenticated fetches bypass the private-IP/HTTPS
+// guards the rest of the codebase applies. A nil value still works (falls
+// back to a bare client with a short default timeout) for callers that
+// genuinely have no such client (e.g. tests).
 // Returns an error if the signing key cannot be loaded.
 func NewASModule(
 	ctx context.Context,
@@ -53,6 +61,7 @@ func NewASModule(
 	webauthnSvc *service.WebAuthnService,
 	store storage.Store,
 	blacklist TokenBlacklistChecker,
+	httpClient *http.Client,
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
@@ -117,9 +126,9 @@ func NewASModule(
 	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
-	// RegisterRoutes). A nil HTTP client makes ValidatorCache fall back to
-	// its own default client.
-	validatorCache := middleware.NewValidatorCache(nil, logger)
+	// RegisterRoutes). See httpClient's doc comment above for why this must
+	// be the caller's configured client, not nil, in production.
+	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
 		KeyManager:     km,
