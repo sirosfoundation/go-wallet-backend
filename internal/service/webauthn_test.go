@@ -18,6 +18,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -1333,6 +1335,95 @@ func TestFullLoginFlow(t *testing.T) {
 		assert.Equal(t, "Login Test User", finishLoginResp.DisplayName)
 		assert.Equal(t, testRPID, finishLoginResp.WebauthnRpId)
 	})
+}
+
+// TestFullLoginFlow_CloneWarningSurfaced covers issue #380: a sign-counter
+// regression (the standard clone-authenticator signal) must not be silently
+// dropped. It logs in once to establish a non-zero baseline counter, then
+// logs in again with a LOWER counter — the classic clone signal — and
+// asserts that (a) the login is still allowed through (we don't block on
+// it), (b) a distinct, greppable "possible cloned authenticator detected"
+// security-event line is logged, and (c) the clone warning is persisted on
+// the stored credential rather than silently dropped.
+func TestFullLoginFlow_CloneWarningSurfaced(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, logger)
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Clone Test User"})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Clone Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(counter uint32) *FinishLoginResponse {
+		t.Helper()
+		credential.Counter = counter
+
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		resp, err := svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err, "login must still succeed even when a clone warning is detected")
+		return resp
+	}
+
+	// Establish a non-zero baseline counter.
+	login(10)
+
+	// A LOWER counter than the stored baseline is the standard
+	// clone-authenticator signal.
+	login(3)
+
+	entries := observed.FilterMessage("possible cloned authenticator detected").All()
+	require.Len(t, entries, 1, "expected exactly one clone-warning security-event log line")
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "webauthn_clone_warning", fields["security_event"])
+	assert.Equal(t, userID.String(), fields["user_id"])
+
+	// The warning must be persisted, not silently dropped.
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	require.Len(t, user.WebauthnCredentials, 1)
+	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
 }
 
 // ============================================================================

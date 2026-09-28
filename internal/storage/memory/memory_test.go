@@ -3,6 +3,8 @@ package memory
 import (
 	"context"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -758,6 +760,103 @@ func TestChallengeStore_Delete(t *testing.T) {
 	_, err = challenges.GetByID(ctx, "challenge-delete")
 	if err != storage.ErrNotFound {
 		t.Error("Challenge should be deleted")
+	}
+}
+
+// TestChallengeStore_ConsumeByID verifies the atomic find-and-delete
+// primitive introduced to fix issue #379 (non-atomic challenge consumption):
+// a successful ConsumeByID returns the challenge and removes it.
+func TestChallengeStore_ConsumeByID(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "challenge-consume",
+		UserID:    "user-456",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	consumed, err := challenges.ConsumeByID(ctx, "challenge-consume")
+	if err != nil {
+		t.Fatalf("ConsumeByID() error = %v", err)
+	}
+	if consumed.Challenge != "random-challenge" {
+		t.Errorf("Challenge = %q, want %q", consumed.Challenge, "random-challenge")
+	}
+
+	// The challenge must be gone after a single consume.
+	if _, err := challenges.GetByID(ctx, "challenge-consume"); err != storage.ErrNotFound {
+		t.Error("challenge should have been deleted by ConsumeByID")
+	}
+}
+
+func TestChallengeStore_ConsumeByID_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByID(ctx, "nonexistent")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByID() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByID_ConcurrentSingleWinner reproduces the W-2 /
+// issue #379 race directly against the storage layer: many goroutines race
+// to consume the exact same challenge ID concurrently. With the old
+// GetByID-then-Delete pattern every one of them could observe the challenge
+// before any deletion landed; ConsumeByID's single atomic operation must
+// ensure exactly one of them gets a non-nil challenge back.
+func TestChallengeStore_ConsumeByID_ConcurrentSingleWinner(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	const id = "race-challenge"
+	challenge := &domain.WebauthnChallenge{
+		ID:        id,
+		UserID:    "user-race",
+		Challenge: "random-challenge",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if c, err := challenges.ConsumeByID(ctx, id); err == nil && c != nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent ConsumeByID calls to succeed, got %d", attempts, got)
+	}
+
+	// The challenge must not be consumable again afterwards.
+	if _, err := challenges.ConsumeByID(ctx, id); err != storage.ErrNotFound {
+		t.Errorf("challenge should already be consumed, ConsumeByID() error = %v", err)
 	}
 }
 
@@ -1875,6 +1974,61 @@ func TestChallengeStore_DeleteByUserID(t *testing.T) {
 	// user-B's challenge should remain
 	if _, err := challenges.GetByID(ctx, "c3"); err != nil {
 		t.Error("Challenge c3 should still exist")
+	}
+}
+
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner exercises the atomic
+// primitive that the W-1 / issue #378 fix in FinishRegistration relies on:
+// many goroutines race to claim the same single-use invite code via
+// MarkCompleted. Exactly one must win; every other caller must observe
+// storage.ErrNotFound (the invite is no longer "active"), which is what lets
+// the service reject a racing registration before it creates a user account.
+func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	invites := store.Invites()
+
+	const code = "RACE-CODE"
+	invite := &domain.Invite{
+		ID:       "invite-race",
+		TenantID: domain.DefaultTenantID,
+		Code:     code,
+		Status:   domain.InviteStatusActive,
+	}
+	if err := invites.Create(ctx, invite); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			userID := domain.UserIDFromString("racer")
+			if err := invites.MarkCompleted(ctx, domain.DefaultTenantID, code, userID); err == nil {
+				successes.Add(1)
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent MarkCompleted calls to succeed, got %d", attempts, got)
+	}
+
+	got, err := invites.GetByID(ctx, "invite-race")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != domain.InviteStatusCompleted {
+		t.Errorf("invite status = %q, want %q", got.Status, domain.InviteStatusCompleted)
 	}
 }
 

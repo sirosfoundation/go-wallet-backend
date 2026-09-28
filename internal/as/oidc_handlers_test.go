@@ -81,6 +81,14 @@ func (m *mockChallengeStore) GetByID(_ context.Context, id string) (*domain.Weba
 	}
 	return c, nil
 }
+func (m *mockChallengeStore) ConsumeByID(_ context.Context, id string) (*domain.WebauthnChallenge, error) {
+	c, ok := m.challenges[id]
+	if !ok {
+		return nil, fmt.Errorf("challenge not found")
+	}
+	delete(m.challenges, id)
+	return c, nil
+}
 func (m *mockChallengeStore) Delete(_ context.Context, id string) error {
 	delete(m.challenges, id)
 	return nil

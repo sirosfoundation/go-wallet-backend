@@ -532,6 +532,18 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	return challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

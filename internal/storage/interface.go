@@ -131,6 +131,15 @@ type ChallengeStore interface {
 	// GetByID retrieves a challenge by ID
 	GetByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error)
 
+	// ConsumeByID atomically retrieves and deletes a challenge by ID in a
+	// single operation (Mongo: FindOneAndDelete; memory: mutex-protected
+	// delete-and-return). Callers MUST use this instead of GetByID+Delete to
+	// consume a one-time challenge: two concurrent calls racing on the same
+	// ID can never both receive a non-nil challenge back. Returns
+	// ErrNotFound if the challenge doesn't exist or was already consumed by
+	// another caller.
+	ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error)
+
 	// Delete deletes a challenge
 	Delete(ctx context.Context, id string) error
 

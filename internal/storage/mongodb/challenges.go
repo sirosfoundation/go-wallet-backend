@@ -40,6 +40,18 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	return &challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	err := s.collection.FindOneAndDelete(ctx, idFilter(id)).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
 	_, err := s.collection.DeleteOne(ctx, idFilter(id))
 	if err != nil {

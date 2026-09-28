@@ -3,6 +3,8 @@ package mongodb
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -634,6 +636,117 @@ func TestNewStore_TLSErrors(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to load MongoDB client certificate")
 	})
+}
+
+// TestChallengeStore_ConsumeByID verifies the atomic FindOneAndDelete
+// primitive that fixes issue #379 (non-atomic WebAuthn challenge
+// consumption): a single ConsumeByID call both returns and deletes the
+// challenge.
+func TestChallengeStore_ConsumeByID(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "consume-challenge-id",
+		Challenge: "test-challenge-string",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	consumed, err := store.Challenges().ConsumeByID(ctx, challenge.ID)
+	require.NoError(t, err)
+	assert.Equal(t, challenge.Action, consumed.Action)
+
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err)
+
+	// A second consume of the same, now-deleted ID must fail.
+	_, err = store.Challenges().ConsumeByID(ctx, challenge.ID)
+	assert.Error(t, err)
+}
+
+// TestChallengeStore_ConsumeByID_ConcurrentSingleWinner reproduces the W-2 /
+// issue #379 production incident directly against MongoDB: many goroutines
+// race FindOneAndDelete on the exact same challenge ID. Exactly one must get
+// a non-nil challenge back.
+func TestChallengeStore_ConsumeByID_ConcurrentSingleWinner(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "consume-race-id",
+		Challenge: "test-challenge-string",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if c, err := store.Challenges().ConsumeByID(ctx, challenge.ID); err == nil && c != nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent ConsumeByID calls to succeed", attempts)
+}
+
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner exercises the atomic
+// update-if-active operation the W-1 / issue #378 fix relies on: many
+// goroutines race to claim the same single-use invite code. Exactly one must
+// win.
+func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	invite := &domain.Invite{
+		ID:       "invite-race-id",
+		TenantID: domain.DefaultTenantID,
+		Code:     "RACE-CODE",
+		Status:   domain.InviteStatusActive,
+	}
+	require.NoError(t, store.Invites().Create(ctx, invite))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			userID := domain.UserIDFromString("racer")
+			if err := store.Invites().MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent MarkCompleted calls to succeed", attempts)
+
+	got, err := store.Invites().GetByID(ctx, invite.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusCompleted, got.Status)
 }
 
 // On a fresh database the counter must hand out 1, 2, 3, ...: with the
