@@ -33,6 +33,21 @@ func newTestResolver(t *testing.T) *Resolver {
 	return r
 }
 
+// newTestResolverWithFallback returns a resolver with the 406 fallback gate on.
+func newTestResolverWithFallback(t *testing.T) *Resolver {
+	t.Helper()
+	fallback := true
+	r, err := New(Config{
+		CacheTTL:      5 * time.Minute,
+		AllowHTTP:     true,
+		FallbackOn406: &fallback,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	return r
+}
+
 // newTestKey returns a fresh ECDSA P-256 key pair and its public JWK for test use.
 func newTestKey(t *testing.T) (*ecdsa.PrivateKey, jose.JSONWebKey) {
 	t.Helper()
@@ -490,7 +505,7 @@ func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r := newTestResolver(t)
+	r := newTestResolverWithFallback(t)
 	res, err := r.ResolveWithInfo(context.Background(), server.URL)
 	if err != nil {
 		t.Fatalf("expected unsigned fallback to succeed, got error: %v", err)
@@ -514,7 +529,7 @@ func TestResolve_SignedNotAcceptable_BothFail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r := newTestResolver(t)
+	r := newTestResolverWithFallback(t)
 	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
 		t.Error("expected error when both signed and unsigned requests return 406")
 	}
@@ -532,7 +547,8 @@ func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r, err := New(Config{AllowHTTP: true, PreferSigned: &pref})
+	fallback := true
+	r, err := New(Config{AllowHTTP: true, PreferSigned: &pref, FallbackOn406: &fallback})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -557,12 +573,31 @@ func TestResolve_NotFound_NoUnsignedRetry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r := newTestResolver(t)
+	r := newTestResolverWithFallback(t)
 	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
 		t.Error("expected error for 404")
 	}
 	if attempts != 1 {
 		t.Errorf("404 must not trigger an unsigned retry; got %d requests", attempts)
+	}
+}
+
+// TestResolve_FallbackDisabled_NoRetryOn406 verifies the default: with the 406
+// fallback gate off, a 406 is terminal and no alternate request is made.
+func TestResolve_FallbackDisabled_NoRetryOn406(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 406")
+	}
+	if attempts != 1 {
+		t.Errorf("fallback disabled must not retry; got %d requests", attempts)
 	}
 }
 

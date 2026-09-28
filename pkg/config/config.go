@@ -232,6 +232,14 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+
+	// MetadataFallbackOn406 enables a workaround for non-compliant OpenID4VCI
+	// issuers that reject the issuer-metadata resolver's preferred Accept with
+	// HTTP 406 instead of serving an acceptable representation: the resolver
+	// retries once with the alternate media type (JSON<->JWT). Default: false
+	// (a 406 is terminal, per strict content negotiation).
+	// Env: WALLET_HTTP_CLIENT_METADATA_FALLBACK_ON_406
+	MetadataFallbackOn406 bool `yaml:"metadata_fallback_on_406" envconfig:"METADATA_FALLBACK_ON_406"`
 }
 
 // NewHTTPClient creates an *http.Client from the configuration, applying proxy,

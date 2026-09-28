@@ -92,6 +92,12 @@ type Config struct {
 	// PreferSigned controls whether the resolver sends Accept headers
 	// preferring signed (application/jwt) responses. Default: true.
 	PreferSigned *bool
+
+	// FallbackOn406 enables a workaround for non-compliant issuers that reject
+	// the preferred Accept with HTTP 406 instead of serving an acceptable
+	// representation: the resolver retries once with the alternate media type.
+	// Default: false (a 406 is terminal).
+	FallbackOn406 *bool
 }
 
 type cachedEntry struct {
@@ -273,6 +279,15 @@ func (r *Resolver) preferSigned() bool {
 	return true
 }
 
+// fallbackOn406 reports whether a 406 on the preferred Accept should trigger a
+// retry with the alternate media type.
+func (r *Resolver) fallbackOn406() bool {
+	if r.cfg.FallbackOn406 != nil {
+		return *r.cfg.FallbackOn406
+	}
+	return false
+}
+
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
 	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
 	// metadata, some issuers reject the application/jwt Accept with 406 instead
@@ -280,6 +295,11 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	accepts := []string{"application/json", "application/jwt"}
 	if r.preferSigned() {
 		accepts = []string{"application/jwt", "application/json"}
+	}
+	// Without the 406 fallback gate, only the preferred representation is
+	// requested and any non-200 status is terminal.
+	if !r.fallbackOn406() {
+		accepts = accepts[:1]
 	}
 
 	var lastStatus int
