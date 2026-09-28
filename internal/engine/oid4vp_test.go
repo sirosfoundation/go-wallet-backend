@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -2117,14 +2118,26 @@ func TestVerifyDIDRequest_AcceptsPrefixedClientID(t *testing.T) {
 // verifier signs and is trusted under.
 
 // stubDIDResolver is a trust.TrustEvaluator that also resolves DIDs, standing
-// in for the AuthZEN PDP. It records every subject it is asked to resolve.
+// in for the AuthZEN PDP. It records every subject it is asked to resolve or
+// evaluate, and lets a test control the evaluate decision.
 type stubDIDResolver struct {
-	didDoc   map[string]interface{}
-	resolved []string
+	didDoc     map[string]interface{}
+	resolved   []string
+	evaluated  []string
+	decision   bool
+	evalErr    error
+	decisionOk bool // if false, decision defaults to true (zero-value-safe for existing callers)
 }
 
-func (s *stubDIDResolver) Evaluate(_ context.Context, _ *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
-	return &trust.EvaluationResponse{Decision: true}, nil
+func (s *stubDIDResolver) Evaluate(_ context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
+	s.evaluated = append(s.evaluated, req.SubjectID)
+	if s.evalErr != nil {
+		return nil, s.evalErr
+	}
+	if !s.decisionOk {
+		return &trust.EvaluationResponse{Decision: true}, nil
+	}
+	return &trust.EvaluationResponse{Decision: s.decision}, nil
 }
 
 func (s *stubDIDResolver) Resolve(_ context.Context, subjectID string) (*trust.EvaluationResponse, error) {
@@ -2197,6 +2210,12 @@ func trustEvaluationSubject(t *testing.T, messages <-chan []byte) string {
 	}
 }
 
+// TestEvaluateVerifierTrust_DecentralizedIdentifier drives the active DID
+// trust path end to end with a PDP configured: cfg.Trust.PDPURL makes
+// GetVerifierPDPURL() non-empty, so evaluateVerifierTrust must go straight to
+// h.TrustSvc.EvaluateVerifier (the PDP-first path) rather than asking the
+// frontend - the frontend fallback is reserved for the no-PDP case (see
+// TestEvaluateVerifierTrust_DecentralizedIdentifier_NoPDPFallsBackToFrontend).
 func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 	const (
 		did      = "did:web:verifier.example"
@@ -2207,35 +2226,36 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
-	stub := &stubDIDResolver{didDoc: map[string]interface{}{
-		"id": did,
-		"verificationMethod": []interface{}{
-			map[string]interface{}{
-				"id":           kid,
-				"type":         "JsonWebKey2020",
-				"controller":   did,
-				"publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{
+				map[string]interface{}{
+					"id":           kid,
+					"type":         "JsonWebKey2020",
+					"controller":   did,
+					"publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+				},
 			},
 		},
-	}}
+		decisionOk: true,
+		decision:   true,
+	}
 
 	cfg := testConfig()
 	cfg.Trust.PDPURL = "http://pdp.test"
 	trustSvc := trust.NewService(cfg, zap.NewNop(),
 		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
 
-	// The frontend side of the websocket: collect what the handler sends so the
-	// trust evaluation request can be inspected.
-	messages := make(chan []byte, 16)
+	// The websocket peer only drains progress messages and never answers a
+	// trust_result action: if evaluateVerifierTrust mistakenly fell back to
+	// the frontend here, WaitForActionWithTimeout would have nothing to
+	// read and the test would hang/time out, failing loudly rather than
+	// silently passing via the old fallback path.
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		for {
-			_, data, err := srvConn.ReadMessage()
-			if err != nil {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
 				return
-			}
-			select {
-			case messages <- data:
-			default:
 			}
 		}
 	})
@@ -2243,15 +2263,6 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 
 	session := testSession(conn)
 	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
-
-	// The frontend's verdict, queued up front: the handler blocks on it.
-	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did"})
-	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
-		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
-		Action:  ActionTrustResult,
-		Payload: result,
-	}
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow:     flow,
@@ -2276,8 +2287,67 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 	assert.Equal(t, []string{did}, stub.resolved)
 	// The domain shown to the user is the DID's either way.
 	assert.Equal(t, "verifier.example", verifier.Domain)
-	// Trust evaluation sees the client_id exactly as the verifier sent it.
-	assert.Equal(t, clientID, trustEvaluationSubject(t, messages))
+	// Trust evaluation (the PDP call) sees the client_id exactly as the
+	// verifier sent it.
+	assert.Equal(t, []string{clientID}, stub.evaluated)
+}
+
+// TestEvaluateVerifierTrust_DecentralizedIdentifier_NoPDPFallsBackToFrontend
+// is the regression guard for the intentional no-PDP dev-mode path: with no
+// verifier PDP configured at all, evaluateVerifierTrust must still fall back
+// to asking the frontend/client, exactly as before this change. DID
+// resolution itself still requires *some* PDP endpoint (ResolveDID always
+// goes through GetVerifierPDPURL()), so this test uses x509_san_dns instead,
+// whose signature verification is entirely local.
+func TestEvaluateVerifierTrust_NoPDPConfigured_FallsBackToFrontend(t *testing.T) {
+	requestJWT, _ := makeSignedJWTWithX5C(t) // DNSNames: verifier.example.com
+
+	cfg := testConfig() // no Trust.PDPURL / Verifier.PDPURL set at all
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eidas"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: result,
+	}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: cfg,
+		Logger: zap.NewNop(),
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     requestJWT,
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted)
+	assert.Equal(t, "verifier.example.com", trustEvaluationSubject(t, messages))
 }
 
 func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *testing.T) {
@@ -2316,6 +2386,238 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *t
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "client_id is not a DID")
+}
+
+// --- M-3 (#375): PDP-first verifier trust, fail-closed, cache correctness ---
+
+// A PDP call error must fail closed (untrusted) and must NEVER fall back to
+// asking the client - the whole point of configuring a verifier PDP is that
+// its unavailability isn't a trust bypass. This mirrors the corrected shape
+// of OID4VCIHandler.evaluateTrust for issuers (#377).
+func TestEvaluateVerifierTrust_PDPError_FailsClosed_NoFrontendFallback(t *testing.T) {
+	requestJWT, _ := makeSignedJWTWithX5C(t) // client_id "verifier.example.com"
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	// The evaluator factory itself fails (e.g. a malformed/unreachable PDP
+	// endpoint) - this is EvaluateVerifier's true Go-error path, as opposed
+	// to a request the PDP itself answers but denies (which already comes
+	// back as Trusted:false, not an error, and was always handled).
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) {
+			return nil, fmt.Errorf("pdp unreachable")
+		})
+
+	// The websocket peer only drains: it never answers a trust_result
+	// action. If evaluateVerifierTrust wrongly fell back to the frontend
+	// after the PDP error, WaitForActionWithTimeout would block on this and
+	// the test would time out instead of returning promptly with an error.
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     requestJWT,
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.Error(t, err)
+	assert.Nil(t, verifier)
+	assert.Contains(t, err.Error(), "untrusted verifier")
+	assert.Contains(t, err.Error(), "trust evaluation error")
+}
+
+// A client-asserted verdict (the no-PDP frontend fallback) must never be
+// written to the trust cache: caching it would let one attacker-controlled
+// answer, plus attacker-controlled name/logo, stand in as ground truth for
+// every subsequent request against this identity for the whole cache TTL.
+func TestEvaluateVerifierTrust_ClientAssertedVerdict_NeverCached(t *testing.T) {
+	requestJWT, _ := makeSignedJWTWithX5C(t)
+
+	cfg := testConfig() // no PDP configured at all
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: "Attacker-Controlled Name"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: result,
+	}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustCache: trustCache,
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     requestJWT,
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted)
+	assert.Equal(t, "Attacker-Controlled Name", verifier.Name)
+	assert.Zero(t, trustCache.Len(), "a client-asserted (non-PDP-backed) verdict must never be cached")
+}
+
+// The trust cache must never let a request skip signature verification: a
+// cache lookup only ever happens with the identity that scheme-bound
+// signature verification produces, so an invalid/unverifiable signature
+// fails before the cache is even consulted - regardless of what a
+// previously-cached (and here, deliberately seeded) entry says.
+func TestEvaluateVerifierTrust_CacheNeverBypassesSignatureVerification(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test" // configured, but must never be reached
+	stub := &stubDIDResolver{}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+
+	trustCache := NewTrustCache(time.Hour)
+	// Seed a trusted verdict under the exact identity key the attacker will
+	// claim, as if a legitimate prior request had earned it.
+	trustCache.Set(domain.DefaultTenantID, "x509_san_dns:verifier.example.com", &TrustCacheRecord{
+		Trusted:     true,
+		TrustStatus: domain.TrustStatusTrusted,
+		Name:        "Legit Verifier",
+	})
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     "not-a.valid-signed.jwt", // fails signature verification
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.Error(t, err)
+	assert.Nil(t, verifier)
+	assert.Contains(t, err.Error(), "JWT verification failed")
+	// The PDP (and therefore any cache read tied to a verified identity)
+	// must never have been reached for this unverifiable request.
+	assert.Empty(t, stub.evaluated)
+}
+
+// A cached verdict must be scoped to the authenticated identity that earned
+// it, not to whatever URL/canonical delivery target a request happens to
+// share with a previous one. Two different, independently-authenticated
+// verifiers sharing the same response_uri must each get their own trust
+// decision - one may never answer for the other.
+func TestEvaluateVerifierTrust_CacheDoesNotLeakAcrossDifferentClaimedVerifier(t *testing.T) {
+	const (
+		sharedResponseURI = "https://shared.example/response"
+		did               = "did:web:verifier-b.example"
+		clientIDB         = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kid               = did + "#jwk-1"
+	)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{
+				map[string]interface{}{
+					"id":           kid,
+					"type":         "JsonWebKey2020",
+					"controller":   did,
+					"publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+				},
+			},
+		},
+		decisionOk: true,
+		decision:   true,
+	}
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	// Seed the cache for a completely different, x509_san_dns-identified
+	// verifier that happens to share the same response_uri, with an
+	// attacker-distinguishable name so a leak is obvious if it occurs.
+	trustCache.Set(domain.TenantID(session.TenantID), "x509_san_dns:verifier-a.example.com", &TrustCacheRecord{
+		Trusted:     true,
+		TrustStatus: domain.TrustStatusTrusted,
+		Name:        "Verifier A (should never be returned for B)",
+	})
+
+	authReqB := &AuthorizationRequest{
+		ClientID:       clientIDB,
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce:          "n",
+		ResponseURI:    sharedResponseURI,
+		RequestJWT:     buildKidSignedJWT(t, key, kid),
+	}
+
+	verifierB, err := h.evaluateVerifierTrust(context.Background(), authReqB)
+	require.NoError(t, err)
+	require.NotNil(t, verifierB)
+	// B was independently resolved and evaluated - A's cache entry did not
+	// short-circuit B's lookup merely because they share a response_uri.
+	assert.Equal(t, []string{did}, stub.resolved)
+	assert.Equal(t, []string{clientIDB}, stub.evaluated)
+	assert.NotEqual(t, "Verifier A (should never be returned for B)", verifierB.Name)
 }
 
 // --- no-matching-credential fast fail ---

@@ -501,30 +501,6 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *AuthorizationRequest) (*VerifierInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingVerifierTrust, "Evaluating verifier trust")
 
-	// Check in-memory trust cache before triggering frontend evaluation
-	canonicalURL := getCanonicalVerifierURL(authReq)
-	if cached := h.getCachedVerifierTrust(canonicalURL); cached != nil {
-		verifier := &VerifierInfo{
-			Name:           cached.Name,
-			ClientIDScheme: cached.ClientIDScheme,
-			Trusted:        cached.Trusted,
-			Framework:      cached.TrustFramework,
-			TrustedStatus:  string(cached.TrustStatus),
-			Domain:         extractDomain(authReq.ClientID),
-		}
-		// Look up admin-configured ClientID (read-only)
-		if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
-			verifier.ClientID = clientID
-		}
-		if !verifier.Trusted {
-			return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
-		}
-		h.Logger.Debug("Using cached trust result",
-			zap.String("verifier", authReq.ClientID),
-			zap.Bool("trusted", cached.Trusted))
-		return verifier, nil
-	}
-
 	// Fetch client metadata if needed
 	var clientMeta *ClientMetadata
 	if authReq.ClientMetadata != nil {
@@ -557,11 +533,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
-	// Scheme-aware key material extraction and JWT verification
+	// Scheme-aware key material extraction and JWT verification. This MUST
+	// run before any cache lookup below (see the cache check further down):
+	// a cache hit must never let a request bypass signature verification for
+	// did:/x509_*/verifier_attestation schemes, and verifiedIdentity - the
+	// authenticated identity the cache is keyed by - only exists once this
+	// has run.
 	var keyMaterial *KeyMaterial
 	var requiresResolution bool
 	var requestJWT string
 	var attestationContext map[string]interface{}
+	var verifiedIdentity string
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
@@ -609,6 +591,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			Type: "jwk",
 			JWK:  matchedJWK,
 		}
+		// Cache identity is the resolved, JWT-verified DID itself, not the
+		// bare client_id string - so a cache entry can only ever answer for
+		// requests that verify against the same DID's keys.
+		verifiedIdentity = "did:" + did
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
@@ -624,6 +610,11 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		// The request JWT's signature has been verified against the embedded
+		// x5c, so the claimed client_id is at least bound to a key the
+		// request itself proves possession of; scope the cache key to this
+		// scheme + client_id pairing.
+		verifiedIdentity = "x509_san_dns:" + authReq.ClientID
 
 	case ClientIDSchemeX509Hash:
 		// X.509 hash scheme: client_id is the leaf cert's own digest rather
@@ -643,6 +634,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		// client_id IS the certificate's own hash under this scheme, and the
+		// request JWT's signature has been verified against that same x5c.
+		verifiedIdentity = "x509_hash:" + authReq.ClientID
 
 	case ClientIDSchemeVerifierAttestation:
 		// Verifier attestation scheme (OID4VP §5.9.3.4 / §12):
@@ -693,6 +687,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			"attestation_subject": attestation.Subject,
 			"attestation_jwt":     attestation.RawJWT,
 		}
+		// The request JWT's signature has been verified above against the
+		// cnf key bound to the attestation's sub, so the cache identity is
+		// the attested subject, not the bare claimed client_id/URL.
+		verifiedIdentity = "verifier_attestation:" + attestation.Subject
 
 	default:
 		// redirect_uri and other schemes: extract key material best-effort
@@ -713,6 +711,157 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 	}
 
+	canonicalURL := getCanonicalVerifierURL(authReq)
+
+	// cacheKey identifies this verifier for the trust cache. Prefer the
+	// identity signature verification just bound above (a DID that verified,
+	// a client_id whose request JWT verified against x5c, an attested
+	// subject) - falling back to the canonical URL only for schemes where no
+	// scheme-bound signature verification exists at all (e.g. redirect_uri).
+	cacheKey := verifiedIdentity
+	if cacheKey == "" {
+		cacheKey = canonicalURL
+	}
+
+	// Check the in-memory trust cache. This runs after signature
+	// verification above, and only ever hits on a PDP-backed verdict: a
+	// client-asserted verdict (the no-PDP fallback path below) is never
+	// written to the cache in the first place - see
+	// evaluateVerifierTrustViaFrontend and cacheVerifierTrust.
+	if cached := h.getCachedVerifierTrust(cacheKey); cached != nil {
+		verifier.Trusted = cached.Trusted
+		verifier.Framework = cached.TrustFramework
+		verifier.TrustedStatus = string(cached.TrustStatus)
+		if cached.Name != "" {
+			verifier.Name = cached.Name
+		}
+		if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+			verifier.ClientID = clientID
+		}
+		if !verifier.Trusted {
+			return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
+		}
+		h.Logger.Debug("Using cached verifier trust result",
+			zap.String("verifier", authReq.ClientID),
+			zap.Bool("trusted", cached.Trusted))
+		return verifier, nil
+	}
+
+	// Try server-side direct evaluation first (preferred path). The backend
+	// calls the go-trust PDP directly - no frontend round-trip needed. This
+	// only activates when a verifier PDP is configured. Mirrors
+	// OID4VCIHandler.evaluateTrust's issuer-side pattern (see oid4vci.go): if
+	// the PDP call errors, that fails closed (untrusted) rather than
+	// falling back to asking the client.
+	if trustEndpoint := h.Config.Trust.GetVerifierPDPURL(); trustEndpoint != "" {
+		return h.evaluateVerifierTrustViaPDP(ctx, authReq, verifier, keyMaterial, trustEndpoint, cacheKey, canonicalURL)
+	}
+
+	// Fallback: frontend-mediated trust evaluation (legacy path). Used only
+	// when no verifier PDP is configured at all - the intentional,
+	// permissive dev/no-PDP mode. Its verdict is never cached.
+	return h.evaluateVerifierTrustViaFrontend(ctx, authReq, verifier, keyMaterial, attestationContext, requiresResolution, requestJWT, canonicalURL)
+}
+
+// evaluateVerifierTrustViaPDP evaluates verifier trust by calling the
+// go-trust PDP directly via h.TrustSvc.EvaluateVerifier. This is the
+// preferred path when a verifier PDP is configured (h.Config.Trust.
+// GetVerifierPDPURL() is non-empty).
+//
+// If the PDP call itself errors, this fails closed and returns an untrusted
+// error - it must NEVER fall back to evaluateVerifierTrustViaFrontend, since
+// that would let a network blip (or an attacker able to disrupt the PDP)
+// downgrade a PDP-backed decision into a client-asserted one. This mirrors
+// the corrected shape of OID4VCIHandler.evaluateTrust for issuers.
+//
+// Only a result produced by this function is ever written to the trust
+// cache (via cacheVerifierTrust) - a client-asserted verdict from
+// evaluateVerifierTrustViaFrontend never is.
+func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, keyMaterial *KeyMaterial, trustEndpoint, cacheKey, canonicalURL string) (*VerifierInfo, error) {
+	evalCtx := ctx
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		evalCtx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
+	}
+
+	var tkm *trust.KeyMaterial
+	if keyMaterial != nil {
+		tkm = &trust.KeyMaterial{
+			Type: keyMaterial.Type,
+			X5C:  keyMaterial.X5C,
+			JWK:  keyMaterial.JWK,
+		}
+	}
+
+	directResult, err := h.TrustSvc.EvaluateVerifier(evalCtx, authReq.ClientID, trustEndpoint, tkm)
+	if err != nil {
+		// Fail closed: a PDP error is never equivalent to "no PDP
+		// configured" and must never fall back to asking the client.
+		h.Logger.Warn("Server-side verifier trust evaluation failed; failing closed (untrusted)",
+			zap.String("verifier", authReq.ClientID),
+			zap.Error(err))
+		return nil, fmt.Errorf("untrusted verifier %s: trust evaluation error: %w", authReq.ClientID, err)
+	}
+
+	verifier.Trusted = directResult.Trusted
+	verifier.Framework = directResult.Framework
+	verifier.Reason = directResult.Reason
+	if directResult.Trusted {
+		verifier.TrustedStatus = string(domain.TrustStatusTrusted)
+	} else {
+		verifier.TrustedStatus = string(domain.TrustStatusUntrusted)
+	}
+
+	h.Logger.Info("Server-side verifier trust evaluation",
+		zap.String("verifier", authReq.ClientID),
+		zap.Bool("trusted", verifier.Trusted),
+		zap.String("framework", verifier.Framework))
+
+	// Send result to frontend/SDK as informational progress
+	_ = h.Progress(StepTrustEvaluated, map[string]interface{}{
+		"verifier_trust_evaluated": true,
+		"verifier":                 authReq.ClientID,
+		"trusted":                  verifier.Trusted,
+		"framework":                verifier.Framework,
+		"reason":                   verifier.Reason,
+	})
+
+	// Cache the PDP-backed verdict. This is the only call site that ever
+	// populates the trust cache.
+	h.cacheVerifierTrust(cacheKey, verifier)
+
+	// Look up admin-configured ClientID for VP audience (read-only)
+	if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+		verifier.ClientID = clientID
+	}
+
+	if !verifier.Trusted {
+		reason := verifier.Reason
+		if reason == "" {
+			reason = "verifier not trusted"
+		}
+		h.Logger.Warn("Blocking untrusted verifier",
+			zap.String("verifier", authReq.ClientID),
+			zap.String("reason", reason))
+		return nil, fmt.Errorf("untrusted verifier %s: %s", authReq.ClientID, reason)
+	}
+
+	return verifier, nil
+}
+
+// evaluateVerifierTrustViaFrontend delegates trust evaluation to the
+// frontend/SDK. This is the legacy path: used only when no verifier PDP is
+// configured at all (h.Config.Trust.GetVerifierPDPURL() is empty) - the
+// intentional, permissive dev/no-PDP mode. The engine sends a
+// trust_evaluation_required progress, the frontend calls /v1/evaluate, and
+// sends back a trust_result action.
+//
+// The resulting verdict is client-asserted, not independently checked by a
+// PDP, so - unlike evaluateVerifierTrustViaPDP - it is deliberately never
+// written to the trust cache. Caching it would let a single
+// attacker-controlled answer (plus attacker-controlled name/logo from
+// client_metadata) stand in as ground truth for every subsequent request
+// against this identity for the whole cache TTL.
+func (h *OID4VPHandler) evaluateVerifierTrustViaFrontend(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, keyMaterial *KeyMaterial, attestationContext map[string]interface{}, requiresResolution bool, requestJWT string, canonicalURL string) (*VerifierInfo, error) {
 	// Build trust evaluation request for frontend
 	trustReq := &TrustEvaluationRequest{
 		SubjectID:          authReq.ClientID,
@@ -810,8 +959,8 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		verifier.Logo = &LogoInfo{URI: trustResult.Logo}
 	}
 
-	// Cache trust evaluation result in memory (does not write to VerifierStore)
-	h.cacheVerifierTrust(authReq, verifier)
+	// Deliberately NOT cached - see the function-level comment: this is a
+	// client-asserted verdict, not one a PDP has independently checked.
 
 	// Look up admin-configured ClientID for VP audience (read-only)
 	if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
@@ -876,9 +1025,12 @@ func getCanonicalVerifierURL(authReq *AuthorizationRequest) string {
 	return authReq.ClientID
 }
 
-// getCachedVerifierTrust checks if a cached trust evaluation exists for the given verifier URL.
+// getCachedVerifierTrust looks up a cached verdict by cacheKey - the
+// authenticated identity computed in evaluateVerifierTrust (see
+// verifiedIdentity there), not a bare client-supplied URL. Only entries
+// written by cacheVerifierTrust (always PDP-backed) are ever found here.
 // Returns nil if no cache is available or the entry has expired.
-func (h *OID4VPHandler) getCachedVerifierTrust(verifierURL string) *TrustCacheRecord {
+func (h *OID4VPHandler) getCachedVerifierTrust(cacheKey string) *TrustCacheRecord {
 	if h.TrustCache == nil {
 		return nil
 	}
@@ -888,7 +1040,7 @@ func (h *OID4VPHandler) getCachedVerifierTrust(verifierURL string) *TrustCacheRe
 		tenantID = domain.TenantID(h.Flow.Session.TenantID)
 	}
 
-	return h.TrustCache.Get(tenantID, verifierURL)
+	return h.TrustCache.Get(tenantID, cacheKey)
 }
 
 // getAdminClientID looks up the admin-configured ClientID for a verifier URL.
@@ -910,9 +1062,20 @@ func (h *OID4VPHandler) getAdminClientID(ctx context.Context, verifierURL string
 	return stored.ClientID
 }
 
-// cacheVerifierTrust stores verifier trust evaluation results in the in-memory cache.
-// This avoids writing to VerifierStore, which would pollute the admin registry.
-func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifier *VerifierInfo) {
+// cacheVerifierTrust stores a verifier trust evaluation result in the
+// in-memory cache, keyed by cacheKey (the authenticated identity computed in
+// evaluateVerifierTrust - see verifiedIdentity there - falling back to the
+// canonical verifier URL only for schemes with no scheme-bound signature
+// verification). This avoids writing to VerifierStore, which would pollute
+// the admin registry.
+//
+// This must ONLY ever be called with a PDP-backed result
+// (evaluateVerifierTrustViaPDP is the sole call site). A client-asserted
+// verdict from evaluateVerifierTrustViaFrontend must never reach this
+// function: caching it would let a single attacker-controlled answer stand
+// in as ground truth for every subsequent request against this identity for
+// the whole cache TTL, without ever consulting the PDP again.
+func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierInfo) {
 	if h.TrustCache == nil {
 		return
 	}
@@ -929,10 +1092,10 @@ func (h *OID4VPHandler) cacheVerifierTrust(authReq *AuthorizationRequest, verifi
 		trustStatus = domain.TrustStatusUntrusted
 	}
 
-	h.TrustCache.Set(tenantID, getCanonicalVerifierURL(authReq), &TrustCacheRecord{
+	h.TrustCache.Set(tenantID, cacheKey, &TrustCacheRecord{
 		Name:           verifier.Name,
-		URL:            getCanonicalVerifierURL(authReq),
-		ClientIDScheme: authReq.ClientIDScheme,
+		URL:            cacheKey,
+		ClientIDScheme: verifier.ClientIDScheme,
 		TrustStatus:    trustStatus,
 		TrustFramework: verifier.Framework,
 		Trusted:        verifier.Trusted,
