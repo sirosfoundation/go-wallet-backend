@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func TestGenerateCodeVerifier(t *testing.T) {
@@ -3604,4 +3605,164 @@ func TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, offer)
 	assert.Equal(t, []string{"eucc"}, offer.CredentialConfigurationIDs)
+}
+
+// --- evaluateTrust: PDP-configured vs. no-PDP-configured semantics (M-5, #377) ---
+//
+// Exact intended semantics:
+//   - No issuer PDP URL configured at all -> falling back to client-asserted
+//     (frontend) trust evaluation is INTENTIONAL (permissive dev/no-PDP mode).
+//   - A PDP URL IS configured, and the call to it errors (rather than
+//     returning a valid trusted/untrusted verdict) -> MUST fail closed
+//     (untrusted / block issuance), and must NEVER fall back to asking the
+//     frontend/WS client in that case.
+
+// TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed verifies that
+// when an issuer PDP URL is configured and TrustSvc.EvaluateIssuer returns an
+// error (e.g. evaluator construction failure), evaluateTrust fails closed:
+// the issuer is treated as untrusted and the frontend is never asked (no
+// trust_evaluation_required progress message is sent, and no
+// evaluateTrustViaFrontend WaitForActionWithTimeout round-trip occurs).
+func TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "https://pdp.example.com"
+
+	evaluatorErr := errors.New("evaluator construction failed")
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) {
+			return nil, evaluatorErr
+		})
+
+	// Capture every message the handler sends to the "frontend" so we can
+	// assert trust_evaluation_required was never sent.
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Deliberately do NOT queue any trust_result action on session.actionCh:
+	// if the fix regresses and the code falls through to
+	// evaluateTrustViaFrontend, WaitForActionWithTimeout must block until the
+	// bounded context below expires rather than ever getting an answer.
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:     flow,
+		Config:   cfg,
+		Logger:   zap.NewNop(),
+		TrustSvc: trustSvc,
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(ctx, "https://issuer.example.com", metadata, false)
+
+	require.Error(t, err)
+	require.NotNil(t, info)
+	assert.False(t, info.Trusted, "issuer must be treated as untrusted on PDP evaluation error")
+	assert.Contains(t, err.Error(), "trust evaluation error")
+	assert.Contains(t, err.Error(), "issuer.example.com")
+
+	// Drain and inspect whatever the handler sent - it must never have asked
+	// the frontend to evaluate trust. Bounded wait (rather than closing the
+	// channel) since the server-side reader goroutine may still be in flight.
+	drainDeadline := time.After(500 * time.Millisecond)
+drain:
+	for {
+		select {
+		case data := <-messages:
+			assert.NotContains(t, string(data), "trust_evaluation_required",
+				"must never fall back to frontend-mediated trust evaluation on a PDP error")
+		case <-drainDeadline:
+			break drain
+		}
+	}
+}
+
+// TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged is a regression
+// guard: when NO issuer PDP URL is configured at all, evaluateTrust must
+// still fall back to the client-asserted (frontend) trust evaluation path
+// exactly as before this fix - that permissive dev/no-PDP mode is
+// intentional and must not be touched by the fail-closed change above.
+func TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged(t *testing.T) {
+	cfg := testConfig()
+	// cfg.Trust.PDPURL left empty: no PDP configured at all.
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Queue the frontend's verdict up front: evaluateTrustViaFrontend blocks on it.
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eudi"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: cfg,
+		Logger: zap.NewNop(),
+		// TrustSvc intentionally nil: with no PDP configured, evaluateTrust
+		// must never dereference it.
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(context.Background(), "https://issuer.example.com", metadata, false)
+
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+	assert.Equal(t, "eudi", info.Framework)
+
+	// Confirm the frontend really was asked (proving this test exercises the
+	// path it claims to, not a leftover default). evaluateTrust already
+	// returned above, so the message was sent before this point; still allow
+	// a short bounded wait for the reader goroutine to have forwarded it.
+	deadline := time.After(2 * time.Second)
+	sawTrustRequired := false
+wait:
+	for {
+		select {
+		case data := <-messages:
+			if strings.Contains(string(data), "trust_evaluation_required") {
+				sawTrustRequired = true
+				break wait
+			}
+		case <-deadline:
+			break wait
+		}
+	}
+	assert.True(t, sawTrustRequired, "no-PDP mode must still ask the frontend to evaluate trust")
 }

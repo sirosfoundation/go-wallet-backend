@@ -1331,8 +1331,19 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		}
 		directResult, err := h.TrustSvc.EvaluateIssuer(evalCtx, issuer, trustEndpoint, keyMaterial)
 		if err != nil {
-			h.Logger.Warn("Server-side issuer trust evaluation failed, falling back to frontend",
+			// A PDP is configured but the evaluation call itself errored (e.g.
+			// evaluator construction failure). This must fail closed: never
+			// fall back to client-asserted (frontend) trust evaluation when a
+			// PDP was supposed to be authoritative.
+			h.Logger.Error("Server-side issuer trust evaluation errored, failing closed",
+				zap.String("issuer", issuer),
 				zap.Error(err))
+			info := &TrustInfo{
+				Trusted:   false,
+				Framework: "none",
+				Reason:    "issuer trust evaluation error",
+			}
+			return info, fmt.Errorf("untrusted issuer %s: trust evaluation error: %w", issuer, err)
 		} else if directResult != nil {
 			info := &TrustInfo{
 				Trusted:      directResult.Trusted,
@@ -1371,7 +1382,9 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	}
 
 	// Fallback: frontend-mediated trust evaluation (legacy path).
-	// Used when no issuer PDP is configured or server-side evaluation failed.
+	// Only reached when NO issuer PDP URL is configured at all (permissive
+	// dev/no-PDP mode). A configured PDP that errors returns above and never
+	// falls through to here - see the fail-closed branch above.
 	return h.evaluateTrustViaFrontend(ctx, issuer, metadata, metadataValidated, keyMaterial)
 }
 
