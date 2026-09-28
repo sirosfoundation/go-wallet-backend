@@ -53,11 +53,21 @@ func signOIDCState(secret []byte, state string) string {
 // MUST be sent back on the cross-site top-level GET redirect the IdP issues
 // to our callback endpoint - a Strict cookie is withheld on that navigation
 // and the flow would always fail.
+//
+// Path is "/", not scoped to "/auth/oidc/callback": the "__Host-" name
+// prefix (production/secure mode) requires Path=/ - browsers silently
+// refuse to store a "__Host-" cookie with any other path, which would make
+// every real OIDC callback fail with "state cookie mismatch" (the cookie
+// this code expects to read back would never have been set in the first
+// place). A narrower path doesn't buy meaningful isolation here anyway:
+// the cookie is HttpOnly (never readable by page script) and its value is
+// HMAC-signed, so carrying it on other requests discloses nothing and
+// authorizes nothing on its own.
 func oidcStateCookie(value string, maxAge int, insecure bool) *http.Cookie {
 	ck := &http.Cookie{
 		Name:     oidcStateCookieName(insecure),
 		Value:    value,
-		Path:     "/auth/oidc/callback",
+		Path:     "/",
 		MaxAge:   maxAge,
 		Secure:   true,
 		HttpOnly: true,

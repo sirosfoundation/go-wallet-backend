@@ -197,9 +197,6 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig, all
 
 	// Apply registration OP
 	if req.RegistrationOP != nil {
-		if err := validateOIDCIssuerScheme(req.RegistrationOP.Issuer, allowHTTP); err != nil {
-			return fmt.Errorf("registration_op: %w", err)
-		}
 		gate.RegistrationOP = &domain.OIDCProviderConfig{
 			DisplayName: req.RegistrationOP.DisplayName,
 			Issuer:      req.RegistrationOP.Issuer,
@@ -212,9 +209,6 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig, all
 
 	// Apply login OP (separate from registration if provided)
 	if req.LoginOP != nil {
-		if err := validateOIDCIssuerScheme(req.LoginOP.Issuer, allowHTTP); err != nil {
-			return fmt.Errorf("login_op: %w", err)
-		}
 		gate.LoginOP = &domain.OIDCProviderConfig{
 			DisplayName: req.LoginOP.DisplayName,
 			Issuer:      req.LoginOP.Issuer,
@@ -222,6 +216,24 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig, all
 			JWKSURI:     req.LoginOP.JWKSURI,
 			Audience:    req.LoginOP.Audience,
 			Scopes:      req.LoginOP.Scopes,
+		}
+	}
+
+	// Validate every *effective* provider left on the gate after applying
+	// this request - not just ones the request itself supplied. Without
+	// this, a request that resupplies only RegistrationOP (or neither)
+	// would leave an already-stored LoginOP unvalidated, so a later update
+	// that only changes e.g. `mode` or `trust_admin_claim` could never be
+	// used to catch/reject a pre-existing http:// issuer that predates this
+	// check. See go-wallet-backend#373.
+	if gate.RegistrationOP != nil {
+		if err := validateOIDCIssuerScheme(gate.RegistrationOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("registration_op: %w", err)
+		}
+	}
+	if gate.LoginOP != nil {
+		if err := validateOIDCIssuerScheme(gate.LoginOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("login_op: %w", err)
 		}
 	}
 

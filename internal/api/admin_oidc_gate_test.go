@@ -340,6 +340,42 @@ func TestApplyOIDCGateRequest_RejectsHTTPIssuer(t *testing.T) {
 	}
 }
 
+// TestApplyOIDCGateRequest_RevalidatesUntouchedStoredProvider covers a
+// Copilot review finding on this PR: a request that doesn't resupply
+// login_op/registration_op (e.g. one that only changes `mode` or
+// `trust_admin_claim`) must still reject an already-stored http:// issuer
+// left over from before the HTTPS-only check existed - otherwise that
+// issuer could never be caught by any later update that doesn't happen to
+// touch the provider fields. See go-wallet-backend#373.
+func TestApplyOIDCGateRequest_RevalidatesUntouchedStoredProvider(t *testing.T) {
+	// Simulate a tenant with a pre-existing http:// LoginOP, as if it were
+	// written before this validation existed (or via allow_http).
+	gate := &domain.OIDCGateConfig{
+		Mode: domain.OIDCGateModeLogin,
+		LoginOP: &domain.OIDCProviderConfig{
+			Issuer:   "http://legacy-idp.example.com",
+			ClientID: "legacy-client",
+		},
+	}
+
+	// A request that only flips trust_admin_claim, without resupplying
+	// login_op at all.
+	trustTrue := true
+	req := &OIDCGateRequest{
+		Mode:            "login",
+		TrustAdminClaim: &trustTrue,
+	}
+
+	if err := applyOIDCGateRequest(req, gate, false); err == nil {
+		t.Fatal("expected the untouched stored http:// login_op to be rejected")
+	}
+
+	// With allow_http, the same request must succeed.
+	if err := applyOIDCGateRequest(req, gate, true); err != nil {
+		t.Errorf("expected success with allowHTTP=true, got: %v", err)
+	}
+}
+
 // TestApplyOIDCGateRequest_TrustAdminClaim covers go-wallet-backend#376
 // (M-4): trust_admin_claim must be off by default and only settable via
 // explicit tenant config.
