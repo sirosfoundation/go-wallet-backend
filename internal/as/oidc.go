@@ -258,19 +258,8 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	// Validate nonce: the ID token's nonce claim must match the stored hash.
-	expectedNonceHash := challenge.UserID // stored nonce hash
-	if expectedNonceHash != "" {
-		if nonceClaim, ok := result.Claims["nonce"].(string); ok {
-			if hashNonce(nonceClaim) != expectedNonceHash {
-				h.logger.Warn("OIDC nonce mismatch")
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "nonce mismatch"})
-				return
-			}
-		} else {
-			h.logger.Warn("OIDC ID token missing nonce claim")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "missing nonce in ID token"})
-			return
-		}
+	if !h.validateNonce(c, challenge.UserID, result.Claims) {
+		return
 	}
 
 	// Map claims to session.
@@ -365,6 +354,28 @@ func (h *OIDCHandlers) validateCallbackState(c *gin.Context, state string) (chal
 	}
 
 	return challenge, true
+}
+
+// validateNonce checks the ID token's nonce claim against the hash stored
+// on the login challenge (skipped when no hash was stored). Writes the
+// JSON error response itself and returns false on a missing or mismatched
+// nonce.
+func (h *OIDCHandlers) validateNonce(c *gin.Context, expectedNonceHash string, claims map[string]interface{}) bool {
+	if expectedNonceHash == "" {
+		return true
+	}
+	nonceClaim, ok := claims["nonce"].(string)
+	if !ok {
+		h.logger.Warn("OIDC ID token missing nonce claim")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing nonce in ID token"})
+		return false
+	}
+	if hashNonce(nonceClaim) != expectedNonceHash {
+		h.logger.Warn("OIDC nonce mismatch")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "nonce mismatch"})
+		return false
+	}
+	return true
 }
 
 // hasAdminClaim checks OIDC claims for admin group/role membership.
