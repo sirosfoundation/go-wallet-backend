@@ -463,6 +463,84 @@ func TestService_EvaluateVerifier_Success(t *testing.T) {
 	}
 }
 
+// TestService_EvaluateVerifierWithContext_ForwardsContext pins that
+// EvaluateVerifierWithContext's evalContext reaches the outbound
+// EvaluationRequest.Context unchanged - the whole point of the method (see
+// its doc comment): a direct-to-PDP verifier evaluation must carry the same
+// trust_chain/attestation context a frontend-mediated one always has.
+func TestService_EvaluateVerifierWithContext_ForwardsContext(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	mock := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return mock, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	evalContext := map[string]interface{}{
+		"trust_chain":         []string{"leaf", "anchor"},
+		"attestation_issuer":  "https://issuer.example.com",
+		"attestation_subject": "https://verifier.example.com",
+	}
+
+	result, err := svc.EvaluateVerifierWithContext(context.Background(), "https://verifier.example.com", "", &KeyMaterial{
+		Type: "x5c",
+		X5C:  []string{"deadbeef"},
+	}, evalContext)
+	if err != nil {
+		t.Fatalf("EvaluateVerifierWithContext() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateVerifierWithContext() Trusted = false, want true")
+	}
+
+	if mock.gotReq == nil {
+		t.Fatal("evaluator never received a request")
+	}
+	if got := mock.gotReq.Context["trust_chain"]; got == nil {
+		t.Error("EvaluationRequest.Context missing trust_chain - evalContext was not forwarded")
+	}
+	if got, want := mock.gotReq.Context["attestation_issuer"], evalContext["attestation_issuer"]; got != want {
+		t.Errorf("EvaluationRequest.Context[attestation_issuer] = %v, want %v", got, want)
+	}
+}
+
+// TestService_EvaluateVerifierWithContext_NilContext confirms passing a nil
+// evalContext behaves exactly like plain EvaluateVerifier (no Context set),
+// so EvaluateVerifierWithContext(ctx, id, ep, km, nil) is a safe drop-in.
+func TestService_EvaluateVerifierWithContext_NilContext(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	mock := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return mock, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateVerifierWithContext(context.Background(), "https://verifier.example.com", "", nil, nil)
+	if err != nil {
+		t.Fatalf("EvaluateVerifierWithContext() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateVerifierWithContext() Trusted = false, want true")
+	}
+	if mock.gotReq != nil && mock.gotReq.Context != nil {
+		t.Errorf("EvaluationRequest.Context = %v, want nil when evalContext is nil", mock.gotReq.Context)
+	}
+}
+
 // TestService_EvaluateFIDO2Attestation_NoEndpoint exercises the fail-closed
 // path when no global PDP is configured - FIDO Alliance MDS3 trust data is
 // global (unlike issuer/verifier, it has no per-flow endpoint override), so
