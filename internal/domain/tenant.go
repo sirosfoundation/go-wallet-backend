@@ -125,6 +125,16 @@ type OIDCGateConfig struct {
 
 	// BindIdentity determines whether to persist the enterprise identity link with the wallet user
 	BindIdentity bool `json:"bind_identity" bson:"bind_identity" gorm:"column:oidc_bind_identity;default:false"`
+
+	// TrustAdminClaim opts this tenant in to minting elevated (admin +
+	// delegation) session permissions from the LoginOP's ID token claims
+	// (a "groups"/"roles"/"realm_roles" claim containing "admin"). Off by
+	// default: the AS does not control an IdP's claim semantics, so an IdP
+	// misconfiguration or a compromised/malicious IdP could otherwise mint
+	// full admin access for any authenticated user. Must be explicitly
+	// enabled per tenant, the same way BindIdentity is. See
+	// go-wallet-backend#376.
+	TrustAdminClaim bool `json:"trust_admin_claim" bson:"trust_admin_claim" gorm:"column:oidc_trust_admin_claim;default:false"`
 }
 
 // IsEnabled returns true if OIDC gating is enabled (mode != none)

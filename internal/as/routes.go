@@ -87,8 +87,10 @@ func NewASModule(
 	// Passkey handlers.
 	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, legacyIssuer, cfg, logger)
 
-	// OIDC handlers.
-	oidcHandler := NewOIDCHandlers(store, sessions, cfg, logger)
+	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
+	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
+	// already requires it to be present and >=32 bytes.
+	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), logger)
 
 	return &ASModule{
 		KeyManager:     km,

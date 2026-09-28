@@ -21,14 +21,19 @@ type oidcTokenResponse struct {
 }
 
 // exchangeCode exchanges an authorization code for tokens at the OIDC token endpoint.
-// Uses public client mode (no client_secret) as the existing OIDCProviderConfig
-// is configured for PKCE public clients.
-func exchangeCode(ctx context.Context, tokenEndpoint, code, clientID, redirectURI string) (*oidcTokenResponse, error) {
+// Uses public client mode (no client_secret); codeVerifier is the PKCE
+// code_verifier generated at /auth/oidc/login and must be non-empty (see
+// go-wallet-backend#373 / M-1) - without it, an authorization code
+// intercepted in transit (e.g. via an open redirect or a leaky referrer)
+// could be redeemed by an attacker who never had a client secret to begin
+// with, since this is a public client.
+func exchangeCode(ctx context.Context, tokenEndpoint, code, clientID, redirectURI, codeVerifier string) (*oidcTokenResponse, error) {
 	data := url.Values{
-		"grant_type":   {"authorization_code"},
-		"code":         {code},
-		"client_id":    {clientID},
-		"redirect_uri": {redirectURI},
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {codeVerifier},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(data.Encode()))

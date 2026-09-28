@@ -24,30 +24,43 @@ import (
 // tenant's OIDCGateConfig at runtime — no build-time dependency on any
 // specific IdP.
 type OIDCHandlers struct {
-	store    storage.Store
-	sessions SessionStore
-	cfg      *config.ASConfig
-	logger   *zap.Logger
+	store       storage.Store
+	sessions    SessionStore
+	cfg         *config.ASConfig
+	stateSecret []byte
+	logger      *zap.Logger
 }
 
 // NewOIDCHandlers creates OIDC auth handlers.
+// stateSecret keys the HMAC that binds the OIDC `state` parameter to a
+// signed cookie set at login-start (go-wallet-backend#385 / T-4); it must
+// be at least 32 bytes. Callers pass the AS's existing JWT secret
+// (pkg/config.JWTConfig.Secret), which pkg/config.Config.Validate already
+// requires to be >=32 bytes - no new secret to provision.
 func NewOIDCHandlers(
 	store storage.Store,
 	sessions SessionStore,
 	cfg *config.ASConfig,
+	stateSecret []byte,
 	logger *zap.Logger,
 ) *OIDCHandlers {
 	return &OIDCHandlers{
-		store:    store,
-		sessions: sessions,
-		cfg:      cfg,
-		logger:   logger,
+		store:       store,
+		sessions:    sessions,
+		cfg:         cfg,
+		stateSecret: stateSecret,
+		logger:      logger,
 	}
 }
 
 // oidcState ties together the OIDC authorization code flow state.
 // Stored in the challenge store with action "oidc_login".
 const oidcChallengeAction = "oidc_login"
+
+// oidcChallengeTTL bounds how long an in-flight OIDC login (state + PKCE
+// verifier + nonce) is valid for. Also used as the state-binding cookie's
+// MaxAge so the two expire together.
+const oidcChallengeTTL = 10 * time.Minute
 
 // Login handles GET /auth/oidc/login.
 // Redirects the user to the tenant's OIDC provider for authentication.
@@ -63,6 +76,14 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 	if err != nil {
 		h.logger.Warn("tenant not found", zap.String("tenant_id", tenantID), zap.Error(err))
 		c.JSON(http.StatusNotFound, gin.H{"error": "tenant not found"})
+		return
+	}
+
+	// Disabled tenants must not be able to start (or complete) an OIDC
+	// login — see the matching check in Callback and go-wallet-backend#385.
+	if !tenant.Enabled {
+		h.logger.Warn("OIDC login attempted for disabled tenant", zap.String("tenant_id", tenantID))
+		c.JSON(http.StatusForbidden, gin.H{"error": "tenant is disabled"})
 		return
 	}
 
@@ -90,16 +111,30 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 	// Store the nonce hash for validation — we don't need to recover the raw nonce.
 	nonceHash := hashNonce(nonce)
 
+	// Generate a PKCE code_verifier/code_challenge pair (RFC 7636, S256).
+	// Required because this is a public client (no client_secret) doing an
+	// authorization-code exchange — without PKCE, an authorization code
+	// intercepted in transit could be redeemed by anyone. See
+	// go-wallet-backend#373 / M-1.
+	codeVerifier, err := generatePKCECodeVerifier()
+	if err != nil {
+		h.logger.Error("failed to generate PKCE code_verifier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
+		return
+	}
+	codeChallenge := pkceCodeChallengeS256(codeVerifier)
+
 	// Store state as a challenge for validation on callback.
 	// The nonce hash is stored in the UserID field (unused for OIDC flows).
 	challenge := &domain.WebauthnChallenge{
-		ID:        state,
-		TenantID:  tenantID,
-		UserID:    nonceHash,
-		Challenge: state,
-		Action:    oidcChallengeAction,
-		ExpiresAt: time.Now().Add(10 * time.Minute),
-		CreatedAt: time.Now(),
+		ID:           state,
+		TenantID:     tenantID,
+		UserID:       nonceHash,
+		Challenge:    state,
+		Action:       oidcChallengeAction,
+		CodeVerifier: codeVerifier,
+		ExpiresAt:    time.Now().Add(oidcChallengeTTL),
+		CreatedAt:    time.Now(),
 	}
 	if err := h.store.Challenges().Create(c.Request.Context(), challenge); err != nil {
 		h.logger.Error("failed to store OIDC state", zap.Error(err))
@@ -121,14 +156,20 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 
 	// Build auth URL with properly encoded parameters.
 	params := url.Values{
-		"response_type": {"code"},
-		"client_id":     {op.ClientID},
-		"redirect_uri":  {redirectURI},
-		"scope":         {scopes},
-		"state":         {state},
-		"nonce":         {nonce},
+		"response_type":         {"code"},
+		"client_id":             {op.ClientID},
+		"redirect_uri":          {redirectURI},
+		"scope":                 {scopes},
+		"state":                 {state},
+		"nonce":                 {nonce},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
 	}
 	authURL := disc.AuthorizationEndpoint + "?" + params.Encode()
+
+	// Bind state to this browser via a signed cookie, checked at Callback
+	// (go-wallet-backend#385 / T-4).
+	setOIDCStateCookie(c, h.stateSecret, state, int(oidcChallengeTTL.Seconds()), h.cfg.InsecureCookies)
 
 	c.Redirect(http.StatusFound, authURL)
 }
@@ -176,6 +217,22 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		return
 	}
 
+	// Verify the state-binding cookie set at /auth/oidc/login matches this
+	// state, before doing anything else with it. This ties the callback to
+	// the browser that initiated the flow: without it, a completed
+	// (state, code) callback obtained via one browser (e.g. the attacker's
+	// own login attempt) could be replayed into a victim's browser, which
+	// would otherwise pass the checks above purely from server-side state
+	// storage. See go-wallet-backend#385 / T-4.
+	if !verifyOIDCStateCookie(c, h.stateSecret, state, h.cfg.InsecureCookies) {
+		h.logger.Warn("OIDC state cookie missing or mismatched")
+		_ = h.store.Challenges().Delete(c.Request.Context(), state)
+		clearOIDCStateCookie(c, h.cfg.InsecureCookies)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "state cookie mismatch"})
+		return
+	}
+	clearOIDCStateCookie(c, h.cfg.InsecureCookies)
+
 	// Clean up challenge.
 	_ = h.store.Challenges().Delete(c.Request.Context(), state)
 
@@ -185,6 +242,15 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	tenant, err := h.store.Tenants().GetByID(c.Request.Context(), domain.TenantID(tenantID))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "tenant lookup failed"})
+		return
+	}
+
+	// Disabled tenants must not be able to complete an OIDC login and mint
+	// a session, even with a valid state/code/ID token. See
+	// go-wallet-backend#385 / T-4.
+	if !tenant.Enabled {
+		h.logger.Warn("OIDC callback for disabled tenant", zap.String("tenant_id", tenantID))
+		c.JSON(http.StatusForbidden, gin.H{"error": "tenant is disabled"})
 		return
 	}
 
@@ -202,7 +268,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	redirectURI := h.redirectURI()
-	tokenResp, err := exchangeCode(c.Request.Context(), disc.TokenEndpoint, code, op.ClientID, redirectURI)
+	tokenResp, err := exchangeCode(c.Request.Context(), disc.TokenEndpoint, code, op.ClientID, redirectURI, challenge.CodeVerifier)
 	if err != nil {
 		h.logger.Error("OIDC token exchange failed", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "token exchange failed"})
@@ -242,10 +308,16 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	// Map claims to session.
 	sub := result.Subject
 
-	// Determine MaxTAC from OIDC claims. Admin users get elevated permissions.
+	// Determine MaxTAC from OIDC claims. Admin users may get elevated
+	// permissions, but ONLY when the tenant has explicitly opted in via
+	// oidc_gate.trust_admin_claim: the AS doesn't control an IdP's claim
+	// semantics, so trusting a "groups"/"roles"/"realm_roles" claim to mint
+	// full admin + delegation access by default would let a misconfigured
+	// or malicious IdP (or a tenant's own users, if the IdP lets them
+	// self-manage group membership) grant themselves admin on this AS. See
+	// go-wallet-backend#376 / M-4.
 	maxTAC := TAC(h.cfg.DefaultMaxTAC)
-	// Check for admin role/group claims — tenant policy could customize this.
-	if hasAdminClaim(result.Claims) {
+	if tenant.OIDCGate.TrustAdminClaim && hasAdminClaim(result.Claims) {
 		maxTAC = TAC("rwlidka") // full admin
 	}
 
@@ -311,6 +383,24 @@ func generateOIDCState() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// generatePKCECodeVerifier generates a PKCE code_verifier per RFC 7636 §4.1:
+// a high-entropy cryptographically random string. 32 random bytes base64url-
+// encoded (43 chars) comfortably satisfies the 43-128 character requirement.
+func generatePKCECodeVerifier() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// pkceCodeChallengeS256 computes the PKCE code_challenge for the S256
+// method (RFC 7636 §4.2): BASE64URL-ENCODE(SHA256(ASCII(code_verifier))).
+func pkceCodeChallengeS256(codeVerifier string) string {
+	sum := sha256.Sum256([]byte(codeVerifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // redirectURI returns the OIDC callback URI from config.
