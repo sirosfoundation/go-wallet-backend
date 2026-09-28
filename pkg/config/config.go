@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -1108,6 +1109,21 @@ type TrustConfig struct {
 	// TLS certificate. Set this when the PDP is signed by an internal/private CA.
 	CACertPath string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 
+	// CacheDisabled turns the engine's in-memory verifier trust cache off, so
+	// every flow asks the PDP again.
+	//
+	// For testing, not for production. A trust decision - including a denial -
+	// is otherwise reused for CacheTTLSeconds, which makes iterating on trust
+	// configuration nearly impossible: fix the whitelist or the keys, redeploy
+	// the PDP, retry, and the wallet is still refused by a cached answer, with
+	// nothing in any log to say the answer was stale. It also means a PDP that
+	// is briefly unreachable takes a verifier down for the rest of the TTL.
+	CacheDisabled bool `yaml:"cache_disabled" envconfig:"CACHE_DISABLED"`
+
+	// CacheTTLSeconds is how long a verifier trust decision is reused.
+	// Zero selects the default of one hour. Ignored when CacheDisabled.
+	CacheTTLSeconds int `yaml:"cache_ttl_seconds" envconfig:"CACHE_TTL_SECONDS"`
+
 	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
 	// When not set, inherits the global trust configuration.
 	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
@@ -1115,6 +1131,38 @@ type TrustConfig struct {
 	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
 	// When not set, inherits the global trust configuration.
 	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
+}
+
+// DefaultTrustCacheTTL is how long a verifier trust decision is reused when
+// TrustConfig.CacheTTLSeconds says nothing.
+const DefaultTrustCacheTTL = time.Hour
+
+// MaxTrustCacheTTLSeconds is the largest CacheTTLSeconds that survives the
+// conversion to a time.Duration, which counts nanoseconds in an int64 - about
+// 292 years. Anything larger wraps to a negative duration, which the cache
+// reads as "off", so a number meant to say "cache for a very long time" would
+// silently mean the opposite. Config.Validate refuses those.
+const MaxTrustCacheTTLSeconds = int(math.MaxInt64 / int64(time.Second))
+
+// VerifierCacheTTL is how long the engine may reuse a verifier trust decision.
+//
+// Zero means "do not cache at all", which is what CacheDisabled selects; the
+// engine's cache treats a non-positive TTL as off rather than as an instantly
+// expiring entry, so there is one meaning for the value and one place that
+// decides it.
+//
+// A negative CacheTTLSeconds reads as the default here, but Config.Validate
+// refuses it before a process gets this far: it is the one value whose intent
+// ("off") differs from what this returns, so it is rejected at startup rather
+// than guessed at.
+func (t TrustConfig) VerifierCacheTTL() time.Duration {
+	if t.CacheDisabled {
+		return 0
+	}
+	if t.CacheTTLSeconds > 0 {
+		return time.Duration(t.CacheTTLSeconds) * time.Second
+	}
+	return DefaultTrustCacheTTL
 }
 
 // NewPDPHTTPClient creates an *http.Client for use with operator-configured PDP endpoints.
@@ -1919,6 +1967,24 @@ func (c *Config) Validate() error {
 		if c.Audit.KeyID == "" {
 			return fmt.Errorf("audit.key_id is required when audit is enabled")
 		}
+	}
+
+	// A negative TTL is refused rather than quietly rounded up to the
+	// default. Someone who writes -1 here means "off", and silently giving
+	// them an hour of cached trust decisions is the exact failure this
+	// setting exists to cure: an answer that is not what the operator asked
+	// for, with nothing anywhere saying so. trust.cache_disabled is the way
+	// to say off.
+	if c.Trust.CacheTTLSeconds < 0 {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not be negative (set trust.cache_disabled to turn the cache off)", c.Trust.CacheTTLSeconds)
+	}
+	// And not so large that it wraps. A value past the int64 nanosecond
+	// range becomes a negative duration, which the cache reads as "off" -
+	// so without this, a number meant to cache for centuries would disable
+	// caching instead, which is the same silent inversion as the negative
+	// case above.
+	if c.Trust.CacheTTLSeconds > MaxTrustCacheTTLSeconds {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not exceed %d (a larger value overflows time.Duration and would silently disable the cache)", c.Trust.CacheTTLSeconds, MaxTrustCacheTTLSeconds)
 	}
 
 	return nil

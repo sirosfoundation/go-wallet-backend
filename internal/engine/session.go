@@ -149,9 +149,18 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		flowHandlers:    make(map[Protocol]FlowHandlerFactory),
 		trustService:    NewTrustService(cfg, logger),
 		registryClient:  NewRegistryClient(cfg, logger),
-		trustCache:      NewTrustCache(1 * time.Hour),
+		trustCache:      NewTrustCache(cfg.Trust.VerifierCacheTTL()),
 		notificationSem: make(chan struct{}, maxConcurrentNotifications),
 		sessionStore:    NewMemorySessionStore(logger), // Default to memory
+	}
+	// Say so loudly. Running without the trust cache means every flow asks the
+	// PDP again, which is the point when testing trust configuration and a
+	// needless load on it otherwise - either way an operator should not have
+	// to read the config to find out which mode this process is in.
+	if ttl := cfg.Trust.VerifierCacheTTL(); ttl <= 0 {
+		m.logger.Warn("Verifier trust cache is DISABLED; every flow will re-evaluate with the PDP")
+	} else {
+		m.logger.Debug("Verifier trust cache enabled", zap.Duration("ttl", ttl))
 	}
 	return m
 }
