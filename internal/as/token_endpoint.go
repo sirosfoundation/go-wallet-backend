@@ -39,6 +39,26 @@ type TokenResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
+// TokenEndpointConfig groups the dependencies for the /auth/token endpoint.
+// Grouped into a struct (rather than individual parameters) to keep
+// TokenEndpointHandler/RegisterTokenEndpoint's own signatures within reason
+// - #381 added Audiences and Blacklist on top of the existing dependencies,
+// which pushed the plain-parameter-list form over the usual limit.
+type TokenEndpointConfig struct {
+	Store   SessionStore
+	Issuer  *TokenIssuer
+	Policy  PolicyEngine
+	TTLFunc func(string) time.Duration
+	// Audiences and Blacklist are used only by the delegation-exchange path
+	// (handleDelegationTokenRequest), which is the only one that verifies an
+	// already-issued Bearer token rather than trusting a server-side session
+	// record - see #381/#382.
+	Audiences       []string
+	Blacklist       TokenBlacklistChecker
+	InsecureCookies bool
+	Logger          *zap.Logger
+}
+
 // TokenEndpointHandler creates the handler for POST /auth/token.
 //
 // Two authentication paths:
@@ -48,24 +68,16 @@ type TokenResponse struct {
 //     a valid session is still required either way.)
 //  2. Bearer token (no cookie) → delegation: the bearer token must contain
 //     the 'k' (delegate) permission, and the issued token is downscoped.
-func TokenEndpointHandler(
-	store SessionStore,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	audiences []string,
-	blacklist TokenBlacklistChecker,
-	insecureCookies bool,
-	logger *zap.Logger,
-) gin.HandlerFunc {
-	opts := CookieOptions{Insecure: insecureCookies}
+func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
+	opts := CookieOptions{Insecure: cfg.InsecureCookies}
+	store := cfg.Store
 	deps := &tokenDeps{
-		issuer:    issuer,
-		policy:    policy,
-		ttlFunc:   ttlFunc,
-		audiences: audiences,
-		blacklist: blacklist,
-		logger:    logger,
+		issuer:    cfg.Issuer,
+		policy:    cfg.Policy,
+		ttlFunc:   cfg.TTLFunc,
+		audiences: cfg.Audiences,
+		blacklist: cfg.Blacklist,
+		logger:    cfg.Logger,
 	}
 	return func(c *gin.Context) {
 		var req TokenRequest
@@ -385,16 +397,6 @@ func issueToken(
 }
 
 // RegisterTokenEndpoint registers POST /auth/token on the given router group.
-func RegisterTokenEndpoint(
-	group *gin.RouterGroup,
-	store SessionStore,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	audiences []string,
-	blacklist TokenBlacklistChecker,
-	insecureCookies bool,
-	logger *zap.Logger,
-) {
-	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, audiences, blacklist, insecureCookies, logger))
+func RegisterTokenEndpoint(group *gin.RouterGroup, cfg TokenEndpointConfig) {
+	group.POST("/token", TokenEndpointHandler(cfg))
 }

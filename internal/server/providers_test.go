@@ -1284,3 +1284,81 @@ func TestBlacklistRevocationChecker_AdaptsToServiceBlacklist(t *testing.T) {
 		t.Error("expected unrelated jti-2 not to be revoked")
 	}
 }
+
+// TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation exercises the
+// cfg.AS.Enabled branch of NewBackendProvider (see #382/#383): the AS
+// module receives the same TokenBlacklist instance as AuthProvider (not a
+// second, unshared one built for it), and the go-tokenauth validator's
+// Revocation checker is wired to that same instance.
+func TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation(t *testing.T) {
+	dir := t.TempDir()
+	asKeyPath, _ := writeTestECKeyAndCert(t, dir, "as")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", ExpiryHours: 24, Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:        true,
+			ExternalURL:    "https://as.example.com",
+			SigningKeyPath: asKeyPath,
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, zap.NewNop(), []string{"auth", "storage"})
+	if err != nil {
+		t.Fatalf("NewBackendProvider() error = %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+
+	if provider.asModule == nil {
+		t.Fatal("expected asModule to be initialized when cfg.AS.Enabled is true")
+	}
+	if provider.tokenValidator == nil {
+		t.Fatal("expected tokenValidator to be initialized when cfg.AS.Enabled is true")
+	}
+	if provider.asModule.Blacklist == nil {
+		t.Fatal("expected AS module's Blacklist to be wired")
+	}
+
+	// Blacklisting a jti through AuthProvider's own TokenBlacklist instance
+	// (the one Logout/DeleteUser write to) must be visible through the AS
+	// module's Blacklist too - proving it's the SAME instance, not a second
+	// one the AS module built for itself.
+	ctx := context.Background()
+	if err := provider.auth.services.TokenBlacklist.Add(ctx, "jti-shared-with-as", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if !provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as") {
+		t.Error("expected AS module's Blacklist to share AuthProvider's TokenBlacklist instance")
+	}
+}
+
+// TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore
+// exercises the AS-module-construction failure path added alongside the
+// blacklist-sharing reorder: authProvider is now constructed before the AS
+// module, so a failure there must also close authProvider's own started
+// background workers (its TokenBlacklist cleanup loop etc.), not just the
+// storage backend.
+func TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore(t *testing.T) {
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", ExpiryHours: 24, Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:        true,
+			SigningKeyPath: filepath.Join(t.TempDir(), "does-not-exist.pem"),
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, zap.NewNop(), []string{"auth", "storage"})
+	if err == nil {
+		t.Fatal("expected an error when the AS signing key path does not exist")
+	}
+	if provider != nil {
+		t.Error("expected a nil provider on initialization failure")
+	}
+}

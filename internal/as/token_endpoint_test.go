@@ -73,7 +73,16 @@ func setupRouterWithIssuer(t *testing.T, issuer *TokenIssuer, audiences []string
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, audiences, blacklist, true, logger)
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          AllowAllPolicy{},
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		Audiences:       audiences,
+		Blacklist:       blacklist,
+		InsecureCookies: true,
+		Logger:          logger,
+	})
 
 	return router, store
 }
@@ -209,7 +218,14 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, nil, nil, true, logger)
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          denyAll,
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		InsecureCookies: true,
+		Logger:          logger,
+	})
 
 	sess := &Session{
 		JTI:       "sess-deny",
