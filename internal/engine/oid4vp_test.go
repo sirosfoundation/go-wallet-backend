@@ -1681,6 +1681,49 @@ func makeSignedJWTWithX5C(t *testing.T) (string, *ecdsa.PrivateKey) {
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sigBytes), key
 }
 
+// makeSignedJWTWithX5CAndTrustChain is makeSignedJWTWithX5C plus a
+// "trust_chain" JWT header parameter, the way a JAR from an OpenID
+// Federation entity carries one (OID4VP §5.9.3.6).
+func makeSignedJWTWithX5CAndTrustChain(t *testing.T, trustChain []string) (string, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-verifier"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"verifier.example.com"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+
+	headerJSON, _ := json.Marshal(map[string]interface{}{
+		"alg":         "ES256",
+		"typ":         "JWT",
+		"x5c":         []string{certB64},
+		"trust_chain": trustChain,
+	})
+	header := base64.RawURLEncoding.EncodeToString(headerJSON)
+
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"iss": "verifier.example.com",
+		"aud": "https://wallet.example.com",
+		"iat": time.Now().Unix(),
+	})
+	payload := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	signingInput := header + "." + payload
+	token := jwt.New(jwt.SigningMethodES256)
+	sigBytes, err := token.Method.Sign(signingInput, key)
+	require.NoError(t, err)
+
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sigBytes), key
+}
+
 func TestValidateAuthorizationRequest_X509SANDNS_ValidJWT(t *testing.T) {
 	jwtToken, _ := makeSignedJWTWithX5C(t)
 	h := &OID4VPHandler{}
@@ -2121,16 +2164,18 @@ func TestVerifyDIDRequest_AcceptsPrefixedClientID(t *testing.T) {
 // in for the AuthZEN PDP. It records every subject it is asked to resolve or
 // evaluate, and lets a test control the evaluate decision.
 type stubDIDResolver struct {
-	didDoc     map[string]interface{}
-	resolved   []string
-	evaluated  []string
-	decision   bool
-	evalErr    error
-	decisionOk bool // if false, decision defaults to true (zero-value-safe for existing callers)
+	didDoc      map[string]interface{}
+	resolved    []string
+	evaluated   []string
+	decision    bool
+	evalErr     error
+	decisionOk  bool // if false, decision defaults to true (zero-value-safe for existing callers)
+	lastContext map[string]interface{}
 }
 
 func (s *stubDIDResolver) Evaluate(_ context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
 	s.evaluated = append(s.evaluated, req.SubjectID)
+	s.lastContext = req.Context
 	if s.evalErr != nil {
 		return nil, s.evalErr
 	}
@@ -2618,6 +2663,114 @@ func TestEvaluateVerifierTrust_CacheDoesNotLeakAcrossDifferentClaimedVerifier(t 
 	assert.Equal(t, []string{did}, stub.resolved)
 	assert.Equal(t, []string{clientIDB}, stub.evaluated)
 	assert.NotEqual(t, "Verifier A (should never be returned for B)", verifierB.Name)
+}
+
+// A x509_san_dns client_id (a SAN DNS name) can be presented by any
+// certificate naming that domain - this handler verifies the request JWT's
+// signature against whatever x5c it carries, but never itself checks that
+// certificate against the one a PDP-backed cache entry was earned by. Two
+// requests claiming the SAME client_id but signing with two DIFFERENT
+// certificates must each reach the PDP independently: the cache key must
+// include a fingerprint of the actual certificate, not just the claimed
+// domain.
+func TestEvaluateVerifierTrust_CacheKeyIncludesCertificateFingerprint(t *testing.T) {
+	jwtA, _ := makeSignedJWTWithX5C(t) // fresh cert/key, client_id "verifier.example.com"
+	jwtB, _ := makeSignedJWTWithX5C(t) // a DIFFERENT fresh cert/key, same claimed client_id
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	stub := &stubDIDResolver{decisionOk: true, decision: true}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	baseReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+	}
+
+	reqA := *baseReq
+	reqA.RequestJWT = jwtA
+	verifierA, err := h.evaluateVerifierTrust(context.Background(), &reqA)
+	require.NoError(t, err)
+	require.True(t, verifierA.Trusted)
+	assert.Equal(t, 1, trustCache.Len(), "cert A's verdict should be cached once")
+
+	reqB := *baseReq
+	reqB.RequestJWT = jwtB
+	verifierB, err := h.evaluateVerifierTrust(context.Background(), &reqB)
+	require.NoError(t, err)
+	require.True(t, verifierB.Trusted)
+
+	// Cert B must have been independently evaluated by the PDP - not served
+	// from cert A's cache entry merely because they share a client_id.
+	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated,
+		"the PDP must be consulted separately for each distinct certificate")
+	assert.Equal(t, 2, trustCache.Len(), "each certificate gets its own cache entry")
+}
+
+// When a verifier PDP is configured, the direct evaluation path must
+// forward the same OIDF trust_chain context a frontend-mediated evaluation
+// has always carried in TrustEvaluationRequest.Context - otherwise go-trust
+// has no trust chain to validate a JAR-signing federation entity against.
+func TestEvaluateVerifierTrust_PDPPath_ForwardsTrustChainContext(t *testing.T) {
+	trustChain := []string{"chain-leaf", "chain-intermediate", "chain-anchor"}
+	requestJWT, _ := makeSignedJWTWithX5CAndTrustChain(t, trustChain)
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	stub := &stubDIDResolver{decisionOk: true, decision: true}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
+	}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     requestJWT,
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted)
+
+	require.NotNil(t, stub.lastContext, "the PDP call must carry an evaluation context")
+	gotChain, ok := stub.lastContext["trust_chain"].([]string)
+	require.True(t, ok, "trust_chain must be forwarded as a []string, got %#v", stub.lastContext["trust_chain"])
+	assert.Equal(t, trustChain, gotChain)
 }
 
 // --- no-matching-credential fast fail ---

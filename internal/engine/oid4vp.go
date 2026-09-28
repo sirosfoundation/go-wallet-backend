@@ -5,8 +5,10 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -548,6 +550,20 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	var requestJWT string
 	var attestationContext map[string]interface{}
 	var verifiedIdentity string
+	// cacheable is false whenever a scheme's identity claim (client_id or
+	// attestation subject) does not, on its own, bind to one specific key:
+	// x509_san_dns's SAN can be presented by any certificate naming that DNS
+	// name; this handler never itself checks that an x509_hash client_id
+	// equals the presented certificate's actual hash (that binding check
+	// belongs to the PDP); and verifier_attestation's "sub" is asserted by
+	// an attestation JWT this handler does not itself verify against a
+	// trusted issuer. For those schemes cacheable only becomes true once a
+	// stable fingerprint of the actual key material is folded into
+	// verifiedIdentity (see keyMaterialFingerprint) - if that fingerprint
+	// can't be computed, the request is never cached at all rather than
+	// falling back to a weaker key a different key's request could collide
+	// with.
+	cacheable := true
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
@@ -614,11 +630,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
-		// The request JWT's signature has been verified against the embedded
-		// x5c, so the claimed client_id is at least bound to a key the
-		// request itself proves possession of; scope the cache key to this
-		// scheme + client_id pairing.
-		verifiedIdentity = "x509_san_dns:" + authReq.ClientID
+		// The request JWT's signature proves possession of the embedded
+		// x5c's private key, but a SAN DNS name is not unique to one
+		// certificate - a different cert naming the same domain would claim
+		// the same client_id. Fold in the leaf certificate's own fingerprint
+		// so the cache is scoped to this specific certificate, not just the
+		// domain it claims.
+		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
+			verifiedIdentity = "x509_san_dns:" + authReq.ClientID + ":" + fp
+		} else {
+			cacheable = false
+		}
 
 	case ClientIDSchemeX509Hash:
 		// X.509 hash scheme: client_id is the leaf cert's own digest rather
@@ -638,9 +660,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
-		// client_id IS the certificate's own hash under this scheme, and the
-		// request JWT's signature has been verified against that same x5c.
-		verifiedIdentity = "x509_hash:" + authReq.ClientID
+		// client_id is SUPPOSED to be the certificate's own hash under this
+		// scheme, but this handler never itself checks that binding - only
+		// go-trust's PDP does. Without a fingerprint here, a request
+		// presenting a different certificate but claiming the same (stale,
+		// previously-trusted) client_id hash would reuse a cached verdict
+		// the PDP never evaluated for that certificate.
+		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
+			verifiedIdentity = "x509_hash:" + authReq.ClientID + ":" + fp
+		} else {
+			cacheable = false
+		}
 
 	case ClientIDSchemeVerifierAttestation:
 		// Verifier attestation scheme (OID4VP §5.9.3.4 / §12):
@@ -692,9 +722,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			"attestation_jwt":     attestation.RawJWT,
 		}
 		// The request JWT's signature has been verified above against the
-		// cnf key bound to the attestation's sub, so the cache identity is
-		// the attested subject, not the bare claimed client_id/URL.
-		verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject
+		// cnf key bound to the attestation's sub, but this handler never
+		// itself verifies the attestation JWT's own signature against a
+		// trusted issuer (that's the PDP's job, given attestation_jwt in
+		// context) - so "sub" alone is an attacker-assertable claim, not a
+		// verified identity. Fold in a fingerprint of the actual key
+		// material so the cache is scoped to that specific key.
+		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
+			verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject + ":" + fp
+		} else {
+			cacheable = false
+		}
 
 	default:
 		// redirect_uri and other schemes: extract key material best-effort
@@ -719,11 +757,16 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	// cacheKey identifies this verifier for the trust cache. Prefer the
 	// identity signature verification just bound above (a DID that verified,
-	// a client_id whose request JWT verified against x5c, an attested
-	// subject) - falling back to the canonical URL only for schemes where no
-	// scheme-bound signature verification exists at all (e.g. redirect_uri).
+	// a client_id+certificate/key fingerprint pairing, an attested subject
+	// bound to its key) - falling back to the canonical URL only for
+	// schemes where no scheme-bound signature verification exists at all
+	// (e.g. redirect_uri). When cacheable is false, a scheme that needed a
+	// key-material fingerprint couldn't produce one; this request's result
+	// is never read from or written to the cache at all, rather than
+	// falling back to a weaker key a different key's request could collide
+	// with (see the per-scheme comments above).
 	cacheKey := verifiedIdentity
-	if cacheKey == "" {
+	if cacheKey == "" && cacheable {
 		cacheKey = canonicalURL
 	}
 
@@ -732,23 +775,25 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// client-asserted verdict (the no-PDP fallback path below) is never
 	// written to the cache in the first place - see
 	// evaluateVerifierTrustViaFrontend and cacheVerifierTrust.
-	if cached := h.getCachedVerifierTrust(cacheKey); cached != nil {
-		verifier.Trusted = cached.Trusted
-		verifier.Framework = cached.TrustFramework
-		verifier.TrustedStatus = string(cached.TrustStatus)
-		if cached.Name != "" {
-			verifier.Name = cached.Name
+	if cacheable {
+		if cached := h.getCachedVerifierTrust(cacheKey); cached != nil {
+			verifier.Trusted = cached.Trusted
+			verifier.Framework = cached.TrustFramework
+			verifier.TrustedStatus = string(cached.TrustStatus)
+			if cached.Name != "" {
+				verifier.Name = cached.Name
+			}
+			if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
+				verifier.ClientID = clientID
+			}
+			if !verifier.Trusted {
+				return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
+			}
+			h.Logger.Debug("Using cached verifier trust result",
+				zap.String("verifier", authReq.ClientID),
+				zap.Bool("trusted", cached.Trusted))
+			return verifier, nil
 		}
-		if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
-			verifier.ClientID = clientID
-		}
-		if !verifier.Trusted {
-			return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
-		}
-		h.Logger.Debug("Using cached verifier trust result",
-			zap.String("verifier", authReq.ClientID),
-			zap.Bool("trusted", cached.Trusted))
-		return verifier, nil
 	}
 
 	// Try server-side direct evaluation first (preferred path). The backend
@@ -803,7 +848,14 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 		}
 	}
 
-	directResult, err := h.TrustSvc.EvaluateVerifier(evalCtx, authReq.ClientID, trustEndpoint, tkm)
+	// Forward the same trust_chain/attestation/URI context the frontend
+	// path has always carried in TrustEvaluationRequest.Context - without
+	// this, a request that depends on either (an OIDF federation entity JAR
+	// signs with a trust_chain header, or a verifier_attestation-scheme
+	// request) would reach the PDP with no way to validate it.
+	evalContext := buildVerifierEvalContext(authReq, authCtx, h.Logger)
+
+	directResult, err := h.TrustSvc.EvaluateVerifierWithContext(evalCtx, authReq.ClientID, trustEndpoint, tkm, evalContext)
 	if err != nil {
 		// Fail closed: a PDP error is never equivalent to "no PDP
 		// configured" and must never fall back to asking the client.
@@ -837,8 +889,13 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	})
 
 	// Cache the PDP-backed verdict. This is the only call site that ever
-	// populates the trust cache.
-	h.cacheVerifierTrust(cacheKey, verifier)
+	// populates the trust cache. An empty cacheKey means the caller decided
+	// this request isn't safely cacheable at all (see evaluateVerifierTrust's
+	// cacheable/cacheKey computation) - skip writing rather than caching
+	// under an empty/ambiguous key.
+	if cacheKey != "" {
+		h.cacheVerifierTrust(cacheKey, verifier)
+	}
 
 	// Look up admin-configured ClientID for VP audience (read-only)
 	if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
@@ -881,34 +938,7 @@ func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAu
 		SubjectType:        SubjectTypeCredentialVerifier,
 		RequiresResolution: authCtx.requiresResolution,
 		RequestJWT:         authCtx.requestJWT,
-		Context: map[string]interface{}{
-			"client_id_scheme": authReq.ClientIDScheme,
-		},
-	}
-
-	// Add response/redirect URI to context
-	if authReq.ResponseURI != "" {
-		trustReq.Context["response_uri"] = authReq.ResponseURI
-	}
-	if authReq.RedirectURI != "" {
-		trustReq.Context["redirect_uri"] = authReq.RedirectURI
-	}
-
-	// Extract and forward trust_chain from JAR header (OID4VP §5.9.3.6)
-	// This allows go-trust to validate a pre-supplied OIDF trust chain
-	// instead of resolving it from scratch.
-	if authReq.RequestJWT != "" {
-		if trustChain := trust.ExtractTrustChainFromJWT(authReq.RequestJWT); len(trustChain) > 0 {
-			trustReq.Context["trust_chain"] = trustChain
-			logger.Debug("Forwarding trust_chain from JAR header",
-				zap.String("verifier", authReq.ClientID),
-				zap.Int("chain_length", len(trustChain)))
-		}
-	}
-
-	// Forward attestation context if present (verifier_attestation scheme)
-	for k, v := range authCtx.attestationContext {
-		trustReq.Context[k] = v
+		Context:            buildVerifierEvalContext(authReq, authCtx, logger),
 	}
 
 	// Convert key material for frontend
@@ -921,6 +951,49 @@ func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAu
 	}
 
 	return trustReq
+}
+
+// buildVerifierEvalContext computes the additional evaluation context a
+// verifier trust decision may depend on: the client_id_scheme and
+// response/redirect URI, any OIDF trust_chain forwarded from the JAR header
+// (OID4VP §5.9.3.6), and any verifier_attestation context (OID4VP §5.9.3.4).
+//
+// Both evaluateVerifierTrustViaFrontend (via buildVerifierTrustRequest) and
+// evaluateVerifierTrustViaPDP (via EvaluateVerifierWithContext) use this, so
+// a PDP-first evaluation gets exactly the same context a frontend-mediated
+// one always has - without it, go-trust has no OIDF trust chain or
+// attestation JWT to validate a request against, for the schemes that
+// depend on either.
+func buildVerifierEvalContext(authReq *AuthorizationRequest, authCtx verifierAuthContext, logger *zap.Logger) map[string]interface{} {
+	context := map[string]interface{}{
+		"client_id_scheme": authReq.ClientIDScheme,
+	}
+
+	if authReq.ResponseURI != "" {
+		context["response_uri"] = authReq.ResponseURI
+	}
+	if authReq.RedirectURI != "" {
+		context["redirect_uri"] = authReq.RedirectURI
+	}
+
+	// Extract and forward trust_chain from JAR header (OID4VP §5.9.3.6)
+	// This allows go-trust to validate a pre-supplied OIDF trust chain
+	// instead of resolving it from scratch.
+	if authReq.RequestJWT != "" {
+		if trustChain := trust.ExtractTrustChainFromJWT(authReq.RequestJWT); len(trustChain) > 0 {
+			context["trust_chain"] = trustChain
+			logger.Debug("Forwarding trust_chain from JAR header",
+				zap.String("verifier", authReq.ClientID),
+				zap.Int("chain_length", len(trustChain)))
+		}
+	}
+
+	// Forward attestation context if present (verifier_attestation scheme)
+	for k, v := range authCtx.attestationContext {
+		context[k] = v
+	}
+
+	return context
 }
 
 // evaluateVerifierTrustViaFrontend delegates trust evaluation to the
@@ -1042,6 +1115,60 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 	}
 
 	return km, nil
+}
+
+// keyMaterialFingerprint returns a stable identifier for the specific key
+// material a request proved possession of via its signature: SHA-256 of an
+// x5c leaf certificate's DER bytes, or the RFC 7638 JWK thumbprint of a JWK.
+// Returns "" if km is nil, empty, or its key material can't be decoded.
+//
+// This exists so the trust cache can be scoped to the actual key a request
+// signed with, not just a claimed identity string - see the x509_san_dns,
+// x509_hash, and verifier_attestation cases in evaluateVerifierTrust, none
+// of which bind a claimed client_id/subject to one specific key on their
+// own (the certificate/attestation-issuer trust check itself is the PDP's
+// job). Without this, a second request presenting a different key but the
+// same claimed identity could reuse a cached verdict the PDP never
+// evaluated for that key.
+func keyMaterialFingerprint(km *KeyMaterial) string {
+	if km == nil {
+		return ""
+	}
+	switch km.Type {
+	case "x5c":
+		if len(km.X5C) == 0 {
+			return ""
+		}
+		der, err := base64.StdEncoding.DecodeString(km.X5C[0])
+		if err != nil {
+			der, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
+			if err != nil {
+				return ""
+			}
+		}
+		sum := sha256.Sum256(der)
+		return "sha256:" + hex.EncodeToString(sum[:])
+	case "jwk":
+		normalized := trust.NormalizeJWKS(km.JWK)
+		if len(normalized) == 0 {
+			return ""
+		}
+		raw, err := json.Marshal(normalized[0])
+		if err != nil {
+			return ""
+		}
+		var parsedJWK jose.JSONWebKey
+		if err := parsedJWK.UnmarshalJSON(raw); err != nil {
+			return ""
+		}
+		thumb, err := parsedJWK.Thumbprint(crypto.SHA256)
+		if err != nil {
+			return ""
+		}
+		return "jwk:" + hex.EncodeToString(thumb)
+	default:
+		return ""
+	}
 }
 
 // getCanonicalVerifierURL returns the canonical URL for a verifier from an authorization request.

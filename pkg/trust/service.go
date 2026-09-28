@@ -216,7 +216,7 @@ func (s *Service) resolveVerifierEndpoint(sessionEndpoint string) string {
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
-	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, "", keyMaterial, "issuer")
+	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, "", keyMaterial, "issuer", nil)
 }
 
 // EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
@@ -229,7 +229,24 @@ func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndp
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
-	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, "", keyMaterial, "verifier")
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, "", keyMaterial, "verifier", nil)
+}
+
+// EvaluateVerifierWithContext is EvaluateVerifier plus caller-supplied
+// AuthZEN evaluation context, forwarded to the PDP as-is (see
+// authzen.Evaluator.toAuthZENRequest, which puts it straight on the
+// outbound AuthZEN request's Context field).
+//
+// This exists so a direct-to-PDP evaluation (see
+// OID4VPHandler.evaluateVerifierTrustViaPDP) doesn't silently drop context
+// a frontend-mediated evaluation has always carried in
+// TrustEvaluationRequest.Context - in particular an OIDF trust_chain (OID4VP
+// §5.9.3.6) or verifier_attestation issuer/JWT fields (OID4VP §5.9.3.4),
+// both of which go-trust's PDP may need to validate a request that a bare
+// subject+key-material evaluation cannot.
+func (s *Service) EvaluateVerifierWithContext(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial, evalContext map[string]interface{}) (*TrustInfo, error) {
+	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, "", keyMaterial, "verifier", evalContext)
 }
 
 // FIDO2AttestationAction is the AuthZEN action.name sent for FIDO2/CTAP2
@@ -261,7 +278,7 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, FIDO2AttestationAction, &KeyMaterial{
 		Type: "x5c",
 		X5C:  x5cChain,
-	}, "aaguid")
+	}, "aaguid", nil)
 }
 
 // evaluate is the shared implementation for issuer, verifier, and FIDO2
@@ -273,7 +290,10 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 // which prefers Role for action.name and falls back to this field. Passing ""
 // preserves today's behavior for callers that rely on Role (EvaluateIssuer,
 // EvaluateVerifier).
-func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, action string, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
+//
+// evalContext, when non-nil, is forwarded as-is to EvaluationRequest.Context
+// (see EvaluateVerifierWithContext's doc comment for why this exists).
+func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, action string, keyMaterial *KeyMaterial, logLabel string, evalContext map[string]interface{}) (*TrustInfo, error) {
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
 		return nil, err
@@ -299,6 +319,9 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	req.Role = role
 	if role == "" && action != "" {
 		req.Action = action
+	}
+	if evalContext != nil {
+		req.Context = evalContext
 	}
 
 	// Set credential type if provided
