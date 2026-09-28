@@ -12,6 +12,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // ASModule is the top-level authorization server module that wires together
@@ -31,6 +32,15 @@ type ASModule struct {
 	Blacklist TokenBlacklistChecker
 	Logger    *zap.Logger
 	Config    *config.ASConfig
+
+	// store and validatorCache back the tenant-header and OIDC-gate
+	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
+	// only AS route group that operates on tenant-scoped data before the
+	// caller has a session, so it needs the same tenant perimeter as the
+	// /user/* routes (see pkg/middleware.TenantHeaderMiddleware and
+	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
+	store          storage.Store
+	validatorCache *middleware.ValidatorCache
 }
 
 // NewASModule creates and initializes the AS module.
@@ -106,6 +116,11 @@ func NewASModule(
 	// already requires it to be present and >=32 bytes.
 	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), logger)
 
+	// Shared cache of OIDC validators for the passkey gate (see
+	// RegisterRoutes). A nil HTTP client makes ValidatorCache fall back to
+	// its own default client.
+	validatorCache := middleware.NewValidatorCache(nil, logger)
+
 	return &ASModule{
 		KeyManager:     km,
 		TokenIssuer:    tokenIssuer,
@@ -117,6 +132,8 @@ func NewASModule(
 		Blacklist:      blacklist,
 		Logger:         logger,
 		Config:         cfg,
+		store:          store,
+		validatorCache: validatorCache,
 	}, nil
 }
 
@@ -126,13 +143,29 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
 
-	// Passkey authentication (public, no auth).
+	// Passkey authentication (public, no auth — but tenant-scoped).
+	// Tenant comes from the validated X-Tenant-ID header, never from the
+	// request body, mirroring the /user/* routes (see providers.go's
+	// AuthProvider.RegisterRoutes). Without this, a caller could pick any
+	// tenant's data via a body field with no validation at all (issue #374).
 	passkey := auth.Group("/passkey")
+	passkey.Use(middleware.TenantHeaderMiddleware(m.store))
 	{
-		passkey.POST("/login/begin", m.PasskeyHandler.LoginBegin)
-		passkey.POST("/login/finish", m.PasskeyHandler.LoginFinish)
-		passkey.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
-		passkey.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
+		// Registration routes (with OIDC registration gate).
+		registration := passkey.Group("")
+		registration.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		{
+			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
+			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
+		}
+
+		// Login routes (with OIDC login gate).
+		login := passkey.Group("")
+		login.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		{
+			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
+			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
+		}
 	}
 
 	// OIDC authentication (public, no auth — redirects to IdP).
