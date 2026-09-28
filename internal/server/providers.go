@@ -223,7 +223,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
 	// latter hardcodes a nil blacklist, which is exactly what left Logout's
@@ -305,7 +305,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
 	// provider is combined with an AuthProvider under BackendProvider,
@@ -655,7 +655,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382).
 	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
@@ -1015,7 +1015,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). This
 	// provider never runs co-hosted with BackendProvider (see cmd/server -

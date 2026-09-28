@@ -86,17 +86,20 @@ func TestTokenBlacklist_Disabled_NoOps(t *testing.T) {
 	if err := b.RevokeUser(ctx, "user-1"); err != nil {
 		t.Fatalf("RevokeUser: %v", err)
 	}
-	if b.IsUserRevoked(ctx, "user-1", time.Now()) {
+	if b.IsUserRevoked(ctx, "user-1") {
 		t.Error("expected IsUserRevoked to always return false when disabled")
 	}
 }
 
-// TestTokenBlacklist_Cleanup_RemovesExpiredJTIsAndStaleRevocations exercises
-// cleanup() directly (it otherwise only ever runs on a real ticker via
-// Start/cleanupLoop, which no test invokes) - both the pre-existing
-// per-jti expiry sweep and the new per-user revocation retention sweep
-// (userRevocationRetention) added alongside RevokeUser/IsUserRevoked.
-func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsAndStaleRevocations(t *testing.T) {
+// TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations
+// exercises cleanup() directly (it otherwise only ever runs on a real
+// ticker via Start/cleanupLoop, which no test invokes): the per-jti expiry
+// sweep still runs, but user-level revocations (see IsUserRevoked's doc
+// comment) are never swept - a Copilot review finding (#391) flagged the
+// original time-bounded retention as unsound: it could expire a
+// revocation marker while a long-lived token for that user was still
+// otherwise valid.
+func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations(t *testing.T) {
 	ctx := context.Background()
 	b := newTestBlacklist(t)
 
@@ -106,18 +109,9 @@ func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsAndStaleRevocations(t *testing
 	if err := b.Add(ctx, "jti-live", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-
-	if err := b.RevokeUser(ctx, "user-stale"); err != nil {
+	if err := b.RevokeUser(ctx, "user-revoked-long-ago"); err != nil {
 		t.Fatalf("RevokeUser: %v", err)
 	}
-	if err := b.RevokeUser(ctx, "user-recent"); err != nil {
-		t.Fatalf("RevokeUser: %v", err)
-	}
-	// Backdate one revocation past the retention window directly (same
-	// package - unexported field access), the other stays recent.
-	b.mu.Lock()
-	b.userRevocations["user-stale"] = time.Now().Add(-(userRevocationRetention + time.Hour))
-	b.mu.Unlock()
 
 	b.cleanup()
 
@@ -130,17 +124,8 @@ func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsAndStaleRevocations(t *testing
 	if !b.IsBlacklisted(ctx, "jti-live") {
 		t.Error("expected jti-live to survive cleanup")
 	}
-
-	b.mu.RLock()
-	_, staleStillPresent := b.userRevocations["user-stale"]
-	_, recentStillPresent := b.userRevocations["user-recent"]
-	b.mu.RUnlock()
-
-	if staleStillPresent {
-		t.Error("expected user-stale's revocation entry to be removed by cleanup (past retention)")
-	}
-	if !recentStillPresent {
-		t.Error("expected user-recent's revocation entry to survive cleanup (within retention)")
+	if !b.IsUserRevoked(ctx, "user-revoked-long-ago") {
+		t.Error("expected a user revocation to survive cleanup regardless of age")
 	}
 }
 

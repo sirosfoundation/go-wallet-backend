@@ -145,7 +145,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

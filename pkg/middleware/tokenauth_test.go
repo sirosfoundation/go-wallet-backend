@@ -20,7 +20,9 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // stubTenantStore implements storage.TenantStore for testing.
@@ -127,7 +129,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -160,7 +162,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -178,7 +180,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -205,7 +207,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -230,7 +232,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -239,6 +241,82 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	if w.Code != 401 {
 		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// TestTokenAuthMiddleware_RevokedUserDenied proves the #391 review fix:
+// per-jti revocation is already enforced inside v.Validate itself (via the
+// go-tokenauth Validator's own Revocation checker - see
+// blacklistRevocationChecker in internal/server/providers.go), but that
+// checker only ever sees a jti, never a user_id, so account deletion's
+// bulk user-level revocation (TokenBlacklist.RevokeUser, #383) would
+// otherwise never be consulted for a token validated through this path -
+// only for the legacy AuthMiddlewareWithBlacklist path. TokenAuthMiddleware
+// must check it itself, using the blacklist passed in directly.
+func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	logger := zap.NewNop()
+
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "revoked-user"},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+	if err := blacklist.RevokeUser(context.Background(), "revoked-user"); err != nil {
+		t.Fatalf("RevokeUser: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for revoked user, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenAuthMiddleware_NonRevokedUserAllowed is the sanity check for the
+// test above: the same blacklist wiring still allows a token whose subject
+// hasn't been revoked.
+func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	logger := zap.NewNop()
+
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123"},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+	if err := blacklist.RevokeUser(context.Background(), "some-other-user"); err != nil {
+		t.Fatalf("RevokeUser: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-revoked user, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

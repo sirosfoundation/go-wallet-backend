@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -835,7 +836,35 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 
 // Logout invalidates the current session by blacklisting the JWT
 func (h *Handlers) Logout(c *gin.Context) {
-	// Get the token from context (set by auth middleware)
+	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
+	// - the path taken whenever AS is enabled), the raw token may be
+	// ES256/EdDSA-signed and the legacy HMAC re-parse below silently fails
+	// to extract its claims, so the jti never reaches the blacklist at all
+	// (#391 review). TokenAuthMiddleware already validated the token and
+	// left the result in context; use its jti directly instead of
+	// re-parsing.
+	if v, exists := c.Get("tokenauth_result"); exists {
+		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
+			if result.JTI != "" && h.services.TokenBlacklist != nil {
+				// claims.Result doesn't expose the token's own expiry (see
+				// go-tokenauth); fall back to the same conservative default
+				// the legacy path below uses when "exp" is missing - real
+				// access tokens expire well before this regardless.
+				expiry := time.Now().Add(24 * time.Hour)
+				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
+					h.logger.Warn("Failed to blacklist token", zap.Error(err))
+				} else {
+					h.logger.Info("User logged out, token blacklisted",
+						zap.String("jti", result.JTI),
+					)
+				}
+			}
+			c.JSON(200, gin.H{"message": "Logged out successfully"})
+			return
+		}
+	}
+
+	// Legacy HMAC path: get the token from context (set by auth middleware)
 	tokenString, exists := c.Get("token")
 	if !exists {
 		// No token? Already logged out effectively

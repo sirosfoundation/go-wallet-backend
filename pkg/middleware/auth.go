@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -18,13 +17,16 @@ import (
 )
 
 // TokenBlacklistChecker is an interface for checking if a token is
-// blacklisted, either individually by jti (e.g. an explicit logout) or, for
-// every token issued to a user at or before a given time, in bulk (e.g. an
-// account deletion, which has no way to enumerate every jti it ever issued -
-// see TokenBlacklist.RevokeUser).
+// blacklisted, either individually by jti (e.g. an explicit logout) or in
+// bulk for every token belonging to a user (e.g. an account deletion, which
+// has no way to enumerate every jti it ever issued - see
+// TokenBlacklist.RevokeUser). Shared by both the legacy HMAC path
+// (AuthMiddlewareWithBlacklist) and the go-tokenauth path
+// (TokenAuthMiddleware), so a revocation is honored regardless of which
+// authenticated the request.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string, issuedAt time.Time) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -138,11 +140,11 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 
 		// Check if the token is blacklisted (if a checker is configured) -
 		// either individually by jti (explicit logout) or in bulk for every
-		// token issued to this user at or before its own "iat" (account
-		// deletion - see TokenBlacklist.RevokeUser). Without this second
-		// check, deleting a user would only invalidate the one token used to
-		// request the deletion, leaving any other still-valid token for that
-		// user usable until it naturally expires (#383).
+		// token belonging to this user (account deletion - see
+		// TokenBlacklist.RevokeUser). Without this second check, deleting a
+		// user would only invalidate the one token used to request the
+		// deletion, leaving any other still-valid token for that user usable
+		// until it naturally expires (#383).
 		if blacklist != nil {
 			jti, _ := claims["jti"].(string)
 			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
@@ -154,11 +156,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				return
 			}
 
-			var issuedAt time.Time
-			if iat, ok := claims["iat"].(float64); ok {
-				issuedAt = time.Unix(int64(iat), 0)
-			}
-			if blacklist.IsUserRevoked(c.Request.Context(), userID, issuedAt) {
+			if blacklist.IsUserRevoked(c.Request.Context(), userID) {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", userID),
 				)

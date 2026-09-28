@@ -27,7 +27,7 @@ func TestLogoutHandler_Success(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -66,7 +66,7 @@ func TestLogoutHandler_NoSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -77,13 +77,64 @@ func TestLogoutHandler_NoSession(t *testing.T) {
 	}
 }
 
+// TestLogoutHandler_BlacklistsPresentedBearerToken proves the #391 review
+// fix: logging out doesn't just revoke the session (which only prevents
+// minting NEW tokens from it) - it also blacklists the specific bearer
+// access token presented alongside the session cookie, closing the gap
+// where a delegation-capable token could otherwise keep re-delegating
+// itself indefinitely after "logout" (delegation needs no live session at
+// all).
+func TestLogoutHandler_BlacklistsPresentedBearerToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	sess := &Session{
+		JTI:       "sess-logout-2",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	issuer := newTestTokenIssuer(t)
+	accessToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentClaims, err := issuer.ParseAndVerify(accessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blacklist := &fakeBlacklist{}
+
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, blacklist, true, logger))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-logout-2"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if !blacklist.IsBlacklisted(context.Background(), parentClaims.ID) {
+		t.Error("expected the presented bearer token's jti to be blacklisted on logout")
+	}
+}
+
 func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)

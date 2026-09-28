@@ -558,13 +558,32 @@ func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
 }
 
 // fakeBlacklist is a minimal TokenBlacklistChecker test double: a fixed set
-// of jtis considered revoked.
+// of jtis considered revoked, and a fixed set of revoked user IDs. Add
+// records what was added, for tests that need to assert on it.
 type fakeBlacklist struct {
-	revoked map[string]bool
+	revoked      map[string]bool
+	revokedUsers map[string]bool
+	added        map[string]time.Time
 }
 
 func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 	return f.revoked[jti]
+}
+
+func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+	return f.revokedUsers[userID]
+}
+
+func (f *fakeBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
+	if f.added == nil {
+		f.added = make(map[string]time.Time)
+	}
+	f.added[jti] = expiry
+	if f.revoked == nil {
+		f.revoked = make(map[string]bool)
+	}
+	f.revoked[jti] = true
+	return nil
 }
 
 func TestTokenEndpoint_Delegation_WrongAudienceDenied(t *testing.T) {
@@ -674,6 +693,38 @@ func TestTokenEndpoint_Delegation_NonRevokedParentAllowed(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for non-revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Delegation_RevokedUserDenied proves the #391 review
+// fix: a delegation-capable token whose OWN jti was never individually
+// blacklisted is still rejected once its subject (user) has been revoked
+// in bulk (see service.TokenBlacklist.RevokeUser / UserService.DeleteUser)
+// - checking the parent's jti alone missed this.
+func TestTokenEndpoint_Delegation_RevokedUserDenied(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's jti is NOT individually blacklisted, but its
+	// subject ("user-1") has been bulk-revoked.
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revokedUsers: map[string]bool{"user-1": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked user's parent token, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

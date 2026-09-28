@@ -10,29 +10,33 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// userRevocationRetention bounds how long a user-level revocation marker
-// (see RevokeUser) is kept once set. It is deliberately independent of any
-// particular token's own TTL - the cleanup loop has no visibility into
-// JWT.ExpiryHours or AS's per-audience TTLs - and is generous enough that no
-// legitimate token can outlive it; a token that would still pass this check
-// is one that has also long since failed its own "exp" claim check.
-const userRevocationRetention = 30 * 24 * time.Hour
-
 // TokenBlacklist manages revoked JWT tokens.
 // Tokens are stored until their expiry time, then automatically cleaned up.
 //
 // It also supports revoking every token for a user in one call (RevokeUser),
 // for use on account deletion (#383): unlike Add, which blacklists one
 // already-known jti, deletion has no way to enumerate every jti ever issued
-// to the user, so it instead records "reject anything issued at or before
-// this instant", which every currently-valid token predates by definition.
+// to the user, so it instead records "this user_id is permanently retired"
+// and IsUserRevoked rejects any token for it from then on.
+//
+// A user-revocation entry is never time-expired (unlike the per-jti
+// entries in tokens, which are only ever kept until the token's own exp):
+// user_id values are UUIDs minted fresh by domain.NewUserID() and are never
+// reissued to a different (or the same) user after deletion, so there is no
+// "issued before/after the revocation" window to reason about - the
+// revocation is simply permanent for that ID, and a time-based retention
+// window (an earlier version of this used a fixed 30-day one) risks
+// expiring the marker while a long-lived token for that same user_id is
+// still otherwise valid. The tradeoff is that this map grows by one entry
+// per account ever deleted and is never pruned - acceptable given how
+// small and infrequent that is compared to the tokens map's own entries.
 type TokenBlacklist struct {
 	config config.TokenBlacklistConfig
 	logger *zap.Logger
 
 	mu              sync.RWMutex
 	tokens          map[string]time.Time // jti -> expiry time
-	userRevocations map[string]time.Time // userID -> revoked-at time
+	userRevocations map[string]bool      // userID -> permanently revoked
 	stopChan        chan struct{}
 	wg              sync.WaitGroup
 }
@@ -44,7 +48,7 @@ func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *Tok
 		config:          cfg,
 		logger:          logger.Named("token-blacklist"),
 		tokens:          make(map[string]time.Time),
-		userRevocations: make(map[string]time.Time),
+		userRevocations: make(map[string]bool),
 		stopChan:        make(chan struct{}),
 	}
 }
@@ -110,20 +114,8 @@ func (b *TokenBlacklist) cleanup() {
 		)
 	}
 
-	revocationsRemoved := 0
-	for userID, revokedAt := range b.userRevocations {
-		if now.Sub(revokedAt) > userRevocationRetention {
-			delete(b.userRevocations, userID)
-			revocationsRemoved++
-		}
-	}
-
-	if revocationsRemoved > 0 {
-		b.logger.Debug("Cleaned up expired user revocation entries",
-			zap.Int("removed", revocationsRemoved),
-			zap.Int("remaining", len(b.userRevocations)),
-		)
-	}
+	// userRevocations is intentionally not swept here - see the type's doc
+	// comment for why a user-level revocation is permanent, not time-bound.
 }
 
 // Add adds a token JTI to the blacklist
@@ -178,11 +170,12 @@ func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 	return true
 }
 
-// RevokeUser marks every token issued to userID at or before now as revoked.
-// Used on account deletion (#383) so previously-issued tokens for that user
-// - not just the one used to authenticate the deletion request - stop
-// working immediately rather than lingering until they naturally expire.
-// Combine with IsUserRevoked, which callers check alongside IsBlacklisted.
+// RevokeUser permanently marks userID as revoked: every token for it,
+// regardless of when issued, is rejected from now on. Used on account
+// deletion (#383) so previously-issued tokens for that user - not just the
+// one used to authenticate the deletion request - stop working immediately
+// rather than lingering until they naturally expire. Combine with
+// IsUserRevoked, which callers check alongside IsBlacklisted.
 func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
 	if !b.config.Enabled {
 		return nil
@@ -195,21 +188,18 @@ func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.userRevocations[userID] = time.Now()
+	b.userRevocations[userID] = true
 
 	b.logger.Debug("All tokens revoked for user", zap.String("user_id", userID))
 
 	return nil
 }
 
-// IsUserRevoked reports whether userID has been revoked (via RevokeUser) at
-// or after issuedAt - i.e. whether a token for that user issued at issuedAt
+// IsUserRevoked reports whether userID has been permanently revoked (via
+// RevokeUser) - i.e. whether any token for that user, however it validated,
 // should be rejected even though its own jti was never individually
-// blacklisted. A zero issuedAt (e.g. a token missing/with an unparseable
-// "iat" claim) is treated as "issued before any revocation", which is the
-// fail-closed direction: it can only cause a token to be rejected once the
-// user has actually been revoked, never bypass a real revocation.
-func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string, issuedAt time.Time) bool {
+// blacklisted.
+func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
 	if !b.config.Enabled {
 		return false
 	}
@@ -221,12 +211,7 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string, issue
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	revokedAt, exists := b.userRevocations[userID]
-	if !exists {
-		return false
-	}
-
-	return !issuedAt.After(revokedAt)
+	return b.userRevocations[userID]
 }
 
 // Remove removes a token from the blacklist (if needed for admin override)

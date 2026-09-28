@@ -9,12 +9,19 @@ import (
 	"go.uber.org/zap"
 )
 
-// TokenBlacklistChecker is the subset of a token blacklist needed to check
-// whether a token has been revoked before it can be used to mint a
-// delegated token. Mirrors pkg/middleware.TokenBlacklistChecker's
-// IsBlacklisted shape; *service.TokenBlacklist satisfies this.
+// TokenBlacklistChecker is the token blacklist capability this package
+// needs: checking whether a token has been revoked before it can be used
+// to mint a delegated token - either the parent token's own jti (an
+// explicit logout/revocation) or, in bulk, every token belonging to its
+// subject (account deletion - see service.TokenBlacklist.RevokeUser) - and
+// writing a new revocation (Add), used by LogoutHandler to blacklist the
+// specific token being logged out. Mirrors pkg/middleware.
+// TokenBlacklistChecker's read methods plus service.TokenBlacklist's own
+// Add; *service.TokenBlacklist satisfies this.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
+	Add(ctx context.Context, jti string, expiry time.Time) error
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -287,12 +294,25 @@ func handleDelegationTokenRequest(
 
 	// A revoked parent token must not be usable to mint a fresh, differently
 	// -jti'd token - otherwise logout/account deletion (#382/#383) would not
-	// actually stop re-delegation. Only fails closed when a blacklist is
-	// actually wired (deps.blacklist != nil); ASModule always wires one from
-	// NewBackendProvider, so this is only ever nil in tests that don't care.
-	if deps.blacklist != nil && parentClaims.ID != "" && deps.blacklist.IsBlacklisted(c.Request.Context(), parentClaims.ID) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
-		return
+	// actually stop re-delegation. Checks both the parent's own jti
+	// (individually blacklisted, e.g. by AS logout - see LogoutHandler) and
+	// its subject in bulk (account deletion - see
+	// service.TokenBlacklist.RevokeUser): checking jti alone missed a
+	// different, not-yet-blacklisted delegation-capable token for the same
+	// deleted user still being exchangeable here (#391 review). Only fails
+	// closed when a blacklist is actually wired (deps.blacklist != nil);
+	// ASModule always wires one from NewBackendProvider, so this is only
+	// ever nil in tests that don't care.
+	if deps.blacklist != nil {
+		ctx := c.Request.Context()
+		if parentClaims.ID != "" && deps.blacklist.IsBlacklisted(ctx, parentClaims.ID) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
+			return
+		}
+		if deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
+			return
+		}
 	}
 
 	// Delegating token must have the 'k' permission.
