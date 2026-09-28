@@ -123,6 +123,78 @@ func TestPasskeyRegisterBegin_HeaderTenantWinsOverBody(t *testing.T) {
 	}
 }
 
+// Regression test for a Copilot review finding on this PR: RegisterFinish
+// must reject a request whose X-Tenant-ID header disagrees with the tenant
+// BeginRegistration actually recorded on the challenge. Without this, a
+// caller could begin under tenant A and finish the same challenge under
+// header tenant B, letting bind_identity enforcement run against the wrong
+// tenant's policy/IdP while the registration itself is still written under
+// A regardless. The mismatch must be caught before any credential parsing,
+// so a bogus/empty credential body is enough to prove it - the request
+// never gets that far.
+func TestPasskeyRegisterFinish_RejectsHeaderChallengeTenantMismatch(t *testing.T) {
+	router, store := setupPasskeyTenantTest(t)
+
+	mustCreateTenant(t, store, &domain.Tenant{ID: "tenant-a", Name: "Tenant A", Enabled: true})
+	mustCreateTenant(t, store, &domain.Tenant{ID: "tenant-b", Name: "Tenant B", Enabled: true})
+
+	beginUnderTenantA := func(t *testing.T) string {
+		t.Helper()
+		beginReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+		beginReq.Header.Set("Content-Type", "application/json")
+		beginReq.Header.Set("X-Tenant-ID", "tenant-a")
+		beginW := httptest.NewRecorder()
+		router.ServeHTTP(beginW, beginReq)
+		if beginW.Code != http.StatusOK {
+			t.Fatalf("begin: expected 200, got %d: %s", beginW.Code, beginW.Body.String())
+		}
+		var beginResp struct {
+			ChallengeID string `json:"challengeId"`
+		}
+		if err := json.Unmarshal(beginW.Body.Bytes(), &beginResp); err != nil {
+			t.Fatalf("failed to decode begin response: %v", err)
+		}
+		return beginResp.ChallengeID
+	}
+
+	t.Run("mismatched header tenant is rejected before touching the challenge's one-time use", func(t *testing.T) {
+		challengeID := beginUnderTenantA(t)
+
+		// Finish under a DIFFERENT header tenant than the one used to begin.
+		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
+		finishReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", strings.NewReader(finishBody))
+		finishReq.Header.Set("Content-Type", "application/json")
+		finishReq.Header.Set("X-Tenant-ID", "tenant-b")
+		finishW := httptest.NewRecorder()
+		router.ServeHTTP(finishW, finishReq)
+
+		if finishW.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 tenant mismatch, got %d: %s", finishW.Code, finishW.Body.String())
+		}
+		if !strings.Contains(finishW.Body.String(), "tenant mismatch") {
+			t.Errorf("expected tenant mismatch error, got: %s", finishW.Body.String())
+		}
+	})
+
+	t.Run("matching header tenant is not rejected as a mismatch", func(t *testing.T) {
+		challengeID := beginUnderTenantA(t)
+
+		// Finish under the SAME header tenant used to begin. This must clear
+		// the tenant-mismatch check and fail later, on the bogus credential,
+		// not be rejected as a tenant mismatch.
+		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
+		finishReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", strings.NewReader(finishBody))
+		finishReq.Header.Set("Content-Type", "application/json")
+		finishReq.Header.Set("X-Tenant-ID", "tenant-a")
+		finishW := httptest.NewRecorder()
+		router.ServeHTTP(finishW, finishReq)
+
+		if finishW.Code == http.StatusForbidden && strings.Contains(finishW.Body.String(), "tenant mismatch") {
+			t.Errorf("matching header tenant must not be rejected as a tenant mismatch, got: %s", finishW.Body.String())
+		}
+	})
+}
+
 // (b) An invite-required tenant cannot be bypassed by omitting the body's
 // tenantId (which used to skip tenant lookup - and therefore the invite
 // check - entirely, defaulting to the "default" tenant) or by supplying a

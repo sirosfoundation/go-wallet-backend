@@ -215,6 +215,18 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: the tenant that actually governs this registration is
+	// whichever tenant BeginRegistration recorded on the challenge - not
+	// necessarily this request's X-Tenant-ID header. Without this, a caller
+	// could begin under tenant A and finish the very same challenge with a
+	// different header tenant B: the bind_identity check below would then
+	// run against B's policy (and B's OIDC issuer) while the registration is
+	// still written under A regardless of what B required, or vice versa.
+	// FinishRegistration enforces this against the challenge's real tenant
+	// and rejects with ErrTenantMismatch on a mismatch (found by Copilot on
+	// this PR; see #374's follow-up).
+	req.ExpectedTenantID = string(requestTenantID(c))
+
 	// SECURITY: when the tenant requires identity binding, an OIDC gate
 	// result MUST be present before we ever call FinishRegistration — this
 	// mirrors internal/api/handlers.go's FinishWebAuthnRegistration, which
@@ -272,6 +284,8 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "authenticator not allowed"})
 		case errors.Is(err, service.ErrInvalidInvite):
 			c.JSON(http.StatusForbidden, gin.H{"error": "invite_invalid"})
+		case errors.Is(err, service.ErrTenantMismatch):
+			c.JSON(http.StatusForbidden, gin.H{"error": "tenant mismatch"})
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "registration failed: " + err.Error()})
 		}
