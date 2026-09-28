@@ -407,6 +407,18 @@ func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
 }
 
+// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its
+// handshake honors revocation (both per-jti and per-user) the same way the
+// HTTP auth middlewares do - see wsengine.TokenBlacklistChecker's doc
+// comment for exactly what this covers versus what a shared
+// *tokenvalidator.Validator (see SetTokenValidator) already checks on its
+// own (#391 review, round 2: the engine's own token validation was found to
+// bypass revocation entirely on the legacy path, and user-level revocation
+// even on the go-tokenauth path).
+func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
+	p.manager.SetTokenBlacklist(b)
+}
+
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {

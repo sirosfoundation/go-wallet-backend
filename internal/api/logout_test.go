@@ -135,3 +135,37 @@ func TestHandlers_Logout_ASToken(t *testing.T) {
 		t.Error("expected the AS-issued token's jti to be blacklisted via tokenauth_result")
 	}
 }
+
+// TestMaxConfiguredASTokenTTL proves the #391 review fix (round 2): the
+// blacklist entry Logout creates for an AS-issued token is sized from the
+// AS's own configured TTLs, not a fixed guess that an operator's
+// AudienceTTLs/DefaultTokenTTL could exceed.
+func TestMaxConfiguredASTokenTTL(t *testing.T) {
+	cfg := &config.Config{
+		AS: config.ASConfig{
+			DefaultTokenTTL: 2 * time.Minute,
+			AudienceTTLs: map[string]time.Duration{
+				"wallet-backend": time.Minute,
+				"wallet-engine":  48 * time.Hour, // longer than the old fixed 24h fallback
+			},
+		},
+	}
+
+	got := maxConfiguredASTokenTTL(cfg)
+	want := 48 * time.Hour
+	if got != want {
+		t.Errorf("maxConfiguredASTokenTTL() = %v, want %v", got, want)
+	}
+}
+
+func TestMaxConfiguredASTokenTTL_NoAudienceOverrides(t *testing.T) {
+	cfg := &config.Config{
+		AS: config.ASConfig{DefaultTokenTTL: 2 * time.Minute},
+	}
+
+	got := maxConfiguredASTokenTTL(cfg)
+	want := 2 * time.Minute
+	if got != want {
+		t.Errorf("maxConfiguredASTokenTTL() = %v, want %v", got, want)
+	}
+}

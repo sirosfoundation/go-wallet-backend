@@ -834,6 +834,24 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	c.Status(204)
 }
 
+// maxConfiguredASTokenTTL returns the longest lifetime the AS is configured
+// to issue an access token for, across DefaultTokenTTL and every
+// per-audience override in AudienceTTLs - used by Logout to size a
+// blacklist entry for an AS-issued token whose actual expiry isn't exposed
+// by go-tokenauth's validation result. Falls back to DefaultTokenTTL alone
+// (2m by default - see config.ASConfig.SetDefaults) if AS isn't configured
+// at all, which is harmless: an AS-disabled deployment never reaches this
+// code path (see Logout's tokenauth_result branch).
+func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
+	longest := cfg.AS.DefaultTokenTTL
+	for _, ttl := range cfg.AS.AudienceTTLs {
+		if ttl > longest {
+			longest = ttl
+		}
+	}
+	return longest
+}
+
 // Logout invalidates the current session by blacklisting the JWT
 func (h *Handlers) Logout(c *gin.Context) {
 	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
@@ -847,10 +865,14 @@ func (h *Handlers) Logout(c *gin.Context) {
 		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
 			if result.JTI != "" && h.services.TokenBlacklist != nil {
 				// claims.Result doesn't expose the token's own expiry (see
-				// go-tokenauth); fall back to the same conservative default
-				// the legacy path below uses when "exp" is missing - real
-				// access tokens expire well before this regardless.
-				expiry := time.Now().Add(24 * time.Hour)
+				// go-tokenauth), so derive the blacklist entry's lifetime
+				// from the AS's own configured token TTLs instead of
+				// guessing a fixed duration: an operator can configure
+				// cfg.AS.DefaultTokenTTL/AudienceTTLs longer than any fixed
+				// guess, and a too-short one would let the blacklist entry
+				// (and therefore the token) become valid again before the
+				// token itself actually expires (#391 review, round 2).
+				expiry := time.Now().Add(maxConfiguredASTokenTTL(h.cfg) + time.Minute)
 				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
 					h.logger.Warn("Failed to blacklist token", zap.Error(err))
 				} else {

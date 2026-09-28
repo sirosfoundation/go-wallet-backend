@@ -31,6 +31,27 @@ var (
 	ErrTooManyPendingFlows = errors.New("too many pending flows")
 )
 
+// TokenBlacklistChecker is the subset of a token blacklist this package
+// needs to reject a revoked token during the WebSocket handshake - either
+// individually by jti (explicit logout) or in bulk for a user (account
+// deletion - see service.TokenBlacklist.RevokeUser). Mirrors
+// pkg/middleware.TokenBlacklistChecker's shape; *service.TokenBlacklist
+// satisfies this.
+//
+// validateToken's go-tokenauth branch relies on the shared
+// *tokenvalidator.Validator (see SetTokenValidator) already having its own
+// per-jti Revocation checker wired to the same blacklist instance (see
+// internal/server.blacklistRevocationChecker) - this field only adds the
+// user-level check that checker's interface can't express, and is the ONLY
+// revocation check at all for the legacy HMAC branch, which the shared
+// Validator never touches (#391 review, round 2: this handshake path was
+// found to bypass both TokenAuthMiddleware's own user-level check and, for
+// legacy tokens, revocation entirely).
+type TokenBlacklistChecker interface {
+	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
+}
+
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
@@ -148,6 +169,10 @@ type Manager struct {
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
 
+	// blacklist checks token/user revocation during the handshake (optional
+	// - see TokenBlacklistChecker's doc comment).
+	blacklist TokenBlacklistChecker
+
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(sessions):
 	// sessions are only registered post-handshake, so counting only sessions
@@ -205,6 +230,14 @@ func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 // SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
+}
+
+// SetTokenBlacklist sets the token blacklist consulted during the
+// WebSocket handshake - see TokenBlacklistChecker's doc comment for what
+// this covers versus what the shared *tokenvalidator.Validator already
+// checks on its own.
+func (m *Manager) SetTokenBlacklist(b TokenBlacklistChecker) {
+	m.blacklist = b
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -683,11 +716,22 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if !result.HasAudience("wallet-registry", "wallet-backend") {
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
+		// Per-jti revocation is already enforced inside Validate itself (the
+		// shared Validator's own Revocation checker - see
+		// internal/server.blacklistRevocationChecker); user-level revocation
+		// is not, since that checker's interface only ever sees a jti (see
+		// #391 review, round 2).
+		if m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID) {
+			return "", "", "", errors.New("token has been revoked")
+		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
-	// Legacy path: direct HMAC validation
+	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
+	// above, nothing else in this path ever checks revocation at all, so
+	// both checks below are needed, not just the user-level one (#391
+	// review, round 2).
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
@@ -708,6 +752,15 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
+		}
+		if m.blacklist != nil {
+			ctx := context.Background()
+			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
+				return "", "", "", errors.New("token has been revoked")
+			}
+			if m.blacklist.IsUserRevoked(ctx, userID) {
+				return "", "", "", errors.New("token has been revoked")
+			}
 		}
 		return userID, tenantID, "", nil
 	}
