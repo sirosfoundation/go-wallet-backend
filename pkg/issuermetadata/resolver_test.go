@@ -520,13 +520,14 @@ func TestResolve_SignedNotAcceptable_BothFail(t *testing.T) {
 	}
 }
 
-// TestResolve_PreferUnsigned_NoRetryOn406 verifies that when signed metadata is
-// not preferred there is a single request (no unsigned retry).
-func TestResolve_PreferUnsigned_NoRetryOn406(t *testing.T) {
+// TestResolve_PreferUnsigned_RetriesSignedOn406 verifies that when unsigned
+// metadata is preferred and the issuer 406s the JSON request, the resolver
+// retries once with application/jwt before surfacing the error.
+func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
 	pref := false
-	var attempts int
+	var accepts []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
+		accepts = append(accepts, r.Header.Get("Accept"))
 		w.WriteHeader(http.StatusNotAcceptable)
 	}))
 	defer server.Close()
@@ -536,10 +537,13 @@ func TestResolve_PreferUnsigned_NoRetryOn406(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
-		t.Error("expected error for 406")
+		t.Error("expected error when both representations return 406")
 	}
-	if attempts != 1 {
-		t.Errorf("PreferSigned=false must not retry; got %d requests", attempts)
+	if len(accepts) != 2 {
+		t.Fatalf("expected 2 requests (json then signed retry), got %d: %v", len(accepts), accepts)
+	}
+	if accepts[0] != "application/json" || accepts[1] != "application/jwt" {
+		t.Errorf("unexpected Accept sequence: %v", accepts)
 	}
 }
 
@@ -1048,11 +1052,10 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	resolver, _ := New(Config{AllowHTTP: true})
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
-	if !strings.Contains(acceptHeader, "application/jwt") {
-		t.Errorf("expected Accept header to include application/jwt, got %q", acceptHeader)
-	}
-	if !strings.Contains(acceptHeader, "application/json") {
-		t.Errorf("expected Accept header to include application/json, got %q", acceptHeader)
+	// Default prefers signed: the first (and here only) request advertises
+	// application/jwt. Unsigned JSON is requested separately, only on a 406.
+	if acceptHeader != "application/jwt" {
+		t.Errorf("expected preferred Accept header application/jwt, got %q", acceptHeader)
 	}
 }
 
