@@ -1,0 +1,316 @@
+package as
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
+)
+
+// capturingWebAuthn is a WebAuthnProvider test double that records the
+// request it was called with, so tests can assert what the handler actually
+// passed down to the service layer (e.g. the resolved OIDCGateBinding).
+type capturingWebAuthn struct {
+	mockWebAuthn
+	lastFinishRegReq   *service.FinishRegistrationRequest
+	lastFinishLoginReq *service.FinishLoginRequest
+}
+
+func (m *capturingWebAuthn) FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error) {
+	m.lastFinishRegReq = req
+	return m.mockWebAuthn.FinishRegistration(ctx, req)
+}
+
+func (m *capturingWebAuthn) FinishLogin(ctx context.Context, req *service.FinishLoginRequest) (*service.FinishLoginResponse, error) {
+	m.lastFinishLoginReq = req
+	return m.mockWebAuthn.FinishLogin(ctx, req)
+}
+
+// contextInjector builds middleware that sets the gin context keys
+// TenantHeaderMiddleware and OIDCGateMiddleware would normally set, so
+// handler-level tests can exercise the bind_identity / OIDC-gate branches
+// directly without standing up the full middleware + storage stack (that
+// integration path is covered separately in passkey_tenant_test.go).
+func contextInjector(tenant *domain.Tenant, oidcResult *oidc.ValidationResult) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if tenant != nil {
+			c.Set("tenant", tenant)
+		}
+		if oidcResult != nil {
+			c.Set(middleware.OIDCGateContextKey, oidcResult)
+		}
+		c.Next()
+	}
+}
+
+func newTestPasskeyHandlers(webauthn WebAuthnProvider) (*PasskeyHandlers, *MemorySessionStore) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	cfg := &config.ASConfig{
+		DefaultMaxTAC:   "rwl",
+		SessionTTL:      24 * time.Hour,
+		InsecureCookies: true,
+	}
+	return NewPasskeyHandlers(webauthn, store, nil, cfg, zap.NewNop()), store
+}
+
+func gatedTenant(bindIdentity bool, regOP *domain.OIDCProviderConfig) *domain.Tenant {
+	return &domain.Tenant{
+		ID:      "gated",
+		Name:    "Gated",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode:           domain.OIDCGateModeRegistration,
+			BindIdentity:   bindIdentity,
+			RegistrationOP: regOP,
+		},
+	}
+}
+
+func TestPasskeyRegisterFinish_BindIdentity_MissingOIDCResult(t *testing.T) {
+	mock := &capturingWebAuthn{}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(gatedTenant(true, &domain.OIDCProviderConfig{Issuer: "https://idp.example.com"}), nil))
+	router.POST("/finish", h.RegisterFinish)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPasskeyRegisterFinish_BindIdentity_Misconfigured(t *testing.T) {
+	mock := &capturingWebAuthn{}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(
+		gatedTenant(true, nil), // BindIdentity enabled, but no RegistrationOP configured.
+		&oidc.ValidationResult{Issuer: "https://idp.example.com", Subject: "user-1", Claims: nil},
+	))
+	router.POST("/finish", h.RegisterFinish)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPasskeyRegisterFinish_BindIdentity_IssuerMismatch(t *testing.T) {
+	mock := &capturingWebAuthn{}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(
+		gatedTenant(true, &domain.OIDCProviderConfig{Issuer: "https://expected-idp.example.com"}),
+		&oidc.ValidationResult{Issuer: "https://attacker-idp.example.com", Subject: "user-1"},
+	))
+	router.POST("/finish", h.RegisterFinish)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 oidc_issuer_mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPasskeyRegisterFinish_BindIdentity_Success(t *testing.T) {
+	mock := &capturingWebAuthn{
+		mockWebAuthn: mockWebAuthn{
+			finishRegResp: &service.FinishRegistrationResponse{UUID: "user-1", TenantID: "gated"},
+		},
+	}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(
+		gatedTenant(true, &domain.OIDCProviderConfig{Issuer: "https://idp.example.com"}),
+		&oidc.ValidationResult{
+			Issuer:  "https://idp.example.com",
+			Subject: "user-1",
+			Claims:  map[string]interface{}{"email": "user@example.com"},
+		},
+	))
+	router.POST("/finish", h.RegisterFinish)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if mock.lastFinishRegReq.OIDCGateBinding == nil {
+		t.Fatal("expected OIDCGateBinding to be populated on the request passed to FinishRegistration")
+	}
+	if mock.lastFinishRegReq.OIDCGateBinding.Email != "user@example.com" {
+		t.Errorf("expected email user@example.com, got %q", mock.lastFinishRegReq.OIDCGateBinding.Email)
+	}
+	if mock.lastFinishRegReq.OIDCGateBinding.BindingType != "registration" {
+		t.Errorf("expected binding type registration, got %q", mock.lastFinishRegReq.OIDCGateBinding.BindingType)
+	}
+}
+
+func TestPasskeyRegisterFinish_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"challenge not found", service.ErrChallengeNotFound, http.StatusNotFound},
+		{"challenge expired", service.ErrChallengeExpired, http.StatusGone},
+		{"verification failed", service.ErrVerificationFailed, http.StatusBadRequest},
+		{"aaguid blacklisted", service.ErrAAGUIDBlacklisted, http.StatusForbidden},
+		{"invalid invite", service.ErrInvalidInvite, http.StatusForbidden},
+		{"unmapped error", fmt.Errorf("boom"), http.StatusBadRequest},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{finishRegErr: tc.err}}
+			h, _ := newTestPasskeyHandlers(mock)
+
+			router := gin.New()
+			router.POST("/finish", h.RegisterFinish)
+
+			body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+			req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPasskeyLoginFinish_OIDCGateBindingPopulated(t *testing.T) {
+	mock := &capturingWebAuthn{
+		mockWebAuthn: mockWebAuthn{
+			finishLoginResp: &service.FinishLoginResponse{UUID: "user-1", TenantID: "tenant-1"},
+		},
+	}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(nil, &oidc.ValidationResult{
+		Issuer:  "https://idp.example.com",
+		Subject: "user-1",
+		Claims:  map[string]interface{}{"email": "user@example.com"},
+	}))
+	router.POST("/finish", h.LoginFinish)
+
+	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if mock.lastFinishLoginReq.OIDCGateBinding == nil {
+		t.Fatal("expected OIDCGateBinding to be populated on the request passed to FinishLogin")
+	}
+	if mock.lastFinishLoginReq.OIDCGateBinding.Email != "user@example.com" {
+		t.Errorf("expected email user@example.com, got %q", mock.lastFinishLoginReq.OIDCGateBinding.Email)
+	}
+}
+
+func TestPasskeyLoginFinish_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"oidc gate required", service.ErrOIDCGateRequired, http.StatusUnauthorized},
+		{"tenant access denied", service.ErrTenantAccessDenied, http.StatusForbidden},
+		{"identity not bound", service.ErrIdentityNotBound, http.StatusForbidden},
+		{"identity binding mismatch", service.ErrIdentityBindingMismatch, http.StatusForbidden},
+		{"unmapped error", fmt.Errorf("boom"), http.StatusUnauthorized},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{finishLoginErr: tc.err}}
+			h, _ := newTestPasskeyHandlers(mock)
+
+			router := gin.New()
+			router.POST("/finish", h.LoginFinish)
+
+			body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+			req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPasskeyRegisterBegin_ErrorMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{"tenant not found", service.ErrTenantNotFound, http.StatusNotFound},
+		{"invite required", service.ErrInviteRequired, http.StatusForbidden},
+		{"invalid invite", service.ErrInvalidInvite, http.StatusForbidden},
+		{"unmapped error", fmt.Errorf("boom"), http.StatusInternalServerError},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{beginRegErr: tc.err}}
+			h, _ := newTestPasskeyHandlers(mock)
+
+			router := gin.New()
+			router.POST("/begin", h.RegisterBegin)
+
+			req := httptest.NewRequest(http.MethodPost, "/begin", nil)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
+			}
+		})
+	}
+}

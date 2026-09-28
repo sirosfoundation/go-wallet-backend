@@ -2,9 +2,16 @@ package as
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -254,5 +261,83 @@ func TestPasskeyRegisterBegin_UnknownHeaderTenantRejected(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 tenant not found, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestNewASModule_WiresPasskeyTenantPerimeter exercises the actual
+// production wiring path (NewASModule, not a hand-built ASModule struct
+// literal), proving the constructor itself sets up the store and
+// validatorCache fields RegisterRoutes needs for the tenant-header and
+// OIDC-gate middleware on /auth/passkey/* - the perimeter this PR adds.
+func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Write a temp ECDSA signing key for the AS's KeyManager.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "ec.pem")
+	f, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatalf("create key file: %v", err)
+	}
+	if err := pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}); err != nil {
+		t.Fatalf("encode key: %v", err)
+	}
+	f.Close()
+
+	store := memory.NewStore()
+	mustCreateTenant(t, store, &domain.Tenant{ID: "tenant-a", Name: "Tenant A", Enabled: true})
+
+	webauthnSvc, err := service.NewWebAuthnService(store, &config.Config{
+		Server: config.ServerConfig{RPName: "Test App", RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: "test-jwt-secret-that-is-long-enough-32", Issuer: "test-issuer", ExpiryHours: 24},
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("failed to create webauthn service: %v", err)
+	}
+
+	asCfg := &config.ASConfig{
+		SigningKeyPath:  keyPath,
+		Issuer:          "https://auth.example.com",
+		DefaultMaxTAC:   "rwl",
+		SessionTTL:      24 * time.Hour,
+		InsecureCookies: true,
+	}
+	jwtCfg := &config.JWTConfig{Issuer: "test-issuer"}
+
+	m, err := NewASModule(context.Background(), asCfg, jwtCfg, webauthnSvc, store, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewASModule: %v", err)
+	}
+
+	router := gin.New()
+	authGroup := router.Group("/auth")
+	m.RegisterRoutes(authGroup)
+
+	// The tenant-header middleware NewASModule wired up must reject an
+	// unknown tenant, and the passkey handlers it constructed must serve a
+	// known one - end to end, through the constructor this test targets.
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", "does-not-exist")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tenant, got %d: %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for known tenant, got %d: %s", w.Code, w.Body.String())
 	}
 }
