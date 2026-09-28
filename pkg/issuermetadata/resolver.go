@@ -277,9 +277,9 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
 	// metadata, some issuers reject the application/jwt Accept with 406 instead
 	// of falling back to JSON; retry once requesting unsigned JSON in that case.
-	accepts := []string{"application/json"}
+	accepts := []string{"application/json", "application/jwt"}
 	if r.preferSigned() {
-		accepts = append([]string{"application/jwt"}, accepts...)
+		accepts = []string{"application/jwt", "application/json"}
 	}
 
 	var lastStatus int
