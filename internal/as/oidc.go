@@ -199,42 +199,10 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		return
 	}
 
-	// Validate state against stored challenge.
-	challenge, err := h.store.Challenges().GetByID(c.Request.Context(), state)
-	if err != nil {
-		h.logger.Warn("OIDC state not found", zap.Error(err))
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired state"})
+	challenge, ok := h.validateCallbackState(c, state)
+	if !ok {
 		return
 	}
-
-	if challenge.Action != oidcChallengeAction {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid state"})
-		return
-	}
-
-	if time.Now().After(challenge.ExpiresAt) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "state expired"})
-		return
-	}
-
-	// Verify the state-binding cookie set at /auth/oidc/login matches this
-	// state, before doing anything else with it. This ties the callback to
-	// the browser that initiated the flow: without it, a completed
-	// (state, code) callback obtained via one browser (e.g. the attacker's
-	// own login attempt) could be replayed into a victim's browser, which
-	// would otherwise pass the checks above purely from server-side state
-	// storage. See go-wallet-backend#385 / T-4.
-	if !verifyOIDCStateCookie(c, h.stateSecret, state, h.cfg.InsecureCookies) {
-		h.logger.Warn("OIDC state cookie missing or mismatched")
-		_ = h.store.Challenges().Delete(c.Request.Context(), state)
-		clearOIDCStateCookie(c, h.cfg.InsecureCookies)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "state cookie mismatch"})
-		return
-	}
-	clearOIDCStateCookie(c, h.cfg.InsecureCookies)
-
-	// Clean up challenge.
-	_ = h.store.Challenges().Delete(c.Request.Context(), state)
 
 	tenantID := challenge.TenantID
 
@@ -360,6 +328,45 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	})
 }
 
+// validateCallbackState validates the state param against its stored
+// challenge (existence, action, expiry) and its browser-binding cookie
+// (go-wallet-backend#385 / T-4: without the cookie check, a completed
+// (state, code) callback obtained via one browser - e.g. the attacker's own
+// login attempt - could be replayed into a victim's browser, since the
+// checks above alone only rely on server-side state storage). On any
+// failure it writes the JSON error response itself and returns ok=false.
+// The challenge is deleted and the cookie cleared exactly once, on every
+// path, so neither can be replayed for a second callback attempt.
+func (h *OIDCHandlers) validateCallbackState(c *gin.Context, state string) (challenge *domain.WebauthnChallenge, ok bool) {
+	challenge, err := h.store.Challenges().GetByID(c.Request.Context(), state)
+	if err != nil {
+		h.logger.Warn("OIDC state not found", zap.Error(err))
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired state"})
+		return nil, false
+	}
+
+	if challenge.Action != oidcChallengeAction {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid state"})
+		return nil, false
+	}
+
+	if time.Now().After(challenge.ExpiresAt) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "state expired"})
+		return nil, false
+	}
+
+	cookieOK := verifyOIDCStateCookie(c, h.stateSecret, state, h.cfg.InsecureCookies)
+	clearOIDCStateCookie(c, h.cfg.InsecureCookies)
+	_ = h.store.Challenges().Delete(c.Request.Context(), state)
+	if !cookieOK {
+		h.logger.Warn("OIDC state cookie missing or mismatched")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "state cookie mismatch"})
+		return nil, false
+	}
+
+	return challenge, true
+}
+
 // hasAdminClaim checks OIDC claims for admin group/role membership.
 func hasAdminClaim(claims map[string]interface{}) bool {
 	// Check common group/role claim patterns.
@@ -386,14 +393,13 @@ func generateOIDCState() (string, error) {
 }
 
 // generatePKCECodeVerifier generates a PKCE code_verifier per RFC 7636 §4.1:
-// a high-entropy cryptographically random string. 32 random bytes base64url-
-// encoded (43 chars) comfortably satisfies the 43-128 character requirement.
+// a high-entropy cryptographically random string. Reuses generateOIDCState's
+// 32-random-bytes/base64url construction (43 chars, comfortably within the
+// 43-128 character requirement) - a PKCE code_verifier has the same
+// "unguessable random token" requirement as an OIDC state value, so a
+// second implementation would just be the same code under a different name.
 func generatePKCECodeVerifier() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	return generateOIDCState()
 }
 
 // pkceCodeChallengeS256 computes the PKCE code_challenge for the S256
