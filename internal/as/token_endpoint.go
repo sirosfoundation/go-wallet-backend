@@ -1,6 +1,7 @@
 package as
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -8,12 +9,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// TokenBlacklistChecker is the subset of a token blacklist needed to check
+// whether a token has been revoked before it can be used to mint a
+// delegated token. Mirrors pkg/middleware.TokenBlacklistChecker's
+// IsBlacklisted shape; *service.TokenBlacklist satisfies this.
+type TokenBlacklistChecker interface {
+	IsBlacklisted(ctx context.Context, jti string) bool
+}
+
 // tokenDeps groups the shared dependencies for token issuance handlers.
 type tokenDeps struct {
-	issuer  *TokenIssuer
-	policy  PolicyEngine
-	ttlFunc func(string) time.Duration
-	logger  *zap.Logger
+	issuer *TokenIssuer
+	policy PolicyEngine
+	// ttlFunc, audiences and blacklist are used differently across the two
+	// token-issuance paths: ttlFunc for both; audiences and blacklist only
+	// by handleDelegationTokenRequest, which is the only path that verifies
+	// an already-issued Bearer token rather than trusting a server-side
+	// session record.
+	ttlFunc   func(string) time.Duration
+	audiences []string
+	blacklist TokenBlacklistChecker
+	logger    *zap.Logger
 }
 
 // TokenResponse is the response body for POST /auth/token.
@@ -37,11 +53,20 @@ func TokenEndpointHandler(
 	issuer *TokenIssuer,
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
+	audiences []string,
+	blacklist TokenBlacklistChecker,
 	insecureCookies bool,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: insecureCookies}
-	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger}
+	deps := &tokenDeps{
+		issuer:    issuer,
+		policy:    policy,
+		ttlFunc:   ttlFunc,
+		audiences: audiences,
+		blacklist: blacklist,
+		logger:    logger,
+	}
 	return func(c *gin.Context) {
 		var req TokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -234,10 +259,27 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	// Parse the delegating token without audience restriction — we need its claims.
-	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, nil)
+	// Parse the delegating token, restricted to this AS's own accepted
+	// audiences (config.ASConfig.Audiences - the same list go-tokenauth's
+	// Validator enforces for every other resource-endpoint request, see
+	// NewBackendProvider). Without this, a token minted for any audience at
+	// all could be replayed here to mint a delegated token for a completely
+	// different one (T-1). An empty deps.audiences skips the check, exactly
+	// like ParseAndVerify's own "when empty, audience validation is skipped"
+	// behavior for every other caller.
+	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, deps.audiences)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid delegating token"})
+		return
+	}
+
+	// A revoked parent token must not be usable to mint a fresh, differently
+	// -jti'd token - otherwise logout/account deletion (#382/#383) would not
+	// actually stop re-delegation. Only fails closed when a blacklist is
+	// actually wired (deps.blacklist != nil); ASModule always wires one from
+	// NewBackendProvider, so this is only ever nil in tests that don't care.
+	if deps.blacklist != nil && parentClaims.ID != "" && deps.blacklist.IsBlacklisted(c.Request.Context(), parentClaims.ID) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
 		return
 	}
 
@@ -349,8 +391,10 @@ func RegisterTokenEndpoint(
 	issuer *TokenIssuer,
 	policy PolicyEngine,
 	ttlFunc func(string) time.Duration,
+	audiences []string,
+	blacklist TokenBlacklistChecker,
 	insecureCookies bool,
 	logger *zap.Logger,
 ) {
-	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, insecureCookies, logger))
+	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, audiences, blacklist, insecureCookies, logger))
 }

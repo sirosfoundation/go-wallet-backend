@@ -337,18 +337,25 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 
 // Storage handlers - Credentials
 
-// getHolderDID retrieves the holder DID from context
+// getHolderDID retrieves the canonical holder DID for the authenticated
+// caller. It is always derived from user_id via domain.HolderDID, never
+// trusted from the token's own "did" claim: legacy HMAC tokens carry both
+// "did" and "user_id" (with did == domain.HolderDID(user_id) - see
+// UserService.generateToken / WebAuthnService.generateToken), but AS-issued
+// tokens (internal/as/token.go) carry only "sub"/user_id and no "did" claim
+// at all. Preferring "did" when present used to give the same physical user
+// two different holder identities depending on which token type
+// authenticated the request, making their previously stored credentials
+// invisible under the other (#384). Deriving from user_id alone, always,
+// keeps both token types resolving to the same identity - and reproduces
+// the exact value legacy tokens' own "did" claim already carried, so
+// existing stored credentials stay reachable.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
-	did, exists := c.Get("did")
-	if exists && did.(string) != "" {
-		return did.(string), true
-	}
-	// Fallback to user_id if did is not set
 	userID, exists := c.Get("user_id")
 	if !exists {
 		return "", false
 	}
-	return userID.(string), true
+	return domain.HolderDID(userID.(string)), true
 }
 
 // getTenantID retrieves the tenant ID from context.
@@ -877,7 +884,11 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	holderDID := userID.(string) // Using userID as holderDID
+	// Use the same canonical holder DID resolution as every other credential
+	// operation (see getHolderDID) - not the raw user_id - so this actually
+	// finds and deletes the credentials/presentations that were stored under
+	// it (#384).
+	holderDID, _ := h.getHolderDID(c)
 
 	if err := h.services.User.DeleteUser(
 		c.Request.Context(),

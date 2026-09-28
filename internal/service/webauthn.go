@@ -641,7 +641,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	user := &domain.User{
 		UUID:        userID,
 		DisplayName: &displayName,
-		DID:         fmt.Sprintf("did:key:%s", userID.String()),
+		DID:         domain.HolderDID(userID.String()),
 		WalletType:  domain.WalletTypeClient,
 		Keys:        req.Keys,
 		PrivateData: req.PrivateData,

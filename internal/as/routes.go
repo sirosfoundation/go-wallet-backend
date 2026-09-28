@@ -24,8 +24,13 @@ type ASModule struct {
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
 	OIDCHandler    *OIDCHandlers
-	Logger         *zap.Logger
-	Config         *config.ASConfig
+	// Blacklist checks whether a token has been revoked (via Logout/user
+	// deletion - see #382/#383). Used by the delegation-exchange path in
+	// TokenEndpointHandler so a revoked parent token can't be re-delegated
+	// into a fresh one (#381). Nil if the caller didn't wire one.
+	Blacklist TokenBlacklistChecker
+	Logger    *zap.Logger
+	Config    *config.ASConfig
 }
 
 // NewASModule creates and initializes the AS module.
@@ -37,6 +42,7 @@ func NewASModule(
 	jwtCfg *config.JWTConfig,
 	webauthnSvc *service.WebAuthnService,
 	store storage.Store,
+	blacklist TokenBlacklistChecker,
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
@@ -98,6 +104,7 @@ func NewASModule(
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
 		OIDCHandler:    oidcHandler,
+		Blacklist:      blacklist,
 		Logger:         logger,
 		Config:         cfg,
 	}, nil
@@ -128,6 +135,8 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// Token endpoint (requires session cookie).
 	RegisterTokenEndpoint(auth, m.Sessions, m.TokenIssuer, m.Policy,
 		func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
+		m.Config.Audiences,
+		m.Blacklist,
 		m.Config.InsecureCookies,
 		m.Logger,
 	)

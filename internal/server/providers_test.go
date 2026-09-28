@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	legacyjwt "github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -31,6 +32,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
@@ -1170,5 +1172,115 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 	router2.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("different caller: status = %d, want %d (must not share the exhausted caller's lockout)", w.Code, http.StatusOK)
+	}
+}
+
+// createLegacyTestToken signs a legacy HMAC token exactly like
+// UserService/WebAuthnService's generateToken - the format
+// AuthMiddlewareWithBlacklist parses.
+func createLegacyTestToken(secret, userID, tenantID, jti string) string {
+	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"user_id":   userID,
+		"tenant_id": tenantID,
+		"jti":       jti,
+		"iat":       time.Now().Unix(),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	signed, _ := token.SignedString([]byte(secret))
+	return signed
+}
+
+// TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage proves
+// #382/#383 end-to-end through the actual production wiring
+// (NewBackendProvider), not a hand-assembled test router with a manually
+// injected blacklist: a token blacklisted by hitting the real Logout route
+// (registered on AuthProvider's routes) is rejected on StorageProvider's
+// routes too - the two providers used to each build their own, unshared
+// TokenBlacklist instance, so this would previously have kept working.
+func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret-for-e2e-blacklist"
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: secret, ExpiryHours: 24, Issuer: "test"},
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+		},
+		Features: config.FeaturesConfig{
+			CredentialStorageEnabled: true,
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, logger, []string{"auth", "storage"})
+	if err != nil {
+		t.Fatalf("NewBackendProvider() error = %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	tokenStr := createLegacyTestToken(secret, "user-e2e", "default", "jti-e2e-1")
+
+	// Storage route works before logout.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /storage/vc before logout: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// Log out via the auth provider's own route.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/user/session/logout", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /user/session/logout: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// The same token must now be rejected on the STORAGE provider's routes,
+	// not just the auth provider's own - proving the blacklist instance is
+	// actually shared between them.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("GET /storage/vc after logout: status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestBlacklistRevocationChecker_AdaptsToServiceBlacklist proves the
+// go-tokenauth revocation.Checker adapter (blacklistRevocationChecker,
+// wired into tokenvalidator.Config.Revocation in NewBackendProvider and
+// NewWalletProviderProvider) correctly reflects a *service.TokenBlacklist's
+// own state. Without this, AS-issued/legacy tokens validated through
+// go-tokenauth - the path taken whenever AS is enabled - would never
+// consult the blacklist at all, even after #382/#383's other fixes.
+func TestBlacklistRevocationChecker_AdaptsToServiceBlacklist(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := config.TokenBlacklistConfig{Enabled: true}
+	blacklist := service.NewTokenBlacklist(cfg, logger)
+	checker := blacklistRevocationChecker{blacklist: blacklist}
+
+	ctx := context.Background()
+	if checker.IsRevoked(ctx, "jti-1") {
+		t.Error("expected jti-1 not to be revoked before Add")
+	}
+
+	if err := blacklist.Add(ctx, "jti-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if !checker.IsRevoked(ctx, "jti-1") {
+		t.Error("expected jti-1 to be revoked after Add")
+	}
+	if checker.IsRevoked(ctx, "jti-2") {
+		t.Error("expected unrelated jti-2 not to be revoked")
 	}
 }

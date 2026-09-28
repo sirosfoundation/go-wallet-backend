@@ -22,9 +22,19 @@ import (
 
 func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, nil, nil)
+	return router, store, issuer
+}
 
-	// Generate signing key.
+// newTestTokenIssuer builds a TokenIssuer backed by a freshly generated
+// signing key, independent of any particular router - so a test can mint a
+// token with one TokenIssuer and then verify a blacklist/audience check
+// against it using a second, separately configured router that still trusts
+// the same key (see TestTokenEndpoint_Delegation_RevokedParentDenied).
+func newTestTokenIssuer(t *testing.T) *TokenIssuer {
+	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -47,17 +57,34 @@ func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenI
 		t.Fatal(err)
 	}
 
-	issuer := NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
+	return NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
 		return 2 * time.Minute
 	})
+}
+
+// setupRouterWithIssuer wires the /auth/token endpoint using the given
+// issuer, accepted audiences and blacklist.
+func setupRouterWithIssuer(t *testing.T, issuer *TokenIssuer, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
 
 	store := NewMemorySessionStore()
 	logger := zap.NewNop()
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
+	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, audiences, blacklist, true, logger)
 
+	return router, store
+}
+
+// setupTokenEndpointWithDeps is setupTokenEndpoint but lets a test supply
+// the accepted audiences and a blacklist for delegation-exchange checks
+// (#381), rather than always skipping them the way setupTokenEndpoint does.
+func setupTokenEndpointWithDeps(t *testing.T, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
+	t.Helper()
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, audiences, blacklist)
 	return router, store, issuer
 }
 
@@ -182,7 +209,7 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
+	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, nil, nil, true, logger)
 
 	sess := &Session{
 		JTI:       "sess-deny",
@@ -511,6 +538,126 @@ func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
 	}
 	if !claims.TAC.Has(TACDelegate) {
 		t.Error("re-delegated token should have 'k' permission")
+	}
+}
+
+// fakeBlacklist is a minimal TokenBlacklistChecker test double: a fixed set
+// of jtis considered revoked.
+type fakeBlacklist struct {
+	revoked map[string]bool
+}
+
+func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
+	return f.revoked[jti]
+}
+
+func TestTokenEndpoint_Delegation_WrongAudienceDenied(t *testing.T) {
+	// Only "wallet-backend" is an accepted audience for this AS - matches
+	// how cfg.AS.Audiences restricts every other token operation (see
+	// NewBackendProvider).
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	// Parent token was minted for a different audience entirely.
+	parentToken, err := issuer.Issue("user-1", "some-other-service", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_MatchingAudienceAllowed(t *testing.T) {
+	// Sanity check for the test above: the same restricted-audiences setup
+	// still allows delegation when the parent token's audience is accepted.
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	parentToken, err := issuer.Issue("user-1", "wallet-backend", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_RevokedParentDenied(t *testing.T) {
+	// Same issuer/signing key used for both the token that gets minted and
+	// the router that verifies it - only the blacklist differs - so the
+	// rejection below is actually caused by the revocation check, not a
+	// signature mismatch from using two unrelated keys.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentClaims, err := issuer.ParseAndVerify(parentToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's own jti is already revoked (mirrors a
+	// Logout/DeleteUser having blacklisted it - #382/#383).
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{parentClaims.ID: true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_NonRevokedParentAllowed(t *testing.T) {
+	// Sanity check for the test above: the same blacklist wiring still
+	// allows delegation when the parent token's jti isn't on it.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{"some-other-jti": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-revoked parent token, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

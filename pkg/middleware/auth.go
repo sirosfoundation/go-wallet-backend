@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -16,9 +17,14 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// TokenBlacklistChecker is an interface for checking if a token is blacklisted
+// TokenBlacklistChecker is an interface for checking if a token is
+// blacklisted, either individually by jti (e.g. an explicit logout) or, for
+// every token issued to a user at or before a given time, in bulk (e.g. an
+// account deletion, which has no way to enumerate every jti it ever issued -
+// see TokenBlacklist.RevokeUser).
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string, issuedAt time.Time) bool
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -122,7 +128,21 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			return
 		}
 
-		// Check if token is blacklisted (if blacklist is configured)
+		// Get user_id from claims
+		userID, ok := claims["user_id"].(string)
+		if !ok {
+			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
+			c.Abort()
+			return
+		}
+
+		// Check if the token is blacklisted (if a checker is configured) -
+		// either individually by jti (explicit logout) or in bulk for every
+		// token issued to this user at or before its own "iat" (account
+		// deletion - see TokenBlacklist.RevokeUser). Without this second
+		// check, deleting a user would only invalidate the one token used to
+		// request the deletion, leaving any other still-valid token for that
+		// user usable until it naturally expires (#383).
 		if blacklist != nil {
 			jti, _ := claims["jti"].(string)
 			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
@@ -133,14 +153,19 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				c.Abort()
 				return
 			}
-		}
 
-		// Get user_id from claims
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
-			c.Abort()
-			return
+			var issuedAt time.Time
+			if iat, ok := claims["iat"].(float64); ok {
+				issuedAt = time.Unix(int64(iat), 0)
+			}
+			if blacklist.IsUserRevoked(c.Request.Context(), userID, issuedAt) {
+				logger.Warn("Token for revoked user used",
+					zap.String("user_id", userID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Get did from claims

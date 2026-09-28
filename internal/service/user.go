@@ -56,6 +56,7 @@ type UserService struct {
 	cfg            *config.Config
 	logger         *zap.Logger
 	sessionCleaner SessionCleaner
+	tokenBlacklist *TokenBlacklist
 }
 
 // NewUserService creates a new UserService
@@ -71,6 +72,14 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 // When set, DeleteUser will purge active sessions for the deleted user.
 func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
 	s.sessionCleaner = sc
+}
+
+// SetTokenBlacklist sets the token blacklist. When set, DeleteUser revokes
+// every previously-issued token for the deleted user (not just the single
+// token used to authenticate the deletion request), so they stop working
+// immediately instead of remaining valid until they naturally expire (#383).
+func (s *UserService) SetTokenBlacklist(b *TokenBlacklist) {
+	s.tokenBlacklist = b
 }
 
 // Register registers a new user
@@ -106,7 +115,7 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 
 	// Generate DID
 	// TODO: Implement proper DID generation based on key material
-	user.DID = fmt.Sprintf("did:key:%s", user.UUID.String())
+	user.DID = domain.HolderDID(user.UUID.String())
 
 	// Compute private data ETag
 	if len(user.PrivateData) > 0 {
@@ -315,6 +324,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
+		}
+	}
+
+	// Revoke all previously-issued tokens for this user (#383). Logout only
+	// ever blacklists the single token used for that request; without this,
+	// any of the deleted user's other still-valid tokens (a different
+	// device, a token minted before this request's) would keep working
+	// until they naturally expire.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
 		}
 	}
 
