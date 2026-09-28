@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -225,6 +226,136 @@ func TestLogoutHandler_BlacklistsLegacyBearerToken(t *testing.T) {
 	}
 	if !blacklist.IsBlacklisted(context.Background(), legacyClaims.ID) {
 		t.Error("expected the legacy bearer token's jti to be blacklisted on logout")
+	}
+}
+
+// TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken is the legacy
+// -issuer counterpart of TestLogoutHandler_RefusesToBlacklistOtherUsersToken.
+func TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	sess := &Session{
+		JTI:       "sess-logout-5",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	legacyIssuer := NewLegacyTokenIssuer([]byte("test-legacy-secret-32-bytes-long!"), "test-issuer", time.Hour)
+	otherUsersToken, err := legacyIssuer.Issue("user-2", "did:key:user-2", "tenant-1", "test-rp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUsersClaims, err := legacyIssuer.Validate(otherUsersToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blacklist := &fakeBlacklist{}
+
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, true, logger))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-logout-5"})
+	req.Header.Set("Authorization", "Bearer "+otherUsersToken)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+	if blacklist.IsBlacklisted(context.Background(), otherUsersClaims.ID) {
+		t.Error("must not blacklist a legacy bearer token belonging to a different user than the session")
+	}
+}
+
+// erroringBlacklist wraps fakeBlacklist but makes Add always fail, to
+// exercise the "failed to blacklist ... on logout" warn-log paths in
+// blacklistOwnBearerToken - which must not turn logout itself into a
+// failure (the handler still returns 204).
+type erroringBlacklist struct {
+	fakeBlacklist
+}
+
+func (e *erroringBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
+	return errors.New("simulated blacklist write failure")
+}
+
+// TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout proves a blacklist
+// write failure while logging out (asymmetric-token path) is logged but
+// doesn't turn session logout itself into a failure.
+func TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	sess := &Session{
+		JTI:       "sess-logout-6",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	issuer := newTestTokenIssuer(t)
+	accessToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, &erroringBlacklist{}, true, logger))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-logout-6"})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 even when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout is the
+// legacy-issuer counterpart of the test above.
+func TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	sess := &Session{
+		JTI:       "sess-logout-7",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	legacyIssuer := NewLegacyTokenIssuer([]byte("test-legacy-secret-32-bytes-long!"), "test-issuer", time.Hour)
+	legacyToken, err := legacyIssuer.Issue("user-1", "did:key:user-1", "tenant-1", "test-rp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, &erroringBlacklist{}, true, logger))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-logout-7"})
+	req.Header.Set("Authorization", "Bearer "+legacyToken)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 even when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

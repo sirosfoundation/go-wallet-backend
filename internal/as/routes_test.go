@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -140,5 +141,52 @@ func TestNewASModule_WiresBlacklistAndRegistersRoutes(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("delegation with revoked parent: status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer proves the #391
+// review fix (round 3): m.LegacyIssuer must validate legacy appTokens
+// against jwtCfg.Issuer, not cfg.Issuer (the AS's own, separately
+// configurable, asymmetric-token issuer identity) - a real legacy appToken
+// (as minted by UserService/WebAuthnService's generateToken) always
+// carries "iss": jwtCfg.Issuer, never cfg.Issuer. This test deliberately
+// configures the two differently, mirroring the deployment shape the
+// review flagged.
+func TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeTestSigningKey(t, dir)
+
+	cfg := &config.ASConfig{
+		SigningKeyPath: keyPath,
+		Issuer:         "https://as.example.com", // deliberately different from jwtCfg.Issuer below
+		ExternalURL:    "https://as.example.com",
+		Legacy:         config.ASLegacyConfig{Enabled: true},
+	}
+	cfg.SetDefaults()
+	jwtCfg := &config.JWTConfig{
+		Secret:      "test-secret-that-is-at-least-32-bytes!",
+		Issuer:      "test-wallet-backend-issuer",
+		ExpiryHours: 24,
+	}
+
+	store := memory.NewStore()
+	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, nil, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewASModule() error = %v", err)
+	}
+	if m.LegacyIssuer == nil {
+		t.Fatal("expected LegacyIssuer to be constructed (Legacy.Enabled=true)")
+	}
+
+	// Simulate a real legacy appToken exactly as UserService/WebAuthnService
+	// mint one: signed with the same secret, "iss" = jwtCfg.Issuer.
+	legacyAppTokenIssuer := NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, time.Hour)
+	appToken, err := legacyAppTokenIssuer.Issue("user-1", "did:key:user-1", "tenant-1", "test-rp")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	if _, err := m.LegacyIssuer.Validate(appToken); err != nil {
+		t.Errorf("expected a real legacy appToken (iss=jwtCfg.Issuer) to validate against m.LegacyIssuer, got: %v", err)
 	}
 }

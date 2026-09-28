@@ -169,3 +169,36 @@ func TestMaxConfiguredASTokenTTL_NoAudienceOverrides(t *testing.T) {
 		t.Errorf("maxConfiguredASTokenTTL() = %v, want %v", got, want)
 	}
 }
+
+// TestTTLForTokenAuthResult proves the #391 review fix (round 3):
+// go-tokenauth's Validator "auto-detects new-style vs legacy" tokens, so
+// Logout's tokenauth_result branch is reached for BOTH kinds, and a legacy
+// token's real lifetime (JWT.ExpiryHours, typically ~24h) is very different
+// from an AS-issued token's (DefaultTokenTTL/AudienceTTLs, typically
+// minutes) - using the wrong one would size the blacklist entry far too
+// short for whichever kind wasn't intended.
+func TestTTLForTokenAuthResult(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{ExpiryHours: 24},
+		AS: config.ASConfig{
+			DefaultTokenTTL: 2 * time.Minute,
+			AudienceTTLs:    map[string]time.Duration{"wallet-engine": 5 * time.Minute},
+		},
+	}
+
+	t.Run("legacy mode uses JWT.ExpiryHours", func(t *testing.T) {
+		got := ttlForTokenAuthResult(cfg, &tokenauthclaims.Result{Mode: tokenauthclaims.ModeLegacy})
+		want := 24 * time.Hour
+		if got != want {
+			t.Errorf("ttlForTokenAuthResult() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("session mode uses the AS's configured TTLs", func(t *testing.T) {
+		got := ttlForTokenAuthResult(cfg, &tokenauthclaims.Result{Mode: tokenauthclaims.ModeSession})
+		want := 5 * time.Minute
+		if got != want {
+			t.Errorf("ttlForTokenAuthResult() = %v, want %v", got, want)
+		}
+	})
+}

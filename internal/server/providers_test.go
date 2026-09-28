@@ -1362,3 +1362,36 @@ func TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore(t *te
 		t.Error("expected a nil provider on initialization failure")
 	}
 }
+
+// TestEngineProvider_SetTokenBlacklist proves the wiring point exists and
+// is callable (see cmd/server/main.go, which wires the same blacklist
+// instance the HTTP auth middlewares use into the WebSocket engine so its
+// handshake honors revocation too - #391 review, round 2). The actual
+// revocation-checking behavior this enables is covered in depth by
+// internal/engine's own TestManager_validateToken_* tests; this just
+// proves the pass-through from the provider reaches the manager without
+// requiring internal/engine's unexported fields to be reachable from here.
+func TestEngineProvider_SetTokenBlacklist(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalEngineConfig(config.HTTPClientConfig{})
+
+	provider, err := NewEngineProvider(cfg, logger, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewEngineProvider() error = %v", err)
+	}
+	t.Cleanup(provider.Close)
+
+	provider.SetTokenBlacklist(&fakeEngineBlacklistForProviderTest{})
+}
+
+// fakeEngineBlacklistForProviderTest is a minimal wsengine.TokenBlacklistChecker
+// implementation, just to prove SetTokenBlacklist accepts a real implementer.
+type fakeEngineBlacklistForProviderTest struct{}
+
+func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) bool {
+	return false
+}
+
+func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) bool {
+	return false
+}

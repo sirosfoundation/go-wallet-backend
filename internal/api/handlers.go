@@ -852,6 +852,20 @@ func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
 	return longest
 }
 
+// ttlForTokenAuthResult returns the lifetime to size a logout blacklist
+// entry for, given the mode go-tokenauth validated the token as. Its own
+// Validator "auto-detects new-style vs legacy" (see TokenAuthMiddleware's
+// doc comment), so tokenauth_result is populated for both kinds of token,
+// not just AS-issued ones, and each has its own, very different, configured
+// lifetime - see maxConfiguredASTokenTTL's doc comment and #391 review,
+// round 3.
+func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) time.Duration {
+	if result.Mode == tokenauthclaims.ModeLegacy {
+		return time.Duration(cfg.JWT.ExpiryHours) * time.Hour
+	}
+	return maxConfiguredASTokenTTL(cfg)
+}
+
 // Logout invalidates the current session by blacklisting the JWT
 func (h *Handlers) Logout(c *gin.Context) {
 	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
@@ -864,15 +878,7 @@ func (h *Handlers) Logout(c *gin.Context) {
 	if v, exists := c.Get("tokenauth_result"); exists {
 		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
 			if result.JTI != "" && h.services.TokenBlacklist != nil {
-				// claims.Result doesn't expose the token's own expiry (see
-				// go-tokenauth), so derive the blacklist entry's lifetime
-				// from the AS's own configured token TTLs instead of
-				// guessing a fixed duration: an operator can configure
-				// cfg.AS.DefaultTokenTTL/AudienceTTLs longer than any fixed
-				// guess, and a too-short one would let the blacklist entry
-				// (and therefore the token) become valid again before the
-				// token itself actually expires (#391 review, round 2).
-				expiry := time.Now().Add(maxConfiguredASTokenTTL(h.cfg) + time.Minute)
+				expiry := time.Now().Add(ttlForTokenAuthResult(h.cfg, result) + time.Minute)
 				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
 					h.logger.Warn("Failed to blacklist token", zap.Error(err))
 				} else {

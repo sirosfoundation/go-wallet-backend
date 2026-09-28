@@ -60,12 +60,20 @@ func NewASModule(
 		return cfg.GetTokenTTL(aud)
 	})
 
-	// Legacy issuer (uses existing HMAC secret).
+	// Legacy issuer (uses existing HMAC secret). Deliberately jwtCfg.Issuer,
+	// NOT the `issuer` var above: legacy appTokens are always minted by
+	// UserService/WebAuthnService's own generateToken with "iss":
+	// jwtCfg.Issuer, regardless of what cfg.AS.Issuer is separately
+	// configured as (the AS's own asymmetric tokenIssuer's identity). Using
+	// `issuer` here previously meant an operator who set cfg.AS.Issuer
+	// differently from cfg.JWT.Issuer got every legacy token rejected by
+	// this issuer, including - silently - LogoutHandler's legacy-token
+	// blacklisting fallback (#391 review, round 3).
 	var legacyIssuer *LegacyTokenIssuer
 	if cfg.Legacy.Enabled {
 		legacyIssuer = NewLegacyTokenIssuer(
 			[]byte(jwtCfg.Secret),
-			issuer,
+			jwtCfg.Issuer,
 			time.Duration(jwtCfg.ExpiryHours)*time.Hour,
 		)
 	}
