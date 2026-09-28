@@ -63,6 +63,10 @@ const (
 	ClientIDSchemeX509SANURI              = "x509_san_uri"
 	ClientIDSchemeX509Hash                = "x509_hash"
 	ClientIDSchemeVerifierAttestation     = "verifier_attestation"
+	// clientIDSchemeVerifierAttestationPrefix is ClientIDSchemeVerifierAttestation
+	// spelled as the client_id prefix it actually appears as on the wire
+	// ("verifier_attestation:<sub>"), per OID4VP §5.9.3.4.
+	clientIDSchemeVerifierAttestationPrefix = ClientIDSchemeVerifierAttestation + ":"
 )
 
 // Response mode constants
@@ -657,7 +661,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		// Validate that attestation sub matches client_id (without the scheme prefix)
-		expectedSub := strings.TrimPrefix(authReq.ClientID, "verifier_attestation:")
+		expectedSub := strings.TrimPrefix(authReq.ClientID, clientIDSchemeVerifierAttestationPrefix)
 		if attestation.Subject != expectedSub {
 			return nil, fmt.Errorf("attestation sub %q does not match client_id %q", attestation.Subject, expectedSub)
 		}
@@ -690,7 +694,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// The request JWT's signature has been verified above against the
 		// cnf key bound to the attestation's sub, so the cache identity is
 		// the attested subject, not the bare claimed client_id/URL.
-		verifiedIdentity = "verifier_attestation:" + attestation.Subject
+		verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject
 
 	default:
 		// redirect_uri and other schemes: extract key material best-effort
@@ -753,14 +757,21 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// OID4VCIHandler.evaluateTrust's issuer-side pattern (see oid4vci.go): if
 	// the PDP call errors, that fails closed (untrusted) rather than
 	// falling back to asking the client.
+	authCtx := verifierAuthContext{
+		keyMaterial:        keyMaterial,
+		attestationContext: attestationContext,
+		requiresResolution: requiresResolution,
+		requestJWT:         requestJWT,
+	}
+
 	if trustEndpoint := h.Config.Trust.GetVerifierPDPURL(); trustEndpoint != "" {
-		return h.evaluateVerifierTrustViaPDP(ctx, authReq, verifier, keyMaterial, trustEndpoint, cacheKey, canonicalURL)
+		return h.evaluateVerifierTrustViaPDP(ctx, authReq, verifier, authCtx, trustEndpoint, cacheKey, canonicalURL)
 	}
 
 	// Fallback: frontend-mediated trust evaluation (legacy path). Used only
 	// when no verifier PDP is configured at all - the intentional,
 	// permissive dev/no-PDP mode. Its verdict is never cached.
-	return h.evaluateVerifierTrustViaFrontend(ctx, authReq, verifier, keyMaterial, attestationContext, requiresResolution, requestJWT, canonicalURL)
+	return h.evaluateVerifierTrustViaFrontend(ctx, authReq, verifier, authCtx, canonicalURL)
 }
 
 // evaluateVerifierTrustViaPDP evaluates verifier trust by calling the
@@ -777,18 +788,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 // Only a result produced by this function is ever written to the trust
 // cache (via cacheVerifierTrust) - a client-asserted verdict from
 // evaluateVerifierTrustViaFrontend never is.
-func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, keyMaterial *KeyMaterial, trustEndpoint, cacheKey, canonicalURL string) (*VerifierInfo, error) {
+func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, authCtx verifierAuthContext, trustEndpoint, cacheKey, canonicalURL string) (*VerifierInfo, error) {
 	evalCtx := ctx
 	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
 		evalCtx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
 	}
 
 	var tkm *trust.KeyMaterial
-	if keyMaterial != nil {
+	if authCtx.keyMaterial != nil {
 		tkm = &trust.KeyMaterial{
-			Type: keyMaterial.Type,
-			X5C:  keyMaterial.X5C,
-			JWK:  keyMaterial.JWK,
+			Type: authCtx.keyMaterial.Type,
+			X5C:  authCtx.keyMaterial.X5C,
+			JWK:  authCtx.keyMaterial.JWK,
 		}
 	}
 
@@ -848,26 +859,28 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	return verifier, nil
 }
 
-// evaluateVerifierTrustViaFrontend delegates trust evaluation to the
-// frontend/SDK. This is the legacy path: used only when no verifier PDP is
-// configured at all (h.Config.Trust.GetVerifierPDPURL() is empty) - the
-// intentional, permissive dev/no-PDP mode. The engine sends a
-// trust_evaluation_required progress, the frontend calls /v1/evaluate, and
-// sends back a trust_result action.
-//
-// The resulting verdict is client-asserted, not independently checked by a
-// PDP, so - unlike evaluateVerifierTrustViaPDP - it is deliberately never
-// written to the trust cache. Caching it would let a single
-// attacker-controlled answer (plus attacker-controlled name/logo from
-// client_metadata) stand in as ground truth for every subsequent request
-// against this identity for the whole cache TTL.
-func (h *OID4VPHandler) evaluateVerifierTrustViaFrontend(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, keyMaterial *KeyMaterial, attestationContext map[string]interface{}, requiresResolution bool, requestJWT string, canonicalURL string) (*VerifierInfo, error) {
-	// Build trust evaluation request for frontend
+// verifierAuthContext bundles the scheme-derived material
+// evaluateVerifierTrust extracts (see its switch over authReq.ClientIDScheme)
+// before dispatching to either evaluateVerifierTrustViaPDP or
+// evaluateVerifierTrustViaFrontend, so callers don't have to thread each
+// field through as its own parameter.
+type verifierAuthContext struct {
+	keyMaterial        *KeyMaterial
+	attestationContext map[string]interface{}
+	requiresResolution bool
+	requestJWT         string
+}
+
+// buildVerifierTrustRequest constructs the TrustEvaluationRequest sent to the
+// frontend for verifier trust evaluation: base subject/key-material fields,
+// response/redirect URI context, any JAR trust_chain header (OID4VP
+// §5.9.3.6), and any verifier_attestation context.
+func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAuthContext, logger *zap.Logger) *TrustEvaluationRequest {
 	trustReq := &TrustEvaluationRequest{
 		SubjectID:          authReq.ClientID,
 		SubjectType:        SubjectTypeCredentialVerifier,
-		RequiresResolution: requiresResolution,
-		RequestJWT:         requestJWT,
+		RequiresResolution: authCtx.requiresResolution,
+		RequestJWT:         authCtx.requestJWT,
 		Context: map[string]interface{}{
 			"client_id_scheme": authReq.ClientIDScheme,
 		},
@@ -887,25 +900,44 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaFrontend(ctx context.Context, au
 	if authReq.RequestJWT != "" {
 		if trustChain := trust.ExtractTrustChainFromJWT(authReq.RequestJWT); len(trustChain) > 0 {
 			trustReq.Context["trust_chain"] = trustChain
-			h.Logger.Debug("Forwarding trust_chain from JAR header",
+			logger.Debug("Forwarding trust_chain from JAR header",
 				zap.String("verifier", authReq.ClientID),
 				zap.Int("chain_length", len(trustChain)))
 		}
 	}
 
 	// Forward attestation context if present (verifier_attestation scheme)
-	for k, v := range attestationContext {
+	for k, v := range authCtx.attestationContext {
 		trustReq.Context[k] = v
 	}
 
 	// Convert key material for frontend
-	if keyMaterial != nil {
+	if authCtx.keyMaterial != nil {
 		trustReq.KeyMaterial = &TrustKeyMaterial{
-			Type: keyMaterial.Type,
-			X5C:  keyMaterial.X5C,
-			JWK:  keyMaterial.JWK,
+			Type: authCtx.keyMaterial.Type,
+			X5C:  authCtx.keyMaterial.X5C,
+			JWK:  authCtx.keyMaterial.JWK,
 		}
 	}
+
+	return trustReq
+}
+
+// evaluateVerifierTrustViaFrontend delegates trust evaluation to the
+// frontend/SDK. This is the legacy path: used only when no verifier PDP is
+// configured at all (h.Config.Trust.GetVerifierPDPURL() is empty) - the
+// intentional, permissive dev/no-PDP mode. The engine sends a
+// trust_evaluation_required progress, the frontend calls /v1/evaluate, and
+// sends back a trust_result action.
+//
+// The resulting verdict is client-asserted, not independently checked by a
+// PDP, so - unlike evaluateVerifierTrustViaPDP - it is deliberately never
+// written to the trust cache. Caching it would let a single
+// attacker-controlled answer (plus attacker-controlled name/logo from
+// client_metadata) stand in as ground truth for every subsequent request
+// against this identity for the whole cache TTL.
+func (h *OID4VPHandler) evaluateVerifierTrustViaFrontend(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo, authCtx verifierAuthContext, canonicalURL string) (*VerifierInfo, error) {
+	trustReq := buildVerifierTrustRequest(authReq, authCtx, h.Logger)
 
 	// Send trust evaluation request to frontend
 	if err := trustReq.Validate(); err != nil {
@@ -1622,7 +1654,7 @@ func inferClientIDScheme(clientID string) string {
 		return ClientIDSchemeX509SANDNS
 	case strings.HasPrefix(clientID, "x509_san_uri:"):
 		return ClientIDSchemeX509SANURI
-	case strings.HasPrefix(clientID, "verifier_attestation:"):
+	case strings.HasPrefix(clientID, clientIDSchemeVerifierAttestationPrefix):
 		return ClientIDSchemeVerifierAttestation
 	case strings.HasPrefix(clientID, "https://"), strings.HasPrefix(clientID, "http://"):
 		// HTTPS/HTTP URLs default to redirect_uri scheme
