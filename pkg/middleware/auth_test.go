@@ -200,6 +200,33 @@ func TestAuthMiddleware_WrongSecret(t *testing.T) {
 	}
 }
 
+func TestAuthMiddleware_MissingUserID(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
+
+	// A token that's otherwise valid (correctly signed, not expired) but
+	// carries no "user_id" claim at all.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
 // createBlacklistTestRouter is like createTestRouter but wires
 // AuthMiddlewareWithBlacklist with a real blacklist, the same way
 // internal/server/providers.go wires it for production request paths (see
