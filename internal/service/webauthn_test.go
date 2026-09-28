@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -1424,6 +1425,234 @@ func TestFullLoginFlow_CloneWarningSurfaced(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, user.WebauthnCredentials, 1)
 	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
+}
+
+// ============================================================================
+// Storage-layer failure paths for the atomic challenge/invite consumption
+// (issues #379, #378) — a real storage outage on ConsumeByID/MarkCompleted,
+// as opposed to the "already consumed" case covered by the concurrency tests
+// in internal/storage/memory and internal/storage/mongodb.
+// ============================================================================
+
+// erroringChallengeStore wraps a real storage.ChallengeStore and forces
+// ConsumeByID to return an arbitrary (non-ErrNotFound) error for one
+// specific challenge ID, so tests can exercise the generic
+// "failed to consume challenge" error-wrapping branch in
+// FinishRegistration/FinishLogin/FinishAddCredential without needing a real
+// storage outage.
+type erroringChallengeStore struct {
+	storage.ChallengeStore
+	failID string
+	err    error
+}
+
+func (e *erroringChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByID(ctx, id)
+}
+
+// storeWithChallengeOverride wraps *memory.Store, swapping out just the
+// Challenges() accessor so every other collection still behaves like the
+// real in-memory store.
+type storeWithChallengeOverride struct {
+	*memory.Store
+	challenges storage.ChallengeStore
+}
+
+func (s *storeWithChallengeOverride) Challenges() storage.ChallengeStore { return s.challenges }
+
+func TestConsumeChallenge_GenericStorageError_IsWrapped(t *testing.T) {
+	wantErr := errors.New("simulated storage outage")
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+
+	t.Run("FinishRegistration", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishRegistration(context.Background(), &FinishRegistrationRequest{
+			ChallengeID: "boom-challenge",
+		})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("FinishLogin", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishLogin(context.Background(), &FinishLoginRequest{
+			ChallengeID: "boom-challenge",
+		})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("FinishAddCredential", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		userID := domain.NewUserID()
+		require.NoError(t, baseStore.Users().Create(context.Background(), &domain.User{UUID: userID}))
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishAddCredential(context.Background(), userID, &FinishAddCredentialRequest{
+			ChallengeID: "boom-challenge",
+		}, "")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+}
+
+// erroringInviteStore wraps a real storage.InviteStore and forces
+// MarkCompleted to fail for one specific invite code, regardless of the
+// invite's actual state. This lets a single-threaded test exercise the
+// "atomic invite claim failed, reject registration before the user account
+// is created" branch that fixes issue #378, without needing a second
+// goroutine to actually race it (that race is covered separately by
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner in
+// internal/storage/memory).
+type erroringInviteStore struct {
+	storage.InviteStore
+	failCode string
+	err      error
+}
+
+func (e *erroringInviteStore) MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error {
+	if code == e.failCode {
+		return e.err
+	}
+	return e.InviteStore.MarkCompleted(ctx, tenantID, code, usedBy)
+}
+
+// storeWithInviteOverride wraps *memory.Store, swapping out just the
+// Invites() accessor.
+type storeWithInviteOverride struct {
+	*memory.Store
+	invites storage.InviteStore
+}
+
+func (s *storeWithInviteOverride) Invites() storage.InviteStore { return s.invites }
+
+// TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated
+// covers issue #378: when the atomic invite claim (MarkCompleted) fails —
+// here simulated directly, the concurrent-loser case is covered by
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner — FinishRegistration
+// must reject the registration with ErrInvalidInvite and must NOT have
+// created the user account or tenant membership. Before the W-1 fix,
+// MarkCompleted ran after Users().Create()/AddMembership, so this same
+// failure would have left a committed, usable account behind.
+func TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:          domain.TenantID("tenant-invite-fail"),
+		Name:        "Invite Fail Tenant",
+		DisplayName: "Invite Fail Tenant",
+		Enabled:     true,
+	}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenant))
+
+	invite := &domain.Invite{
+		ID:        "invite-1",
+		TenantID:  tenant.ID,
+		Code:      "INVITE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, baseStore.Invites().Create(ctx, invite))
+
+	wrapped := &storeWithInviteOverride{
+		Store: baseStore,
+		invites: &erroringInviteStore{
+			InviteStore: baseStore.Invites(),
+			failCode:    invite.Code,
+			err:         errors.New("simulated atomic claim failure"),
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Invite Fail User",
+		TenantID:    string(tenant.ID),
+		InviteCode:  invite.Code,
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Invite Fail User",
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	// No user or membership must have been created: the atomic invite claim
+	// failing must gate user creation, not happen after it.
+	tenantUsers, err := baseStore.UserTenants().GetTenantUsers(ctx, tenant.ID)
+	require.NoError(t, err)
+	assert.Empty(t, tenantUsers, "no tenant membership should exist when the atomic invite claim fails")
+
+	// The invite itself must still read back as untouched (still active) —
+	// erroringInviteStore never delegated to the real MarkCompleted.
+	gotInvite, err := baseStore.Invites().GetByCode(ctx, tenant.ID, invite.Code)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusActive, gotInvite.Status)
 }
 
 // ============================================================================
