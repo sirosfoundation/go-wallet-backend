@@ -52,6 +52,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			logAuthReject(logger, c, "malformed_authorization_header")
 			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
 			c.Abort()
 			return
@@ -59,6 +60,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		providedToken := strings.TrimSpace(parts[1])
 		if providedToken == "" {
+			logAuthReject(logger, c, "empty_bearer_token")
 			c.JSON(401, gin.H{"error": "Token required"})
 			c.Abort()
 			return
@@ -66,7 +68,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		// Constant-time comparison to prevent timing attacks
 		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
-			logger.Warn("Invalid admin token attempt")
+			logAuthReject(logger, c, "invalid_admin_token")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -102,6 +104,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			logAuthReject(logger, c, "missing_authorization_header")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
