@@ -178,7 +178,13 @@ func (c *Checker) fetch(ctx context.Context, uri string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/"+statusListTokenTyp)
-	resp, err := c.client.Do(req)
+	// The URI comes from a credential the holder presents, so it is
+	// attacker-influenced by nature. The scheme is checked above and c.client
+	// is the SSRF-guarded client (NewHTTPClient: private, loopback, link-local
+	// and metadata addresses refused on every hop, DNS pinned to the checked
+	// address); there is no allowlist because issuers are arbitrary public
+	// hosts.
+	resp, err := c.client.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
 		return "", fmt.Errorf("fetch status list: %w", err)
 	}
