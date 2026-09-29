@@ -395,6 +395,19 @@ type FinishRegistrationRequest struct {
 	// OIDCGateBinding contains optional OIDC identity binding info (set by handler)
 	// This is populated from the OIDC gate middleware result when bind_identity is true
 	OIDCGateBinding *OIDCGateBinding `json:"-"` // Do not bind from JSON
+
+	// ExpectedTenantID, when set by the handler, must match the tenant
+	// BeginRegistration recorded on the challenge (challenge.TenantID).
+	// Handlers set this from their own validated tenant context (e.g. the
+	// X-Tenant-ID header, or the JWT tenant_id claim for an authenticated
+	// caller) so that a caller can't run BeginRegistration under one tenant
+	// and FinishRegistration under a different one - which would otherwise
+	// let tenant-scoped policy decisions the handler makes (e.g.
+	// bind_identity enforcement) run against the wrong tenant's config while
+	// the registration itself is still written under whatever tenant the
+	// challenge actually belongs to. Left empty, no check is performed (for
+	// callers that don't have this context). See issue #374/#395.
+	ExpectedTenantID string `json:"-"` // Do not bind from JSON
 }
 
 // OIDCGateBinding contains OIDC identity info for binding
@@ -437,11 +450,22 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		return nil, errors.New("invalid challenge action")
 	}
 
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
-
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
+
+	// SECURITY: reject if the caller's validated tenant context (set by the
+	// handler) doesn't match the tenant this challenge actually belongs to -
+	// see ExpectedTenantID's doc comment. Checked BEFORE the challenge is
+	// deleted below: otherwise a caller who merely knows a valid challenge ID
+	// could submit it with a mismatched tenant purely to burn the one-time
+	// challenge, denying the legitimate caller (with the matching tenant)
+	// the ability to ever finish it.
+	if req.ExpectedTenantID != "" && domain.TenantID(req.ExpectedTenantID) != tenantID {
+		return nil, ErrTenantMismatch
+	}
+
+	// Delete challenge (one-time use)
+	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Re-validate invite if one was used at BeginRegistration time.
 	// The invite may have been revoked or expired during the challenge window.

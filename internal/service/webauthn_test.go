@@ -11,6 +11,7 @@ import (
 	"github.com/descope/virtualwebauthn"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -359,6 +360,121 @@ func TestWebAuthnService_ChallengeExpiration(t *testing.T) {
 		_, err = svc.FinishRegistration(ctx, req)
 		if err != ErrChallengeExpired {
 			t.Errorf("Expected ErrChallengeExpired, got %v", err)
+		}
+	})
+}
+
+// TestWebAuthnService_RefreshAccessToken is a regression test for issue
+// #392: RefreshAccessToken/RefreshTokenRequest were fully implemented but
+// api.Handlers.RefreshToken (the handler that calls this method) was never
+// mounted on any route, exactly like Logout before #391. This proves the
+// underlying service logic actually works, now that the handler is wired
+// up (see internal/server/providers.go's new POST /user/session/refresh).
+func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
+	newSvcWithRefresh := func(t *testing.T) (*WebAuthnService, *memory.Store) {
+		t.Helper()
+		cfg := &config.Config{
+			Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+			JWT: config.JWTConfig{
+				Secret:      testJWTSecret,
+				Issuer:      testJWTIssuer,
+				ExpiryHours: testJWTExpiryHours,
+				RefreshDays: 7,
+			},
+		}
+		store := memory.NewStore()
+		svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+		if err != nil {
+			t.Fatalf("Failed to create WebAuthn service: %v", err)
+		}
+		return svc, store
+	}
+
+	t.Run("refreshes a valid refresh token into a new access token", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+		require.NotEmpty(t, refreshToken)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		assert.NotEmpty(t, resp.Token, "expected a new access token")
+		assert.NotEmpty(t, resp.RefreshToken, "expected a rotated refresh token")
+		assert.NotEqual(t, refreshToken, resp.RefreshToken, "refresh token should be rotated, not reused")
+
+		// The new access token must actually be usable: parse it and confirm
+		// it carries this user's identity and tenant (as generateToken would
+		// produce), not the refresh token's own claims verbatim.
+		parsed, err := jwt.Parse(resp.Token, func(token *jwt.Token) (interface{}, error) {
+			return []byte(testJWTSecret), nil
+		})
+		require.NoError(t, err)
+		require.True(t, parsed.Valid)
+		claims, ok := parsed.Claims.(jwt.MapClaims)
+		require.True(t, ok)
+		assert.Equal(t, user.UUID.String(), claims["user_id"])
+		assert.Equal(t, "test-tenant", claims["tenant_id"])
+	})
+
+	t.Run("disabled refresh tokens are rejected", func(t *testing.T) {
+		svc, _ := setupWebAuthnService(t) // RefreshDays defaults to 0 (disabled)
+		_, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{RefreshToken: "anything"})
+		if err == nil {
+			t.Fatal("expected an error when refresh tokens are disabled")
+		}
+	})
+
+	t.Run("malformed refresh token is rejected", func(t *testing.T) {
+		svc, _ := newSvcWithRefresh(t)
+		_, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{RefreshToken: "not-a-jwt"})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+	})
+
+	t.Run("an access token cannot be used as a refresh token", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-2"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		accessToken, err := svc.generateToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: accessToken})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken (wrong type claim), got %v", err)
+		}
+	})
+
+	t.Run("refresh token for a since-deleted user is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-3"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_ = store.Users().Delete(ctx, user.UUID)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken for a deleted user, got %v", err)
 		}
 	})
 }

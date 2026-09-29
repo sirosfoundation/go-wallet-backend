@@ -141,6 +141,18 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: the tenant that actually governs this registration is
+	// whichever tenant BeginRegistration recorded on the challenge - not
+	// necessarily this request's current tenant context. Without this, a
+	// caller could begin under tenant A and finish the very same challenge
+	// under tenant B: the bind_identity check below would then run against
+	// B's policy (and B's OIDC issuer) while the registration is still
+	// written under A regardless of what B required, or vice versa. This
+	// mirrors StartWebAuthnRegistration's tenant source and the /auth/passkey
+	// path's RegisterFinish fix (issue #374); see #395.
+	tenantIDForCheck, _ := h.getTenantID(c)
+	req.ExpectedTenantID = string(tenantIDForCheck)
+
 	// SECURITY: Check if identity binding is required for this tenant
 	// This must be validated BEFORE checking oidcResult to prevent bypass
 	tenantVal, tenantExists := c.Get("tenant")
@@ -208,6 +220,8 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 			c.JSON(400, gin.H{"error": "Verification failed"})
 		case errors.Is(err, service.ErrAAGUIDBlacklisted):
 			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
+		case errors.Is(err, service.ErrTenantMismatch):
+			c.JSON(403, gin.H{"error": "tenant mismatch"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete registration"})
 		}

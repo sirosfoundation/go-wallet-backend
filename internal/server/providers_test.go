@@ -871,6 +871,184 @@ func TestAuthProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	})
 }
 
+// createLegacyRefreshTestToken signs a legacy HMAC refresh token exactly
+// like WebAuthnService.generateRefreshToken - the format
+// WebAuthnService.RefreshAccessToken parses.
+func createLegacyRefreshTestToken(secret, userID, tenantID string) string {
+	now := time.Now()
+	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"user_id":   userID,
+		"tenant_id": tenantID,
+		"type":      "refresh",
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),
+		"exp":       now.AddDate(0, 0, 7).Unix(),
+		"iss":       "test",
+		"aud":       "localhost",
+		"jti":       "refresh-jti-1",
+	})
+	signed, _ := token.SignedString([]byte(secret))
+	return signed
+}
+
+// TestAuthProvider_RegisterRoutes_RefreshTokenReachable is a regression test
+// for issue #392: api.Handlers.RefreshToken existed since refresh tokens
+// were added, but - like Logout before #391 - was never actually mounted on
+// any route, making the whole refresh-token feature unreachable. This
+// proves POST /user/session/refresh is registered, is NOT gated behind a
+// currently-valid access token (the whole point of a refresh token is to
+// recover from an expired one), and actually performs a working refresh:
+// the newly issued access token authenticates a genuinely protected route.
+func TestAuthProvider_RegisterRoutes_RefreshTokenReachable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	store := newTestMemoryBackend(t)
+
+	ctx := context.Background()
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:refresh-route-test"}
+	if err := store.Users().Create(ctx, user); err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if !hasRoute(router.Routes(), http.MethodPost, "/user/session/refresh") {
+		t.Fatal("expected POST /user/session/refresh to be registered")
+	}
+
+	refreshToken := createLegacyRefreshTestToken(cfg.JWT.Secret, user.UUID.String(), "default")
+
+	body := `{"refreshToken":"` + refreshToken + `"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /user/session/refresh: status = %d, body = %s", w.Code, w.Body.String())
+	}
+	assertNoCacheHeaders(t, w.Header())
+
+	var resp struct {
+		Token        string `json:"appToken"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode refresh response: %v", err)
+	}
+	if resp.Token == "" {
+		t.Fatal("expected a new access token in the response")
+	}
+	if resp.RefreshToken == "" {
+		t.Fatal("expected a rotated refresh token in the response")
+	}
+
+	// Prove the new access token is actually usable end to end, not just
+	// present in the response: it must authenticate a real protected route.
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/user/session/account-info", nil)
+	req2.Header.Set("Authorization", "Bearer "+resp.Token)
+	router.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET /user/session/account-info with refreshed token: status = %d, body = %s", w2.Code, w2.Body.String())
+	}
+
+	// An expired/garbage access token must NOT be usable in place of a
+	// refresh token - the endpoint must reject it, proving it actually
+	// parses the "type":"refresh" claim rather than accepting any valid
+	// HMAC-signed token from this issuer.
+	accessToken := createLegacyTestToken(cfg.JWT.Secret, user.UUID.String(), "default", "access-jti-1")
+	w3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(`{"refreshToken":"`+accessToken+`"}`))
+	req3.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh with an access token instead of a refresh token: status = %d, want %d, body = %s", w3.Code, http.StatusUnauthorized, w3.Body.String())
+	}
+}
+
+// TestAuthProvider_FinishWebAuthnRegistration_RejectsTenantMismatch is a
+// regression test for issue #395: FinishWebAuthnRegistration (/user/*) had
+// the same tenant/challenge mismatch gap that PR #386 fixed on the
+// /auth/passkey/* path (issue #374) - BeginRegistration records whichever
+// tenant the X-Tenant-ID header names at that time on the challenge, but
+// FinishRegistration never checked that the CURRENT request's header still
+// names the same tenant before running bind_identity/invite logic. This
+// proves a mismatched header is rejected (before the bogus credential body
+// is ever processed) and a matching header is not rejected as a mismatch.
+func TestAuthProvider_FinishWebAuthnRegistration_RejectsTenantMismatch(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.Server.RPName = "Test App" // required by go-webauthn's BeginRegistration
+	store := newTestMemoryBackend(t)
+
+	ctx := context.Background()
+	if err := store.Tenants().Create(ctx, &domain.Tenant{ID: "tenant-a", Name: "Tenant A", Enabled: true}); err != nil {
+		t.Fatalf("failed to create tenant-a: %v", err)
+	}
+	if err := store.Tenants().Create(ctx, &domain.Tenant{ID: "tenant-b", Name: "Tenant B", Enabled: true}); err != nil {
+		t.Fatalf("failed to create tenant-b: %v", err)
+	}
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	beginUnderTenantA := func(t *testing.T) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-begin", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", "tenant-a")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("begin: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			ChallengeID string `json:"challengeId"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode begin response: %v", err)
+		}
+		return resp.ChallengeID
+	}
+
+	t.Run("mismatched header tenant is rejected before the credential is processed", func(t *testing.T) {
+		challengeID := beginUnderTenantA(t)
+
+		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
+		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-finish", strings.NewReader(finishBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", "tenant-b")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 tenant mismatch, got %d: %s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "tenant mismatch") {
+			t.Errorf("expected tenant mismatch error, got: %s", w.Body.String())
+		}
+	})
+
+	t.Run("matching header tenant is not rejected as a mismatch", func(t *testing.T) {
+		challengeID := beginUnderTenantA(t)
+
+		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
+		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-finish", strings.NewReader(finishBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", "tenant-a")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code == http.StatusForbidden && strings.Contains(w.Body.String(), "tenant mismatch") {
+			t.Errorf("matching header tenant must not be rejected as a tenant mismatch, got: %s", w.Body.String())
+		}
+	})
+}
+
 func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := minimalTestConfig()
