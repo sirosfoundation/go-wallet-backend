@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,6 +58,95 @@ func TestTokenBlacklist_IsBlacklisted_ExpiredEntryNotBlacklisted(t *testing.T) {
 	if b.IsBlacklisted(ctx, "jti-expired") {
 		t.Error("expected an entry past its own expiry not to be blacklisted")
 	}
+}
+
+// TestTokenBlacklist_ConsumeOnce covers the atomic, always-on primitive
+// added for WebAuthnService.RefreshAccessToken's single-use enforcement
+// (Copilot review on go-wallet-backend#400): unlike Add/IsBlacklisted,
+// ConsumeOnce must work even when the blacklist feature is disabled, and
+// must be safe under concurrent use of the same jti.
+func TestTokenBlacklist_ConsumeOnce(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("first call returns true, every subsequent call returns false", func(t *testing.T) {
+		b := newTestBlacklist(t)
+		expiry := time.Now().Add(time.Hour)
+
+		first, err := b.ConsumeOnce(ctx, "jti-consume-1", expiry)
+		if err != nil || !first {
+			t.Fatalf("first ConsumeOnce: firstUse=%v err=%v, want true/nil", first, err)
+		}
+
+		second, err := b.ConsumeOnce(ctx, "jti-consume-1", expiry)
+		if err != nil || second {
+			t.Fatalf("second ConsumeOnce: firstUse=%v err=%v, want false/nil", second, err)
+		}
+	})
+
+	t.Run("works even when the blacklist feature is disabled", func(t *testing.T) {
+		b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		expiry := time.Now().Add(time.Hour)
+
+		first, err := b.ConsumeOnce(ctx, "jti-consume-2", expiry)
+		if err != nil || !first {
+			t.Fatalf("first ConsumeOnce (disabled feature): firstUse=%v err=%v, want true/nil", first, err)
+		}
+		second, err := b.ConsumeOnce(ctx, "jti-consume-2", expiry)
+		if err != nil || second {
+			t.Fatalf("second ConsumeOnce (disabled feature): firstUse=%v err=%v, want false/nil", second, err)
+		}
+	})
+
+	t.Run("empty jti is always treated as first use (untracked)", func(t *testing.T) {
+		b := newTestBlacklist(t)
+		expiry := time.Now().Add(time.Hour)
+
+		for i := 0; i < 3; i++ {
+			first, err := b.ConsumeOnce(ctx, "", expiry)
+			if err != nil || !first {
+				t.Fatalf("ConsumeOnce(\"\") call %d: firstUse=%v err=%v, want true/nil", i, first, err)
+			}
+		}
+	})
+
+	t.Run("a jti past its own recorded expiry can be consumed again", func(t *testing.T) {
+		b := newTestBlacklist(t)
+
+		first, err := b.ConsumeOnce(ctx, "jti-consume-3", time.Now().Add(-time.Hour))
+		if err != nil || !first {
+			t.Fatalf("first ConsumeOnce (already-expired entry): firstUse=%v err=%v, want true/nil", first, err)
+		}
+		// The stored entry is already expired, so a later consume attempt
+		// for the same jti is treated as first use again - matching
+		// IsBlacklisted's own "expired entries don't count" semantics.
+		second, err := b.ConsumeOnce(ctx, "jti-consume-3", time.Now().Add(time.Hour))
+		if err != nil || !second {
+			t.Fatalf("second ConsumeOnce (past-expiry entry): firstUse=%v err=%v, want true/nil", second, err)
+		}
+	})
+
+	t.Run("concurrent ConsumeOnce on the same jti: exactly one caller wins", func(t *testing.T) {
+		b := newTestBlacklist(t)
+		expiry := time.Now().Add(time.Hour)
+
+		const n = 50
+		var wg sync.WaitGroup
+		var wins int64
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				if first, _ := b.ConsumeOnce(ctx, "jti-race", expiry); first {
+					atomic.AddInt64(&wins, 1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if wins != 1 {
+			t.Fatalf("expected exactly 1 winner out of %d concurrent ConsumeOnce calls on the same jti, got %d", n, wins)
+		}
+	})
 }
 
 func TestTokenBlacklist_Remove(t *testing.T) {

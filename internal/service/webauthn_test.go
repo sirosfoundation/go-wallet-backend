@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -550,11 +552,18 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 	// stolen refresh token could be replayed indefinitely, each replay
 	// minting another full-lived refresh token. With a TokenBlacklist wired
 	// in (SetTokenBlacklist), the presented refresh token must become
-	// single-use: consumed on successful exchange, rejected on replay.
-	t.Run("a consumed refresh token cannot be replayed once a blacklist is wired in", func(t *testing.T) {
+	// single-use: consumed on successful exchange, rejected on replay - and
+	// this must hold even with TokenBlacklistConfig.Enabled: false (the
+	// checked-in/production default), since a second Copilot round on #400
+	// found that gating consumption on that same opt-in flag left refresh
+	// tokens replayable in the standard configuration despite this method
+	// appearing to enforce single-use. ConsumeOnce is deliberately NOT
+	// gated by it (see its doc comment) - Enabled: false here is the point
+	// of this test, not an oversight.
+	t.Run("a consumed refresh token cannot be replayed, even with the blacklist feature disabled (default config)", func(t *testing.T) {
 		svc, store := newSvcWithRefresh(t)
 		ctx := context.Background()
-		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
 		svc.SetTokenBlacklist(blacklist)
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-4"}
@@ -568,7 +577,8 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, resp.RefreshToken)
 
-		// Replaying the SAME (now-consumed) refresh token must be rejected.
+		// Replaying the SAME (now-consumed) refresh token must be rejected,
+		// despite Enabled: false.
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
 		if err != ErrInvalidRefreshToken {
 			t.Fatalf("expected ErrInvalidRefreshToken on refresh-token replay, got %v", err)
@@ -579,6 +589,43 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
 		require.NoError(t, err)
 		require.NotEmpty(t, resp2.Token)
+	})
+
+	// Regression test for the second Copilot review round on #400: the
+	// check-and-consume sequence must be atomic, so that two concurrent
+	// requests replaying the same refresh token cannot both win the race
+	// (both observing "not yet consumed" and each minting its own
+	// replacement token pair). Exactly one of N concurrent callers sharing
+	// the same refresh token must succeed.
+	t.Run("concurrent replay of the same refresh token: exactly one caller succeeds", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-concurrent"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		const n = 20
+		var wg sync.WaitGroup
+		var successes int64
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				if _, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken}); err == nil {
+					atomic.AddInt64(&successes, 1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if successes != 1 {
+			t.Fatalf("expected exactly 1 successful refresh out of %d concurrent replays of the same token, got %d", n, successes)
+		}
 	})
 
 	t.Run("consuming a refresh token without an exp claim falls back to RefreshDays for the blacklist entry", func(t *testing.T) {
@@ -606,15 +653,17 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, resp.Token)
 
-		// It must now be blacklisted (consumed), even without an exp claim
-		// to read the expiry from.
-		if !blacklist.IsBlacklisted(ctx, "no-exp-jti") {
-			t.Fatal("expected the no-exp refresh token's jti to be blacklisted after consumption")
+		// It must now be consumed, even without an exp claim to read the
+		// expiry from - proven by a second use being rejected as a replay.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected the no-exp refresh token to be rejected as a replay on second use, got %v", err)
 		}
 	})
 
-	t.Run("without a blacklist wired in, a refresh token remains reusable (unchanged, pre-existing behavior)", func(t *testing.T) {
-		svc, store := newSvcWithRefresh(t) // no SetTokenBlacklist call
+	t.Run("without a TokenBlacklist wired in at all, a refresh token remains reusable (unchanged, pre-existing behavior)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t) // no SetTokenBlacklist call - tokenBlacklist stays nil
+
 		ctx := context.Background()
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-5"}
@@ -626,10 +675,11 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
 		require.NoError(t, err)
 
-		// No blacklist wired in: replay is not rejected as a mismatch (this
-		// case is exactly why SetTokenBlacklist should be wired in
-		// production - see internal/service/services.go - but the method
-		// itself must not panic or misbehave when it isn't).
+		// No TokenBlacklist wired in at all (nil): single-use enforcement is
+		// skipped entirely, since there's nowhere to track consumed jtis.
+		// services.go always wires one in for the real service; this only
+		// matters for a hand-built WebAuthnService that never calls
+		// SetTokenBlacklist.
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
 		require.NoError(t, err)
 	})
