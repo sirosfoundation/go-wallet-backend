@@ -208,18 +208,64 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	return c.DefaultTokenTTL
 }
 
+// StatusCheckMode selects how the engine treats credential status
+// (draft-ietf-oauth-status-list) when the wallet is about to present.
+type StatusCheckMode string
+
+const (
+	// StatusCheckOff performs no status lookup.
+	StatusCheckOff StatusCheckMode = "off"
+	// StatusCheckWarn looks status up and logs a not-valid result, but never
+	// refuses a presentation.
+	StatusCheckWarn StatusCheckMode = "warn"
+	// StatusCheckEnforceRevoked refuses a presentation only when the
+	// credential is positively determined not to be valid; anything that
+	// prevents a determination is logged and the presentation proceeds.
+	StatusCheckEnforceRevoked StatusCheckMode = "enforce-revoked"
+	// StatusCheckStrict refuses a presentation unless the credential is
+	// positively determined to be valid.
+	StatusCheckStrict StatusCheckMode = "strict"
+)
+
 // PresentationConfig controls checks the engine applies to what the wallet is
 // about to present in an OpenID4VP flow.
 type PresentationConfig struct {
-	// StatusCheck makes the engine look up a Token Status List
-	// (draft-ietf-oauth-status-list) entry for every presented SD-JWT VC that
-	// carries a `status.status_list` claim, and refuse the presentation when
-	// the credential is not VALID. Fail closed: if the list cannot be fetched,
-	// verified or read, the presentation is refused. Credentials without a
-	// status claim, and mdoc credentials, are not checked.
-	// Default: true. Set false to skip the check entirely.
+	// StatusCheck controls the Token Status List (draft-ietf-oauth-status-list)
+	// check on presented SD-JWT VCs that carry a `status.status_list` claim.
+	// The verifier, not the wallet, is responsible for the authoritative
+	// check, and a list may be reachable by the issuer and verifier but not
+	// by the wallet, so by default the wallet only refuses on a positive
+	// finding. Values:
+	// `off` (no lookup);
+	// `warn` (look up and log a not-valid result, never refuse);
+	// `enforce-revoked` (default: refuse with CREDENTIAL_REVOKED only when the
+	// list was fetched and verified and the entry is non-zero, i.e. INVALID,
+	// SUSPENDED or application-specific; if the list cannot be fetched or
+	// verified, log a warning and proceed);
+	// `strict` (refuse unless the entry is positively VALID: an unreachable,
+	// unsigned, expired or malformed list also refuses).
+	// A list only counts if its signature is bound to the key in the
+	// credential's own x5c/jwk header; otherwise it is unverifiable (see above).
+	// mdoc credentials are not checked. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_STATUS_CHECK
-	StatusCheck bool `yaml:"status_check" envconfig:"STATUS_CHECK"`
+	StatusCheck StatusCheckMode `yaml:"status_check" envconfig:"STATUS_CHECK"`
+}
+
+// Effective returns the mode to apply, treating the zero value as the default.
+func (m StatusCheckMode) Effective() StatusCheckMode {
+	if m == "" {
+		return StatusCheckEnforceRevoked
+	}
+	return m
+}
+
+// validate rejects unknown modes so a typo cannot silently weaken the check.
+func (m StatusCheckMode) validate() error {
+	switch m.Effective() {
+	case StatusCheckOff, StatusCheckWarn, StatusCheckEnforceRevoked, StatusCheckStrict:
+		return nil
+	}
+	return fmt.Errorf("invalid presentation.status_check %q: must be one of off, warn, enforce-revoked, strict", string(m))
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -1738,7 +1784,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
-		Presentation: PresentationConfig{StatusCheck: true},
+		Presentation: PresentationConfig{StatusCheck: StatusCheckEnforceRevoked},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -2010,6 +2056,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
 				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
+	}
+
+	if err := c.Presentation.StatusCheck.validate(); err != nil {
+		return err
 	}
 
 	// Validate audit configuration — without this, cfg.Audit.Enabled=true

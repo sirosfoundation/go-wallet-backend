@@ -2619,3 +2619,37 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
+	for _, mode := range []StatusCheckMode{"", StatusCheckOff, StatusCheckWarn, StatusCheckEnforceRevoked, StatusCheckStrict} {
+		if err := mode.validate(); err != nil {
+			t.Errorf("%q: %v", mode, err)
+		}
+	}
+	if StatusCheckMode("").Effective() != StatusCheckEnforceRevoked || StatusCheckStrict.Effective() != StatusCheckStrict {
+		t.Error("Effective() must default the zero value to enforce-revoked and keep explicit values")
+	}
+	for _, bad := range []StatusCheckMode{"true", "enforce", "STRICT", "fail-closed"} {
+		err := bad.validate()
+		if err == nil || !strings.Contains(err.Error(), "presentation.status_check") {
+			t.Errorf("%q: want a presentation.status_check error, got %v", bad, err)
+		}
+	}
+	if defaultConfig().Presentation.StatusCheck != StatusCheckEnforceRevoked {
+		t.Error("default must be enforce-revoked")
+	}
+
+	cfg := &Config{
+		Server:       ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		Storage:      StorageConfig{Type: "memory"},
+		JWT:          JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		Presentation: PresentationConfig{StatusCheck: "bogus"},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check") {
+		t.Errorf("Validate must reject an unknown status_check, got %v", err)
+	}
+	cfg.Presentation.StatusCheck = StatusCheckWarn
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("warn rejected: %v", err)
+	}
+}

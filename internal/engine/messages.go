@@ -119,8 +119,8 @@ const (
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
 	// ErrCodeCredentialRevoked is returned when a credential selected for
-	// presentation is not VALID in its Token Status List, or its status could
-	// not be determined. Clients that do not know the code fall back to the
+	// presentation is not VALID in its Token Status List (or, in strict
+	// mode, its status could not be determined). Clients that do not know the code fall back to the
 	// generic message.
 	ErrCodeCredentialRevoked ErrorCode = "CREDENTIAL_REVOKED"
 	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
@@ -174,7 +174,7 @@ func (c ErrorCode) UserFacingMessage() string {
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
 	case ErrCodeCredentialRevoked:
-		return "A credential you selected has been revoked or its status could not be checked"
+		return "A credential you selected is no longer valid (revoked or suspended)"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:

@@ -146,7 +146,7 @@ func TestCheck(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c, uri, _ := serve(t, func(u string) string { return makeToken(t, tc.opts(u)) }, tc.ctype)
-			err := c.Check(ctx, &Reference{Idx: tc.idx, URI: uri}, nil)
+			err := c.Check(ctx, &Reference{Idx: tc.idx, URI: uri}, jwkSigner(key))
 			switch {
 			case tc.revoked:
 				if !errors.Is(err, ErrRevoked) {
@@ -178,7 +178,7 @@ func TestCheck_TamperedSignature(t *testing.T) {
 		s, _ := bad.SignedString(other)
 		return s
 	}, "")
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, nil); err == nil {
+	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key)); err == nil {
 		t.Fatal("forged status list accepted")
 	}
 }
@@ -217,7 +217,7 @@ func TestCheck_Cache(t *testing.T) {
 		return makeToken(t, tokenOpts{sub: u, key: key, exp: time.Now().Add(time.Hour)})
 	}, "")
 	for i := 0; i < 3; i++ {
-		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, nil); err != nil {
+		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -225,7 +225,7 @@ func TestCheck_Cache(t *testing.T) {
 		t.Fatalf("want 1 fetch, got %d", *hits)
 	}
 	c.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
-	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, nil)
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key))
 	if *hits != 2 {
 		t.Fatalf("want refetch after ttl, got %d fetches", *hits)
 	}
@@ -242,6 +242,7 @@ func TestReferenceFromCredentialClaims(t *testing.T) {
 	}
 	for name, claims := range map[string]map[string]any{
 		"not object":  {"status": "x"},
+		"null":        {"status": nil},
 		"no list":     {"status": map[string]any{"other": 1}},
 		"no idx":      {"status": map[string]any{"status_list": map[string]any{"uri": "u"}}},
 		"neg idx":     {"status": map[string]any{"status_list": map[string]any{"idx": float64(-1), "uri": "u"}}},
@@ -267,6 +268,21 @@ func TestEntry_Bounds(t *testing.T) {
 	}
 	if _, err := entry(1, list, -1); err == nil {
 		t.Error("negative index must fail")
+	}
+	// A credential-controlled idx must not wrap idx*bits around to a valid
+	// position (2^62*4 wraps to 0) or a negative one (which would panic).
+	for _, bits := range []int{1, 2, 4, 8} {
+		for _, idx := range []int64{1 << 62, 1<<62 + 1, 1<<63 - 1, 1 << 61, -1 << 63} {
+			if _, err := entry(bits, list, idx); err == nil {
+				t.Errorf("entry(bits=%d, idx=%d) must be out of range", bits, idx)
+			}
+		}
+	}
+	// The last valid index of each width still reads.
+	for _, bits := range []int{1, 2, 4, 8} {
+		if _, err := entry(bits, list, int64(len(list))*8/int64(bits)-1); err != nil {
+			t.Errorf("last index at bits=%d: %v", bits, err)
+		}
 	}
 }
 
@@ -319,5 +335,34 @@ func TestKeyID_And_SameKey(t *testing.T) {
 	}
 	if signerFingerprint(a) != keyID(a) {
 		t.Error("signerFingerprint must equal keyID")
+	}
+}
+
+func TestCheck_UnboundListIsUnverifiable(t *testing.T) {
+	key := newKey(t)
+	c, uri, _ := serve(t, func(u string) string {
+		return makeToken(t, tokenOpts{sub: u, key: key, values: map[int]int{1: 1}})
+	}, "")
+	// A self-signed list (key in its own header) with no credential key to
+	// bind it to says entry 1 is revoked; that must not be acted on.
+	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, nil)
+	if err == nil || errors.Is(err, ErrRevoked) {
+		t.Fatalf("unbound list must be unverifiable, not a verdict: %v", err)
+	}
+}
+
+func TestCheck_RequiresIat(t *testing.T) {
+	key := newKey(t)
+	c, uri, _ := serve(t, func(u string) string {
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u,
+			"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
+		tok.Header["typ"] = "statuslist+jwt"
+		tok.Header["jwk"] = jwkOf(&key.PublicKey)
+		s, _ := tok.SignedString(key)
+		return s
+	}, "")
+	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key))
+	if err == nil || errors.Is(err, ErrRevoked) {
+		t.Fatalf("token without iat must be rejected as unverifiable: %v", err)
 	}
 }

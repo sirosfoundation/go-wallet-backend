@@ -35,14 +35,16 @@ type OID4VPHandler struct {
 	httpClient *http.Client
 	// statusChecker is nil when presentation.status_check is off.
 	statusChecker *statuslist.Checker
+	statusMode    config.StatusCheckMode
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
 func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 	httpClient := cfg.HTTPClient.NewHTTPClient(0)
 	var checker *statuslist.Checker
-	if cfg.Presentation.StatusCheck {
-		checker = statuslist.NewChecker(httpClient, cfg.HTTPClient.AllowsPlaintext())
+	mode := cfg.Presentation.StatusCheck.Effective()
+	if mode != config.StatusCheckOff {
+		checker = sharedStatusChecker(cfg)
 	}
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
@@ -56,6 +58,7 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 		},
 		httpClient:    httpClient,
 		statusChecker: checker,
+		statusMode:    mode,
 	}, nil
 }
 
@@ -225,10 +228,19 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		return err
 	}
 
-	// Step 4b: refuse to present a credential that is revoked, or whose status
-	// cannot be established. The vp_token is the first point at which the
-	// backend sees credential content (it never holds the credentials), and
-	// nothing has been sent to the verifier yet.
+	return h.presentOrRefuse(ctx, authReq, vpToken)
+}
+
+// presentOrRefuse gates the vp_token on the credential status check and, if
+// it passes, submits it to the verifier and completes the flow.
+//
+// The gate refuses a credential that is positively known not to be valid
+// (strict mode: also one whose status cannot be established). The vp_token is
+// the first point at which the backend sees credential content (it never
+// holds the credentials), and nothing has been sent to the verifier yet. On
+// refusal the verifier gets the generic access_denied and skips
+// submitResponse; the wallet gets CREDENTIAL_REVOKED.
+func (h *OID4VPHandler) presentOrRefuse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) error {
 	if err := h.checkPresentationStatus(ctx, vpToken); err != nil {
 		h.Logger.Warn("presentation refused by credential status check", zap.Error(err))
 		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)

@@ -40,6 +40,10 @@ const (
 	statusListTokenTyp = "statuslist+jwt"
 )
 
+// errUnbound is returned for a list whose signature cannot be tied to the
+// credential's issuer key, so its content must not be acted on.
+var errUnbound = errors.New("status list signature cannot be bound to the credential issuer's key (credential header carries no x5c or jwk)")
+
 // Reference is the `status.status_list` claim of a credential
 // (draft-ietf-oauth-status-list §6.2).
 type Reference struct {
@@ -47,9 +51,13 @@ type Reference struct {
 	URI string `json:"uri"`
 }
 
-// ErrRevoked is wrapped by the error Check returns when the credential's
-// entry is anything other than VALID (0): revoked, suspended, or an
-// application-specific state. A wallet has no business presenting any of them.
+// ErrRevoked is wrapped by the error Check returns ONLY when the list was
+// fetched, its signature, typ, sub and exp were verified, and the entry at the
+// credential's index is anything other than VALID (0): INVALID (1), SUSPENDED
+// (2) or an application-specific value. Every other error Check returns means
+// "could not determine" and must not be read as revocation. The distinction is
+// what lets a wallet refuse only on a positive determination while leaving the
+// authoritative check to the verifier.
 var ErrRevoked = errors.New("credential status is not valid")
 
 // ReferenceFromCredentialClaims extracts the status_list reference from a
@@ -59,8 +67,11 @@ var ErrRevoked = errors.New("credential status is not valid")
 // instead of treating a malformed claim as "no status".
 func ReferenceFromCredentialClaims(claims map[string]any) (ref *Reference, present bool, err error) {
 	raw, ok := claims["status"]
-	if !ok || raw == nil {
+	if !ok {
 		return nil, false, nil
+	}
+	if raw == nil {
+		return nil, true, errors.New("status claim is null")
 	}
 	status, ok := raw.(map[string]any)
 	if !ok {
@@ -113,14 +124,18 @@ func NewChecker(client *http.Client, allowHTTP bool) *Checker {
 }
 
 // Check returns nil only if the entry at ref is VALID in a status list token
-// that was fetched, is signed, matches ref.URI and is still fresh. Every
-// other outcome, including every failure to find out, is an error: a
-// presentation that cannot be checked is refused, not waved through.
+// that was fetched, is signed, matches ref.URI and is still fresh. A positive
+// determination that the entry is not VALID returns an error wrapping
+// ErrRevoked; every failure to find out (network, non-200, CWT, expired list,
+// bad or unverifiable signature, malformed token) returns an error that does
+// not. Callers choose what to do with the latter.
 //
-// signer, when non-nil, is the key the credential itself was issued under;
-// the list must then be signed by the same key. When nil (the credential
-// names its issuer key some other way) the list only has to verify against
-// the key in its own header.
+// signer is the key the credential itself was issued under (its x5c or jwk
+// header). If the list carries its own key (x5c or jwk header) it must be the
+// same key; if it carries none (only a kid, which is what siros-status-service
+// publishes) it is verified against signer. When signer is nil the list
+// cannot be bound to the issuer and is unverifiable: Check returns an error
+// (never ErrRevoked), because a list that vouches for itself proves nothing.
 func (c *Checker) Check(ctx context.Context, ref *Reference, signer *trust.KeyMaterial) error {
 	bits, list, err := c.load(ctx, ref.URI, signer)
 	if err != nil {
@@ -131,7 +146,7 @@ func (c *Checker) Check(ctx context.Context, ref *Reference, signer *trust.KeyMa
 		return err
 	}
 	if value != 0 {
-		return fmt.Errorf("%w: status %d at index %d of %s", ErrRevoked, value, ref.Idx, ref.URI)
+		return fmt.Errorf("%w: status value %d", ErrRevoked, value)
 	}
 	return nil
 }
@@ -222,12 +237,27 @@ func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []by
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
 		return 0, nil, 0, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
 	}
-	km, err := trust.VerifyJWTWithEmbeddedKey(token)
-	if err != nil {
-		return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
+	// Trust model: a list is only authoritative when its signature is bound
+	// to the key the credential was issued under. A key the list carries for
+	// itself proves nothing (whoever substitutes the response can self-sign
+	// an all-valid list), so without a signer the list is unverifiable.
+	if signer == nil {
+		return 0, nil, 0, errUnbound
 	}
-	if signer != nil && !sameKey(signer, km) {
-		return 0, nil, 0, errors.New("status list is not signed by the credential's issuer key")
+	km, err := trust.VerifyJWTWithEmbeddedKey(token)
+	switch {
+	case err == nil:
+		if !sameKey(signer, km) {
+			return 0, nil, 0, errors.New("status list is not signed by the credential's issuer key")
+		}
+	case errors.Is(err, trust.ErrNoEmbeddedKey):
+		// Only a kid in the header (what siros-status-service publishes):
+		// verify against the credential's own issuer key.
+		if err := verifyWithKey(token, signer); err != nil {
+			return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
+		}
+	default:
+		return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
 	}
 
 	var claims struct {
@@ -242,6 +272,9 @@ func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []by
 	}
 	if err := decodeSegment(parts[1], &claims); err != nil {
 		return 0, nil, 0, fmt.Errorf("status list payload: %w", err)
+	}
+	if claims.Iat == nil {
+		return 0, nil, 0, errors.New("status list token has no iat")
 	}
 	if claims.Sub != uri {
 		return 0, nil, 0, fmt.Errorf("status list sub %q does not match uri %q", claims.Sub, uri)
@@ -278,6 +311,42 @@ func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []by
 	return claims.StatusList.Bits, list, ttl, nil
 }
 
+// verifyWithKey verifies the JWS signature of token against a key the caller
+// already holds (the credential's issuer key).
+func verifyWithKey(token string, km *trust.KeyMaterial) error {
+	var pub any
+	switch {
+	case len(km.X5C) > 0:
+		der, err := base64.StdEncoding.DecodeString(km.X5C[0])
+		if err != nil {
+			return fmt.Errorf("x5c leaf: %w", err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("x5c leaf: %w", err)
+		}
+		pub = cert.PublicKey
+	case km.JWK != nil:
+		b, err := json.Marshal(km.JWK)
+		if err != nil {
+			return err
+		}
+		var jwk jose.JSONWebKey
+		if err := jwk.UnmarshalJSON(b); err != nil {
+			return err
+		}
+		pub = jwk.Key
+	default:
+		return errors.New("no key to verify with")
+	}
+	jws, err := jose.ParseSigned(token, []jose.SignatureAlgorithm{jose.ES256, jose.ES384, jose.ES512, jose.RS256, jose.PS256, jose.EdDSA})
+	if err != nil {
+		return err
+	}
+	_, err = jws.Verify(pub)
+	return err
+}
+
 func decodeSegment(seg string, v any) error {
 	b, err := base64.RawURLEncoding.DecodeString(seg)
 	if err != nil {
@@ -309,11 +378,13 @@ func inflate(lst string) ([]byte, error) {
 // entry reads the idx-th status value; bits within a byte are packed
 // least-significant first (draft-ietf-oauth-status-list §4.1).
 func entry(bits int, list []byte, idx int64) (int, error) {
+	// idx comes from the credential. Bound it by the list size before any
+	// multiplication so a huge value cannot wrap around to a valid position.
+	if idx < 0 || idx >= int64(len(list))*8/int64(bits) {
+		return 0, errors.New("status list index is out of range")
+	}
 	bitPos := idx * int64(bits)
 	byteIdx := bitPos / 8
-	if idx < 0 || byteIdx >= int64(len(list)) {
-		return 0, fmt.Errorf("status list index %d is out of range", idx)
-	}
 	shift := uint(bitPos % 8)
 	return int(list[byteIdx]>>shift) & (1<<uint(bits) - 1), nil
 }
