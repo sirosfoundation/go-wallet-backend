@@ -290,6 +290,9 @@ type CredentialConfigurations map[string]CredentialConfig
 // is no individual credential to skip.
 func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(string(data)) == "null" {
+		// Clear, as encoding/json does for a map, so a reused value never
+		// keeps the previous document's configurations.
+		*c = nil
 		return nil
 	}
 	var raw map[string]json.RawMessage

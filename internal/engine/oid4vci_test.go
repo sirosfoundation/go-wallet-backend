@@ -3969,3 +3969,13 @@ func TestIssuerMetadata_LegacyClaimsArrayDoesNotDropConfiguration(t *testing.T) 
 		t.Errorf("unexpected config: %+v", cfg)
 	}
 }
+
+// A null credential_configurations_supported must clear a reused value.
+func TestIssuerMetadata_NullCredentialConfigurationsClearsReusedValue(t *testing.T) {
+	var m IssuerMetadata
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":{"a":{"format":"dc+sd-jwt"}}}`), &m))
+	require.Len(t, m.CredentialConfigurationsSupported, 1)
+
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":null}`), &m))
+	assert.Empty(t, m.CredentialConfigurationsSupported)
+}
