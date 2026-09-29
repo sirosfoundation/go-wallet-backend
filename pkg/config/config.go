@@ -232,6 +232,17 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
+	// providers that may resolve to private/loopback/link-local addresses.
+	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC
+	// discovery, token exchange and JWKS fetches), never to the client used
+	// for issuers, verifiers and other counterparties. Matching is by exact,
+	// case-insensitive hostname of every request, redirect hops and the
+	// token_endpoint/jwks_uri named by a discovery document included, so a
+	// discovery document cannot steer the request to an unlisted internal
+	// host. Cloud metadata endpoints stay blocked regardless.
+	// Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated)
+	TrustedIdPHosts []string `yaml:"trusted_idp_hosts" envconfig:"TRUSTED_IDP_HOSTS"`
 }
 
 // NewHTTPClient creates an *http.Client from the configuration, applying proxy,
@@ -250,13 +261,10 @@ type HTTPClientConfig struct {
 //     cannot be downgraded to a network any observer on the path can read or
 //     rewrite.
 //
-// Both guards reach only what is fetched through this client. One production
-// path builds its own and is governed by neither:
-//
-//   - internal/as's OIDC discovery and token exchange, which construct a bare
-//     http.Client, so neither the address nor the scheme policy applies.
-//     Bringing it under this configuration is separate work: it would change
-//     which IdP addresses an existing deployment can reach.
+// Both guards reach only what is fetched through this client. internal/as's
+// OIDC discovery and token exchange use NewIdPHTTPClient, which applies the
+// same policy but lets the operator's TrustedIdPHosts sit on private
+// addresses.
 //
 // internal/service.HelperService.GetCertificateChain also dials TLS directly
 // rather than through an http.Client (it reads a certificate chain off a
@@ -270,6 +278,33 @@ type HTTPClientConfig struct {
 // address this process never saw. A deployment that relies on an egress proxy
 // should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
+	return c.newHTTPClient(timeoutOverride, nil)
+}
+
+// NewIdPHTTPClient is NewHTTPClient for talking to the operator's OIDC
+// identity providers: the same address and scheme policy, except that the
+// hostnames in TrustedIdPHosts may resolve to private addresses. Use it for
+// the AS's OIDC discovery, token exchange and JWKS fetches, and nothing that
+// dials a host a counterparty chose.
+func (c HTTPClientConfig) NewIdPHTTPClient(timeoutOverride time.Duration) *http.Client {
+	return c.newHTTPClient(timeoutOverride, c.trustedIdPHostSet())
+}
+
+// trustedIdPHostSet returns TrustedIdPHosts as a lowercase set, or nil.
+func (c HTTPClientConfig) trustedIdPHostSet() map[string]struct{} {
+	if len(c.TrustedIdPHosts) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(c.TrustedIdPHosts))
+	for _, h := range c.TrustedIdPHosts {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			set[h] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHosts map[string]struct{}) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -298,12 +333,13 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
+		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
 		roundTripper = ssrfGuard{
 			base:      transport,
 			proxy:     transport.Proxy,
 			lookup:    defaultLookupIP,
 			httpsOnly: !c.AllowsPlaintext(),
+			trusted:   trustedHosts,
 		}
 	}
 
@@ -329,7 +365,7 @@ func (c HTTPClientConfig) GuardedDialContext() func(ctx context.Context, network
 	if c.AllowPrivateIPs {
 		return baseDialer.DialContext
 	}
-	return guardedDial(defaultLookupIP, baseDialer.DialContext)
+	return guardedDial(defaultLookupIP, baseDialer.DialContext, nil)
 }
 
 // AllowsPlaintext reports whether this configuration permits non-TLS (plain
@@ -370,7 +406,10 @@ func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
 // public address for the check and an internal one a moment later for the
 // connection, and the guard above would have inspected an address that is
 // never dialled.
-func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
+//
+// trusted names hosts (lowercase) that may resolve to private ranges; see
+// HTTPClientConfig.TrustedIdPHosts. The metadata endpoints stay blocked.
+func guardedDial(lookup lookupFunc, dial dialFunc, trusted map[string]struct{}) dialFunc {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -380,7 +419,7 @@ func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
 		if err != nil {
 			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 		}
-		if err := checkAddresses(host, ips); err != nil {
+		if err := checkAddressesFor(host, ips, trusted); err != nil {
 			return nil, err
 		}
 
@@ -506,6 +545,14 @@ func matchesNetwork(network string, ip net.IP) bool {
 // deployment's own network, and the cloud metadata endpoints named separately
 // so the refusal says which rule was hit.
 func checkAddresses(host string, ips []net.IP) error {
+	return checkAddressesFor(host, ips, nil)
+}
+
+// checkAddressesFor is checkAddresses, except that a host in trusted is
+// allowed private, loopback and link-local addresses. Cloud metadata
+// endpoints and unspecified addresses are refused for every host.
+func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) error {
+	_, isTrusted := trusted[strings.ToLower(host)]
 	if len(ips) == 0 {
 		return fmt.Errorf("no addresses found for %s", host)
 	}
@@ -515,7 +562,7 @@ func checkAddresses(host string, ips []net.IP) error {
 		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
 		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
@@ -549,6 +596,7 @@ type ssrfGuard struct {
 	proxy     func(*http.Request) (*url.URL, error)
 	lookup    lookupFunc
 	httpsOnly bool
+	trusted   map[string]struct{}
 }
 
 func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -570,7 +618,7 @@ func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 		}
-		if err := checkAddresses(host, ips); err != nil {
+		if err := checkAddressesFor(host, ips, g.trusted); err != nil {
 			return nil, err
 		}
 	}

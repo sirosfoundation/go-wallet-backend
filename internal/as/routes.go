@@ -46,9 +46,10 @@ type ASModule struct {
 
 // NewASModule creates and initializes the AS module.
 // The ctx parameter controls the lifecycle of background goroutines (session cleanup).
-// httpClient is used for the passkey OIDC gate's issuer discovery and JWKS
-// fetches (see RegisterRoutes) - callers should pass the same configured,
-// SSRF-guarded client used elsewhere (e.g. cfg.HTTPClient.NewHTTPClient(0)),
+// httpClient is used for every request to an OIDC identity provider: the
+// login flow's discovery and token exchange, and the passkey OIDC gate's
+// issuer discovery and JWKS fetches (see RegisterRoutes) - callers should
+// pass a configured, SSRF-guarded client (cfg.HTTPClient.NewIdPHTTPClient(0)),
 // not nil, or those unauthenticated fetches bypass the private-IP/HTTPS
 // guards the rest of the codebase applies. A nil value still works (falls
 // back to a bare client with a short default timeout) for callers that
@@ -123,7 +124,7 @@ func NewASModule(
 	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
 	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
 	// already requires it to be present and >=32 bytes.
-	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), logger)
+	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
 	// RegisterRoutes). See httpClient's doc comment above for why this must
