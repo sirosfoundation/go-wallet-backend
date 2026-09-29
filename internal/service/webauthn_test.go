@@ -544,6 +544,95 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 			t.Errorf("expected ErrInvalidRefreshToken for a deleted user, got %v", err)
 		}
 	})
+
+	// Regression test for a Copilot review finding on #400: RefreshAccessToken
+	// only rotated tokens and never invalidated the one just used, so a
+	// stolen refresh token could be replayed indefinitely, each replay
+	// minting another full-lived refresh token. With a TokenBlacklist wired
+	// in (SetTokenBlacklist), the presented refresh token must become
+	// single-use: consumed on successful exchange, rejected on replay.
+	t.Run("a consumed refresh token cannot be replayed once a blacklist is wired in", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-4"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// First use succeeds and rotates the token.
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.RefreshToken)
+
+		// Replaying the SAME (now-consumed) refresh token must be rejected.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken on refresh-token replay, got %v", err)
+		}
+
+		// The newly rotated refresh token, never having been used, must
+		// still work.
+		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		require.NoError(t, err)
+		require.NotEmpty(t, resp2.Token)
+	})
+
+	t.Run("consuming a refresh token without an exp claim falls back to RefreshDays for the blacklist entry", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-6"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		// Hand-crafted refresh token deliberately omitting "exp" - exercises
+		// the fallback expiry branch in the consume step, which a
+		// normally-generated refresh token (always has exp) never takes.
+		noExpToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "test-tenant",
+			"type":      "refresh",
+			"jti":       "no-exp-jti",
+		})
+		signed, err := noExpToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.Token)
+
+		// It must now be blacklisted (consumed), even without an exp claim
+		// to read the expiry from.
+		if !blacklist.IsBlacklisted(ctx, "no-exp-jti") {
+			t.Fatal("expected the no-exp refresh token's jti to be blacklisted after consumption")
+		}
+	})
+
+	t.Run("without a blacklist wired in, a refresh token remains reusable (unchanged, pre-existing behavior)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t) // no SetTokenBlacklist call
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-5"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+
+		// No blacklist wired in: replay is not rejected as a mismatch (this
+		// case is exactly why SetTokenBlacklist should be wired in
+		// production - see internal/service/services.go - but the method
+		// itself must not panic or misbehave when it isn't).
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+	})
 }
 
 func TestWebAuthnUser(t *testing.T) {

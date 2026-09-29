@@ -48,6 +48,7 @@ type WebAuthnService struct {
 	logger          *zap.Logger
 	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
+	tokenBlacklist  *TokenBlacklist
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -85,6 +86,16 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 		webauthn:        wa,
 		aaguidValidator: validator,
 	}, nil
+}
+
+// SetTokenBlacklist sets the token blacklist. When set, RefreshAccessToken
+// consumes (blacklists) the presented refresh token's own jti once it has
+// been exchanged, so the same refresh token can't be replayed to mint
+// another access/refresh token pair indefinitely - see RefreshAccessToken's
+// doc comment (Copilot review on #400: RefreshAccessToken only rotated
+// tokens and never invalidated the one just used).
+func (s *WebAuthnService) SetTokenBlacklist(b *TokenBlacklist) {
+	s.tokenBlacklist = b
 }
 
 // getAttestationPreference returns the configured attestation conveyance preference
@@ -1293,7 +1304,17 @@ type RefreshTokenResponse struct {
 	RefreshToken string `json:"refreshToken,omitempty"`
 }
 
-// RefreshAccessToken exchanges a valid refresh token for a new access token
+// RefreshAccessToken exchanges a valid refresh token for a new access token.
+//
+// SECURITY: the presented refresh token is single-use. Once successfully
+// exchanged, its own jti is blacklisted (when a TokenBlacklist is wired in
+// via SetTokenBlacklist) so it can't be replayed to mint another
+// access/refresh token pair - without this, a stolen refresh token could be
+// used indefinitely, every use producing another full-lived refresh token,
+// and Logout (which only blacklists the caller's current access token) had
+// no way to stop it (Copilot review on #400). Rotation still issues a new
+// refresh token each call, exactly as before; this only closes the reuse
+// window on the token being replaced.
 func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTokenRequest) (*RefreshTokenResponse, error) {
 	if s.cfg.JWT.RefreshDays <= 0 {
 		return nil, fmt.Errorf("refresh tokens are disabled")
@@ -1319,6 +1340,18 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	// Verify this is a refresh token
 	tokenType, _ := claims["type"].(string)
 	if tokenType != "refresh" {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// Reject a refresh token that has already been consumed by a previous
+	// call - see the doc comment above. A jti-less token (shouldn't happen
+	// for tokens this service issues) can't be tracked, so it's neither
+	// checked nor consumed below; presence of tokenBlacklist is optional
+	// (nil when the caller never wired one in), matching UserService's own
+	// SetTokenBlacklist pattern.
+	jti, _ := claims["jti"].(string)
+	if s.tokenBlacklist != nil && jti != "" && s.tokenBlacklist.IsBlacklisted(ctx, jti) {
+		s.logger.Warn("Refresh token reuse detected", zap.String("jti", jti))
 		return nil, ErrInvalidRefreshToken
 	}
 
@@ -1349,6 +1382,20 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 
 	// Generate new refresh token (rotation for security)
 	newRefreshToken, _ := s.generateRefreshToken(user, tenantID)
+
+	// Consume the presented refresh token now that it has been successfully
+	// exchanged, so it can't be replayed (see doc comment above).
+	if s.tokenBlacklist != nil && jti != "" {
+		var expiry time.Time
+		if exp, ok := claims["exp"].(float64); ok {
+			expiry = time.Unix(int64(exp), 0)
+		} else {
+			expiry = time.Now().AddDate(0, 0, s.cfg.JWT.RefreshDays)
+		}
+		if err := s.tokenBlacklist.Add(ctx, jti, expiry); err != nil {
+			s.logger.Warn("Failed to blacklist consumed refresh token", zap.Error(err))
+		}
+	}
 
 	s.logger.Info("Access token refreshed",
 		zap.String("user_id", userIDStr),
