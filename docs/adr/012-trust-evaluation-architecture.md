@@ -175,6 +175,7 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 │     │──── flow_progress ────▶│                               │               │
 │     │     requires_resolution: true                          │               │
 │     │     request_jwt: "eyJ..."                              │               │
+│     │     resolution_subject_id: "did:web:verifier.example.com"│              │
 │     │     subject_id: "did:web:verifier.example.com"         │               │
 │     │                        │                               │               │
 │     │                 ┌──────┴──────┐                        │               │
@@ -182,7 +183,8 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 │     │                 └──────┬──────┘                        │               │
 │     │                        │                               │               │
 │     │                        │──── POST /v1/resolve ────────▶│               │
-│     │                        │     { subject_id: "did:..." } │──▶ PDP        │
+│     │                        │  { subject_id: resolution_    │               │
+│     │                        │      subject_id }             │──▶ PDP        │
 │     │                        │                               │               │
 │     │                        │◀─── { keys: [...], ... } ─────│               │
 │     │                        │                               │               │
@@ -450,23 +452,32 @@ user interaction timeout.
 
 ### DID Resolution Error Handling
 
-For DID-based client_id schemes (`client_id_scheme=did`), the frontend must:
+For DID-based client_id schemes (`client_id_scheme=did` or
+`decentralized_identifier`), the frontend must:
 
-1. Receive `TrustEvaluationRequest` with `requires_resolution: true` and `request_jwt`
-2. Call `POST /v1/resolve` with the DID to get the DID document
+1. Receive `TrustEvaluationRequest` with `requires_resolution: true`,
+   `request_jwt`, and `resolution_subject_id`
+2. Call `POST /v1/resolve` with `resolution_subject_id` (the bare DID) to
+   get the DID document - never `subject_id`, which keeps the
+   `decentralized_identifier:` prefix `/v1/resolve` cannot accept as a
+   resolvable DID
 3. Verify `request_jwt` signature using resolved keys
-4. Call `POST /v1/evaluate` with the resolved key material
+4. Call `POST /v1/evaluate` with `subject_id` and the resolved key material
 5. Return `trust_result` action within `TrustEvaluationTimeout`
 
 **Error cases handled by the backend:**
 - `TrustEvaluationRequest` validation fails → Flow rejected with error
 - `RequestJWT` empty when `RequiresResolution=true` → Validation error
+- `ResolutionSubjectID` empty when `RequiresResolution=true` → Validation error
 - Frontend doesn't respond within 2 minutes → `ErrFlowTimeout`
 - Trust result validation fails → Flow rejected with error
 
-**Important**: The backend validates that `RequestJWT` is present when
-`RequiresResolution=true`. Issuers with DID-based identifiers do not require
-a signed request JWT (issuance is initiated by the issuer).
+**Important**: The backend validates that `RequestJWT` and
+`ResolutionSubjectID` are both present when `RequiresResolution=true`.
+Issuers with DID-based identifiers do not require a signed request JWT
+(issuance is initiated by the issuer) - that specific check does not apply
+to `OID4VCIHandler.evaluateTrustViaFrontend`, which never calls this
+shared `Validate()`.
 
 ### Input Validation
 
@@ -476,6 +487,7 @@ The backend validates all trust evaluation messages:
 - `SubjectID` must be non-empty
 - `SubjectType` must be `credential_issuer` or `credential_verifier`
 - `RequestJWT` required when `RequiresResolution=true` (for verifiers)
+- `ResolutionSubjectID` required when `RequiresResolution=true`
 - `KeyMaterial.Type` must be `x5c` or `jwk` (if provided)
 
 **TrustResultPayload validation:**
