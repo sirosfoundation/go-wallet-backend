@@ -93,11 +93,13 @@ type Config struct {
 	// preferring signed (application/jwt) responses. Default: true.
 	PreferSigned *bool
 
-	// FallbackOn406 enables a workaround for non-compliant issuers that reject
-	// the preferred Accept with HTTP 406 instead of serving an acceptable
-	// representation: the resolver retries once with the alternate media type.
-	// Default: false (a 406 is terminal).
-	FallbackOn406 *bool
+	// FallbackOn4xx enables a workaround for non-compliant issuers that answer
+	// the preferred Accept with a 4xx (406 Not Acceptable, but also 400, 404,
+	// 415, ... some servers only serve what their Accept list names) instead of
+	// serving an acceptable representation: the resolver retries once with the
+	// alternate media type. HTTP 429 is never retried this way. Default: false
+	// (any non-200 is terminal).
+	FallbackOn4xx *bool
 }
 
 type cachedEntry struct {
@@ -279,26 +281,27 @@ func (r *Resolver) preferSigned() bool {
 	return true
 }
 
-// fallbackOn406 reports whether a 406 on the preferred Accept should trigger a
+// fallbackOn4xx reports whether a 4xx on the preferred Accept should trigger a
 // retry with the alternate media type.
-func (r *Resolver) fallbackOn406() bool {
-	if r.cfg.FallbackOn406 != nil {
-		return *r.cfg.FallbackOn406
+func (r *Resolver) fallbackOn4xx() bool {
+	if r.cfg.FallbackOn4xx != nil {
+		return *r.cfg.FallbackOn4xx
 	}
 	return false
 }
 
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
 	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
-	// metadata, some issuers reject the application/jwt Accept with 406 instead
-	// of falling back to JSON; retry once requesting unsigned JSON in that case.
+	// metadata, some issuers reject the application/jwt Accept with a 4xx
+	// instead of falling back to JSON (and the reverse when unsigned is
+	// preferred); retry once requesting the other representation in that case.
 	accepts := []string{"application/json", "application/jwt"}
 	if r.preferSigned() {
 		accepts = []string{"application/jwt", "application/json"}
 	}
-	// Without the 406 fallback gate, only the preferred representation is
+	// Without the 4xx fallback gate, only the preferred representation is
 	// requested and any non-200 status is terminal.
-	if !r.fallbackOn406() {
+	if !r.fallbackOn4xx() {
 		accepts = accepts[:1]
 	}
 
@@ -312,9 +315,11 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 			return result, nil
 		}
 		lastStatus = status
-		// Only a "signed not available" signal warrants an unsigned retry;
-		// any other status is terminal.
-		if status != http.StatusNotAcceptable {
+		// A client error on the preferred representation may just mean the
+		// issuer does not serve that media type, so try the other one. Other
+		// statuses are terminal, as is 429: it says nothing about the media
+		// type, and an immediate second request only adds load.
+		if status < 400 || status >= 500 || status == http.StatusTooManyRequests {
 			break
 		}
 	}
