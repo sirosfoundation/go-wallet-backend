@@ -1639,18 +1639,31 @@ func (s *storeWithUserOverride) Users() storage.UserStore { return s.users }
 //
 // This is deliberately NOT a full FinishLogin/go-webauthn integration test:
 // go-webauthn's own Authenticator.UpdateCounter, when handed a live-aliased
-// Authenticator (as the in-memory store always produces), incidentally
+// Authenticator (as the in-memory store used to always produce), incidentally
 // self-protects against the exact scenario a full-flow test would try to
 // construct — its own regression check already sees whatever a concurrent
-// write most recently landed, because it's reading the SAME aliased object,
-// making the extra direct assignment a no-op in every ordering that could
-// be driven deterministically through the public API. Isolating the exact
-// vulnerable CODE PATTERN here — obtain a live pointer via GetByID, mutate
-// SignCount on it directly, only then call UpdateCredentialAuthenticator —
-// is what actually demonstrates the defect precisely and deterministically:
-// it doesn't matter whether the mutation happens to originate from
-// FinishLogin or a similar future call site, this shape is unsafe on the
-// memory backend, period.
+// write most recently landed, because it was reading the SAME aliased
+// object, making an extra direct assignment a no-op in every ordering that
+// could be driven deterministically through the public API. Isolating the
+// exact code pattern here — obtain a *domain.User via GetByID, mutate
+// SignCount on the object returned, only then call
+// UpdateCredentialAuthenticator — demonstrates precisely and
+// deterministically whether that shape is safe, independent of whether the
+// mutation happens to originate from FinishLogin or a similar future call
+// site.
+//
+// A Copilot review on #388 additionally pointed out that GetByID handing out
+// the live map pointer meant reads through it (e.g. FinishLogin building
+// go-webauthn credentials from the returned user, after its own RLock was
+// already released) were unsynchronized with concurrent writers holding
+// UserStore.mu inside UpdateCredentialAuthenticator — a genuine Go data race,
+// not just a discipline problem. The fix (UserStore.GetByID/GetByUsername/
+// GetByDID now return an independent deep copy — see deepCopyUser in
+// internal/storage/memory/memory.go) closes that at the storage layer
+// itself: mutating the returned object can no longer reach stored state at
+// all, so the "vulnerable pattern" this test used to be able to demonstrate
+// is no longer reachable through the public GetByID API — which is exactly
+// what the first sub-test below now asserts.
 func TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -1663,35 +1676,43 @@ func TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate(t *tes
 	}
 	require.NoError(t, store.Users().Create(ctx, user))
 
-	t.Run("vulnerable pattern: direct mutation before the atomic call defeats it", func(t *testing.T) {
+	t.Run("GetByID returns an independent copy: mutating it cannot defeat the atomic update", func(t *testing.T) {
 		// A concurrent, independent write already advanced the counter to 20.
 		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
 		require.NoError(t, err)
 
-		// The vulnerable shape: obtain a live pointer via GetByID (aliased on
-		// the memory backend), then mutate SignCount on it directly — exactly
-		// what FinishLogin used to do — using THIS caller's own, older/lower
+		// The formerly-vulnerable shape: fetch via GetByID, then mutate
+		// SignCount directly on the object it returned — exactly what
+		// FinishLogin used to do — using this caller's own, older/lower
 		// reported count (10), before ever calling the atomic update.
 		fetched, err := store.Users().GetByID(ctx, user.UUID)
 		require.NoError(t, err)
 		matchedCred := &fetched.WebauthnCredentials[0]
-		matchedCred.Authenticator.SignCount = 10 // the vulnerable direct write
+		matchedCred.Authenticator.SignCount = 10 // mutates fetched's own copy only
 
-		// The atomic call now has nothing left to protect: the value it
-		// compares its own input (10) against has already been clobbered to
-		// 10 by the direct write above, so 10 > 10 is false and it does
-		// nothing further — but the damage (20 -> 10) is already done.
+		// Confirm the mutation really did land locally (proving this isn't a
+		// vacuous test), but never touched the stored value.
+		require.Equal(t, uint32(10), fetched.WebauthnCredentials[0].Authenticator.SignCount)
+		unaffected, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(20), unaffected.WebauthnCredentials[0].Authenticator.SignCount,
+			"mutating the object returned by GetByID must not reach stored state")
+
+		// The atomic call, using the same stale/lower reported count (10),
+		// correctly refuses to regress the stored counter — same outcome as
+		// the discipline-based "fixed pattern" below, but now guaranteed by
+		// the storage layer rather than by caller discipline.
 		_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
 		require.NoError(t, err)
 
 		got, err := store.Users().GetByID(ctx, user.UUID)
 		require.NoError(t, err)
-		assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount,
-			"demonstrates the defect: the direct mutation lowered the stored counter despite the monotonic update")
+		assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+			"the monotonic atomic update must not be defeated by mutating a fetched copy")
 	})
 
 	t.Run("fixed pattern: no direct mutation, atomic call alone cannot regress", func(t *testing.T) {
-		// Reset to the same starting point as the vulnerable sub-test.
+		// Reset to the same starting point as the sub-test above.
 		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
 		require.NoError(t, err)
 
@@ -1708,6 +1729,66 @@ func TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate(t *tes
 		assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
 			"without the direct mutation, the monotonic atomic update alone correctly refuses to lower the stored counter")
 	})
+}
+
+// TestUserStore_GetByID_ConcurrentReadsDontRaceWithUpdateCredentialAuthenticator
+// is the concurrency reproduction of the Copilot #388 finding: GetByID used
+// to hand back the live map pointer, so a goroutine reading fields off a
+// previously-fetched user (as FinishLogin does once it has left the
+// GetByID call itself, e.g. inside go-webauthn's own credential-building
+// callback) had no synchronization at all with a concurrent
+// UpdateCredentialAuthenticator call mutating
+// WebauthnCredentials[i].Authenticator on that SAME shared object. That's a
+// genuine, `go test -race`-detectable data race, not just a logical bug —
+// this test drives real concurrent goroutines so the race detector can
+// actually observe it. Before the deepCopyUser fix, this test failed
+// immediately under `-race` with "DATA RACE" on
+// WebauthnCredentials[i].Authenticator; after it, GetByID's independent copy
+// means the reader and the writer never touch the same memory, so `-race`
+// (and this test) stays clean.
+func TestUserStore_GetByID_ConcurrentReadsDontRaceWithUpdateCredentialAuthenticator(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Writer: repeatedly advances SignCount and flips CloneWarning, exactly
+	// the fields a concurrent FinishLogin's persistence would touch.
+	go func() {
+		defer wg.Done()
+		for i := uint32(0); i < iterations; i++ {
+			_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", i+2, i%2 == 0)
+			assert.NoError(t, err)
+		}
+	}()
+
+	// Reader: fetches the user and reads exactly the fields FinishLogin
+	// reads off a previously-fetched credential (SignCount, CloneWarning)
+	// after its own GetByID call has already returned (i.e. outside any
+	// lock the store itself might be holding).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			fetched, err := store.Users().GetByID(ctx, user.UUID)
+			assert.NoError(t, err)
+			for j := range fetched.WebauthnCredentials {
+				_ = fetched.WebauthnCredentials[j].Authenticator.SignCount
+				_ = fetched.WebauthnCredentials[j].Authenticator.CloneWarning
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 // TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace covers a review
