@@ -253,34 +253,13 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	}
 
 	// Check if OIDC gate authentication result is present
-	// Note: For login, we can't get tenant ID from request - it's determined from the credential
-	// The middleware sets the result in context, and the service will verify it matches the user's bound identity
-	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
-		// Extract email from claims if available
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		binding := &service.OIDCGateBinding{
-			Issuer:  oidcResult.Issuer,
-			Subject: oidcResult.Subject,
-			Email:   email,
-			// Record the full validated claims too, so FinishLogin can
-			// re-check them against the credential's real tenant's own
-			// RequiredClaims - see OIDCGateBinding.Claims's doc comment.
-			Claims: oidcResult.Claims,
-		}
-		// Record which audience this token was actually validated against
-		// (this request's header tenant's LoginOP) so FinishLogin can compare
-		// it against the credential's real tenant's own configured audience -
-		// issuer alone doesn't prove the token was meant for that tenant if
-		// two tenants share an IdP domain. See OIDCGateBinding.Audience.
-		// Mirrors internal/as.PasskeyHandlers.LoginFinish (#386/#408/#409).
-		if headerTenant, ok := middleware.GetTenant(c); ok {
-			if loginOP := headerTenant.OIDCGate.GetLoginOP(); loginOP != nil {
-				binding.Audience = loginOP.EffectiveAudience()
-			}
-		}
+	// Note: For login, we can't get tenant ID from request - it's determined
+	// from the credential. Builds Issuer/Subject/Email/Audience/Claims the
+	// same way internal/as.PasskeyHandlers.LoginFinish does - shared to
+	// avoid duplicating this tenant-aware binding construction between the
+	// two login paths (see middleware.BuildLoginOIDCGateBinding's doc
+	// comment, and #386/#408/#409).
+	if binding := middleware.BuildLoginOIDCGateBinding(c); binding != nil {
 		req.OIDCGateBinding = binding
 	}
 
