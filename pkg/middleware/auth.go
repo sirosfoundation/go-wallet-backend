@@ -43,6 +43,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			logAuthReject(logger, c, "missing_authorization_header")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -82,6 +83,20 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 	return AuthMiddlewareWithBlacklist(cfg, store, nil, logger)
 }
 
+// logAuthReject records why a request was refused by an authentication
+// middleware. Rejections used to be visible only as a JSON body on the
+// client, which is unreachable when debugging wrapper apps or platforms
+// without client-side request logs (#301). Never pass the token itself.
+func logAuthReject(logger *zap.Logger, c *gin.Context, reason string, fields ...zap.Field) {
+	base := []zap.Field{
+		zap.String("reason", reason),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+		zap.String("client_ip", c.ClientIP()),
+	}
+	logger.Warn("Authentication rejected", append(base, fields...)...)
+}
+
 // AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
 func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -95,6 +110,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || parts[0] != "Bearer" {
+			logAuthReject(logger, c, "malformed_authorization_header")
 			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
 			c.Abort()
 			return
@@ -102,6 +118,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 
 		tokenString := strings.TrimSpace(parts[1])
 		if tokenString == "" {
+			logAuthReject(logger, c, "empty_bearer_token")
 			c.JSON(401, gin.H{"error": "Token required"})
 			c.Abort()
 			return
@@ -117,6 +134,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		})
 
 		if err != nil || !token.Valid {
+			logAuthReject(logger, c, "invalid_token", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -125,6 +143,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// Extract claims
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok {
+			logAuthReject(logger, c, "invalid_token_claims")
 			c.JSON(401, gin.H{"error": "Invalid token claims"})
 			c.Abort()
 			return
@@ -133,6 +152,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// Get user_id from claims
 		userID, ok := claims["user_id"].(string)
 		if !ok {
+			logAuthReject(logger, c, "missing_user_id_claim")
 			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
 			c.Abort()
 			return
