@@ -1756,6 +1756,13 @@ func (e *erroringChallengeStore) ConsumeByID(ctx context.Context, id string) (*d
 	return e.ChallengeStore.ConsumeByID(ctx, id)
 }
 
+func (e *erroringChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByIDForUser(ctx, id, userID)
+}
+
 // storeWithChallengeOverride wraps *memory.Store, swapping out just the
 // Challenges() accessor so every other collection still behaves like the
 // real in-memory store.
@@ -2159,9 +2166,22 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 			Credential:  json.RawMessage(`{}`),
 		}
 
+		// Review finding on PR #388: consuming the challenge before checking
+		// ownership let a mismatched caller (user 2, here) permanently burn
+		// user 1's real challenge. The atomic ConsumeByIDForUser fix folds
+		// the ownership check into the same atomic find-and-delete, so
+		// user 2's request must be rejected as "not found" (indistinguishable
+		// from the challenge simply not existing — deliberately, so a caller
+		// can't probe which) WITHOUT consuming it.
 		_, err = setup.service.FinishAddCredential(setup.ctx, userID2, finishReq, "")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "challenge user mismatch")
+		assert.ErrorIs(t, err, ErrChallengeNotFound)
+
+		// The real owner (user 1) must still be able to use their own
+		// challenge afterward — it must not have been consumed by user 2's
+		// mismatched attempt.
+		got, err := setup.store.Challenges().GetByID(setup.ctx, "user1-challenge")
+		require.NoError(t, err, "user 1's challenge must survive a mismatched-owner attempt from user 2")
+		assert.Equal(t, userID1.String(), got.UserID)
 	})
 }
 

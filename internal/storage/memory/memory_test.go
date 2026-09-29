@@ -373,8 +373,12 @@ func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true); err != nil {
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true)
+	if err != nil {
 		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if !transitioned {
+		t.Error("transitioned should be true: this call moved CloneWarning from false to true")
 	}
 
 	got, err := users.GetByID(ctx, user.UUID)
@@ -409,14 +413,22 @@ func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing
 	}
 
 	// First call latches CloneWarning=true.
-	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true); err != nil {
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true)
+	if err != nil {
 		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if !transitioned {
+		t.Error("first call should report transitioned=true")
 	}
 
 	// A later call with cloneWarning=false (a clean, non-regressing login)
-	// must NOT clear it.
-	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false); err != nil {
+	// must NOT clear it, and must not itself report a transition.
+	transitioned, err = users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	if err != nil {
 		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if transitioned {
+		t.Error("a call with cloneWarning=false must never report transitioned=true")
 	}
 
 	got, err := users.GetByID(ctx, user.UUID)
@@ -431,14 +443,97 @@ func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing
 	}
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic covers a
+// review finding on PR #388: SignCount must never decrease, since two
+// concurrent logins can persist out of order (a higher counter landing
+// before a lower one from an earlier, slower request). An unconditional
+// overwrite would let the later, lower write regress the stored baseline.
+func TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if _, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	// A lower counter arriving after must not decrease the stored baseline.
+	if _, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 20 {
+		t.Errorf("SignCount = %d, want 20 (a lower value must never decrease the stored counter)", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+}
+
 func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	users := store.Users()
 
-	err := users.UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	_, err := users.UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
 	if err != storage.ErrNotFound {
 		t.Errorf("expected ErrNotFound for a nonexistent user, got %v", err)
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
+// the review finding that a caller-side "was this already latched" check
+// (computed from a separately-read snapshot) can let concurrent callers
+// duplicate a one-time side effect: many goroutines race to call
+// UpdateCredentialAuthenticator(cloneWarning=true) on the same credential,
+// and exactly one of them must see transitioned=true.
+func TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 1, true)
+			if err == nil && transitioned {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent calls to report transitioned=true, got %d", attempts, got)
 	}
 }
 

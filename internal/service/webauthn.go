@@ -1195,60 +1195,19 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// Capture whether this credential's CloneWarning was already latched in
-	// storage BEFORE this call, so the security-event log/audit emit below
-	// can distinguish a NEWLY detected counter regression from a lingering
-	// flag left over from a past login. WebAuthnCredentials() (used to
-	// build the credential set handed to go-webauthn above) hydrates the
-	// persisted CloneWarning, and go-webauthn's Authenticator.UpdateCounter
-	// never clears it on a clean, properly-incrementing assertion — so once
-	// latched, credential.Authenticator.CloneWarning stays true on every
-	// subsequent login, not just the one that triggered it. Without this
-	// distinction the block below would emit a "possible cloned
-	// authenticator" event on every single login after the first detected
-	// regression, flooding logs and audit alerts instead of firing once at
-	// the moment of detection.
-	alreadyLatched := matchedCred.Authenticator.CloneWarning
-	newlyDetectedCloneWarning := credential.Authenticator.CloneWarning && !alreadyLatched
-
-	// Update the credential's signature count. CloneWarning is sticky: once
-	// set, a later login with a properly-incrementing counter must not
-	// silently clear it back to false — go-webauthn's per-call Authenticator
-	// only ever reports whether *this* assertion's counter regressed, so a
-	// clean subsequent login would otherwise erase the audit trail of an
-	// earlier detected clone. Only ever latch it true; clearing it is a
-	// deliberate operator action, not an automatic side effect of a login.
+	// Update the in-memory view of the signature count for logging below;
+	// SignCount and CloneWarning are authoritatively persisted via the
+	// atomic call further down (SignCount is max-only, never decreases the
+	// stored counter). Deliberately NOT also locally setting
+	// matchedCred.Authenticator.CloneWarning here: the memory store's
+	// GetByID returns the same pointer it holds internally rather than a
+	// copy (unlike MongoDB, which always decodes a fresh struct), so a
+	// local mutation here would corrupt the "value immediately before this
+	// write" the atomic call below needs to observe to correctly detect a
+	// genuine false-to-true transition — this was caught by
+	// TestFullLoginFlow_CloneWarningSurfaced starting to fail once this line
+	// was (re-)added during a later refactor; removed again on purpose.
 	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
-	if credential.Authenticator.CloneWarning {
-		matchedCred.Authenticator.CloneWarning = true
-	}
-
-	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
-	// signature counter regressed relative to what we have stored — the
-	// standard signal that this credential's private key has been cloned
-	// onto a second authenticator. We deliberately still let the login
-	// through (a single stateful counter is a weak signal in isolation, and
-	// some legitimate authenticators never increment it), but the warning
-	// must never be silently swallowed: log it as a distinct, greppable
-	// security-event line and, when audit is enabled, record it in the
-	// shared SET audit trail so it can be alerted on and investigated
-	// (issue #380). Gated on newlyDetectedCloneWarning, not the raw flag, so
-	// this fires once per actual detection rather than on every subsequent
-	// login.
-	if newlyDetectedCloneWarning {
-		s.logger.Warn("possible cloned authenticator detected",
-			zap.String("security_event", "webauthn_clone_warning"),
-			zap.String("user_id", userID.String()),
-			zap.String("tenant_id", string(tenantID)),
-			zap.String("credential_id", credentialID),
-			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
-		)
-		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
-			"user_id":    userID.String(),
-			"tenant_id":  string(tenantID),
-			"sign_count": matchedCred.Authenticator.SignCount,
-		})
-	}
 
 	// Log public key diagnostics for successful login
 	if s.logger.Core().Enabled(zap.DebugLevel) {
@@ -1280,9 +1239,49 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// OR-only assignment under one mutex acquisition). No concurrent
 	// ordering of two such calls can ever result in a true being overwritten
 	// by a false.
-	if err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, matchedCred.Authenticator.SignCount, credential.Authenticator.CloneWarning); err != nil {
+	//
+	// It also reports whether THIS call is the one that actually flipped
+	// CloneWarning from false to true — a real compare-and-set outcome from
+	// the storage layer, not a locally precomputed guess. That distinction
+	// matters under concurrency: two logins on separate challenges can both
+	// read a stale CloneWarning=false before either persists, so a local
+	// "was it already true when I read it" check (as an earlier version of
+	// this fix used) would let both independently conclude "newly
+	// detected" and both emit the security event — a duplicate. Gating the
+	// emission on the atomic transition result instead means only the one
+	// call that actually won the race reports it.
+	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, matchedCred.Authenticator.SignCount, credential.Authenticator.CloneWarning)
+	if err != nil {
 		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
 		// Don't fail login for this
+	}
+
+	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
+	// signature counter regressed relative to what we have stored — the
+	// standard signal that this credential's private key has been cloned
+	// onto a second authenticator. We deliberately still let the login
+	// through (a single stateful counter is a weak signal in isolation, and
+	// some legitimate authenticators never increment it), but the warning
+	// must never be silently swallowed: log it as a distinct, greppable
+	// security-event line and, when audit is enabled, record it in the
+	// shared SET audit trail so it can be alerted on and investigated
+	// (issue #380). Gated on the atomic false-to-true transition reported by
+	// UpdateCredentialAuthenticator above, not the raw flag, so this fires
+	// exactly once per actual detection — even under concurrent logins —
+	// rather than on every subsequent login or being duplicated by a race.
+	if transitioned {
+		s.logger.Warn("possible cloned authenticator detected",
+			zap.String("security_event", "webauthn_clone_warning"),
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("credential_id", credentialID),
+			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+		)
+		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+			"user_id":    userID.String(),
+			"tenant_id":  string(tenantID),
+			"sign_count": matchedCred.Authenticator.SignCount,
+		})
 	}
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
@@ -1842,10 +1841,19 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		return nil, err
 	}
 
-	// Atomically consume the challenge (single find-and-delete); see the
-	// same fix in FinishRegistration/FinishLogin for issue #379 — this path
-	// has the identical GetByID+Delete TOCTOU and is closed the same way.
-	challenge, err := s.store.Challenges().ConsumeByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge, constrained to this authenticated
+	// caller's own userID as part of the SAME atomic find-and-delete (not a
+	// separate check performed after consuming). This path is unlike
+	// FinishRegistration/FinishLogin: the caller here is already
+	// authenticated, and the challenge additionally carries an owning
+	// userID that must match. Plain ConsumeByID would let a caller who
+	// somehow obtains another user's add-credential challenge ID
+	// permanently burn that user's pending ceremony — it would consume
+	// (delete) the real owner's challenge before the ownership mismatch was
+	// ever checked. ConsumeByIDForUser folds the ownership check into the
+	// atomic filter itself, so a mismatched caller gets ErrNotFound without
+	// ever touching the real owner's challenge.
+	challenge, err := s.store.Challenges().ConsumeByIDForUser(ctx, req.ChallengeID, userID.String())
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrChallengeNotFound
@@ -1859,10 +1867,6 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
-	}
-
-	if challenge.UserID != userID.String() {
-		return nil, errors.New("challenge user mismatch")
 	}
 
 	waUser := &WebAuthnUser{user: user}

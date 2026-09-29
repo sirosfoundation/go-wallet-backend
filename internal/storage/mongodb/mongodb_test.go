@@ -211,7 +211,9 @@ func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
 	}
 	require.NoError(t, store.Users().Create(ctx, user))
 
-	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true))
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true)
+	require.NoError(t, err)
+	assert.True(t, transitioned, "this call moved CloneWarning from false to true")
 
 	got, err := store.Users().GetByID(ctx, user.UUID)
 	require.NoError(t, err)
@@ -240,11 +242,15 @@ func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing
 	require.NoError(t, store.Users().Create(ctx, user))
 
 	// First call latches CloneWarning=true.
-	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true))
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true)
+	require.NoError(t, err)
+	assert.True(t, transitioned, "first call should report transitioned=true")
 
 	// A later call with cloneWarning=false (a clean, non-regressing login)
-	// must NOT clear it.
-	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false))
+	// must NOT clear it, and must not itself report a transition.
+	transitioned, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	require.NoError(t, err)
+	assert.False(t, transitioned, "a call with cloneWarning=false must never report transitioned=true")
 
 	got, err := store.Users().GetByID(ctx, user.UUID)
 	require.NoError(t, err)
@@ -253,12 +259,80 @@ func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing
 	assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount)
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic covers a
+// review finding on PR #388: SignCount must never decrease. Against a real
+// MongoDB, this exercises the $max operator directly.
+func TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+	require.NoError(t, err)
+	// A lower counter arriving after must not decrease the stored baseline.
+	_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	require.NoError(t, err)
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+		"a lower value must never decrease the stored counter")
+}
+
 func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
 
-	err := store.Users().UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	_, err := store.Users().UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
 	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
+// the review finding that a caller-side "was this already latched" check
+// can let concurrent callers duplicate a one-time side effect: many
+// goroutines race to call UpdateCredentialAuthenticator(cloneWarning=true)
+// on the same credential against a real MongoDB, and exactly one of them
+// must see transitioned=true.
+func TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 1, true)
+			if err == nil && transitioned {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent calls to report transitioned=true", attempts)
 }
 
 func TestChallengeStore_CRUD(t *testing.T) {

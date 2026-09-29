@@ -99,6 +99,14 @@ func (m *mockChallengeStore) ConsumeByID(_ context.Context, id string) (*domain.
 	delete(m.challenges, id)
 	return c, nil
 }
+func (m *mockChallengeStore) ConsumeByIDForUser(_ context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	c, ok := m.challenges[id]
+	if !ok || c.UserID != userID {
+		return nil, storage.ErrNotFound
+	}
+	delete(m.challenges, id)
+	return c, nil
+}
 func (m *mockChallengeStore) Delete(_ context.Context, id string) error {
 	delete(m.challenges, id)
 	return nil

@@ -332,29 +332,39 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	return nil
 }
 
-func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error {
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	user, exists := s.data[id.String()]
 	if !exists {
-		return storage.ErrNotFound
+		return false, storage.ErrNotFound
 	}
 
 	for i := range user.WebauthnCredentials {
 		if user.WebauthnCredentials[i].ID == credentialID {
-			user.WebauthnCredentials[i].Authenticator.SignCount = signCount
+			// Monotonic non-decreasing, matching MongoDB's $max semantics
+			// (see the interface doc comment and the Mongo implementation
+			// for why an unconditional overwrite is unsafe here).
+			if signCount > user.WebauthnCredentials[i].Authenticator.SignCount {
+				user.WebauthnCredentials[i].Authenticator.SignCount = signCount
+			}
+			// Compare-and-set, under the same lock as the read: this is the
+			// authoritative "did I just cause the false->true transition"
+			// answer, safe from the duplicate-event race a caller-side
+			// precomputed comparison would be vulnerable to.
+			transitioned := cloneWarning && !user.WebauthnCredentials[i].Authenticator.CloneWarning
 			// OR-only: never write false over an existing true.
 			if cloneWarning {
 				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
 			}
 			user.UpdatedAt = time.Now()
-			return nil
+			return transitioned, nil
 		}
 	}
 	// User exists but no credential with that ID: silent no-op success,
 	// matching MongoDB's arrayFilter semantics (see interface doc comment).
-	return nil
+	return false, nil
 }
 
 // CredentialStore implements in-memory credential storage
@@ -563,6 +573,18 @@ func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.We
 
 	challenge, exists := s.data[id]
 	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || challenge.UserID != userID {
 		return nil, storage.ErrNotFound
 	}
 	delete(s.data, id)

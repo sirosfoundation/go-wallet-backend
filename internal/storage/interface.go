@@ -92,16 +92,34 @@ type UserStore interface {
 	// here — the underlying implementations must never let this method
 	// write false over an existing true — so it can only ever gain the
 	// signal, never lose it to a race, however the two calls interleave.
-	// SignCount is a plain overwrite (last-writer-wins is acceptable for a
-	// monotonic counter; it isn't the security-critical field). Returns
-	// storage.ErrNotFound if the user doesn't exist. If the user exists but
+	// SignCount is monotonic non-decreasing (Mongo: $max; memory: only
+	// assigned when greater), not a plain overwrite: concurrent logins can
+	// persist out of order, and letting a later write lower the stored
+	// counter would both falsely flag a subsequent legitimate assertion as
+	// a clone regression and let an actually-regressing counter slip
+	// through as non-regressing against an artificially-lowered baseline.
+	// Returns storage.ErrNotFound if the user doesn't exist. If the user exists but
 	// has no credential with that ID, this is a silent no-op success in
 	// both backends (MongoDB's arrayFilter update can't distinguish
 	// "matched the document but zero array elements" from "document not
 	// found", so this is a deliberate, matching behavior rather than an
 	// accidental divergence) — callers must only call this with a
 	// credentialID they've just matched on that same user.
-	UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error
+	//
+	// transitioned reports whether THIS call is the one that actually
+	// flipped CloneWarning from false to true in storage — a genuine
+	// compare-and-set outcome from the atomic write itself (MongoDB:
+	// FindOneAndUpdate returning the pre-image so the prior stored value
+	// can be inspected; memory: checked under the same mutex acquisition as
+	// the write), not something callers should try to infer from a
+	// separately-read snapshot. Two concurrent callers that both pass
+	// cloneWarning=true can both observe a stale "not yet latched" view
+	// before either persists; only relying on this return value (rather
+	// than a local pre-check) ensures exactly one of them sees
+	// transitioned=true, so a caller gating a one-time side effect (e.g. a
+	// security-event log line) on this value can't duplicate it under a
+	// race. Always false when cloneWarning is false.
+	UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (transitioned bool, err error)
 }
 
 // CredentialStore defines the interface for credential storage operations
@@ -162,6 +180,19 @@ type ChallengeStore interface {
 	// ErrNotFound if the challenge doesn't exist or was already consumed by
 	// another caller.
 	ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error)
+
+	// ConsumeByIDForUser atomically retrieves and deletes a challenge by ID,
+	// but ONLY if it also belongs to the given userID — the ownership check
+	// is part of the same atomic find-and-delete, not a separate check
+	// performed after consuming. This is what an authenticated, per-user
+	// operation (e.g. FinishAddCredential) must use instead of plain
+	// ConsumeByID: a caller presenting a DIFFERENT user's challenge ID gets
+	// an atomic ErrNotFound without ever touching that other user's real,
+	// still-pending challenge — a mismatched-owner call must never be able
+	// to burn someone else's ceremony. Returns ErrNotFound if the challenge
+	// doesn't exist, was already consumed, or belongs to a different user
+	// (deliberately indistinguishable, so a caller can't probe which).
+	ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error)
 
 	// Delete deletes a challenge
 	Delete(ctx context.Context, id string) error

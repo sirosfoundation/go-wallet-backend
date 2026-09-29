@@ -398,9 +398,8 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	return nil
 }
 
-func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error {
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	setFields := bson.M{
-		"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
 		"updated_at": time.Now(),
 	}
 	// OR-only: only ever include clone_warning in the $set when it's true.
@@ -413,21 +412,56 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 		setFields["webauthn_credentials.$[cred].authenticator.clone_warning"] = true
 	}
 
-	opts := options.Update().SetArrayFilters(options.ArrayFilters{
-		Filters: []interface{}{bson.M{"cred.id": credentialID}},
-	})
-	result, err := s.collection.UpdateOne(ctx,
-		bson.M{"_id.id": id.String()},
-		bson.M{"$set": setFields},
-		opts,
-	)
+	// SignCount must be monotonic non-decreasing: two concurrent logins can
+	// persist out of order (e.g. a counter=20 assertion lands before a
+	// counter=10 one from an earlier, slower request), and a plain
+	// unconditional overwrite would let the later write lower the stored
+	// baseline — which would falsely flag a subsequent legitimate assertion
+	// as a clone regression, and could let an actually-regressing counter
+	// slip through as "non-regressing" against the artificially-lowered
+	// baseline. $max is MongoDB's atomic "only update if greater" operator:
+	// combined with $set in the same update document, this whole operation
+	// is still a single atomic write.
+	update := bson.M{
+		"$set": setFields,
+		"$max": bson.M{
+			"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
+		},
+	}
+
+	opts := options.FindOneAndUpdate().
+		SetArrayFilters(options.ArrayFilters{
+			Filters: []interface{}{bson.M{"cred.id": credentialID}},
+		}).
+		// Return the PRE-image (the document as it was immediately before
+		// this update was applied), not the default post-image, so we can
+		// inspect what CloneWarning was a moment before this exact write —
+		// this is what makes the returned "transitioned" value a genuine
+		// compare-and-set outcome of the single atomic operation, rather
+		// than a separate, racy read.
+		SetReturnDocument(options.Before)
+
+	var before domain.User
+	err := s.collection.FindOneAndUpdate(ctx, bson.M{"_id.id": id.String()}, update, opts).Decode(&before)
 	if err != nil {
-		return fmt.Errorf("failed to update credential authenticator: %w", err)
+		if err == mongo.ErrNoDocuments {
+			return false, storage.ErrNotFound
+		}
+		return false, fmt.Errorf("failed to update credential authenticator: %w", err)
 	}
-	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
+
+	if !cloneWarning {
+		return false, nil
 	}
-	return nil
+	for _, c := range before.WebauthnCredentials {
+		if c.ID == credentialID {
+			return !c.Authenticator.CloneWarning, nil
+		}
+	}
+	// Credential not found in the pre-image: the arrayFilter matched zero
+	// array elements (see the interface doc comment on the silent no-op
+	// case) — conservatively report no transition.
+	return false, nil
 }
 
 // idFilter returns a BSON filter that matches a document by _id.
