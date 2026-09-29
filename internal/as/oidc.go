@@ -327,7 +327,14 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 // The challenge is deleted and the cookie cleared exactly once, on every
 // path, so neither can be replayed for a second callback attempt.
 func (h *OIDCHandlers) validateCallbackState(c *gin.Context, state string) (challenge *domain.WebauthnChallenge, ok bool) {
-	challenge, err := h.store.Challenges().GetByID(c.Request.Context(), state)
+	// Atomically consume the state challenge (single find-and-delete). A
+	// separate GetByID+Delete here would let two concurrent callbacks
+	// presenting the same state both pass validation before either deletion
+	// landed — the same challenge-reuse TOCTOU fixed for the WebAuthn paths
+	// in internal/service/webauthn.go (issue #379); this consumer shares the
+	// same ChallengeStore and was missed in that fix. ConsumeByID guarantees
+	// at most one caller ever gets a non-nil challenge back for a given ID.
+	challenge, err := h.store.Challenges().ConsumeByID(c.Request.Context(), state)
 	if err != nil {
 		h.logger.Warn("OIDC state not found", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired state"})
@@ -346,7 +353,6 @@ func (h *OIDCHandlers) validateCallbackState(c *gin.Context, state string) (chal
 
 	cookieOK := verifyOIDCStateCookie(c, h.stateSecret, state, h.cfg.InsecureCookies)
 	clearOIDCStateCookie(c, h.cfg.InsecureCookies)
-	_ = h.store.Challenges().Delete(c.Request.Context(), state)
 	if !cookieOK {
 		h.logger.Warn("OIDC state cookie missing or mismatched")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "state cookie mismatch"})
