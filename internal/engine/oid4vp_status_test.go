@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/statuslist"
@@ -164,6 +166,54 @@ func TestCheckPresentationStatus_ModeSemantics(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPresentOrRefuse_WarnNeverRefuses(t *testing.T) {
+	for name, tc := range map[string]struct {
+		down bool
+		idx  int
+	}{"revoked": {false, 1}, "unreachable": {true, 0}} {
+		t.Run(name, func(t *testing.T) {
+			h, mint, received, posted, authReq := presentFixture(t, config.StatusCheckWarn, tc.down)
+			core, logs := observer.New(zap.WarnLevel)
+			h.Logger = zap.New(core)
+			tok := mint(tc.idx, true)
+
+			require.NoError(t, h.presentOrRefuse(context.Background(), authReq, tok))
+
+			form := <-posted
+			assert.Equal(t, tok, form.Get("vp_token"), "warn must still submit the presentation")
+			assert.Empty(t, form.Get("error"))
+			msg := awaitMessage(t, received, string(TypeFlowComplete))
+			assert.NotNil(t, msg)
+			select {
+			case m := <-received:
+				assert.NotEqual(t, string(TypeFlowError), m["type"], "warn must never send CREDENTIAL_REVOKED")
+			default:
+			}
+
+			require.NotZero(t, logs.Len(), "a warning must be logged")
+			for _, e := range logs.All() {
+				assert.NotContains(t, e.Message+fmt.Sprint(e.ContextMap()), tok)
+			}
+			if !tc.down {
+				assert.Equal(t, 1, logs.FilterMessage("credential status revoked").Len())
+				f := logs.FilterMessage("credential status revoked").All()[0].ContextMap()
+				assert.Equal(t, false, f["presentation_refused"])
+				assert.Equal(t, "warn", f["status_check"])
+			}
+		})
+	}
+}
+
+func TestPresentOrRefuse_RevokedLogIsGreppable(t *testing.T) {
+	h, mint, _, _, authReq := presentFixture(t, config.StatusCheckEnforceRevoked, false)
+	core, logs := observer.New(zap.WarnLevel)
+	h.Logger = zap.New(core)
+	require.Error(t, h.presentOrRefuse(context.Background(), authReq, mint(1, true)))
+	e := logs.FilterMessage("credential status revoked").All()
+	require.Len(t, e, 1)
+	assert.Equal(t, true, e[0].ContextMap()["presentation_refused"])
 }
 
 func TestListHost(t *testing.T) {

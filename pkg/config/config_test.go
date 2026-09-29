@@ -2626,8 +2626,8 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 			t.Errorf("%q: %v", mode, err)
 		}
 	}
-	if StatusCheckMode("").Effective() != StatusCheckEnforceRevoked || StatusCheckStrict.Effective() != StatusCheckStrict {
-		t.Error("Effective() must default the zero value to enforce-revoked and keep explicit values")
+	if StatusCheckMode("").Effective() != StatusCheckWarn || StatusCheckStrict.Effective() != StatusCheckStrict {
+		t.Error("Effective() must default the zero value to warn and keep explicit values")
 	}
 	for _, bad := range []StatusCheckMode{"true", "enforce", "STRICT", "fail-closed"} {
 		err := bad.validate()
@@ -2635,8 +2635,8 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 			t.Errorf("%q: want a presentation.status_check error, got %v", bad, err)
 		}
 	}
-	if defaultConfig().Presentation.StatusCheck != StatusCheckEnforceRevoked {
-		t.Error("default must be enforce-revoked")
+	if defaultConfig().Presentation.StatusCheck != StatusCheckWarn {
+		t.Error("default must be warn")
 	}
 
 	cfg := &Config{

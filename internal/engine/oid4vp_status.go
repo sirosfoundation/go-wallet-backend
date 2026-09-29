@@ -42,8 +42,9 @@ func sharedStatusChecker(cfg *config.Config) *statuslist.Checker {
 //
 // Which outcomes refuse the presentation depends on presentation.status_check:
 //
-//   - warn: never; a positively not-valid credential is logged.
-//   - enforce-revoked (default): only a positive determination (list fetched,
+//   - warn (default): never; every problem, including a positively revoked
+//     credential ("credential status revoked"), is logged.
+//   - enforce-revoked: only a positive determination (list fetched,
 //     typ/sub/exp/signature verified, entry non-zero). If the list cannot be
 //     obtained or verified the wallet logs a warning and proceeds, because a
 //     list may be reachable by the issuer and verifier but not by the wallet
@@ -73,20 +74,25 @@ func (h *OID4VPHandler) statusOutcome(err error, uri string) error {
 		return nil
 	}
 	host := listHost(uri)
+	mode := h.statusMode.Effective()
 	if errors.Is(err, statuslist.ErrRevoked) {
-		if h.statusMode == config.StatusCheckWarn {
-			h.Logger.Warn("presented credential is not valid per its status list; presenting anyway (status_check=warn)",
-				zap.String("status_list_host", host))
+		// Stable, greppable message; no token contents, index or holder data.
+		refused := mode != config.StatusCheckWarn
+		h.Logger.Warn("credential status revoked",
+			zap.String("status_list_host", host),
+			zap.String("status_check", string(mode)),
+			zap.Bool("presentation_refused", refused))
+		if !refused {
 			return nil
 		}
 		return fmt.Errorf("credential status (%s): %w", host, err)
 	}
-	if h.statusMode == config.StatusCheckStrict {
+	if mode == config.StatusCheckStrict {
 		return fmt.Errorf("credential status (%s) could not be determined: %w", host, err)
 	}
 	h.Logger.Warn("credential status could not be determined; presenting, the verifier is responsible for the status check",
 		zap.String("status_list_host", host),
-		zap.String("status_check", string(h.statusMode)),
+		zap.String("status_check", string(mode)),
 		zap.Error(err))
 	return nil
 }

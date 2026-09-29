@@ -215,8 +215,9 @@ type StatusCheckMode string
 const (
 	// StatusCheckOff performs no status lookup.
 	StatusCheckOff StatusCheckMode = "off"
-	// StatusCheckWarn looks status up and logs a not-valid result, but never
-	// refuses a presentation.
+	// StatusCheckWarn (the default) looks status up and logs every problem,
+	// including a positively determined revocation, but never refuses a
+	// presentation.
 	StatusCheckWarn StatusCheckMode = "warn"
 	// StatusCheckEnforceRevoked refuses a presentation only when the
 	// credential is positively determined not to be valid; anything that
@@ -234,16 +235,18 @@ type PresentationConfig struct {
 	// check on presented SD-JWT VCs that carry a `status.status_list` claim.
 	// The verifier, not the wallet, is responsible for the authoritative
 	// check, and a list may be reachable by the issuer and verifier but not
-	// by the wallet, so by default the wallet only refuses on a positive
-	// finding. Values:
+	// by the wallet, so the default never blocks a presentation. Values:
 	// `off` (no lookup);
-	// `warn` (look up and log a not-valid result, never refuse);
-	// `enforce-revoked` (default: refuse with CREDENTIAL_REVOKED only when the
-	// list was fetched and verified and the entry is non-zero, i.e. INVALID,
-	// SUSPENDED or application-specific; if the list cannot be fetched or
-	// verified, log a warning and proceed);
+	// `warn` (default: look up and log a warning for every problem, including
+	// a revoked credential, but never refuse; a revocation logs
+	// "credential status revoked");
+	// `enforce-revoked` (refuse with CREDENTIAL_REVOKED only when the list
+	// was fetched and verified against the credential issuer's key and the
+	// entry is non-zero, i.e. INVALID, SUSPENDED or application-specific; if
+	// the list cannot be fetched or verified, log a warning and proceed);
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
 	// unsigned, expired or malformed list also refuses).
+	// Choose enforce-revoked or strict to have the wallet refuse.
 	// A list only counts if its signature is bound to the key in the
 	// credential's own x5c/jwk header; otherwise it is unverifiable (see above).
 	// mdoc credentials are not checked. Unknown values fail at startup.
@@ -254,7 +257,7 @@ type PresentationConfig struct {
 // Effective returns the mode to apply, treating the zero value as the default.
 func (m StatusCheckMode) Effective() StatusCheckMode {
 	if m == "" {
-		return StatusCheckEnforceRevoked
+		return StatusCheckWarn
 	}
 	return m
 }
@@ -1784,7 +1787,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
-		Presentation: PresentationConfig{StatusCheck: StatusCheckEnforceRevoked},
+		Presentation: PresentationConfig{StatusCheck: StatusCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
