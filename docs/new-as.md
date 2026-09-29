@@ -287,6 +287,32 @@ Deprecation: true
 Sunset: 2027-10-01T00:00:00Z
 ```
 
+### Sunset enforcement (implemented)
+
+`as.legacy.sunset_date` (RFC 3339, validated at startup) is enforced, not just advertised. Once the instant is reached (the instant itself counts as passed) or if the date is malformed, legacy is treated as disabled:
+
+- HMAC tokens are refused by every validator (HTTP routes, engine handshake, keystore websocket, and the registry when `jwt.legacy_sunset_date` mirrors it), evaluated per request so a long-running process does not need a restart. ES256 tokens are unaffected.
+- Legacy issuance stops: `/user/{register,login}-webauthn-*` and `/user/session/refresh` answer `410 legacy_tokens_sunset` (when the AS is enabled), as do legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/finish` calls. Session-mode clients are unaffected.
+- Startup logs one line stating the state; within 30 days of the date it logs a `DEPRECATION` warning.
+
+### Registry / separate processes
+
+`cmd/registry` validates through the same go-tokenauth validator. To accept ES256 session tokens set `jwt.jwks_url` (the backend's `/auth/.well-known/jwks.json`), `jwt.as_issuer` (= `as.issuer`, defaults to `jwt.issuer`) and optionally `jwt.audiences`. HMAC keeps working while `jwt.secret` is set and `jwt.legacy_enabled` is not false. Mirror `as.legacy.sunset_date` into `jwt.legacy_sunset_date`. NB: legacy tokens carry the RP ID as `aud`, so an audience list also filters HMAC tokens; leave `jwt.audiences` empty until legacy is off.
+
+### HSM-backed signing key
+
+`as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 and Ed25519 keys. `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
+
+### Go-live checklist for removing the legacy path
+
+1. Client audit clean: no client reads the body `appToken` / calls `/user/*-webauthn-*` / omits `X-Token-Mode: session` (wallet-frontend is clean apart from a stale `sessionStorage.appToken` read in `verifyRequestUriAndCerts.ts`; the Kotlin/Swift SDK `WebAuthnAuthClient` and `go-siros-cli` still use the legacy endpoints).
+2. Registry (and any other process validating with the shared secret) configured with `jwt.jwks_url`/`as_issuer`.
+3. Metrics/logs show `client_mode=legacy` at zero for a full token lifetime plus refresh TTL.
+4. Set `as.legacy.sunset_date` (announced via the Sunset header), watch for the 30-day warning and 410s.
+5. Flip `as.legacy.enabled=false` (default) after burn-in; keep `jwt.secret` only for the OIDC state cookie.
+6. Delete `internal/as/legacy_token.go`, the HS256 `generateToken`/refresh paths in `internal/service`, the HMAC fallbacks in `pkg/middleware/auth.go`, `internal/engine/session.go`, `internal/websocket/manager.go`, `internal/registry/jwt.go`, and the `Legacy` config blocks; remove the `/user/*` login routes.
+7. Rollback before step 6: unset the sunset date and set `as.legacy.enabled=true`, restart.
+
 ### Refresh token handling
 
 - **Legacy mode**: Continue issuing refresh tokens with same ramp-down on expiry

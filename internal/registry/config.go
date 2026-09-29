@@ -4,6 +4,7 @@ package registry
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -293,6 +294,47 @@ type JWTConfig struct {
 
 	// RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed)
 	RequireAuth bool `yaml:"require_auth" envconfig:"REQUIRE_AUTH"`
+
+	// JWKSURL is the Authorization Server's JWKS endpoint (e.g.
+	// https://wallet.example.com/auth/.well-known/jwks.json). When set, ES256
+	// (ES384/EdDSA) session tokens issued by the AS are accepted, verified
+	// against this key set. Independent of the HMAC secret: the registry can
+	// run as its own process without sharing jwt.secret once legacy is off.
+	JWKSURL string `yaml:"jwks_url" envconfig:"JWKS_URL"`
+
+	// ASIssuer is the expected "iss" of AS-issued (ES256) tokens, i.e. the
+	// backend's as.issuer. Defaults to Issuer when empty.
+	ASIssuer string `yaml:"as_issuer" envconfig:"AS_ISSUER"`
+
+	// Audiences lists accepted "aud" values (e.g. "wallet-registry"). Empty
+	// means no audience check. NOTE: legacy HMAC tokens carry the RP ID as
+	// "aud"; while legacy is active, an audience list also filters HMAC
+	// tokens, so include the RP ID or leave this empty until legacy is off.
+	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
+
+	// LegacyEnabled controls whether HMAC (jwt.secret) tokens are accepted.
+	// Defaults to true when unset. Mirror the backend's as.legacy.enabled.
+	LegacyEnabled *bool `yaml:"legacy_enabled" envconfig:"LEGACY_ENABLED"`
+
+	// LegacySunsetDate (RFC 3339) is when HMAC tokens stop being accepted;
+	// mirror the backend's as.legacy.sunset_date. Evaluated on every request.
+	LegacySunsetDate string `yaml:"legacy_sunset_date" envconfig:"LEGACY_SUNSET_DATE"`
+}
+
+// legacyActive reports whether HMAC tokens are acceptable at now. A malformed
+// sunset date counts as passed (fail closed).
+func (j JWTConfig) legacyActive(now time.Time) bool {
+	if j.Secret == "" || (j.LegacyEnabled != nil && !*j.LegacyEnabled) {
+		return false
+	}
+	if j.LegacySunsetDate == "" {
+		return true
+	}
+	t, err := time.Parse(time.RFC3339, j.LegacySunsetDate)
+	if err != nil {
+		return false
+	}
+	return now.Before(t)
 }
 
 // LoggingConfig contains logging configuration
@@ -446,7 +488,21 @@ func (c *Config) Validate() error {
 		}
 		c.JWT.Secret = secret
 	}
-	if c.JWT.RequireAuth && c.JWT.Secret == "" {
+	if c.JWT.LegacySunsetDate != "" {
+		if _, err := time.Parse(time.RFC3339, c.JWT.LegacySunsetDate); err != nil {
+			return fmt.Errorf("jwt.legacy_sunset_date %q is not a valid RFC 3339 timestamp: %w", c.JWT.LegacySunsetDate, err)
+		}
+	}
+	if c.JWT.JWKSURL != "" {
+		u, err := url.Parse(c.JWT.JWKSURL)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("jwt.jwks_url must be an absolute http(s) URL")
+		}
+	}
+	if c.JWT.RequireAuth && c.JWT.JWKSURL == "" && c.JWT.LegacyEnabled != nil && !*c.JWT.LegacyEnabled {
+		return fmt.Errorf("JWT authentication is required but jwt.legacy_enabled is false and jwt.jwks_url is not set: no token could ever validate")
+	}
+	if c.JWT.RequireAuth && c.JWT.Secret == "" && c.JWT.JWKSURL == "" {
 		return fmt.Errorf("JWT secret is required when authentication is required (set jwt.secret or jwt.secret_path)")
 	}
 

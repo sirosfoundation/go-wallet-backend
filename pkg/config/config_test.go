@@ -1424,8 +1424,8 @@ func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "" {
-		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 != nil {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (never inherited from the wallet provider), got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1451,7 +1451,7 @@ func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
 
 func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	cfg := &Config{}
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "as-key", PIN: "1"}
 	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
 
 	cfg.EnableForRole()
@@ -1459,8 +1459,8 @@ func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
-		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 == nil || cfg.AS.SigningKeyPKCS11.KeyLabel != "as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1602,7 +1602,7 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}
 	cfg.AS.RulesDir = "/tmp/rules"
 	err := cfg.Validate()
 	if err == nil {
@@ -1613,17 +1613,37 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_AS_PKCS11NotImplemented(t *testing.T) {
-	cfg := validBaseConfig()
-	cfg.AS.Enabled = true
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
-	cfg.AS.RulesDir = "/tmp/rules"
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for PKCS11 not implemented")
+func TestConfig_Validate_AS_PKCS11(t *testing.T) {
+	cases := []struct {
+		name    string
+		p       *PKCS11SigningConfig
+		wantErr string
+	}{
+		{"ok pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}, ""},
+		{"ok pin_path", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PINPath: "/p"}, ""},
+		{"no module", &PKCS11SigningConfig{KeyLabel: "k", PIN: "1"}, "module_path is required"},
+		{"no label", &PKCS11SigningConfig{ModulePath: "/m.so", PIN: "1"}, "key_label is required"},
+		{"no pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k"}, "pin or pin_path is required"},
+		{"negative pool", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1", PoolSize: -1}, "pool_size"},
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("unexpected error: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.AS.Enabled = true
+			cfg.AS.SigningKeyPKCS11 = tc.p
+			cfg.AS.Issuer = "https://as.example"
+			cfg.AS.RulesDir = "/tmp/rules"
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 

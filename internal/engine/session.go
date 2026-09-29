@@ -781,6 +781,12 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if err != nil {
 			return "", "", "", err
 		}
+		// Sunset enforcement: refuse legacy (HMAC) tokens once
+		// as.legacy.sunset_date has passed, even if this process started
+		// earlier and its validator still has legacy enabled.
+		if result.Mode == claims.ModeLegacy && !m.cfg.LegacyAllowed(time.Now()) {
+			return "", "", "", errors.New("legacy tokens are no longer accepted (as.legacy.sunset_date has passed)")
+		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
 		if !result.HasAudience("wallet-registry", "wallet-backend") {

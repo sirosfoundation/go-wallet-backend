@@ -51,9 +51,11 @@ type ASConfig struct {
 	// used to sign access tokens. Mutually exclusive with SigningKeyPKCS11.
 	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
 
-	// SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing.
+	// SigningKeyPKCS11 configures an HSM-backed (PKCS#11) AS signing key
+	// (ECDSA P-256/P-384 or Ed25519). Requires a binary built with
+	// -tags pkcs11. module_path, key_label and pin or pin_path are required.
 	// Mutually exclusive with SigningKeyPath.
-	SigningKeyPKCS11 string `yaml:"signing_key_pkcs11" envconfig:"SIGNING_KEY_PKCS11"`
+	SigningKeyPKCS11 *PKCS11SigningConfig `yaml:"signing_key_pkcs11,omitempty" envconfig:"SIGNING_KEY_PKCS11"`
 
 	// Issuer is the value of the "iss" claim in issued access tokens.
 	// Defaults to JWT.Issuer if not set.
@@ -115,9 +117,59 @@ type ASLegacyConfig struct {
 	// are sent on legacy token responses.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is the date after which legacy tokens will no longer be supported.
-	// Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
+	// SunsetDate is the instant after which legacy tokens are no longer
+	// supported. Format: RFC 3339 (e.g. "2027-10-01T00:00:00Z"). Besides the
+	// Sunset HTTP header it is enforced: once reached, HMAC tokens are
+	// refused (per request, no restart needed) and legacy issuance stops (the
+	// /user/* login, register and refresh routes and legacy-mode
+	// /auth/passkey finish calls answer 410). A warning is logged at startup
+	// within 30 days of it. A malformed value is a config error.
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
+}
+
+// LegacySunsetWarnWindow is how long before as.legacy.sunset_date a
+// deprecation warning is logged at startup.
+const LegacySunsetWarnWindow = 30 * 24 * time.Hour
+
+// SunsetTime parses SunsetDate (RFC 3339). ok is false when no date is
+// configured. A malformed date returns an error.
+func (l ASLegacyConfig) SunsetTime() (t time.Time, ok bool, err error) {
+	if l.SunsetDate == "" {
+		return time.Time{}, false, nil
+	}
+	t, err = time.Parse(time.RFC3339, l.SunsetDate)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("as.legacy.sunset_date %q is not a valid RFC 3339 timestamp: %w", l.SunsetDate, err)
+	}
+	return t, true, nil
+}
+
+// SunsetPassed reports whether the sunset date has been reached (the sunset
+// instant itself counts as passed). A configured but unparsable date counts as
+// passed, so a broken date can never keep legacy tokens alive (fail closed).
+func (l ASLegacyConfig) SunsetPassed(now time.Time) bool {
+	t, ok, err := l.SunsetTime()
+	if err != nil {
+		return true
+	}
+	return ok && !now.Before(t)
+}
+
+// Active reports whether legacy HMAC tokens may be issued and validated at
+// now: enabled and the sunset date (if any) not yet reached.
+func (l ASLegacyConfig) Active(now time.Time) bool {
+	return l.Enabled && !l.SunsetPassed(now)
+}
+
+// LegacyAllowed reports whether legacy (HMAC) session tokens are permitted at
+// now. When the AS is disabled there is no ES256 alternative, so HMAC remains
+// the only mechanism and is always allowed; otherwise it follows
+// AS.Legacy.Active.
+func (c *Config) LegacyAllowed(now time.Time) bool {
+	if !c.AS.Enabled {
+		return true
+	}
+	return c.AS.Legacy.Active(now)
 }
 
 // SetDefaults sets default values for AS configuration.
@@ -180,12 +232,13 @@ func (c *Config) EnableForRole() {
 	// there would silently sign AS tokens with the weaker on-disk key while
 	// the wallet provider itself actually signs WIA/KA with the HSM key -
 	// a real, silent security downgrade, not just an unsupported
-	// configuration. AS's own PKCS11 signing is not implemented (see
-	// Validate()), so this deliberately leaves SigningKeyPath empty in that
-	// case; Validate() then rejects with a clear, actionable error rather
-	// than silently limping along with AS enabled on the wrong key.
+	// configuration. The AS must be given its own as.signing_key_pkcs11 (it is
+	// deliberately not inherited from the wallet provider), so this leaves
+	// SigningKeyPath empty in that case; Validate() then rejects with a
+	// clear, actionable error rather than silently limping along with AS
+	// enabled on the wrong key.
 	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
-	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" && !walletProviderUsesPKCS11 {
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == nil && !walletProviderUsesPKCS11 {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
 	}
 	if c.AS.RulesDir == "" {
@@ -1593,6 +1646,13 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
+	if c.AS.SigningKeyPKCS11 != nil && c.AS.SigningKeyPKCS11.PINPath != "" {
+		c.AS.SigningKeyPKCS11.PIN, err = readSecretFile(c.AS.SigningKeyPKCS11.PINPath)
+		if err != nil {
+			return fmt.Errorf("as.signing_key_pkcs11.pin_path: %w", err)
+		}
+	}
+
 	// Load Play Integrity decryption/verification keys from file
 	natCfg := &c.WalletProvider.Attestation.NativeAttestation
 	if natCfg.GooglePlayIntegrityDecryptionKeyPath != "" {
@@ -1871,14 +1931,28 @@ func (c *Config) Validate() error {
 
 	// Validate AS configuration
 	if c.AS.Enabled {
-		if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
+		if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == nil {
 			return fmt.Errorf("as: signing_key_path or signing_key_pkcs11 is required when AS is enabled")
 		}
-		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != "" {
+		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != nil {
 			return fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
 		}
-		if c.AS.SigningKeyPKCS11 != "" {
-			return fmt.Errorf("as: signing_key_pkcs11 is not yet implemented; use signing_key_path")
+		if p := c.AS.SigningKeyPKCS11; p != nil {
+			if p.ModulePath == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.module_path is required")
+			}
+			if p.KeyLabel == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.key_label is required")
+			}
+			if p.PIN == "" && p.PINPath == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.pin or pin_path is required")
+			}
+			if p.PoolSize < 0 {
+				return fmt.Errorf("as: signing_key_pkcs11.pool_size must not be negative")
+			}
+		}
+		if _, _, err := c.AS.Legacy.SunsetTime(); err != nil {
+			return fmt.Errorf("as: %w", err)
 		}
 		if c.AS.RulesDir == "" {
 			return fmt.Errorf("as: rules_dir is required when AS is enabled (AllowAll is not safe for production)")

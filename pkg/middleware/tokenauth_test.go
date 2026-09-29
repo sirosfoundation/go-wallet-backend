@@ -498,3 +498,46 @@ func TestExtractBearer(t *testing.T) {
 		})
 	}
 }
+
+func TestTokenAuthMiddleware_LegacyAllowedGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	v := validator.New(validator.Config{Legacy: validator.LegacyConfig{Enabled: true, HMACSecret: secret}})
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{"default": {ID: "default", Enabled: true}}}
+
+	tok := hmacLegacyToken(t, secret)
+
+	run := func(allowed func(time.Time) bool) int {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.Use(TokenAuthMiddleware(v, tenants, nil, zap.NewNop(), WithLegacyAllowed(allowed)))
+		r.GET("/t", func(c *gin.Context) { c.Status(200) })
+		req := httptest.NewRequest("GET", "/t", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	if code := run(func(time.Time) bool { return true }); code != 200 {
+		t.Errorf("legacy allowed: got %d", code)
+	}
+	if code := run(func(time.Time) bool { return false }); code != 401 {
+		t.Errorf("legacy refused after sunset: got %d", code)
+	}
+}
+
+func TestLegacyIssuanceGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	run := func(allowed func(time.Time) bool) int {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.POST("/login", LegacyIssuanceGate(allowed), func(c *gin.Context) { c.Status(200) })
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/login", nil))
+		return w.Code
+	}
+	if run(nil) != 200 || run(func(time.Time) bool { return true }) != 200 {
+		t.Error("gate must pass when legacy is allowed")
+	}
+	if run(func(time.Time) bool { return false }) != 410 {
+		t.Error("gate must answer 410 once legacy is closed")
+	}
+}

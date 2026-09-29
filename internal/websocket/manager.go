@@ -14,6 +14,9 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -123,6 +126,9 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// tokenValidator, when set, authenticates the handshake token.
+	tokenValidator *tokenvalidator.Validator
 
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(clients):
@@ -303,7 +309,38 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	}
 }
 
+// SetTokenValidator makes the handshake validate tokens through the shared
+// go-tokenauth validator (ES256 via JWKS, HMAC only while legacy is enabled)
+// instead of the bare HMAC path. Call before serving connections.
+func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
+	m.tokenValidator = v
+}
+
 func (m *Manager) validateToken(tokenString string) (string, error) {
+	if m.tokenValidator != nil {
+		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
+		if err != nil {
+			return "", err
+		}
+		if result.Mode == claims.ModeLegacy && !m.cfg.LegacyAllowed(time.Now()) {
+			return "", errors.New("legacy tokens are no longer accepted")
+		}
+		// The keystore socket is per-user: an anonymous (identity-free)
+		// token has nothing to bind to.
+		if result.UserID == "" {
+			return "", errors.New("invalid token claims")
+		}
+		return result.UserID, nil
+	}
+
+	// No validator wired (AS disabled): HMAC is the only mechanism, unless the
+	// AS is enabled and its legacy window has closed - then refuse (fail closed).
+	if !m.cfg.LegacyAllowed(time.Now()) {
+		return "", errors.New("legacy tokens are no longer accepted")
+	}
+	if m.cfg.JWT.Secret == "" {
+		return "", errors.New("jwt secret not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")

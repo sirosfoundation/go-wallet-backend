@@ -128,7 +128,12 @@ Environment prefix: `WALLET_AS`
 |----------|-------------|------|-------------|
 | `as.enabled` | `WALLET_AS_ENABLED` | boolean | Enabled controls whether the new AS is active. |
 | `as.signing_key_path` | `WALLET_AS_SIGNING_KEY_PATH` | string | SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519) used to sign access tokens. Mutually exclusive with SigningKeyPKCS11. |
-| `as.signing_key_pkcs11` | `WALLET_AS_SIGNING_KEY_PKCS11` | string | SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing. Mutually exclusive with SigningKeyPath. |
+| `as.signing_key_pkcs11.module_path` | `WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH` | string |  |
+| `as.signing_key_pkcs11.slot_id` | `WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID` | uint |  |
+| `as.signing_key_pkcs11.pin` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN` | string |  |
+| `as.signing_key_pkcs11.pin_path` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN) |
+| `as.signing_key_pkcs11.key_label` | `WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL` | string |  |
+| `as.signing_key_pkcs11.pool_size` | `WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `as.issuer` | `WALLET_AS_ISSUER` | string | Issuer is the value of the "iss" claim in issued access tokens. Defaults to JWT.Issuer if not set. |
 | `as.default_token_ttl` | `WALLET_AS_DEFAULT_TOKEN_TTL` | duration | DefaultTokenTTL is the default access token lifetime. Default: 2m |
 | `as.audience_ttls` | `WALLET_AS_AUDIENCE_TTLS` | map[string]time.Duration | AudienceTTLs allows per-audience TTL overrides. Keys are audience strings, values are durations. |
@@ -139,7 +144,7 @@ Environment prefix: `WALLET_AS`
 | `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
 | `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
 | `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader controls whether Deprecation + Sunset headers are sent on legacy token responses. |
-| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the date after which legacy tokens will no longer be supported. Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z"). |
+| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the instant after which legacy tokens are no longer supported. Format: RFC 3339 (e.g. "2027-10-01T00:00:00Z"). Besides the Sunset HTTP header it is enforced: once reached, HMAC tokens are refused (per request, no restart needed) and legacy issuance stops (the /user/* login, register and refresh routes and legacy-mode /auth/passkey finish calls answer 410). A warning is logged at startup within 30 days of it. A malformed value is a config error. |
 | `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs. Required when OIDC is used. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
@@ -413,6 +418,11 @@ Environment prefix: `REGISTRY_JWT`
 | `jwt.secret_path` | `REGISTRY_JWT_SECRET_PATH` | string | SecretPath is an alternative to Secret: path to a file containing the JWT secret. If both Secret and SecretPath are set, SecretPath takes precedence. |
 | `jwt.issuer` | `REGISTRY_JWT_ISSUER` | string | Issuer is the expected issuer claim in the JWT |
 | `jwt.require_auth` | `REGISTRY_JWT_REQUIRE_AUTH` | boolean | RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed) |
+| `jwt.jwks_url` | `REGISTRY_JWT_JWKS_URL` | string | JWKSURL is the Authorization Server's JWKS endpoint (e.g. https://wallet.example.com/auth/.well-known/jwks.json). When set, ES256 (ES384/EdDSA) session tokens issued by the AS are accepted, verified against this key set. Independent of the HMAC secret: the registry can run as its own process without sharing jwt.secret once legacy is off. |
+| `jwt.as_issuer` | `REGISTRY_JWT_AS_ISSUER` | string | ASIssuer is the expected "iss" of AS-issued (ES256) tokens, i.e. the backend's as.issuer. Defaults to Issuer when empty. |
+| `jwt.audiences` | `REGISTRY_JWT_AUDIENCES` | string list | Audiences lists accepted "aud" values (e.g. "wallet-registry"). Empty means no audience check. NOTE: legacy HMAC tokens carry the RP ID as "aud"; while legacy is active, an audience list also filters HMAC tokens, so include the RP ID or leave this empty until legacy is off. |
+| `jwt.legacy_enabled` | `REGISTRY_JWT_LEGACY_ENABLED` | boolean | LegacyEnabled controls whether HMAC (jwt.secret) tokens are accepted. Defaults to true when unset. Mirror the backend's as.legacy.enabled. |
+| `jwt.legacy_sunset_date` | `REGISTRY_JWT_LEGACY_SUNSET_DATE` | string | LegacySunsetDate (RFC 3339) is when HMAC tokens stop being accepted; mirror the backend's as.legacy.sunset_date. Evaluated on every request. |
 
 ## registry.logging
 

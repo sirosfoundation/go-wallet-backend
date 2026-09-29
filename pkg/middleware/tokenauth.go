@@ -7,6 +7,7 @@ package middleware
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -17,6 +18,35 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
+
+// TokenAuthOption customizes TokenAuthMiddleware.
+type TokenAuthOption func(*tokenAuthOptions)
+
+type tokenAuthOptions struct {
+	legacyAllowed func(time.Time) bool
+}
+
+// WithLegacyAllowed makes the middleware refuse legacy (HMAC) tokens whenever
+// allowed(now) is false (as.legacy.sunset_date enforcement).
+func WithLegacyAllowed(allowed func(time.Time) bool) TokenAuthOption {
+	return func(o *tokenAuthOptions) { o.legacyAllowed = allowed }
+}
+
+// LegacyIssuanceGate refuses (410 Gone) requests to endpoints that mint legacy
+// HMAC session tokens once allowed(now) is false. The response tells clients to
+// use the session-mode flow (X-Token-Mode: session).
+func LegacyIssuanceGate(allowed func(time.Time) bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if allowed == nil || allowed(time.Now()) {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(410, gin.H{
+			"error":   "legacy_tokens_sunset",
+			"message": "legacy HMAC session tokens are no longer issued; use the /auth/passkey endpoints with X-Token-Mode: session",
+		})
+	}
+}
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
 type TenantLookup interface {
@@ -46,7 +76,11 @@ type TenantLookup interface {
 // RevokeUser (#383) would otherwise never be consulted for tokens
 // validated through this path - only for tokens validated through the
 // legacy AuthMiddlewareWithBlacklist.
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger, opts ...TokenAuthOption) gin.HandlerFunc {
+	var o tokenAuthOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -62,6 +96,16 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logger.Debug("Token validation failed", zap.Error(err))
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		// Sunset enforcement: a legacy (HMAC) token is refused once the
+		// legacy window has closed, even if the process started before the
+		// sunset date and its validator still has legacy enabled.
+		if result.Mode == claims.ModeLegacy && o.legacyAllowed != nil && !o.legacyAllowed(time.Now()) {
+			logger.Debug("Legacy token refused: as.legacy.sunset_date has passed")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return

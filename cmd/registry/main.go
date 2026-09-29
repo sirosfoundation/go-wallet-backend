@@ -89,6 +89,7 @@ func main() {
 
 	// Add JWT middleware (sets authenticated flag)
 	// Use strict JWTMiddleware when RequireAuth is true, otherwise OptionalJWTMiddleware
+	config.JWT.LogLegacyStatus(logger, time.Now())
 	if config.JWT.RequireAuth {
 		router.Use(registry.JWTMiddleware(config.JWT, logger))
 	} else {

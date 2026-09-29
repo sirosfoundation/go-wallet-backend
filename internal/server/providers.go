@@ -64,6 +64,44 @@ func (p *AuthProvider) Name() string         { return "auth" }
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
+// legacyIssuanceGate refuses the /user/* routes that mint HS256 session tokens
+// once the AS is enabled and the legacy window (as.legacy.enabled /
+// as.legacy.sunset_date) has closed. Without the AS the HMAC tokens are the
+// only session mechanism, so the gate is a no-op.
+func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
+	if !p.cfg.AS.Enabled {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return middleware.LegacyIssuanceGate(p.cfg.LegacyAllowed)
+}
+
+// LogLegacyTokenStatus logs the legacy (HMAC) session token state at startup:
+// disabled, active, active with a sunset date, deprecation warning inside the
+// 30-day window, or sunset already reached.
+func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger, now time.Time) {
+	if !cfg.AS.Enabled {
+		return
+	}
+	l := cfg.AS.Legacy
+	sunset, hasSunset, _ := l.SunsetTime()
+	switch {
+	case !l.Enabled:
+		logger.Info("Legacy HMAC session tokens are disabled (as.legacy.enabled=false)")
+	case l.SunsetPassed(now):
+		logger.Warn("Legacy HMAC session tokens are DISABLED: as.legacy.sunset_date has passed; HMAC validation is refused and legacy issuance stopped",
+			zap.String("sunset_date", l.SunsetDate))
+	case hasSunset && sunset.Sub(now) <= config.LegacySunsetWarnWindow:
+		logger.Warn("DEPRECATION: legacy HMAC session tokens will be disabled soon (as.legacy.sunset_date); migrate clients to X-Token-Mode: session",
+			zap.String("sunset_date", l.SunsetDate),
+			zap.Duration("remaining", sunset.Sub(now).Round(time.Hour)))
+	case hasSunset:
+		logger.Info("Legacy HMAC session tokens are enabled until as.legacy.sunset_date",
+			zap.String("sunset_date", l.SunsetDate))
+	default:
+		logger.Info("Legacy HMAC session tokens are enabled (no as.legacy.sunset_date set)")
+	}
+}
+
 // Close stops background workers in the auth provider.
 func (p *AuthProvider) Close() error {
 	p.services.Stop()
@@ -87,6 +125,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		registration.Use(
 			middleware.NoCacheMiddleware(),
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
+			p.legacyIssuanceGate(),
 		)
 		{
 			registration.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
@@ -98,6 +137,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		login.Use(
 			middleware.NoCacheMiddleware(),
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
+			p.legacyIssuanceGate(),
 		)
 		{
 			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
@@ -127,7 +167,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		// 404, indistinguishable from any other unsupported endpoint.
 		if p.cfg.JWT.RefreshDays > 0 {
 			refresh := userBase.Group("/session")
-			refresh.Use(middleware.NoCacheMiddleware())
+			refresh.Use(middleware.NoCacheMiddleware(), p.legacyIssuanceGate())
 			{
 				refresh.POST("/refresh", p.handlers.RefreshToken)
 			}
@@ -252,7 +292,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
 	}
 	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
 	// latter hardcodes a nil blacklist, which is exactly what left Logout's
@@ -334,7 +374,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
 	// provider is combined with an AuthProvider under BackendProvider,
@@ -614,7 +654,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
+				Enabled:    cfg.AS.Legacy.Active(time.Now()),
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
 			// Same blacklist as everything else in this process (#382/#383) -
@@ -627,6 +667,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
+		LogLegacyTokenStatus(cfg, logger, time.Now())
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
 			zap.Strings("audiences", cfg.AS.Audiences),
@@ -634,6 +675,11 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	}
 
 	authProvider.tokenValidator = tv
+	if tv != nil {
+		// The keystore websocket handshake validates through the same
+		// dual (ES256/JWKS + legacy HMAC) validator as the HTTP routes.
+		authProvider.services.Keystore.SetTokenValidator(tv)
+	}
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
 	storageProvider.tokenValidator = tv
 	// Share the auth provider's blacklist instance (see the comment above
@@ -708,7 +754,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382).
 	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
@@ -721,6 +767,9 @@ func (p *BackendProvider) Close() error {
 	}
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
+	}
+	if p.asModule != nil {
+		_ = p.asModule.Close() // releases HSM sessions
 	}
 	if p.store != nil {
 		return p.store.Close()
@@ -1040,7 +1089,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
+				Enabled:    cfg.AS.Legacy.Active(time.Now()),
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
 			// See NewBackendProvider's identical wiring (#382/#383). This
@@ -1049,6 +1098,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
+		LogLegacyTokenStatus(cfg, logger, time.Now())
 	}
 
 	return &WalletProviderProvider{
@@ -1070,7 +1120,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). This
 	// provider never runs co-hosted with BackendProvider (see cmd/server -

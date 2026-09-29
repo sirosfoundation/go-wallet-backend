@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 // ASModule is the top-level authorization server module that wires together
@@ -65,7 +67,7 @@ func NewASModule(
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
-	km, err := NewKeyManager(cfg.SigningKeyPath)
+	km, err := newConfiguredKeyManager(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +91,7 @@ func NewASModule(
 	// this issuer, including - silently - LogoutHandler's legacy-token
 	// blacklisting fallback (#391 review, round 3).
 	var legacyIssuer *LegacyTokenIssuer
-	if cfg.Legacy.Enabled {
+	if cfg.Legacy.Active(time.Now()) {
 		legacyIssuer = NewLegacyTokenIssuer(
 			[]byte(jwtCfg.Secret),
 			jwtCfg.Issuer,
@@ -238,4 +240,50 @@ func newMemorySessionStoreWithCleanup(ctx context.Context) *MemorySessionStore {
 	sessions := NewMemorySessionStore()
 	sessions.StartCleanup(ctx, 5*time.Minute)
 	return sessions
+}
+
+// newConfiguredKeyManager builds the KeyManager from either the PEM signing key
+// file or the PKCS#11 (HSM) key. Exactly one must be configured; anything else
+// is refused (config validation checks this too, this keeps the module safe
+// when constructed directly).
+func newConfiguredKeyManager(cfg *config.ASConfig) (*KeyManager, error) {
+	switch {
+	case cfg.SigningKeyPath != "" && cfg.SigningKeyPKCS11 != nil:
+		return nil, fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
+	case cfg.SigningKeyPKCS11 != nil:
+		p := cfg.SigningKeyPKCS11
+		signer, err := newPKCS11Signer(&signing.PKCS11Config{
+			ModulePath: p.ModulePath,
+			SlotID:     p.SlotID,
+			PIN:        p.PIN,
+			KeyLabel:   p.KeyLabel,
+			PoolSize:   p.PoolSize,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("as: pkcs11 signing key: %w", err)
+		}
+		km, err := NewKeyManagerFromSigner(signer)
+		if err != nil {
+			if c, ok := signer.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+			return nil, err
+		}
+		return km, nil
+	default:
+		return NewKeyManager(cfg.SigningKeyPath)
+	}
+}
+
+// newPKCS11Signer is a seam so tests can inject a fake HSM signer.
+var newPKCS11Signer = func(cfg *signing.PKCS11Config) (crypto.Signer, error) {
+	return signing.NewPKCS11Signer(cfg)
+}
+
+// Close releases resources held by the module (HSM sessions).
+func (m *ASModule) Close() error {
+	if m == nil || m.KeyManager == nil {
+		return nil
+	}
+	return m.KeyManager.Close()
 }

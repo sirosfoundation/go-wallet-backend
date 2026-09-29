@@ -1,0 +1,151 @@
+package websocket
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+)
+
+const wsDualSecret = "0123456789abcdef0123456789abcdef"
+
+func wsValidator(t *testing.T, legacy bool) (*tokenvalidator.Validator, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "ES256"}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(srv.Close)
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: srv.URL,
+		Issuer:  "as",
+		Legacy:  tokenvalidator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(wsDualSecret)},
+	})
+	v.Start(context.Background())
+	t.Cleanup(v.Stop)
+	return v, key
+}
+
+func wsES256(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Duration) string {
+	t.Helper()
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "k1"))
+	require.NoError(t, err)
+	claims := map[string]any{"iss": "as", "tenant_id": "default", "tac": "r",
+		"iat": time.Now().Unix(), "exp": time.Now().Add(exp).Unix()}
+	if sub != "" {
+		claims["sub"] = sub
+	}
+	raw, err := gojosejwt.Signed(sig).Claims(claims).Serialize()
+	require.NoError(t, err)
+	return raw
+}
+
+func wsHMAC(t *testing.T, secret string) string {
+	t.Helper()
+	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "legacy-user", "tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(secret))
+	require.NoError(t, err)
+	return s
+}
+
+func wsCfg(asEnabled bool, sunset string) *config.Config {
+	c := &config.Config{JWT: config.JWTConfig{Secret: wsDualSecret}}
+	c.AS.Enabled = asEnabled
+	c.AS.Legacy = config.ASLegacyConfig{Enabled: true, SunsetDate: sunset}
+	return c
+}
+
+func TestManager_validateToken_Dual(t *testing.T) {
+	v, key := wsValidator(t, true)
+	m := NewManager(wsCfg(true, ""), zap.NewNop())
+	m.SetTokenValidator(v)
+
+	uid, err := m.validateToken(wsES256(t, key, "es-user", time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, "es-user", uid)
+
+	uid, err = m.validateToken(wsHMAC(t, wsDualSecret))
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-user", uid)
+
+	// expired, forged, anonymous, none-alg, garbage
+	_, err = m.validateToken(wsES256(t, key, "es-user", -time.Hour))
+	assert.Error(t, err)
+	other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	_, err = m.validateToken(wsES256(t, other, "es-user", time.Minute))
+	assert.Error(t, err)
+	_, err = m.validateToken(wsES256(t, key, "", time.Minute))
+	assert.Error(t, err, "anonymous token has no user to bind the keystore socket to")
+	_, err = m.validateToken(wsHMAC(t, "wrong-secret-wrong-secret-wrong-xx"))
+	assert.Error(t, err)
+	none, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{"user_id": "x", "exp": time.Now().Add(time.Hour).Unix()}).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	_, err = m.validateToken(none)
+	assert.Error(t, err)
+	_, err = m.validateToken("garbage")
+	assert.Error(t, err)
+}
+
+func TestManager_validateToken_LegacyDisabledInValidator(t *testing.T) {
+	v, key := wsValidator(t, false)
+	m := NewManager(wsCfg(true, ""), zap.NewNop())
+	m.SetTokenValidator(v)
+	_, err := m.validateToken(wsHMAC(t, wsDualSecret))
+	assert.Error(t, err)
+	_, err = m.validateToken(wsES256(t, key, "u", time.Minute))
+	assert.NoError(t, err)
+}
+
+func TestManager_validateToken_SunsetPassed(t *testing.T) {
+	past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	// With a validator that (started before sunset) still has legacy on.
+	v, key := wsValidator(t, true)
+	m := NewManager(wsCfg(true, past), zap.NewNop())
+	m.SetTokenValidator(v)
+	_, err := m.validateToken(wsHMAC(t, wsDualSecret))
+	assert.ErrorContains(t, err, "no longer accepted")
+	_, err = m.validateToken(wsES256(t, key, "u", time.Minute))
+	assert.NoError(t, err, "ES256 stays valid after sunset")
+
+	// Without a validator: HMAC path refused after sunset, allowed before.
+	m = NewManager(wsCfg(true, past), zap.NewNop())
+	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
+	assert.ErrorContains(t, err, "no longer accepted")
+	m = NewManager(wsCfg(true, future), zap.NewNop())
+	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
+	assert.NoError(t, err)
+
+	// AS disabled: HMAC is the only mechanism and is not affected by a stray date.
+	m = NewManager(wsCfg(false, past), zap.NewNop())
+	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
+	assert.NoError(t, err)
+}
+
+func TestManager_validateToken_EmptySecretRefused(t *testing.T) {
+	cfg := wsCfg(false, "")
+	cfg.JWT.Secret = ""
+	m := NewManager(cfg, zap.NewNop())
+	_, err := m.validateToken(wsHMAC(t, ""))
+	assert.Error(t, err)
+}
