@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/statuslist"
@@ -134,4 +135,21 @@ func TestCheckPresentationStatus_Disabled(t *testing.T) {
 	if err := h.checkPresentationStatus(context.Background(), mint(1, true)); err != nil {
 		t.Fatalf("disabled check must not refuse: %v", err)
 	}
+}
+
+func TestPresentedTokens_Shapes(t *testing.T) {
+	assert.Nil(t, presentedTokens("  "))
+	assert.ElementsMatch(t, []string{"a", "b", "c"}, presentedTokens(`{"q1":"a","q2":["b","c"]}`))
+	assert.ElementsMatch(t, []string{"a", "b"}, presentedTokens(`["a","b"]`))
+	assert.Equal(t, []string{"a", "b"}, presentedTokens("a\nb"))
+	// Malformed JSON-looking input falls back to being treated as raw tokens.
+	assert.Equal(t, []string{`{"q":`}, presentedTokens(`{"q":`))
+	assert.Equal(t, []string{`[1,2]`}, presentedTokens(`[1,2]`))
+}
+
+func TestDecodeJWTSegment_Errors(t *testing.T) {
+	var v map[string]any
+	assert.Error(t, decodeJWTSegment("!!", &v))
+	assert.Error(t, decodeJWTSegment(base64.RawURLEncoding.EncodeToString([]byte("nope")), &v))
+	assert.NoError(t, decodeJWTSegment(base64.RawURLEncoding.EncodeToString([]byte(`{"a":1}`)), &v))
 }

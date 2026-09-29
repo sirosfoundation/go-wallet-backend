@@ -253,3 +253,71 @@ func TestReferenceFromCredentialClaims(t *testing.T) {
 		}
 	}
 }
+
+func TestEntry_Bounds(t *testing.T) {
+	list := []byte{0b00000010, 0xff}
+	if v, err := entry(1, list, 1); err != nil || v != 1 {
+		t.Errorf("entry(1,1) = %d, %v", v, err)
+	}
+	if v, err := entry(2, list, 0); err != nil || v != 2 {
+		t.Errorf("entry(2,0) = %d, %v", v, err)
+	}
+	if _, err := entry(1, list, 16); err == nil {
+		t.Error("index past the list must fail")
+	}
+	if _, err := entry(1, list, -1); err == nil {
+		t.Error("negative index must fail")
+	}
+}
+
+func TestInflate_Errors(t *testing.T) {
+	if _, err := inflate("!!not base64!!"); err == nil {
+		t.Error("bad base64 must fail")
+	}
+	if _, err := inflate(base64.RawURLEncoding.EncodeToString([]byte("not zlib"))); err == nil {
+		t.Error("non-zlib data must fail")
+	}
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	_, _ = zw.Write(make([]byte, maxInflateBytes+1))
+	_ = zw.Close()
+	if _, err := inflate(base64.RawURLEncoding.EncodeToString(buf.Bytes())); err == nil {
+		t.Error("an oversized inflation must fail (zip bomb)")
+	}
+}
+
+func TestDecodeSegment_Errors(t *testing.T) {
+	var v map[string]any
+	if err := decodeSegment("!!", &v); err == nil {
+		t.Error("bad base64 must fail")
+	}
+	if err := decodeSegment(base64.RawURLEncoding.EncodeToString([]byte("not json")), &v); err == nil {
+		t.Error("bad json must fail")
+	}
+}
+
+func TestKeyID_And_SameKey(t *testing.T) {
+	k1, k2 := newKey(t), newKey(t)
+	a := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k1.PublicKey)}
+	b := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k1.PublicKey)}
+	c := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k2.PublicKey)}
+	if !sameKey(a, b) {
+		t.Error("the same JWK must match")
+	}
+	if sameKey(a, c) {
+		t.Error("different JWKs must not match")
+	}
+	// Anything that cannot be reduced to a key id must never compare equal:
+	// two unknowns are not the same key.
+	for _, km := range []*trust.KeyMaterial{nil, {}, {X5C: []string{"!!"}}, {X5C: []string{"AAAA"}}, {JWK: map[string]any{"kty": "bogus"}}} {
+		if keyID(km) != "" {
+			t.Errorf("keyID(%+v) must be empty", km)
+		}
+		if sameKey(km, km) {
+			t.Errorf("sameKey(%+v, itself) must be false when there is no key", km)
+		}
+	}
+	if signerFingerprint(a) != keyID(a) {
+		t.Error("signerFingerprint must equal keyID")
+	}
+}
