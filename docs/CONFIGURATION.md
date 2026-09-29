@@ -22,6 +22,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [http_client](#http_client)
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
+- [presentation](#presentation)
 - [Registry Server](#registry-server)
 - [registry.server](#registryserver)
 - [registry.source](#registrysource)
@@ -282,6 +283,14 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.issuer` | `WALLET_AUDIT_ISSUER` | string | Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org"). |
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
+
+## presentation
+
+Environment prefix: `WALLET_PRESENTATION`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `presentation.status_check` | `WALLET_PRESENTATION_STATUS_CHECK` | boolean | StatusCheck makes the engine look up a Token Status List (draft-ietf-oauth-status-list) entry for every presented SD-JWT VC that carries a `status.status_list` claim, and refuse the presentation when the credential is not VALID. Fail closed: if the list cannot be fetched, verified or read, the presentation is refused. Credentials without a status claim, and mdoc credentials, are not checked. Default: true. Set false to skip the check entirely. Env: WALLET_PRESENTATION_STATUS_CHECK |
 
 ## Registry Server
 

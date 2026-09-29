@@ -25,6 +25,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/statuslist"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -32,10 +33,17 @@ import (
 type OID4VPHandler struct {
 	BaseHandler
 	httpClient *http.Client
+	// statusChecker is nil when presentation.status_check is off.
+	statusChecker *statuslist.Checker
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
 func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+	httpClient := cfg.HTTPClient.NewHTTPClient(0)
+	var checker *statuslist.Checker
+	if cfg.Presentation.StatusCheck {
+		checker = statuslist.NewChecker(httpClient, cfg.HTTPClient.AllowsPlaintext())
+	}
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
 			Flow:       flow,
@@ -46,7 +54,8 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 			Verifiers:  verifiers,
 			TrustCache: trustCache,
 		},
-		httpClient: cfg.HTTPClient.NewHTTPClient(0),
+		httpClient:    httpClient,
+		statusChecker: checker,
 	}, nil
 }
 
@@ -213,6 +222,21 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
 		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+		return err
+	}
+
+	// Step 4b: refuse to present a credential that is revoked, or whose status
+	// cannot be established. The vp_token is the first point at which the
+	// backend sees credential content (it never holds the credentials), and
+	// nothing has been sent to the verifier yet.
+	if err := h.checkPresentationStatus(ctx, vpToken); err != nil {
+		h.Logger.Warn("presentation refused by credential status check", zap.Error(err))
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+		details := map[string]interface{}{}
+		if redirectURI != "" {
+			details["redirect_uri"] = redirectURI
+		}
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodeCredentialRevoked, ErrCodeCredentialRevoked.UserFacingMessage(), details)
 		return err
 	}
 

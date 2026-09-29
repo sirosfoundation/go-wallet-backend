@@ -118,8 +118,13 @@ const (
 	// was never asked, so reporting this to the wallet as "declined" would be
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
-	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeCredentialRevoked is returned when a credential selected for
+	// presentation is not VALID in its Token Status List, or its status could
+	// not be determined. Clients that do not know the code fall back to the
+	// generic message.
+	ErrCodeCredentialRevoked ErrorCode = "CREDENTIAL_REVOKED"
+	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -168,6 +173,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Presentation failed"
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
+	case ErrCodeCredentialRevoked:
+		return "A credential you selected has been revoked or its status could not be checked"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:

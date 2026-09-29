@@ -32,6 +32,7 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
@@ -205,6 +206,20 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 		return ttl
 	}
 	return c.DefaultTokenTTL
+}
+
+// PresentationConfig controls checks the engine applies to what the wallet is
+// about to present in an OpenID4VP flow.
+type PresentationConfig struct {
+	// StatusCheck makes the engine look up a Token Status List
+	// (draft-ietf-oauth-status-list) entry for every presented SD-JWT VC that
+	// carries a `status.status_list` claim, and refuse the presentation when
+	// the credential is not VALID. Fail closed: if the list cannot be fetched,
+	// verified or read, the presentation is refused. Credentials without a
+	// status claim, and mdoc credentials, are not checked.
+	// Default: true. Set false to skip the check entirely.
+	// Env: WALLET_PRESENTATION_STATUS_CHECK
+	StatusCheck bool `yaml:"status_check" envconfig:"STATUS_CHECK"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -1723,6 +1738,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
+		Presentation: PresentationConfig{StatusCheck: true},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
