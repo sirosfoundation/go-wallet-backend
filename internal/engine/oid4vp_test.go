@@ -3183,6 +3183,161 @@ func TestEvaluateVerifierTrust_RedirectURIScheme_PDPPath_UsesCanonicalURLCacheKe
 	assert.True(t, cached.Trusted)
 }
 
+// A DID document can list multiple active verification methods (key
+// rotation overlap). The PDP evaluates trust against the SPECIFIC key that
+// verified a request, so two requests for the same DID signed by two
+// DIFFERENT resolved keys must each reach the PDP independently - one
+// key's cached verdict must never answer for the other.
+func TestEvaluateVerifierTrust_DIDCacheKeyIncludesMatchedKeyFingerprint(t *testing.T) {
+	const (
+		did      = "did:web:verifier.example"
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kidA     = did + "#jwk-a"
+		kidB     = did + "#jwk-b"
+	)
+
+	keyA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	keyB, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{
+				map[string]interface{}{
+					"id": kidA, "type": "JsonWebKey2020", "controller": did,
+					"publicKeyJwk": ecPublicJWK(&keyA.PublicKey, kidA),
+				},
+				map[string]interface{}{
+					"id": kidB, "type": "JsonWebKey2020", "controller": did,
+					"publicKeyJwk": ecPublicJWK(&keyB.PublicKey, kidB),
+				},
+			},
+		},
+		decisionOk: true,
+		decision:   true,
+	}
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	reqA := &AuthorizationRequest{
+		ClientID: clientID, ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce: "n", ResponseURI: "https://verifier.example/response",
+		RequestJWT: buildKidSignedJWT(t, keyA, kidA),
+	}
+	verifierA, err := h.evaluateVerifierTrust(context.Background(), reqA)
+	require.NoError(t, err)
+	require.True(t, verifierA.Trusted)
+	assert.Equal(t, 1, trustCache.Len())
+
+	reqB := &AuthorizationRequest{
+		ClientID: clientID, ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
+		Nonce: "n", ResponseURI: "https://verifier.example/response",
+		RequestJWT: buildKidSignedJWT(t, keyB, kidB),
+	}
+	verifierB, err := h.evaluateVerifierTrust(context.Background(), reqB)
+	require.NoError(t, err)
+	require.True(t, verifierB.Trusted)
+
+	// Both keys resolve to the same DID, but each must have been
+	// independently evaluated by the PDP - key B must not have been served
+	// from key A's cache entry.
+	assert.Equal(t, []string{did, did}, stub.resolved)
+	assert.Equal(t, []string{clientID, clientID}, stub.evaluated)
+	assert.Equal(t, 2, trustCache.Len())
+}
+
+// The verifier_attestation trust decision depends on the whole attestation
+// JWT the PDP validates (signature, issuer chain, expiry, redirect_uris),
+// not just the subject/key it asserts. A new attestation JWT can share the
+// same subject and cnf key as a previous, already-trusted one - two such
+// requests must each reach the PDP independently.
+func TestEvaluateVerifierTrust_AttestationCacheKeyIncludesRawJWTHash(t *testing.T) {
+	const (
+		subject = "verifier.example.com"
+		issuer  = "https://attestation-issuer.example"
+	)
+	clientID := clientIDSchemeVerifierAttestationPrefix + subject
+
+	cnfKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	// Same issuer/subject/cnf key both times - buildVerifierAttestationRequestJWT
+	// signs the (unverified-by-us) attestation JWT itself with a fresh
+	// throwaway key each call, so the two raw attestation JWTs differ even
+	// though what they assert is identical.
+	requestJWT1 := buildVerifierAttestationRequestJWT(t, issuer, subject, cnfKey)
+	requestJWT2 := buildVerifierAttestationRequestJWT(t, issuer, subject, cnfKey)
+	require.NotEqual(t, requestJWT1, requestJWT2, "test setup: the two request JWTs must actually differ")
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	stub := &stubDIDResolver{decisionOk: true, decision: true}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	authReq1 := &AuthorizationRequest{
+		ClientID: clientID, ClientIDScheme: ClientIDSchemeVerifierAttestation,
+		Nonce: "n", ResponseURI: "https://verifier.example.com/response",
+		RequestJWT: requestJWT1,
+	}
+	v1, err := h.evaluateVerifierTrust(context.Background(), authReq1)
+	require.NoError(t, err)
+	require.True(t, v1.Trusted)
+	assert.Equal(t, 1, trustCache.Len())
+
+	authReq2 := &AuthorizationRequest{
+		ClientID: clientID, ClientIDScheme: ClientIDSchemeVerifierAttestation,
+		Nonce: "n", ResponseURI: "https://verifier.example.com/response",
+		RequestJWT: requestJWT2,
+	}
+	v2, err := h.evaluateVerifierTrust(context.Background(), authReq2)
+	require.NoError(t, err)
+	require.True(t, v2.Trusted)
+
+	// A second, different attestation JWT sharing the same subject and cnf
+	// key must still reach the PDP independently - never served from the
+	// first attestation's cache entry.
+	assert.Equal(t, []string{clientID, clientID}, stub.evaluated)
+	assert.Equal(t, 2, trustCache.Len())
+}
+
 // --- no-matching-credential fast fail ---
 
 // feedAction queues a client action on the session, the way the websocket

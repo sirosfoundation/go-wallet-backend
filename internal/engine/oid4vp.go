@@ -611,10 +611,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			Type: "jwk",
 			JWK:  matchedJWK,
 		}
-		// Cache identity is the resolved, JWT-verified DID itself, not the
-		// bare client_id string - so a cache entry can only ever answer for
-		// requests that verify against the same DID's keys.
-		verifiedIdentity = "did:" + did
+		// Cache identity is the resolved, JWT-verified DID itself - but a
+		// DID document can list multiple active verification methods (key
+		// rotation overlap), and the PDP evaluates trust against this
+		// SPECIFIC matched key, not the DID in the abstract. Fold in a
+		// fingerprint of that key so a request verified against a
+		// different resolved key for the same DID can never reuse this
+		// verdict.
+		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
+			verifiedIdentity = "did:" + did + ":" + fp
+		} else {
+			cacheable = false
+		}
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
@@ -721,18 +729,18 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			"attestation_subject": attestation.Subject,
 			"attestation_jwt":     attestation.RawJWT,
 		}
-		// The request JWT's signature has been verified above against the
-		// cnf key bound to the attestation's sub, but this handler never
-		// itself verifies the attestation JWT's own signature against a
-		// trusted issuer (that's the PDP's job, given attestation_jwt in
-		// context) - so "sub" alone is an attacker-assertable claim, not a
-		// verified identity. Fold in a fingerprint of the actual key
-		// material so the cache is scoped to that specific key.
-		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
-			verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject + ":" + fp
-		} else {
-			cacheable = false
-		}
+		// The trust decision the PDP makes for this scheme depends on the
+		// WHOLE attestation JWT - its signature, issuer chain, expiry, and
+		// redirect_uris claims (that's why attestation_jwt is forwarded as
+		// context) - not just the subject/key it asserts. A new, expired,
+		// or revoked attestation can share the same subject and even the
+		// same cnf key as a previously-trusted one, so the cache identity
+		// must bind to this specific attestation JWT, not to what it
+		// claims. This is always computable once extraction succeeded
+		// (attestation.RawJWT is never empty here), so - unlike the other
+		// schemes above - there is no "fingerprint unavailable" case to
+		// fall back on.
+		verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject + ":" + sha256Hex(attestation.RawJWT)
 
 	default:
 		// redirect_uri and other schemes: extract key material best-effort
@@ -1117,19 +1125,29 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 	return km, nil
 }
 
+// sha256Hex returns the hex-encoded SHA-256 digest of s - used to fold an
+// arbitrary string (e.g. a raw attestation JWT) into a trust-cache identity
+// without embedding the string itself.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
 // keyMaterialFingerprint returns a stable identifier for the specific key
 // material a request proved possession of via its signature: SHA-256 of an
 // x5c leaf certificate's DER bytes, or the RFC 7638 JWK thumbprint of a JWK.
 // Returns "" if km is nil, empty, or its key material can't be decoded.
 //
 // This exists so the trust cache can be scoped to the actual key a request
-// signed with, not just a claimed identity string - see the x509_san_dns,
-// x509_hash, and verifier_attestation cases in evaluateVerifierTrust, none
-// of which bind a claimed client_id/subject to one specific key on their
-// own (the certificate/attestation-issuer trust check itself is the PDP's
-// job). Without this, a second request presenting a different key but the
-// same claimed identity could reuse a cached verdict the PDP never
-// evaluated for that key.
+// signed with, not just a claimed identity string - see the did:,
+// x509_san_dns, and x509_hash cases in evaluateVerifierTrust, none of which
+// bind a claimed client_id/DID to one specific key on their own (a DID
+// document can list multiple active verification methods, and the
+// certificate/SAN trust check itself is the PDP's job). Without this, a
+// second request presenting a different key but the same claimed identity
+// could reuse a cached verdict the PDP never evaluated for that key.
+// verifier_attestation uses sha256Hex(attestation.RawJWT) instead, not this
+// function - see its case in evaluateVerifierTrust for why.
 func keyMaterialFingerprint(km *KeyMaterial) string {
 	if km == nil {
 		return ""
