@@ -459,6 +459,18 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		return svc, store
 	}
 
+	// addTenantMembership records the user as a member of tenantID, needed
+	// wherever a test's refresh token carries a non-default tenant claim -
+	// see RefreshAccessToken's tenant-membership re-validation (Copilot
+	// review on #400, fourth round).
+	addTenantMembership := func(t *testing.T, store *memory.Store, userID domain.UserID, tenantID domain.TenantID) {
+		t.Helper()
+		require.NoError(t, store.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{
+			UserID:   userID,
+			TenantID: tenantID,
+		}))
+	}
+
 	t.Run("refreshes a valid refresh token into a new access token", func(t *testing.T) {
 		svc, store := newSvcWithRefresh(t)
 		ctx := context.Background()
@@ -467,6 +479,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		if err := store.Users().Create(ctx, user); err != nil {
 			t.Fatalf("failed to create user: %v", err)
 		}
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 
 		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
 		require.NoError(t, err)
@@ -574,6 +587,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		// transient). The SAME refresh token must still work - proving it
 		// was never consumed by the failed attempt above.
 		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
 		if err != nil {
 			t.Fatalf("expected the refresh token to still be usable after the earlier failed lookup, got error: %v", err)
@@ -604,6 +618,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-4"}
 		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 
 		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
 		require.NoError(t, err)
@@ -641,6 +656,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-concurrent"}
 		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 
 		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
 		require.NoError(t, err)
@@ -672,6 +688,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-6"}
 		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 
 		// Hand-crafted refresh token deliberately omitting "exp" - exercises
 		// the fallback expiry branch in the consume step, which a
@@ -697,6 +714,56 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		}
 	})
 
+	// Regression test for a Copilot review finding on #400 (fourth round):
+	// FinishLogin derives tenantID fresh from the user's CURRENT membership
+	// records every time someone logs in, so removing a user's tenant
+	// membership takes effect at their next login - but RefreshAccessToken
+	// used to just trust whatever tenant_id claim the presented refresh
+	// token already carried, forever, letting a removed user keep
+	// refreshing indefinitely instead of losing access within one
+	// access-token lifetime.
+	t.Run("refresh token for a tenant the user was removed from is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-removed-membership"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// Membership removed (e.g. an admin removed this user from the
+		// tenant) - the refresh token itself is unchanged, still carrying
+		// the old tenant_id claim.
+		require.NoError(t, store.UserTenants().RemoveMembership(ctx, user.UUID, "test-tenant"))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken after tenant membership was removed, got %v", err)
+		}
+	})
+
+	// The default tenant is exempt from the membership check above, matching
+	// FinishLogin/GetUserTenants' existing "no memberships recorded -> a
+	// legacy default-tenant user" fallback elsewhere in this file - a
+	// default-tenant refresh token must keep working without ever having an
+	// explicit UserTenantMembership row.
+	t.Run("refresh for the default tenant does not require an explicit membership record", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-default-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		// Deliberately no addTenantMembership call.
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+	})
+
 	t.Run("without a TokenBlacklist wired in at all, a refresh token remains reusable (unchanged, pre-existing behavior)", func(t *testing.T) {
 		svc, store := newSvcWithRefresh(t) // no SetTokenBlacklist call - tokenBlacklist stays nil
 
@@ -704,6 +771,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-5"}
 		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
 
 		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
 		require.NoError(t, err)

@@ -1371,6 +1371,34 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		return nil, ErrInvalidRefreshToken
 	}
 
+	// SECURITY: re-validate tenant membership for non-default tenants
+	// before rotating. FinishLogin derives tenantID fresh from the user's
+	// CURRENT membership records (store.UserTenants().GetUserTenants) every
+	// time someone logs in, so removing a user's tenant membership takes
+	// effect at their very next login - but until now, RefreshAccessToken
+	// simply trusted whatever tenant_id claim the presented refresh token
+	// already carried, forever, with no per-refresh membership check (and
+	// no route in this stack mounts TenantMembershipMiddleware either).
+	// That let a removed user keep refreshing indefinitely instead of
+	// losing access within one access-token lifetime, the whole point of
+	// short-lived access tokens (Copilot review on #400, fourth round). The
+	// default tenant is exempt, matching FinishLogin/GetUserTenants'
+	// existing "no memberships recorded -> legacy default-tenant user"
+	// fallback (domain.DefaultTenantID) elsewhere in this file.
+	if tenantID != "" && tenantID != domain.DefaultTenantID {
+		isMember, err := s.store.UserTenants().IsMember(ctx, userID, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify tenant membership: %w", err)
+		}
+		if !isMember {
+			s.logger.Warn("Refresh token for a tenant the user is no longer a member of",
+				zap.String("user_id", userIDStr),
+				zap.String("tenant_id", tenantIDStr),
+			)
+			return nil, ErrInvalidRefreshToken
+		}
+	}
+
 	// Atomically consume the refresh token's jti - see the doc comment
 	// above. Deliberately placed here: AFTER every non-mutating validation
 	// above (signature, type, user existence) has already succeeded, and
