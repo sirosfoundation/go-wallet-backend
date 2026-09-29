@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -23,6 +22,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -440,62 +440,6 @@ type OIDCGateBinding struct {
 	// e.g. internal/api/handlers.go's FinishWebAuthnLogin), no claims
 	// re-check is performed - purely opt-in, like Audience above.
 	Claims jwt.MapClaims
-}
-
-// oidcClaimsMatch reports whether a validated token claim value satisfies a
-// tenant's configured OIDCGate.RequiredClaims expectation. Mirrors
-// pkg/middleware's own claimsMatch exactly (string/array subset matching,
-// bool/float64/int equality, reflect.DeepEqual fallback for anything else) -
-// duplicated rather than imported so this package doesn't take on a
-// dependency on the HTTP middleware layer for what is otherwise a pure claim
-// comparison; keep the two in sync if either changes.
-func oidcClaimsMatch(expected, actual interface{}) bool {
-	switch e := expected.(type) {
-	case bool:
-		a, ok := actual.(bool)
-		return ok && e == a
-	case string:
-		if a, ok := actual.(string); ok {
-			return e == a
-		}
-		if arr, ok := actual.([]interface{}); ok {
-			for _, v := range arr {
-				if s, ok := v.(string); ok && s == e {
-					return true
-				}
-			}
-		}
-		return false
-	case float64:
-		a, ok := actual.(float64)
-		return ok && e == a
-	case int:
-		a, ok := actual.(float64)
-		return ok && float64(e) == a
-	case []interface{}:
-		a, ok := actual.([]interface{})
-		if !ok {
-			if len(e) == 1 {
-				return oidcClaimsMatch(e[0], actual)
-			}
-			return false
-		}
-		for _, ev := range e {
-			found := false
-			for _, av := range a {
-				if oidcClaimsMatch(ev, av) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	default:
-		return reflect.DeepEqual(expected, actual)
-	}
 }
 
 // FinishRegistrationResponse contains the result of registration
@@ -1259,7 +1203,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		if req.OIDCGateBinding.Claims != nil && len(tenant.OIDCGate.RequiredClaims) > 0 {
 			for key, expected := range tenant.OIDCGate.RequiredClaims {
 				actual, exists := req.OIDCGateBinding.Claims[key]
-				if !exists || !oidcClaimsMatch(expected, actual) {
+				if !exists || !oidc.ClaimsMatch(expected, actual) {
 					s.logger.Warn("OIDC binding required-claims mismatch",
 						zap.String("user_id", userID.String()),
 						zap.String("tenant_id", string(tenantID)),
