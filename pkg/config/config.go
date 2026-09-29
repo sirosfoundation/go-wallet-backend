@@ -32,6 +32,7 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
@@ -205,6 +206,56 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 		return ttl
 	}
 	return c.DefaultTokenTTL
+}
+
+// DCQLConsentCheckMode selects how the engine treats a consent that does not
+// fit the DCQL query the backend sent to the client.
+type DCQLConsentCheckMode string
+
+const (
+	// DCQLConsentCheckOff performs no comparison.
+	DCQLConsentCheckOff DCQLConsentCheckMode = "off"
+	// DCQLConsentCheckWarn (the default) logs a structured warning naming the
+	// reason class and query id, and proceeds.
+	DCQLConsentCheckWarn DCQLConsentCheckMode = "warn"
+	// DCQLConsentCheckEnforce refuses the presentation before any signing:
+	// the verifier gets access_denied and the client a PRESENTATION_ERROR.
+	DCQLConsentCheckEnforce DCQLConsentCheckMode = "enforce"
+)
+
+// Effective returns the mode to apply, treating the zero value as the default.
+func (m DCQLConsentCheckMode) Effective() DCQLConsentCheckMode {
+	if m == "" {
+		return DCQLConsentCheckWarn
+	}
+	return m
+}
+
+func (m DCQLConsentCheckMode) validate() error {
+	switch m.Effective() {
+	case DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce:
+		return nil
+	}
+	return fmt.Errorf("invalid presentation.dcql_consent_check %q: must be one of off, warn, enforce", string(m))
+}
+
+// PresentationConfig controls checks the engine applies to what the wallet is
+// about to present in an OpenID4VP flow.
+type PresentationConfig struct {
+	// DCQLConsentCheck compares the user's consent (selected credential query
+	// ids and disclosed claims) with the DCQL query the backend sent to the
+	// client, before any signing. The frontend is not trusted to have
+	// honoured the query. Values: `off` (no check);
+	// `warn` (default: log a warning with the reason class and query id, never
+	// refuse; claim-path matching can disagree with a real verifier's
+	// notion of a path, so a deployer opts into enforcement);
+	// `enforce` (refuse with PRESENTATION_ERROR and answer the verifier
+	// access_denied, without signing). Nothing about claim names or values is
+	// logged. Not enforced: credential_sets satisfaction (only that no query
+	// outside every option is selected), `values` constraints, and the
+	// contents of the resulting vp_token. Unknown values fail at startup.
+	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
+	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -1723,6 +1774,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
+		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -1994,6 +2046,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
 				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
+	}
+
+	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
+		return err
 	}
 
 	// Validate audit configuration — without this, cfg.Audit.Enabled=true

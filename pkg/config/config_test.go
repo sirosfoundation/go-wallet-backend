@@ -2619,3 +2619,26 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
+	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
+		if err := m.validate(); err != nil {
+			t.Errorf("mode %q rejected: %v", m, err)
+		}
+	}
+	if DCQLConsentCheckMode("").Effective() != DCQLConsentCheckWarn {
+		t.Error("zero value must default to warn")
+	}
+	if defaultConfig().Presentation.DCQLConsentCheck != DCQLConsentCheckWarn {
+		t.Error("default config must be warn")
+	}
+	cfg := validBaseConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("base config invalid: %v", err)
+	}
+	cfg.Presentation.DCQLConsentCheck = "enforced"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "dcql_consent_check") {
+		t.Errorf("unknown mode must fail validation, got %v", err)
+	}
+}
