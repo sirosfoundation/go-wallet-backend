@@ -785,17 +785,22 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// this specific request for the trust cache. Prefer the identity
 	// signature verification just bound above (a DID that verified, a
 	// client_id+certificate/key fingerprint pairing, an attested subject
-	// bound to its key) - falling back to the canonical URL only for
+	// bound to its key) - falling back to canonicalURL+client_id only for
 	// schemes where no scheme-bound signature verification exists at all
-	// (e.g. redirect_uri). When cacheable is false, a scheme that needed a
-	// key-material fingerprint couldn't produce one; this request's result
-	// is never read from or written to the cache at all, rather than
-	// falling back to a weaker key a different key's request could collide
-	// with (see the per-scheme comments above). The same applies if the
-	// context itself can't be hashed.
+	// (e.g. redirect_uri). client_id is included explicitly alongside
+	// canonicalURL (not just relied on as canonicalURL's fallback value)
+	// because canonicalURL prioritizes response_uri/redirect_uri over
+	// client_id - two unsigned requests sharing a response_uri but
+	// claiming DIFFERENT client_ids would otherwise collide on the same
+	// key. When cacheable is false, a scheme that needed a key-material
+	// fingerprint couldn't produce one; this request's result is never
+	// read from or written to the cache at all, rather than falling back
+	// to a weaker key a different key's request could collide with (see
+	// the per-scheme comments above). The same applies if the context
+	// itself can't be hashed.
 	cacheKey := verifiedIdentity
 	if cacheKey == "" && cacheable {
-		cacheKey = canonicalURL
+		cacheKey = canonicalURL + "|client_id:" + authReq.ClientID
 	}
 	if cacheKey != "" && contextHash != "" {
 		cacheKey += "|ctx:" + contextHash

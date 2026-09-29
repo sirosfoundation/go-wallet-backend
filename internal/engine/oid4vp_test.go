@@ -3416,6 +3416,64 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
 	assert.Equal(t, 2, trustCache.Len())
 }
 
+// For schemes with no scheme-bound signature verification at all (e.g.
+// redirect_uri), the cache key falls back to canonicalURL - but
+// canonicalURL prioritizes response_uri over client_id, so two unsigned
+// requests sharing the same response_uri but claiming DIFFERENT client_ids
+// must still reach the PDP independently: the fallback key must include
+// client_id explicitly, not rely on canonicalURL alone.
+func TestEvaluateVerifierTrust_FallbackCacheKeyIncludesClientID(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	stub := &stubDIDResolver{decisionOk: true, decision: true}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	const sharedResponseURI = "https://shared.example/response"
+
+	req1 := &AuthorizationRequest{
+		ClientID:       "https://verifier-a.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+		Nonce:          "n",
+		ResponseURI:    sharedResponseURI,
+	}
+	v1, err := h.evaluateVerifierTrust(context.Background(), req1)
+	require.NoError(t, err)
+	require.True(t, v1.Trusted)
+	assert.Equal(t, 1, trustCache.Len())
+
+	req2 := &AuthorizationRequest{
+		ClientID:       "https://verifier-b.example.com",
+		ClientIDScheme: ClientIDSchemeRedirectURI,
+		Nonce:          "n",
+		ResponseURI:    sharedResponseURI,
+	}
+	v2, err := h.evaluateVerifierTrust(context.Background(), req2)
+	require.NoError(t, err)
+	require.True(t, v2.Trusted)
+
+	// Same response_uri, different claimed client_id: must not collide on
+	// the same cache entry.
+	assert.Equal(t, []string{"https://verifier-a.example.com", "https://verifier-b.example.com"}, stub.evaluated)
+	assert.Equal(t, 2, trustCache.Len())
+}
+
 // --- no-matching-credential fast fail ---
 
 // feedAction queues a client action on the session, the way the websocket
