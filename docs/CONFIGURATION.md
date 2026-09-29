@@ -282,6 +282,7 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.issuer` | `WALLET_AUDIT_ISSUER` | string | Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org"). |
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
+| `audit.identity_events` | `WALLET_AUDIT_IDENTITY_EVENTS` | string list | IdentityEvents selects which enterprise-identity (OIDC gate) audit events are emitted, by short name: bound, verified, mismatch, gate_bypass. Default: none. Requires enabled. The subject is only ever emitted as a hash. Unknown names are rejected at startup. Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated) |
 
 ## Registry Server
 

@@ -2619,3 +2619,28 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.IdentityEvents = []string{"bound"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires audit.enabled") {
+		t.Errorf("identity_events without audit.enabled must be rejected, got %v", err)
+	}
+
+	cfg = validBaseConfig()
+	cfg.Audit = AuditConfig{Enabled: true, Issuer: "https://w", KeyPath: "/k", KeyID: "k", IdentityEvents: []string{"boudn"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Errorf("a misspelt event name must be rejected, got %v", err)
+	}
+
+	cfg.Audit.IdentityEvents = []string{" Bound ", "verified", "mismatch", "gate_bypass"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	if !cfg.Audit.IdentityEventEnabled("bound") || cfg.Audit.IdentityEventEnabled("nope") {
+		t.Error("IdentityEventEnabled mismatch")
+	}
+	if (AuditConfig{}).IdentityEventEnabled("bound") {
+		t.Error("no event may be enabled by default")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,15 @@ import (
 // the same way WIAService declares its own issuance-failure event.
 const EventWebAuthnCloneWarning = set.EventURI("urn:siros:audit:webauthn:clone_warning")
 
+// Enterprise-identity (OIDC gate) audit events (#66). Which of them are
+// emitted is selected by AuditConfig.IdentityEvents; none are by default.
+const (
+	EventIdentityBound      = set.EventURI("urn:siros:audit:identity:bound")
+	EventIdentityVerified   = set.EventURI("urn:siros:audit:identity:verified")
+	EventIdentityMismatch   = set.EventURI("urn:siros:audit:identity:mismatch")
+	EventIdentityGateBypass = set.EventURI("urn:siros:audit:identity:gate_bypass")
+)
+
 var (
 	ErrChallengeNotFound       = errors.New("challenge not found")
 	ErrChallengeExpired        = errors.New("challenge expired")
@@ -60,6 +70,7 @@ type WebAuthnService struct {
 	aaguidValidator *AAGUIDValidator
 	tokenBlacklist  *TokenBlacklist
 	audit           *audit.Emitter
+	auditCfg        config.AuditConfig
 }
 
 // SetAuditEmitter attaches a SET audit emitter to the service, used to record
@@ -68,6 +79,40 @@ type WebAuthnService struct {
 // (Emit/EmitWithSubject are no-ops on a nil *audit.Emitter).
 func (s *WebAuthnService) SetAuditEmitter(a *audit.Emitter) {
 	s.audit = a
+}
+
+// SetAuditIdentityConfig selects which enterprise-identity audit events are
+// emitted (see config.AuditConfig.IdentityEvents). The zero value emits none.
+func (s *WebAuthnService) SetAuditIdentityConfig(cfg config.AuditConfig) {
+	s.auditCfg = cfg
+}
+
+// auditIdentity emits an enterprise-identity audit event if that event is
+// selected in config. The subject is never emitted in the clear: it is
+// identified by a hash over issuer and subject.
+func (s *WebAuthnService) auditIdentity(name string, event set.EventURI, userID string, tenantID domain.TenantID, issuer, subject string, extra map[string]any) {
+	if s.audit == nil || !s.auditCfg.IdentityEventEnabled(name) {
+		return
+	}
+	data := map[string]any{
+		"user_id":   userID,
+		"tenant_id": string(tenantID),
+		"issuer":    issuer,
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	subjectID := "user:" + userID
+	if subject != "" {
+		subjectID = subjectHash(issuer, subject)
+	}
+	s.audit.EmitWithSubject(event, subjectID, data)
+}
+
+// subjectHash returns a stable, non-reversible identifier for an OIDC subject.
+func subjectHash(issuer, subject string) string {
+	h := sha256.Sum256([]byte(issuer + "\x00" + subject))
+	return "sha256:" + hex.EncodeToString(h[:])
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -798,6 +843,9 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		s.logger.Info("Bound enterprise identity to user",
 			zap.String("tenant_id", string(tenantID)),
 			zap.String("issuer", req.OIDCGateBinding.Issuer))
+		s.auditIdentity(config.AuditIdentityBound, EventIdentityBound, userID.String(), tenantID,
+			req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+			map[string]any{"binding_type": req.OIDCGateBinding.BindingType})
 	}
 
 	// Atomically consume the invite BEFORE creating the user account. The
@@ -1330,6 +1378,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			s.logger.Warn("Login gate required but no OIDC binding provided",
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)))
+			s.auditIdentity(config.AuditIdentityGateBypass, EventIdentityGateBypass, userID.String(), tenantID, "", "", nil)
 			return nil, ErrOIDCGateRequired
 		}
 
@@ -1347,6 +1396,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("tenant_id", string(tenantID)),
 				zap.String("expected_issuer", loginOP.Issuer),
 				zap.String("actual_issuer", req.OIDCGateBinding.Issuer))
+			s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+				map[string]any{"reason": "issuer", "expected_issuer": loginOP.Issuer})
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for wrong OP
 		}
 
@@ -1362,6 +1414,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("tenant_id", string(tenantID)),
 				zap.String("expected_audience", loginOP.EffectiveAudience()),
 				zap.String("actual_audience", req.OIDCGateBinding.Audience))
+			s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+				map[string]any{"reason": "audience"})
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for the wrong app
 		}
 
@@ -1380,6 +1435,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 						zap.String("user_id", userID.String()),
 						zap.String("tenant_id", string(tenantID)),
 						zap.String("claim", key))
+					s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+						req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+						map[string]any{"reason": "required_claims", "claim": key})
 					return nil, ErrOIDCGateRequired
 				}
 			}
@@ -1392,6 +1450,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				s.logger.Warn("User has no bound enterprise identity for tenant",
 					zap.String("user_id", userID.String()),
 					zap.String("tenant_id", string(tenantID)))
+				s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+					req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+					map[string]any{"reason": "not_bound"})
 				return nil, ErrIdentityNotBound
 			}
 
@@ -1405,6 +1466,15 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 					zap.String("actual_issuer", req.OIDCGateBinding.Issuer),
 					zap.String("expected_subject", existingIdentity.Subject),
 					zap.String("actual_subject", req.OIDCGateBinding.Subject))
+				s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+					req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+					map[string]any{
+						"reason":          "identity",
+						"expected_issuer": existingIdentity.Issuer,
+						// Hash of the bound identity, so the two can be compared
+						// without either subject appearing in the audit trail.
+						"expected_subject_hash": subjectHash(existingIdentity.Issuer, existingIdentity.Subject),
+					})
 				return nil, ErrIdentityBindingMismatch
 			}
 
@@ -1412,6 +1482,8 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)),
 				zap.String("issuer", req.OIDCGateBinding.Issuer))
+			s.auditIdentity(config.AuditIdentityVerified, EventIdentityVerified, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject, nil)
 		}
 	}
 
