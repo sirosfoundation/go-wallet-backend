@@ -1171,9 +1171,17 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// Update the credential's signature count
+	// Update the credential's signature count. CloneWarning is sticky: once
+	// set, a later login with a properly-incrementing counter must not
+	// silently clear it back to false — go-webauthn's per-call Authenticator
+	// only ever reports whether *this* assertion's counter regressed, so a
+	// clean subsequent login would otherwise erase the audit trail of an
+	// earlier detected clone. Only ever latch it true; clearing it is a
+	// deliberate operator action, not an automatic side effect of a login.
 	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
-	matchedCred.Authenticator.CloneWarning = credential.Authenticator.CloneWarning
+	if credential.Authenticator.CloneWarning {
+		matchedCred.Authenticator.CloneWarning = true
+	}
 	user.UpdatedAt = time.Now()
 
 	// SECURITY: go-webauthn sets CloneWarning when the authenticator's

@@ -233,7 +233,16 @@ type InviteStore interface {
 	// GetAllByTenant retrieves all invites for a tenant
 	GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.Invite, error)
 
-	// MarkCompleted atomically marks an active invite as completed
+	// MarkCompleted atomically marks an invite as completed, but only if it
+	// is currently active AND not expired — both conditions are checked as
+	// part of the same atomic operation (Mongo: a single filtered UpdateOne;
+	// memory: under one mutex acquisition). This closes a narrower TOCTOU
+	// than the active/completed race MarkCompleted itself already prevents:
+	// without the expiry check being atomic too, an invite that passed an
+	// earlier IsUsable() check could tick over its expiry while a slow
+	// caller (e.g. WebAuthn verification) is still in flight, and this call
+	// would otherwise still succeed. Returns storage.ErrNotFound if the
+	// invite isn't active, is expired, or doesn't exist.
 	MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error
 
 	// Update updates an invite (for renew/revoke)

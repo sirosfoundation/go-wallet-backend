@@ -735,10 +735,11 @@ func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
 	ctx := context.Background()
 
 	invite := &domain.Invite{
-		ID:       "invite-race-id",
-		TenantID: domain.DefaultTenantID,
-		Code:     "RACE-CODE",
-		Status:   domain.InviteStatusActive,
+		ID:        "invite-race-id",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "RACE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	require.NoError(t, store.Invites().Create(ctx, invite))
 
@@ -767,6 +768,34 @@ func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
 	got, err := store.Invites().GetByID(ctx, invite.ID)
 	require.NoError(t, err)
 	assert.Equal(t, domain.InviteStatusCompleted, got.Status)
+}
+
+// TestInviteStore_MarkCompleted_ExpiredInviteRejected covers a review
+// finding on PR #388: MarkCompleted's atomic filter only checked
+// status == active, not expiry, as a separate condition. An invite that
+// ticks over its expiry between an earlier IsUsable() check and this call
+// (e.g. while WebAuthn verification is still in flight) must not still be
+// claimable — expiry has to be part of the same atomic filter.
+func TestInviteStore_MarkCompleted_ExpiredInviteRejected(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	invite := &domain.Invite{
+		ID:        "invite-expired-id",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "EXPIRED-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(-time.Minute), // active status, but expired
+	}
+	require.NoError(t, store.Invites().Create(ctx, invite))
+
+	userID := domain.UserIDFromString("racer")
+	err := store.Invites().MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID)
+	assert.ErrorIs(t, err, storage.ErrNotFound, "MarkCompleted on an expired-but-active invite should return ErrNotFound")
+
+	got, err := store.Invites().GetByID(ctx, invite.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusActive, got.Status, "MarkCompleted must not have claimed an expired invite")
 }
 
 // On a fresh database the counter must hand out 1, 2, 3, ...: with the

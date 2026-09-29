@@ -1990,10 +1990,11 @@ func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
 
 	const code = "RACE-CODE"
 	invite := &domain.Invite{
-		ID:       "invite-race",
-		TenantID: domain.DefaultTenantID,
-		Code:     code,
-		Status:   domain.InviteStatusActive,
+		ID:        "invite-race",
+		TenantID:  domain.DefaultTenantID,
+		Code:      code,
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
 	}
 	if err := invites.Create(ctx, invite); err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -2029,6 +2030,46 @@ func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
 	}
 	if got.Status != domain.InviteStatusCompleted {
 		t.Errorf("invite status = %q, want %q", got.Status, domain.InviteStatusCompleted)
+	}
+}
+
+// TestInviteStore_MarkCompleted_ExpiredInviteRejected covers a review
+// finding on PR #388: MarkCompleted's atomic predicate only checked
+// Status == Active, not expiry. An invite that passed an earlier
+// IsUsable() check (status active AND not expired) could tick over its
+// expiry while a slow caller (e.g. WebAuthn verification) is still in
+// flight, and MarkCompleted would still succeed since expiry wasn't part
+// of the same atomic check. The expiry condition must be checked under
+// the same lock as the status check, not as a separate earlier read.
+func TestInviteStore_MarkCompleted_ExpiredInviteRejected(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	invites := store.Invites()
+
+	invite := &domain.Invite{
+		ID:        "invite-expired",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "EXPIRED-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(-time.Minute), // active status, but expired
+	}
+	if err := invites.Create(ctx, invite); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	userID := domain.UserIDFromString("racer")
+	err := invites.MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID)
+	if err != storage.ErrNotFound {
+		t.Errorf("MarkCompleted() on an expired-but-active invite should return ErrNotFound, got %v", err)
+	}
+
+	// The invite must remain untouched — still active, not completed.
+	got, err := invites.GetByID(ctx, "invite-expired")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != domain.InviteStatusActive {
+		t.Errorf("invite status = %q, want %q (MarkCompleted must not have claimed an expired invite)", got.Status, domain.InviteStatusActive)
 	}
 }
 

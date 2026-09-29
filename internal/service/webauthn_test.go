@@ -1427,6 +1427,97 @@ func TestFullLoginFlow_CloneWarningSurfaced(t *testing.T) {
 	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
 }
 
+// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin covers a review
+// finding on PR #388: FinishLogin used to unconditionally overwrite the
+// stored CloneWarning with whatever go-webauthn reported for *that*
+// assertion, which reads as if a later, cleanly-incrementing login could
+// silently clear a flag set by an earlier detected clone.
+//
+// In practice, with go-webauthn v0.18.2's current Authenticator.UpdateCounter
+// (a non-regressing counter only advances SignCount and leaves CloneWarning
+// untouched — it's a one-way latch already, and we hydrate the stored
+// CloneWarning back into the Authenticator we hand the library on every call
+// via WebAuthnCredentials()), this specific clearing scenario doesn't
+// currently reproduce end-to-end: this test still passed even with the old
+// unconditional-overwrite code, because the value being written back was
+// already "true" by the time it got there. Verified this by reverting the
+// fix and rerunning this exact test.
+//
+// The fix is kept anyway as defense-in-depth: the "never silently clear a
+// latched clone warning" guarantee should live in our own code, not depend
+// on an undocumented behavior of a third-party library's counter-update
+// logic that could change in a future version. This test locks in that
+// invariant explicitly, independent of go-webauthn's internals.
+func TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Clone Latch Test User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Clone Latch Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(counter uint32) {
+		t.Helper()
+		credential.Counter = counter
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err)
+	}
+
+	// Baseline, then a regression that latches CloneWarning=true.
+	login(10)
+	login(3)
+
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	require.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning, "sanity: clone warning must be set after the regression")
+
+	// A subsequent, cleanly-incrementing login (counter > stored) reports no
+	// clone warning for itself — it must NOT clear the latched flag.
+	login(20)
+
+	user, err = store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning, "a clean subsequent login must not clear a previously latched clone warning")
+	assert.Equal(t, uint32(20), user.WebauthnCredentials[0].Authenticator.SignCount, "sign count must still advance normally")
+}
+
 // ============================================================================
 // Storage-layer failure paths for the atomic challenge/invite consumption
 // (issues #379, #378) — a real storage outage on ConsumeByID/MarkCompleted,
