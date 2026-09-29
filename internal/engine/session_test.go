@@ -1208,3 +1208,105 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 		return err != nil
 	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
 }
+
+// TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature is
+// a regression test for #403: the engine's own revocation signal
+// (Manager.RevokeUser / isUserRevoked) must reject an already-revoked
+// user's session even with no TokenBlacklistChecker wired at all - not
+// merely with the optional security.token_blacklist feature "disabled" in
+// config, but genuinely absent (m.blacklist == nil, matching a deployment
+// that never calls SetTokenBlacklist). Mirrors
+// TestManager_RegisterSession_RejectsAlreadyRevokedUser, but drives the
+// rejection through RevokeUser instead of a fake blacklist.
+func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	// Deliberately no SetTokenBlacklist call: m.blacklist stays nil.
+	m.RevokeUser("already-revoked-user")
+
+	srvConnCh := make(chan *websocket.Conn, 1)
+	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		srvConnCh <- srvConn
+	})
+	defer cleanup()
+	srvConn := <-srvConnCh
+
+	session := &Session{
+		ID:       "revoked-user-session-no-blacklist",
+		UserID:   "already-revoked-user",
+		conn:     srvConn,
+		flows:    make(map[string]*Flow),
+		logger:   zap.NewNop(),
+		actionCh: make(chan *FlowActionMessage, 1),
+		signCh:   make(chan *SignResponseMessage, 1),
+		matchCh:  make(chan *MatchResponseMessage, 1),
+		closeCh:  make(chan struct{}, 1),
+		stopPing: make(chan struct{}),
+	}
+
+	accepted := m.registerSession(session)
+	assert.False(t, accepted, "a session for a manager-revoked user must be rejected even with no TokenBlacklist wired at all")
+
+	m.sessionsMu.RLock()
+	_, present := m.sessions[session.ID]
+	m.sessionsMu.RUnlock()
+	assert.False(t, present, "a rejected session must not be added to m.sessions")
+
+	require.Eventually(t, func() bool {
+		_, _, err := clientConn.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
+}
+
+// TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature is the
+// end-to-end regression test for #403: account deletion (via
+// Manager.DeleteByUser, the exact seam service.UserService.DeleteUser
+// calls through - see cmd/server/main.go) must both close an
+// already-established session AND reject a brand new handshake attempt
+// for that user, entirely independent of the optional
+// security.token_blacklist feature - which this test never configures at
+// all (no SetTokenBlacklist call, legacy HMAC auth path, m.blacklist is
+// nil throughout).
+func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	const userID = "deleted-no-blacklist-feature"
+	ws := dialAndHandshakeAsUser(t, m, wsURL, userID)
+	defer func() { _ = ws.Close() }()
+
+	// Simulate account deletion through the actual seam
+	// service.UserService.DeleteUser calls (see cmd/server/main.go).
+	require.NoError(t, m.DeleteByUser(context.Background(), userID))
+
+	// The already-open session must actually close.
+	require.Eventually(t, func() bool {
+		_, _, err := ws.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "the deleted user's existing session did not close")
+
+	// A brand new handshake attempt for the same (now-revoked) user must
+	// also be rejected - not just the already-open session closed.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
+	require.NoError(t, err)
+
+	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer func() { _ = ws2.Close() }()
+	require.NoError(t, ws2.WriteJSON(HandshakeMessage{
+		Message:  Message{Type: TypeHandshake},
+		AppToken: tokenString,
+	}))
+
+	var msg Message
+	require.NoError(t, ws2.ReadJSON(&msg))
+	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
+}
