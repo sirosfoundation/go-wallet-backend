@@ -1845,7 +1845,13 @@ func TestValidateAuthorizationRequest_X509SANURI_InvalidJWT(t *testing.T) {
 	assert.Contains(t, err.Error(), "JWT signature verification failed")
 }
 
-func TestValidateAuthorizationRequest_X509SANURI_NoJWTSkipsCheck(t *testing.T) {
+// Unlike x509_san_dns/x509_hash (whose early checks only fire when a
+// RequestJWT is present, deferring a missing one to evaluateVerifierTrust's
+// scheme switch - by which point its unconditional client_metadata_uri
+// fetch has already run), x509_san_uri rejects a missing RequestJWT here
+// too - not just an invalid one - per the Copilot finding on PR #401
+// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132142866).
+func TestValidateAuthorizationRequest_X509SANURI_NoJWTRejected(t *testing.T) {
 	h := &OID4VPHandler{}
 	authReq := &AuthorizationRequest{
 		Nonce:          "abc",
@@ -1853,10 +1859,11 @@ func TestValidateAuthorizationRequest_X509SANURI_NoJWTSkipsCheck(t *testing.T) {
 		ResponseURI:    "https://verifier.example.com/response",
 		ClientID:       "https://verifier.example.com/id",
 		ClientIDScheme: ClientIDSchemeX509SANURI,
-		// No RequestJWT — the JWT verification step should be skipped
+		// No RequestJWT
 	}
 	err := h.validateAuthorizationRequest(authReq, nil)
-	assert.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "x509_san_uri scheme requires a signed request JWT")
 }
 
 // TestOID4VPFlow_X509SANURI_InvalidSignature_NeverFetchesClientMetadata is
@@ -1867,34 +1874,59 @@ func TestValidateAuthorizationRequest_X509SANURI_NoJWTSkipsCheck(t *testing.T) {
 // verify must be rejected before ever reaching evaluateVerifierTrust's
 // client_metadata_uri fetch, so the verifier-controlled metadata endpoint
 // must see zero requests.
-func TestOID4VPFlow_X509SANURI_InvalidSignature_NeverFetchesClientMetadata(t *testing.T) {
-	var metadataFetches int32
-	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&metadataFetches, 1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"client_name":"whatever"}`))
-	}))
-	defer metadataServer.Close()
-
-	h := &OID4VPHandler{
-		BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
-		httpClient:  metadataServer.Client(),
+func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *testing.T) {
+	tests := []struct {
+		name       string
+		requestJWT string
+		wantErrMsg string
+	}{
+		{
+			name:       "invalid signature",
+			requestJWT: "invalid.jwt.token",
+			wantErrMsg: "JWT signature verification failed",
+		},
+		{
+			// Per the Copilot finding on PR #401
+			// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132142866):
+			// a missing RequestJWT is exactly as unauthenticated as an
+			// invalid one and must be rejected before any fetch too.
+			name:       "missing request JWT",
+			requestJWT: "",
+			wantErrMsg: "requires a signed request JWT",
+		},
 	}
-	authReq := &AuthorizationRequest{
-		Nonce:             "abc",
-		ResponseMode:      ResponseModeDirectPost,
-		ResponseURI:       "https://verifier.example.com/response",
-		ClientID:          "https://verifier.example.com/id",
-		ClientIDScheme:    ClientIDSchemeX509SANURI,
-		RequestJWT:        "invalid.jwt.token",
-		ClientMetadataURI: metadataServer.URL,
-	}
 
-	err := h.validateAuthorizationRequest(authReq, nil)
-	require.Error(t, err, "an invalidly-signed x509_san_uri request must be rejected before any metadata fetch")
-	assert.Contains(t, err.Error(), "JWT signature verification failed")
-	assert.Equal(t, int32(0), atomic.LoadInt32(&metadataFetches),
-		"client_metadata_uri must never be fetched for a request whose signature doesn't verify")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var metadataFetches int32
+			metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&metadataFetches, 1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"client_name":"whatever"}`))
+			}))
+			defer metadataServer.Close()
+
+			h := &OID4VPHandler{
+				BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
+				httpClient:  metadataServer.Client(),
+			}
+			authReq := &AuthorizationRequest{
+				Nonce:             "abc",
+				ResponseMode:      ResponseModeDirectPost,
+				ResponseURI:       "https://verifier.example.com/response",
+				ClientID:          "https://verifier.example.com/id",
+				ClientIDScheme:    ClientIDSchemeX509SANURI,
+				RequestJWT:        tt.requestJWT,
+				ClientMetadataURI: metadataServer.URL,
+			}
+
+			err := h.validateAuthorizationRequest(authReq, nil)
+			require.Error(t, err, "must be rejected before any metadata fetch")
+			assert.Contains(t, err.Error(), tt.wantErrMsg)
+			assert.Equal(t, int32(0), atomic.LoadInt32(&metadataFetches),
+				"client_metadata_uri must never be fetched for an unauthenticated request")
+		})
+	}
 }
 
 // --- Tests for inferClientIDScheme new branches ---
@@ -1992,6 +2024,16 @@ func TestValidateAuthorizationRequest_AllKnownSchemes(t *testing.T) {
 				ResponseURI:    "https://verifier.example.com/response",
 				ClientID:       "https://verifier.example.com",
 				ClientIDScheme: scheme,
+			}
+			// Unlike the other schemes here, x509_san_uri rejects a
+			// missing RequestJWT outright (see
+			// TestValidateAuthorizationRequest_X509SANURI_NoJWTRejected) -
+			// give it a validly-signed one so this table only exercises
+			// "is the scheme recognized at all", the same as every other
+			// entry.
+			if scheme == ClientIDSchemeX509SANURI {
+				jwtToken, _ := makeSignedJWTWithX5CURISAN(t, authReq.ClientID)
+				authReq.RequestJWT = jwtToken
 			}
 			err := h.validateAuthorizationRequest(authReq, nil)
 			assert.NoError(t, err)

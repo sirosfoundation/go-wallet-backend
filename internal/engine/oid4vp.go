@@ -2075,10 +2075,18 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	// here it's not just the trust cache: evaluateVerifierTrust fetches
 	// client_metadata_uri (an outbound HTTP request to a verifier-controlled
 	// URL) unconditionally, before its scheme switch ever runs, so an
-	// invalidly-signed x509_san_uri request could otherwise trigger that
-	// fetch before ever being rejected. Verify the JWT signature against its
-	// embedded x5c first, same as its sibling certificate-bound schemes.
-	if authReq.ClientIDScheme == ClientIDSchemeX509SANURI && authReq.RequestJWT != "" {
+	// invalidly-signed - or entirely unsigned - x509_san_uri request could
+	// otherwise trigger that fetch before ever being rejected. Unlike
+	// x509_san_dns/x509_hash above (whose early checks only run when a
+	// RequestJWT is present, leaving a missing one to be rejected later,
+	// inside evaluateVerifierTrust's scheme switch, by which point the
+	// fetch has already happened), reject a missing RequestJWT here too,
+	// not just an invalid one, so no unauthenticated x509_san_uri request -
+	// signed or not - ever reaches that fetch.
+	if authReq.ClientIDScheme == ClientIDSchemeX509SANURI {
+		if authReq.RequestJWT == "" {
+			return errors.New("x509_san_uri scheme requires a signed request JWT")
+		}
 		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
 		if err != nil {
 			return fmt.Errorf("x509_san_uri JWT signature verification failed: %w", err)
