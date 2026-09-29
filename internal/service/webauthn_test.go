@@ -301,6 +301,73 @@ func TestWebAuthnService_FinishRegistration_Errors(t *testing.T) {
 	})
 }
 
+// TestWebAuthnService_FinishRegistration_TenantMismatch is a direct
+// service-level regression test for issue #395 (mirroring PR #386's fix for
+// the analogous /auth/passkey/* bug, #374): FinishRegistration must reject a
+// request whose ExpectedTenantID disagrees with the tenant BeginRegistration
+// actually recorded on the challenge, and must do so BEFORE the one-time
+// challenge is deleted (so a mismatched caller can't burn it out from under
+// the legitimate caller). Exercised directly against the service (not
+// through internal/api or internal/server) so this package's own coverage
+// reflects the check - the handler/route-level regression tests live in
+// internal/server/providers_test.go.
+func TestWebAuthnService_FinishRegistration_TenantMismatch(t *testing.T) {
+	svc, store := setupWebAuthnService(t)
+	ctx := context.Background()
+
+	tenantA := domain.TenantID("tenant-a")
+	tenantB := domain.TenantID("tenant-b")
+	require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantA, Name: "Tenant A", Enabled: true}))
+	require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantB, Name: "Tenant B", Enabled: true}))
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{TenantID: string(tenantA)})
+	require.NoError(t, err)
+
+	t.Run("mismatched ExpectedTenantID is rejected before the challenge is consumed", func(t *testing.T) {
+		_, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID:      beginResp.ChallengeID,
+			Credential:       json.RawMessage(`{}`),
+			ExpectedTenantID: string(tenantB),
+		})
+		if err != ErrTenantMismatch {
+			t.Fatalf("expected ErrTenantMismatch, got %v", err)
+		}
+
+		// The challenge must still exist - a mismatched request must not be
+		// able to burn the one-time challenge for the legitimate caller.
+		if _, err := store.Challenges().GetByID(ctx, beginResp.ChallengeID); err != nil {
+			t.Fatalf("challenge should survive a tenant mismatch, got: %v", err)
+		}
+	})
+
+	t.Run("matching ExpectedTenantID is not rejected as a mismatch", func(t *testing.T) {
+		_, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID:      beginResp.ChallengeID,
+			Credential:       json.RawMessage(`{}`),
+			ExpectedTenantID: string(tenantA),
+		})
+		// The bogus credential will still fail verification further down,
+		// but it must NOT be rejected as a tenant mismatch.
+		if err == ErrTenantMismatch {
+			t.Fatal("matching ExpectedTenantID must not be rejected as a tenant mismatch")
+		}
+	})
+
+	t.Run("empty ExpectedTenantID performs no check (backward compatible)", func(t *testing.T) {
+		beginResp2, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{TenantID: string(tenantA)})
+		require.NoError(t, err)
+
+		_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID: beginResp2.ChallengeID,
+			Credential:  json.RawMessage(`{}`),
+			// ExpectedTenantID left empty
+		})
+		if err == ErrTenantMismatch {
+			t.Fatal("empty ExpectedTenantID must not trigger a tenant mismatch")
+		}
+	})
+}
+
 func TestWebAuthnService_FinishLogin_Errors(t *testing.T) {
 	svc, _ := setupWebAuthnService(t)
 	ctx := context.Background()
