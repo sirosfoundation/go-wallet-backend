@@ -42,6 +42,12 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		logger.Warn("Failed to create WebAuthn service", zap.Error(err))
 		// Continue without WebAuthn - it will be nil
 	}
+	if webauthnSvc != nil {
+		// Use the shared SET audit emitter constructor so security events
+		// (e.g. clone-authenticator warnings) are audited whenever cfg.Audit
+		// is enabled, consistent with WIA/admin-API auditing.
+		webauthnSvc.SetAuditEmitter(audit.NewFromConfig(cfg, logger))
+	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
 

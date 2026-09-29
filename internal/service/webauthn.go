@@ -17,14 +17,23 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/golang-jwt/jwt/v5"
 	cryptoutil "github.com/sirosfoundation/go-cryptoutil"
+	"github.com/sirosfoundation/go-siros-set/set"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
+
+// EventWebAuthnCloneWarning is emitted when go-webauthn detects that an
+// authenticator's signature counter regressed — the classic signal that
+// credential key material has been cloned onto a second authenticator. Not
+// part of go-siros-set's predefined event catalog, so it's declared locally
+// the same way WIAService declares its own issuance-failure event.
+const EventWebAuthnCloneWarning = set.EventURI("urn:siros:audit:webauthn:clone_warning")
 
 var (
 	ErrChallengeNotFound       = errors.New("challenge not found")
@@ -50,6 +59,15 @@ type WebAuthnService struct {
 	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
 	tokenBlacklist  *TokenBlacklist
+	audit           *audit.Emitter
+}
+
+// SetAuditEmitter attaches a SET audit emitter to the service, used to record
+// security-relevant events (currently: clone-authenticator warnings) in the
+// shared audit trail. Safe to call with nil, which leaves auditing disabled
+// (Emit/EmitWithSubject are no-ops on a nil *audit.Emitter).
+func (s *WebAuthnService) SetAuditEmitter(a *audit.Emitter) {
+	s.audit = a
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -262,6 +280,20 @@ type BeginRegistrationRequest struct {
 // BeginRegistration starts WebAuthn registration for a new user
 // If tenantId is provided, the user will be registered in that tenant
 func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegistrationRequest) (*BeginRegistrationResponse, error) {
+	// Invite codes are tenant-scoped (Invites().GetByCode requires a
+	// tenantID) and FinishRegistration's atomic invite claim is likewise
+	// only reachable when the challenge carries a tenantID. Without this
+	// guard, an invite code supplied alongside an empty tenantID would
+	// never be validated OR consumed at all: BeginRegistration's invite
+	// checks live entirely inside the `req.TenantID != ""` branch below, and
+	// FinishRegistration's completion-time claim is gated the same way — so
+	// that combination would silently create a global (non-tenant) account
+	// while leaving the referenced invite untouched, instead of being
+	// rejected. Fail closed here instead.
+	if req.InviteCode != "" && req.TenantID == "" {
+		return nil, ErrInvalidInvite
+	}
+
 	// Validate tenant exists if provided
 	var tenantID domain.TenantID
 	if req.TenantID != "" {
@@ -468,17 +500,41 @@ type FinishRegistrationResponse struct {
 
 // FinishRegistration completes WebAuthn registration
 func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishRegistrationRequest) (*FinishRegistrationResponse, error) {
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge (single find-and-delete), constrained
+	// to the caller's validated tenant context (set by the handler) as part
+	// of the SAME atomic operation when one was given — see
+	// ExpectedTenantID's doc comment. This closes two TOCTOU windows at
+	// once: a separate GetByID+Delete lets concurrent callers presenting
+	// the same challengeId+assertion all read the challenge before any of
+	// them deletes it, and all pass verification (issue #379); and a
+	// tenant-mismatch check performed only AFTER an unconstrained consume
+	// would let a caller who merely knows a valid challenge ID submit it
+	// with the wrong tenant purely to burn the one-time challenge, denying
+	// the legitimate caller (with the matching tenant) the ability to ever
+	// finish it. ConsumeByIDForTenant guarantees at most one caller ever
+	// gets a non-nil challenge back for a given ID, and a tenant mismatch
+	// never touches the real challenge at all.
+	challenge, err := s.store.Challenges().ConsumeByIDForTenant(ctx, req.ChallengeID, req.ExpectedTenantID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
+			if req.ExpectedTenantID != "" {
+				// Distinguish "doesn't exist" from "tenant mismatch" only
+				// for the caller-facing error code, not the storage query
+				// itself (which is deliberately a single atomic op either
+				// way) — a non-existent challenge and a same-tenant lookup
+				// both already return ErrChallengeNotFound; we only need
+				// ErrTenantMismatch when a tenant context was actually
+				// supplied, matching the error this replaces.
+				if _, getErr := s.store.Challenges().GetByID(ctx, req.ChallengeID); getErr == nil {
+					return nil, ErrTenantMismatch
+				}
+			}
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
@@ -488,20 +544,6 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
-
-	// SECURITY: reject if the caller's validated tenant context (set by the
-	// handler) doesn't match the tenant this challenge actually belongs to -
-	// see ExpectedTenantID's doc comment. Checked BEFORE the challenge is
-	// deleted below: otherwise a caller who merely knows a valid challenge ID
-	// could submit it with a mismatched tenant purely to burn the one-time
-	// challenge, denying the legitimate caller (with the matching tenant)
-	// the ability to ever finish it.
-	if req.ExpectedTenantID != "" && domain.TenantID(req.ExpectedTenantID) != tenantID {
-		return nil, ErrTenantMismatch
-	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Re-validate invite if one was used at BeginRegistration time.
 	// The invite may have been revoked or expired during the challenge window.
@@ -758,6 +800,40 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 			zap.String("issuer", req.OIDCGateBinding.Issuer))
 	}
 
+	// Atomically consume the invite BEFORE creating the user account. The
+	// early IsUsable() check above and this atomic MarkCompleted are not
+	// atomic with each other, so a concurrent loser can still pass that
+	// early check while a winner's MarkCompleted has already committed; by
+	// gating user creation on MarkCompleted succeeding here, the loser is
+	// rejected before Users().Create()/AddMembership ever run, instead of
+	// after an account has already been committed (issue #378 — the invite
+	// single-use TOCTOU). MarkCompleted is a single atomic
+	// find-and-update-if-active operation in both storage backends, so only
+	// one concurrent caller can ever win it.
+	//
+	// A non-empty InviteCode with an empty tenantID is rejected up front in
+	// BeginRegistration and should therefore never reach a stored challenge,
+	// but fail closed here too as defense-in-depth: an invite code must
+	// always resolve to a real atomic claim, never be silently skipped.
+	if challenge.InviteCode != "" {
+		if tenantID == "" {
+			s.logger.Warn("Challenge carries an invite code but no tenant; rejecting registration",
+				zap.String("user_id", userID.String()))
+			return nil, ErrInvalidInvite
+		}
+		if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
+			invitePrefix := challenge.InviteCode
+			if len(invitePrefix) > 8 {
+				invitePrefix = invitePrefix[:8]
+			}
+			s.logger.Warn("Invite could not be atomically claimed; rejecting registration",
+				zap.Error(err),
+				zap.String("invite_code_prefix", invitePrefix),
+				zap.String("user_id", userID.String()))
+			return nil, ErrInvalidInvite
+		}
+	}
+
 	// Store the user
 	if err := s.store.Users().Create(ctx, user); err != nil {
 		s.logger.Error("Failed to create user", zap.Error(err))
@@ -778,17 +854,6 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 				zap.Error(err),
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)))
-		}
-
-		// Mark invite as completed if one was used
-		if challenge.InviteCode != "" {
-			if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
-				s.logger.Error("Failed to mark invite as completed — registration will be rolled back",
-					zap.Error(err),
-					zap.String("invite_code_prefix", challenge.InviteCode[:8]),
-					zap.String("user_id", userID.String()))
-				return nil, ErrInvalidInvite
-			}
 		}
 
 		// Get tenant display name for response
@@ -915,26 +980,28 @@ type FinishLoginResponse struct {
 
 // FinishLogin completes WebAuthn authentication
 func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginRequest) (*FinishLoginResponse, error) {
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge (single find-and-delete). Without
+	// this, N concurrent FinishLogin calls presenting the same
+	// challengeId+assertion could all read the challenge via GetByID before
+	// any of them called Delete, and all pass verification — confirmed on
+	// production as 16 parallel login_finish calls on one challenge
+	// producing 14 valid appTokens (issue #379). ConsumeByID guarantees at
+	// most one caller ever gets a non-nil challenge back for a given ID.
+	challenge, err := s.store.Challenges().ConsumeByID(ctx, req.ChallengeID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
 	if challenge.Action != "login" {
 		return nil, errors.New("invalid challenge action")
 	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Debug: log the credential data being parsed
 	credData := taggedbinary.MustDecodeJSON(req.Credential)
@@ -1134,9 +1201,21 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// Update the credential's signature count
-	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
-	user.UpdatedAt = time.Now()
+	// Keep the assertion's reported counter in a LOCAL value for
+	// logging/the atomic persist call below, rather than mutating
+	// matchedCred/the stored user object directly. This is the same
+	// aliasing hazard already documented (and fixed) for CloneWarning a few
+	// lines below: the memory store's GetByID returns the same pointer it
+	// holds internally rather than a copy (unlike MongoDB, which always
+	// decodes a fresh struct), so writing straight into matchedCred here
+	// would mutate the LIVE stored credential before
+	// UpdateCredentialAuthenticator's max-under-lock update ever runs — if
+	// 20 is stored and this assertion reports a regression to 10, the
+	// stored value would already be lowered to 10 by this line alone,
+	// defeating the monotonic $max/max-under-lock guarantee entirely (and
+	// racing unsynchronized against any other concurrent access to the same
+	// in-memory object). See go-wallet-backend#411.
+	newSignCount := credential.Authenticator.SignCount
 
 	// Log public key diagnostics for successful login
 	if s.logger.Core().Enabled(zap.DebugLevel) {
@@ -1146,13 +1225,94 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.String("user_id", userID.String()),
 			zap.String("stored_public_key_sha256", storedPublicKeyHash),
 			zap.Int("stored_public_key_len", storedPublicKeyLen),
-			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+			zap.Uint32("sign_count", newSignCount),
 		)
 	}
 
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Error("Failed to update user", zap.Error(err))
-		// Don't fail login for this
+	// SECURITY: persist SignCount/CloneWarning via a single atomic,
+	// field-scoped update rather than the whole-document Update()/ReplaceOne
+	// used elsewhere. A read-then-write mitigation (re-reading the stored
+	// CloneWarning immediately before a ReplaceOne and OR-ing it in) was
+	// tried here first and was correctly flagged in review as still racy:
+	// two concurrent logins can both observe CloneWarning==false, and
+	// whichever one's ReplaceOne lands last — even if it's the "clean" one
+	// that read before the "clone detected" one wrote — clobbers the whole
+	// document with its own stale, false snapshot. There is no read-then-write
+	// window that closes that: it needs the storage layer itself to make
+	// the write conditional/OR-only in one round trip.
+	// UpdateCredentialAuthenticator does exactly that (MongoDB: a single
+	// UpdateOne with an arrayFilter that only ever includes clone_warning in
+	// its $set when true, never explicitly writing false — omitting the
+	// field leaves whatever is currently stored untouched; memory: the same
+	// OR-only assignment under one mutex acquisition). No concurrent
+	// ordering of two such calls can ever result in a true being overwritten
+	// by a false.
+	//
+	// It also reports whether THIS call is the one that actually flipped
+	// CloneWarning from false to true — a real compare-and-set outcome from
+	// the storage layer, not a locally precomputed guess. That distinction
+	// matters under concurrency: two logins on separate challenges can both
+	// read a stale CloneWarning=false before either persists, so a local
+	// "was it already true when I read it" check (as an earlier version of
+	// this fix used) would let both independently conclude "newly
+	// detected" and both emit the security event — a duplicate. Gating the
+	// emission on the atomic transition result instead means only the one
+	// call that actually won the race reports it.
+	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, newSignCount, credential.Authenticator.CloneWarning)
+	if err != nil {
+		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
+		// Don't fail login for this — but if a clone was genuinely detected
+		// on THIS assertion, the persistence failure must not also silently
+		// swallow the security signal itself. transitioned is unreliable
+		// here (the atomic call never got to compare-and-set), so this is a
+		// distinct, separately-greppable event from the normal
+		// "webauthn_clone_warning" line below — it says "detected, but we
+		// don't know if this made it into storage", not "confirmed newly
+		// latched". See go-wallet-backend#411.
+		if credential.Authenticator.CloneWarning {
+			s.logger.Error("possible cloned authenticator detected but the warning failed to persist",
+				zap.String("security_event", "webauthn_clone_warning_persist_failed"),
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("credential_id", credentialID),
+				zap.Uint32("sign_count", newSignCount),
+				zap.Error(err),
+			)
+			s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+				"user_id":    userID.String(),
+				"tenant_id":  string(tenantID),
+				"sign_count": newSignCount,
+				"persisted":  false,
+			})
+		}
+	}
+
+	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
+	// signature counter regressed relative to what we have stored — the
+	// standard signal that this credential's private key has been cloned
+	// onto a second authenticator. We deliberately still let the login
+	// through (a single stateful counter is a weak signal in isolation, and
+	// some legitimate authenticators never increment it), but the warning
+	// must never be silently swallowed: log it as a distinct, greppable
+	// security-event line and, when audit is enabled, record it in the
+	// shared SET audit trail so it can be alerted on and investigated
+	// (issue #380). Gated on the atomic false-to-true transition reported by
+	// UpdateCredentialAuthenticator above, not the raw flag, so this fires
+	// exactly once per actual detection — even under concurrent logins —
+	// rather than on every subsequent login or being duplicated by a race.
+	if transitioned {
+		s.logger.Warn("possible cloned authenticator detected",
+			zap.String("security_event", "webauthn_clone_warning"),
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("credential_id", credentialID),
+			zap.Uint32("sign_count", newSignCount),
+		)
+		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+			"user_id":    userID.String(),
+			"tenant_id":  string(tenantID),
+			"sign_count": newSignCount,
+		})
 	}
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
@@ -1712,30 +1872,33 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		return nil, err
 	}
 
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge, constrained to this authenticated
+	// caller's own userID as part of the SAME atomic find-and-delete (not a
+	// separate check performed after consuming). This path is unlike
+	// FinishRegistration/FinishLogin: the caller here is already
+	// authenticated, and the challenge additionally carries an owning
+	// userID that must match. Plain ConsumeByID would let a caller who
+	// somehow obtains another user's add-credential challenge ID
+	// permanently burn that user's pending ceremony — it would consume
+	// (delete) the real owner's challenge before the ownership mismatch was
+	// ever checked. ConsumeByIDForUser folds the ownership check into the
+	// atomic filter itself, so a mismatched caller gets ErrNotFound without
+	// ever touching the real owner's challenge.
+	challenge, err := s.store.Challenges().ConsumeByIDForUser(ctx, req.ChallengeID, userID.String())
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
 	}
-
-	if challenge.UserID != userID.String() {
-		return nil, errors.New("challenge user mismatch")
-	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	waUser := &WebAuthnUser{user: user}
 
