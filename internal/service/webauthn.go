@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -426,6 +427,75 @@ type OIDCGateBinding struct {
 	// any caller that doesn't set it, e.g. internal/api/handlers.go's
 	// FinishWebAuthnLogin), no audience check is performed - purely opt-in.
 	Audience string
+
+	// Claims, when set, are the full validated token claims (the same map
+	// the OIDC gate middleware itself checked against the HEADER tenant's
+	// OIDCGate.RequiredClaims). FinishLogin re-checks them against the
+	// CREDENTIAL's real tenant's own RequiredClaims: Issuer and Audience
+	// matching isn't enough if two tenants share both but configure
+	// different RequiredClaims - a token accepted for a permissive tenant
+	// could otherwise satisfy a stricter tenant's login gate purely because
+	// the gate middleware only ever validated it against the header tenant's
+	// policy. Left nil (the default for any caller that doesn't set it,
+	// e.g. internal/api/handlers.go's FinishWebAuthnLogin), no claims
+	// re-check is performed - purely opt-in, like Audience above.
+	Claims jwt.MapClaims
+}
+
+// oidcClaimsMatch reports whether a validated token claim value satisfies a
+// tenant's configured OIDCGate.RequiredClaims expectation. Mirrors
+// pkg/middleware's own claimsMatch exactly (string/array subset matching,
+// bool/float64/int equality, reflect.DeepEqual fallback for anything else) -
+// duplicated rather than imported so this package doesn't take on a
+// dependency on the HTTP middleware layer for what is otherwise a pure claim
+// comparison; keep the two in sync if either changes.
+func oidcClaimsMatch(expected, actual interface{}) bool {
+	switch e := expected.(type) {
+	case bool:
+		a, ok := actual.(bool)
+		return ok && e == a
+	case string:
+		if a, ok := actual.(string); ok {
+			return e == a
+		}
+		if arr, ok := actual.([]interface{}); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok && s == e {
+					return true
+				}
+			}
+		}
+		return false
+	case float64:
+		a, ok := actual.(float64)
+		return ok && e == a
+	case int:
+		a, ok := actual.(float64)
+		return ok && float64(e) == a
+	case []interface{}:
+		a, ok := actual.([]interface{})
+		if !ok {
+			if len(e) == 1 {
+				return oidcClaimsMatch(e[0], actual)
+			}
+			return false
+		}
+		for _, ev := range e {
+			found := false
+			for _, av := range a {
+				if oidcClaimsMatch(ev, av) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(expected, actual)
+	}
 }
 
 // FinishRegistrationResponse contains the result of registration
@@ -1177,6 +1247,26 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("expected_audience", loginOP.EffectiveAudience()),
 				zap.String("actual_audience", req.OIDCGateBinding.Audience))
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for the wrong app
+		}
+
+		// SECURITY: when the caller recorded the token's full validated
+		// claims (see OIDCGateBinding.Claims's doc comment), re-check them
+		// against THIS tenant's own RequiredClaims. Issuer and Audience
+		// matching alone isn't enough: two tenants can share both while
+		// configuring different RequiredClaims, and the OIDC gate middleware
+		// only ever validated the token against the HEADER tenant's
+		// RequiredClaims - not the credential's real tenant's.
+		if req.OIDCGateBinding.Claims != nil && len(tenant.OIDCGate.RequiredClaims) > 0 {
+			for key, expected := range tenant.OIDCGate.RequiredClaims {
+				actual, exists := req.OIDCGateBinding.Claims[key]
+				if !exists || !oidcClaimsMatch(expected, actual) {
+					s.logger.Warn("OIDC binding required-claims mismatch",
+						zap.String("user_id", userID.String()),
+						zap.String("tenant_id", string(tenantID)),
+						zap.String("claim", key))
+					return nil, ErrOIDCGateRequired
+				}
+			}
 		}
 
 		// If bind_identity is enabled, verify the enterprise identity matches

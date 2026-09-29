@@ -299,12 +299,56 @@ func TestPasskeyLoginFinish_OIDCGateBinding_AudiencePopulatedFromTenant(t *testi
 	}
 }
 
+// TestPasskeyLoginFinish_OIDCGateBinding_ClaimsPopulated covers a third
+// Copilot review finding: LoginFinish must also record the token's full
+// validated claims, so FinishLogin can re-check them against the
+// credential's real tenant's own RequiredClaims - issuer/audience matching
+// alone isn't enough when two tenants share both but require different
+// claims.
+func TestPasskeyLoginFinish_OIDCGateBinding_ClaimsPopulated(t *testing.T) {
+	mock := &capturingWebAuthn{
+		mockWebAuthn: mockWebAuthn{
+			finishLoginResp: &service.FinishLoginResponse{UUID: "user-1", TenantID: "tenant-1"},
+		},
+	}
+	h, _ := newTestPasskeyHandlers(mock)
+
+	router := gin.New()
+	router.Use(contextInjector(nil, &oidc.ValidationResult{
+		Issuer:  "https://idp.example.com",
+		Subject: "user-1",
+		Claims:  map[string]interface{}{"role": "admin", "email": "user@example.com"},
+	}))
+	router.POST("/finish", h.LoginFinish)
+
+	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if mock.lastFinishLoginReq.OIDCGateBinding == nil {
+		t.Fatal("expected OIDCGateBinding to be populated")
+	}
+	if role, _ := mock.lastFinishLoginReq.OIDCGateBinding.Claims["role"].(string); role != "admin" {
+		t.Errorf("expected claims to carry role=admin, got %v", mock.lastFinishLoginReq.OIDCGateBinding.Claims)
+	}
+}
+
 func TestPasskeyLoginFinish_ErrorMapping(t *testing.T) {
 	cases := []struct {
 		name       string
 		err        error
 		wantStatus int
 	}{
+		{"challenge not found", service.ErrChallengeNotFound, http.StatusNotFound},
+		{"challenge expired", service.ErrChallengeExpired, http.StatusGone},
+		{"user not found", service.ErrUserNotFound, http.StatusNotFound},
+		{"credential not found", service.ErrCredentialNotFound, http.StatusNotFound},
+		{"verification failed", service.ErrVerificationFailed, http.StatusUnauthorized},
 		{"oidc gate required", service.ErrOIDCGateRequired, http.StatusUnauthorized},
 		{"tenant access denied", service.ErrTenantAccessDenied, http.StatusForbidden},
 		{"identity not bound", service.ErrIdentityNotBound, http.StatusForbidden},

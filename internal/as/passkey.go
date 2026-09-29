@@ -87,6 +87,10 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 			Issuer:  oidcResult.Issuer,
 			Subject: oidcResult.Subject,
 			Email:   email,
+			// Record the full validated claims too, so FinishLogin can
+			// re-check them against the credential's real tenant's own
+			// RequiredClaims - see OIDCGateBinding.Claims's doc comment.
+			Claims: oidcResult.Claims,
 		}
 		// Record which audience this token was actually validated against
 		// (this request's header tenant's LoginOP) so FinishLogin can compare
@@ -105,6 +109,16 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
 		switch {
+		case errors.Is(err, service.ErrChallengeNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "challenge not found"})
+		case errors.Is(err, service.ErrChallengeExpired):
+			c.JSON(http.StatusGone, gin.H{"error": "challenge expired"})
+		case errors.Is(err, service.ErrUserNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		case errors.Is(err, service.ErrCredentialNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "credential not found"})
+		case errors.Is(err, service.ErrVerificationFailed):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		case errors.Is(err, service.ErrOIDCGateRequired):
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "oidc gate authentication required", "code": "oidc_gate_required"})
 		case errors.Is(err, service.ErrTenantAccessDenied):

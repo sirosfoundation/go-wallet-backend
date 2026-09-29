@@ -11,6 +11,7 @@ import (
 	"github.com/descope/virtualwebauthn"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -1509,6 +1510,234 @@ func TestWebAuthnService_FinishLogin_OIDCGate_MatchingAudience_Success(t *testin
 	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.NoError(t, err, "Login should succeed when the audience matches")
 	assert.NotEmpty(t, resp.Token)
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch covers a
+// third Copilot review finding on this PR: Issuer and Audience matching
+// alone isn't enough if two tenants share both but configure different
+// OIDCGate.RequiredClaims - the gate middleware only ever validates a token
+// against the HEADER tenant's RequiredClaims, never the CREDENTIAL's real
+// tenant's. FinishLogin must re-check the credential tenant's own
+// RequiredClaims against the token's actual validated claims.
+func TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims"),
+		Name:    "Test Tenant Claims",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Correct issuer and audience, but the validated claims don't satisfy
+	// this tenant's RequiredClaims (e.g. the token was validated against a
+	// different, more permissive tenant sharing the same issuer/audience).
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-client",
+			Claims:   jwt.MapClaims{"role": "user"}, // Missing/wrong role.
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require the correct claims even when issuer and audience match")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success exercises
+// the other side: a binding whose Claims satisfy the tenant's
+// RequiredClaims must be allowed through.
+func TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims-ok"),
+		Name:    "Test Tenant Claims OK",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-ok-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims OK User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims OK User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-ok-client",
+			Claims:   jwt.MapClaims{"role": "admin"},
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when RequiredClaims are satisfied")
+	assert.NotEmpty(t, resp.Token)
+}
+
+// TestOidcClaimsMatch mirrors pkg/middleware's own TestClaimsMatch exactly -
+// oidcClaimsMatch is a deliberate duplicate of that package's claimsMatch
+// (see oidcClaimsMatch's doc comment for why), so it must behave identically.
+func TestOidcClaimsMatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		expected interface{}
+		actual   interface{}
+		want     bool
+	}{
+		// Basic type matching
+		{name: "bool true match", expected: true, actual: true, want: true},
+		{name: "bool false match", expected: false, actual: false, want: true},
+		{name: "bool mismatch", expected: true, actual: false, want: false},
+		{name: "string match", expected: "admin", actual: "admin", want: true},
+		{name: "string mismatch", expected: "admin", actual: "user", want: false},
+		{name: "float match", expected: 1.5, actual: 1.5, want: true},
+		{name: "float mismatch", expected: 1.5, actual: 2.5, want: false},
+		{name: "int to float match", expected: 42, actual: float64(42), want: true},
+		{name: "int to float mismatch", expected: 42, actual: float64(43), want: false},
+
+		// String in array matching (common for groups/roles)
+		{name: "string in array", expected: "admin", actual: []interface{}{"admin", "user"}, want: true},
+		{name: "string not in array", expected: "superadmin", actual: []interface{}{"admin", "user"}, want: false},
+		{name: "string vs empty array", expected: "admin", actual: []interface{}{}, want: false},
+
+		// Array subset matching
+		{name: "array exact match", expected: []interface{}{"admin"}, actual: []interface{}{"admin"}, want: true},
+		{name: "array subset match", expected: []interface{}{"admin"}, actual: []interface{}{"admin", "user"}, want: true},
+		{name: "array superset no match", expected: []interface{}{"admin", "superadmin"}, actual: []interface{}{"admin"}, want: false},
+		{name: "array all present", expected: []interface{}{"admin", "user"}, actual: []interface{}{"user", "admin", "guest"}, want: true},
+		{name: "array order independent", expected: []interface{}{"b", "a"}, actual: []interface{}{"a", "b", "c"}, want: true},
+		{name: "array partial missing", expected: []interface{}{"admin", "missing"}, actual: []interface{}{"admin", "user"}, want: false},
+
+		// Single-element array vs scalar
+		{name: "single array vs string", expected: []interface{}{"admin"}, actual: "admin", want: true},
+		{name: "single array vs wrong string", expected: []interface{}{"admin"}, actual: "user", want: false},
+		{name: "multi array vs string no match", expected: []interface{}{"admin", "user"}, actual: "admin", want: false},
+
+		// Type mismatches
+		{name: "string vs bool", expected: "true", actual: true, want: false},
+		{name: "bool vs string", expected: true, actual: "true", want: false},
+		{name: "string vs number", expected: "42", actual: float64(42), want: false},
+
+		// Complex/unhandled types fall back to reflect.DeepEqual.
+		{name: "map deep equal fallback", expected: map[string]interface{}{"a": 1.0}, actual: map[string]interface{}{"a": 1.0}, want: true},
+		{name: "map deep equal fallback mismatch", expected: map[string]interface{}{"a": 1.0}, actual: map[string]interface{}{"a": 2.0}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := oidcClaimsMatch(tt.expected, tt.actual)
+			assert.Equal(t, tt.want, got, "oidcClaimsMatch(%v, %v) = %v, want %v", tt.expected, tt.actual, got, tt.want)
+		})
+	}
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
