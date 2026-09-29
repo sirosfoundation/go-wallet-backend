@@ -68,3 +68,26 @@ func TestRequiredClaimsEqual(t *testing.T) {
 	assert.False(t, requiredClaimsEqual(map[string]any{"a": true}, map[string]any{"a": false}))
 	assert.False(t, requiredClaimsEqual(map[string]any{"a": true}, map[string]any{"b": true}))
 }
+
+// A repeated key would otherwise be resolved silently by encoding/json (last
+// wins), letting {"groups":["admin"],"groups":[]} weaken the gate.
+func TestParseRequiredClaims_RejectsDuplicateJSONKeys(t *testing.T) {
+	for _, in := range []string{
+		`{"groups":["admin"],"groups":[]}`,
+		`{"a":{"x":1,"x":2}}`,
+		`{"a":[{"x":1,"x":2}]}`,
+		`{"a":"b"} {"c":"d"}`,
+	} {
+		if _, err := parseRequiredClaims(in); err == nil {
+			t.Errorf("parseRequiredClaims(%q): expected an error", in)
+		}
+	}
+
+	got, err := parseRequiredClaims(`{"groups":["admin"],"tier":{"x":1}}`)
+	if err != nil {
+		t.Fatalf("valid input rejected: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("unexpected claims: %v", got)
+	}
+}

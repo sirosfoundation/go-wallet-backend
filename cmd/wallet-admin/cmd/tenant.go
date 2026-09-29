@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -404,6 +406,11 @@ func parseRequiredClaims(raw string) (map[string]interface{}, error) {
 
 	claims := map[string]interface{}{}
 	if strings.HasPrefix(raw, "{") {
+		// encoding/json keeps the last of two equal keys without complaint,
+		// so {"groups":["admin"],"groups":[]} would silently weaken the gate.
+		if err := rejectDuplicateJSONKeys([]byte(raw)); err != nil {
+			return nil, fmt.Errorf("invalid --required-claims JSON: %w", err)
+		}
 		if err := json.Unmarshal([]byte(raw), &claims); err != nil {
 			return nil, fmt.Errorf("invalid --required-claims JSON: %w", err)
 		}
@@ -430,6 +437,56 @@ func parseRequiredClaims(raw string) (map[string]interface{}, error) {
 		}
 	}
 	return claims, nil
+}
+
+// rejectDuplicateJSONKeys returns an error if any object in data, at any
+// depth, repeats a key, or if data has trailing content after the first value.
+func rejectDuplicateJSONKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := checkJSONValue(dec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("unexpected content after the JSON value")
+	}
+	return nil
+}
+
+func checkJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]struct{}{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, _ := keyTok.(string)
+			if _, dup := seen[key]; dup {
+				return fmt.Errorf("duplicate key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := checkJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := checkJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token() // closing delimiter
+	return err
 }
 
 func init() {
