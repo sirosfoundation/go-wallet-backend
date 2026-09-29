@@ -1363,6 +1363,11 @@ type SecurityConfig struct {
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
+	// OIDCGateRateLimit limits requests that present a token to the OIDC
+	// registration/login gates (#65). Two independent buckets: per client IP
+	// and per tenant; a request must fit in both.
+	OIDCGateRateLimit OIDCGateRateLimitConfig `yaml:"oidc_gate_rate_limit" envconfig:"OIDC_GATE_RATE_LIMIT"`
+
 	// AAGUIDBlacklist contains AAGUID blacklist configuration for WebAuthn
 	AAGUIDBlacklist AAGUIDBlacklistConfig `yaml:"aaguid_blacklist" envconfig:"AAGUID_BLACKLIST"`
 
@@ -1413,6 +1418,24 @@ type AuthRateLimitConfig struct {
 	// LockoutSeconds is how long to lock out after exceeding the limit
 	// Default: 300 (5 minutes)
 	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// OIDCGateRateLimitConfig configures rate limiting in front of the OIDC gates.
+//
+// Token validation is the expensive part of a gated request (discovery and
+// JWKS fetches, signature checks), so the limiter runs before it. It only
+// counts requests that carry a bearer token, so tenants without a gate are
+// unaffected. A failed validation costs two tokens instead of one.
+//
+// Two buckets, because either alone fails badly: per-IP alone lets one
+// tenant's attackers lock out everyone behind a shared NAT; per-tenant alone
+// lets a single client exhaust a whole tenant. Client-IP keying relies on
+// gin's trusted-proxy handling being correct behind a load balancer.
+type OIDCGateRateLimitConfig struct {
+	// PerIP limits by client IP. Defaults: enabled, 30 attempts / 60 s, 60 s lockout.
+	PerIP AuthRateLimitConfig `yaml:"per_ip" envconfig:"PER_IP"`
+	// PerTenant limits by tenant. Defaults: enabled, 300 attempts / 60 s, 60 s lockout.
+	PerTenant AuthRateLimitConfig `yaml:"per_tenant" envconfig:"PER_TENANT"`
 }
 
 // SetDefaults sets default values for auth rate limiting
@@ -1698,6 +1721,10 @@ func defaultConfig() *Config {
 				MaxAttempts:    10,
 				WindowSeconds:  60,
 				LockoutSeconds: 300,
+			},
+			OIDCGateRateLimit: OIDCGateRateLimitConfig{
+				PerIP:     AuthRateLimitConfig{Enabled: true, MaxAttempts: 30, WindowSeconds: 60, LockoutSeconds: 60},
+				PerTenant: AuthRateLimitConfig{Enabled: true, MaxAttempts: 300, WindowSeconds: 60, LockoutSeconds: 60},
 			},
 			AAGUIDBlacklist: AAGUIDBlacklistConfig{
 				Enabled:       false, // Disabled by default

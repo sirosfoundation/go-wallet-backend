@@ -237,6 +237,14 @@ Environment prefix: `WALLET_SECURITY`
 | `security.auth_rate_limit.max_attempts` | `WALLET_SECURITY_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
 | `security.auth_rate_limit.window_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
 | `security.auth_rate_limit.lockout_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
+| `security.oidc_gate_rate_limit.per_ip.enabled` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `security.oidc_gate_rate_limit.per_ip.max_attempts` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
+| `security.oidc_gate_rate_limit.per_ip.window_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
+| `security.oidc_gate_rate_limit.per_ip.lockout_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
+| `security.oidc_gate_rate_limit.per_tenant.enabled` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `security.oidc_gate_rate_limit.per_tenant.max_attempts` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
+| `security.oidc_gate_rate_limit.per_tenant.window_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
+| `security.oidc_gate_rate_limit.per_tenant.lockout_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
 | `security.aaguid_blacklist.enabled` | `WALLET_SECURITY_AAGUID_BLACKLIST_ENABLED` | boolean | Enabled controls whether AAGUID blacklist checking is active |
 | `security.aaguid_blacklist.aaguids` | `WALLET_SECURITY_AAGUID_BLACKLIST_AAGUIDS` | string list | AAGUIDs is a list of blocked AAGUIDs (hex-encoded UUIDs without dashes) Example: ["00000000000000000000000000000000"] to block zero AAGUID |
 | `security.aaguid_blacklist.reject_unknown` | `WALLET_SECURITY_AAGUID_BLACKLIST_REJECT_UNKNOWN` | boolean | RejectUnknown rejects authenticators with zero/unknown AAGUIDs Default: false (permissive - allows unknown authenticators) |

@@ -2619,3 +2619,14 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	ip, tenant := cfg.Security.OIDCGateRateLimit.PerIP, cfg.Security.OIDCGateRateLimit.PerTenant
+	if !ip.Enabled || ip.MaxAttempts != 30 || ip.WindowSeconds != 60 || ip.LockoutSeconds != 60 {
+		t.Errorf("per-IP defaults wrong: %+v", ip)
+	}
+	if !tenant.Enabled || tenant.MaxAttempts != 300 || tenant.WindowSeconds != 60 || tenant.LockoutSeconds != 60 {
+		t.Errorf("per-tenant defaults wrong: %+v", tenant)
+	}
+}
