@@ -113,21 +113,22 @@ func matchJoinedPath(entry string, path []interface{}) bool {
 		}
 		return strings.HasPrefix(rest, ".") && matchJoinedPath(rest[1:], path[1:])
 	}
-	// Wildcard element: try each boundary.
-	for i := 0; i <= len(entry); i++ {
-		if i < len(entry) && entry[i] != '.' {
-			continue
-		}
-		rest := entry[i:]
+	// Wildcard element: the null element consumes everything up to some dot
+	// boundary (or the end of the string), so try each boundary in turn.
+	tryRest := func(rest string) bool {
 		if len(path) == 1 {
-			if matchJoinedPath(rest, path[1:]) {
-				return true
-			}
-			continue
+			return matchJoinedPath(rest, path[1:])
 		}
-		if strings.HasPrefix(rest, ".") && matchJoinedPath(rest[1:], path[1:]) {
+		return strings.HasPrefix(rest, ".") && matchJoinedPath(rest[1:], path[1:])
+	}
+	for i := 0; i < len(entry); i++ {
+		if entry[i] == '.' && tryRest(entry[i:]) {
 			return true
 		}
+	}
+	// The wildcard may also consume the whole remainder (empty rest).
+	if tryRest("") {
+		return true
 	}
 	return false
 }
