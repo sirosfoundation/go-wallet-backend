@@ -73,3 +73,67 @@ func TestSubjectHash_IsStableAndIssuerScoped(t *testing.T) {
 	require.NotEqual(t, subjectHash("i1", "s"), subjectHash("i2", "s"))
 	require.True(t, strings.HasPrefix(subjectHash("i", "s"), "sha256:"))
 }
+
+// capturedAudit collects the SET records a service emits, decoded.
+type capturedAudit struct {
+	t   *testing.T
+	buf *bytes.Buffer
+}
+
+// attachIdentityAudit wires a capturing SET emitter into svc with the given
+// identity events selected.
+func attachIdentityAudit(t *testing.T, svc *WebAuthnService, events ...string) *capturedAudit {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	signer, err := set.NewSigner(key, jose.ES256, "k")
+	require.NoError(t, err)
+	buf := &bytes.Buffer{}
+	svc.SetAuditEmitter(audit.New("https://wallet.example", signer, slog.New(slog.NewJSONHandler(buf, nil))))
+	svc.SetAuditIdentityConfig(config.AuditConfig{Enabled: true, IdentityEvents: events})
+	return &capturedAudit{t: t, buf: buf}
+}
+
+func (c *capturedAudit) records() []map[string]any {
+	c.t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(c.buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			JWS string `json:"jws"`
+		}
+		require.NoError(c.t, json.Unmarshal([]byte(line), &rec))
+		parts := strings.Split(rec.JWS, ".")
+		require.Len(c.t, parts, 3)
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		require.NoError(c.t, err)
+		var claims map[string]any
+		require.NoError(c.t, json.Unmarshal(payload, &claims))
+		out = append(out, claims)
+	}
+	return out
+}
+
+// URIs returns the emitted event URIs in order.
+func (c *capturedAudit) URIs() []string {
+	var uris []string
+	for _, r := range c.records() {
+		for uri := range r["events"].(map[string]any) {
+			uris = append(uris, uri)
+		}
+	}
+	return uris
+}
+
+// Payloads returns each emitted event's data object in order.
+func (c *capturedAudit) Payloads() []map[string]any {
+	var out []map[string]any
+	for _, r := range c.records() {
+		for _, data := range r["events"].(map[string]any) {
+			out = append(out, data.(map[string]any))
+		}
+	}
+	return out
+}

@@ -2815,6 +2815,8 @@ func TestBEREncodedECDSASignature(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -2892,10 +2894,13 @@ func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require OIDC gate when binding is missing")
+	assert.Equal(t, []string{"urn:siros:audit:identity:gate_bypass"}, auditEvents.URIs())
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -2973,6 +2978,8 @@ func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+	require.Equal(t, []string{"urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "issuer", auditEvents.Payloads()[0]["reason"])
 }
 
 // TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience covers a Copilot
@@ -3398,6 +3405,8 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -3485,10 +3494,15 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrIdentityBindingMismatch, "Should fail when binding doesn't match stored identity")
+	// The identity was bound at registration; the failed login is a mismatch.
+	require.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "identity", auditEvents.Payloads()[1]["reason"])
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -3572,6 +3586,7 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	require.NoError(t, err, "Login should succeed when OIDC binding matches stored identity")
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
+	assert.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:verified"}, auditEvents.URIs())
 }
 
 // ============================================================================

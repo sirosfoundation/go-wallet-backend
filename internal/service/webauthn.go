@@ -843,9 +843,6 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		s.logger.Info("Bound enterprise identity to user",
 			zap.String("tenant_id", string(tenantID)),
 			zap.String("issuer", req.OIDCGateBinding.Issuer))
-		s.auditIdentity(config.AuditIdentityBound, EventIdentityBound, userID.String(), tenantID,
-			req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
-			map[string]any{"binding_type": req.OIDCGateBinding.BindingType})
 	}
 
 	// Atomically consume the invite BEFORE creating the user account. The
@@ -886,6 +883,16 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	if err := s.store.Users().Create(ctx, user); err != nil {
 		s.logger.Error("Failed to create user", zap.Error(err))
 		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Audit the binding only now that the user, and with it the bound
+	// identity, is persisted: an invite claim or Create failure above must
+	// not leave an immutable "bound" record for an identity that was never
+	// bound.
+	if req.OIDCGateBinding != nil && tenantID != "" {
+		s.auditIdentity(config.AuditIdentityBound, EventIdentityBound, userID.String(), tenantID,
+			req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+			map[string]any{"binding_type": req.OIDCGateBinding.BindingType})
 	}
 
 	// Add user to tenant if tenant-scoped registration
