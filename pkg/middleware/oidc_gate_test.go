@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -362,4 +364,50 @@ func TestValidatorCache_CustomAudience(t *testing.T) {
 
 	v := cache.GetOrCreate(config)
 	assert.NotNil(t, v)
+}
+
+func TestValidatorCache_EvictsLeastRecentlyUsedWhenFull(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.maxEntries = 2
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
+
+	cfg := func(n string) *domain.OIDCProviderConfig {
+		return &domain.OIDCProviderConfig{Issuer: "https://" + n + ".example.com", ClientID: n}
+	}
+
+	a := cache.GetOrCreate(cfg("a"))
+	clock = clock.Add(time.Second)
+	cache.GetOrCreate(cfg("b"))
+	clock = clock.Add(time.Second)
+	assert.Same(t, a, cache.GetOrCreate(cfg("a"))) // touch a; b is now LRU
+	clock = clock.Add(time.Second)
+	cache.GetOrCreate(cfg("c")) // evicts b
+
+	assert.Equal(t, 2, cache.Len())
+	assert.Same(t, a, cache.GetOrCreate(cfg("a")), "recently used entry must survive")
+}
+
+func TestValidatorCache_DropsIdleEntries(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.idleTTL = time.Minute
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
+
+	old := &domain.OIDCProviderConfig{Issuer: "https://old.example.com", ClientID: "old"}
+	v1 := cache.GetOrCreate(old)
+	clock = clock.Add(2 * time.Minute)
+	cache.GetOrCreate(&domain.OIDCProviderConfig{Issuer: "https://new.example.com", ClientID: "new"})
+
+	assert.Equal(t, 1, cache.Len(), "idle entry must be dropped when a new one is added")
+	assert.NotSame(t, v1, cache.GetOrCreate(old), "an evicted provider gets a fresh validator")
+}
+
+func TestValidatorCache_BoundedUnderChurn(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.maxEntries = 8
+	for i := 0; i < 100; i++ {
+		cache.GetOrCreate(&domain.OIDCProviderConfig{Issuer: fmt.Sprintf("https://idp%d.example.com", i), ClientID: "c"})
+	}
+	assert.LessOrEqual(t, cache.Len(), 8)
 }
