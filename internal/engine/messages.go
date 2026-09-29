@@ -748,7 +748,15 @@ func (km *TrustKeyMaterial) Validate() error {
 type TrustResultPayload struct {
 	// Trusted indicates whether the subject is trusted
 	Trusted bool `json:"trusted"`
-	// Name is the display name from trust evaluation
+	// Name is the display name from trust evaluation. Deprecated for
+	// verifier trust (#406): OID4VPHandler.evaluateVerifierTrustViaFrontend
+	// no longer overrides VerifierInfo.Name from this field - the wallet
+	// backend has no way to distinguish a frontend's own independently-
+	// verified display name from one it merely echoed back from the
+	// verifier's own unauthenticated client_metadata.client_name, so the
+	// displayed name is always the identifier the trust evaluation was
+	// actually about, consistent with the PDP-backed path (#398). Retained
+	// on the wire for backward compatibility and non-verifier callers.
 	Name string `json:"name,omitempty"`
 	// Logo is the logo URL from trust evaluation
 	Logo string `json:"logo,omitempty"`

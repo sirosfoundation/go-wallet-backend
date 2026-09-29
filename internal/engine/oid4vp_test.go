@@ -1795,7 +1795,12 @@ func TestValidateAuthorizationRequest_X509SANDNS_JWKHeaderRejected(t *testing.T)
 	assert.Contains(t, err.Error(), "requires x5c")
 }
 
-func TestValidateAuthorizationRequest_X509SANDNS_NoJWTSkipsCheck(t *testing.T) {
+// A missing RequestJWT is rejected here too, not just an invalid one (#405
+// - mirrors the identical x509_san_uri fix from #401): otherwise an
+// entirely unsigned x509_san_dns request could still reach
+// evaluateVerifierTrust's unconditional client_metadata_uri fetch before
+// being rejected.
+func TestValidateAuthorizationRequest_X509SANDNS_NoJWTRejected(t *testing.T) {
 	h := &OID4VPHandler{}
 	authReq := &AuthorizationRequest{
 		Nonce:          "abc",
@@ -1803,10 +1808,11 @@ func TestValidateAuthorizationRequest_X509SANDNS_NoJWTSkipsCheck(t *testing.T) {
 		ResponseURI:    "https://verifier.example.com/response",
 		ClientID:       "verifier.example.com",
 		ClientIDScheme: ClientIDSchemeX509SANDNS,
-		// No RequestJWT — the JWT verification step should be skipped
+		// No RequestJWT
 	}
 	err := h.validateAuthorizationRequest(authReq, nil)
-	assert.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "x509_san_dns scheme requires a signed request JWT")
 }
 
 // x509_san_uri gets the same early, pre-metadata-fetch signature check as
@@ -1929,6 +1935,77 @@ func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *t
 	}
 }
 
+// TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerification
+// is the regression test for #405: x509_san_dns and x509_hash had the same
+// "unsigned/invalidly-signed request can still trigger evaluateVerifierTrust's
+// unconditional client_metadata_uri fetch before verification" gap that
+// TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification
+// above already covers for x509_san_uri (fixed in #401). Both schemes' early
+// checks in validateAuthorizationRequest now reject a missing RequestJWT the
+// same way, before either scheme's check even reaches the invalid-signature
+// branch.
+func TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerification(t *testing.T) {
+	schemeTests := []struct {
+		scheme        string
+		clientID      string
+		wantSchemeErr string
+	}{
+		{scheme: ClientIDSchemeX509SANDNS, clientID: "verifier.example.com", wantSchemeErr: "x509_san_dns"},
+		{scheme: ClientIDSchemeX509Hash, clientID: "deadbeef", wantSchemeErr: "x509_hash"},
+	}
+	jwtTests := []struct {
+		name       string
+		requestJWT string
+		wantErrMsg string
+	}{
+		{
+			name:       "invalid signature",
+			requestJWT: "invalid.jwt.token",
+			wantErrMsg: "JWT signature verification failed",
+		},
+		{
+			name:       "missing request JWT",
+			requestJWT: "",
+			wantErrMsg: "requires a signed request JWT",
+		},
+	}
+
+	for _, st := range schemeTests {
+		for _, jt := range jwtTests {
+			t.Run(st.scheme+"/"+jt.name, func(t *testing.T) {
+				var metadataFetches int32
+				metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					atomic.AddInt32(&metadataFetches, 1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"client_name":"whatever"}`))
+				}))
+				defer metadataServer.Close()
+
+				h := &OID4VPHandler{
+					BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
+					httpClient:  metadataServer.Client(),
+				}
+				authReq := &AuthorizationRequest{
+					Nonce:             "abc",
+					ResponseMode:      ResponseModeDirectPost,
+					ResponseURI:       "https://verifier.example.com/response",
+					ClientID:          st.clientID,
+					ClientIDScheme:    st.scheme,
+					RequestJWT:        jt.requestJWT,
+					ClientMetadataURI: metadataServer.URL,
+				}
+
+				err := h.validateAuthorizationRequest(authReq, nil)
+				require.Error(t, err, "must be rejected before any metadata fetch")
+				assert.Contains(t, err.Error(), st.wantSchemeErr)
+				assert.Contains(t, err.Error(), jt.wantErrMsg)
+				assert.Equal(t, int32(0), atomic.LoadInt32(&metadataFetches),
+					"client_metadata_uri must never be fetched for an unauthenticated request")
+			})
+		}
+	}
+}
+
 // --- Tests for inferClientIDScheme new branches ---
 
 func TestInferClientIDScheme_ColonPrefix(t *testing.T) {
@@ -1962,6 +2039,92 @@ func TestInferClientIDScheme_X509SANURI(t *testing.T) {
 func TestInferClientIDScheme_VerifierAttestation(t *testing.T) {
 	got := inferClientIDScheme("verifier_attestation:eyJ...")
 	assert.Equal(t, ClientIDSchemeVerifierAttestation, got)
+}
+
+// --- #404: pdpSubjectID must preserve the client_id_scheme prefix
+// go-trust's ParseClientIDScheme/VerifyLeafBinding require ---
+
+// TestPDPSubjectID_PreservesClientIDSchemePrefix is the regression test for
+// #404. go-trust's ParseClientIDScheme (pkg/registry/clientid.go) only
+// recognizes an x509_san_dns/x509_san_uri/x509_hash client_id_scheme claim -
+// and therefore only invokes VerifyLeafBinding to check the presented
+// certificate is actually bound to it, rather than merely chained to a
+// trusted CA - when Subject.ID itself carries the "<scheme>:" prefix (see
+// go-trust's pkg/registry/static/whitelist.go's isCertificateArrayResourceType:
+// "'x5c' is what real callers (e.g. go-wallet-backend) always send, encoding
+// the client_id_scheme in Subject.ID instead").
+//
+// This wallet accepts client_id on the wire two ways: the prefix already
+// embedded in client_id itself (OpenID4VP 1.0 final), or a bare client_id
+// with client_id_scheme as a separate field (the earlier draft convention,
+// still supported - and what this wallet's own test fixtures throughout
+// this file use). Before this fix, pdpSubjectID's job was done by passing
+// authReq.ClientID straight through: correct by accident for the first wire
+// form, but for the second, the certificate's binding to its claimed
+// SAN/hash was never actually checked by go-trust at all.
+func TestPDPSubjectID_PreservesClientIDSchemePrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		clientID string
+		scheme   string
+		want     string
+	}{
+		{
+			name:     "x509_san_dns, bare client_id + separate scheme field",
+			clientID: "verifier.example.com",
+			scheme:   ClientIDSchemeX509SANDNS,
+			want:     "x509_san_dns:verifier.example.com",
+		},
+		{
+			name:     "x509_san_dns, prefix already embedded in client_id",
+			clientID: "x509_san_dns:verifier.example.com",
+			scheme:   ClientIDSchemeX509SANDNS,
+			want:     "x509_san_dns:verifier.example.com", // must not double-prefix
+		},
+		{
+			name:     "x509_san_uri, bare client_id + separate scheme field",
+			clientID: "https://verifier.example.com/id",
+			scheme:   ClientIDSchemeX509SANURI,
+			want:     "x509_san_uri:https://verifier.example.com/id",
+		},
+		{
+			name:     "x509_san_uri, prefix already embedded in client_id",
+			clientID: "x509_san_uri:https://verifier.example.com/id",
+			scheme:   ClientIDSchemeX509SANURI,
+			want:     "x509_san_uri:https://verifier.example.com/id", // must not double-prefix
+		},
+		{
+			name:     "x509_hash, bare client_id + separate scheme field",
+			clientID: "deadbeef",
+			scheme:   ClientIDSchemeX509Hash,
+			want:     "x509_hash:deadbeef",
+		},
+		{
+			name:     "did scheme is untouched - no prefix to add",
+			clientID: "did:web:verifier.example",
+			scheme:   ClientIDSchemeDID,
+			want:     "did:web:verifier.example",
+		},
+		{
+			name:     "decentralized_identifier scheme is untouched here - a different, separate field (ResolutionSubjectID) handles its prefix",
+			clientID: "decentralized_identifier:did:web:verifier.example",
+			scheme:   ClientIDSchemeDecentralizedIdentifier,
+			want:     "decentralized_identifier:did:web:verifier.example",
+		},
+		{
+			name:     "redirect_uri scheme is untouched - no crypto binding claim to preserve",
+			clientID: "https://verifier.example.com",
+			scheme:   ClientIDSchemeRedirectURI,
+			want:     "https://verifier.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{ClientID: tt.clientID, ClientIDScheme: tt.scheme}
+			assert.Equal(t, tt.want, pdpSubjectID(authReq))
+		})
+	}
 }
 
 // --- Tests for computeVerifierJWKThumbprint ---
@@ -2025,14 +2188,18 @@ func TestValidateAuthorizationRequest_AllKnownSchemes(t *testing.T) {
 				ClientID:       "https://verifier.example.com",
 				ClientIDScheme: scheme,
 			}
-			// Unlike the other schemes here, x509_san_uri rejects a
-			// missing RequestJWT outright (see
-			// TestValidateAuthorizationRequest_X509SANURI_NoJWTRejected) -
-			// give it a validly-signed one so this table only exercises
-			// "is the scheme recognized at all", the same as every other
-			// entry.
-			if scheme == ClientIDSchemeX509SANURI {
+			// Unlike the other schemes here, x509_san_dns/x509_san_uri
+			// reject a missing RequestJWT outright (see
+			// TestValidateAuthorizationRequest_X509SANDNS_NoJWTRejected /
+			// _X509SANURI_NoJWTRejected) - give them a validly-signed one
+			// so this table only exercises "is the scheme recognized at
+			// all", the same as every other entry.
+			switch scheme {
+			case ClientIDSchemeX509SANURI:
 				jwtToken, _ := makeSignedJWTWithX5CURISAN(t, authReq.ClientID)
+				authReq.RequestJWT = jwtToken
+			case ClientIDSchemeX509SANDNS:
+				jwtToken, _ := makeSignedJWTWithX5C(t)
 				authReq.RequestJWT = jwtToken
 			}
 			err := h.validateAuthorizationRequest(authReq, nil)
@@ -2077,6 +2244,7 @@ func TestValidateAuthorizationRequest_ClientIDMismatchViaMsg(t *testing.T) {
 }
 
 func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
+	jwtToken, _ := makeSignedJWTWithX5C(t)
 	h := &OID4VPHandler{}
 	authReq := &AuthorizationRequest{
 		Nonce:          "abc",
@@ -2084,6 +2252,7 @@ func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
 		ResponseURI:    "https://evil.example.com/response",
 		ClientID:       "verifier.example.com",
 		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		RequestJWT:     jwtToken,
 	}
 	msg := &FlowStartMessage{
 		RequestURI: "https://verifier.example.com/request",
@@ -2578,7 +2747,10 @@ func TestEvaluateVerifierTrust_NoPDPConfigured_FallsBackToFrontend(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, verifier)
 	assert.True(t, verifier.Trusted)
-	assert.Equal(t, "verifier.example.com", trustEvaluationSubject(t, messages))
+	// The frontend's own /v1/evaluate call needs the client_id_scheme
+	// prefix present in Subject.ID for go-trust to invoke VerifyLeafBinding
+	// (#404) - see pdpSubjectID's doc comment.
+	assert.Equal(t, "x509_san_dns:verifier.example.com", trustEvaluationSubject(t, messages))
 }
 
 func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *testing.T) {
@@ -2810,8 +2982,16 @@ func TestEvaluateVerifierTrust_PDPPath_CacheHit_Untrusted_SkipsSecondPDPCall(t *
 
 // A client-asserted verdict (the no-PDP frontend fallback) must never be
 // written to the trust cache: caching it would let one attacker-controlled
-// answer, plus attacker-controlled name/logo, stand in as ground truth for
-// every subsequent request against this identity for the whole cache TTL.
+// answer stand in as ground truth for every subsequent request against this
+// identity for the whole cache TTL. The Trusted/Framework decision itself
+// is still accepted from the frontend at face value here (that's the whole
+// point of this permissive no-PDP dev mode - see the function-level comment
+// on evaluateVerifierTrustViaFrontend), but the display name is not (#406):
+// verifier.Name stays the identifier the evaluation was actually about
+// (authReq.ClientID), never the frontend-asserted name, consistent with
+// #398's fix to the PDP-backed path - this wallet-backend has no way to
+// tell that name apart from the verifier's own unauthenticated
+// client_metadata.client_name.
 func TestEvaluateVerifierTrust_ClientAssertedVerdict_NeverCached(t *testing.T) {
 	requestJWT, _ := makeSignedJWTWithX5C(t)
 
@@ -2853,7 +3033,8 @@ func TestEvaluateVerifierTrust_ClientAssertedVerdict_NeverCached(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, verifier)
 	assert.True(t, verifier.Trusted)
-	assert.Equal(t, "Attacker-Controlled Name", verifier.Name)
+	assert.Equal(t, authReq.ClientID, verifier.Name, "the displayed name must be the verified client_id, never the frontend-asserted name (#406)")
+	assert.NotEqual(t, "Attacker-Controlled Name", verifier.Name)
 	assert.Zero(t, trustCache.Len(), "a client-asserted (non-PDP-backed) verdict must never be cached")
 }
 
@@ -3042,8 +3223,10 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesCertificateFingerprint(t *testing
 	require.True(t, verifierB.Trusted)
 
 	// Cert B must have been independently evaluated by the PDP - not served
-	// from cert A's cache entry merely because they share a client_id.
-	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated,
+	// from cert A's cache entry merely because they share a client_id. The
+	// PDP subject carries the x509_san_dns: prefix (#404) so go-trust can
+	// actually invoke VerifyLeafBinding against it.
+	assert.Equal(t, []string{"x509_san_dns:verifier.example.com", "x509_san_dns:verifier.example.com"}, stub.evaluated,
 		"the PDP must be consulted separately for each distinct certificate")
 	assert.Equal(t, 2, trustCache.Len(), "each certificate gets its own cache entry")
 }
@@ -3203,7 +3386,9 @@ func TestEvaluateVerifierTrust_X509Hash_PDPPath(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, verifier)
 	assert.True(t, verifier.Trusted)
-	assert.Equal(t, []string{claimedHash}, stub.evaluated)
+	// The x509_hash: prefix must be present in Subject.ID for go-trust's
+	// ParseClientIDScheme/VerifyLeafBinding to run against it (#404).
+	assert.Equal(t, []string{"x509_hash:" + claimedHash}, stub.evaluated)
 	assert.Equal(t, 1, trustCache.Len(), "a fingerprinted x509_hash verdict is cacheable")
 }
 
@@ -3586,7 +3771,8 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
 
 	// Same certificate, different response_uri: the PDP must be consulted
 	// again rather than reusing the first response_uri's cached verdict.
-	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated)
+	// (Subject.ID carries the x509_san_dns: prefix per #404.)
+	assert.Equal(t, []string{"x509_san_dns:verifier.example.com", "x509_san_dns:verifier.example.com"}, stub.evaluated)
 	assert.Equal(t, 2, trustCache.Len())
 
 	// A genuinely identical repeat (same cert, same response_uri) must
@@ -3596,7 +3782,7 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
 	v1Repeat, err := h.evaluateVerifierTrust(context.Background(), &req1Repeat)
 	require.NoError(t, err)
 	require.True(t, v1Repeat.Trusted)
-	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated,
+	assert.Equal(t, []string{"x509_san_dns:verifier.example.com", "x509_san_dns:verifier.example.com"}, stub.evaluated,
 		"an identical repeat of the first request must be served from cache")
 	assert.Equal(t, 2, trustCache.Len())
 }
@@ -4166,7 +4352,9 @@ func TestEvaluateVerifierTrust_X509SANURI_MatchingSAN_TrustedAndCached(t *testin
 	require.NoError(t, err)
 	require.NotNil(t, verifier)
 	assert.True(t, verifier.Trusted)
-	assert.Equal(t, []string{sanURI}, stub.evaluated)
+	// The x509_san_uri: prefix must be present in Subject.ID for
+	// go-trust's ParseClientIDScheme/VerifyLeafBinding to run (#404).
+	assert.Equal(t, []string{"x509_san_uri:" + sanURI}, stub.evaluated)
 	require.Equal(t, 1, trustCache.Len())
 
 	// A second request presenting a DIFFERENT certificate but claiming the
@@ -4184,7 +4372,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MatchingSAN_TrustedAndCached(t *testin
 	verifier2, err := h.evaluateVerifierTrust(context.Background(), authReq2)
 	require.NoError(t, err)
 	require.NotNil(t, verifier2)
-	assert.Equal(t, []string{sanURI, sanURI}, stub.evaluated,
+	assert.Equal(t, []string{"x509_san_uri:" + sanURI, "x509_san_uri:" + sanURI}, stub.evaluated,
 		"a different certificate claiming the same client_id must be evaluated independently")
 	assert.Equal(t, 2, trustCache.Len(), "each certificate gets its own cache entry")
 }
@@ -4229,7 +4417,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MismatchedSAN_Untrusted(t *testing.T) 
 	require.Error(t, err)
 	assert.Nil(t, verifier)
 	assert.Contains(t, err.Error(), "untrusted verifier")
-	assert.Equal(t, []string{sanURI}, stub.evaluated, "the PDP must still be consulted for a validly-signed request")
+	assert.Equal(t, []string{"x509_san_uri:" + sanURI}, stub.evaluated, "the PDP must still be consulted for a validly-signed request")
 }
 
 // --- #398: the trust cache/display must never persist an unvalidated,
@@ -4307,7 +4495,64 @@ func TestEvaluateVerifierTrust_DisplayName_IgnoresClientSuppliedName(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, verifier2)
 	assert.Equal(t, authReq.ClientID, verifier2.Name)
-	assert.Equal(t, []string{"verifier.example.com"}, stub.evaluated, "the second request must be served from cache, not re-evaluated")
+	assert.Equal(t, []string{"x509_san_dns:verifier.example.com"}, stub.evaluated, "the second request must be served from cache, not re-evaluated")
+}
+
+// --- #406: the no-PDP frontend fallback must not display a
+// frontend-asserted name either, consistent with #398's PDP-backed fix ---
+
+// TestEvaluateVerifierTrust_NoPDPFrontendFallback_DisplayName_IgnoresFrontendAssertedName
+// is the regression test for #406. evaluateVerifierTrustViaFrontend (the
+// permissive no-PDP dev-mode path) still accepted the frontend's
+// TrustResultPayload.Name and used it as the displayed verifier.Name -
+// unlike the PDP-backed path, which #398 fixed to always show authReq.ClientID
+// instead of an unvalidated client_metadata.client_name. This wallet-backend
+// has no way to tell a frontend-asserted display name apart from one the
+// frontend merely echoed back from the verifier's own unauthenticated
+// client_metadata, so it must not be trusted here either, even though the
+// Trusted/Framework decision itself genuinely is still accepted from the
+// frontend at face value in this intentional, permissive mode.
+func TestEvaluateVerifierTrust_NoPDPFrontendFallback_DisplayName_IgnoresFrontendAssertedName(t *testing.T) {
+	const frontendAssertedName = "Totally Legit Bank (frontend-asserted)"
+	requestJWT, _ := makeSignedJWTWithX5C(t) // client_id "verifier.example.com"
+
+	cfg := testConfig() // no PDP configured at all
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: frontendAssertedName})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: result,
+	}
+
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop()}}
+	authReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		ResponseURI:    "https://verifier.example.com/response",
+		RequestJWT:     requestJWT,
+	}
+
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted, "the frontend's trust decision is still accepted at face value in this permissive mode")
+	assert.Equal(t, authReq.ClientID, verifier.Name, "the displayed name must be the verified client_id, never a frontend-asserted name")
+	assert.NotEqual(t, frontendAssertedName, verifier.Name)
 }
 
 // cacheKeyForX509SANDNS recomputes the cache key evaluateVerifierTrust would
