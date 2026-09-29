@@ -194,6 +194,73 @@ func TestUserStore_CRUD(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_SetsFields covers the basic
+// happy path against a real MongoDB: the arrayFilter-based UpdateOne
+// correctly targets the right credential within the array and sets both
+// fields.
+func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-other", Authenticator: domain.Authenticator{SignCount: 99}},
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true))
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	require.Len(t, got.WebauthnCredentials, 2)
+	assert.Equal(t, uint32(5), got.WebauthnCredentials[1].Authenticator.SignCount)
+	assert.True(t, got.WebauthnCredentials[1].Authenticator.CloneWarning)
+	// The other credential in the array must be untouched.
+	assert.Equal(t, uint32(99), got.WebauthnCredentials[0].Authenticator.SignCount)
+	assert.False(t, got.WebauthnCredentials[0].Authenticator.CloneWarning)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly covers
+// the exact property PR #388's review demanded, against a real MongoDB:
+// this method must never write CloneWarning=false over an existing true,
+// via a single atomic UpdateOne with no read-then-write window at all.
+func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	// First call latches CloneWarning=true.
+	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true))
+
+	// A later call with cloneWarning=false (a clean, non-regressing login)
+	// must NOT clear it.
+	require.NoError(t, store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false))
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.True(t, got.WebauthnCredentials[0].Authenticator.CloneWarning,
+		"CloneWarning must stay true — a call with cloneWarning=false must never clear it")
+	assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount)
+}
+
+func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	err := store.Users().UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
 func TestChallengeStore_CRUD(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()

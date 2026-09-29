@@ -332,6 +332,31 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	return nil
 }
 
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].ID == credentialID {
+			user.WebauthnCredentials[i].Authenticator.SignCount = signCount
+			// OR-only: never write false over an existing true.
+			if cloneWarning {
+				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
+			}
+			user.UpdatedAt = time.Now()
+			return nil
+		}
+	}
+	// User exists but no credential with that ID: silent no-op success,
+	// matching MongoDB's arrayFilter semantics (see interface doc comment).
+	return nil
+}
+
 // CredentialStore implements in-memory credential storage
 type CredentialStore struct {
 	mu     sync.RWMutex

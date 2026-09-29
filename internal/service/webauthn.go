@@ -1222,7 +1222,6 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	if credential.Authenticator.CloneWarning {
 		matchedCred.Authenticator.CloneWarning = true
 	}
-	user.UpdatedAt = time.Now()
 
 	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
 	// signature counter regressed relative to what we have stored — the
@@ -1263,33 +1262,26 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		)
 	}
 
-	// SECURITY: this function's user snapshot was read at the top of
-	// FinishLogin, and Update below persists the ENTIRE document (Mongo:
-	// UserStore.Update does a ReplaceOne). If a concurrent login on a
-	// different challenge for this same credential has, since our read,
-	// already latched CloneWarning=true in storage, this request's stale
-	// in-memory copy (still false) would silently clobber that back to
-	// false when we replace the whole document — a lost update that could
-	// erase the security signal a moment after it was recorded. Re-read the
-	// currently stored value for this exact credential immediately before
-	// persisting and OR it in: this can only ever add the flag back, never
-	// remove it, and it shrinks the race window down to one extra read
-	// right before the write, instead of spanning this entire request's
-	// WebAuthn assertion verification. Best-effort: if the re-read fails,
-	// fall through to the normal update rather than blocking the login.
-	if !matchedCred.Authenticator.CloneWarning {
-		if latest, ferr := s.store.Users().GetByID(ctx, userID); ferr == nil {
-			for i := range latest.WebauthnCredentials {
-				if latest.WebauthnCredentials[i].ID == credentialID && latest.WebauthnCredentials[i].Authenticator.CloneWarning {
-					matchedCred.Authenticator.CloneWarning = true
-					break
-				}
-			}
-		}
-	}
-
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Error("Failed to update user", zap.Error(err))
+	// SECURITY: persist SignCount/CloneWarning via a single atomic,
+	// field-scoped update rather than the whole-document Update()/ReplaceOne
+	// used elsewhere. A read-then-write mitigation (re-reading the stored
+	// CloneWarning immediately before a ReplaceOne and OR-ing it in) was
+	// tried here first and was correctly flagged in review as still racy:
+	// two concurrent logins can both observe CloneWarning==false, and
+	// whichever one's ReplaceOne lands last — even if it's the "clean" one
+	// that read before the "clone detected" one wrote — clobbers the whole
+	// document with its own stale, false snapshot. There is no read-then-write
+	// window that closes that: it needs the storage layer itself to make
+	// the write conditional/OR-only in one round trip.
+	// UpdateCredentialAuthenticator does exactly that (MongoDB: a single
+	// UpdateOne with an arrayFilter that only ever includes clone_warning in
+	// its $set when true, never explicitly writing false — omitting the
+	// field leaves whatever is currently stored untouched; memory: the same
+	// OR-only assignment under one mutex acquisition). No concurrent
+	// ordering of two such calls can ever result in a true being overwritten
+	// by a false.
+	if err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, matchedCred.Authenticator.SignCount, credential.Authenticator.CloneWarning); err != nil {
+		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
 		// Don't fail login for this
 	}
 

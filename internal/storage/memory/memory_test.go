@@ -356,6 +356,92 @@ func TestUserStore_UpdatePrivateData(t *testing.T) {
 	}
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_SetsFields covers the basic
+// happy path: SignCount is a plain overwrite, CloneWarning=true is set.
+func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 5 {
+		t.Errorf("SignCount = %d, want 5", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+	if !got.WebauthnCredentials[0].Authenticator.CloneWarning {
+		t.Error("CloneWarning should be true")
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly covers
+// the exact property PR #388's review demanded: this method must never
+// write CloneWarning=false over an existing true, no matter what value a
+// later call passes.
+func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// First call latches CloneWarning=true.
+	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+
+	// A later call with cloneWarning=false (a clean, non-regressing login)
+	// must NOT clear it.
+	if err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if !got.WebauthnCredentials[0].Authenticator.CloneWarning {
+		t.Error("CloneWarning must stay true — a call with cloneWarning=false must never clear it")
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 10 {
+		t.Errorf("SignCount = %d, want 10 (SignCount itself is a plain overwrite)", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+}
+
+func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	err := users.UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	if err != storage.ErrNotFound {
+		t.Errorf("expected ErrNotFound for a nonexistent user, got %v", err)
+	}
+}
+
 // Credential Store Tests
 
 func TestCredentialStore_Create(t *testing.T) {

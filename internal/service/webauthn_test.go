@@ -1557,20 +1557,20 @@ func TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin(t *testing.T) {
 }
 
 // raceInjectingUserStore wraps a real storage.UserStore and, on its SECOND
-// GetByID call, invokes onSecondCall once (after taking that call's own
-// snapshot, before returning it) — used to deterministically simulate a
-// concurrent write landing in storage in between FinishLogin's two existing
-// GetByID calls (its own initial snapshot, then go-webauthn's internal
-// discoverable-credential lookup) and its later mitigation re-read, without
-// needing actual goroutines to race (see
+// GetByID call — go-webauthn's own internal discoverable-credential lookup,
+// FinishLogin's only other GetByID besides its initial snapshot — invokes
+// onSecondCall once (after taking that call's own snapshot, before
+// returning it) to deterministically simulate a concurrent write landing in
+// storage right after that lookup and before FinishLogin's final persist,
+// without needing actual goroutines to race (see
 // TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace). Firing after that
 // call's own fetch, not before, matters: it must not also change what
 // go-webauthn itself hydrates into the Credential it returns (which would
 // let the *existing* single-request sticky-latch already cover this case,
-// making the test pass without exercising the new re-read mitigation at
-// all — this was caught empirically by reverting the fix and observing the
-// test still passed, then fixing the injection point until reverting it
-// made the test fail as expected).
+// making the test pass without exercising the fix under test at all — this
+// was caught empirically by reverting the fix and observing the test still
+// passed, then fixing the injection point until reverting it made the test
+// fail as expected).
 //
 // GetByID always returns a deep copy of the credential slice, matching a
 // real document-store backend (MongoDB decodes a fresh struct on every
@@ -1626,22 +1626,29 @@ func (s *storeWithUserOverride) Users() storage.UserStore { return s.users }
 
 // TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace covers a review
 // finding on PR #388: FinishLogin's CloneWarning latch only protected a
-// single request's own in-memory snapshot. Users().Update persists the
-// ENTIRE user document (MongoDB's implementation is a ReplaceOne), so a
-// second, concurrent request that read the user BEFORE a first request
-// latched CloneWarning=true, but persists AFTER it, would silently clobber
-// the flag back to false — a classic lost update, distinct from (and on top
-// of) the single-request stickiness covered by
-// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin.
+// single request's own in-memory snapshot. The original persistence path
+// (Users().Update, a whole-document ReplaceOne) meant a second, concurrent
+// request that read the user BEFORE a first request latched
+// CloneWarning=true, but persisted AFTER it, would silently clobber the
+// flag back to false — a classic lost update, distinct from (and on top of)
+// the single-request stickiness covered by
+// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin. A first
+// mitigation (re-reading the stored value immediately before persisting and
+// OR-ing it in) was flagged in a follow-up review as still racy — a
+// read-then-write pair can never be made airtight no matter how close
+// together the read and write are. The actual fix replaces the
+// whole-document persistence for this path with
+// UserStore.UpdateCredentialAuthenticator, a single atomic, field-scoped
+// update that never writes CloneWarning=false over an existing true — see
+// its doc comment in internal/storage/interface.go.
 //
-// Reproduces this deterministically (no real goroutines needed) by wrapping
-// UserStore so that exactly between this login's own initial read and its
-// final persist, a "concurrent" write lands directly in the backing store,
-// setting CloneWarning=true. FinishLogin's mitigation re-reads the current
-// stored value for this exact credential immediately before persisting and
-// ORs it in — this test would fail without that re-read, since this
-// request's own assertion is a clean, non-regressing login that never sees
-// a clone warning itself.
+// Reproduces the race deterministically (no real goroutines needed) by
+// wrapping UserStore so that exactly between this login's own two internal
+// GetByID calls, a "concurrent" write lands directly in the backing store,
+// setting CloneWarning=true. This login's own assertion is a clean,
+// non-regressing one that never sees a clone warning itself, so without
+// UpdateCredentialAuthenticator's OR-only semantics this would clobber the
+// concurrent write back to false.
 func TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace(t *testing.T) {
 	cfg := &config.Config{
 		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},

@@ -79,6 +79,29 @@ type UserStore interface {
 
 	// UpdatePrivateData updates user's private data with optimistic locking
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+
+	// UpdateCredentialAuthenticator atomically persists a single WebAuthn
+	// credential's SignCount and CloneWarning, identified by the
+	// credential's ID (the base64url string, domain.WebauthnCredential.ID),
+	// without a whole-document read-modify-write. This exists because
+	// Update above replaces the entire document (Mongo: ReplaceOne): two
+	// concurrent logins that each read the user before either persisted
+	// would otherwise race on a last-writer-wins basis, and a "clean" login
+	// racing after a "clone detected" login could silently clobber the
+	// latter's CloneWarning=true back to false. CloneWarning is OR-only
+	// here — the underlying implementations must never let this method
+	// write false over an existing true — so it can only ever gain the
+	// signal, never lose it to a race, however the two calls interleave.
+	// SignCount is a plain overwrite (last-writer-wins is acceptable for a
+	// monotonic counter; it isn't the security-critical field). Returns
+	// storage.ErrNotFound if the user doesn't exist. If the user exists but
+	// has no credential with that ID, this is a silent no-op success in
+	// both backends (MongoDB's arrayFilter update can't distinguish
+	// "matched the document but zero array elements" from "document not
+	// found", so this is a deliberate, matching behavior rather than an
+	// accidental divergence) — callers must only call this with a
+	// credentialID they've just matched on that same user.
+	UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error
 }
 
 // CredentialStore defines the interface for credential storage operations

@@ -398,6 +398,38 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 	return nil
 }
 
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) error {
+	setFields := bson.M{
+		"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
+		"updated_at": time.Now(),
+	}
+	// OR-only: only ever include clone_warning in the $set when it's true.
+	// Omitting the field entirely when false leaves whatever is currently
+	// stored untouched — this single UpdateOne is the whole operation, so
+	// there is no read-then-write window at all: it can never overwrite an
+	// existing true with false, regardless of how concurrent calls
+	// interleave.
+	if cloneWarning {
+		setFields["webauthn_credentials.$[cred].authenticator.clone_warning"] = true
+	}
+
+	opts := options.Update().SetArrayFilters(options.ArrayFilters{
+		Filters: []interface{}{bson.M{"cred.id": credentialID}},
+	})
+	result, err := s.collection.UpdateOne(ctx,
+		bson.M{"_id.id": id.String()},
+		bson.M{"$set": setFields},
+		opts,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update credential authenticator: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
 // idFilter returns a BSON filter that matches a document by _id.
 // Go typed strings in bson.D Value fields are always encoded as BSON strings
 // by the driver — never as documents or query operators — so this is safe
