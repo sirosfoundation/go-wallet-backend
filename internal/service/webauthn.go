@@ -1361,12 +1361,44 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 
 	tenantIDStr, _ := claims["tenant_id"].(string)
 	tenantID := domain.TenantID(tenantIDStr)
+	if tenantID == "" {
+		// Matches pkg/middleware.AuthMiddleware's own "no tenant_id claim ->
+		// default tenant" backward-compatibility fallback for older tokens.
+		tenantID = domain.DefaultTenantID
+	}
 
 	// Get the user (verify they still exist)
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		s.logger.Warn("Refresh token for non-existent user",
 			zap.String("user_id", userIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// SECURITY: re-validate the tenant itself (exists and is enabled) before
+	// rotating - not just the user's membership in it (below). Both
+	// authenticated-request paths (pkg/middleware.AuthMiddleware,
+	// TokenAuthMiddleware) already reject a request whose tenant no longer
+	// exists or has been disabled; RefreshAccessToken didn't, so a stolen
+	// refresh token for a since-disabled tenant could keep rotating
+	// indefinitely and regain full access the moment that tenant was
+	// re-enabled (Copilot review on #400, fifth round). Checked
+	// unconditionally, including for the default tenant - unlike the
+	// membership check below - since even the default tenant's own record
+	// could be disabled.
+	tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
+	if err != nil {
+		s.logger.Warn("Refresh token for a nonexistent tenant",
+			zap.String("user_id", userIDStr),
+			zap.String("tenant_id", tenantIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+	if !tenant.Enabled {
+		s.logger.Warn("Refresh token for a disabled tenant",
+			zap.String("user_id", userIDStr),
+			zap.String("tenant_id", tenantIDStr),
 		)
 		return nil, ErrInvalidRefreshToken
 	}
@@ -1385,7 +1417,7 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	// default tenant is exempt, matching FinishLogin/GetUserTenants'
 	// existing "no memberships recorded -> legacy default-tenant user"
 	// fallback (domain.DefaultTenantID) elsewhere in this file.
-	if tenantID != "" && tenantID != domain.DefaultTenantID {
+	if tenantID != domain.DefaultTenantID {
 		isMember, err := s.store.UserTenants().IsMember(ctx, userID, tenantID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to verify tenant membership: %w", err)
@@ -1413,14 +1445,27 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	// same refresh token, only the one that wins it proceeds to mint
 	// tokens - the loser is rejected here regardless of timing, wherever
 	// in the function this call sits.
+	//
+	// Both jti and exp are REQUIRED here (Copilot review on #400, fifth
+	// round): every token this service actually issues
+	// (generateRefreshToken) always sets both, so this only ever rejects a
+	// malformed/hand-crafted token. Without this check, an omitted jti
+	// would reach ConsumeOnce, which deliberately treats an empty jti as
+	// always "first use" (see its own doc comment - meant for a
+	// hypothetical jti-less token this service issued, not as a bypass),
+	// letting such a token replay freely; and an omitted exp would fall
+	// back to RefreshDays for the blacklist entry's OWN expiry while the
+	// underlying JWT itself never expires, so once that blacklist entry
+	// aged out the same non-expiring token would become usable again.
 	jti, _ := claims["jti"].(string)
+	expFloat, hasExp := claims["exp"].(float64)
+	if jti == "" || !hasExp {
+		s.logger.Warn("Refresh token missing required jti/exp claims")
+		return nil, ErrInvalidRefreshToken
+	}
+	expiry := time.Unix(int64(expFloat), 0)
+
 	if s.tokenBlacklist != nil {
-		var expiry time.Time
-		if exp, ok := claims["exp"].(float64); ok {
-			expiry = time.Unix(int64(exp), 0)
-		} else {
-			expiry = time.Now().AddDate(0, 0, s.cfg.JWT.RefreshDays)
-		}
 		firstUse, err := s.tokenBlacklist.ConsumeOnce(ctx, jti, expiry)
 		if err != nil {
 			return nil, fmt.Errorf("failed to consume refresh token: %w", err)

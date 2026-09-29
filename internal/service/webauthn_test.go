@@ -459,13 +459,19 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		return svc, store
 	}
 
-	// addTenantMembership records the user as a member of tenantID, needed
-	// wherever a test's refresh token carries a non-default tenant claim -
-	// see RefreshAccessToken's tenant-membership re-validation (Copilot
-	// review on #400, fourth round).
+	// addTenantMembership creates tenantID (enabled) if it doesn't already
+	// exist and records the user as one of its members - needed wherever a
+	// test's refresh token carries a non-default tenant claim, since
+	// RefreshAccessToken now re-validates both that the tenant itself
+	// exists and is enabled (fifth Copilot round) and that the user is
+	// still a member of it (fourth Copilot round) before rotating.
 	addTenantMembership := func(t *testing.T, store *memory.Store, userID domain.UserID, tenantID domain.TenantID) {
 		t.Helper()
-		require.NoError(t, store.UserTenants().AddMembership(context.Background(), &domain.UserTenantMembership{
+		ctx := context.Background()
+		if _, err := store.Tenants().GetByID(ctx, tenantID); err != nil {
+			require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantID, Name: string(tenantID), Enabled: true}))
+		}
+		require.NoError(t, store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
 			UserID:   userID,
 			TenantID: tenantID,
 		}))
@@ -680,19 +686,52 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		}
 	})
 
-	t.Run("consuming a refresh token without an exp claim falls back to RefreshDays for the blacklist entry", func(t *testing.T) {
+	// Regression tests for a Copilot review finding on #400 (fifth round):
+	// a refresh token missing "jti" would reach ConsumeOnce, which
+	// deliberately treats an empty jti as always "first use" (meant for a
+	// hypothetical jti-less token this service issued, not as a bypass),
+	// letting such a token replay freely forever; a token missing "exp"
+	// would fall back to RefreshDays for the blacklist entry's OWN expiry
+	// while the underlying JWT itself never expires, so the same
+	// non-expiring token would become usable again once that blacklist
+	// entry aged out. Both claims are now required outright - every token
+	// this service actually issues (generateRefreshToken) always sets both,
+	// so this only ever rejects a malformed/hand-crafted token.
+	t.Run("a refresh token without a jti claim is rejected", func(t *testing.T) {
 		svc, store := newSvcWithRefresh(t)
 		ctx := context.Background()
 		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
 		svc.SetTokenBlacklist(blacklist)
 
-		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-6"}
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-nojti"}
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		// Hand-crafted refresh token deliberately omitting "exp" - exercises
-		// the fallback expiry branch in the consume step, which a
-		// normally-generated refresh token (always has exp) never takes.
+		noJTIToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "test-tenant",
+			"type":      "refresh",
+			"exp":       time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := noJTIToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a missing jti claim, got %v", err)
+		}
+	})
+
+	t.Run("a refresh token without an exp claim is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-noexp"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
 		noExpToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 			"user_id":   user.UUID.String(),
 			"tenant_id": "test-tenant",
@@ -702,15 +741,9 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		signed, err := noExpToken.SignedString([]byte(testJWTSecret))
 		require.NoError(t, err)
 
-		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
-		require.NoError(t, err)
-		require.NotEmpty(t, resp.Token)
-
-		// It must now be consumed, even without an exp claim to read the
-		// expiry from - proven by a second use being rejected as a replay.
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
 		if err != ErrInvalidRefreshToken {
-			t.Fatalf("expected the no-exp refresh token to be rejected as a replay on second use, got %v", err)
+			t.Fatalf("expected ErrInvalidRefreshToken for a missing exp claim, got %v", err)
 		}
 	})
 
@@ -744,6 +777,52 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		}
 	})
 
+	// Regression test for a Copilot review finding on #400 (fifth round):
+	// pkg/middleware.AuthMiddleware and TokenAuthMiddleware both reject an
+	// authenticated request whose tenant no longer exists or has been
+	// disabled, but RefreshAccessToken didn't apply the same check - a
+	// stolen refresh token for a since-disabled tenant could keep rotating
+	// indefinitely and regain full access the moment that tenant was
+	// re-enabled.
+	t.Run("refresh token for a since-disabled tenant is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-disabled-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		tenant, err := store.Tenants().GetByID(ctx, "test-tenant")
+		require.NoError(t, err)
+		tenant.Enabled = false
+		require.NoError(t, store.Tenants().Update(ctx, tenant))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken after the tenant was disabled, got %v", err)
+		}
+	})
+
+	t.Run("refresh token for a nonexistent tenant is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-nonexistent-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		// Deliberately not calling addTenantMembership: no such tenant exists.
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("no-such-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a nonexistent tenant, got %v", err)
+		}
+	})
+
 	// The default tenant is exempt from the membership check above, matching
 	// FinishLogin/GetUserTenants' existing "no memberships recorded -> a
 	// legacy default-tenant user" fallback elsewhere in this file - a
@@ -761,6 +840,31 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+	})
+
+	// A refresh token with an empty (but present) tenant_id claim falls
+	// back to the default tenant, matching pkg/middleware.AuthMiddleware's
+	// own "no tenant_id claim -> default tenant" backward-compatibility
+	// behavior for older tokens.
+	t.Run("refresh with an empty tenant_id claim falls back to the default tenant", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-empty-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		emptyTenantToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "",
+			"type":      "refresh",
+			"jti":       "empty-tenant-jti",
+			"exp":       time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := emptyTenantToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
 		require.NoError(t, err)
 	})
 
