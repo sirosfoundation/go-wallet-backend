@@ -566,6 +566,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			services.WebAuthn,
 			store,
 			services.TokenBlacklist,
+			cfg.HTTPClient.NewHTTPClient(0),
 			logger,
 		)
 		if err != nil {

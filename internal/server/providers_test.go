@@ -1573,3 +1573,52 @@ func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti
 func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) bool {
 	return false
 }
+
+// TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
+// Copilot review finding on the passkey tenant-perimeter fix (#374/#386):
+// NewBackendProvider must pass its own configured, SSRF-guarded HTTP client
+// into as.NewASModule (used for the passkey route group's OIDC gate), not a
+// bare nil one - exercising the real constructor end to end, not a
+// hand-built BackendProvider literal, so this wiring is actually covered.
+func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, _ := writeTestECKeyAndCert(t, dir, "as-signing")
+
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+
+	logger := zap.NewNop()
+	p, err := NewBackendProvider(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.ASModule() == nil {
+		t.Fatal("expected ASModule to be wired when cfg.AS.Enabled is true")
+	}
+
+	// End-to-end sanity check: the passkey route group (tenant-header +
+	// OIDC-gate middleware, backed by the ValidatorCache built from the
+	// configured HTTP client) must actually be reachable for the default
+	// (ungated) tenant memory.NewStore() pre-seeds.
+	router := gin.New()
+	p.RegisterRoutes(router)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from the default tenant's passkey register/begin, got %d: %s", w.Code, w.Body.String())
+	}
+}

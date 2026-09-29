@@ -73,7 +73,7 @@ func TestNewASModule_WiresBlacklistAndRegistersRoutes(t *testing.T) {
 	store := memory.NewStore()
 	blacklist := &fakeBlacklist{revoked: map[string]bool{"jti-revoked": true}}
 
-	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, blacklist, zap.NewNop())
+	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, blacklist, nil, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewASModule() error = %v", err)
 	}
@@ -170,7 +170,7 @@ func TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer(t *testing.T) {
 	}
 
 	store := memory.NewStore()
-	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, nil, zap.NewNop())
+	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, nil, nil, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewASModule() error = %v", err)
 	}

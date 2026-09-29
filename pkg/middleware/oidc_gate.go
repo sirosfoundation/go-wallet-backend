@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
 
@@ -201,7 +200,7 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType GateType, logge
 					respondOIDCRequired(c, opConfig, "Missing required claim: "+key)
 					return
 				}
-				if !claimsMatch(expected, actual) {
+				if !oidc.ClaimsMatch(expected, actual) {
 					logger.Debug("Claim mismatch",
 						zap.String("claim", key),
 						zap.Any("expected", expected),
@@ -238,63 +237,6 @@ func respondOIDCRequired(c *gin.Context, opConfig *domain.OIDCProviderConfig, me
 		},
 	})
 	c.Abort()
-}
-
-// claimsMatch compares expected and actual claim values
-// Supports subset matching for arrays (expected values must be present in actual)
-func claimsMatch(expected, actual interface{}) bool {
-	switch e := expected.(type) {
-	case bool:
-		a, ok := actual.(bool)
-		return ok && e == a
-	case string:
-		// String expected value can match either a string or be present in an array
-		if a, ok := actual.(string); ok {
-			return e == a
-		}
-		// Check if string is in array (e.g., expected: "admin", actual: ["admin", "user"])
-		if arr, ok := actual.([]interface{}); ok {
-			for _, v := range arr {
-				if s, ok := v.(string); ok && s == e {
-					return true
-				}
-			}
-		}
-		return false
-	case float64:
-		a, ok := actual.(float64)
-		return ok && e == a
-	case int:
-		a, ok := actual.(float64)
-		return ok && float64(e) == a
-	case []interface{}:
-		// For array expected values, check if all expected values are present in actual
-		a, ok := actual.([]interface{})
-		if !ok {
-			// actual is not an array - check if single expected element matches
-			if len(e) == 1 {
-				return claimsMatch(e[0], actual)
-			}
-			return false
-		}
-		// All expected values must be present in actual (subset matching)
-		for _, ev := range e {
-			found := false
-			for _, av := range a {
-				if claimsMatch(ev, av) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	default:
-		// For complex types, use reflect.DeepEqual as fallback
-		return reflect.DeepEqual(expected, actual)
-	}
 }
 
 // GetOIDCGateResult returns the OIDC gate validation result from context
