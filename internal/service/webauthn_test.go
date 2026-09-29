@@ -1730,6 +1730,126 @@ func TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace(t *testing.T) {
 		"a concurrent write that latched CloneWarning=true must survive this request's own ReplaceOne, not be clobbered back to false")
 }
 
+// TestFinishRegistration_ExpectedTenantIDMismatch_RejectsBeforeConsumingChallenge
+// covers the rebase-onto-main fixup: a mismatched ExpectedTenantID (the
+// caller's validated tenant context, e.g. from the X-Tenant-ID header) must
+// be rejected via ErrTenantMismatch, and the real challenge must survive —
+// it must not be consumed by ConsumeByIDForTenant just because the tenant
+// didn't match.
+func TestFinishRegistration_ExpectedTenantIDMismatch_RejectsBeforeConsumingChallenge(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	tenantA := &domain.Tenant{ID: "tenant-a", Name: "Tenant A", DisplayName: "Tenant A", Enabled: true}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenantA))
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Tenant A User",
+		TenantID:    "tenant-a",
+	})
+	require.NoError(t, err)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID:      beginResp.ChallengeID,
+		Credential:       json.RawMessage(`{}`),
+		DisplayName:      "Tenant A User",
+		ExpectedTenantID: "tenant-b",
+	})
+	require.ErrorIs(t, err, ErrTenantMismatch)
+
+	_, err = baseStore.Challenges().GetByID(ctx, beginResp.ChallengeID)
+	assert.NoError(t, err, "challenge should survive a mismatched ExpectedTenantID attempt, not be consumed")
+}
+
+// erroringUserStore wraps a real storage.UserStore and forces
+// UpdateCredentialAuthenticator to return an arbitrary error for one
+// specific user, so tests can exercise FinishLogin's "don't fail login for
+// this" error-logging branch without needing a real storage outage.
+type erroringUserStore struct {
+	storage.UserStore
+	failUserID string
+	err        error
+}
+
+func (e *erroringUserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
+	if id.String() == e.failUserID {
+		return false, e.err
+	}
+	return e.UserStore.UpdateCredentialAuthenticator(ctx, id, credentialID, signCount, cloneWarning)
+}
+
+// TestFullLoginFlow_UpdateCredentialAuthenticatorError_DoesNotFailLogin
+// covers FinishLogin's error-logging branch when the atomic
+// UpdateCredentialAuthenticator persistence call itself fails (e.g. a
+// storage outage): the login must still succeed ("don't fail login for
+// this" — matching the same tolerance the old whole-document Update() had).
+func TestFullLoginFlow_UpdateCredentialAuthenticatorError_DoesNotFailLogin(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Persist Error User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Persist Error User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	wrapped := &storeWithUserOverride{
+		Store: baseStore,
+		users: &erroringUserStore{
+			UserStore:  baseStore.Users(),
+			failUserID: userID.String(),
+			err:        errors.New("simulated storage outage"),
+		},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	beginLoginResp, err := svc.BeginLogin(ctx)
+	require.NoError(t, err)
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+	_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+	})
+	require.NoError(t, err, "a persistence failure must not fail the login itself")
+}
+
 // ============================================================================
 // Storage-layer failure paths for the atomic challenge/invite consumption
 // (issues #379, #378) — a real storage outage on ConsumeByID/MarkCompleted,

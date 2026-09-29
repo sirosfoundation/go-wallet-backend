@@ -294,6 +294,28 @@ func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound covers the
+// documented silent no-op case against a real MongoDB: the user exists, but
+// no credential with the given ID does — the arrayFilter matches the
+// document but zero array elements, which must succeed with no error and
+// transitioned=false, not ErrNotFound.
+func TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "some-other-cred"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "nonexistent-cred", 1, true)
+	assert.NoError(t, err)
+	assert.False(t, transitioned)
+}
+
 // TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
 // the review finding that a caller-side "was this already latched" check
 // can let concurrent callers duplicate a one-time side effect: many
@@ -807,6 +829,108 @@ func TestChallengeStore_ConsumeByID(t *testing.T) {
 	// A second consume of the same, now-deleted ID must fail.
 	_, err = store.Challenges().ConsumeByID(ctx, challenge.ID)
 	assert.Error(t, err)
+}
+
+// TestChallengeStore_ConsumeByIDForUser covers the atomic ownership-scoped
+// consume added for issue #379's FinishAddCredential fix against a real
+// MongoDB: a matching userID succeeds and removes the challenge; a
+// mismatched userID gets ErrNotFound and leaves the real owner's challenge
+// untouched.
+func TestChallengeStore_ConsumeByIDForUser(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "add-cred-challenge-id",
+		UserID:    "user-owner",
+		Challenge: "test-challenge-string",
+		Action:    "add_credential",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	// Mismatched userID: must fail without consuming.
+	_, err := store.Challenges().ConsumeByIDForUser(ctx, challenge.ID, "user-attacker")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.NoError(t, err, "challenge should survive a mismatched-owner attempt")
+
+	// Matching userID: must succeed and consume it.
+	consumed, err := store.Challenges().ConsumeByIDForUser(ctx, challenge.ID, "user-owner")
+	require.NoError(t, err)
+	assert.Equal(t, "user-owner", consumed.UserID)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err, "challenge should be consumed after a matching-owner ConsumeByIDForUser")
+}
+
+func TestChallengeStore_ConsumeByIDForUser_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	_, err := store.Challenges().ConsumeByIDForUser(ctx, "nonexistent", "user-owner")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestChallengeStore_ConsumeByIDForTenant covers the atomic tenant-scoped
+// consume added when this branch was rebased onto main's #386, against a
+// real MongoDB: a matching tenant succeeds; a mismatched tenant gets
+// ErrNotFound and leaves the challenge untouched; an empty
+// expectedTenantID behaves like plain ConsumeByID (no constraint).
+func TestChallengeStore_ConsumeByIDForTenant(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "register-challenge-id",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "test-challenge-string",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	// Mismatched tenant: must fail without consuming.
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "tenant-b")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.NoError(t, err, "challenge should survive a mismatched-tenant attempt")
+
+	// Matching tenant: must succeed and consume it.
+	consumed, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "tenant-a")
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", consumed.TenantID)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err, "challenge should be consumed after a matching-tenant ConsumeByIDForTenant")
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_EmptyExpectedTenantIDIsNoConstraint(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "global-challenge-id",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "test-challenge-string",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "")
+	assert.NoError(t, err, "empty expectedTenantID should mean no constraint")
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, "nonexistent", "tenant-a")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
 // TestChallengeStore_ConsumeByID_GenericError exercises ConsumeByID's other

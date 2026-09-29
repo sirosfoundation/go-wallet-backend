@@ -491,6 +491,36 @@ func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
 	}
 }
 
+// TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound covers the
+// documented silent no-op case: the user exists, but no credential with the
+// given ID does. This matches MongoDB's arrayFilter semantics, which can't
+// distinguish "matched the document but zero array elements" from "document
+// not found" (see the interface doc comment) — must succeed with no error
+// and transitioned=false, not ErrNotFound.
+func TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "some-other-cred"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "nonexistent-cred", 1, true)
+	if err != nil {
+		t.Errorf("expected no error for an existing user with a nonexistent credential ID, got %v", err)
+	}
+	if transitioned {
+		t.Error("transitioned should be false when the credential ID doesn't exist")
+	}
+}
+
 // TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
 // the review finding that a caller-side "was this already latched" check
 // (computed from a separately-read snapshot) can let concurrent callers
@@ -986,6 +1016,137 @@ func TestChallengeStore_ConsumeByID_NotFound(t *testing.T) {
 	_, err := challenges.ConsumeByID(ctx, "nonexistent")
 	if err != storage.ErrNotFound {
 		t.Errorf("ConsumeByID() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByIDForUser covers the atomic ownership-scoped
+// consume added for issue #379's FinishAddCredential fix: a matching userID
+// succeeds and removes the challenge; a mismatched userID gets ErrNotFound
+// and leaves the real owner's challenge untouched.
+func TestChallengeStore_ConsumeByIDForUser(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "add-cred-challenge",
+		UserID:    "user-owner",
+		Challenge: "random-challenge",
+		Action:    "add_credential",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mismatched userID: must fail, and must NOT consume the challenge.
+	if _, err := challenges.ConsumeByIDForUser(ctx, "add-cred-challenge", "user-attacker"); err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForUser() with wrong userID should return ErrNotFound, got %v", err)
+	}
+	if _, err := challenges.GetByID(ctx, "add-cred-challenge"); err != nil {
+		t.Errorf("challenge should survive a mismatched-owner attempt, GetByID() error = %v", err)
+	}
+
+	// Matching userID: must succeed and consume it.
+	consumed, err := challenges.ConsumeByIDForUser(ctx, "add-cred-challenge", "user-owner")
+	if err != nil {
+		t.Fatalf("ConsumeByIDForUser() error = %v", err)
+	}
+	if consumed.UserID != "user-owner" {
+		t.Errorf("consumed.UserID = %q, want user-owner", consumed.UserID)
+	}
+	if _, err := challenges.GetByID(ctx, "add-cred-challenge"); err != storage.ErrNotFound {
+		t.Error("challenge should be consumed after a matching-owner ConsumeByIDForUser")
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForUser_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByIDForUser(ctx, "nonexistent", "user-owner")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForUser() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByIDForTenant covers the atomic tenant-scoped
+// consume added when this branch was rebased onto main's #386 (tenant
+// mismatch must be checked as part of the same atomic consume, not after):
+// a matching tenant succeeds; a mismatched tenant gets ErrNotFound and
+// leaves the challenge untouched; an empty expectedTenantID behaves like
+// plain ConsumeByID (no constraint).
+func TestChallengeStore_ConsumeByIDForTenant(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "register-challenge",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mismatched tenant: must fail, and must NOT consume the challenge.
+	if _, err := challenges.ConsumeByIDForTenant(ctx, "register-challenge", "tenant-b"); err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForTenant() with wrong tenant should return ErrNotFound, got %v", err)
+	}
+	if _, err := challenges.GetByID(ctx, "register-challenge"); err != nil {
+		t.Errorf("challenge should survive a mismatched-tenant attempt, GetByID() error = %v", err)
+	}
+
+	// Matching tenant: must succeed and consume it.
+	consumed, err := challenges.ConsumeByIDForTenant(ctx, "register-challenge", "tenant-a")
+	if err != nil {
+		t.Fatalf("ConsumeByIDForTenant() error = %v", err)
+	}
+	if consumed.TenantID != "tenant-a" {
+		t.Errorf("consumed.TenantID = %q, want tenant-a", consumed.TenantID)
+	}
+	if _, err := challenges.GetByID(ctx, "register-challenge"); err != storage.ErrNotFound {
+		t.Error("challenge should be consumed after a matching-tenant ConsumeByIDForTenant")
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_EmptyExpectedTenantIDIsNoConstraint(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "global-challenge",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Empty expectedTenantID: no constraint, must succeed regardless of the
+	// challenge's actual tenant.
+	if _, err := challenges.ConsumeByIDForTenant(ctx, "global-challenge", ""); err != nil {
+		t.Errorf("ConsumeByIDForTenant() with empty expectedTenantID should succeed, got %v", err)
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByIDForTenant(ctx, "nonexistent", "tenant-a")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForTenant() for nonexistent challenge should return ErrNotFound, got %v", err)
 	}
 }
 
