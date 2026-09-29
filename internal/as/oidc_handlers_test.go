@@ -733,6 +733,76 @@ func TestOIDCCallback_StateCookieMismatch(t *testing.T) {
 	})
 }
 
+// TestOIDCCallback_MissingCookieDoesNotBurnChallenge covers a review finding
+// on PR #388: validateCallbackState used to consume the challenge
+// (ConsumeByID) BEFORE checking the browser-binding cookie. A request that
+// merely knows/guesses a valid `state` value (e.g. leaked via a referrer
+// header or server logs) but lacks the legitimate browser's cookie could
+// therefore burn the real challenge — the actual browser's later, genuine
+// callback would then be rejected with "invalid or expired state" even
+// though nothing about ITS request was ever compromised. The cookie must be
+// verified before the atomic consume, so a cookie-less request can never
+// affect the legitimate callback.
+func TestOIDCCallback_MissingCookieDoesNotBurnChallenge(t *testing.T) {
+	challengeStore := &mockChallengeStore{
+		challenges: map[string]*domain.WebauthnChallenge{
+			"shared-state": {
+				ID:        "shared-state",
+				TenantID:  "t1",
+				Challenge: "shared-state",
+				Action:    oidcChallengeAction,
+				ExpiresAt: time.Now().Add(time.Hour),
+			},
+		},
+	}
+	store := &mockStore{
+		tenants: &mockTenantStore{
+			tenants: map[domain.TenantID]*domain.Tenant{
+				"t1": {
+					ID:      "t1",
+					Enabled: true,
+					OIDCGate: domain.OIDCGateConfig{
+						Mode: domain.OIDCGateModeLogin,
+						LoginOP: &domain.OIDCProviderConfig{
+							Issuer:   "https://127.0.0.1:1/nonexistent",
+							ClientID: "test-client",
+						},
+					},
+				},
+			},
+		},
+		challenges: challengeStore,
+	}
+	router, _ := setupOIDCHandlers(store)
+
+	// Attacker (or just a stray retry/prefetch): knows the state value, but
+	// has no cookie at all.
+	attackerReq := httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=shared-state&code=authcode", nil)
+	attackerW := httptest.NewRecorder()
+	router.ServeHTTP(attackerW, attackerReq)
+	if attackerW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected the cookie-less attempt to get 401, got %d: %s", attackerW.Code, attackerW.Body.String())
+	}
+
+	// Legitimate request: same state, WITH the correct cookie. Must still be
+	// able to consume the (still-present) challenge and proceed past state
+	// validation — it fails downstream at OIDC discovery (the issuer is
+	// deliberately unreachable), not at the state check, proving the
+	// challenge survived the earlier cookie-less attempt.
+	legitReq := withOIDCStateCookie(
+		httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=shared-state&code=authcode", nil),
+		"shared-state",
+	)
+	legitW := httptest.NewRecorder()
+	router.ServeHTTP(legitW, legitReq)
+	if legitW.Code == http.StatusUnauthorized && strings.Contains(legitW.Body.String(), "invalid or expired state") {
+		t.Fatalf("legitimate callback was rejected as if the challenge had already been consumed: %d: %s", legitW.Code, legitW.Body.String())
+	}
+	if legitW.Code != http.StatusBadGateway {
+		t.Fatalf("expected the legitimate callback to reach OIDC discovery (502), got %d: %s", legitW.Code, legitW.Body.String())
+	}
+}
+
 // TestOIDCCallback_DisabledTenant covers go-wallet-backend#385 (T-4): a
 // disabled tenant must not be able to complete an OIDC login, even with an
 // otherwise-valid state/cookie/code.

@@ -280,6 +280,20 @@ type BeginRegistrationRequest struct {
 // BeginRegistration starts WebAuthn registration for a new user
 // If tenantId is provided, the user will be registered in that tenant
 func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegistrationRequest) (*BeginRegistrationResponse, error) {
+	// Invite codes are tenant-scoped (Invites().GetByCode requires a
+	// tenantID) and FinishRegistration's atomic invite claim is likewise
+	// only reachable when the challenge carries a tenantID. Without this
+	// guard, an invite code supplied alongside an empty tenantID would
+	// never be validated OR consumed at all: BeginRegistration's invite
+	// checks live entirely inside the `req.TenantID != ""` branch below, and
+	// FinishRegistration's completion-time claim is gated the same way — so
+	// that combination would silently create a global (non-tenant) account
+	// while leaving the referenced invite untouched, instead of being
+	// rejected. Fail closed here instead.
+	if req.InviteCode != "" && req.TenantID == "" {
+		return nil, ErrInvalidInvite
+	}
+
 	// Validate tenant exists if provided
 	var tenantID domain.TenantID
 	if req.TenantID != "" {
@@ -790,7 +804,17 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	// single-use TOCTOU). MarkCompleted is a single atomic
 	// find-and-update-if-active operation in both storage backends, so only
 	// one concurrent caller can ever win it.
-	if tenantID != "" && challenge.InviteCode != "" {
+	//
+	// A non-empty InviteCode with an empty tenantID is rejected up front in
+	// BeginRegistration and should therefore never reach a stored challenge,
+	// but fail closed here too as defense-in-depth: an invite code must
+	// always resolve to a real atomic claim, never be silently skipped.
+	if challenge.InviteCode != "" {
+		if tenantID == "" {
+			s.logger.Warn("Challenge carries an invite code but no tenant; rejecting registration",
+				zap.String("user_id", userID.String()))
+			return nil, ErrInvalidInvite
+		}
 		if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
 			invitePrefix := challenge.InviteCode
 			if len(invitePrefix) > 8 {
@@ -1219,6 +1243,31 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.Int("stored_public_key_len", storedPublicKeyLen),
 			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
 		)
+	}
+
+	// SECURITY: this function's user snapshot was read at the top of
+	// FinishLogin, and Update below persists the ENTIRE document (Mongo:
+	// UserStore.Update does a ReplaceOne). If a concurrent login on a
+	// different challenge for this same credential has, since our read,
+	// already latched CloneWarning=true in storage, this request's stale
+	// in-memory copy (still false) would silently clobber that back to
+	// false when we replace the whole document — a lost update that could
+	// erase the security signal a moment after it was recorded. Re-read the
+	// currently stored value for this exact credential immediately before
+	// persisting and OR it in: this can only ever add the flag back, never
+	// remove it, and it shrinks the race window down to one extra read
+	// right before the write, instead of spanning this entire request's
+	// WebAuthn assertion verification. Best-effort: if the re-read fails,
+	// fall through to the normal update rather than blocking the login.
+	if !matchedCred.Authenticator.CloneWarning {
+		if latest, ferr := s.store.Users().GetByID(ctx, userID); ferr == nil {
+			for i := range latest.WebauthnCredentials {
+				if latest.WebauthnCredentials[i].ID == credentialID && latest.WebauthnCredentials[i].Authenticator.CloneWarning {
+					matchedCred.Authenticator.CloneWarning = true
+					break
+				}
+			}
+		}
 	}
 
 	if err := s.store.Users().Update(ctx, user); err != nil {

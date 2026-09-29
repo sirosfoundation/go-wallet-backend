@@ -246,6 +246,31 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 	})
 }
 
+// TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected
+// covers a review finding on PR #388: an invite code is tenant-scoped
+// (Invites().GetByCode requires a tenantID, and FinishRegistration's atomic
+// invite claim is only reachable when the stored challenge carries a
+// tenantID), but BeginRegistration's invite validation lived entirely
+// inside the `req.TenantID != ""` branch and unconditionally stored
+// req.InviteCode on the challenge regardless. Supplying an invite code with
+// no tenantID therefore skipped invite validation AND consumption
+// entirely, silently creating a global (non-tenant) account while leaving
+// the referenced invite untouched, instead of being rejected. This
+// combination must fail closed at BeginRegistration.
+func TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected(t *testing.T) {
+	svc, _ := setupWebAuthnService(t)
+	ctx := context.Background()
+
+	_, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "No Tenant Invite User",
+		InviteCode:  "some-invite-code",
+		// TenantID intentionally left empty.
+	})
+	if !errors.Is(err, ErrInvalidInvite) {
+		t.Errorf("expected ErrInvalidInvite for an invite code with no tenantID, got %v", err)
+	}
+}
+
 func TestWebAuthnService_BeginLogin(t *testing.T) {
 	svc, _ := setupWebAuthnService(t)
 	ctx := context.Background()
@@ -1518,6 +1543,173 @@ func TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin(t *testing.T) {
 	assert.Equal(t, uint32(20), user.WebauthnCredentials[0].Authenticator.SignCount, "sign count must still advance normally")
 }
 
+// raceInjectingUserStore wraps a real storage.UserStore and, on its SECOND
+// GetByID call, invokes onSecondCall once (after taking that call's own
+// snapshot, before returning it) — used to deterministically simulate a
+// concurrent write landing in storage in between FinishLogin's two existing
+// GetByID calls (its own initial snapshot, then go-webauthn's internal
+// discoverable-credential lookup) and its later mitigation re-read, without
+// needing actual goroutines to race (see
+// TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace). Firing after that
+// call's own fetch, not before, matters: it must not also change what
+// go-webauthn itself hydrates into the Credential it returns (which would
+// let the *existing* single-request sticky-latch already cover this case,
+// making the test pass without exercising the new re-read mitigation at
+// all — this was caught empirically by reverting the fix and observing the
+// test still passed, then fixing the injection point until reverting it
+// made the test fail as expected).
+//
+// GetByID always returns a deep copy of the credential slice, matching a
+// real document-store backend (MongoDB decodes a fresh struct on every
+// read) rather than the wrapped internal/storage/memory implementation's
+// aliasing behavior (its GetByID returns the same pointer stored in its
+// map). Without that copy, this test's "concurrent write" would alias the
+// exact same WebauthnCredentials slice the calling FinishLogin is already
+// holding, mutating it in place regardless of whether the fix under test
+// re-reads anything — which would make the test pass even without the fix,
+// silently proving nothing.
+type raceInjectingUserStore struct {
+	storage.UserStore
+	mu           sync.Mutex
+	calls        int
+	onSecondCall func()
+}
+
+func (s *raceInjectingUserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+
+	// Snapshot BEFORE injecting the "concurrent" write, so this call
+	// (go-webauthn's own discoverable-credential lookup) sees the
+	// pre-race state — matching a real production race where the other
+	// request's write lands sometime during THIS request's own assertion
+	// verification, which happens after go-webauthn's lookup but before
+	// FinishLogin's final persist.
+	user, err := s.UserStore.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	cp := *user
+	cp.WebauthnCredentials = append([]domain.WebauthnCredential(nil), user.WebauthnCredentials...)
+
+	if call == 2 && s.onSecondCall != nil {
+		s.onSecondCall()
+	}
+
+	return &cp, nil
+}
+
+// storeWithUserOverride wraps *memory.Store, swapping out just the Users()
+// accessor so every other collection still behaves like the real in-memory
+// store.
+type storeWithUserOverride struct {
+	*memory.Store
+	users storage.UserStore
+}
+
+func (s *storeWithUserOverride) Users() storage.UserStore { return s.users }
+
+// TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace covers a review
+// finding on PR #388: FinishLogin's CloneWarning latch only protected a
+// single request's own in-memory snapshot. Users().Update persists the
+// ENTIRE user document (MongoDB's implementation is a ReplaceOne), so a
+// second, concurrent request that read the user BEFORE a first request
+// latched CloneWarning=true, but persists AFTER it, would silently clobber
+// the flag back to false — a classic lost update, distinct from (and on top
+// of) the single-request stickiness covered by
+// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin.
+//
+// Reproduces this deterministically (no real goroutines needed) by wrapping
+// UserStore so that exactly between this login's own initial read and its
+// final persist, a "concurrent" write lands directly in the backing store,
+// setting CloneWarning=true. FinishLogin's mitigation re-reads the current
+// stored value for this exact credential immediately before persisting and
+// ORs it in — this test would fail without that re-read, since this
+// request's own assertion is a clean, non-regressing login that never sees
+// a clone warning itself.
+func TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Race Test User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Race Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	credentialIDStr := base64.RawURLEncoding.EncodeToString(credential.ID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+	credential.Counter = 10 // establish a baseline sign count via a normal login
+
+	raceStore := &raceInjectingUserStore{
+		UserStore: baseStore.Users(),
+		onSecondCall: func() {
+			// Simulate a concurrent request's ReplaceOne landing right here,
+			// between this request's own initial snapshot and its final
+			// persist: directly latch CloneWarning=true in the backing
+			// store, bypassing this request's in-memory copy entirely.
+			u, err := baseStore.Users().GetByID(ctx, userID)
+			require.NoError(t, err)
+			for i := range u.WebauthnCredentials {
+				if u.WebauthnCredentials[i].ID == credentialIDStr {
+					u.WebauthnCredentials[i].Authenticator.CloneWarning = true
+				}
+			}
+			require.NoError(t, baseStore.Users().Update(ctx, u))
+		},
+	}
+	wrapped := &storeWithUserOverride{Store: baseStore, users: raceStore}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	// A clean, cleanly-incrementing login on the wrapped store: this
+	// request's OWN assertion never sees a clone warning, but the
+	// "concurrent" write injected mid-flight already latched one.
+	beginLoginResp, err := svc.BeginLogin(ctx)
+	require.NoError(t, err)
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+	credential.Counter = 20
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+	_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+	})
+	require.NoError(t, err)
+
+	final, err := baseStore.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.True(t, final.WebauthnCredentials[0].Authenticator.CloneWarning,
+		"a concurrent write that latched CloneWarning=true must survive this request's own ReplaceOne, not be clobbered back to false")
+}
+
 // ============================================================================
 // Storage-layer failure paths for the atomic challenge/invite consumption
 // (issues #379, #378) — a real storage outage on ConsumeByID/MarkCompleted,
@@ -1744,6 +1936,68 @@ func TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated(t 
 	gotInvite, err := baseStore.Invites().GetByCode(ctx, tenant.ID, invite.Code)
 	require.NoError(t, err)
 	assert.Equal(t, domain.InviteStatusActive, gotInvite.Status)
+}
+
+// TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed is
+// the defense-in-depth companion to
+// TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected: even
+// though BeginRegistration now rejects an invite-code-without-tenant
+// request up front, this constructs a challenge directly in the store
+// (bypassing BeginRegistration entirely, as if one somehow existed from
+// before that guard, or from a future code path that stores a challenge
+// differently) with a non-empty InviteCode but an empty TenantID, and
+// asserts FinishRegistration still fails closed with ErrInvalidInvite
+// rather than silently skipping invite consumption and creating a global
+// account.
+func TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	// Use the normal BeginRegistration path (no tenant, no invite code — a
+	// perfectly ordinary global registration) to get a well-formed
+	// challenge and options, then mutate the STORED challenge directly to
+	// carry a non-empty InviteCode. This simulates a challenge somehow
+	// ending up in this shape (e.g. a future code path that constructs one
+	// differently) without needing to hand-build virtualwebauthn/WebAuthn
+	// protocol structs.
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "No Tenant User"})
+	require.NoError(t, err)
+
+	storedChallenge, err := baseStore.Challenges().GetByID(ctx, beginResp.ChallengeID)
+	require.NoError(t, err)
+	storedChallenge.InviteCode = "orphaned-invite-code"
+	require.NoError(t, baseStore.Challenges().Create(ctx, storedChallenge)) // memory Create overwrites by ID
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "No Tenant User",
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	userID := domain.UserIDFromString(storedChallenge.UserID)
+	_, err = baseStore.Users().GetByID(ctx, userID)
+	assert.ErrorIs(t, err, storage.ErrNotFound, "no user must be created when a challenge carries an invite code but no tenant")
 }
 
 // ============================================================================
