@@ -407,7 +407,31 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 		}
 	}
 
+	// Bind the plain-JSON metadata document to the URL it was requested from.
+	// Per OpenID4VCI §11.2.1, credential_issuer MUST match the Credential
+	// Issuer Identifier that was used to fetch this metadata. Without this
+	// check a metadata document served from (or injected at) an unrelated
+	// path/host could impersonate a different issuer identifier.
+	if err := validateCredentialIssuerClaim(raw, issuerURL); err != nil {
+		return nil, err
+	}
+
 	return &fetchResult{metadata: raw, validated: false, signed: false}, nil
+}
+
+// validateCredentialIssuerClaim checks that the metadata's credential_issuer
+// claim matches the issuer URL the document was requested/offered for. This
+// mirrors the 'sub' claim check performed for signed (application/jwt)
+// metadata responses in validateJWTClaims.
+func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL string) error {
+	credentialIssuer, _ := claims["credential_issuer"].(string)
+	if credentialIssuer == "" {
+		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
+	}
+if credentialIssuer != issuerURL {
+		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
+	}
+	return nil
 }
 
 // validateSignedMetadata verifies the signed_metadata JWT against the issuer's
