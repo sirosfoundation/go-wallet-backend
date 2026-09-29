@@ -763,19 +763,44 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 
 	canonicalURL := getCanonicalVerifierURL(authReq)
 
-	// cacheKey identifies this verifier for the trust cache. Prefer the
-	// identity signature verification just bound above (a DID that verified,
-	// a client_id+certificate/key fingerprint pairing, an attested subject
+	// The identity fingerprint above (a matched key, a certificate, an
+	// attestation JWT hash) only proves who signed the request - it says
+	// nothing about the OTHER fields the PDP evaluates a request against:
+	// response_uri/redirect_uri (a policy may only trust a verifier for a
+	// specific callback endpoint) and, when present, an OIDF trust_chain.
+	// The same verified identity presenting DIFFERENT PDP-relevant context
+	// must not reuse a verdict the PDP evaluated for the FIRST context, so
+	// fold a hash of that context into the cache key too. authCtx must be
+	// built before this, and is reused unchanged by evaluateVerifierTrustViaPDP/
+	// evaluateVerifierTrustViaFrontend below.
+	authCtx := verifierAuthContext{
+		keyMaterial:        keyMaterial,
+		attestationContext: attestationContext,
+		requiresResolution: requiresResolution,
+		requestJWT:         requestJWT,
+	}
+	contextHash := hashEvalContext(buildVerifierEvalContext(authReq, authCtx, h.Logger))
+
+	// cacheKey identifies this verifier AND the PDP-relevant context of
+	// this specific request for the trust cache. Prefer the identity
+	// signature verification just bound above (a DID that verified, a
+	// client_id+certificate/key fingerprint pairing, an attested subject
 	// bound to its key) - falling back to the canonical URL only for
 	// schemes where no scheme-bound signature verification exists at all
 	// (e.g. redirect_uri). When cacheable is false, a scheme that needed a
 	// key-material fingerprint couldn't produce one; this request's result
 	// is never read from or written to the cache at all, rather than
 	// falling back to a weaker key a different key's request could collide
-	// with (see the per-scheme comments above).
+	// with (see the per-scheme comments above). The same applies if the
+	// context itself can't be hashed.
 	cacheKey := verifiedIdentity
 	if cacheKey == "" && cacheable {
 		cacheKey = canonicalURL
+	}
+	if cacheKey != "" && contextHash != "" {
+		cacheKey += "|ctx:" + contextHash
+	} else {
+		cacheable = false
 	}
 
 	// Check the in-memory trust cache. This runs after signature
@@ -810,13 +835,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// OID4VCIHandler.evaluateTrust's issuer-side pattern (see oid4vci.go): if
 	// the PDP call errors, that fails closed (untrusted) rather than
 	// falling back to asking the client.
-	authCtx := verifierAuthContext{
-		keyMaterial:        keyMaterial,
-		attestationContext: attestationContext,
-		requiresResolution: requiresResolution,
-		requestJWT:         requestJWT,
-	}
-
 	if trustEndpoint := h.Config.Trust.GetVerifierPDPURL(); trustEndpoint != "" {
 		return h.evaluateVerifierTrustViaPDP(ctx, authReq, verifier, authCtx, trustEndpoint, cacheKey, canonicalURL)
 	}
@@ -1131,6 +1149,23 @@ func (h *OID4VPHandler) verifyDIDRequest(authReq *AuthorizationRequest) (*KeyMat
 func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// hashEvalContext returns a stable digest of the PDP-relevant evaluation
+// context (response_uri/redirect_uri, an OIDF trust_chain, verifier_attestation
+// fields - see buildVerifierEvalContext) so the trust cache can be scoped to
+// that context, not just the verifier's identity. json.Marshal of a
+// map[string]interface{} sorts keys, so this is deterministic across calls
+// with the same content. Returns "" if the context can't be marshaled -
+// callers must treat that as "not cacheable", not as an empty/absent
+// context, so two requests that differ only in an unhashable context field
+// are never conflated.
+func hashEvalContext(evalContext map[string]interface{}) string {
+	raw, err := json.Marshal(evalContext)
+	if err != nil {
+		return ""
+	}
+	return sha256Hex(string(raw))
 }
 
 // keyMaterialFingerprint returns a stable identifier for the specific key

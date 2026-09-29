@@ -3178,9 +3178,18 @@ func TestEvaluateVerifierTrust_RedirectURIScheme_PDPPath_UsesCanonicalURLCacheKe
 	assert.True(t, verifier.Trusted)
 	assert.Equal(t, 1, trustCache.Len())
 
-	cached := trustCache.Get(domain.TenantID(session.TenantID), "https://verifier.example.com/response")
-	require.NotNil(t, cached, "expected the cache entry keyed by the canonical verifier URL")
-	assert.True(t, cached.Trusted)
+	// An identical second request (same canonical URL and PDP-relevant
+	// context) must hit the same cache entry rather than reaching the PDP
+	// again - proving the canonical-URL-based key is being computed
+	// consistently, without depending on its exact (now context-hash-
+	// suffixed) string form.
+	verifier2, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifier2)
+	assert.True(t, verifier2.Trusted)
+	assert.Equal(t, 1, trustCache.Len())
+	assert.Equal(t, []string{"https://verifier.example.com"}, stub.evaluated,
+		"the second, identical request must be served from cache, not the PDP again")
 }
 
 // A DID document can list multiple active verification methods (key
@@ -3335,6 +3344,75 @@ func TestEvaluateVerifierTrust_AttestationCacheKeyIncludesRawJWTHash(t *testing.
 	// key must still reach the PDP independently - never served from the
 	// first attestation's cache entry.
 	assert.Equal(t, []string{clientID, clientID}, stub.evaluated)
+	assert.Equal(t, 2, trustCache.Len())
+}
+
+// The verified identity (a certificate, a matched DID key, an attestation)
+// only proves who signed a request - it says nothing about the OTHER
+// PDP-relevant context of that request (response_uri/redirect_uri, an OIDF
+// trust_chain). The SAME identity presenting a DIFFERENT response_uri must
+// reach the PDP independently: a policy may only trust a verifier for a
+// specific callback endpoint, and the cache must not let a verdict earned
+// for one endpoint answer for another.
+func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
+	requestJWT, _ := makeSignedJWTWithX5C(t) // same certificate both times
+
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	stub := &stubDIDResolver{decisionOk: true, decision: true}
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	trustCache := NewTrustCache(time.Hour)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VPHandler{BaseHandler: BaseHandler{
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
+	}}
+
+	baseReq := &AuthorizationRequest{
+		ClientID:       "verifier.example.com",
+		ClientIDScheme: ClientIDSchemeX509SANDNS,
+		Nonce:          "n",
+		RequestJWT:     requestJWT,
+	}
+
+	req1 := *baseReq
+	req1.ResponseURI = "https://verifier.example.com/response-a"
+	v1, err := h.evaluateVerifierTrust(context.Background(), &req1)
+	require.NoError(t, err)
+	require.True(t, v1.Trusted)
+	assert.Equal(t, 1, trustCache.Len())
+
+	req2 := *baseReq
+	req2.ResponseURI = "https://verifier.example.com/response-b"
+	v2, err := h.evaluateVerifierTrust(context.Background(), &req2)
+	require.NoError(t, err)
+	require.True(t, v2.Trusted)
+
+	// Same certificate, different response_uri: the PDP must be consulted
+	// again rather than reusing the first response_uri's cached verdict.
+	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated)
+	assert.Equal(t, 2, trustCache.Len())
+
+	// A genuinely identical repeat (same cert, same response_uri) must
+	// still hit the cache, proving this isn't simply caching turned off.
+	req1Repeat := *baseReq
+	req1Repeat.ResponseURI = "https://verifier.example.com/response-a"
+	v1Repeat, err := h.evaluateVerifierTrust(context.Background(), &req1Repeat)
+	require.NoError(t, err)
+	require.True(t, v1Repeat.Trusted)
+	assert.Equal(t, []string{"verifier.example.com", "verifier.example.com"}, stub.evaluated,
+		"an identical repeat of the first request must be served from cache")
 	assert.Equal(t, 2, trustCache.Len())
 }
 
