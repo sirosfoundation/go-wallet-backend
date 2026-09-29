@@ -535,13 +535,27 @@ func setupServerTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	v := tokenvalidator.New(tokenvalidator.Config{
 		JWKSURL: srv.URL,
 		Issuer:  "test-issuer",
+		// go-tokenauth v0.5.0 made Config.Audiences mandatory - both
+		// validation paths now refuse to validate at all when it's empty
+		// (closing a fail-open audience-confusion gap). This mirrors the
+		// real deployment's Audiences: cfg.AS.Audiences (the whole
+		// deployment's configured, accepted set - see
+		// NewBackendProvider/NewAuthProvider's own wiring), with
+		// route-level restriction still layered on top via
+		// result.HasAudience/RequireAudience - so it must list every
+		// audience any test in this file signs a token for, not just the
+		// one(s) a given test expects to ultimately be accepted after that
+		// finer route-level check.
+		Audiences: []string{"wallet-registry", "wallet-backend", "some-other-audience"},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: jwt.Claims{Audience: jwt.Audience{"wallet-backend"}},
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Validate(context.Background(), probe); err == nil {

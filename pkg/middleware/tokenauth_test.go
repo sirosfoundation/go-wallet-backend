@@ -45,6 +45,13 @@ func (s *stubTenantStore) GetAll(context.Context) ([]*domain.Tenant, error) {
 	return nil, nil
 }
 
+// testTokenAudience is the audience every test in this file configures its
+// validator with and signs its tokens for. go-tokenauth v0.5.0 made
+// Config.Audiences mandatory (both validation paths now refuse to validate
+// at all when it's empty, closing a fail-open audience-confusion gap) -
+// see signToken/setupTokenAuthTest.
+const testTokenAudience = "test-audience"
+
 // testTokenAuthConfig returns a minimal config for TokenAuthMiddleware in
 // tests. Only JWT.Secret matters - it's used solely to re-parse a
 // legacy-mode token for its "sid" claim (see legacytoken.SID) - and none of
@@ -74,15 +81,18 @@ func setupTokenAuthTest(t *testing.T) (*validator.Validator, *ecdsa.PrivateKey, 
 	t.Cleanup(srv.Close)
 
 	v := validator.New(validator.Config{
-		JWKSURL: srv.URL,
-		Issuer:  "test-issuer",
+		JWKSURL:   srv.URL,
+		Issuer:    "test-issuer",
+		Audiences: []string{testTokenAudience},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: jwt.Claims{Audience: jwt.Audience{testTokenAudience}},
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Validate(context.Background(), probe); err == nil {
@@ -112,6 +122,7 @@ func signToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl claims.Acc
 	cl.Claims = jwt.Claims{
 		Issuer:    issuer,
 		Subject:   cl.Claims.Subject,
+		Audience:  cl.Claims.Audience,
 		IssuedAt:  jwt.NewNumericDate(now),
 		NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Second)),
 		Expiry:    jwt.NewNumericDate(now.Add(5 * time.Minute)),
@@ -132,7 +143,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "test-tenant",
 		TAC:      "rwl",
 	})
@@ -210,7 +221,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "disabled",
 		TAC:      "r",
 	})
@@ -235,7 +246,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "nonexistent",
 		TAC:      "r",
 	})
@@ -271,7 +282,7 @@ func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "revoked-user"},
+		Claims:   jwt.Claims{Subject: "revoked-user", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "test-tenant",
 		TAC:      "rwl",
 	})
@@ -306,7 +317,7 @@ func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "test-tenant",
 		TAC:      "rwl",
 	})
@@ -342,6 +353,8 @@ func createLegacyModeTokenWithSID(secret, userID, jti, sid string) string {
 		"tenant_id": "test-tenant",
 		"jti":       jti,
 		"sid":       sid,
+		"iss":       "legacy-mode-test-issuer",
+		"aud":       testTokenAudience,
 		"exp":       time.Now().Add(time.Hour).Unix(),
 	})
 	signed, _ := token.SignedString([]byte(secret))
@@ -360,7 +373,12 @@ func createLegacyModeTokenWithSID(secret, userID, jti, sid string) string {
 func TestTokenAuthMiddleware_ModeLegacy_RevokedFamilyTokenRejected(t *testing.T) {
 	secret := "legacy-mode-test-secret"
 	v := validator.New(validator.Config{
-		Legacy: validator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret)},
+		Audiences: []string{testTokenAudience},
+		Legacy: validator.LegacyConfig{
+			Enabled:    true,
+			HMACSecret: []byte(secret),
+			Issuers:    []string{"legacy-mode-test-issuer"},
+		},
 	})
 	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
 		"test-tenant": {ID: "test-tenant", Enabled: true},

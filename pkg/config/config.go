@@ -69,7 +69,13 @@ type ASConfig struct {
 
 	// Audiences lists the accepted audience values for token validation.
 	// Tokens must contain at least one of these in their "aud" claim.
-	// When empty, audience validation is skipped.
+	// Required when AS is enabled - Validate() rejects an empty list.
+	// go-tokenauth v0.5.0 made this mandatory at the validator level too
+	// (both its validation paths now refuse to validate at all when their
+	// own configured Audiences is empty, closing a fail-open
+	// audience-confusion gap - a deployment upgraded past that version
+	// with no audiences configured would otherwise reject every request
+	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
@@ -1912,6 +1918,18 @@ func (c *Config) Validate() error {
 		}
 		if c.AS.Issuer == "" {
 			return fmt.Errorf("as: issuer is required (set as.issuer or jwt.issuer)")
+		}
+		// Required as of the go-tokenauth v0.5.0 dependency bump: an empty
+		// Audiences list used to mean "skip audience validation" both here
+		// and in go-tokenauth's own Validator, but go-tokenauth v0.5.0
+		// made it a hard configuration error there instead (closing a
+		// fail-open audience-confusion gap) - every request would
+		// otherwise start being silently rejected at runtime the moment
+		// this dependency is upgraded, for any deployment that previously
+		// relied on the old "empty means accept any audience" behavior.
+		// Failing fast here, at startup, is far preferable to that.
+		if len(c.AS.Audiences) == 0 {
+			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
 		}
 	}
 

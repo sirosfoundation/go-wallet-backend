@@ -1676,6 +1676,7 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
 	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.AS.Audiences = []string{"wallet-backend"}
 	cfg.JWT.Issuer = "https://example.com"
 	err := cfg.Validate()
 	if err != nil {
@@ -1683,6 +1684,29 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	}
 	if cfg.AS.Issuer != "https://example.com" {
 		t.Errorf("expected AS issuer to fall back to JWT issuer, got %q", cfg.AS.Issuer)
+	}
+}
+
+// TestConfig_Validate_AS_MissingAudiences is a regression test for the
+// go-tokenauth v0.5.0 dependency bump: go-tokenauth's own Validator now
+// refuses to validate ANY token at all when its configured Audiences is
+// empty (previously "empty means accept any audience"). Config.Validate()
+// must fail fast at startup on the same condition, rather than let an
+// AS-enabled deployment with no audiences configured start up seemingly
+// fine and then silently reject every request once traffic arrives.
+func TestConfig_Validate_AS_MissingAudiences(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	// No AS.Audiences set.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing as.audiences")
+	}
+	if !strings.Contains(err.Error(), "audiences is required") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

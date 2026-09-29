@@ -49,13 +49,26 @@ func setupEngineTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	}))
 	t.Cleanup(srv.Close)
 
-	v := tokenvalidator.New(tokenvalidator.Config{JWKSURL: srv.URL, Issuer: "test-issuer"})
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: srv.URL,
+		Issuer:  "test-issuer",
+		// go-tokenauth v0.5.0 made Config.Audiences mandatory - both
+		// validation paths now refuse to validate at all when it's empty
+		// (closing a fail-open audience-confusion gap). This mirrors the
+		// real deployment's Audiences: cfg.AS.Audiences, with route-level
+		// restriction (result.HasAudience) still layered on top, so it
+		// must list every audience any test in this file signs a token
+		// for.
+		Audiences: []string{"wallet-registry", "wallet-backend", "some-other-audience"},
+	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}},
+	})
 	require.Eventually(t, func() bool {
 		_, err := v.Validate(context.Background(), probe)
 		return err == nil
@@ -592,7 +605,12 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *tes
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
 	m := NewManager(cfg, zap.NewNop())
 	v := tokenvalidator.New(tokenvalidator.Config{
-		Legacy: tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret)},
+		Audiences: []string{"wallet-registry"},
+		Legacy: tokenvalidator.LegacyConfig{
+			Enabled:    true,
+			HMACSecret: []byte(secret),
+			Issuers:    []string{"test-legacy-issuer"},
+		},
 	})
 	m.SetTokenValidator(v)
 	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-2": true}})
@@ -602,6 +620,7 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *tes
 		"tenant_id": "test-tenant",
 		"jti":       "jti-not-individually-blacklisted-2",
 		"sid":       "sid-revoked-2",
+		"iss":       "test-legacy-issuer",
 		"aud":       "wallet-registry",
 		"exp":       time.Now().Add(time.Hour).Unix(),
 	})
