@@ -274,7 +274,6 @@ go-wallet-backend/
 ## Security Features
 
 - **Authentication**: JWT, WebAuthn
-- **Password Hashing**: bcrypt (cost 12)
 - **HTTPS**: Recommended for production
 - **CORS**: Configurable origins
 - **Secrets**: Environment variables, never in code
