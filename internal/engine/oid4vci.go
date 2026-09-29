@@ -1406,6 +1406,19 @@ func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer st
 			"metadata_validated": metadataValidated,
 		},
 	}
+	if requiresResolution {
+		// Unlike OID4VP's decentralized_identifier:-prefixed client_id (see
+		// oid4vp.go's ResolutionSubjectID), an OID4VCI issuer identifier has
+		// no scheme prefix to strip in the first place - issuer already IS
+		// the bare DID whenever requiresResolution is true, so no
+		// didFromClientID-equivalent extraction is needed here. But
+		// ResolutionSubjectID is still required by TrustEvaluationRequest's
+		// documented contract whenever RequiresResolution is true (see
+		// messages.go), and a real frontend implementing that contract has
+		// no reason to fall back to SubjectID on its own - so it must be
+		// populated explicitly here too, not left empty.
+		trustReq.ResolutionSubjectID = issuer
+	}
 
 	// Convert key material for frontend (nil for DID schemes - frontend resolves)
 	if keyMaterial != nil {
@@ -1417,7 +1430,14 @@ func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer st
 	}
 
 	// Send trust evaluation request to frontend
-	// Skip validation for issuers - RequiresResolution doesn't require RequestJWT
+	// Skip the shared TrustEvaluationRequest.Validate() for issuers: unlike
+	// an OID4VP verifier, an OID4VCI issuer has no signed request object for
+	// the frontend to verify, so RequestJWT is never applicable here -
+	// Validate() would reject every DID issuer over a requirement that
+	// genuinely doesn't apply to this flow. ResolutionSubjectID is still
+	// populated above whenever RequiresResolution is true, though: that
+	// part of the contract does apply here too (a real frontend follows the
+	// same documented contract for both issuer and verifier requests).
 	if trustReq.SubjectID == "" {
 		return nil, errors.New("invalid trust evaluation request: SubjectID is required")
 	}
