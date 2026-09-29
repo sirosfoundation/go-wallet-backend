@@ -600,11 +600,16 @@ type ServerConfig struct {
 	// TrustedProxies lists the proxy addresses or CIDRs whose X-Forwarded-For
 	// (and X-Real-IP) headers are believed when determining the client IP,
 	// which the per-IP rate limits depend on. Use ["none"] to trust no proxy
-	// (the client IP is then the TCP peer). Unset keeps gin's default of
-	// trusting every peer, which lets a direct caller pick its own IP by
-	// sending X-Forwarded-For, so per-IP limits can be bypassed; a warning is
-	// logged at startup while per-IP limiting is enabled. Set this to your
-	// load balancer's addresses in production.
+	// (the client IP is then the TCP peer, which is right when clients connect
+	// directly).
+	// BACKWARDS COMPATIBILITY: when unset, gin's original behaviour is kept and
+	// every peer is trusted. That lets any direct caller choose its own client
+	// IP by sending X-Forwarded-For, so the per-IP limits can be bypassed (the
+	// per-tenant limit still holds), and a warning is logged at startup while
+	// per-IP limiting is enabled. It stays the default so an upgrade does not
+	// put every client behind a load balancer into one rate-limit bucket.
+	// Production deployments should set this: to the load balancer's addresses
+	// behind one, or ["none"] without one.
 	// Env: WALLET_SERVER_TRUSTED_PROXIES (comma-separated)
 	TrustedProxies []string `yaml:"trusted_proxies" envconfig:"TRUSTED_PROXIES"`
 	// EngineWSPingInterval is how often the server sends a WebSocket ping to
