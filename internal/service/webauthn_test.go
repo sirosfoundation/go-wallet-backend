@@ -2356,6 +2356,81 @@ func TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated(t 
 	assert.Equal(t, domain.InviteStatusActive, gotInvite.Status)
 }
 
+// TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent
+// covers the ordering of identity:bound (#66): it is emitted only after the
+// user is persisted, so an atomic invite-claim failure leaves no bound record.
+func TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:          domain.TenantID("tenant-invite-fail"),
+		Name:        "Invite Fail Tenant",
+		DisplayName: "Invite Fail Tenant",
+		Enabled:     true,
+	}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenant))
+
+	invite := &domain.Invite{
+		ID:        "invite-1",
+		TenantID:  tenant.ID,
+		Code:      "INVITE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, baseStore.Invites().Create(ctx, invite))
+
+	wrapped := &storeWithInviteOverride{
+		Store: baseStore,
+		invites: &erroringInviteStore{
+			InviteStore: baseStore.Invites(),
+			failCode:    invite.Code,
+			err:         errors.New("simulated atomic claim failure"),
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+	auditEvents := attachIdentityAudit(t, svc, config.AuditIdentityBound)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Invite Fail User",
+		TenantID:    string(tenant.ID),
+		InviteCode:  invite.Code,
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID:     beginResp.ChallengeID,
+		Credential:      json.RawMessage(regResponse),
+		DisplayName:     "Invite Fail User",
+		OIDCGateBinding: &OIDCGateBinding{Issuer: "https://idp.example.com", Subject: "alice"},
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	// The registration was rejected, so the identity was never bound and no
+	// immutable "bound" record may exist for it (#66).
+	assert.Empty(t, auditEvents.URIs(), "a failed registration must not emit identity:bound")
+}
+
 // TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed is
 // the defense-in-depth companion to
 // TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected: even
