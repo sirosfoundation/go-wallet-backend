@@ -7,7 +7,6 @@ package middleware
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -23,26 +22,28 @@ import (
 type TokenAuthOption func(*tokenAuthOptions)
 
 type tokenAuthOptions struct {
-	legacyAllowed func(time.Time) bool
+	sessionAudiences []string
 }
 
-// WithLegacyAllowed makes the middleware refuse legacy (HMAC) tokens whenever
-// allowed(now) is false (as.legacy.sunset_date enforcement).
-func WithLegacyAllowed(allowed func(time.Time) bool) TokenAuthOption {
-	return func(o *tokenAuthOptions) { o.legacyAllowed = allowed }
+// WithSessionAudiences restricts new-style (ES256/JWKS) tokens to the given
+// "aud" values. It deliberately never applies to legacy HMAC tokens, which
+// carry the RP ID as "aud": while legacy is enabled they must not be rejected
+// by an audience list (backwards compatibility).
+func WithSessionAudiences(auds []string) TokenAuthOption {
+	return func(o *tokenAuthOptions) { o.sessionAudiences = auds }
 }
 
-// LegacyIssuanceGate refuses (410 Gone) requests to endpoints that mint legacy
-// HMAC session tokens once allowed(now) is false. The response tells clients to
-// use the session-mode flow (X-Token-Mode: session).
-func LegacyIssuanceGate(allowed func(time.Time) bool) gin.HandlerFunc {
+// LegacyIssuanceGate refuses (410) requests to endpoints that mint legacy
+// HMAC session tokens when legacy is disabled (as.legacy.enabled=false). The
+// response tells clients to use the session-mode flow (X-Token-Mode: session).
+func LegacyIssuanceGate(enabled bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if allowed == nil || allowed(time.Now()) {
+		if enabled {
 			c.Next()
 			return
 		}
 		c.AbortWithStatusJSON(410, gin.H{
-			"error":   "legacy_tokens_sunset",
+			"error":   "legacy_tokens_disabled",
 			"message": "legacy HMAC session tokens are no longer issued; use the /auth/passkey endpoints with X-Token-Mode: session",
 		})
 	}
@@ -101,11 +102,10 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 			return
 		}
 
-		// Sunset enforcement: a legacy (HMAC) token is refused once the
-		// legacy window has closed, even if the process started before the
-		// sunset date and its validator still has legacy enabled.
-		if result.Mode == claims.ModeLegacy && o.legacyAllowed != nil && !o.legacyAllowed(time.Now()) {
-			logger.Debug("Legacy token refused: as.legacy.sunset_date has passed")
+		// Audience list applies to new-style tokens only (see
+		// WithSessionAudiences).
+		if result.Mode != claims.ModeLegacy && len(o.sessionAudiences) > 0 && !result.HasAudience(o.sessionAudiences...) {
+			logger.Debug("Token audience not accepted")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -260,7 +260,9 @@ func RequireAudience(allowed ...string) gin.HandlerFunc {
 			return
 		}
 
-		if !result.HasAudience(allowed...) {
+		// Legacy HMAC tokens carry the RP ID as "aud", not a service name, so
+		// the audience restriction only applies to new-style tokens.
+		if result.Mode != claims.ModeLegacy && !result.HasAudience(allowed...) {
 			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return

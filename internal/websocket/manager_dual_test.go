@@ -68,16 +68,16 @@ func wsHMAC(t *testing.T, secret string) string {
 	return s
 }
 
-func wsCfg(asEnabled bool, sunset string) *config.Config {
+func wsCfg(asEnabled, legacyEnabled bool) *config.Config {
 	c := &config.Config{JWT: config.JWTConfig{Secret: wsDualSecret}}
 	c.AS.Enabled = asEnabled
-	c.AS.Legacy = config.ASLegacyConfig{Enabled: true, SunsetDate: sunset}
+	c.AS.Legacy = config.ASLegacyConfig{Enabled: legacyEnabled}
 	return c
 }
 
 func TestManager_validateToken_Dual(t *testing.T) {
 	v, key := wsValidator(t, true)
-	m := NewManager(wsCfg(true, ""), zap.NewNop())
+	m := NewManager(wsCfg(true, true), zap.NewNop())
 	m.SetTokenValidator(v)
 
 	uid, err := m.validateToken(wsES256(t, key, "es-user", time.Minute))
@@ -107,7 +107,7 @@ func TestManager_validateToken_Dual(t *testing.T) {
 
 func TestManager_validateToken_LegacyDisabledInValidator(t *testing.T) {
 	v, key := wsValidator(t, false)
-	m := NewManager(wsCfg(true, ""), zap.NewNop())
+	m := NewManager(wsCfg(true, true), zap.NewNop())
 	m.SetTokenValidator(v)
 	_, err := m.validateToken(wsHMAC(t, wsDualSecret))
 	assert.Error(t, err)
@@ -115,35 +115,40 @@ func TestManager_validateToken_LegacyDisabledInValidator(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestManager_validateToken_SunsetPassed(t *testing.T) {
-	past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-
-	// With a validator that (started before sunset) still has legacy on.
-	v, key := wsValidator(t, true)
-	m := NewManager(wsCfg(true, past), zap.NewNop())
-	m.SetTokenValidator(v)
+func TestManager_validateToken_LegacyDisabled(t *testing.T) {
+	// Without a validator: HMAC refused when the AS is enabled with legacy off.
+	m := NewManager(wsCfg(true, false), zap.NewNop())
 	_, err := m.validateToken(wsHMAC(t, wsDualSecret))
-	assert.ErrorContains(t, err, "no longer accepted")
-	_, err = m.validateToken(wsES256(t, key, "u", time.Minute))
-	assert.NoError(t, err, "ES256 stays valid after sunset")
-
-	// Without a validator: HMAC path refused after sunset, allowed before.
-	m = NewManager(wsCfg(true, past), zap.NewNop())
-	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
-	assert.ErrorContains(t, err, "no longer accepted")
-	m = NewManager(wsCfg(true, future), zap.NewNop())
-	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
-	assert.NoError(t, err)
-
-	// AS disabled: HMAC is the only mechanism and is not affected by a stray date.
-	m = NewManager(wsCfg(false, past), zap.NewNop())
+	assert.ErrorContains(t, err, "disabled")
+	// Legacy on: allowed.
+	m = NewManager(wsCfg(true, true), zap.NewNop())
 	_, err = m.validateToken(wsHMAC(t, wsDualSecret))
 	assert.NoError(t, err)
 }
 
+func TestManager_validateToken_AudienceNewStyleOnly(t *testing.T) {
+	v, key := wsValidator(t, true)
+	cfg := wsCfg(true, true)
+	cfg.AS.Audiences = []string{"wallet-backend"}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenValidator(v)
+
+	// Legacy HMAC token carries the RP ID as aud: never filtered.
+	hm, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "legacy-user", "aud": "rp.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(wsDualSecret))
+	require.NoError(t, err)
+	uid, err := m.validateToken(hm)
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-user", uid)
+
+	// New-style token without the audience is refused (wsES256 sets none).
+	_, err = m.validateToken(wsES256(t, key, "u", time.Minute))
+	assert.ErrorContains(t, err, "audience")
+}
+
 func TestManager_validateToken_EmptySecretRefused(t *testing.T) {
-	cfg := wsCfg(false, "")
+	cfg := wsCfg(false, true)
 	cfg.JWT.Secret = ""
 	m := NewManager(cfg, zap.NewNop())
 	_, err := m.validateToken(wsHMAC(t, ""))

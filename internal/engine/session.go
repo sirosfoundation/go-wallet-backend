@@ -781,15 +781,15 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if err != nil {
 			return "", "", "", err
 		}
-		// Sunset enforcement: refuse legacy (HMAC) tokens once
-		// as.legacy.sunset_date has passed, even if this process started
-		// earlier and its validator still has legacy enabled.
-		if result.Mode == claims.ModeLegacy && !m.cfg.LegacyAllowed(time.Now()) {
-			return "", "", "", errors.New("legacy tokens are no longer accepted (as.legacy.sunset_date has passed)")
+		// The AS audience list applies to new-style tokens only (legacy
+		// HMAC tokens carry the RP ID as "aud").
+		if aud := m.cfg.AS.Audiences; result.Mode != claims.ModeLegacy && len(aud) > 0 && !result.HasAudience(aud...) {
+			return "", "", "", errors.New("token audience not accepted")
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
-		if !result.HasAudience("wallet-registry", "wallet-backend") {
+		// Legacy HMAC tokens are exempt: their "aud" is the RP ID.
+		if result.Mode != claims.ModeLegacy && !result.HasAudience("wallet-registry", "wallet-backend") {
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
@@ -807,7 +807,14 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
-	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
+	// Legacy path: direct HMAC validation, only while legacy is enabled. This
+	// applies whether or not a validator is wired (a standalone engine has
+	// none); with as.legacy.enabled=false no HMAC token is accepted.
+	if !m.cfg.LegacyEnabled() {
+		return "", "", "", errors.New("legacy tokens are disabled")
+	}
+
+	// Unlike the go-tokenauth branch
 	// above, nothing else in this path ever checks revocation at all, so
 	// both checks below are needed, not just the user-level one (#391
 	// review, round 2).

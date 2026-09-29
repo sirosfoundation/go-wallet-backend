@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -16,28 +15,22 @@ import (
 )
 
 func TestLogLegacyTokenStatus(t *testing.T) {
-	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
-	ts := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339) }
 	cases := []struct {
-		name    string
-		as      config.ASConfig
-		want    string
-		level   string
-		nothing bool
+		name  string
+		as    config.ASConfig
+		want  string
+		level string
+		none  bool
 	}{
 		{"AS disabled logs nothing", config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true}}, "", "", true},
-		{"disabled", config.ASConfig{Enabled: true}, "disabled (as.legacy.enabled=false)", "info", false},
-		{"sunset passed", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true, SunsetDate: ts(-time.Second)}}, "sunset_date has passed", "warn", false},
-		{"exactly at sunset", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true, SunsetDate: ts(0)}}, "sunset_date has passed", "warn", false},
-		{"inside 30 days", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true, SunsetDate: ts(30 * 24 * time.Hour)}}, "DEPRECATION", "warn", false},
-		{"just outside 30 days", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true, SunsetDate: ts(30*24*time.Hour + time.Second)}}, "enabled until", "info", false},
-		{"no sunset", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true}}, "no as.legacy.sunset_date", "info", false},
+		{"enabled", config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true}}, "enabled", "info", false},
+		{"disabled", config.ASConfig{Enabled: true}, "DISABLED", "warn", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			core, logs := observer.New(zap.InfoLevel)
-			LogLegacyTokenStatus(&config.Config{AS: tc.as}, zap.New(core), now)
-			if tc.nothing {
+			LogLegacyTokenStatus(&config.Config{AS: tc.as}, zap.New(core))
+			if tc.none {
 				assert.Equal(t, 0, logs.Len())
 				return
 			}
@@ -50,7 +43,6 @@ func TestLogLegacyTokenStatus(t *testing.T) {
 
 func TestAuthProvider_legacyIssuanceGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	status := func(cfg *config.Config) int {
 		p := &AuthProvider{cfg: cfg}
 		r := gin.New()
@@ -61,12 +53,11 @@ func TestAuthProvider_legacyIssuanceGate(t *testing.T) {
 	}
 	// AS disabled: HMAC is the only mechanism, gate is a no-op.
 	c := &config.Config{}
-	c.AS.Legacy = config.ASLegacyConfig{Enabled: true, SunsetDate: past}
 	assert.Equal(t, 200, status(c))
-	// AS enabled, sunset passed: refused.
+	// AS enabled, legacy disabled: refused.
 	c.AS.Enabled = true
 	assert.Equal(t, 410, status(c))
-	// AS enabled, legacy active: open.
-	c.AS.Legacy.SunsetDate = ""
+	// AS enabled, legacy enabled: open.
+	c.AS.Legacy.Enabled = true
 	assert.Equal(t, 200, status(c))
 }

@@ -45,7 +45,7 @@ func (m *mockWebAuthn) FinishRegistration(_ context.Context, _ *service.FinishRe
 func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
-	cfg := &config.ASConfig{
+	cfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
@@ -319,33 +319,32 @@ func TestPasskeyRegisterFinish_BadRequest(t *testing.T) {
 	}
 }
 
-func TestPasskeyFinish_LegacyClientRefusedAfterSunset(t *testing.T) {
+func TestPasskeyFinish_LegacyClientRefusedWhenLegacyDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mock := &mockWebAuthn{
 		finishLoginResp: &service.FinishLoginResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
 		finishRegResp:   &service.FinishRegistrationResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
 	}
+	// as.legacy.enabled=false, no sunset date: config alone decides.
 	cfg := &config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}
-	cfg.Legacy = config.ASLegacyConfig{Enabled: true, SunsetDate: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)}
 	h := NewPasskeyHandlers(mock, NewMemorySessionStore(), nil, cfg, zap.NewNop())
 	router := gin.New()
 	router.POST("/login/finish", h.LoginFinish)
 	router.POST("/register/finish", h.RegisterFinish)
 
 	for _, path := range []string{"/login/finish", "/register/finish"} {
-		// Legacy client (no X-Token-Mode): refused, no token minted.
 		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte("{}")))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
-		if w.Code != http.StatusGone {
-			t.Errorf("%s: expected 410 for legacy client after sunset, got %d: %s", path, w.Code, w.Body.String())
+		if w.Code != http.StatusGone || !bytes.Contains(w.Body.Bytes(), []byte("legacy_tokens_disabled")) {
+			t.Errorf("%s: expected 410 legacy_tokens_disabled for legacy client, got %d: %s", path, w.Code, w.Body.String())
 		}
 		if bytes.Contains(w.Body.Bytes(), []byte("SECRETVALUE")) {
 			t.Errorf("%s: response must not contain a token", path)
 		}
 
-		// Session-mode client: unaffected by the sunset.
+		// Session-mode client: unaffected.
 		req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte("{}")))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(TokenModeHeader, TokenModeSessionValue)

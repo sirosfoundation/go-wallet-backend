@@ -2639,3 +2639,53 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestConfig_LegacyEnabled(t *testing.T) {
+	c := &Config{}
+	if !c.LegacyEnabled() {
+		t.Error("unloaded config with AS disabled: HMAC is the only mechanism")
+	}
+	c.AS.Enabled = true
+	if c.LegacyEnabled() {
+		t.Error("AS enabled, legacy off: must be disabled")
+	}
+	c.AS.Legacy.Enabled = true
+	if !c.LegacyEnabled() {
+		t.Error("AS enabled, legacy on")
+	}
+	// Loaded configs follow as.legacy.enabled even when this process has no AS
+	// (standalone engine/registry mirroring the backend).
+	c = &Config{loaded: true}
+	if c.LegacyEnabled() {
+		t.Error("loaded config with as.legacy.enabled=false must be disabled")
+	}
+	c.AS.Legacy.Enabled = true
+	if !c.LegacyEnabled() {
+		t.Error("loaded config with as.legacy.enabled=true must be enabled")
+	}
+}
+
+func TestLoad_LegacyEnabledDefaultsTrue(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/c.yaml"
+	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LegacyEnabled() {
+		t.Error("as.legacy.enabled must default to true")
+	}
+	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nas:\n  legacy:\n    enabled: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacyEnabled() {
+		t.Error("explicit as.legacy.enabled=false must disable legacy even with the AS disabled")
+	}
+}

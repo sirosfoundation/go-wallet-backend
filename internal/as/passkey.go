@@ -53,18 +53,16 @@ func NewPasskeyHandlers(
 	}
 }
 
-// refuseSunsetLegacy answers 410 and returns true when the request comes from a
-// legacy client (no X-Token-Mode: session) and the legacy window has closed
-// (as.legacy.sunset_date reached): legacy HMAC tokens are neither validated
-// nor issued any more, so the flow is refused up front instead of minting an
-// unusable token. Only the sunset date triggers this; as.legacy.enabled=false
-// alone keeps the pre-existing behavior.
-func (h *PasskeyHandlers) refuseSunsetLegacy(c *gin.Context) bool {
-	if DetectClientMode(c) == ClientModeSession || !h.cfg.Legacy.SunsetPassed(time.Now()) {
+// refuseDisabledLegacy answers 410 and returns true when the request comes from
+// a legacy client (no X-Token-Mode: session) and legacy is disabled
+// (as.legacy.enabled=false): HMAC tokens are neither validated nor issued, so
+// the flow is refused up front instead of minting an unusable token.
+func (h *PasskeyHandlers) refuseDisabledLegacy(c *gin.Context) bool {
+	if DetectClientMode(c) == ClientModeSession || h.cfg.Legacy.Enabled {
 		return false
 	}
 	c.AbortWithStatusJSON(http.StatusGone, gin.H{
-		"error":   "legacy_tokens_sunset",
+		"error":   "legacy_tokens_disabled",
 		"message": "legacy HMAC session tokens are no longer issued; send X-Token-Mode: session",
 	})
 	return true
@@ -90,7 +88,7 @@ func (h *PasskeyHandlers) LoginBegin(c *gin.Context) {
 // this request (see RegisterRoutes' OIDCGateMiddleware), is passed through so
 // FinishLogin can verify it against the credential's actual tenant.
 func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
-	if h.refuseSunsetLegacy(c) {
+	if h.refuseDisabledLegacy(c) {
 		return
 	}
 	var req service.FinishLoginRequest
@@ -254,7 +252,7 @@ func requestTenantID(c *gin.Context) domain.TenantID {
 // RegisterFinish handles POST /auth/passkey/register/finish.
 // Creates a session on successful registration (auto-login).
 func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
-	if h.refuseSunsetLegacy(c) {
+	if h.refuseDisabledLegacy(c) {
 		return
 	}
 	var req service.FinishRegistrationRequest

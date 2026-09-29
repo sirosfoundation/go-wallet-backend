@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,12 +66,19 @@ func NewASModule(
 	blacklist TokenBlacklistChecker,
 	httpClient *http.Client,
 	logger *zap.Logger,
-) (*ASModule, error) {
+) (module *ASModule, err error) {
 	// Key manager.
 	km, err := newConfiguredKeyManager(cfg)
 	if err != nil {
 		return nil, err
 	}
+	// Release HSM sessions on every later failure so a retried init cannot
+	// leak them.
+	defer func() {
+		if err != nil {
+			_ = km.Close()
+		}
+	}()
 
 	// Token issuer.
 	issuer := cfg.Issuer
@@ -91,7 +99,7 @@ func NewASModule(
 	// this issuer, including - silently - LogoutHandler's legacy-token
 	// blacklisting fallback (#391 review, round 3).
 	var legacyIssuer *LegacyTokenIssuer
-	if cfg.Legacy.Active(time.Now()) {
+	if cfg.Legacy.Enabled {
 		legacyIssuer = NewLegacyTokenIssuer(
 			[]byte(jwtCfg.Secret),
 			jwtCfg.Issuer,
@@ -153,6 +161,13 @@ func NewASModule(
 func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
+
+	// Metadata for issuer/jwks_uri discovery by separate processes (e.g. the
+	// registry). Needs the public base URL; without it the jwks_uri cannot
+	// be stated and the route is not registered.
+	if ext := strings.TrimRight(m.Config.ExternalURL, "/"); ext != "" {
+		RegisterMetadataRoute(auth.Group(""), m.TokenIssuer.issuer, ext+"/auth/.well-known/jwks.json")
+	}
 
 	// Passkey authentication (public, no auth — but tenant-scoped).
 	// Tenant comes from the validated X-Tenant-ID header, never from the

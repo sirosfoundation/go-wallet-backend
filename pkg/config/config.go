@@ -40,6 +40,12 @@ type Config struct {
 	// never configured". Unexported: never (un)marshaled, so it can't leak
 	// into YAML output or be set by config files/env itself.
 	asEnabledExplicit bool
+
+	// loaded is set by Load(): the config came through defaultConfig() (which
+	// sets as.legacy.enabled=true), so AS.Legacy.Enabled is authoritative
+	// even when the AS itself is disabled in this process (e.g. a standalone
+	// engine or registry mirroring the backend's as.legacy.enabled=false).
+	loaded bool
 }
 
 // ASConfig contains the new Authorization Server configuration.
@@ -117,59 +123,22 @@ type ASLegacyConfig struct {
 	// are sent on legacy token responses.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is the instant after which legacy tokens are no longer
-	// supported. Format: RFC 3339 (e.g. "2027-10-01T00:00:00Z"). Besides the
-	// Sunset HTTP header it is enforced: once reached, HMAC tokens are
-	// refused (per request, no restart needed) and legacy issuance stops (the
-	// /user/* login, register and refresh routes and legacy-mode
-	// /auth/passkey finish calls answer 410). A warning is logged at startup
-	// within 30 days of it. A malformed value is a config error.
+	// SunsetDate is the date after which legacy tokens will no longer be supported.
+	// Informational only: used in the Sunset HTTP header. It does not disable
+	// anything; use enabled=false for that. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
 }
 
-// LegacySunsetWarnWindow is how long before as.legacy.sunset_date a
-// deprecation warning is logged at startup.
-const LegacySunsetWarnWindow = 30 * 24 * time.Hour
-
-// SunsetTime parses SunsetDate (RFC 3339). ok is false when no date is
-// configured. A malformed date returns an error.
-func (l ASLegacyConfig) SunsetTime() (t time.Time, ok bool, err error) {
-	if l.SunsetDate == "" {
-		return time.Time{}, false, nil
+// LegacyEnabled reports whether legacy (HMAC) session tokens are permitted.
+// It follows as.legacy.enabled (default true; false refuses HMAC everywhere
+// and stops legacy issuance). For a Config that did not come through Load()
+// (tests, programmatic use) a disabled AS means HMAC is the only mechanism
+// and stays enabled.
+func (c *Config) LegacyEnabled() bool {
+	if c.loaded {
+		return c.AS.Legacy.Enabled
 	}
-	t, err = time.Parse(time.RFC3339, l.SunsetDate)
-	if err != nil {
-		return time.Time{}, false, fmt.Errorf("as.legacy.sunset_date %q is not a valid RFC 3339 timestamp: %w", l.SunsetDate, err)
-	}
-	return t, true, nil
-}
-
-// SunsetPassed reports whether the sunset date has been reached (the sunset
-// instant itself counts as passed). A configured but unparsable date counts as
-// passed, so a broken date can never keep legacy tokens alive (fail closed).
-func (l ASLegacyConfig) SunsetPassed(now time.Time) bool {
-	t, ok, err := l.SunsetTime()
-	if err != nil {
-		return true
-	}
-	return ok && !now.Before(t)
-}
-
-// Active reports whether legacy HMAC tokens may be issued and validated at
-// now: enabled and the sunset date (if any) not yet reached.
-func (l ASLegacyConfig) Active(now time.Time) bool {
-	return l.Enabled && !l.SunsetPassed(now)
-}
-
-// LegacyAllowed reports whether legacy (HMAC) session tokens are permitted at
-// now. When the AS is disabled there is no ES256 alternative, so HMAC remains
-// the only mechanism and is always allowed; otherwise it follows
-// AS.Legacy.Active.
-func (c *Config) LegacyAllowed(now time.Time) bool {
-	if !c.AS.Enabled {
-		return true
-	}
-	return c.AS.Legacy.Active(now)
+	return !c.AS.Enabled || c.AS.Legacy.Enabled
 }
 
 // SetDefaults sets default values for AS configuration.
@@ -1551,6 +1520,7 @@ type RedisConfig struct {
 func Load(configFile string) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
+	cfg.loaded = true
 
 	// Load from YAML file if provided (overrides defaults)
 	if configFile != "" {
@@ -1950,9 +1920,6 @@ func (c *Config) Validate() error {
 			if p.PoolSize < 0 {
 				return fmt.Errorf("as: signing_key_pkcs11.pool_size must not be negative")
 			}
-		}
-		if _, _, err := c.AS.Legacy.SunsetTime(); err != nil {
-			return fmt.Errorf("as: %w", err)
 		}
 		if c.AS.RulesDir == "" {
 			return fmt.Errorf("as: rules_dir is required when AS is enabled (AllowAll is not safe for production)")

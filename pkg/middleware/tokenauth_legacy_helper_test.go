@@ -7,12 +7,13 @@ import (
 	gojwt "github.com/golang-jwt/jwt/v5"
 )
 
-func hmacLegacyToken(t *testing.T, secret []byte) string {
+func gojwtSigned(t *testing.T, secret []byte, claims map[string]any) string {
 	t.Helper()
-	tok := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
-		"user_id": "u1", "tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
-	})
-	s, err := tok.SignedString(secret)
+	m := gojwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix()}
+	for k, v := range claims {
+		m[k] = v
+	}
+	s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, m).SignedString(secret)
 	if err != nil {
 		t.Fatal(err)
 	}

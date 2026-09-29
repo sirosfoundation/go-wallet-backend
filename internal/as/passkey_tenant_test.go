@@ -56,7 +56,7 @@ func setupPasskeyTenantTest(t *testing.T) (*gin.Engine, *memory.Store) {
 		t.Fatalf("failed to create webauthn service: %v", err)
 	}
 
-	asCfg := &config.ASConfig{
+	asCfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
@@ -383,7 +383,7 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 		t.Fatalf("failed to create webauthn service: %v", err)
 	}
 
-	asCfg := &config.ASConfig{
+	asCfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
 		SigningKeyPath:  keyPath,
 		Issuer:          "https://auth.example.com",
 		DefaultMaxTAC:   "rwl",

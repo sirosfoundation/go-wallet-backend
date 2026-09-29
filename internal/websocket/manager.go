@@ -322,8 +322,10 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if result.Mode == claims.ModeLegacy && !m.cfg.LegacyAllowed(time.Now()) {
-			return "", errors.New("legacy tokens are no longer accepted")
+		// Audience list applies to new-style tokens only: legacy HMAC tokens
+		// carry the RP ID as "aud" and must not be rejected by it.
+		if aud := m.cfg.AS.Audiences; result.Mode != claims.ModeLegacy && len(aud) > 0 && !result.HasAudience(aud...) {
+			return "", errors.New("token audience not accepted")
 		}
 		// The keystore socket is per-user: an anonymous (identity-free)
 		// token has nothing to bind to.
@@ -334,9 +336,9 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 	}
 
 	// No validator wired (AS disabled): HMAC is the only mechanism, unless the
-	// AS is enabled and its legacy window has closed - then refuse (fail closed).
-	if !m.cfg.LegacyAllowed(time.Now()) {
-		return "", errors.New("legacy tokens are no longer accepted")
+	// AS is enabled with as.legacy.enabled=false - then refuse (fail closed).
+	if !m.cfg.LegacyEnabled() {
+		return "", errors.New("legacy tokens are disabled")
 	}
 	if m.cfg.JWT.Secret == "" {
 		return "", errors.New("jwt secret not configured")

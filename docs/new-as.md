@@ -287,17 +287,33 @@ Deprecation: true
 Sunset: 2027-10-01T00:00:00Z
 ```
 
-### Sunset enforcement (implemented)
+### Disabling legacy: `as.legacy.enabled=false` (implemented)
 
-`as.legacy.sunset_date` (RFC 3339, validated at startup) is enforced, not just advertised. Once the instant is reached (the instant itself counts as passed) or if the date is malformed, legacy is treated as disabled:
+The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. `as.legacy.sunset_date` stays informational (Sunset header) and disables nothing. With `as.legacy.enabled=false`:
 
-- HMAC tokens are refused by every validator (HTTP routes, engine handshake, keystore websocket, and the registry when `jwt.legacy_sunset_date` mirrors it), evaluated per request so a long-running process does not need a restart. ES256 tokens are unaffected.
-- Legacy issuance stops: `/user/{register,login}-webauthn-*` and `/user/session/refresh` answer `410 legacy_tokens_sunset` (when the AS is enabled), as do legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/finish` calls. Session-mode clients are unaffected.
-- Startup logs one line stating the state; within 30 days of the date it logs a `DEPRECATION` warning.
+- HMAC tokens are refused everywhere: `TokenAuthMiddleware`, the engine handshake (including the standalone-engine HMAC fallback), the keystore websocket, and the registry (`jwt.legacy_enabled=false`). No legacy issuer is created.
+- Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (when the AS is enabled) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/finish`. Session-mode clients are unaffected.
+- One startup log line states whether legacy is enabled.
+
+### Audience semantics
+
+An audience list (`as.audiences`, registry `jwt.audiences`) applies to new-style (ES256/JWKS) tokens only. Legacy HMAC tokens carry the RP ID as `aud` and are never rejected by an audience list while legacy is enabled (signature, expiry and issuer are still checked). `RequireAudience` and the engine's `wallet-registry`/`wallet-backend` check follow the same rule. The registry defaults to requiring `wallet-registry` on ES256 tokens when `jwt.audiences` is unset.
 
 ### Registry / separate processes
 
-`cmd/registry` validates through the same go-tokenauth validator. To accept ES256 session tokens set `jwt.jwks_url` (the backend's `/auth/.well-known/jwks.json`), `jwt.as_issuer` (= `as.issuer`, defaults to `jwt.issuer`) and optionally `jwt.audiences`. HMAC keeps working while `jwt.secret` is set and `jwt.legacy_enabled` is not false. Mirror `as.legacy.sunset_date` into `jwt.legacy_sunset_date`. NB: legacy tokens carry the RP ID as `aud`, so an audience list also filters HMAC tokens; leave `jwt.audiences` empty until legacy is off.
+The AS serves minimal RFC 8414-shaped metadata (`issuer`, `jwks_uri`) at `<external_url>/auth/.well-known/oauth-authorization-server`. The registry discovers issuer and JWKS from it:
+
+```yaml
+jwt:
+  as_url: https://wallet.example.com/auth   # discovery
+  # explicit overrides (skip discovery):
+  # jwks_url: https://wallet.example.com/auth/.well-known/jwks.json
+  # as_issuer: https://wallet.example.com/auth
+  # audiences: [wallet-registry]             # default
+  # legacy_enabled: true                     # mirror as.legacy.enabled
+```
+
+The metadata `issuer` must equal `as_issuer` if set and, when it is itself an http(s) URL, `as_url` (so a URL-form `as.issuer` should be the `/auth` base URL); `jwks_uri` must be same-origin with `as_url`. URLs must be https unless `http_client.allow_http` (or `allow_private_ips`) is set. Until discovery succeeds ES256 tokens are refused (fail closed) and discovery is retried with exponential backoff (background and lazily per request); HMAC works meanwhile while legacy is enabled. `require_auth` is satisfied by `secret`, `jwks_url` or `as_url`.
 
 ### HSM-backed signing key
 
@@ -305,13 +321,13 @@ Sunset: 2027-10-01T00:00:00Z
 
 ### Go-live checklist for removing the legacy path
 
-1. Client audit clean: no client reads the body `appToken` / calls `/user/*-webauthn-*` / omits `X-Token-Mode: session` (wallet-frontend is clean apart from a stale `sessionStorage.appToken` read in `verifyRequestUriAndCerts.ts`; the Kotlin/Swift SDK `WebAuthnAuthClient` and `go-siros-cli` still use the legacy endpoints).
-2. Registry (and any other process validating with the shared secret) configured with `jwt.jwks_url`/`as_issuer`.
-3. Metrics/logs show `client_mode=legacy` at zero for a full token lifetime plus refresh TTL.
-4. Set `as.legacy.sunset_date` (announced via the Sunset header), watch for the 30-day warning and 410s.
-5. Flip `as.legacy.enabled=false` (default) after burn-in; keep `jwt.secret` only for the OIDC state cookie.
-6. Delete `internal/as/legacy_token.go`, the HS256 `generateToken`/refresh paths in `internal/service`, the HMAC fallbacks in `pkg/middleware/auth.go`, `internal/engine/session.go`, `internal/websocket/manager.go`, `internal/registry/jwt.go`, and the `Legacy` config blocks; remove the `/user/*` login routes.
-7. Rollback before step 6: unset the sunset date and set `as.legacy.enabled=true`, restart.
+0. **Precondition: all clients are moved to session mode BEFORE any backend turns legacy off** (siros-sdk-kotlin#235, siros-sdk-swift#179, wallet-frontend#322; go-siros-cli is intentionally out of scope).
+1. Client audit clean: no client reads the body `appToken`, calls `/user/*-webauthn-*` or omits `X-Token-Mode: session`.
+2. Registry (and any other separate process) configured with `jwt.as_url` (or `jwks_url`/`as_issuer`).
+3. `client_mode=legacy` at zero for a full token lifetime plus refresh TTL.
+4. Flip `as.legacy.enabled=false` (and registry `jwt.legacy_enabled=false`); `jwt.secret` stays only for the OIDC state cookie.
+5. After burn-in, delete `internal/as/legacy_token.go`, the HS256 `generateToken`/refresh paths in `internal/service`, the HMAC fallbacks in `pkg/middleware/auth.go`, `internal/engine/session.go`, `internal/websocket/manager.go`, `internal/registry/jwt.go`, the `Legacy` config and the `/user/*` login routes.
+6. Rollback before step 5: set `as.legacy.enabled=true` and restart.
 
 ### Refresh token handling
 

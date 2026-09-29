@@ -65,41 +65,26 @@ func (p *AuthProvider) Name() string         { return "auth" }
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
 // legacyIssuanceGate refuses the /user/* routes that mint HS256 session tokens
-// once the AS is enabled and the legacy window (as.legacy.enabled /
-// as.legacy.sunset_date) has closed. Without the AS the HMAC tokens are the
+// when the AS is enabled and as.legacy.enabled is false. Without the AS the HMAC tokens are the
 // only session mechanism, so the gate is a no-op.
 func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
 	if !p.cfg.AS.Enabled {
 		return func(c *gin.Context) { c.Next() }
 	}
-	return middleware.LegacyIssuanceGate(p.cfg.LegacyAllowed)
+	return middleware.LegacyIssuanceGate(p.cfg.AS.Legacy.Enabled)
 }
 
-// LogLegacyTokenStatus logs the legacy (HMAC) session token state at startup:
-// disabled, active, active with a sunset date, deprecation warning inside the
-// 30-day window, or sunset already reached.
-func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger, now time.Time) {
+// LogLegacyTokenStatus logs once at startup whether legacy (HMAC) session
+// tokens are enabled.
+func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
 	if !cfg.AS.Enabled {
 		return
 	}
-	l := cfg.AS.Legacy
-	sunset, hasSunset, _ := l.SunsetTime()
-	switch {
-	case !l.Enabled:
-		logger.Info("Legacy HMAC session tokens are disabled (as.legacy.enabled=false)")
-	case l.SunsetPassed(now):
-		logger.Warn("Legacy HMAC session tokens are DISABLED: as.legacy.sunset_date has passed; HMAC validation is refused and legacy issuance stopped",
-			zap.String("sunset_date", l.SunsetDate))
-	case hasSunset && sunset.Sub(now) <= config.LegacySunsetWarnWindow:
-		logger.Warn("DEPRECATION: legacy HMAC session tokens will be disabled soon (as.legacy.sunset_date); migrate clients to X-Token-Mode: session",
-			zap.String("sunset_date", l.SunsetDate),
-			zap.Duration("remaining", sunset.Sub(now).Round(time.Hour)))
-	case hasSunset:
-		logger.Info("Legacy HMAC session tokens are enabled until as.legacy.sunset_date",
-			zap.String("sunset_date", l.SunsetDate))
-	default:
-		logger.Info("Legacy HMAC session tokens are enabled (no as.legacy.sunset_date set)")
+	if cfg.AS.Legacy.Enabled {
+		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
+		return
 	}
+	logger.Warn("Legacy HMAC session tokens are DISABLED (as.legacy.enabled=false): HMAC validation is refused and legacy issuance answers 410")
 }
 
 // Close stops background workers in the auth provider.
@@ -292,7 +277,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
 	}
 	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
 	// latter hardcodes a nil blacklist, which is exactly what left Logout's
@@ -374,7 +359,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
 	// provider is combined with an AuthProvider under BackendProvider,
@@ -650,11 +635,14 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		}
 		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
+			JWKSURL: jwksURL,
+			Issuer:  issuer,
+			// Audiences are NOT passed to the validator: it would also apply
+			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
+			// are enforced for new-style tokens only, by
+			// middleware.WithSessionAudiences and the engine/websocket checks.
 			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Active(time.Now()),
+				Enabled:    cfg.AS.Legacy.Enabled,
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
 			// Same blacklist as everything else in this process (#382/#383) -
@@ -667,7 +655,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
-		LogLegacyTokenStatus(cfg, logger, time.Now())
+		LogLegacyTokenStatus(cfg, logger)
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
 			zap.Strings("audiences", cfg.AS.Audiences),
@@ -754,7 +742,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382).
 	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
@@ -1085,11 +1073,14 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		}
 		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
+			JWKSURL: jwksURL,
+			Issuer:  issuer,
+			// Audiences are NOT passed to the validator: it would also apply
+			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
+			// are enforced for new-style tokens only, by
+			// middleware.WithSessionAudiences and the engine/websocket checks.
 			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Active(time.Now()),
+				Enabled:    cfg.AS.Legacy.Enabled,
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
 			// See NewBackendProvider's identical wiring (#382/#383). This
@@ -1098,7 +1089,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
-		LogLegacyTokenStatus(cfg, logger, time.Now())
+		LogLegacyTokenStatus(cfg, logger)
 	}
 
 	return &WalletProviderProvider{
@@ -1120,7 +1111,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithLegacyAllowed(p.cfg.LegacyAllowed))
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). This
 	// provider never runs co-hosted with BackendProvider (see cmd/server -

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,6 +103,7 @@ func signToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl claims.Acc
 	cl.Claims = jwt.Claims{
 		Issuer:    issuer,
 		Subject:   cl.Claims.Subject,
+		Audience:  cl.Claims.Audience,
 		IssuedAt:  jwt.NewNumericDate(now),
 		NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Second)),
 		Expiry:    jwt.NewNumericDate(now.Add(5 * time.Minute)),
@@ -499,45 +501,59 @@ func TestExtractBearer(t *testing.T) {
 	}
 }
 
-func TestTokenAuthMiddleware_LegacyAllowedGate(t *testing.T) {
+func TestLegacyIssuanceGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	secret := []byte("0123456789abcdef0123456789abcdef")
-	v := validator.New(validator.Config{Legacy: validator.LegacyConfig{Enabled: true, HMACSecret: secret}})
-	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{"default": {ID: "default", Enabled: true}}}
-
-	tok := hmacLegacyToken(t, secret)
-
-	run := func(allowed func(time.Time) bool) int {
+	run := func(enabled bool) (int, string) {
 		w := httptest.NewRecorder()
 		_, r := gin.CreateTestContext(w)
-		r.Use(TokenAuthMiddleware(v, tenants, nil, zap.NewNop(), WithLegacyAllowed(allowed)))
-		r.GET("/t", func(c *gin.Context) { c.Status(200) })
+		r.POST("/login", LegacyIssuanceGate(enabled), func(c *gin.Context) { c.Status(200) })
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/login", nil))
+		return w.Code, w.Body.String()
+	}
+	if code, _ := run(true); code != 200 {
+		t.Error("gate must pass when legacy is enabled")
+	}
+	code, body := run(false)
+	if code != 410 || !strings.Contains(body, "legacy_tokens_disabled") {
+		t.Errorf("gate must answer 410 legacy_tokens_disabled when legacy is off, got %d %s", code, body)
+	}
+}
+
+// Legacy HMAC tokens carry the RP ID as aud; an audience list must never
+// reject them, while new-style tokens are still held to it.
+func TestTokenAuthMiddleware_SessionAudiences(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	both := validator.New(validator.Config{Legacy: validator.LegacyConfig{Enabled: true, HMACSecret: secret}})
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{"default": {ID: "default", Enabled: true}}}
+	auds := []string{"wallet-backend"}
+
+	status := func(val *validator.Validator, tok string) int {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.Use(TokenAuthMiddleware(val, tenants, nil, zap.NewNop(), WithSessionAudiences(auds)))
+		r.GET("/t", RequireAudience("wallet-backend"), func(c *gin.Context) { c.Status(200) })
 		req := httptest.NewRequest("GET", "/t", nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		r.ServeHTTP(w, req)
 		return w.Code
 	}
-	if code := run(func(time.Time) bool { return true }); code != 200 {
-		t.Errorf("legacy allowed: got %d", code)
-	}
-	if code := run(func(time.Time) bool { return false }); code != 401 {
-		t.Errorf("legacy refused after sunset: got %d", code)
-	}
-}
 
-func TestLegacyIssuanceGate(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	run := func(allowed func(time.Time) bool) int {
-		w := httptest.NewRecorder()
-		_, r := gin.CreateTestContext(w)
-		r.POST("/login", LegacyIssuanceGate(allowed), func(c *gin.Context) { c.Status(200) })
-		r.ServeHTTP(w, httptest.NewRequest("POST", "/login", nil))
-		return w.Code
+	// HMAC token whose aud is the RP ID: accepted.
+	hm := gojwtSigned(t, secret, map[string]any{"user_id": "u", "tenant_id": "default", "aud": "rp.example.com"})
+	if c := status(both, hm); c != 200 {
+		t.Errorf("legacy token with RP-ID aud must be accepted, got %d", c)
 	}
-	if run(nil) != 200 || run(func(time.Time) bool { return true }) != 200 {
-		t.Error("gate must pass when legacy is allowed")
+	mk := func(aud string) string {
+		return signToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   jwt.Claims{Subject: "u", Audience: jwt.Audience{aud}},
+			TenantID: "default",
+		})
 	}
-	if run(func(time.Time) bool { return false }) != 410 {
-		t.Error("gate must answer 410 once legacy is closed")
+	if c := status(v, mk("wallet-backend")); c != 200 {
+		t.Errorf("ES256 token with allowed aud must be accepted, got %d", c)
+	}
+	if c := status(v, mk("other")); c != 401 {
+		t.Errorf("ES256 token with wrong aud must be rejected, got %d", c)
 	}
 }
