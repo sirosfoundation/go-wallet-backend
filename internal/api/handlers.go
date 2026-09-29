@@ -897,15 +897,23 @@ func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) t
 // access or refresh token which could still legitimately carry the revoked
 // sid can possibly still be unexpired. Every token minted for a given sid
 // (WebAuthnService.generateToken/generateRefreshToken/RefreshAccessToken)
-// is minted no later than the moment of revocation itself -
-// IsFamilyRevoked is checked before minting any further token for that sid
-// - so the longer-lived of the pair (the refresh token, JWT.RefreshDays,
-// when refresh tokens are even enabled) bounds it.
+// is minted no later than the moment of revocation itself - IsFamilyRevoked
+// is checked before minting any further token for that sid.
+//
+// Uses the MAX of both configured lifetimes, not just the refresh token's
+// (Copilot review on #414): nothing in config.Config.Validate enforces
+// JWT.RefreshDays outliving JWT.ExpiryHours, so an unusual but valid
+// configuration (e.g. a short-lived refresh token paired with a
+// long-lived access token) would otherwise let the marker expire while an
+// access token from an earlier rotation - its own jti never individually
+// blacklisted - was still unexpired and usable again.
 func familyRetention(cfg *config.Config) time.Duration {
-	if cfg.JWT.RefreshDays > 0 {
-		return time.Duration(cfg.JWT.RefreshDays) * 24 * time.Hour
+	refresh := time.Duration(cfg.JWT.RefreshDays) * 24 * time.Hour
+	access := time.Duration(cfg.JWT.ExpiryHours) * time.Hour
+	if refresh > access {
+		return refresh
 	}
-	return time.Duration(cfg.JWT.ExpiryHours) * time.Hour
+	return access
 }
 
 // legacyTokenSID re-parses a legacy HMAC-signed token to extract its "sid"

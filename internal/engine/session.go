@@ -50,6 +50,16 @@ var (
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
+
+	// IsFamilyRevoked reports whether sid - a refresh-token family/session
+	// id (see service.WebAuthnService.generateToken's doc comment) - has
+	// been revoked via RevokeFamily (what api.Handlers.Logout calls). Added
+	// for #402/#414 (Copilot review): without this, an access token from an
+	// earlier rotation of a since-logged-out session - its own jti never
+	// individually blacklisted - could still authenticate a NEW WebSocket
+	// handshake to this engine even after the HTTP paths (pkg/middleware.
+	// AuthMiddlewareWithBlacklist/TokenAuthMiddleware) already reject it.
+	IsFamilyRevoked(ctx context.Context, sid string) bool
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
@@ -797,6 +807,21 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
 			return "", "", "", errors.New("token has been revoked")
 		}
+		// Refresh-token family revocation (#402/#414), legacy-mode tokens
+		// only: go-tokenauth "auto-detects new-style vs legacy" tokens, so a
+		// WebAuthnService-issued legacy HMAC token can reach this branch
+		// too whenever the AS is enabled. go-tokenauth's shared
+		// *claims.Result has no "sid" field at all (it's shared with
+		// AS-issued tokens, which have no family concept in this codebase),
+		// so this re-parses the same already-validated raw token
+		// independently to reach that one extra claim - mirrors
+		// pkg/middleware.legacyTokenSID exactly, for the identical reason.
+		// New-style AS-issued tokens (ModeSession) are skipped entirely.
+		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
+			if sid := legacyTokenSID(m.cfg.JWT.Secret, tokenString); sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
+				return "", "", "", errors.New("token has been revoked")
+			}
+		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
@@ -834,6 +859,11 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			if m.blacklist.IsUserRevoked(ctx, userID) {
 				return "", "", "", errors.New("token has been revoked")
 			}
+			// Refresh-token family revocation (#402/#414) - see the
+			// go-tokenauth branch above's identical check for why.
+			if sid, _ := mapClaims["sid"].(string); sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
+				return "", "", "", errors.New("token has been revoked")
+			}
 		}
 		// Checked unconditionally (unlike the m.blacklist block above,
 		// which is skipped entirely when no blacklist is wired): the
@@ -846,6 +876,35 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 	}
 
 	return "", "", "", errors.New("invalid token")
+}
+
+// legacyTokenSID re-parses rawToken - a token go-tokenauth has already
+// validated as legacy-mode/HMAC - to read its "sid" (refresh-token family)
+// claim, a wallet-backend-specific concept go-tokenauth's own *claims.Result
+// deliberately doesn't expose. Mirrors pkg/middleware.legacyTokenSID (kept
+// unexported and duplicated rather than shared across packages, for the
+// same reason that one is: this is a narrow, one-caller re-parse of a
+// single extra claim, not worth growing a shared type/module for).
+// Returns "" if the token can't be parsed with m.cfg.JWT.Secret or carries
+// no sid claim at all (e.g. minted before #402/#414).
+func legacyTokenSID(secret, rawToken string) string {
+	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return []byte(secret), nil
+	})
+	if err != nil || !token.Valid {
+		return ""
+	}
+
+	mapClaims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return ""
+	}
+
+	sid, _ := mapClaims["sid"].(string)
+	return sid
 }
 
 func (m *Manager) getCapabilities() []string {

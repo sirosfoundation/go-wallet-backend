@@ -450,8 +450,9 @@ func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
 
 // fakeEngineBlacklist is a minimal TokenBlacklistChecker test double.
 type fakeEngineBlacklist struct {
-	revoked      map[string]bool
-	revokedUsers map[string]bool
+	revoked         map[string]bool
+	revokedUsers    map[string]bool
+	revokedFamilies map[string]bool
 }
 
 func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
@@ -460,6 +461,10 @@ func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) boo
 
 func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
 	return f.revokedUsers[userID]
+}
+
+func (f *fakeEngineBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
+	return f.revokedFamilies[sid]
 }
 
 // TestManager_validateToken_GoTokenauth_RevokedUserDenied proves the #391
@@ -546,6 +551,65 @@ func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
 	userID, _, _, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user-123", userID)
+}
+
+// TestManager_validateToken_Legacy_RevokedFamilyDenied is a regression test
+// for a Copilot review finding on #414: an access token carrying a "sid"
+// claim (the refresh-token family/session id - see
+// service.WebAuthnService.generateToken's doc comment) must be rejected
+// once that family has been revoked (TokenBlacklist.RevokeFamily, what
+// api.Handlers.Logout calls), even though this token's own jti was never
+// individually blacklisted - otherwise an access token from an earlier
+// rotation of an already-logged-out session could still establish a NEW
+// engine WebSocket session.
+func TestManager_validateToken_Legacy_RevokedFamilyDenied(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-1": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"jti":     "jti-not-individually-blacklisted",
+		"sid":     "sid-revoked-1",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+// TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied is a
+// regression test for the same #414 finding, on the go-tokenauth path: it
+// "auto-detects new-style vs legacy" tokens, so a WebAuthnService-issued
+// legacy HMAC token can reach this branch too whenever the AS is enabled
+// (m.tokenValidator set) - go-tokenauth's shared *claims.Result has no
+// "sid" field at all, so validateToken must re-parse the raw token itself
+// (legacyTokenSID) to still catch a revoked family here.
+func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *testing.T) {
+	secret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	m := NewManager(cfg, zap.NewNop())
+	v := tokenvalidator.New(tokenvalidator.Config{
+		Legacy: tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret)},
+	})
+	m.SetTokenValidator(v)
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-2": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   "test-user-123",
+		"tenant_id": "test-tenant",
+		"jti":       "jti-not-individually-blacklisted-2",
+		"sid":       "sid-revoked-2",
+		"aud":       "wallet-registry",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
 }
 
 // ===== handleFlowStart TAC enforcement tests =====

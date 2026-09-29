@@ -1608,6 +1608,10 @@ func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, use
 	return false
 }
 
+func (fakeEngineBlacklistForProviderTest) IsFamilyRevoked(ctx context.Context, sid string) bool {
+	return false
+}
+
 // TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
 // Copilot review finding on the passkey tenant-perimeter fix (#374/#386):
 // NewBackendProvider must pass its own configured, SSRF-guarded HTTP client
