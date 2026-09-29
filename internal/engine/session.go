@@ -830,6 +830,78 @@ func (m *Manager) CleanupSessions(ctx context.Context) (int64, error) {
 	return m.sessionStore.Cleanup(ctx)
 }
 
+// DeleteByUser implements service.SessionCleaner (duck-typed - engine must
+// not import package service): it closes every live WebSocket session this
+// process's Manager currently holds for userID, e.g. because the account
+// was just deleted.
+//
+// This is a separate cleaner from the persistent SessionStore's own
+// DeleteByUser (see cmd/server/main.go, which wires both): that one only
+// ever purged the persisted SessionData bookkeeping record, never the
+// *websocket.Conn* itself, so an already-established connection for a
+// deleted user stayed open and usable until it disconnected on its own
+// (#393 - found as a follow-up to #391, which closed the equivalent gap
+// for new handshakes via IsUserRevoked, but not for connections that were
+// already past the handshake). Only new handshakes for a deleted user are
+// blocked by that check; this closes the ones that already succeeded.
+//
+// Sessions live on other backend replicas (Redis-backed horizontal
+// scaling) are out of scope here: only this process's own live connections
+// can be closed directly.
+func (m *Manager) DeleteByUser(_ context.Context, userID string) error {
+	m.CloseUserSessions(userID, "account deleted")
+	return nil
+}
+
+// CloseUserSessions closes every live session belonging to userID (sending
+// a close frame with reason where the connection can still accept one) and
+// returns how many were closed. A user can hold more than one concurrent
+// session (multiple devices), so this closes all of them, not just the one
+// in userIndex ("last connection wins" - see registerSession). Matching is
+// strictly by exact Session.UserID equality (and userID must be non-empty),
+// so this can never close an anonymous session or a different user's
+// session.
+func (m *Manager) CloseUserSessions(userID string, reason string) int {
+	if userID == "" {
+		// Never treat "no user" as "match anonymous sessions" - every
+		// unauthenticated/anonymous session also has an empty UserID, and
+		// closing all of those would be a foot-gun this must not allow.
+		return 0
+	}
+
+	m.sessionsMu.RLock()
+	matches := make([]*Session, 0, 1)
+	for _, s := range m.sessions {
+		if s.UserID == userID {
+			matches = append(matches, s)
+		}
+	}
+	m.sessionsMu.RUnlock()
+
+	for _, s := range matches {
+		s.closeWithReason(reason)
+	}
+	return len(matches)
+}
+
+// closeWithReason sends a WebSocket close frame carrying reason (best
+// effort - the connection may already be broken or busy) and then closes
+// the underlying connection. This unblocks the session's read loop with an
+// error exactly like a client-initiated disconnect, so the Manager's normal
+// per-connection teardown (unregisterSession, flow cancellation, stopping
+// the ping goroutine - see handleSession/handleNewConnection) runs
+// unchanged rather than being duplicated here.
+func (s *Session) closeWithReason(reason string) {
+	s.sendMu.Lock()
+	_ = s.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+		time.Now().Add(time.Second),
+	)
+	s.sendMu.Unlock()
+	_ = s.conn.Close()
+}
+
 // Close closes all sessions
 func (m *Manager) Close() {
 	m.sessionsMu.Lock()

@@ -401,6 +401,17 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
+// Manager returns the engine's WebSocket session manager for cross-provider
+// wiring. It duck-types service.SessionCleaner (via its DeleteByUser
+// method), so it can be wired into service.MultiSessionCleaner exactly like
+// SessionStore() is - see cmd/server/main.go. Unlike SessionStore(), which
+// only ever purges the persisted SessionData bookkeeping record, the
+// Manager itself closes the live *websocket.Conn* for the deleted user
+// (#393).
+func (p *EngineProvider) Manager() *wsengine.Manager {
+	return p.manager
+}
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {

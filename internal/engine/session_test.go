@@ -924,3 +924,217 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
 }
+
+// dialAndHandshakeAsUser dials m's HandleConnection over a real WebSocket
+// connection, completes the handshake for userID with a legacy HMAC token
+// (mirroring TestManager_validateToken_UserID), and waits for the session to
+// be registered in m.sessions before returning. This exercises the same
+// path a real client goes through, not a synthetic Session built by hand.
+// (Named distinctly from keepalive_test.go's dialAndHandshake, which always
+// authenticates as the same fixed user and manages its own Manager/server.)
+func dialAndHandshakeAsUser(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
+	t.Helper()
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
+	require.NoError(t, err)
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{
+		Message:  Message{Type: TypeHandshake},
+		AppToken: tokenString,
+	}))
+
+	var complete Message
+	require.NoError(t, ws.ReadJSON(&complete))
+	require.Equal(t, TypeHandshakeComplete, complete.Type)
+
+	require.Eventually(t, func() bool {
+		m.sessionsMu.RLock()
+		defer m.sessionsMu.RUnlock()
+		for _, s := range m.sessions {
+			if s.UserID == userID {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "session was not registered after handshake")
+
+	return ws
+}
+
+// TestManager_CloseUserSessions_ClosesLiveConnection is a regression test
+// for #393: PR #391 closed the gap where a *new* WebSocket handshake for a
+// deleted user's token would still be accepted (see the IsUserRevoked
+// checks in validateToken), but an already-established connection for that
+// user was never touched by account deletion at all - it stayed open and
+// fully usable until it disconnected on its own. This asserts the live
+// connection is actually closed by the server, not merely that a fresh
+// handshake attempt would now be rejected.
+func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	const deletedUser = "user-being-deleted"
+	ws := dialAndHandshakeAsUser(t, m, wsURL, deletedUser)
+	defer func() { _ = ws.Close() }()
+
+	closed := m.CloseUserSessions(deletedUser, "account deleted")
+	assert.Equal(t, 1, closed, "exactly the deleted user's one live session should have been closed")
+
+	// The client must observe the connection actually closing.
+	require.Eventually(t, func() bool {
+		_, _, err := ws.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
+
+	// And the manager's own bookkeeping must reflect that too, via the
+	// same natural teardown path a client-initiated disconnect takes
+	// (unregisterSession) - not a special-cased removal.
+	require.Eventually(t, func() bool {
+		m.sessionsMu.RLock()
+		defer m.sessionsMu.RUnlock()
+		_, stillIndexed := m.userIndex[deletedUser]
+		return len(m.sessions) == 0 && !stillIndexed
+	}, time.Second, 10*time.Millisecond, "session bookkeeping was not cleaned up after close")
+}
+
+// TestManager_CloseUserSessions_ClosesAllOfThatUsersSessions is a
+// regression test: a user can hold more than one concurrent session
+// (multiple devices), and CloseUserSessions must close every one of them,
+// not just the single entry Manager.userIndex happens to hold ("last
+// connection wins" - see registerSession).
+func TestManager_CloseUserSessions_ClosesAllOfThatUsersSessions(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	const deletedUser = "multi-device-user"
+
+	// Manually register two sessions for the same user directly in
+	// m.sessions, bypassing registerSession's "close the existing session
+	// for this user" replacement behavior on handshake - the whole point
+	// here is to exercise the case where more than one live session for a
+	// user coexists (e.g. a future multi-session model), which
+	// CloseUserSessions must still handle correctly by scanning
+	// m.sessions rather than only consulting userIndex.
+	ws1 := dialAndHandshakeAsUser(t, m, wsURL, "other-user-not-touched")
+	defer func() { _ = ws1.Close() }()
+	m.sessionsMu.Lock()
+	for _, s := range m.sessions {
+		if s.UserID == "other-user-not-touched" {
+			s.UserID = deletedUser
+		}
+	}
+	m.sessionsMu.Unlock()
+
+	ws2 := dialAndHandshakeAsUser(t, m, wsURL, deletedUser)
+	defer func() { _ = ws2.Close() }()
+
+	m.sessionsMu.RLock()
+	preCount := 0
+	for _, s := range m.sessions {
+		if s.UserID == deletedUser {
+			preCount++
+		}
+	}
+	m.sessionsMu.RUnlock()
+	require.Equal(t, 2, preCount, "test setup must produce two live sessions for the same user")
+
+	closed := m.CloseUserSessions(deletedUser, "account deleted")
+	assert.Equal(t, 2, closed, "both of the deleted user's sessions should have been closed")
+
+	for _, ws := range []*websocket.Conn{ws1, ws2} {
+		require.Eventually(t, func() bool {
+			_, _, err := ws.ReadMessage()
+			return err != nil
+		}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
+	}
+}
+
+// TestManager_CloseUserSessions_NeverTouchesOtherUsers is a regression test
+// guarding against the most dangerous possible bug in this feature: closing
+// account A's session must never close account B's.
+func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	deletedWS := dialAndHandshakeAsUser(t, m, wsURL, "deleted-user")
+	defer func() { _ = deletedWS.Close() }()
+	survivorWS := dialAndHandshakeAsUser(t, m, wsURL, "innocent-bystander")
+	defer func() { _ = survivorWS.Close() }()
+
+	closed := m.CloseUserSessions("deleted-user", "account deleted")
+	assert.Equal(t, 1, closed)
+
+	require.Eventually(t, func() bool {
+		_, _, err := deletedWS.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "the deleted user's connection should have closed")
+
+	// The survivor must remain fully functional: give it a moment to prove
+	// it, then confirm it is still registered and can still exchange
+	// messages (a ping/pong round trip), rather than merely "didn't error
+	// within an arbitrary instant".
+	require.Never(t, func() bool {
+		_, _, err := survivorWS.ReadMessage()
+		return err != nil
+	}, 200*time.Millisecond, 20*time.Millisecond, "an innocent bystander's session must never be closed")
+
+	m.sessionsMu.RLock()
+	_, stillPresent := m.userIndex["innocent-bystander"]
+	m.sessionsMu.RUnlock()
+	assert.True(t, stillPresent, "the innocent bystander must still be registered")
+}
+
+// TestManager_DeleteByUser_ClosesLiveConnection exercises the exact seam
+// service.UserService.DeleteUser calls through: Manager.DeleteByUser is
+// wired into service.MultiSessionCleaner alongside the persistent
+// SessionStore's own DeleteByUser (see cmd/server/main.go). Manager itself
+// duck-types service.SessionCleaner without engine importing that package.
+func TestManager_DeleteByUser_ClosesLiveConnection(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	const deletedUser = "deleted-via-service-seam"
+	ws := dialAndHandshakeAsUser(t, m, wsURL, deletedUser)
+	defer func() { _ = ws.Close() }()
+
+	require.NoError(t, m.DeleteByUser(context.Background(), deletedUser))
+
+	require.Eventually(t, func() bool {
+		_, _, err := ws.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
+}
+
+// TestManager_CloseUserSessions_EmptyUserIDIsNoOp guards against the
+// interface's most obvious foot-gun: every anonymous/unauthenticated
+// session also has UserID == "", so matching on an empty string would
+// close all of them.
+func TestManager_CloseUserSessions_EmptyUserIDIsNoOp(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	assert.Zero(t, m.CloseUserSessions("", "account deleted"))
+}
