@@ -19,20 +19,64 @@ import (
 
 var (
 	statusCheckersMu sync.Mutex
-	statusCheckers   = map[*config.Config]*statuslist.Checker{}
+	statusCheckers   = map[statusCheckerKey]*statuslist.Checker{}
 )
+
+type statusCheckerKey struct {
+	cfg *config.Config
+	svc *TrustService
+}
+
+// Wording of pkg/trust's Service.evaluate for the two "no decision" outcomes,
+// which it reports as Trusted=false rather than as an error.
+const (
+	trustFrameworkNone  = "none"
+	trustFailedReasonPf = "Trust evaluation failed"
+)
+
+// statusSignerTrust adapts the go-trust backed TrustService to
+// statuslist.SignerTrust. The call is EvaluateIssuer: a status list token is
+// issued by (or on behalf of) a credential issuer, go-trust has no
+// status-list role, and the issuer PDP already validates x5c chains and jwk
+// keys against trust lists and registries. The tenant travels in ctx
+// (trust.ContextWithTenant, set by Execute) and is applied by the PDP client's
+// TenantTransport. "No PDP configured" and "evaluation failed" come back from
+// the service as untrusted, so they are turned into errors here to keep them
+// apart from a genuine negative decision.
+func statusSignerTrust(svc *TrustService) statuslist.SignerTrust {
+	if svc == nil {
+		return nil
+	}
+	return func(ctx context.Context, subject string, km *trust.KeyMaterial) (bool, error) {
+		info, err := svc.EvaluateIssuer(ctx, subject, "", km)
+		if err != nil {
+			return false, err
+		}
+		if info.Trusted {
+			return true, nil
+		}
+		if info.Framework == trustFrameworkNone {
+			return false, errors.New("no trust PDP configured")
+		}
+		if strings.HasPrefix(info.Reason, trustFailedReasonPf) {
+			return false, errors.New(info.Reason)
+		}
+		return false, nil
+	}
+}
 
 // sharedStatusChecker returns the process-wide Checker for cfg. Handlers are
 // built per flow, so a Checker made there would drop its list cache after
 // every presentation; one per config lets the token's ttl deduplicate fetches
 // across presentations. The Checker is safe for concurrent use.
-func sharedStatusChecker(cfg *config.Config) *statuslist.Checker {
+func sharedStatusChecker(cfg *config.Config, svc *TrustService) *statuslist.Checker {
 	statusCheckersMu.Lock()
 	defer statusCheckersMu.Unlock()
-	c, ok := statusCheckers[cfg]
+	k := statusCheckerKey{cfg, svc}
+	c, ok := statusCheckers[k]
 	if !ok {
-		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext())
-		statusCheckers[cfg] = c
+		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), statusSignerTrust(svc))
+		statusCheckers[k] = c
 	}
 	return c
 }
@@ -87,13 +131,26 @@ func (h *OID4VPHandler) statusOutcome(err error, uri string) error {
 		}
 		return fmt.Errorf("credential status (%s): %w", host, err)
 	}
+	msg := "credential status could not be determined; the verifier is responsible for the status check"
+	reason := "list_unverifiable"
+	switch {
+	case errors.Is(err, statuslist.ErrSignerUntrusted):
+		// A negative trust decision, not an error: its own greppable event.
+		msg = "credential status list signer not trusted; list ignored"
+		reason = "signer_untrusted"
+	case errors.Is(err, statuslist.ErrNoSignerKey):
+		reason = "no_signer_key"
+	case errors.Is(err, statuslist.ErrTrustUnavailable):
+		reason = "trust_unavailable"
+	}
+	h.Logger.Warn(msg,
+		zap.String("status_list_host", host),
+		zap.String("status_check", string(mode)),
+		zap.String("reason", reason),
+		zap.Error(err))
 	if mode == config.StatusCheckStrict {
 		return fmt.Errorf("credential status (%s) could not be determined: %w", host, err)
 	}
-	h.Logger.Warn("credential status could not be determined; presenting, the verifier is responsible for the status check",
-		zap.String("status_list_host", host),
-		zap.String("status_check", string(mode)),
-		zap.Error(err))
 	return nil
 }
 
@@ -126,19 +183,7 @@ func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string) erro
 		return h.statusOutcome(fmt.Errorf("credential status claim: %w", err), "")
 	}
 
-	var header struct {
-		X5C []string `json:"x5c"`
-		JWK any      `json:"jwk"`
-	}
-	_ = decodeJWTSegment(parts[0], &header)
-	var signer *trust.KeyMaterial
-	switch {
-	case len(header.X5C) > 0:
-		signer = &trust.KeyMaterial{Type: KeyMaterialTypeX5C, X5C: header.X5C}
-	case header.JWK != nil:
-		signer = &trust.KeyMaterial{Type: KeyMaterialTypeJWK, JWK: header.JWK}
-	}
-	return h.statusOutcome(h.statusChecker.Check(ctx, ref, signer), ref.URI)
+	return h.statusOutcome(h.statusChecker.Check(ctx, ref), ref.URI)
 }
 
 // presentedTokens flattens a vp_token into the individual presentations: a

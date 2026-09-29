@@ -40,9 +40,30 @@ const (
 	statusListTokenTyp = "statuslist+jwt"
 )
 
-// errUnbound is returned for a list whose signature cannot be tied to the
-// credential's issuer key, so its content must not be acted on.
-var errUnbound = errors.New("status list signature cannot be bound to the credential issuer's key (credential header carries no x5c or jwk)")
+// errKeyMismatch is returned when a list header carries both x5c and jwk and
+// they are different keys.
+var errKeyMismatch = errors.New("status list header jwk does not match the x5c leaf key")
+
+var (
+	// ErrSignerUntrusted is wrapped when the list's signature verified but
+	// the trust decision for the signer key was negative. It is distinct from
+	// a failure to obtain a decision (ErrTrustUnavailable).
+	ErrSignerUntrusted = errors.New("status list signer is not trusted")
+	// ErrTrustUnavailable is wrapped when no trust decision could be had: no
+	// trust PDP configured, or the evaluation itself failed.
+	ErrTrustUnavailable = errors.New("status list signer trust could not be evaluated")
+	// ErrNoSignerKey is returned for a list whose header carries no x5c or
+	// jwk (a kid alone identifies nothing this wallet can resolve).
+	ErrNoSignerKey = errors.New("status list carries no signer key material (x5c or jwk header)")
+)
+
+// SignerTrust evaluates whether the key that signed a status list is trusted
+// to publish status lists. subject names the signer (the list's iss claim, else
+// the list URI's origin); km is the x5c chain or jwk from the list header.
+// trusted=false with a nil error is a negative decision; a non-nil error
+// means no decision could be obtained. The Checker never acts on a list
+// unless this returns (true, nil).
+type SignerTrust func(ctx context.Context, subject string, km *trust.KeyMaterial) (trusted bool, err error)
 
 // Reference is the `status.status_list` claim of a credential
 // (draft-ietf-oauth-status-list §6.2).
@@ -103,6 +124,7 @@ func ReferenceFromCredentialClaims(claims map[string]any) (ref *Reference, prese
 // whether a credential's entry is VALID.
 type Checker struct {
 	client *http.Client
+	trust  SignerTrust
 	// allowHTTP permits a plain-http status list URI (development only).
 	allowHTTP bool
 	now       func() time.Time
@@ -119,25 +141,25 @@ type cachedList struct {
 
 // NewChecker returns a Checker that fetches through client, which must be the
 // SSRF-guarded client (HTTPClientConfig.NewHTTPClient).
-func NewChecker(client *http.Client, allowHTTP bool) *Checker {
-	return &Checker{client: client, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}}
+//
+// signerTrust decides whether a list's signer key is trusted (go-trust). With
+// a nil signerTrust no list can be authoritative and every Check reports the
+// list as unverifiable.
+func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *Checker {
+	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}}
 }
 
 // Check returns nil only if the entry at ref is VALID in a status list token
-// that was fetched, is signed, matches ref.URI and is still fresh. A positive
-// determination that the entry is not VALID returns an error wrapping
-// ErrRevoked; every failure to find out (network, non-200, CWT, expired list,
-// bad or unverifiable signature, malformed token) returns an error that does
-// not. Callers choose what to do with the latter.
-//
-// signer is the key the credential itself was issued under (its x5c or jwk
-// header). If the list carries its own key (x5c or jwk header) it must be the
-// same key; if it carries none (only a kid, which is what siros-status-service
-// publishes) it is verified against signer. When signer is nil the list
-// cannot be bound to the issuer and is unverifiable: Check returns an error
-// (never ErrRevoked), because a list that vouches for itself proves nothing.
-func (c *Checker) Check(ctx context.Context, ref *Reference, signer *trust.KeyMaterial) error {
-	bits, list, err := c.load(ctx, ref.URI, signer)
+// that was fetched, whose JWS verifies against the key in its own x5c/jwk
+// header, whose signer key the trust service accepts, that matches ref.URI and
+// is fresh. A list is authoritative only under those conditions: only then can
+// Check return an error wrapping ErrRevoked (entry non-zero). Every other
+// failure (network, non-200, CWT, expired, bad signature, no key, negative or
+// unavailable trust decision, malformed token) returns an error that does not
+// wrap ErrRevoked; a negative trust decision wraps ErrSignerUntrusted and an
+// unobtainable one ErrTrustUnavailable. Callers choose what to do with those.
+func (c *Checker) Check(ctx context.Context, ref *Reference) error {
+	bits, list, err := c.load(ctx, ref.URI)
 	if err != nil {
 		return err
 	}
@@ -151,11 +173,8 @@ func (c *Checker) Check(ctx context.Context, ref *Reference, signer *trust.KeyMa
 	return nil
 }
 
-func (c *Checker) load(ctx context.Context, uri string, signer *trust.KeyMaterial) (int, []byte, error) {
+func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	key := uri
-	if signer != nil {
-		key += "\x00" + signerFingerprint(signer)
-	}
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && c.now().Before(e.expires) {
 		c.mu.Unlock()
@@ -167,7 +186,7 @@ func (c *Checker) load(ctx context.Context, uri string, signer *trust.KeyMateria
 	if err != nil {
 		return 0, nil, err
 	}
-	bits, list, ttl, err := c.parse(token, uri, signer)
+	bits, list, ttl, err := c.parse(ctx, token, uri)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -223,13 +242,14 @@ func (c *Checker) fetch(ctx context.Context, uri string) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
-func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []byte, time.Duration, error) {
+func (c *Checker) parse(ctx context.Context, token, uri string) (int, []byte, time.Duration, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return 0, nil, 0, errors.New("status list token is not a JWT")
 	}
 	var header struct {
-		Typ string `json:"typ"`
+		Typ string         `json:"typ"`
+		JWK map[string]any `json:"jwk"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
 		return 0, nil, 0, fmt.Errorf("status list header: %w", err)
@@ -237,31 +257,29 @@ func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []by
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
 		return 0, nil, 0, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
 	}
-	// Trust model: a list is only authoritative when its signature is bound
-	// to the key the credential was issued under. A key the list carries for
-	// itself proves nothing (whoever substitutes the response can self-sign
-	// an all-valid list), so without a signer the list is unverifiable.
-	if signer == nil {
-		return 0, nil, 0, errUnbound
-	}
+	// The list's own header key verifies the JWS; whether that key may
+	// publish status lists is the trust service's decision, taken below once
+	// the token is otherwise valid. The credential issuer's key plays no part:
+	// an external status service signs with its own key.
 	km, err := trust.VerifyJWTWithEmbeddedKey(token)
-	switch {
-	case err == nil:
-		if !sameKey(signer, km) {
-			return 0, nil, 0, errors.New("status list is not signed by the credential's issuer key")
-		}
-	case errors.Is(err, trust.ErrNoEmbeddedKey):
-		// Only a kid in the header (what siros-status-service publishes):
-		// verify against the credential's own issuer key.
-		if err := verifyWithKey(token, signer); err != nil {
-			return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
-		}
-	default:
+	if errors.Is(err, trust.ErrNoEmbeddedKey) {
+		return 0, nil, 0, ErrNoSignerKey
+	}
+	if err != nil {
 		return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
+	}
+	// Precedence when the header carries both: x5c is what is verified and
+	// trust-evaluated; a jwk that is also present must be the x5c leaf's key,
+	// otherwise the header is inconsistent and the list unverifiable.
+	if km.Type == "x5c" {
+		if err := checkJWKMatchesLeaf(header.JWK, km.X5C[0]); err != nil {
+			return 0, nil, 0, err
+		}
 	}
 
 	var claims struct {
 		Sub        string `json:"sub"`
+		Iss        string `json:"iss"`
 		Iat        *int64 `json:"iat"`
 		Exp        *int64 `json:"exp"`
 		TTL        *int64 `json:"ttl"`
@@ -308,43 +326,64 @@ func (c *Checker) parse(token, uri string, signer *trust.KeyMaterial) (int, []by
 	if err != nil {
 		return 0, nil, 0, err
 	}
+	if err := c.evaluateSigner(ctx, claims.Iss, uri, km); err != nil {
+		return 0, nil, 0, err
+	}
 	return claims.StatusList.Bits, list, ttl, nil
 }
 
-// verifyWithKey verifies the JWS signature of token against a key the caller
-// already holds (the credential's issuer key).
-func verifyWithKey(token string, km *trust.KeyMaterial) error {
-	var pub any
-	switch {
-	case len(km.X5C) > 0:
-		der, err := base64.StdEncoding.DecodeString(km.X5C[0])
-		if err != nil {
-			return fmt.Errorf("x5c leaf: %w", err)
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			return fmt.Errorf("x5c leaf: %w", err)
-		}
-		pub = cert.PublicKey
-	case km.JWK != nil:
-		b, err := json.Marshal(km.JWK)
-		if err != nil {
-			return err
-		}
-		var jwk jose.JSONWebKey
-		if err := jwk.UnmarshalJSON(b); err != nil {
-			return err
-		}
-		pub = jwk.Key
-	default:
-		return errors.New("no key to verify with")
+// evaluateSigner asks the trust service whether the list signer may publish
+// status lists. The subject is the list's iss claim, or the origin of its URI.
+func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust.KeyMaterial) error {
+	if c.trust == nil {
+		return fmt.Errorf("%w: no trust service configured", ErrTrustUnavailable)
 	}
-	jws, err := jose.ParseSigned(token, []jose.SignatureAlgorithm{jose.ES256, jose.ES384, jose.ES512, jose.RS256, jose.PS256, jose.EdDSA})
+	subject := iss
+	if subject == "" {
+		u, err := url.Parse(uri)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("%w: no signer identity", ErrTrustUnavailable)
+		}
+		subject = u.Scheme + "://" + u.Host
+	}
+	trusted, err := c.trust(ctx, subject, km)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrTrustUnavailable, err)
+	}
+	if !trusted {
+		return fmt.Errorf("%w (%s)", ErrSignerUntrusted, subject)
+	}
+	return nil
+}
+
+// checkJWKMatchesLeaf requires a jwk header parameter, when present, to be the
+// public key of the x5c leaf certificate.
+func checkJWKMatchesLeaf(jwkParam map[string]any, leaf string) error {
+	if len(jwkParam) == 0 {
+		return nil
+	}
+	der, err := base64.StdEncoding.DecodeString(leaf)
+	if err != nil {
+		return fmt.Errorf("status list x5c leaf: %w", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return fmt.Errorf("status list x5c leaf: %w", err)
+	}
+	b, err := json.Marshal(jwkParam)
 	if err != nil {
 		return err
 	}
-	_, err = jws.Verify(pub)
-	return err
+	var jwk jose.JSONWebKey
+	if err := jwk.UnmarshalJSON(b); err != nil {
+		return fmt.Errorf("status list jwk: %w", err)
+	}
+	type equaler interface{ Equal(crypto.PublicKey) bool }
+	pub, ok := jwk.Public().Key.(equaler)
+	if !ok || !pub.Equal(cert.PublicKey) {
+		return errKeyMismatch
+	}
+	return nil
 }
 
 func decodeSegment(seg string, v any) error {
@@ -387,46 +426,4 @@ func entry(bits int, list []byte, idx int64) (int, error) {
 	byteIdx := bitPos / 8
 	shift := uint(bitPos % 8)
 	return int(list[byteIdx]>>shift) & (1<<uint(bits) - 1), nil
-}
-
-// keyID reduces a signer's embedded key to a comparable string: the
-// SubjectPublicKeyInfo of the x5c leaf, or the RFC 7638 thumbprint of the JWK.
-func keyID(km *trust.KeyMaterial) string {
-	if km == nil {
-		return ""
-	}
-	if len(km.X5C) > 0 {
-		der, err := base64.StdEncoding.DecodeString(km.X5C[0])
-		if err != nil {
-			return ""
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			return ""
-		}
-		return "spki:" + string(cert.RawSubjectPublicKeyInfo)
-	}
-	if km.JWK != nil {
-		b, err := json.Marshal(km.JWK)
-		if err != nil {
-			return ""
-		}
-		var jwk jose.JSONWebKey
-		if err := jwk.UnmarshalJSON(b); err != nil {
-			return ""
-		}
-		tp, err := jwk.Thumbprint(crypto.SHA256)
-		if err != nil {
-			return ""
-		}
-		return "jwk:" + string(tp)
-	}
-	return ""
-}
-
-func signerFingerprint(km *trust.KeyMaterial) string { return keyID(km) }
-
-func sameKey(a, b *trust.KeyMaterial) bool {
-	ka := keyID(a)
-	return ka != "" && ka == keyID(b)
 }

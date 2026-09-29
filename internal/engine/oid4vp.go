@@ -44,7 +44,7 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 	var checker *statuslist.Checker
 	mode := cfg.Presentation.StatusCheck.Effective()
 	if mode != config.StatusCheckOff {
-		checker = sharedStatusChecker(cfg)
+		checker = sharedStatusChecker(cfg, trustSvc)
 	}
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{

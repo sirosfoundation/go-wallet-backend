@@ -241,14 +241,15 @@ type PresentationConfig struct {
 	// a revoked credential, but never refuse; a revocation logs
 	// "credential status revoked");
 	// `enforce-revoked` (refuse with CREDENTIAL_REVOKED only when the list
-	// was fetched and verified against the credential issuer's key and the
-	// entry is non-zero, i.e. INVALID, SUSPENDED or application-specific; if
+	// was fetched, its JWS verified against the x5c/jwk in its header, that
+	// signer key accepted by the go-trust issuer PDP, and the entry is non-zero, i.e. INVALID, SUSPENDED or application-specific; if
 	// the list cannot be fetched or verified, log a warning and proceed);
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
 	// unsigned, expired or malformed list also refuses).
 	// Choose enforce-revoked or strict to have the wallet refuse.
-	// A list only counts if its signature is bound to the key in the
-	// credential's own x5c/jwk header; otherwise it is unverifiable (see above).
+	// A list without a verifiable, trusted signer key (no x5c/jwk, no PDP
+	// configured, negative or failed trust decision) is unverifiable and never
+	// produces a verdict in any mode.
 	// mdoc credentials are not checked. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_STATUS_CHECK
 	StatusCheck StatusCheckMode `yaml:"status_check" envconfig:"STATUS_CHECK"`

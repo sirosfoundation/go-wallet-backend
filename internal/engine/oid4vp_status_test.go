@@ -26,6 +26,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/statuslist"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func statusJWK(k *ecdsa.PublicKey) map[string]any {
@@ -52,6 +53,10 @@ func signJWT(t *testing.T, key *ecdsa.PrivateKey, header map[string]any, claims 
 // statusFixture serves a status list with entry 1 revoked and returns a
 // handler wired to it plus a function minting credentials pointing at it.
 func statusFixture(t *testing.T, serverBroken bool) (*OID4VPHandler, func(idx int, withStatus bool) string) {
+	return statusFixtureTrust(t, serverBroken, func(context.Context, string, *trust.KeyMaterial) (bool, error) { return true, nil })
+}
+
+func statusFixtureTrust(t *testing.T, serverBroken bool, signerTrust statuslist.SignerTrust) (*OID4VPHandler, func(idx int, withStatus bool) string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -77,7 +82,7 @@ func statusFixture(t *testing.T, serverBroken bool) (*OID4VPHandler, func(idx in
 
 	h := &OID4VPHandler{
 		BaseHandler:   BaseHandler{Logger: zap.NewNop()},
-		statusChecker: statuslist.NewChecker(srv.Client(), false),
+		statusChecker: statuslist.NewChecker(srv.Client(), false, signerTrust),
 		statusMode:    config.StatusCheckEnforceRevoked,
 	}
 	mint := func(idx int, withStatus bool) string {
@@ -250,9 +255,12 @@ func TestDecodeJWTSegment_Errors(t *testing.T) {
 // presentFixture wires a selection-test handler (real websocket to the
 // "wallet") to a status fixture, plus a verifier endpoint recording what it is
 // sent.
-func presentFixture(t *testing.T, mode config.StatusCheckMode, listDown bool) (*OID4VPHandler, func(idx int, withStatus bool) string, chan map[string]any, chan url.Values, *AuthorizationRequest) {
+func presentFixture(t *testing.T, mode config.StatusCheckMode, listDown bool, trustOpt ...statuslist.SignerTrust) (*OID4VPHandler, func(idx int, withStatus bool) string, chan map[string]any, chan url.Values, *AuthorizationRequest) {
 	t.Helper()
 	sh, mint := statusFixture(t, listDown)
+	if len(trustOpt) > 0 {
+		sh, mint = statusFixtureTrust(t, listDown, trustOpt[0])
+	}
 	h, _, received, cleanup := newSelectionTestHandler(t)
 	t.Cleanup(cleanup)
 	h.statusChecker = sh.statusChecker
@@ -336,9 +344,9 @@ func TestPresentOrRefuse_SubmitFailure(t *testing.T) {
 
 func TestSharedStatusChecker(t *testing.T) {
 	cfg := &config.Config{}
-	a, b := sharedStatusChecker(cfg), sharedStatusChecker(cfg)
+	a, b := sharedStatusChecker(cfg, nil), sharedStatusChecker(cfg, nil)
 	assert.Same(t, a, b, "one Checker per config so the list cache spans presentations")
-	assert.NotSame(t, a, sharedStatusChecker(&config.Config{}))
+	assert.NotSame(t, a, sharedStatusChecker(&config.Config{}, nil))
 
 	// Concurrent use of the shared instance (run with -race).
 	var wg sync.WaitGroup
@@ -346,7 +354,7 @@ func TestSharedStatusChecker(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = sharedStatusChecker(cfg).Check(context.Background(), &statuslist.Reference{Idx: 1, URI: "http://127.0.0.1:1/x"}, nil)
+			_ = sharedStatusChecker(cfg, nil).Check(context.Background(), &statuslist.Reference{Idx: 1, URI: "http://127.0.0.1:1/x"})
 		}()
 	}
 	wg.Wait()
@@ -365,4 +373,100 @@ func TestNewOID4VPHandler_StatusMode(t *testing.T) {
 		assert.Equal(t, wantChecker, h.statusChecker != nil, string(mode))
 		assert.Equal(t, mode.Effective(), h.statusMode)
 	}
+}
+
+func untrusted(context.Context, string, *trust.KeyMaterial) (bool, error) { return false, nil }
+func trustErr(context.Context, string, *trust.KeyMaterial) (bool, error) {
+	return false, errors.New("pdp down")
+}
+
+func TestCheckPresentationStatus_TrustGatesVerdict(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		trust      statuslist.SignerTrust
+		mode       config.StatusCheckMode
+		wantRefuse bool
+		wantRevoke bool
+		wantLog    string
+	}{
+		{"trusted+revoked enforce refuses", nil, config.StatusCheckEnforceRevoked, true, true, "credential status revoked"},
+		{"untrusted enforce proceeds", untrusted, config.StatusCheckEnforceRevoked, false, false, "credential status list signer not trusted; list ignored"},
+		{"untrusted warn proceeds", untrusted, config.StatusCheckWarn, false, false, "credential status list signer not trusted; list ignored"},
+		{"untrusted strict refuses", untrusted, config.StatusCheckStrict, true, false, "credential status list signer not trusted; list ignored"},
+		{"trust error enforce proceeds", trustErr, config.StatusCheckEnforceRevoked, false, false, "credential status could not be determined; the verifier is responsible for the status check"},
+		{"trust error strict refuses", trustErr, config.StatusCheckStrict, true, false, "credential status could not be determined; the verifier is responsible for the status check"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var h *OID4VPHandler
+			var mint func(int, bool) string
+			if tc.trust == nil {
+				h, mint = statusFixture(t, false)
+			} else {
+				h, mint = statusFixtureTrust(t, false, tc.trust)
+			}
+			core, logs := observer.New(zap.WarnLevel)
+			h.Logger = zap.New(core)
+			h.statusMode = tc.mode
+			err := h.checkPresentationStatus(ctx, mint(1, true))
+			assert.Equal(t, tc.wantRefuse, err != nil, "%v", err)
+			assert.Equal(t, tc.wantRevoke, errors.Is(err, statuslist.ErrRevoked))
+			assert.Equal(t, 1, logs.FilterMessage(tc.wantLog).Len(), "logs: %v", logs.All())
+		})
+	}
+}
+
+// fakeTrustEvaluator records the request and answers with a fixed response.
+type fakeTrustEvaluator struct {
+	resp   *trust.EvaluationResponse
+	err    error
+	gotReq *trust.EvaluationRequest
+	tenant string
+}
+
+func (f *fakeTrustEvaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
+	f.gotReq, f.tenant = req, trust.TenantFromContext(ctx)
+	return f.resp, f.err
+}
+func (f *fakeTrustEvaluator) Name() string                                 { return "fake" }
+func (f *fakeTrustEvaluator) SupportedResourceTypes() []trust.ResourceType { return nil }
+func (f *fakeTrustEvaluator) Healthy() bool                                { return true }
+
+func TestStatusSignerTrust(t *testing.T) {
+	assert.Nil(t, statusSignerTrust(nil))
+	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{"AAAA"}}
+
+	svcWith := func(pdp string, ev *fakeTrustEvaluator) *TrustService {
+		cfg := &config.Config{}
+		cfg.Trust.PDPURL = pdp
+		return trust.NewService(cfg, zap.NewNop(), func(string, time.Duration) (trust.TrustEvaluator, error) { return ev, nil })
+	}
+	ctx := trust.ContextWithTenant(context.Background(), "tenant-9")
+
+	ev := &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: true}}
+	ok, err := statusSignerTrust(svcWith("http://pdp", ev))(ctx, "https://status.example", km)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	// The standard issuer evaluation: role credential-issuer, x5c resource, tenant in ctx.
+	assert.Equal(t, trust.RoleCredentialIssuer, ev.gotReq.Role)
+	assert.Equal(t, "https://status.example", ev.gotReq.SubjectID)
+	assert.Equal(t, trust.KeyTypeX5C, ev.gotReq.KeyType)
+	assert.Equal(t, "tenant-9", ev.tenant)
+
+	// A genuine negative decision: (false, nil), distinct from an error.
+	ev = &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: false, Reason: "not in any trust list"}}
+	ok, err = statusSignerTrust(svcWith("http://pdp", ev))(ctx, "s", km)
+	assert.NoError(t, err)
+	assert.False(t, ok)
+
+	// Evaluation failure is reported as an error, not as a negative decision.
+	ev = &fakeTrustEvaluator{err: errors.New("boom")}
+	ok, err = statusSignerTrust(svcWith("http://pdp", ev))(ctx, "s", km)
+	assert.Error(t, err)
+	assert.False(t, ok)
+
+	// No PDP configured: an error (unavailable), not a negative decision.
+	ok, err = statusSignerTrust(svcWith("", &fakeTrustEvaluator{}))(ctx, "s", km)
+	assert.Error(t, err)
+	assert.False(t, ok)
 }

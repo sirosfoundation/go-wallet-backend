@@ -19,6 +19,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
+func trustAll(context.Context, string, *trust.KeyMaterial) (bool, error) { return true, nil }
+
 func jwkOf(k *ecdsa.PublicKey) map[string]any {
 	return map[string]any{
 		"kty": "EC", "crv": "P-256",
@@ -96,7 +98,7 @@ func serve(t *testing.T, mk func(uri string) string, ctype string) (*Checker, st
 	}))
 	t.Cleanup(srv.Close)
 	uri = srv.URL + "/statuslists/1"
-	return NewChecker(srv.Client(), false), uri, hits
+	return NewChecker(srv.Client(), false, trustAll), uri, hits
 }
 
 func TestCheck(t *testing.T) {
@@ -146,7 +148,7 @@ func TestCheck(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c, uri, _ := serve(t, func(u string) string { return makeToken(t, tc.opts(u)) }, tc.ctype)
-			err := c.Check(ctx, &Reference{Idx: tc.idx, URI: uri}, jwkSigner(key))
+			err := c.Check(ctx, &Reference{Idx: tc.idx, URI: uri})
 			switch {
 			case tc.revoked:
 				if !errors.Is(err, ErrRevoked) {
@@ -178,22 +180,8 @@ func TestCheck_TamperedSignature(t *testing.T) {
 		s, _ := bad.SignedString(other)
 		return s
 	}, "")
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key)); err == nil {
+	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}); err == nil {
 		t.Fatal("forged status list accepted")
-	}
-}
-
-func TestCheck_SignerBinding(t *testing.T) {
-	issuer, attacker := newKey(t), newKey(t)
-	km := func(k *ecdsa.PrivateKey) *trust.KeyMaterial {
-		return &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k.PublicKey)}
-	}
-	c, uri, _ := serve(t, func(u string) string { return makeToken(t, tokenOpts{sub: u, key: attacker}) }, "")
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, km(issuer)); err == nil {
-		t.Fatal("list signed by a foreign key accepted for another issuer's credential")
-	}
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, km(attacker)); err != nil {
-		t.Fatalf("list signed by the credential's key rejected: %v", err)
 	}
 }
 
@@ -202,11 +190,11 @@ func TestCheck_FetchFailuresFailClosed(t *testing.T) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c := NewChecker(srv.Client(), false)
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: srv.URL}, nil); err == nil {
+	c := NewChecker(srv.Client(), false, trustAll)
+	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: srv.URL}); err == nil {
 		t.Fatal("http 500 must be an error")
 	}
-	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: "http://example.invalid/x"}, nil); err == nil {
+	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: "http://example.invalid/x"}); err == nil {
 		t.Fatal("plain http must be refused")
 	}
 }
@@ -217,7 +205,7 @@ func TestCheck_Cache(t *testing.T) {
 		return makeToken(t, tokenOpts{sub: u, key: key, exp: time.Now().Add(time.Hour)})
 	}, "")
 	for i := 0; i < 3; i++ {
-		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key)); err != nil {
+		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -225,7 +213,7 @@ func TestCheck_Cache(t *testing.T) {
 		t.Fatalf("want 1 fetch, got %d", *hits)
 	}
 	c.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
-	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key))
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if *hits != 2 {
 		t.Fatalf("want refetch after ttl, got %d fetches", *hits)
 	}
@@ -312,45 +300,6 @@ func TestDecodeSegment_Errors(t *testing.T) {
 	}
 }
 
-func TestKeyID_And_SameKey(t *testing.T) {
-	k1, k2 := newKey(t), newKey(t)
-	a := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k1.PublicKey)}
-	b := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k1.PublicKey)}
-	c := &trust.KeyMaterial{Type: "jwk", JWK: jwkOf(&k2.PublicKey)}
-	if !sameKey(a, b) {
-		t.Error("the same JWK must match")
-	}
-	if sameKey(a, c) {
-		t.Error("different JWKs must not match")
-	}
-	// Anything that cannot be reduced to a key id must never compare equal:
-	// two unknowns are not the same key.
-	for _, km := range []*trust.KeyMaterial{nil, {}, {X5C: []string{"!!"}}, {X5C: []string{"AAAA"}}, {JWK: map[string]any{"kty": "bogus"}}} {
-		if keyID(km) != "" {
-			t.Errorf("keyID(%+v) must be empty", km)
-		}
-		if sameKey(km, km) {
-			t.Errorf("sameKey(%+v, itself) must be false when there is no key", km)
-		}
-	}
-	if signerFingerprint(a) != keyID(a) {
-		t.Error("signerFingerprint must equal keyID")
-	}
-}
-
-func TestCheck_UnboundListIsUnverifiable(t *testing.T) {
-	key := newKey(t)
-	c, uri, _ := serve(t, func(u string) string {
-		return makeToken(t, tokenOpts{sub: u, key: key, values: map[int]int{1: 1}})
-	}, "")
-	// A self-signed list (key in its own header) with no credential key to
-	// bind it to says entry 1 is revoked; that must not be acted on.
-	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, nil)
-	if err == nil || errors.Is(err, ErrRevoked) {
-		t.Fatalf("unbound list must be unverifiable, not a verdict: %v", err)
-	}
-}
-
 func TestCheck_RequiresIat(t *testing.T) {
 	key := newKey(t)
 	c, uri, _ := serve(t, func(u string) string {
@@ -361,7 +310,7 @@ func TestCheck_RequiresIat(t *testing.T) {
 		s, _ := tok.SignedString(key)
 		return s
 	}, "")
-	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}, jwkSigner(key))
+	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if err == nil || errors.Is(err, ErrRevoked) {
 		t.Fatalf("token without iat must be rejected as unverifiable: %v", err)
 	}
