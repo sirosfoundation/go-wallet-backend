@@ -6,6 +6,8 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1088,14 +1090,27 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 		return err != nil
 	}, time.Second, 10*time.Millisecond, "the deleted user's connection should have closed")
 
-	// The survivor must remain fully functional: give it a moment to prove
-	// it, then confirm it is still registered and can still exchange
-	// messages (a ping/pong round trip), rather than merely "didn't error
-	// within an arbitrary instant".
+	// The survivor must remain fully functional. require.Never calls its
+	// condition synchronously on every tick, so a plain blocking
+	// ReadMessage (no data ever arrives on the happy path) would hang the
+	// very first call forever - it never gets a chance to time out and
+	// move on to the next tick, so the test itself would never complete.
+	// Bound each check with a short per-tick read deadline instead: a
+	// timeout means "still open, nothing to read yet" (expected), while
+	// any other error means the connection actually closed (failure).
 	require.Never(t, func() bool {
+		_ = survivorWS.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
 		_, _, err := survivorWS.ReadMessage()
-		return err != nil
+		if err == nil {
+			return false
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return false // nothing arrived this tick - the connection is still open
+		}
+		return true // any non-timeout error means it was actually closed
 	}, 200*time.Millisecond, 20*time.Millisecond, "an innocent bystander's session must never be closed")
+	_ = survivorWS.SetReadDeadline(time.Time{})
 
 	m.sessionsMu.RLock()
 	_, stillPresent := m.userIndex["innocent-bystander"]
@@ -1137,4 +1152,59 @@ func TestManager_CloseUserSessions_EmptyUserIDIsNoOp(t *testing.T) {
 	m := NewManager(cfg, zap.NewNop())
 
 	assert.Zero(t, m.CloseUserSessions("", "account deleted"))
+}
+
+// TestManager_RegisterSession_RejectsAlreadyRevokedUser is a regression
+// test for a TOCTOU window found in review of #393: validateToken's own
+// IsUserRevoked check (in handleNewConnection, immediately before
+// registerSession is called) happens before a Session object even exists.
+// A user revoked in the gap between that check and registerSession
+// actually inserting the session into m.sessions would otherwise register
+// successfully and become a permanent zombie - CloseUserSessions (and
+// therefore account deletion) can only ever close a session already
+// present in m.sessions at the moment it scans.
+//
+// This constructs the session directly (bypassing validateToken
+// entirely) to test registerSession's own recheck in isolation, rather
+// than trying to win an actual goroutine race against real handshake
+// timing.
+func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"already-revoked-user": true}})
+
+	srvConnCh := make(chan *websocket.Conn, 1)
+	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		srvConnCh <- srvConn
+	})
+	defer cleanup()
+	srvConn := <-srvConnCh
+
+	session := &Session{
+		ID:       "revoked-user-session",
+		UserID:   "already-revoked-user",
+		conn:     srvConn,
+		flows:    make(map[string]*Flow),
+		logger:   zap.NewNop(),
+		actionCh: make(chan *FlowActionMessage, 1),
+		signCh:   make(chan *SignResponseMessage, 1),
+		matchCh:  make(chan *MatchResponseMessage, 1),
+		closeCh:  make(chan struct{}, 1),
+		stopPing: make(chan struct{}),
+	}
+
+	accepted := m.registerSession(session)
+	assert.False(t, accepted, "a session for an already-revoked user must be rejected")
+
+	m.sessionsMu.RLock()
+	_, present := m.sessions[session.ID]
+	_, indexed := m.userIndex[session.UserID]
+	m.sessionsMu.RUnlock()
+	assert.False(t, present, "a rejected session must not be added to m.sessions")
+	assert.False(t, indexed, "a rejected session must not be added to m.userIndex")
+
+	require.Eventually(t, func() bool {
+		_, _, err := clientConn.ReadMessage()
+		return err != nil
+	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
 }

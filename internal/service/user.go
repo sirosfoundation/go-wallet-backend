@@ -320,21 +320,33 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
 	}
 
+	// Revoke all previously-issued tokens for this user (#383) BEFORE
+	// purging sessions below - not after. Logout only ever blacklists the
+	// single token used for that request; without this, any of the deleted
+	// user's other still-valid tokens (a different device, a token minted
+	// before this request's) would keep working until they naturally
+	// expire.
+	//
+	// The ordering matters for engine (WebSocket) sessions specifically
+	// (#393 review): a handshake can pass the engine's own IsUserRevoked
+	// check and then only finish registering itself in
+	// engine.Manager.sessions *after* the cleaner below has already
+	// scanned it. Revoking first means engine.Manager.registerSession's own
+	// recheck (done under the same lock the scan uses) will already see
+	// this user as revoked for any such late registration, and any
+	// registration that instead completed *before* this revocation is
+	// still guaranteed to be present in m.sessions by the time the scan
+	// below runs. Reversing this order would reopen that gap.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		}
+	}
+
 	// Purge active WebSocket sessions (Redis or memory)
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
-		}
-	}
-
-	// Revoke all previously-issued tokens for this user (#383). Logout only
-	// ever blacklists the single token used for that request; without this,
-	// any of the deleted user's other still-valid tokens (a different
-	// device, a token minted before this request's) would keep working
-	// until they naturally expire.
-	if s.tokenBlacklist != nil {
-		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
 		}
 	}
 

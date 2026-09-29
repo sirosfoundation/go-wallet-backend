@@ -357,8 +357,14 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		pongTimeout:   pongTimeout,
 	}
 
-	// Register session
-	m.registerSession(session)
+	// Register session. A rejection here means the user was revoked in the
+	// narrow window between validateToken's own check above and this call -
+	// registerSession has already closed the connection itself in that
+	// case, so there is nothing left to unregister.
+	if !m.registerSession(session) {
+		session.logger.Warn("Handshake rejected: user revoked between token validation and session registration")
+		return
+	}
 	defer m.unregisterSession(session)
 
 	// Send handshake complete
@@ -643,8 +649,33 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
-func (m *Manager) registerSession(session *Session) {
+// registerSession adds session to the manager's live-session bookkeeping
+// and returns true, unless userID was revoked between validateToken's own
+// check (in handleNewConnection, immediately before this call) and this
+// call actually acquiring the lock - in which case it closes the
+// connection itself and returns false without registering anything.
+//
+// That recheck closes a narrow TOCTOU window found in review: DeleteUser's
+// session cleaner (see service.UserService.DeleteUser and
+// Manager.CloseUserSessions) only ever closes sessions already present in
+// m.sessions at the moment it runs. Without this recheck, a handshake that
+// passed validateToken just before the user was deleted, but that only
+// finishes registering after CloseUserSessions's scan already ran, would
+// become a permanent zombie - immune to every check #393 exists to add.
+// Rechecking here, atomically with insertion under the same sessionsMu
+// that CloseUserSessions scans under, closes that gap: any session that
+// registers after the revocation is caught here; any that registered
+// before it is caught by the scan that necessarily follows (see
+// service.UserService.DeleteUser, which revokes before it cleans up
+// sessions).
+func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
+
+	if session.UserID != "" && m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
+	}
 	defer m.sessionsMu.Unlock()
 
 	// Close existing session for this user (skip for anonymous sessions)
@@ -678,6 +709,7 @@ func (m *Manager) registerSession(session *Session) {
 			m.logger.Warn("Failed to persist session", zap.Error(err))
 		}
 	}
+	return true
 }
 
 func (m *Manager) unregisterSession(session *Session) {
@@ -891,14 +923,21 @@ func (m *Manager) CloseUserSessions(userID string, reason string) int {
 // per-connection teardown (unregisterSession, flow cancellation, stopping
 // the ping goroutine - see handleSession/handleNewConnection) runs
 // unchanged rather than being duplicated here.
+//
+// Deliberately does NOT take s.sendMu: per gorilla/websocket's own
+// concurrency contract, WriteControl (unlike WriteJSON/WriteMessage, which
+// s.Send serializes via sendMu) may be called concurrently with any other
+// write. Taking sendMu here would let a backpressured client - whose peer
+// never reads, and whose write deadline was cleared after upgrade, see
+// handleNewConnection - block this call, and therefore account deletion,
+// indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
+// this call regardless of whether it succeeds, and Close is unconditional.
 func (s *Session) closeWithReason(reason string) {
-	s.sendMu.Lock()
 	_ = s.conn.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
 		time.Now().Add(time.Second),
 	)
-	s.sendMu.Unlock()
 	_ = s.conn.Close()
 }
 
