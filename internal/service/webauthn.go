@@ -49,6 +49,7 @@ type WebAuthnService struct {
 	logger          *zap.Logger
 	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
+	tokenBlacklist  *TokenBlacklist
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -86,6 +87,16 @@ func NewWebAuthnServiceWithValidator(store storage.Store, cfg *config.Config, lo
 		webauthn:        wa,
 		aaguidValidator: validator,
 	}, nil
+}
+
+// SetTokenBlacklist sets the token blacklist. When set, RefreshAccessToken
+// consumes (blacklists) the presented refresh token's own jti once it has
+// been exchanged, so the same refresh token can't be replayed to mint
+// another access/refresh token pair indefinitely - see RefreshAccessToken's
+// doc comment (Copilot review on #400: RefreshAccessToken only rotated
+// tokens and never invalidated the one just used).
+func (s *WebAuthnService) SetTokenBlacklist(b *TokenBlacklist) {
+	s.tokenBlacklist = b
 }
 
 // getAttestationPreference returns the configured attestation conveyance preference
@@ -400,13 +411,14 @@ type FinishRegistrationRequest struct {
 	// ExpectedTenantID, when set by the handler, must match the tenant
 	// BeginRegistration recorded on the challenge (challenge.TenantID).
 	// Handlers set this from their own validated tenant context (e.g. the
-	// X-Tenant-ID header) so that a caller can't run BeginRegistration under
-	// one tenant and FinishRegistration under a different one - which would
-	// otherwise let tenant-scoped policy decisions the handler makes (e.g.
+	// X-Tenant-ID header, or the JWT tenant_id claim for an authenticated
+	// caller) so that a caller can't run BeginRegistration under one tenant
+	// and FinishRegistration under a different one - which would otherwise
+	// let tenant-scoped policy decisions the handler makes (e.g.
 	// bind_identity enforcement) run against the wrong tenant's config while
 	// the registration itself is still written under whatever tenant the
 	// challenge actually belongs to. Left empty, no check is performed (for
-	// callers that don't have this context). See issue #374 follow-up.
+	// callers that don't have this context). See issue #374/#395.
 	ExpectedTenantID string `json:"-"` // Do not bind from JSON
 }
 
@@ -1341,6 +1353,14 @@ func (s *WebAuthnService) generateRefreshToken(user *domain.User, tenantID domai
 // ErrInvalidRefreshToken indicates the refresh token is invalid or expired
 var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 
+// ErrRefreshDisabled indicates refresh tokens are turned off by config
+// (JWT.RefreshDays <= 0). This is an expected, admin-controlled state, not
+// a server malfunction - callers must map it to a non-5xx response rather
+// than treating it like an unexpected internal error (Copilot review on
+// #400: mounting the route unconditionally turned this config choice into
+// a 500 response).
+var ErrRefreshDisabled = errors.New("refresh tokens are disabled")
+
 // RefreshTokenRequest contains the request for refreshing an access token
 type RefreshTokenRequest struct {
 	RefreshToken string `json:"refreshToken"`
@@ -1352,10 +1372,29 @@ type RefreshTokenResponse struct {
 	RefreshToken string `json:"refreshToken,omitempty"`
 }
 
-// RefreshAccessToken exchanges a valid refresh token for a new access token
+// RefreshAccessToken exchanges a valid refresh token for a new access token.
+//
+// SECURITY: the presented refresh token is single-use, ENFORCED
+// UNCONDITIONALLY whenever a TokenBlacklist is wired in via
+// SetTokenBlacklist (which services.go always does) - deliberately not
+// gated by TokenBlacklistConfig.Enabled, unlike Add/IsBlacklisted's general
+// opt-in revocation feature. Without this, the "checked-in"/default
+// configuration (blacklist disabled) would leave refresh tokens replayable
+// indefinitely, every replay minting another full-lived access/refresh
+// pair, despite this method appearing to enforce single-use - Copilot
+// review on #400 ("wiring this object does not consume refresh tokens for
+// standard configurations"). The check-and-consume step itself
+// (TokenBlacklist.ConsumeOnce) is atomic under one lock, so two concurrent
+// requests replaying the same refresh token cannot both win the race
+// (Copilot review on #400, second round: "the check-and-consume sequence
+// is not atomic"). Logout still only blacklists the caller's current
+// access token, not this refresh token's family - see the follow-up filed
+// as issue #402. Rotation still issues a new refresh token each call,
+// exactly as before; this only closes the reuse window on the token being
+// replaced.
 func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTokenRequest) (*RefreshTokenResponse, error) {
 	if s.cfg.JWT.RefreshDays <= 0 {
-		return nil, fmt.Errorf("refresh tokens are disabled")
+		return nil, ErrRefreshDisabled
 	}
 
 	// Parse the refresh token
@@ -1390,6 +1429,11 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 
 	tenantIDStr, _ := claims["tenant_id"].(string)
 	tenantID := domain.TenantID(tenantIDStr)
+	if tenantID == "" {
+		// Matches pkg/middleware.AuthMiddleware's own "no tenant_id claim ->
+		// default tenant" backward-compatibility fallback for older tokens.
+		tenantID = domain.DefaultTenantID
+	}
 
 	// Get the user (verify they still exist)
 	user, err := s.store.Users().GetByID(ctx, userID)
@@ -1398,6 +1442,106 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 			zap.String("user_id", userIDStr),
 		)
 		return nil, ErrInvalidRefreshToken
+	}
+
+	// SECURITY: re-validate the tenant itself (exists and is enabled) before
+	// rotating - not just the user's membership in it (below). Both
+	// authenticated-request paths (pkg/middleware.AuthMiddleware,
+	// TokenAuthMiddleware) already reject a request whose tenant no longer
+	// exists or has been disabled; RefreshAccessToken didn't, so a stolen
+	// refresh token for a since-disabled tenant could keep rotating
+	// indefinitely and regain full access the moment that tenant was
+	// re-enabled (Copilot review on #400, fifth round). Checked
+	// unconditionally, including for the default tenant - unlike the
+	// membership check below - since even the default tenant's own record
+	// could be disabled.
+	tenant, err := s.store.Tenants().GetByID(ctx, tenantID)
+	if err != nil {
+		s.logger.Warn("Refresh token for a nonexistent tenant",
+			zap.String("user_id", userIDStr),
+			zap.String("tenant_id", tenantIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+	if !tenant.Enabled {
+		s.logger.Warn("Refresh token for a disabled tenant",
+			zap.String("user_id", userIDStr),
+			zap.String("tenant_id", tenantIDStr),
+		)
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// SECURITY: re-validate tenant membership for non-default tenants
+	// before rotating. FinishLogin derives tenantID fresh from the user's
+	// CURRENT membership records (store.UserTenants().GetUserTenants) every
+	// time someone logs in, so removing a user's tenant membership takes
+	// effect at their very next login - but until now, RefreshAccessToken
+	// simply trusted whatever tenant_id claim the presented refresh token
+	// already carried, forever, with no per-refresh membership check (and
+	// no route in this stack mounts TenantMembershipMiddleware either).
+	// That let a removed user keep refreshing indefinitely instead of
+	// losing access within one access-token lifetime, the whole point of
+	// short-lived access tokens (Copilot review on #400, fourth round). The
+	// default tenant is exempt, matching FinishLogin/GetUserTenants'
+	// existing "no memberships recorded -> legacy default-tenant user"
+	// fallback (domain.DefaultTenantID) elsewhere in this file.
+	if tenantID != domain.DefaultTenantID {
+		isMember, err := s.store.UserTenants().IsMember(ctx, userID, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify tenant membership: %w", err)
+		}
+		if !isMember {
+			s.logger.Warn("Refresh token for a tenant the user is no longer a member of",
+				zap.String("user_id", userIDStr),
+				zap.String("tenant_id", tenantIDStr),
+			)
+			return nil, ErrInvalidRefreshToken
+		}
+	}
+
+	// Atomically consume the refresh token's jti - see the doc comment
+	// above. Deliberately placed here: AFTER every non-mutating validation
+	// above (signature, type, user existence) has already succeeded, and
+	// IMMEDIATELY BEFORE minting the replacement pair below. Consuming any
+	// earlier - e.g. right after parsing the token - would irreversibly
+	// burn a legitimate refresh token on a transient failure below it (a
+	// storage hiccup on the user lookup, say), forcing a valid client to
+	// re-authenticate from scratch instead of simply retrying (Copilot
+	// review on #400, third round). This ordering doesn't reopen the
+	// concurrency race ConsumeOnce's atomicity closes: it's still a single
+	// atomic check-and-mark-used call, so of two requests racing on the
+	// same refresh token, only the one that wins it proceeds to mint
+	// tokens - the loser is rejected here regardless of timing, wherever
+	// in the function this call sits.
+	//
+	// Both jti and exp are REQUIRED here (Copilot review on #400, fifth
+	// round): every token this service actually issues
+	// (generateRefreshToken) always sets both, so this only ever rejects a
+	// malformed/hand-crafted token. Without this check, an omitted jti
+	// would reach ConsumeOnce, which deliberately treats an empty jti as
+	// always "first use" (see its own doc comment - meant for a
+	// hypothetical jti-less token this service issued, not as a bypass),
+	// letting such a token replay freely; and an omitted exp would fall
+	// back to RefreshDays for the blacklist entry's OWN expiry while the
+	// underlying JWT itself never expires, so once that blacklist entry
+	// aged out the same non-expiring token would become usable again.
+	jti, _ := claims["jti"].(string)
+	expFloat, hasExp := claims["exp"].(float64)
+	if jti == "" || !hasExp {
+		s.logger.Warn("Refresh token missing required jti/exp claims")
+		return nil, ErrInvalidRefreshToken
+	}
+	expiry := time.Unix(int64(expFloat), 0)
+
+	if s.tokenBlacklist != nil {
+		firstUse, err := s.tokenBlacklist.ConsumeOnce(ctx, jti, expiry)
+		if err != nil {
+			return nil, fmt.Errorf("failed to consume refresh token: %w", err)
+		}
+		if !firstUse {
+			s.logger.Warn("Refresh token reuse detected", zap.String("jti", jti))
+			return nil, ErrInvalidRefreshToken
+		}
 	}
 
 	// Generate new access token

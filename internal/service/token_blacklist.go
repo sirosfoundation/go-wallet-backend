@@ -53,15 +53,23 @@ func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *Tok
 	}
 }
 
-// Start begins the cleanup worker for expired blacklist entries
+// Start begins the cleanup worker for expired blacklist entries.
+//
+// This always launches the cleanup goroutine, even when config.Enabled is
+// false: ConsumeOnce (see its doc comment) writes entries unconditionally,
+// independent of that flag, so a disabled blacklist can still accumulate
+// consumed-refresh-token entries that need periodic sweeping - without
+// this, every successful refresh would permanently grow the map for the
+// life of the process whenever the general blacklist feature happens to be
+// off (Copilot review on go-wallet-backend#400).
 func (b *TokenBlacklist) Start() {
-	if !b.config.Enabled {
-		b.logger.Info("Token blacklist disabled")
-		return
-	}
-
 	b.wg.Add(1)
 	go b.cleanupLoop()
+
+	if !b.config.Enabled {
+		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs for ConsumeOnce-tracked entries")
+		return
+	}
 
 	b.logger.Info("Token blacklist started",
 		zap.Int("cleanup_interval_seconds", b.config.CleanupIntervalSeconds),
@@ -141,6 +149,44 @@ func (b *TokenBlacklist) Add(ctx context.Context, jti string, expiry time.Time) 
 	)
 
 	return nil
+}
+
+// ConsumeOnce atomically checks-and-marks jti as used, returning true only
+// the first time it is called for a given jti (false on every subsequent
+// call, including concurrent ones - the check and the insert happen under
+// the same write lock, so two goroutines racing on the same jti cannot both
+// observe "not yet consumed").
+//
+// Unlike Add/IsBlacklisted, this is NOT gated by config.Enabled: those two
+// implement the general-purpose, operator-opt-in token revocation feature
+// (Logout, DeleteUser - see their callers), but single-use enforcement for
+// a refresh token (see WebAuthnService.RefreshAccessToken) is a correctness
+// property of the refresh-token protocol itself, not an optional feature -
+// making it conditional on a separate, independently-configured toggle
+// would mean the "checked-in" default configuration (TokenBlacklist
+// disabled) leaves refresh tokens replayable indefinitely despite
+// RefreshAccessToken appearing to enforce single-use (Copilot review on
+// #400: "wiring this object does not consume refresh tokens for standard
+// configurations"). This still reuses the same underlying map/expiry
+// cleanup machinery as Add/IsBlacklisted - only the Enabled gate is
+// bypassed.
+func (b *TokenBlacklist) ConsumeOnce(ctx context.Context, jti string, expiry time.Time) (firstUse bool, err error) {
+	if jti == "" {
+		// Can't track a jti-less token; treat as always "first use" so
+		// callers don't spuriously reject a token this service issued
+		// without one (shouldn't happen in practice).
+		return true, nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if existingExpiry, exists := b.tokens[jti]; exists && time.Now().Before(existingExpiry) {
+		return false, nil
+	}
+
+	b.tokens[jti] = expiry
+	return true, nil
 }
 
 // IsBlacklisted checks if a token JTI is on the blacklist

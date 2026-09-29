@@ -819,3 +819,32 @@ func TestHandlers_StoreCredential_MissingFormat(t *testing.T) {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 }
+
+// TestHandlers_RefreshToken_Disabled is a regression test for two rounds of
+// Copilot review findings on #400. Round one: the /user/session/refresh
+// route was mounted unconditionally, but when JWT.RefreshDays <= 0 (the
+// checked-in default), WebAuthnService.RefreshAccessToken returns
+// service.ErrRefreshDisabled - an expected, config-driven state, not a
+// server malfunction; RefreshToken's switch had no case for it, so it fell
+// through to the generic default and returned 500. Round two: mapping it to
+// 503 instead was still flagged - a 503 is still a 5xx and reads as a
+// server failure to callers/monitoring. This handler-level case is now
+// unreachable via HTTP in practice (internal/server/providers.go only
+// mounts the route when refresh tokens are enabled - see
+// TestAuthProvider_RegisterRoutes_RefreshTokenNotMountedWhenDisabled), but
+// is exercised directly here as defense in depth, expecting a clean 404.
+func TestHandlers_RefreshToken_Disabled(t *testing.T) {
+	handlers, router, _ := setupTestHandlersWithUser(t) // RefreshDays defaults to 0 (disabled)
+	router.POST("/session/refresh", handlers.RefreshToken)
+
+	body, _ := json.Marshal(map[string]interface{}{"refreshToken": "anything"})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/session/refresh", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
+	}
+}
