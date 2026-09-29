@@ -411,3 +411,23 @@ func TestValidatorCache_BoundedUnderChurn(t *testing.T) {
 	}
 	assert.LessOrEqual(t, cache.Len(), 8)
 }
+
+// An entry idle past the TTL is a miss for the very lookup that finds it: it
+// must be rebuilt, not revived by that lookup's own touch.
+func TestValidatorCache_IdleEntryIsRebuiltOnLookup(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.idleTTL = time.Minute
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
+
+	cfg := &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"}
+	v1 := cache.GetOrCreate(cfg)
+
+	clock = clock.Add(30 * time.Second)
+	assert.Same(t, v1, cache.GetOrCreate(cfg), "within the TTL the entry is reused")
+
+	clock = clock.Add(2 * time.Minute)
+	v2 := cache.GetOrCreate(cfg)
+	assert.NotSame(t, v1, v2, "an entry idle past the TTL must be rebuilt")
+	assert.Equal(t, 1, cache.Len())
+}

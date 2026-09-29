@@ -93,7 +93,7 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 	key := config.Issuer + "|" + audience + "|" + config.JWKSURI
 
 	c.mu.RLock()
-	if e, ok := c.validators[key]; ok {
+	if e, ok := c.validators[key]; ok && !c.idleExpired(e) {
 		e.lastUsed.Store(c.now().UnixNano())
 		c.mu.RUnlock()
 		return e.validator
@@ -103,10 +103,15 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Double-check after acquiring write lock
+	// Double-check after acquiring write lock. An entry that has been idle
+	// past the TTL is a miss: it is dropped here and rebuilt below, so its
+	// JWKS is fetched afresh instead of being kept alive by this very lookup.
 	if e, ok := c.validators[key]; ok {
-		e.lastUsed.Store(c.now().UnixNano())
-		return e.validator
+		if !c.idleExpired(e) {
+			e.lastUsed.Store(c.now().UnixNano())
+			return e.validator
+		}
+		delete(c.validators, key)
 	}
 
 	c.evictLocked()
@@ -123,12 +128,16 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 	return v
 }
 
+// idleExpired reports whether e has gone unused for longer than the idle TTL.
+func (c *ValidatorCache) idleExpired(e *cachedValidator) bool {
+	return c.now().Sub(time.Unix(0, e.lastUsed.Load())) > c.idleTTL
+}
+
 // evictLocked makes room for one new entry: it drops idle entries, then the
 // least recently used ones until below maxEntries. Caller holds c.mu.
 func (c *ValidatorCache) evictLocked() {
-	now := c.now()
 	for k, e := range c.validators {
-		if now.Sub(time.Unix(0, e.lastUsed.Load())) > c.idleTTL {
+		if c.idleExpired(e) {
 			delete(c.validators, k)
 		}
 	}
