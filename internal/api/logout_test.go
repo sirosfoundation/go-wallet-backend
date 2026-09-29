@@ -136,6 +136,159 @@ func TestHandlers_Logout_ASToken(t *testing.T) {
 	}
 }
 
+// TestHandlers_Logout_LegacyToken_RevokesFamily is a regression test for
+// #402: a legacy HMAC access token carrying a "sid" claim (the
+// refresh-token family/session id minted alongside its paired refresh
+// token - see WebAuthnService.generateToken's doc comment) must have that
+// whole family revoked on logout, not just its own jti.
+func TestHandlers_Logout_LegacyToken_RevokesFamily(t *testing.T) {
+	handlers, router := setupLogoutTestHandlers(t)
+
+	secret := handlers.cfg.JWT.Secret
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1",
+		"jti":     "jti-legacy-family-logout",
+		"sid":     "sid-legacy-family-1",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	router.POST("/logout", func(c *gin.Context) {
+		c.Set("token", tokenStr)
+		c.Next()
+	}, handlers.Logout)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !handlers.services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-legacy-family-1") {
+		t.Error("expected the refresh-token family to be revoked on logout")
+	}
+}
+
+// TestHandlers_Logout_LegacyToken_NoSidClaim_NoFamilyRevocationAttempted is
+// the sanity check for the test above: a legacy token minted before #402
+// (no "sid" claim at all) must not error or panic - there is simply no
+// family to revoke.
+func TestHandlers_Logout_LegacyToken_NoSidClaim_NoFamilyRevocationAttempted(t *testing.T) {
+	handlers, router := setupLogoutTestHandlers(t)
+
+	secret := handlers.cfg.JWT.Secret
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1",
+		"jti":     "jti-legacy-no-sid",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	router.POST("/logout", func(c *gin.Context) {
+		c.Set("token", tokenStr)
+		c.Next()
+	}, handlers.Logout)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-legacy-no-sid") {
+		t.Error("expected the token's own jti to still be blacklisted")
+	}
+}
+
+// TestHandlers_Logout_ASToken_ModeLegacy_RevokesFamily is a regression test
+// for #402: go-tokenauth's Validator "auto-detects new-style vs legacy"
+// tokens (see pkg/middleware.TokenAuthMiddleware's doc comment), so a
+// WebAuthnService-issued legacy HMAC token - carrying a "sid" claim -
+// reaches Logout's tokenauth_result branch, not the legacy one below it,
+// whenever the AS is enabled. That branch must still revoke the family:
+// go-tokenauth's shared *claims.Result has no "sid" field at all, so Logout
+// has to re-parse the raw token itself (still available via the "token"
+// context key TokenAuthMiddleware also sets) to reach it.
+func TestHandlers_Logout_ASToken_ModeLegacy_RevokesFamily(t *testing.T) {
+	handlers, router := setupLogoutTestHandlers(t)
+
+	secret := handlers.cfg.JWT.Secret
+	rawToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1",
+		"jti":     "jti-modelegacy-family",
+		"sid":     "sid-modelegacy-family-1",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	rawTokenStr, err := rawToken.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	result := &tokenauthclaims.Result{
+		UserID: "user-1",
+		JTI:    "jti-modelegacy-family",
+		Mode:   tokenauthclaims.ModeLegacy,
+	}
+
+	router.POST("/logout", func(c *gin.Context) {
+		c.Set("token", rawTokenStr)
+		c.Set("tokenauth_result", result)
+		c.Next()
+	}, handlers.Logout)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !handlers.services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-modelegacy-family-1") {
+		t.Error("expected the refresh-token family to be revoked via the tokenauth_result/ModeLegacy path")
+	}
+}
+
+// TestHandlers_Logout_ASToken_ModeSession_NoFamilyRevocationAttempted is
+// the sanity check that new-style AS-issued tokens (which have no
+// sid/refresh-token-family concept in this codebase) never even attempt a
+// re-parse - the existing TestHandlers_Logout_ASToken already proves this
+// implicitly (its "token" context value is deliberately unparseable), but
+// this makes the ModeSession-skips-family-revocation behavior explicit.
+func TestHandlers_Logout_ASToken_ModeSession_NoFamilyRevocationAttempted(t *testing.T) {
+	handlers, router := setupLogoutTestHandlers(t)
+
+	result := &tokenauthclaims.Result{
+		UserID: "user-1",
+		JTI:    "jti-modesession-no-family",
+		Mode:   tokenauthclaims.ModeSession,
+	}
+
+	router.POST("/logout", func(c *gin.Context) {
+		c.Set("token", "not-a-valid-hmac-token")
+		c.Set("tokenauth_result", result)
+		c.Next()
+	}, handlers.Logout)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// No sid was ever presented and Mode is ModeSession, so nothing should
+	// be revoked under any sid - there is nothing meaningful to assert
+	// beyond "this didn't error/panic", which the 200 above already covers.
+}
+
 // TestMaxConfiguredASTokenTTL proves the #391 review fix (round 2): the
 // blacklist entry Logout creates for an AS-issued token is sized from the
 // AS's own configured TTLs, not a fixed guess that an operator's

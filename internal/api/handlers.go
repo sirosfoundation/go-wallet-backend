@@ -891,7 +891,56 @@ func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) t
 	return maxConfiguredASTokenTTL(cfg)
 }
 
-// Logout invalidates the current session by blacklisting the JWT
+// familyRetention returns how long a Logout-triggered RevokeFamily entry
+// must be kept (see TokenBlacklist.RevokeFamily's own doc comment for why
+// it, unlike RevokeUser, is swept once this elapses): long enough that no
+// access or refresh token which could still legitimately carry the revoked
+// sid can possibly still be unexpired. Every token minted for a given sid
+// (WebAuthnService.generateToken/generateRefreshToken/RefreshAccessToken)
+// is minted no later than the moment of revocation itself -
+// IsFamilyRevoked is checked before minting any further token for that sid
+// - so the longer-lived of the pair (the refresh token, JWT.RefreshDays,
+// when refresh tokens are even enabled) bounds it.
+func familyRetention(cfg *config.Config) time.Duration {
+	if cfg.JWT.RefreshDays > 0 {
+		return time.Duration(cfg.JWT.RefreshDays) * 24 * time.Hour
+	}
+	return time.Duration(cfg.JWT.ExpiryHours) * time.Hour
+}
+
+// legacyTokenSID re-parses a legacy HMAC-signed token to extract its "sid"
+// (refresh-token family/session id - see WebAuthnService.generateToken's
+// doc comment) claim. Mirrors pkg/middleware.legacyTokenSID (kept
+// unexported and duplicated rather than shared, for the same reason that
+// one is: go-tokenauth's shared *claims.Result deliberately doesn't expose
+// a wallet-backend-specific claim like "sid", so both this handler's
+// tokenauth_result branch below and TokenAuthMiddleware need their own
+// small re-parse of the one extra claim, independent of that shared type).
+func legacyTokenSID(secret, rawToken string) string {
+	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return []byte(secret), nil
+	})
+	if err != nil || !token.Valid {
+		return ""
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return ""
+	}
+
+	sid, _ := claims["sid"].(string)
+	return sid
+}
+
+// Logout invalidates the current session by blacklisting the JWT and, when
+// it carries one, revoking its whole refresh-token family (#402) - so a
+// refresh token issued alongside it (or produced by any rotation of it)
+// stops working immediately too, rather than remaining valid until it
+// naturally expires or is itself used.
 func (h *Handlers) Logout(c *gin.Context) {
 	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
 	// - the path taken whenever AS is enabled), the raw token may be
@@ -912,6 +961,32 @@ func (h *Handlers) Logout(c *gin.Context) {
 					)
 				}
 			}
+
+			// Refresh-token family revocation (#402), legacy-mode tokens
+			// only: go-tokenauth "auto-detects new-style vs legacy" (see
+			// TokenAuthMiddleware's doc comment), so a WebAuthnService-
+			// issued legacy HMAC token can be authenticated through this
+			// tokenauth_result path instead of the legacy branch below
+			// whenever the AS is enabled - without this, a session logged
+			// out through that deployment mode would never actually have
+			// its refresh-token family revoked. New-style AS-issued tokens
+			// (ModeSession) have no sid/refresh-token-family concept in
+			// this codebase, so only ModeLegacy is handled here.
+			if result.Mode == tokenauthclaims.ModeLegacy && h.services.TokenBlacklist != nil {
+				if rawToken, exists := c.Get("token"); exists {
+					if sid := legacyTokenSID(h.cfg.JWT.Secret, rawToken.(string)); sid != "" {
+						expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
+						if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
+							h.logger.Warn("Failed to revoke refresh-token family", zap.Error(err))
+						} else {
+							h.logger.Info("User logged out, refresh-token family revoked",
+								zap.String("sid", sid),
+							)
+						}
+					}
+				}
+			}
+
 			c.JSON(200, gin.H{"message": "Logged out successfully"})
 			return
 		}
@@ -925,7 +1000,7 @@ func (h *Handlers) Logout(c *gin.Context) {
 		return
 	}
 
-	// Parse the token to get claims (we need jti and exp)
+	// Parse the token to get claims (we need jti, exp, and sid)
 	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
 		return []byte(h.cfg.JWT.Secret), nil
 	})
@@ -949,6 +1024,19 @@ func (h *Handlers) Logout(c *gin.Context) {
 				} else {
 					h.logger.Info("User logged out, token blacklisted",
 						zap.String("jti", jti),
+					)
+				}
+			}
+
+			// Refresh-token family revocation (#402) - see this function's
+			// own doc comment.
+			if sid, _ := claims["sid"].(string); sid != "" && h.services.TokenBlacklist != nil {
+				familyExpiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
+				if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, familyExpiry); err != nil {
+					h.logger.Warn("Failed to revoke refresh-token family", zap.Error(err))
+				} else {
+					h.logger.Info("User logged out, refresh-token family revoked",
+						zap.String("sid", sid),
 					)
 				}
 			}

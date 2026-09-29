@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
@@ -46,7 +48,15 @@ type TenantLookup interface {
 // RevokeUser (#383) would otherwise never be consulted for tokens
 // validated through this path - only for tokens validated through the
 // legacy AuthMiddlewareWithBlacklist.
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+//
+// cfg is used only to re-parse a legacy-mode token (result.Mode ==
+// ModeLegacy) far enough to read its "sid" (refresh-token family) claim for
+// the same family-revocation check (#402) - go-tokenauth's *claims.Result
+// is shared with AS-issued tokens and deliberately doesn't expose a
+// wallet-backend-specific claim like "sid", so this re-parses the same
+// legacy HMAC token go-tokenauth already validated (see legacyTokenSID)
+// rather than growing that shared type/module for one caller's claim.
+func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -78,6 +88,26 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 			c.JSON(401, gin.H{"error": "Token has been revoked"})
 			c.Abort()
 			return
+		}
+
+		// Refresh-token family revocation (#402), legacy-mode tokens only:
+		// go-tokenauth "auto-detects new-style vs legacy" (this function's
+		// own doc comment above), so a WebAuthnService-issued legacy HMAC
+		// token can reach this middleware instead of
+		// AuthMiddlewareWithBlacklist whenever the AS is enabled - and
+		// without this check, revoking its family on logout would be
+		// silently ineffective for exactly that deployment mode. New-style
+		// AS-issued tokens (ModeSession) have no sid/family concept at all;
+		// only ModeLegacy is checked.
+		if blacklist != nil && result.Mode == claims.ModeLegacy {
+			if sid := legacyTokenSID(cfg.JWT.Secret, rawToken); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+				logger.Warn("Token for revoked refresh-token family used",
+					zap.String("sid", sid),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Tenant validation: look up and check enabled
@@ -237,4 +267,31 @@ func extractBearer(c *gin.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
+}
+
+// legacyTokenSID re-parses rawToken - a token go-tokenauth has already
+// validated as legacy-mode/HMAC - to read its "sid" (refresh-token family)
+// claim, a wallet-backend-specific concept go-tokenauth's own *claims.Result
+// deliberately doesn't expose (see TokenAuthMiddleware's doc comment).
+// Returns "" if the token can't be parsed with secret or carries no sid
+// claim; callers must treat that as "no family to check", not an error -
+// legacy tokens minted before #402 have no sid at all.
+func legacyTokenSID(secret, rawToken string) string {
+	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return []byte(secret), nil
+	})
+	if err != nil || !token.Valid {
+		return ""
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return ""
+	}
+
+	sid, _ := claims["sid"].(string)
+	return sid
 }

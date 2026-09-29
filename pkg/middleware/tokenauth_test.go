@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	legacyjwt "github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -42,6 +43,15 @@ func (s *stubTenantStore) Create(context.Context, *domain.Tenant) error { return
 func (s *stubTenantStore) Update(context.Context, *domain.Tenant) error { return nil }
 func (s *stubTenantStore) GetAll(context.Context) ([]*domain.Tenant, error) {
 	return nil, nil
+}
+
+// testTokenAuthConfig returns a minimal config for TokenAuthMiddleware in
+// tests. Only JWT.Secret matters - it's used solely to re-parse a
+// legacy-mode token for its "sid" claim (see legacyTokenSID) - and none of
+// the ES256/EdDSA-signed tokens these tests present are legacy-mode, so
+// its exact value is otherwise irrelevant here.
+func testTokenAuthConfig() *config.Config {
+	return &config.Config{JWT: config.JWTConfig{Secret: "test-tokenauth-secret"}}
 }
 
 // setupTokenAuthTest creates a test JWKS server and validator.
@@ -129,7 +139,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -162,7 +172,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -180,7 +190,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -207,7 +217,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -232,7 +242,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -273,7 +283,7 @@ func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -308,7 +318,7 @@ func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -317,6 +327,76 @@ func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for non-revoked user, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// createLegacyModeTokenWithSID signs a legacy HMAC token shaped exactly
+// like WebAuthnService.generateToken (see internal/service/webauthn.go),
+// carrying a "sid" claim - go-tokenauth's Validator "auto-detects" this as
+// ModeLegacy purely from its HS256 header alg (see validator.Validate's own
+// doc comment), independent of go-tokenauth's own LegacyTokenClaims shape,
+// which has no "sid" field at all and simply ignores it on unmarshal.
+func createLegacyModeTokenWithSID(secret, userID, jti, sid string) string {
+	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"user_id":   userID,
+		"tenant_id": "test-tenant",
+		"jti":       jti,
+		"sid":       sid,
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	signed, _ := token.SignedString([]byte(secret))
+	return signed
+}
+
+// TestTokenAuthMiddleware_ModeLegacy_RevokedFamilyTokenRejected is a
+// regression test for #402: go-tokenauth's Validator "auto-detects
+// new-style vs legacy" tokens (TokenAuthMiddleware's own doc comment), so a
+// WebAuthnService-issued legacy HMAC token reaches THIS middleware instead
+// of the legacy AuthMiddlewareWithBlacklist whenever the AS is enabled.
+// Without checking family revocation here too (via legacyTokenSID's
+// re-parse - go-tokenauth's shared *claims.Result has no "sid" field),
+// revoking a session's refresh-token family on logout would be silently
+// ineffective for exactly this deployment mode.
+func TestTokenAuthMiddleware_ModeLegacy_RevokedFamilyTokenRejected(t *testing.T) {
+	secret := "legacy-mode-test-secret"
+	v := validator.New(validator.Config{
+		Legacy: validator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret)},
+	})
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	logger := zap.NewNop()
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+
+	tokenStr := createLegacyModeTokenWithSID(secret, "user-123", "jti-legacy-mode-family-1", "sid-legacy-mode-family-1")
+
+	router := gin.New()
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	// Works before the family is revoked.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 before family revocation, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if err := blacklist.RevokeFamily(context.Background(), "sid-legacy-mode-family-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+
+	// The same token - its own jti never individually blacklisted - must
+	// now be rejected.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a ModeLegacy token whose refresh-token family was revoked, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

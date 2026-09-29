@@ -488,7 +488,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		}
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 		require.NotEmpty(t, refreshToken)
 
@@ -543,7 +543,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 			t.Fatalf("failed to create user: %v", err)
 		}
 
-		accessToken, err := svc.generateToken(user, domain.TenantID("test-tenant"))
+		accessToken, err := svc.generateToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: accessToken})
@@ -560,7 +560,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		if err := store.Users().Create(ctx, user); err != nil {
 			t.Fatalf("failed to create user: %v", err)
 		}
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		_ = store.Users().Delete(ctx, user.UUID)
@@ -585,7 +585,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		svc.SetTokenBlacklist(blacklist)
 
 		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-7"}
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		// User does not exist yet: lookup fails, request is rejected.
@@ -631,7 +631,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		// First use succeeds and rotates the token.
@@ -669,7 +669,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		const n = 20
@@ -768,7 +768,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		// Membership removed (e.g. an admin removed this user from the
@@ -797,7 +797,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		tenant, err := store.Tenants().GetByID(ctx, "test-tenant")
@@ -819,7 +819,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		// Deliberately not calling addTenantMembership: no such tenant exists.
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("no-such-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("no-such-tenant"), "")
 		require.NoError(t, err)
 
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
@@ -841,7 +841,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		// Deliberately no addTenantMembership call.
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+		refreshToken, err := svc.generateRefreshToken(user, domain.DefaultTenantID, "")
 		require.NoError(t, err)
 
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
@@ -882,7 +882,7 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, store.Users().Create(ctx, user))
 		addTenantMembership(t, store, user.UUID, "test-tenant")
 
-		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
 		require.NoError(t, err)
 
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
@@ -896,6 +896,128 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
 		require.NoError(t, err)
 	})
+
+	// Regression test for #402: the refresh-token family/session id (sid)
+	// must be carried forward UNCHANGED across rotation, so a Logout that
+	// happens after several rotations can still revoke every token derived
+	// from the original login in one call - not just whichever single
+	// jti/token happened to be current.
+	t.Run("rotation carries the refresh-token family (sid) forward unchanged", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-1"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "sid-fixed-1")
+		require.NoError(t, err)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+
+		assert.Equal(t, "sid-fixed-1", sidClaim(t, resp.Token), "access token must carry the original sid forward")
+		assert.Equal(t, "sid-fixed-1", sidClaim(t, resp.RefreshToken), "rotated refresh token must carry the original sid forward")
+
+		// Rotate a second time: the family must still be the same one, not
+		// re-derived from the (also unchanged) user_id/tenant_id, proving
+		// it's genuinely being carried forward rather than freshly derived
+		// each time some other claim happens to match.
+		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		require.NoError(t, err)
+		assert.Equal(t, "sid-fixed-1", sidClaim(t, resp2.Token))
+		assert.Equal(t, "sid-fixed-1", sidClaim(t, resp2.RefreshToken))
+	})
+
+	// Regression test for #402: a refresh token minted before the sid
+	// concept existed carries no "sid" claim at all. Rotating it must not
+	// leave the new pair permanently outside Logout's reach either - a
+	// fresh family should start being tracked from that rotation onward.
+	t.Run("rotating a pre-#402 refresh token with no sid claim starts a fresh family", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-2"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "") // no sid
+		require.NoError(t, err)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+
+		newSid := sidClaim(t, resp.Token)
+		assert.NotEmpty(t, newSid, "expected a fresh sid to be minted for a token that never had one")
+		assert.Equal(t, newSid, sidClaim(t, resp.RefreshToken), "the freshly minted access and refresh tokens must share the same new sid")
+	})
+
+	// Regression test for #402: RefreshAccessToken must reject a refresh
+	// token whose family has been revoked (TokenBlacklist.RevokeFamily -
+	// what Logout now calls), even though this specific token's own jti was
+	// never individually blacklisted - proving the actual security property
+	// #402 was filed for: a stolen/still-held refresh token stops working
+	// as soon as its session is logged out, not just when it's itself used
+	// or naturally expires.
+	t.Run("a refresh token whose family has been revoked is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-3"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "sid-revoked-1")
+		require.NoError(t, err)
+
+		// Simulate Logout: revoke the family before the refresh token is
+		// ever used.
+		require.NoError(t, blacklist.RevokeFamily(ctx, "sid-revoked-1", time.Now().Add(time.Hour)))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a revoked family, got %v", err)
+		}
+	})
+
+	// Sanity check for the test above: a DIFFERENT family being revoked
+	// must not affect this one.
+	t.Run("a refresh token whose family has NOT been revoked still works", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+		require.NoError(t, blacklist.RevokeFamily(ctx, "sid-some-other-family", time.Now().Add(time.Hour)))
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-4"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "sid-not-revoked-1")
+		require.NoError(t, err)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		assert.NotEmpty(t, resp.Token)
+	})
+}
+
+// sidClaim parses a legacy HMAC token signed with testJWTSecret and returns
+// its "sid" claim (empty string if absent) - a small test helper for
+// asserting on the refresh-token family/session id (#402) carried by
+// tokens this package's own generateToken/generateRefreshToken produce.
+func sidClaim(t *testing.T, tokenStr string) string {
+	t.Helper()
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		return []byte(testJWTSecret), nil
+	})
+	require.NoError(t, err)
+	claims, ok := token.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+	sid, _ := claims["sid"].(string)
+	return sid
 }
 
 func TestWebAuthnUser(t *testing.T) {
@@ -1335,6 +1457,82 @@ func TestFullLoginFlow(t *testing.T) {
 	})
 }
 
+// TestFullLoginFlow_MintsSharedRefreshTokenFamily is a regression test for
+// #402: FinishLogin must mint a single sid (refresh-token family/session
+// id) and set it on BOTH the access token and its paired refresh token, not
+// just leave each to derive it independently - otherwise
+// TokenBlacklist.RevokeFamily on logout would have nothing consistent to
+// revoke. Unlike TestFullLoginFlow, this builds its own setup (not
+// newTestVirtualWebAuthnSetup, which fixes RefreshDays at 0/disabled) so a
+// refresh token actually gets minted.
+func TestFullLoginFlow_MintsSharedRefreshTokenFamily(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT: config.JWTConfig{
+			Secret:      testJWTSecret,
+			Issuer:      testJWTIssuer,
+			ExpiryHours: testJWTExpiryHours,
+			RefreshDays: 7,
+		},
+	}
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Family Sid Test User"})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	finishRegResp, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Family Sid Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	beginLoginResp, err := svc.BeginLogin(ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+
+	finishLoginResp, err := svc.FinishLogin(ctx, &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+	})
+	require.NoError(t, err)
+
+	require.NotEmpty(t, finishLoginResp.Token)
+	require.NotEmpty(t, finishLoginResp.RefreshToken)
+
+	accessSid := sidClaim(t, finishLoginResp.Token)
+	refreshSid := sidClaim(t, finishLoginResp.RefreshToken)
+	assert.NotEmpty(t, accessSid, "expected FinishLogin's access token to carry a sid claim")
+	assert.Equal(t, accessSid, refreshSid, "access and refresh tokens from the same login must share the same sid")
+}
+
 // ============================================================================
 // BeginAddCredential Tests
 // ============================================================================
@@ -1577,7 +1775,7 @@ func TestGenerateToken(t *testing.T) {
 		DID:  did,
 	}
 
-	token, err := svc.generateToken(user, domain.DefaultTenantID)
+	token, err := svc.generateToken(user, domain.DefaultTenantID, "")
 	require.NoError(t, err)
 	assert.NotEmpty(t, token)
 
