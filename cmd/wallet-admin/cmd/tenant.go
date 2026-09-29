@@ -221,6 +221,7 @@ var (
 	oidcGateLoginName          string
 	oidcGateLoginScopes        string
 	oidcGateBindIdentity       bool
+	oidcGateTrustAdminClaim    bool
 	oidcGateClear              bool
 )
 
@@ -242,6 +243,13 @@ Identity Binding:
   When --bind-identity is enabled, the enterprise identity (issuer + subject)
   is stored with the wallet user. On subsequent logins (if gated), the user
   must authenticate with the same enterprise identity.
+
+Admin Claim Trust:
+  --trust-admin-claim opts this tenant in to minting elevated (admin +
+  delegation) session permissions when a login_op ID token's
+  groups/roles/realm_roles claim contains "admin". OFF BY DEFAULT: the AS
+  does not control the IdP's claim semantics, so only enable this if you
+  trust the IdP to gate its own "admin" claim correctly.
 
 Examples:
   # Enable registration gate with Keycloak
@@ -271,11 +279,12 @@ Examples:
 		if oidcGateClear {
 			reqBody := map[string]interface{}{
 				"oidc_gate": map[string]interface{}{
-					"mode":            "none",
-					"registration_op": nil,
-					"login_op":        nil,
-					"bind_identity":   false,
-					"required_claims": nil,
+					"mode":              "none",
+					"registration_op":   nil,
+					"login_op":          nil,
+					"bind_identity":     false,
+					"trust_admin_claim": false,
+					"required_claims":   nil,
 				},
 			}
 
@@ -296,8 +305,9 @@ Examples:
 
 		// Build OIDC gate config
 		oidcGate := map[string]interface{}{
-			"mode":          oidcGateMode,
-			"bind_identity": oidcGateBindIdentity,
+			"mode":              oidcGateMode,
+			"bind_identity":     oidcGateBindIdentity,
+			"trust_admin_claim": oidcGateTrustAdminClaim,
 		}
 
 		// Registration provider config
@@ -392,5 +402,6 @@ func init() {
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginName, "login-display-name", "", "Display name for login IdP (e.g., 'Enterprise SSO')")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginScopes, "login-scopes", "", "OIDC scopes for login (default: 'openid profile email')")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateBindIdentity, "bind-identity", false, "Bind enterprise identity to wallet user (verify on login)")
+	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateTrustAdminClaim, "trust-admin-claim", false, "Mint elevated admin permissions from the login IdP's groups/roles claim (off by default)")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateClear, "clear", false, "Clear OIDC gate configuration")
 }

@@ -734,6 +734,7 @@ func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -813,6 +814,7 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
