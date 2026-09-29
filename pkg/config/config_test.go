@@ -2630,3 +2630,20 @@ func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
 		t.Errorf("per-tenant defaults wrong: %+v", tenant)
 	}
 }
+
+func TestConfig_Validate_TrustedProxies(t *testing.T) {
+	for _, ok := range [][]string{nil, {"none"}, {"10.0.0.0/8", "192.168.1.1", "fd00::/8"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]string{{"10.0.0.0/33"}, {"lb.example.com"}, {"none", "10.0.0.1"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies") {
+			t.Errorf("%v must be rejected, got %v", bad, err)
+		}
+	}
+}

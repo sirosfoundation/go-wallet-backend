@@ -149,8 +149,6 @@ func NewASModule(
 	}, nil
 }
 
-// RegisterRoutes registers all AS endpoints on the given router group.
-// The group should be mounted at /auth.
 // SetOIDCGateRateLimiter installs the rate limiter that runs in front of the
 // passkey OIDC gates. Call it before RegisterRoutes; the same limiter is
 // meant to be shared with the /user/* gates so both draw from one set of
@@ -169,6 +167,8 @@ func (m *ASModule) gateLimitMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) { c.Next() }
 }
 
+// RegisterRoutes registers all AS endpoints on the given router group.
+// The group should be mounted at /auth.
 func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)

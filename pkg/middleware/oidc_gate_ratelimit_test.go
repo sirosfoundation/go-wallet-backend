@@ -47,8 +47,8 @@ func gateCall(r *gin.Engine, ip, tenant string, bearer bool) *httptest.ResponseR
 
 func limitCfg(perIP, perTenant int) config.OIDCGateRateLimitConfig {
 	return config.OIDCGateRateLimitConfig{
-		PerIP:     config.AuthRateLimitConfig{Enabled: true, MaxAttempts: perIP, WindowSeconds: 60, LockoutSeconds: 60},
-		PerTenant: config.AuthRateLimitConfig{Enabled: true, MaxAttempts: perTenant, WindowSeconds: 60, LockoutSeconds: 60},
+		PerIP:     config.OIDCGateIPLimitConfig{Enabled: true, MaxAttempts: perIP, WindowSeconds: 60, LockoutSeconds: 60},
+		PerTenant: config.OIDCGateTenantLimitConfig{Enabled: true, MaxAttempts: perTenant, WindowSeconds: 60, LockoutSeconds: 60},
 	}
 }
 

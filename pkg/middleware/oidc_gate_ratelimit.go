@@ -23,13 +23,14 @@ type OIDCGateRateLimiter struct {
 
 // NewOIDCGateRateLimiter creates the limiter from configuration.
 func NewOIDCGateRateLimiter(cfg config.OIDCGateRateLimitConfig, logger *zap.Logger) *OIDCGateRateLimiter {
-	cfg.PerIP.SetDefaults()
-	cfg.PerTenant.SetDefaults()
+	ip, tenant := config.AuthRateLimitConfig(cfg.PerIP), config.AuthRateLimitConfig(cfg.PerTenant)
+	ip.SetDefaults()
+	tenant.SetDefaults()
 	return &OIDCGateRateLimiter{
-		perIP:         NewAuthRateLimiter(cfg.PerIP, logger.Named("oidc-gate-ip")),
-		perTenant:     NewAuthRateLimiter(cfg.PerTenant, logger.Named("oidc-gate-tenant")),
-		retryAfterIP:  cfg.PerIP.LockoutSeconds,
-		retryAfterTen: cfg.PerTenant.LockoutSeconds,
+		perIP:         NewAuthRateLimiter(ip, logger.Named("oidc-gate-ip")),
+		perTenant:     NewAuthRateLimiter(tenant, logger.Named("oidc-gate-tenant")),
+		retryAfterIP:  ip.LockoutSeconds,
+		retryAfterTen: tenant.LockoutSeconds,
 		logger:        logger,
 	}
 }
@@ -64,8 +65,8 @@ func (l *OIDCGateRateLimiter) Middleware() gin.HandlerFunc {
 
 		c.Next()
 
-		// A gate that refused the token makes the attempt cost double for
-		// that client, so guessing is dearer than valid use.
+		// A gate that refused the token costs that client extra tokens (three
+		// in total instead of one), so guessing is dearer than valid use.
 		if c.IsAborted() && c.Writer.Status() == http.StatusUnauthorized {
 			l.perIP.RecordFailure(ip)
 		}
