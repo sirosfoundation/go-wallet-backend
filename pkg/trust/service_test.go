@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -1002,9 +1004,118 @@ func (n *nonResolvingEvaluator) Name() string                           { return
 func (n *nonResolvingEvaluator) SupportedResourceTypes() []ResourceType { return nil }
 func (n *nonResolvingEvaluator) Healthy() bool                          { return true }
 
-// EvaluateStatusListSigner sends its own action.name (not credential-issuer),
-// uses the issuer PDP endpoint resolution, and carries the key material.
-func TestService_EvaluateStatusListSigner(t *testing.T) {
+// actionEvaluator answers per action.name and records every call in order.
+type actionEvaluator struct {
+	testMockEvaluator
+	answers map[string]any // action -> true/false/error
+	calls   []*EvaluationRequest
+	tenants []string
+}
+
+func (a *actionEvaluator) Evaluate(ctx context.Context, req *EvaluationRequest) (*EvaluationResponse, error) {
+	a.calls = append(a.calls, req)
+	a.tenants = append(a.tenants, TenantFromContext(ctx))
+	name := string(req.Role)
+	if name == "" {
+		name = req.GetAction()
+	}
+	switch v := a.answers[name].(type) {
+	case error:
+		return nil, v
+	case bool:
+		return &EvaluationResponse{Decision: v, Reason: "answered " + name}, nil
+	}
+	return &EvaluationResponse{Decision: false}, nil
+}
+
+func (a *actionEvaluator) order() []string {
+	var out []string
+	for _, r := range a.calls {
+		if r.Role != "" {
+			out = append(out, string(r.Role))
+		} else {
+			out = append(out, r.GetAction())
+		}
+	}
+	return out
+}
+
+func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
+	boom := errors.New("pdp down")
+	tests := []struct {
+		name        string
+		pdp         string
+		answers     map[string]any
+		wantOrder   []string
+		wantTrusted bool
+		wantAction  string
+		wantError   bool // Reason reports a failed evaluation
+		wantLog     string
+	}{
+		{"first positive: one call", "https://pdp", map[string]any{"status-list-signer": true, "credential-issuer": true},
+			[]string{"status-list-signer"}, true, "status-list-signer", false, ""},
+		{"first negative, issuer positive", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": true},
+			[]string{"status-list-signer", "credential-issuer"}, true, "credential-issuer", false, "status-list-signer did not trust it"},
+		{"first error, issuer positive", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": true},
+			[]string{"status-list-signer", "credential-issuer"}, true, "credential-issuer", false, "status-list-signer evaluation failed"},
+		{"both negative", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": false},
+			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
+		{"both error", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": boom},
+			[]string{"status-list-signer", "credential-issuer"}, false, "", true, ""},
+		{"first error, issuer negative is a negative", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": false},
+			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
+		{"first negative, issuer error is a negative", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": boom},
+			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
+		{"no PDP: one call", "", map[string]any{"status-list-signer": true}, nil, false, "", false, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Trust: config.TrustConfig{Timeout: 10, PDPURL: tc.pdp}}
+			ev := &actionEvaluator{answers: tc.answers}
+			core, logs := observer.New(zap.DebugLevel)
+			svc := NewService(cfg, zap.New(core), func(string, time.Duration) (TrustEvaluator, error) { return ev, nil })
+			km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
+			ctx := ContextWithTenant(context.Background(), "tenant-3")
+
+			info, err := svc.EvaluateStatusListSigner(ctx, "https://status.example", "", km)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Trusted != tc.wantTrusted || info.Action != tc.wantAction {
+				t.Fatalf("trusted=%v action=%q, want %v %q (%+v)", info.Trusted, info.Action, tc.wantTrusted, tc.wantAction, info)
+			}
+			if got := strings.HasPrefix(info.Reason, "Trust evaluation failed"); got != tc.wantError {
+				t.Fatalf("error-reason=%v want %v (%q)", got, tc.wantError, info.Reason)
+			}
+			if got := ev.order(); strings.Join(got, ",") != strings.Join(tc.wantOrder, ",") {
+				t.Fatalf("call order %v, want %v", got, tc.wantOrder)
+			}
+			// Same subject, key material and tenant on every call.
+			for i, r := range ev.calls {
+				if r.GetSubjectID() != "https://status.example" || r.GetKeyType() != ResourceTypeX5C || ev.tenants[i] != "tenant-3" {
+					t.Errorf("call %d: subject=%q keyType=%q tenant=%q", i, r.GetSubjectID(), r.GetKeyType(), ev.tenants[i])
+				}
+			}
+			if len(ev.calls) > 0 && (ev.calls[0].Role != RoleAny || ev.calls[0].GetAction() != StatusListSignerAction) {
+				t.Errorf("first call must be status-list-signer, got role=%q action=%q", ev.calls[0].Role, ev.calls[0].GetAction())
+			}
+			if tc.wantLog != "" {
+				var found bool
+				for _, e := range logs.FilterMessageSnippet("credential-issuer fallback").All() {
+					found = found || (strings.Contains(e.Message, tc.wantLog) && e.ContextMap()["signer_trust_action"] == "credential-issuer")
+				}
+				if !found {
+					t.Errorf("missing fallback log containing %q: %v", tc.wantLog, logs.All())
+				}
+			}
+			if tc.wantAction == "status-list-signer" && logs.FilterField(zap.String("signer_trust_action", "status-list-signer")).Len() != 1 {
+				t.Errorf("missing signer_trust_action=status-list-signer log")
+			}
+		})
+	}
+}
+
+func TestService_EvaluateStatusListSigner_Endpoint(t *testing.T) {
 	cfg := &config.Config{Trust: config.TrustConfig{Timeout: 10}}
 	cfg.Trust.Issuer.PDPURL = "https://issuer-pdp.example.com"
 	eval := &testMockEvaluator{decision: true}
@@ -1013,23 +1124,14 @@ func TestService_EvaluateStatusListSigner(t *testing.T) {
 		gotEndpoint = endpoint
 		return eval, nil
 	})
-
 	km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
 	info, err := svc.EvaluateStatusListSigner(context.Background(), "https://status.example", "", km)
-	if err != nil || !info.Trusted {
+	if err != nil || !info.Trusted || info.Action != StatusListSignerAction || StatusListSignerAction != "status-list-signer" {
 		t.Fatalf("EvaluateStatusListSigner() = %+v, %v", info, err)
 	}
 	if gotEndpoint != "https://issuer-pdp.example.com" {
 		t.Errorf("endpoint = %q, want the issuer PDP", gotEndpoint)
 	}
-	if eval.gotReq.Role != RoleAny || eval.gotReq.GetAction() != StatusListSignerAction || StatusListSignerAction != "status-list-signer" {
-		t.Errorf("role=%q action=%q", eval.gotReq.Role, eval.gotReq.GetAction())
-	}
-	if eval.gotReq.GetSubjectID() != "https://status.example" || eval.gotReq.GetKeyType() != ResourceTypeX5C {
-		t.Errorf("subject=%q keyType=%q", eval.gotReq.GetSubjectID(), eval.gotReq.GetKeyType())
-	}
-
-	// Session override wins; no PDP fails closed.
 	if _, err := svc.EvaluateStatusListSigner(context.Background(), "s", "https://override", km); err != nil || gotEndpoint != "https://override" {
 		t.Errorf("override endpoint = %q, err %v", gotEndpoint, err)
 	}

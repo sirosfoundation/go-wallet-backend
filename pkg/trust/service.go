@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,6 +114,9 @@ type TrustInfo struct {
 	Framework    string   `json:"framework,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
 	Certificates []string `json:"certificates,omitempty"`
+	// Action names the AuthZEN action whose positive decision produced this
+	// result; set only by EvaluateStatusListSigner.
+	Action string `json:"action,omitempty"`
 }
 
 // EvaluatorFactory creates a TrustEvaluator for a given PDP endpoint.
@@ -308,23 +312,79 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 // ("AuthZEN actions used by go-wallet-backend").
 const StatusListSignerAction = "status-list-signer"
 
+// StatusListSignerFallbackAction is the second action tried when the
+// status-list-signer evaluation is not positive.
+const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
+
+// evalFailedReasonPrefix starts TrustInfo.Reason when the evaluation itself
+// failed (as opposed to the PDP answering "no").
+const evalFailedReasonPrefix = "Trust evaluation failed"
+
 // EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
 // x5c chain or jwk from a status list's header) may sign status lists for
-// subject (the list's iss claim, else the origin of the list URI). It sends
-// action.name "status-list-signer" (Role is left empty so the explicit action
-// is used, as for EvaluateFIDO2Attestation).
+// subject (the list's iss claim, else the origin of the list URI).
+//
+// It makes up to two calls with the same subject, key material, endpoint and
+// (tenant) context, and trusts the signer if either is positive:
+//
+//  1. action.name "status-list-signer" (Role is left empty so the explicit
+//     action is used, as for EvaluateFIDO2Attestation);
+//  2. if that is not positive (negative or error), the credential-issuer role
+//     via EvaluateIssuer, a deliberate compatibility choice so deployments
+//     without a status-list-signer policy keep working.
+//
+// The second call is skipped when the first found no PDP configured (it could
+// not differ). TrustInfo.Action names the action that produced a positive
+// result. When both calls fail to trust the signer, a genuine negative from
+// either wins over an evaluation error, so callers can tell "the PDP said no"
+// from "no decision could be had".
 //
 // The endpoint is resolved like EvaluateIssuer's (session override, then the
 // per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
-// issuer-side entity, and no separate status-list PDP setting exists. With no
-// PDP resolved the result is Trusted=false (fail closed).
+// issuer-side entity, and no separate status-list PDP setting exists.
 func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
-	return s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
+	first, err := s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
 		action:      StatusListSignerAction,
 		keyMaterial: keyMaterial,
 		logLabel:    "status_list_signer",
 	})
+	if err != nil {
+		return nil, err
+	}
+	if first.Trusted {
+		first.Action = StatusListSignerAction
+		s.logger.Debug("status list signer trusted",
+			zap.String("signer_trust_action", StatusListSignerAction))
+		return first, nil
+	}
+	if first.Framework == "none" {
+		return first, nil
+	}
+
+	second, err := s.EvaluateIssuer(ctx, subject, trustEndpoint, keyMaterial)
+	if err != nil {
+		return nil, err
+	}
+	if second.Trusted {
+		second.Action = StatusListSignerFallbackAction
+		if strings.HasPrefix(first.Reason, evalFailedReasonPrefix) {
+			s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
+				zap.String("signer_trust_action", StatusListSignerFallbackAction),
+				zap.String("status_list_signer_reason", first.Reason))
+		} else {
+			s.logger.Warn("status list signer trusted via credential-issuer fallback; status-list-signer did not trust it",
+				zap.String("signer_trust_action", StatusListSignerFallbackAction),
+				zap.String("status_list_signer_reason", first.Reason))
+		}
+		return second, nil
+	}
+
+	// Neither trusted the signer: a genuine negative outranks an error.
+	if strings.HasPrefix(first.Reason, evalFailedReasonPrefix) && !strings.HasPrefix(second.Reason, evalFailedReasonPrefix) {
+		return second, nil
+	}
+	return first, nil
 }
 
 // evaluateOptions bundles evaluate's request-shaping parameters beyond the
@@ -448,7 +508,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		return &TrustInfo{
 			Trusted:   false,
 			Framework: "authzen",
-			Reason:    "Trust evaluation failed: " + err.Error(),
+			Reason:    evalFailedReasonPrefix + ": " + err.Error(),
 		}, nil
 	}
 

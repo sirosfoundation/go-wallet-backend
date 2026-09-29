@@ -460,15 +460,24 @@ func TestStatusSignerTrust(t *testing.T) {
 	assert.Equal(t, trust.KeyTypeX5C, ev.gotReq.KeyType)
 	assert.Equal(t, "tenant-9", ev.tenant)
 
-	// A PDP that only trusts the credential-issuer action must not authorize a
-	// list signer: the adapter never sends that role.
+	// A PDP that only trusts the credential-issuer action: the first call
+	// (status-list-signer) is negative, the credential-issuer fallback is
+	// positive, so the signer is trusted. The first call is still
+	// status-list-signer.
 	issuerOnly := &fakeTrustEvaluator{}
+	var seen []string
 	issuerOnly.decide = func(req *trust.EvaluationRequest) bool {
-		return req.Role == trust.RoleCredentialIssuer || req.GetAction() == "credential-issuer"
+		name := string(req.Role)
+		if name == "" {
+			name = req.GetAction()
+		}
+		seen = append(seen, name)
+		return name == "credential-issuer"
 	}
 	ok, err = statusSignerTrust(svcWith("http://pdp", issuerOnly))(ctx, "s", km)
 	assert.NoError(t, err)
-	assert.False(t, ok, "a credential-issuer-only positive decision must not authorize a list signer")
+	assert.True(t, ok, "credential-issuer fallback trusts the signer")
+	assert.Equal(t, []string{"status-list-signer", "credential-issuer"}, seen)
 
 	// A genuine negative decision: (false, nil), distinct from an error.
 	ev = &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: false, Reason: "not in any trust list"}}

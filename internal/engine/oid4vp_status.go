@@ -36,10 +36,10 @@ const (
 
 // statusSignerTrust adapts the go-trust backed TrustService to
 // statuslist.SignerTrust. The call is EvaluateStatusListSigner: action.name
-// "status-list-signer", resource type x5c or jwk, issuer PDP endpoint. It has
-// its own action because being trusted to issue credentials is not being
-// trusted to sign their revocation status; the go-trust deployment must define
-// a policy of that name (else go-trust applies its default policy; see
+// "status-list-signer" first, then (if not positive) the credential-issuer
+// role, trusted if either is positive; resource type x5c or jwk, issuer PDP
+// endpoint. The go-trust deployment must define a policy named
+// status-list-signer (else go-trust applies its default policy; see
 // docs/adr/012). The tenant travels in ctx (trust.ContextWithTenant, set by
 // Execute) and is applied by the PDP client's TenantTransport. "No PDP
 // configured" and "evaluation failed" come back from the service as

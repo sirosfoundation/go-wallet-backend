@@ -247,7 +247,8 @@ type PresentationConfig struct {
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
 	// unsigned, expired or malformed list also refuses).
 	// Choose enforce-revoked or strict to have the wallet refuse. The signer
-	// is evaluated by go-trust with action.name `status-list-signer`; the
+	// is evaluated by go-trust with action.name `status-list-signer`, then
+	// credential-issuer if that is not positive; the
 	// go-trust deployment must define a policy of that name or go-trust applies
 	// its default policy (docs/adr/012-trust-evaluation-architecture.md).
 	// A list without a verifiable, trusted signer key (no x5c/jwk, no PDP
