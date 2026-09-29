@@ -267,7 +267,10 @@ type CredentialConfig struct {
 	Scope               string                 `json:"scope,omitempty"`
 	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
-	Claims              map[string]interface{} `json:"claims,omitempty"`
+	// Claims is the pre-1.0 location of claim metadata; 1.0 moved it under
+	// credential_metadata. Kept raw and unread so an issuer that publishes it
+	// in either shape (some send an array) does not fail the whole document (#370).
+	Claims json.RawMessage `json:"claims,omitempty"`
 }
 
 // CredentialConfigurations is credential_configurations_supported, decoded

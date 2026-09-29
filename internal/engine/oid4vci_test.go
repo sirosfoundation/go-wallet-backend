@@ -3950,3 +3950,22 @@ func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *test
 	assert.True(t, req.RequiresResolution, "a did: issuer must ask the frontend to resolve it")
 	assert.Equal(t, issuer, req.ResolutionSubjectID, "ResolutionSubjectID must be populated for a DID issuer, same as for a DID verifier")
 }
+
+// Cleverbase publishes claims both at the configuration level (as an array)
+// and under credential_metadata. The credential must still be usable (#370).
+func TestIssuerMetadata_LegacyClaimsArrayDoesNotDropConfiguration(t *testing.T) {
+	doc := `{"credential_issuer":"https://i.example","credential_endpoint":"https://i.example/c",
+	"credential_configurations_supported":{"hello-world":{"format":"dc+sd-jwt","vct":"x","claims":[],
+	"credential_metadata":{"claims":[]}}}}`
+	var m IssuerMetadata
+	if err := json.Unmarshal([]byte(doc), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg, ok := m.CredentialConfigurationsSupported["hello-world"]
+	if !ok {
+		t.Fatal("configuration with a legacy claims array was dropped")
+	}
+	if cfg.Format != "dc+sd-jwt" || cfg.VCT != "x" {
+		t.Errorf("unexpected config: %+v", cfg)
+	}
+}
