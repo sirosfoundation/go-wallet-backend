@@ -217,6 +217,16 @@ func TestHandlers_GetAccountInfo_Success(t *testing.T) {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 
+	// Password authentication was removed (#162): the raw JSON must not
+	// carry hasPassword, which unmarshalling into the struct would hide.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("Failed to parse raw response: %v", err)
+	}
+	if _, present := raw["hasPassword"]; present {
+		t.Error("account info must not include hasPassword")
+	}
+
 	var response AccountInfoResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
