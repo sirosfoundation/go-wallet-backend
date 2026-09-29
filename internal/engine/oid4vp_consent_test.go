@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestCheckConsentAgainstDCQL(t *testing.T) {
 		{"child of requested path", consentTestQuery, []ConsentSelection{sel("pid", "address.street.name")}, "", ""},
 		{"always disclosed", consentTestQuery, []ConsentSelection{sel("pid", "vct", "given_name")}, "", ""},
 		{"empty disclosed", consentTestQuery, []ConsentSelection{sel("pid")}, "", ""},
-		{"unknown query id", consentTestQuery, []ConsentSelection{sel("other", "given_name")}, consentReasonOutsideQuery, "other"},
+		{"unknown query id", consentTestQuery, []ConsentSelection{sel("other", "given_name")}, consentReasonOutsideQuery, ""}, // client-supplied id is kept out of the violation
 		{"empty query id", consentTestQuery, []ConsentSelection{sel("", "given_name")}, consentReasonOutsideQuery, ""},
 		{"claim outside query", consentTestQuery, []ConsentSelection{sel("pid", "given_name", "birth_date")}, consentReasonClaimOutside, "pid"},
 		{"parent of requested path is a superset", consentTestQuery, []ConsentSelection{sel("pid", "address")}, consentReasonClaimOutside, "pid"},
@@ -221,4 +222,72 @@ func TestVetConsent_EdgeCases(t *testing.T) {
 	// Nil config behaves as the default (warn).
 	h.Config = nil
 	assert.NoError(t, h.vetConsent(&AuthorizationRequest{DCQLQuery: json.RawMessage(consentTestQuery)}, []ConsentSelection{sel("nope")}))
+}
+
+// A claim path may hold only strings, non-negative integers and null. Anything
+// else must be reported as unparseable, never read as a wildcard (which would
+// authorise every disclosure).
+func TestCheckConsentAgainstDCQL_UnsupportedPathElementsAreUnparseable(t *testing.T) {
+	for _, path := range []string{`[true]`, `[{}]`, `["a", false]`, `[-1]`, `[1.5]`, `[]`, `[["x"]]`} {
+		q := `{"credentials":[{"id":"pid","format":"dc+sd-jwt","claims":[{"path":` + path + `}]}]}`
+		_, err := checkConsentAgainstDCQL(json.RawMessage(q), []ConsentSelection{sel("pid", "anything")})
+		assert.Error(t, err, "path %s must be unparseable", path)
+	}
+	// The accepted elements still work: string, integer, null.
+	q := `{"credentials":[{"id":"pid","format":"dc+sd-jwt","claims":[{"path":["a",0,null]}]}]}`
+	v, err := checkConsentAgainstDCQL(json.RawMessage(q), []ConsentSelection{sel("pid", "a.0.b")})
+	require.NoError(t, err)
+	assert.Nil(t, v)
+
+	q = `{"credentials":[{"id":"pid","format":"dc+sd-jwt","claims":[{"path":` + tooLongPath() + `}]}]}`
+	_, err = checkConsentAgainstDCQL(json.RawMessage(q), []ConsentSelection{sel("pid", "x")})
+	assert.Error(t, err, "an over-long path must be refused")
+}
+
+func tooLongPath() string {
+	parts := make([]string, maxClaimPathElems+1)
+	for i := range parts {
+		parts[i] = `"a"`
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// Many wildcards against a long non-matching entry must not blow up: the
+// matcher is memoised, so this finishes at once instead of exploring ~10^7
+// states.
+func TestMatchJoinedPath_ManyWildcardsIsFast(t *testing.T) {
+	path := make([]interface{}, 12)
+	path[11] = "z" // the wildcards can never satisfy this
+	entry := strings.Repeat("a.", 24) + "b"
+
+	done := make(chan bool, 1)
+	go func() { done <- matchJoinedPath(entry, path) }()
+	select {
+	case got := <-done:
+		assert.False(t, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("matchJoinedPath did not finish: wildcard matching is not polynomial")
+	}
+}
+
+func TestMatchJoinedPath_WildcardBoundaries(t *testing.T) {
+	assert.True(t, matchJoinedPath("a.b.c", []interface{}{"a", nil, "c"}))
+	assert.True(t, matchJoinedPath("a..c", []interface{}{"a", nil, "c"}), "a wildcard may match no characters")
+	assert.True(t, matchJoinedPath("a.b.c.d", []interface{}{"a", nil}), "a descendant is a subset")
+	assert.False(t, matchJoinedPath("a.b", []interface{}{"a", nil, "c"}))
+	assert.True(t, matchJoinedPath("org.iso.18013.5.1.family_name", []interface{}{"org.iso.18013.5.1", "family_name"}))
+}
+
+// Over-long entries are refused without being matched at all.
+func TestClaimPathMatcher_OverlongEntry(t *testing.T) {
+	m := claimPathMatcher{{"a", nil}}
+	assert.False(t, m.allows("a."+strings.Repeat("x", maxClaimEntryLen)))
+}
+
+func TestLoggableID_Bounded(t *testing.T) {
+	assert.Equal(t, "pid", loggableID("pid"))
+	long := strings.Repeat("é", maxLoggedQueryID+10)
+	got := loggableID(long)
+	assert.LessOrEqual(t, len([]rune(got)), maxLoggedQueryID+3)
+	assert.True(t, strings.HasSuffix(got, "..."))
 }

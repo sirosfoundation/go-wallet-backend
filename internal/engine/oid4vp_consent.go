@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -54,6 +55,39 @@ var alwaysDisclosed = map[string]bool{
 	"iss": true, "iat": true, "exp": true, "nbf": true, "vct": true, "cnf": true, "status": true,
 }
 
+// Bounds on what a verifier-controlled query or client-controlled entry may
+// make the matcher chew on.
+const (
+	maxClaimPathElems = 32
+	maxClaimEntryLen  = 512
+	maxLoggedQueryID  = 64
+)
+
+// validateClaimPath checks one DCQL claims[].path: non-empty and made only of
+// strings, non-negative integers and null (wildcard), as DCQL defines. A path
+// with anything else cannot be interpreted, and must not be read as a
+// wildcard.
+func validateClaimPath(path []interface{}) error {
+	if len(path) == 0 {
+		return errors.New("empty claim path")
+	}
+	if len(path) > maxClaimPathElems {
+		return errors.New("claim path too long")
+	}
+	for _, e := range path {
+		switch v := e.(type) {
+		case nil, string:
+		case float64:
+			if v < 0 || v != math.Trunc(v) {
+				return errors.New("claim path index is not a non-negative integer")
+			}
+		default:
+			return fmt.Errorf("unsupported claim path element type %T", e)
+		}
+	}
+	return nil
+}
+
 // claimPathMatcher decides whether one disclosed_claims entry is authorised
 // by a set of requested DCQL claim paths.
 //
@@ -79,6 +113,9 @@ func (m claimPathMatcher) allows(entry string) bool {
 	if alwaysDisclosed[entry] {
 		return true
 	}
+	if len(entry) > maxClaimEntryLen {
+		return false
+	}
 	for _, p := range m {
 		if len(p) == 0 {
 			continue
@@ -99,38 +136,52 @@ func (m claimPathMatcher) allows(entry string) bool {
 // namespace such as "org.iso.18013.5.1"), so entry is not split; each element
 // is matched as a prefix ending at a dot boundary, and a null element matches
 // any run of characters up to a dot boundary (including none).
+//
+// Results are memoised on (path index, entry offset), so the work is
+// polynomial in len(path) and len(entry) however many wildcards a
+// verifier-controlled query contains.
 func matchJoinedPath(entry string, path []interface{}) bool {
-	if len(path) == 0 {
-		return entry == "" || strings.HasPrefix(entry, ".")
-	}
-	if s, ok := pathElemString(path[0]); ok {
-		if !strings.HasPrefix(entry, s) {
-			return false
+	memo := map[[2]int]bool{}
+	seen := map[[2]int]bool{}
+	var rec func(pi, off int) bool
+	// after continues past element pi, whose match ended at entry[end].
+	after := func(pi, end int) bool {
+		if pi == len(path)-1 {
+			return rec(pi+1, end)
 		}
-		rest := entry[len(s):]
-		if len(path) == 1 {
-			return matchJoinedPath(rest, path[1:])
+		return strings.HasPrefix(entry[end:], ".") && rec(pi+1, end+1)
+	}
+	rec = func(pi, off int) bool {
+		key := [2]int{pi, off}
+		if seen[key] {
+			return memo[key]
 		}
-		return strings.HasPrefix(rest, ".") && matchJoinedPath(rest[1:], path[1:])
-	}
-	// Wildcard element: the null element consumes everything up to some dot
-	// boundary (or the end of the string), so try each boundary in turn.
-	tryRest := func(rest string) bool {
-		if len(path) == 1 {
-			return matchJoinedPath(rest, path[1:])
+		var res bool
+		rest := entry[off:]
+		switch {
+		case pi == len(path):
+			res = rest == "" || strings.HasPrefix(rest, ".")
+		default:
+			if s, ok := pathElemString(path[pi]); ok {
+				res = strings.HasPrefix(rest, s) && after(pi, off+len(s))
+			} else {
+				// Wildcard: it consumes up to some dot boundary of the
+				// remainder, or all of it.
+				for i := off; i < len(entry) && !res; i++ {
+					if entry[i] == '.' {
+						res = after(pi, i)
+					}
+				}
+				if !res {
+					res = after(pi, len(entry))
+				}
+			}
 		}
-		return strings.HasPrefix(rest, ".") && matchJoinedPath(rest[1:], path[1:])
+		seen[key] = true
+		memo[key] = res
+		return res
 	}
-	for i := 0; i < len(entry); i++ {
-		if entry[i] == '.' && tryRest(entry[i:]) {
-			return true
-		}
-	}
-	// The wildcard may also consume the whole remainder (empty rest).
-	if tryRest("") {
-		return true
-	}
-	return false
+	return rec(0, 0)
 }
 
 // checkConsentAgainstDCQL compares a consent with the DCQL query the backend
@@ -156,6 +207,11 @@ func checkConsentAgainstDCQL(dcql json.RawMessage, selected []ConsentSelection) 
 	idx := make(map[string]int, len(q.Credentials))
 	for i, c := range q.Credentials {
 		idx[c.ID] = i
+		for _, cl := range c.Claims {
+			if err := validateClaimPath(cl.Path); err != nil {
+				return nil, fmt.Errorf("credential %q: %w", c.ID, err)
+			}
+		}
 	}
 
 	var inSets map[string]bool
@@ -174,7 +230,14 @@ func checkConsentAgainstDCQL(dcql json.RawMessage, selected []ConsentSelection) 
 	for _, s := range selected {
 		i, ok := idx[s.CredentialQueryID]
 		if !ok || (inSets != nil && !inSets[s.CredentialQueryID]) {
-			return &consentViolation{Reason: consentReasonOutsideQuery, QueryID: s.CredentialQueryID}, nil
+			// The id came from the client, not the query: keep it out of
+			// the violation (and so out of the logs) unless the query
+			// itself defines it.
+			v := &consentViolation{Reason: consentReasonOutsideQuery}
+			if ok {
+				v.QueryID = s.CredentialQueryID
+			}
+			return v, nil
 		}
 		count[s.CredentialQueryID]++
 		if count[s.CredentialQueryID] > 1 && !q.Credentials[i].Multiple {
@@ -250,10 +313,19 @@ func (h *OID4VPHandler) vetConsent(authReq *AuthorizationRequest, selected []Con
 	}
 	if mode == config.DCQLConsentCheckEnforce {
 		h.Logger.Warn("consent refused: does not fit the DCQL query",
-			zap.String("reason", v.Reason), zap.String("credential_query_id", v.QueryID))
+			zap.String("reason", v.Reason), zap.String("credential_query_id", loggableID(v.QueryID)))
 		return v
 	}
 	h.Logger.Warn("consent does not fit the DCQL query (warn mode, proceeding)",
-		zap.String("reason", v.Reason), zap.String("credential_query_id", v.QueryID))
+		zap.String("reason", v.Reason), zap.String("credential_query_id", loggableID(v.QueryID)))
 	return nil
+}
+
+// loggableID bounds a query id taken from the verifier's DCQL query before it
+// is logged.
+func loggableID(id string) string {
+	if r := []rune(id); len(r) > maxLoggedQueryID {
+		return string(r[:maxLoggedQueryID]) + "..."
+	}
+	return id
 }
