@@ -2588,3 +2588,9 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
 	}
 }
+
+func TestDefaultConfig_MetadataFallbackOn4xxIsOn(t *testing.T) {
+	if !defaultConfig().HTTPClient.MetadataFallbackOn4xx {
+		t.Error("metadata 4xx fallback must default to on (#371)")
+	}
+}

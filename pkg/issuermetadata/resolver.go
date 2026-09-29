@@ -97,8 +97,9 @@ type Config struct {
 	// the preferred Accept with a 4xx (406 Not Acceptable, but also 400, 404,
 	// 415, ... some servers only serve what their Accept list names) instead of
 	// serving an acceptable representation: the resolver retries once with the
-	// alternate media type. HTTP 429 is never retried this way. Default: false
-	// (any non-200 is terminal).
+	// alternate media type. HTTP 429 is never retried this way. Default: true
+	// when nil (set false for strict content negotiation, where any non-200
+	// is terminal).
 	FallbackOn4xx *bool
 }
 
@@ -287,7 +288,7 @@ func (r *Resolver) fallbackOn4xx() bool {
 	if r.cfg.FallbackOn4xx != nil {
 		return *r.cfg.FallbackOn4xx
 	}
-	return false
+	return true
 }
 
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
@@ -299,7 +300,7 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	if r.preferSigned() {
 		accepts = []string{"application/jwt", "application/json"}
 	}
-	// Without the 4xx fallback gate, only the preferred representation is
+	// With the 4xx fallback turned off, only the preferred representation is
 	// requested and any non-200 status is terminal.
 	if !r.fallbackOn4xx() {
 		accepts = accepts[:1]

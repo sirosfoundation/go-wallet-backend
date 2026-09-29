@@ -23,9 +23,11 @@ import (
 
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
+	noFallback := false
 	r, err := New(Config{
-		CacheTTL:  5 * time.Minute,
-		AllowHTTP: true,
+		CacheTTL:      5 * time.Minute,
+		AllowHTTP:     true,
+		FallbackOn4xx: &noFallback, // strict: one request, any non-200 terminal
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -33,7 +35,7 @@ func newTestResolver(t *testing.T) *Resolver {
 	return r
 }
 
-// newTestResolverWithFallback returns a resolver with the 406 fallback gate on.
+// newTestResolverWithFallback returns a resolver with the 4xx fallback on.
 func newTestResolverWithFallback(t *testing.T) *Resolver {
 	t.Helper()
 	fallback := true
@@ -1197,5 +1199,25 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "trust engine unavailable") {
 		t.Errorf("expected propagated error, got: %v", err)
+	}
+}
+
+// The fallback is on by default (#371): a resolver built without saying so
+// retries the other media type after a 4xx.
+func TestResolve_FallbackOnByDefault(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{AllowHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = r.Resolve(context.Background(), server.URL)
+	if attempts != 2 {
+		t.Errorf("default must retry once after a 4xx; got %d requests", attempts)
 	}
 }
