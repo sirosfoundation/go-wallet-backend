@@ -554,8 +554,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// authenticated identity the cache is keyed by - only exists once this
 	// has run.
 	var keyMaterial *KeyMaterial
-	var requiresResolution bool
-	var requestJWT string
 	var attestationContext map[string]interface{}
 	var verifiedIdentity string
 	// cacheable is false whenever a scheme's identity claim (client_id or
@@ -589,25 +587,14 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		}
 
 		if h.Config.Trust.GetVerifierPDPURL() == "" {
-			// No verifier PDP configured at all - the intentional,
-			// permissive dev/no-PDP mode. h.TrustSvc.ResolveDID always
-			// resolves against GetVerifierPDPURL() itself (an empty
-			// trustEndpoint override falls back to exactly this same
-			// config value), so calling it here would only ever fail with
-			// "no trust evaluator configured for DID resolution" - it can
-			// never actually succeed in this mode. Defer DID resolution
-			// and request JWT verification to the frontend/SDK entirely
-			// instead (mirrors OID4VCIHandler.evaluateTrustViaFrontend,
-			// which never attempts server-side resolution for a did:
-			// issuer either): keyMaterial stays nil so the frontend knows
-			// to resolve it, and this request is never cached - there is
-			// no verified identity yet to scope a cache entry to, and
-			// evaluateVerifierTrustViaFrontend never writes to the cache
-			// regardless.
-			requiresResolution = true
-			requestJWT = authReq.RequestJWT
-			cacheable = false
-			break
+			// A did: verifier cannot be authenticated without a PDP:
+			// h.TrustSvc.ResolveDID resolves through the verifier PDP, and
+			// the frontend fallback (requires_resolution) would only send
+			// the client to POST /v1/resolve, which answers 503 when no
+			// PDP is configured (#410). A PDP is a required component, so
+			// fail here with a message that names the cause instead of
+			// deferring to a path that cannot succeed.
+			return nil, fmt.Errorf("client_id_scheme=%s requires a configured trust PDP to resolve %s", authReq.ClientIDScheme, did)
 		}
 
 		// Resolve DID document to get verification method keys
@@ -653,11 +640,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		} else {
 			cacheable = false
 		}
-		// This handler has already resolved the DID and verified the
-		// request JWT itself (above, since a verifier PDP is configured),
-		// so evaluateVerifierTrustViaPDP never needs requiresResolution/
-		// requestJWT - only the no-PDP branch above sets them, for
-		// evaluateVerifierTrustViaFrontend's benefit.
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
@@ -839,8 +821,6 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	authCtx := verifierAuthContext{
 		keyMaterial:        keyMaterial,
 		attestationContext: attestationContext,
-		requiresResolution: requiresResolution,
-		requestJWT:         requestJWT,
 	}
 	contextHash := hashEvalContext(buildVerifierEvalContext(authReq, authCtx, h.Logger))
 
@@ -1018,8 +998,6 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 type verifierAuthContext struct {
 	keyMaterial        *KeyMaterial
 	attestationContext map[string]interface{}
-	requiresResolution bool
-	requestJWT         string
 }
 
 // buildVerifierTrustRequest constructs the TrustEvaluationRequest sent to the
@@ -1030,28 +1008,12 @@ func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAu
 	trustReq := &TrustEvaluationRequest{
 		// SubjectID keeps the original, wire-form client_id (including
 		// OpenID4VP 1.0's decentralized_identifier: prefix, when present)
-		// unchanged - this is what /v1/evaluate must see, matching
-		// evaluateVerifierTrustViaPDP below, which evaluates authReq.ClientID
-		// unchanged. Per docs/client-id-strategy.md's client-id-strategy
-		// table, the prefix is stripped for resolution only, never for
-		// evaluation: a no-PDP and a PDP-backed flow must evaluate the same
-		// subject. See ResolutionSubjectID below for what /v1/resolve
-		// actually needs - a DIFFERENT identifier that one field can't also
-		// serve.
-		SubjectID:          authReq.ClientID,
-		SubjectType:        SubjectTypeCredentialVerifier,
-		RequiresResolution: authCtx.requiresResolution,
-		RequestJWT:         authCtx.requestJWT,
-		Context:            buildVerifierEvalContext(authReq, authCtx, logger),
-	}
-
-	if authCtx.requiresResolution {
-		// didFromClientID strips the decentralized_identifier: prefix when
-		// present (a no-op for the older did: spelling, which never carries
-		// it to begin with) - /v1/resolve needs the bare DID, the same
-		// reason the server-side PDP branch above resolves via
-		// didFromClientID(authReq.ClientID) rather than the raw client_id.
-		trustReq.ResolutionSubjectID = didFromClientID(authReq.ClientID)
+		// unchanged, matching evaluateVerifierTrustViaPDP, which evaluates
+		// authReq.ClientID unchanged. did: verifiers never reach this
+		// frontend path - they need a PDP (see evaluateVerifierTrust).
+		SubjectID:   authReq.ClientID,
+		SubjectType: SubjectTypeCredentialVerifier,
+		Context:     buildVerifierEvalContext(authReq, authCtx, logger),
 	}
 
 	// Convert key material for frontend

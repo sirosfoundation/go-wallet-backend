@@ -3947,119 +3947,45 @@ func TestRequestedCredentialTypes(t *testing.T) {
 	}
 }
 
-// --- #396: DID-scheme frontend fallback must set requires_resolution/request_jwt ---
+// --- #410: a did: verifier needs a PDP; there is no frontend fallback ---
 
-// TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags is
-// the regression test for #396, driven end to end through
-// evaluateVerifierTrust itself (not evaluateVerifierTrustViaFrontend
-// directly - an earlier version of this test bypassed the DID case's own
-// control flow, which a Copilot review round on this PR correctly flagged:
-// https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132050371).
-//
-// Getting here for real required a second fix alongside the original
-// requiresResolution/requestJWT assignments: the DID case used to call
-// h.TrustSvc.ResolveDID unconditionally, which always resolves against the
-// same h.Config.Trust.GetVerifierPDPURL() the top-level dispatch checks - so
-// with no PDP configured, ResolveDID would always fail before the switch
-// even finished, and with one configured, dispatch would always choose the
-// PDP path instead. Either way, a did: request could never actually reach
-// evaluateVerifierTrustViaFrontend. The DID case now checks
-// GetVerifierPDPURL() itself and, when empty, skips local resolution
-// entirely (mirroring OID4VCIHandler.evaluateTrustViaFrontend, which never
-// attempts server-side resolution for a did: issuer either) - so this test
-// now drives the real path.
-//
-// This exercises the OpenID4VP 1.0 final-spec decentralized_identifier:
-// prefix specifically (not the "did" scheme, whose client_id is already
-// the bare DID with nothing to strip): a third Copilot review round found
-// that an earlier version of this test built its client_id as
-// ClientIDSchemeDID + ":" + did ("did:did:web:...", a bogus double
-// prefix - a copy/paste mistake, not a real wire form) and so never
-// actually caught buildVerifierTrustRequest sending the full,
-// still-prefixed client_id as SubjectID, when the frontend passes
-// SubjectID straight to /v1/resolve when RequiresResolution is true,
-// which needs the bare DID
-// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132318509).
-//
-// A fourth review round then caught that the resulting fix was itself
-// only half right: stripping the prefix from SubjectID fixes /v1/resolve
-// but breaks /v1/evaluate, which - per docs/client-id-strategy.md - needs
-// the ORIGINAL, unstripped client_id (matching evaluateVerifierTrustViaPDP,
-// which evaluates authReq.ClientID unchanged); one field can't serve both
-// needs. Fixed by leaving SubjectID as the original client_id and adding a
-// separate ResolutionSubjectID field carrying the bare DID specifically
-// for /v1/resolve
-// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132423915).
-// This test now asserts both: the eventual /v1/evaluate subject
-// (SubjectID) matches the PDP path's unchanged authReq.ClientID, and the
-// /v1/resolve subject (ResolutionSubjectID) gets the bare DID.
-func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *testing.T) {
-	const (
-		did      = "did:web:verifier.example"
-		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
-	)
-	requestJWT := "header.payload.sig"
+// With no PDP configured, a did:-scheme verifier must fail hard instead of
+// deferring to the frontend: the frontend's only route to a resolved DID is
+// POST /v1/resolve, which itself answers 503 without a PDP.
+func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_FailsHard(t *testing.T) {
+	const did = "did:web:verifier.example"
 
-	messages := make(chan []byte, 16)
-	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		for {
-			_, data, err := srvConn.ReadMessage()
-			if err != nil {
-				return
+	for _, tc := range []struct{ scheme, clientID string }{
+		{ClientIDSchemeDID, did},
+		{ClientIDSchemeDecentralizedIdentifier, ClientIDSchemeDecentralizedIdentifier + ":" + did},
+	} {
+		t.Run(tc.scheme, func(t *testing.T) {
+			conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+				for {
+					if _, _, err := srvConn.ReadMessage(); err != nil {
+						return
+					}
+				}
+			})
+			defer cleanup()
+			flow := &Flow{ID: "test-flow", Session: testSession(conn), Data: make(map[string]interface{})}
+			h := &OID4VPHandler{BaseHandler: BaseHandler{
+				Flow: flow, Config: testConfig(), Logger: zap.NewNop(), TrustCache: NewTrustCache(time.Hour),
+			}}
+			authReq := &AuthorizationRequest{
+				ClientID:       tc.clientID,
+				ClientIDScheme: tc.scheme,
+				Nonce:          "n",
+				ResponseURI:    "https://verifier.example/response",
+				RequestJWT:     "header.payload.sig",
 			}
-			select {
-			case messages <- data:
-			default:
-			}
-		}
-	})
-	defer cleanup()
 
-	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
-
-	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
-	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
-		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
-		Action:  ActionTrustResult,
-		Payload: result,
+			verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
+			require.Error(t, err)
+			assert.Nil(t, verifier)
+			assert.Contains(t, err.Error(), "requires a configured trust PDP")
+		})
 	}
-
-	cfg := testConfig() // no Trust.PDPURL / Verifier.PDPURL set at all
-	trustCache := NewTrustCache(time.Hour)
-	h := &OID4VPHandler{BaseHandler: BaseHandler{
-		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustCache: trustCache,
-	}}
-	authReq := &AuthorizationRequest{
-		ClientID:       clientID,
-		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
-		Nonce:          "n",
-		ResponseURI:    "https://verifier.example/response",
-		RequestJWT:     requestJWT,
-	}
-
-	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
-	require.NoError(t, err)
-	require.NotNil(t, verifier)
-	assert.True(t, verifier.Trusted)
-
-	req := trustEvaluationRequest(t, messages)
-	// SubjectID must stay the ORIGINAL, still-prefixed client_id: /v1/evaluate
-	// needs the same subject the PDP path evaluates (authReq.ClientID,
-	// unchanged - see TestEvaluateVerifierTrust_DecentralizedIdentifier).
-	assert.Equal(t, clientID, req.SubjectID, "SubjectID must match the PDP path's unchanged authReq.ClientID - the wire-form client_id, prefix and all")
-	// ResolutionSubjectID is the separate field carrying the bare DID
-	// /v1/resolve actually needs.
-	assert.Equal(t, did, req.ResolutionSubjectID, "ResolutionSubjectID must be the bare DID (with the decentralized_identifier: prefix stripped) - the frontend passes it to /v1/resolve")
-	assert.True(t, req.RequiresResolution, "a did:-scheme verifier must ask the frontend to resolve it")
-	assert.Equal(t, requestJWT, req.RequestJWT, "the frontend needs the signed request JWT to verify against the resolved DID")
-	assert.Nil(t, req.KeyMaterial, "no key material was resolved locally - the frontend resolves it")
-	require.NoError(t, req.Validate())
-
-	// A client-asserted verdict from this path must never be cached either
-	// (same rule as every other no-PDP frontend-fallback request).
-	assert.Zero(t, trustCache.Len())
 }
 
 // --- #397: x509_san_uri must get the same mandatory-signature-verification
