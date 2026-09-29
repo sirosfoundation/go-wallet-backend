@@ -419,26 +419,28 @@ type OIDCGateBinding struct {
 
 	// Audience, when set, is the audience the presented token was actually
 	// validated against (the tenant whose gate the caller passed - see
-	// AS PasskeyHandlers.LoginFinish). FinishLogin compares it against the
-	// CREDENTIAL's real tenant's LoginOP audience: without this, two tenants
-	// that share an OIDC issuer but use different client IDs/audiences could
-	// have a token valid for tenant A's app satisfy tenant B's login gate,
-	// since only Issuer was previously compared. Left empty (the default for
-	// any caller that doesn't set it, e.g. internal/api/handlers.go's
-	// FinishWebAuthnLogin), no audience check is performed - purely opt-in.
+	// AS PasskeyHandlers.LoginFinish, and internal/api/handlers.go's
+	// FinishWebAuthnLogin, which sets it the same way for /user/*).
+	// FinishLogin compares it against the CREDENTIAL's real tenant's LoginOP
+	// audience: without this, two tenants that share an OIDC issuer but use
+	// different client IDs/audiences could have a token valid for tenant A's
+	// app satisfy tenant B's login gate, since only Issuer was previously
+	// compared. Left empty (the default for any caller that doesn't set it),
+	// no audience check is performed - purely opt-in.
 	Audience string
 
 	// Claims, when set, are the full validated token claims (the same map
 	// the OIDC gate middleware itself checked against the HEADER tenant's
-	// OIDCGate.RequiredClaims). FinishLogin re-checks them against the
-	// CREDENTIAL's real tenant's own RequiredClaims: Issuer and Audience
-	// matching isn't enough if two tenants share both but configure
-	// different RequiredClaims - a token accepted for a permissive tenant
-	// could otherwise satisfy a stricter tenant's login gate purely because
-	// the gate middleware only ever validated it against the header tenant's
-	// policy. Left nil (the default for any caller that doesn't set it,
-	// e.g. internal/api/handlers.go's FinishWebAuthnLogin), no claims
-	// re-check is performed - purely opt-in, like Audience above.
+	// OIDCGate.RequiredClaims). Set by both AS PasskeyHandlers.LoginFinish
+	// and internal/api/handlers.go's FinishWebAuthnLogin. FinishLogin
+	// re-checks them against the CREDENTIAL's real tenant's own
+	// RequiredClaims: Issuer and Audience matching isn't enough if two
+	// tenants share both but configure different RequiredClaims - a token
+	// accepted for a permissive tenant could otherwise satisfy a stricter
+	// tenant's login gate purely because the gate middleware only ever
+	// validated it against the header tenant's policy. Left nil (the
+	// default for any caller that doesn't set it), no claims re-check is
+	// performed - purely opt-in, like Audience above.
 	Claims jwt.MapClaims
 }
 
