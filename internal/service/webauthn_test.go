@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -516,8 +517,12 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 	t.Run("disabled refresh tokens are rejected", func(t *testing.T) {
 		svc, _ := setupWebAuthnService(t) // RefreshDays defaults to 0 (disabled)
 		_, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{RefreshToken: "anything"})
-		if err == nil {
-			t.Fatal("expected an error when refresh tokens are disabled")
+		// Must be the typed ErrRefreshDisabled, not an ad hoc error: callers
+		// (internal/api.Handlers.RefreshToken) switch on it to avoid
+		// surfacing this expected, config-driven state as a 500 (Copilot
+		// review on #400).
+		if !errors.Is(err, ErrRefreshDisabled) {
+			t.Fatalf("expected ErrRefreshDisabled, got %v", err)
 		}
 	})
 

@@ -1353,6 +1353,14 @@ func (s *WebAuthnService) generateRefreshToken(user *domain.User, tenantID domai
 // ErrInvalidRefreshToken indicates the refresh token is invalid or expired
 var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 
+// ErrRefreshDisabled indicates refresh tokens are turned off by config
+// (JWT.RefreshDays <= 0). This is an expected, admin-controlled state, not
+// a server malfunction - callers must map it to a non-5xx response rather
+// than treating it like an unexpected internal error (Copilot review on
+// #400: mounting the route unconditionally turned this config choice into
+// a 500 response).
+var ErrRefreshDisabled = errors.New("refresh tokens are disabled")
+
 // RefreshTokenRequest contains the request for refreshing an access token
 type RefreshTokenRequest struct {
 	RefreshToken string `json:"refreshToken"`
@@ -1386,7 +1394,7 @@ type RefreshTokenResponse struct {
 // replaced.
 func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTokenRequest) (*RefreshTokenResponse, error) {
 	if s.cfg.JWT.RefreshDays <= 0 {
-		return nil, fmt.Errorf("refresh tokens are disabled")
+		return nil, ErrRefreshDisabled
 	}
 
 	// Parse the refresh token

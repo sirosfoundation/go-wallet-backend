@@ -341,6 +341,11 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrInvalidRefreshToken):
 			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
+		case errors.Is(err, service.ErrRefreshDisabled):
+			// Config-driven, expected state (JWT.RefreshDays <= 0) - not a
+			// server malfunction, so it must not surface as a 500 (Copilot
+			// review on #400).
+			c.JSON(503, gin.H{"error": "Token refresh is disabled"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to refresh token"})
 		}

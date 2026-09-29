@@ -819,3 +819,28 @@ func TestHandlers_StoreCredential_MissingFormat(t *testing.T) {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 }
+
+// TestHandlers_RefreshToken_Disabled is a regression test for a Copilot
+// review finding on #400: the /user/session/refresh route is mounted
+// unconditionally, but when JWT.RefreshDays <= 0 (the checked-in default),
+// WebAuthnService.RefreshAccessToken returns service.ErrRefreshDisabled -
+// an expected, config-driven state, not a server malfunction. Before this
+// fix, RefreshToken's switch had no case for it, so it fell through to the
+// generic default and returned 500, alarming callers/monitoring for a
+// perfectly normal "this deployment doesn't support refresh tokens"
+// configuration. It must map to a non-5xx status instead.
+func TestHandlers_RefreshToken_Disabled(t *testing.T) {
+	handlers, router, _ := setupTestHandlersWithUser(t) // RefreshDays defaults to 0 (disabled)
+	router.POST("/session/refresh", handlers.RefreshToken)
+
+	body, _ := json.Marshal(map[string]interface{}{"refreshToken": "anything"})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/session/refresh", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusServiceUnavailable, w.Code, w.Body.String())
+	}
+}
