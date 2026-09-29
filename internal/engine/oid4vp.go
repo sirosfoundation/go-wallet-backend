@@ -1028,21 +1028,30 @@ type verifierAuthContext struct {
 // §5.9.3.6), and any verifier_attestation context.
 func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAuthContext, logger *zap.Logger) *TrustEvaluationRequest {
 	trustReq := &TrustEvaluationRequest{
-		// didFromClientID strips OpenID4VP 1.0's decentralized_identifier:
-		// prefix when present (a no-op for every other scheme, including
-		// the older did: spelling, which never carries that prefix to
-		// begin with). The frontend passes SubjectID straight to /v1/resolve
-		// when RequiresResolution is true, which needs the bare DID, not
-		// the wire-form client_id - the same reason the server-side PDP
-		// branch above already resolves via didFromClientID(authReq.ClientID)
-		// rather than the raw client_id. The evaluate step doesn't lose the
-		// scheme distinction this strips: buildVerifierEvalContext already
-		// carries the original client_id_scheme in Context separately.
-		SubjectID:          didFromClientID(authReq.ClientID),
+		// SubjectID keeps the original, wire-form client_id (including
+		// OpenID4VP 1.0's decentralized_identifier: prefix, when present)
+		// unchanged - this is what /v1/evaluate must see, matching
+		// evaluateVerifierTrustViaPDP below, which evaluates authReq.ClientID
+		// unchanged. Per docs/client-id-strategy.md's client-id-strategy
+		// table, the prefix is stripped for resolution only, never for
+		// evaluation: a no-PDP and a PDP-backed flow must evaluate the same
+		// subject. See ResolutionSubjectID below for what /v1/resolve
+		// actually needs - a DIFFERENT identifier that one field can't also
+		// serve.
+		SubjectID:          authReq.ClientID,
 		SubjectType:        SubjectTypeCredentialVerifier,
 		RequiresResolution: authCtx.requiresResolution,
 		RequestJWT:         authCtx.requestJWT,
 		Context:            buildVerifierEvalContext(authReq, authCtx, logger),
+	}
+
+	if authCtx.requiresResolution {
+		// didFromClientID strips the decentralized_identifier: prefix when
+		// present (a no-op for the older did: spelling, which never carries
+		// it to begin with) - /v1/resolve needs the bare DID, the same
+		// reason the server-side PDP branch above resolves via
+		// didFromClientID(authReq.ClientID) rather than the raw client_id.
+		trustReq.ResolutionSubjectID = didFromClientID(authReq.ClientID)
 	}
 
 	// Convert key material for frontend

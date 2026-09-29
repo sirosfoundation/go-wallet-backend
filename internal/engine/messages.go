@@ -657,7 +657,15 @@ const (
 // The frontend should call POST /v1/evaluate with this data and return the result.
 // For DID schemes, the frontend should first call /v1/resolve to get the DID document.
 type TrustEvaluationRequest struct {
-	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer URL for issuers)
+	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer
+	// URL for issuers), exactly as presented on the wire - including OpenID4VP
+	// 1.0's decentralized_identifier: prefix, when the verifier used it. This
+	// is what /v1/evaluate sees, matching the identifier the server-side PDP
+	// path evaluates too (evaluateVerifierTrustViaPDP sends authReq.ClientID
+	// unchanged) - per docs/client-id-strategy.md, the prefix is stripped for
+	// resolution only, never for evaluation, so a no-PDP and a PDP-backed
+	// flow must evaluate the identical subject. See ResolutionSubjectID for
+	// the (different) identifier /v1/resolve needs.
 	SubjectID string `json:"subject_id"`
 	// SubjectType is "credential_verifier" or "credential_issuer"
 	SubjectType string `json:"subject_type"`
@@ -667,6 +675,15 @@ type TrustEvaluationRequest struct {
 	// RequiresResolution indicates the frontend should call /v1/resolve first.
 	// Set to true for DID schemes where key material must be resolved from DID document.
 	RequiresResolution bool `json:"requires_resolution,omitempty"`
+	// ResolutionSubjectID is the identifier the frontend should resolve via
+	// /v1/resolve when RequiresResolution is true: the bare DID, with any
+	// client_id_scheme prefix (e.g. decentralized_identifier:) already
+	// stripped. This is deliberately a separate field from SubjectID -
+	// /v1/resolve needs the bare DID, but /v1/evaluate needs the original,
+	// unstripped identifier (see SubjectID's doc comment above), and one
+	// field cannot serve both requirements at once. Empty whenever
+	// RequiresResolution is false.
+	ResolutionSubjectID string `json:"resolution_subject_id,omitempty"`
 	// RequestJWT is the signed request JWT for DID schemes.
 	// Frontend should verify this JWT using keys obtained from /v1/resolve.
 	RequestJWT string `json:"request_jwt,omitempty"`
@@ -684,9 +701,14 @@ func (r *TrustEvaluationRequest) Validate() error {
 		return fmt.Errorf("TrustEvaluationRequest: SubjectType must be %q or %q, got %q",
 			SubjectTypeCredentialIssuer, SubjectTypeCredentialVerifier, r.SubjectType)
 	}
-	// RequiresResolution requires RequestJWT for DID schemes
+	// RequiresResolution requires RequestJWT and ResolutionSubjectID: the
+	// frontend cannot call /v1/resolve at all without knowing what to
+	// resolve, or verify what it resolves against without the request JWT.
 	if r.RequiresResolution && r.RequestJWT == "" {
 		return errors.New("TrustEvaluationRequest: RequestJWT is required when RequiresResolution is true")
+	}
+	if r.RequiresResolution && r.ResolutionSubjectID == "" {
+		return errors.New("TrustEvaluationRequest: ResolutionSubjectID is required when RequiresResolution is true")
 	}
 	// Validate key material if provided
 	if r.KeyMaterial != nil {

@@ -3976,11 +3976,23 @@ func TestRequestedCredentialTypes(t *testing.T) {
 // ClientIDSchemeDID + ":" + did ("did:did:web:...", a bogus double
 // prefix - a copy/paste mistake, not a real wire form) and so never
 // actually caught buildVerifierTrustRequest sending the full,
-// still-prefixed client_id as SubjectID: the frontend passes SubjectID
-// straight to /v1/resolve when RequiresResolution is true, which needs
-// the bare DID, exactly like the server-side PDP branch already resolves
-// via didFromClientID(authReq.ClientID) rather than the raw client_id
+// still-prefixed client_id as SubjectID, when the frontend passes
+// SubjectID straight to /v1/resolve when RequiresResolution is true,
+// which needs the bare DID
 // (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132318509).
+//
+// A fourth review round then caught that the resulting fix was itself
+// only half right: stripping the prefix from SubjectID fixes /v1/resolve
+// but breaks /v1/evaluate, which - per docs/client-id-strategy.md - needs
+// the ORIGINAL, unstripped client_id (matching evaluateVerifierTrustViaPDP,
+// which evaluates authReq.ClientID unchanged); one field can't serve both
+// needs. Fixed by leaving SubjectID as the original client_id and adding a
+// separate ResolutionSubjectID field carrying the bare DID specifically
+// for /v1/resolve
+// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132423915).
+// This test now asserts both: the eventual /v1/evaluate subject
+// (SubjectID) matches the PDP path's unchanged authReq.ClientID, and the
+// /v1/resolve subject (ResolutionSubjectID) gets the bare DID.
 func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *testing.T) {
 	const (
 		did      = "did:web:verifier.example"
@@ -4033,7 +4045,13 @@ func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *
 	assert.True(t, verifier.Trusted)
 
 	req := trustEvaluationRequest(t, messages)
-	assert.Equal(t, did, req.SubjectID, "SubjectID must be the bare DID (with the decentralized_identifier: prefix stripped) - the frontend passes it straight to /v1/resolve")
+	// SubjectID must stay the ORIGINAL, still-prefixed client_id: /v1/evaluate
+	// needs the same subject the PDP path evaluates (authReq.ClientID,
+	// unchanged - see TestEvaluateVerifierTrust_DecentralizedIdentifier).
+	assert.Equal(t, clientID, req.SubjectID, "SubjectID must match the PDP path's unchanged authReq.ClientID - the wire-form client_id, prefix and all")
+	// ResolutionSubjectID is the separate field carrying the bare DID
+	// /v1/resolve actually needs.
+	assert.Equal(t, did, req.ResolutionSubjectID, "ResolutionSubjectID must be the bare DID (with the decentralized_identifier: prefix stripped) - the frontend passes it to /v1/resolve")
 	assert.True(t, req.RequiresResolution, "a did:-scheme verifier must ask the frontend to resolve it")
 	assert.Equal(t, requestJWT, req.RequestJWT, "the frontend needs the signed request JWT to verify against the resolved DID")
 	assert.Nil(t, req.KeyMaterial, "no key material was resolved locally - the frontend resolves it")
