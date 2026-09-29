@@ -38,6 +38,8 @@ const (
 	maxCacheEntries = 256
 
 	statusListTokenTyp = "statuslist+jwt"
+	mediaTypeJWT       = "application/statuslist+jwt"
+	mediaTypeCWT       = "application/statuslist+cwt"
 )
 
 // errKeyMismatch is returned when a list header carries both x5c and jwk and
@@ -154,7 +156,7 @@ func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *C
 // header, whose signer key the trust service accepts, that matches ref.URI and
 // is fresh. A list is authoritative only under those conditions: only then can
 // Check return an error wrapping ErrRevoked (entry non-zero). Every other
-// failure (network, non-200, CWT, expired, bad signature, no key, negative or
+// failure (network, non-200, unsupported media type, expired, bad signature, no key, negative or
 // unavailable trust decision, malformed token) returns an error that does not
 // wrap ErrRevoked; a negative trust decision wraps ErrSignerUntrusted and an
 // unobtainable one ErrTrustUnavailable. Callers choose what to do with those.
@@ -182,11 +184,23 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	}
 	c.mu.Unlock()
 
-	token, err := c.fetch(ctx, uri)
+	body, mediaType, err := c.fetch(ctx, uri)
 	if err != nil {
 		return 0, nil, err
 	}
-	bits, list, ttl, err := c.parse(ctx, token, uri)
+	var bits int
+	var list []byte
+	var ttl time.Duration
+	switch mediaType {
+	case mediaTypeJWT, "":
+		// A missing Content-Type is read as the JWT form, the only one
+		// that ever came without one; a CWT body then fails to parse.
+		bits, list, ttl, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
+	case mediaTypeCWT:
+		bits, list, ttl, err = c.parseCWT(ctx, body, uri)
+	default:
+		err = fmt.Errorf("status list has unsupported media type %q", mediaType)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
@@ -199,19 +213,21 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	return bits, list, nil
 }
 
-func (c *Checker) fetch(ctx context.Context, uri string) (string, error) {
+// fetch returns the raw body and the response media type ("" when the server
+// sent none).
+func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		return "", fmt.Errorf("status list uri: %w", err)
+		return nil, "", fmt.Errorf("status list uri: %w", err)
 	}
 	if u.Scheme != "https" && (!c.allowHTTP || u.Scheme != "http") {
-		return "", fmt.Errorf("status list uri must be https: %q", u.Scheme)
+		return nil, "", fmt.Errorf("status list uri must be https: %q", u.Scheme)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	req.Header.Set("Accept", "application/"+statusListTokenTyp)
+	req.Header.Set("Accept", mediaTypeJWT+", "+mediaTypeCWT+";q=0.8")
 	// The URI comes from a credential the holder presents, so it is
 	// attacker-influenced by nature. The scheme is checked above and c.client
 	// is the SSRF-guarded client (NewHTTPClient: private, loopback, link-local
@@ -220,29 +236,24 @@ func (c *Checker) fetch(ctx context.Context, uri string) (string, error) {
 	// hosts.
 	resp, err := c.client.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
-		return "", fmt.Errorf("fetch status list: %w", err)
+		return nil, "", fmt.Errorf("fetch status list: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch status list: http %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("fetch status list: http %d", resp.StatusCode)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		mt, _, _ := mime.ParseMediaType(ct)
-		if mt == "application/statuslist+cwt" {
-			return "", errors.New("status list is a CWT; only the JWT form is supported")
-		}
-	}
+	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("read status list: %w", err)
+		return nil, "", fmt.Errorf("read status list: %w", err)
 	}
 	if len(body) > maxTokenBytes {
-		return "", errors.New("status list token too large")
+		return nil, "", errors.New("status list token too large")
 	}
-	return strings.TrimSpace(string(body)), nil
+	return body, mt, nil
 }
 
-func (c *Checker) parse(ctx context.Context, token, uri string) (int, []byte, time.Duration, error) {
+func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte, time.Duration, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return 0, nil, 0, errors.New("status list token is not a JWT")
@@ -291,22 +302,44 @@ func (c *Checker) parse(ctx context.Context, token, uri string) (int, []byte, ti
 	if err := decodeSegment(parts[1], &claims); err != nil {
 		return 0, nil, 0, fmt.Errorf("status list payload: %w", err)
 	}
-	if claims.Iat == nil {
-		return 0, nil, 0, errors.New("status list token has no iat")
-	}
-	if claims.Sub != uri {
-		return 0, nil, 0, fmt.Errorf("status list sub %q does not match uri %q", claims.Sub, uri)
-	}
 	if claims.StatusList == nil {
 		return 0, nil, 0, errors.New("status list token has no status_list claim")
 	}
+	lst, err := base64.RawURLEncoding.DecodeString(claims.StatusList.Lst)
+	if err != nil {
+		return 0, nil, 0, fmt.Errorf("status list lst: %w", err)
+	}
+	return c.accept(ctx, uri, km, listClaims{
+		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, ttl: claims.TTL,
+		bits: claims.StatusList.Bits, lst: lst,
+	})
+}
+
+// listClaims is the form-independent content of a Status List Token.
+type listClaims struct {
+	sub, iss      string
+	iat, exp, ttl *int64
+	bits          int
+	lst           []byte // zlib-compressed, not base64
+}
+
+// accept applies the claim checks shared by the JWT and CWT forms, inflates
+// the list and asks the trust service about the (already signature-verified)
+// signer key km. Only a list that passes all of it is returned.
+func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (int, []byte, time.Duration, error) {
+	if lc.iat == nil {
+		return 0, nil, 0, errors.New("status list token has no iat")
+	}
+	if lc.sub != uri {
+		return 0, nil, 0, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
+	}
 	now := c.now()
 	ttl := defaultCacheTTL
-	if claims.TTL != nil && *claims.TTL > 0 {
-		ttl = time.Duration(*claims.TTL) * time.Second
+	if lc.ttl != nil && *lc.ttl > 0 {
+		ttl = time.Duration(*lc.ttl) * time.Second
 	}
-	if claims.Exp != nil {
-		exp := time.Unix(*claims.Exp, 0)
+	if lc.exp != nil {
+		exp := time.Unix(*lc.exp, 0)
 		if !now.Before(exp) {
 			return 0, nil, 0, errors.New("status list token has expired")
 		}
@@ -317,19 +350,19 @@ func (c *Checker) parse(ctx context.Context, token, uri string) (int, []byte, ti
 	if ttl > maxCacheTTL {
 		ttl = maxCacheTTL
 	}
-	switch claims.StatusList.Bits {
+	switch lc.bits {
 	case 1, 2, 4, 8:
 	default:
-		return 0, nil, 0, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", claims.StatusList.Bits)
+		return 0, nil, 0, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", lc.bits)
 	}
-	list, err := inflate(claims.StatusList.Lst)
+	list, err := inflate(lc.lst)
 	if err != nil {
 		return 0, nil, 0, err
 	}
-	if err := c.evaluateSigner(ctx, claims.Iss, uri, km); err != nil {
+	if err := c.evaluateSigner(ctx, lc.iss, uri, km); err != nil {
 		return 0, nil, 0, err
 	}
-	return claims.StatusList.Bits, list, ttl, nil
+	return lc.bits, list, ttl, nil
 }
 
 // evaluateSigner asks the trust service whether the list signer may publish
@@ -394,11 +427,7 @@ func decodeSegment(seg string, v any) error {
 	return json.Unmarshal(b, v)
 }
 
-func inflate(lst string) ([]byte, error) {
-	compressed, err := base64.RawURLEncoding.DecodeString(lst)
-	if err != nil {
-		return nil, fmt.Errorf("status list lst: %w", err)
-	}
+func inflate(compressed []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		return nil, fmt.Errorf("status list lst: %w", err)

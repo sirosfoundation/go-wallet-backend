@@ -109,7 +109,7 @@ func TestInterop_SirosStatusServiceShape(t *testing.T) {
 	if !errors.Is(err, ErrNoSignerKey) || errors.Is(err, ErrRevoked) {
 		t.Fatalf("kid-only service token must be unverifiable, got %v", err)
 	}
-	if accept != "application/statuslist+jwt" {
+	if accept != "application/statuslist+jwt, application/statuslist+cwt;q=0.8" {
 		t.Fatalf("Accept = %q", accept)
 	}
 
@@ -150,6 +150,7 @@ func TestCheck_HeaderKeyPrecedence(t *testing.T) {
 	} {
 		var uri string
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/statuslist+jwt")
 			tok, _ := x5cServiceToken(t, key, uri, map[int]int{1: 1}, tc.mode)
 			_, _ = w.Write([]byte(tok))
 		}))

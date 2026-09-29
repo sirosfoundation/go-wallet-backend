@@ -91,9 +91,10 @@ func serve(t *testing.T, mk func(uri string) string, ctype string) (*Checker, st
 	var uri string
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*hits++
-		if ctype != "" {
-			w.Header().Set("Content-Type", ctype)
+		if ctype == "" {
+			ctype = mediaTypeJWT
 		}
+		w.Header().Set("Content-Type", ctype)
 		_, _ = w.Write([]byte(mk(uri)))
 	}))
 	t.Cleanup(srv.Close)
@@ -275,17 +276,14 @@ func TestEntry_Bounds(t *testing.T) {
 }
 
 func TestInflate_Errors(t *testing.T) {
-	if _, err := inflate("!!not base64!!"); err == nil {
-		t.Error("bad base64 must fail")
-	}
-	if _, err := inflate(base64.RawURLEncoding.EncodeToString([]byte("not zlib"))); err == nil {
+	if _, err := inflate([]byte("not zlib")); err == nil {
 		t.Error("non-zlib data must fail")
 	}
 	var buf bytes.Buffer
 	zw := zlib.NewWriter(&buf)
 	_, _ = zw.Write(make([]byte, maxInflateBytes+1))
 	_ = zw.Close()
-	if _, err := inflate(base64.RawURLEncoding.EncodeToString(buf.Bytes())); err == nil {
+	if _, err := inflate(buf.Bytes()); err == nil {
 		t.Error("an oversized inflation must fail (zip bomb)")
 	}
 }

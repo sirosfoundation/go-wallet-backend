@@ -68,6 +68,7 @@ func statusFixtureTrust(t *testing.T, serverBroken bool, signerTrust statuslist.
 			http.Error(w, "down", http.StatusServiceUnavailable)
 			return
 		}
+		w.Header().Set("Content-Type", "application/statuslist+jwt")
 		var buf bytes.Buffer
 		zw := zlib.NewWriter(&buf)
 		_, _ = zw.Write([]byte{0b10, 0, 0, 0, 0, 0, 0, 0}) // idx 1 = 1
