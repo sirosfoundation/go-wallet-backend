@@ -1001,3 +1001,41 @@ func (n *nonResolvingEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest
 func (n *nonResolvingEvaluator) Name() string                           { return "non-resolver" }
 func (n *nonResolvingEvaluator) SupportedResourceTypes() []ResourceType { return nil }
 func (n *nonResolvingEvaluator) Healthy() bool                          { return true }
+
+// EvaluateStatusListSigner sends its own action.name (not credential-issuer),
+// uses the issuer PDP endpoint resolution, and carries the key material.
+func TestService_EvaluateStatusListSigner(t *testing.T) {
+	cfg := &config.Config{Trust: config.TrustConfig{Timeout: 10}}
+	cfg.Trust.Issuer.PDPURL = "https://issuer-pdp.example.com"
+	eval := &testMockEvaluator{decision: true}
+	var gotEndpoint string
+	svc := NewService(cfg, zap.NewNop(), func(endpoint string, _ time.Duration) (TrustEvaluator, error) {
+		gotEndpoint = endpoint
+		return eval, nil
+	})
+
+	km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
+	info, err := svc.EvaluateStatusListSigner(context.Background(), "https://status.example", "", km)
+	if err != nil || !info.Trusted {
+		t.Fatalf("EvaluateStatusListSigner() = %+v, %v", info, err)
+	}
+	if gotEndpoint != "https://issuer-pdp.example.com" {
+		t.Errorf("endpoint = %q, want the issuer PDP", gotEndpoint)
+	}
+	if eval.gotReq.Role != RoleAny || eval.gotReq.GetAction() != StatusListSignerAction || StatusListSignerAction != "status-list-signer" {
+		t.Errorf("role=%q action=%q", eval.gotReq.Role, eval.gotReq.GetAction())
+	}
+	if eval.gotReq.GetSubjectID() != "https://status.example" || eval.gotReq.GetKeyType() != ResourceTypeX5C {
+		t.Errorf("subject=%q keyType=%q", eval.gotReq.GetSubjectID(), eval.gotReq.GetKeyType())
+	}
+
+	// Session override wins; no PDP fails closed.
+	if _, err := svc.EvaluateStatusListSigner(context.Background(), "s", "https://override", km); err != nil || gotEndpoint != "https://override" {
+		t.Errorf("override endpoint = %q, err %v", gotEndpoint, err)
+	}
+	none := NewService(&config.Config{}, zap.NewNop(), func(string, time.Duration) (TrustEvaluator, error) { return eval, nil })
+	info, err = none.EvaluateStatusListSigner(context.Background(), "s", "", km)
+	if err != nil || info.Trusted || info.Framework != "none" {
+		t.Errorf("no PDP: %+v, %v", info, err)
+	}
+}

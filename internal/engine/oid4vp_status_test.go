@@ -423,10 +423,14 @@ type fakeTrustEvaluator struct {
 	err    error
 	gotReq *trust.EvaluationRequest
 	tenant string
+	decide func(*trust.EvaluationRequest) bool // overrides resp when set
 }
 
 func (f *fakeTrustEvaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
 	f.gotReq, f.tenant = req, trust.TenantFromContext(ctx)
+	if f.decide != nil {
+		return &trust.EvaluationResponse{Decision: f.decide(req)}, nil
+	}
 	return f.resp, f.err
 }
 func (f *fakeTrustEvaluator) Name() string                                 { return "fake" }
@@ -448,11 +452,23 @@ func TestStatusSignerTrust(t *testing.T) {
 	ok, err := statusSignerTrust(svcWith("http://pdp", ev))(ctx, "https://status.example", km)
 	assert.NoError(t, err)
 	assert.True(t, ok)
-	// The standard issuer evaluation: role credential-issuer, x5c resource, tenant in ctx.
-	assert.Equal(t, trust.RoleCredentialIssuer, ev.gotReq.Role)
+	// Dedicated action, not the credential-issuer role; x5c resource; tenant in ctx.
+	assert.Equal(t, trust.RoleAny, ev.gotReq.Role)
+	assert.Equal(t, "status-list-signer", ev.gotReq.GetAction())
+	assert.NotEqual(t, "credential-issuer", ev.gotReq.GetAction())
 	assert.Equal(t, "https://status.example", ev.gotReq.SubjectID)
 	assert.Equal(t, trust.KeyTypeX5C, ev.gotReq.KeyType)
 	assert.Equal(t, "tenant-9", ev.tenant)
+
+	// A PDP that only trusts the credential-issuer action must not authorize a
+	// list signer: the adapter never sends that role.
+	issuerOnly := &fakeTrustEvaluator{}
+	issuerOnly.decide = func(req *trust.EvaluationRequest) bool {
+		return req.Role == trust.RoleCredentialIssuer || req.GetAction() == "credential-issuer"
+	}
+	ok, err = statusSignerTrust(svcWith("http://pdp", issuerOnly))(ctx, "s", km)
+	assert.NoError(t, err)
+	assert.False(t, ok, "a credential-issuer-only positive decision must not authorize a list signer")
 
 	// A genuine negative decision: (false, nil), distinct from an error.
 	ev = &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: false, Reason: "not in any trust list"}}

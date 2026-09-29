@@ -35,20 +35,22 @@ const (
 )
 
 // statusSignerTrust adapts the go-trust backed TrustService to
-// statuslist.SignerTrust. The call is EvaluateIssuer: a status list token is
-// issued by (or on behalf of) a credential issuer, go-trust has no
-// status-list role, and the issuer PDP already validates x5c chains and jwk
-// keys against trust lists and registries. The tenant travels in ctx
-// (trust.ContextWithTenant, set by Execute) and is applied by the PDP client's
-// TenantTransport. "No PDP configured" and "evaluation failed" come back from
-// the service as untrusted, so they are turned into errors here to keep them
-// apart from a genuine negative decision.
+// statuslist.SignerTrust. The call is EvaluateStatusListSigner: action.name
+// "status-list-signer", resource type x5c or jwk, issuer PDP endpoint. It has
+// its own action because being trusted to issue credentials is not being
+// trusted to sign their revocation status; the go-trust deployment must define
+// a policy of that name (else go-trust applies its default policy; see
+// docs/adr/012). The tenant travels in ctx (trust.ContextWithTenant, set by
+// Execute) and is applied by the PDP client's TenantTransport. "No PDP
+// configured" and "evaluation failed" come back from the service as
+// untrusted, so they are turned into errors here to keep them apart from a
+// genuine negative decision.
 func statusSignerTrust(svc *TrustService) statuslist.SignerTrust {
 	if svc == nil {
 		return nil
 	}
 	return func(ctx context.Context, subject string, km *trust.KeyMaterial) (bool, error) {
-		info, err := svc.EvaluateIssuer(ctx, subject, "", km)
+		info, err := svc.EvaluateStatusListSigner(ctx, subject, "", km)
 		if err != nil {
 			return false, err
 		}

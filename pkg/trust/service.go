@@ -295,6 +295,38 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 	})
 }
 
+// StatusListSignerAction is the AuthZEN action.name sent when evaluating the
+// signer of a Token Status List (draft-ietf-oauth-status-list). It is distinct
+// from credential-issuer on purpose: being trusted to issue credentials is not
+// the same as being trusted to publish their revocation status, and an
+// external status service signs with its own key.
+//
+// The go-trust deployment MUST define a policy with exactly this name.
+// go-trust's PolicyManager.GetPolicy falls back to the DEFAULT policy for an
+// unknown action.name, so without it the signer is silently judged by the
+// default policy. See docs/adr/012-trust-evaluation-architecture.md
+// ("AuthZEN actions used by go-wallet-backend").
+const StatusListSignerAction = "status-list-signer"
+
+// EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
+// x5c chain or jwk from a status list's header) may sign status lists for
+// subject (the list's iss claim, else the origin of the list URI). It sends
+// action.name "status-list-signer" (Role is left empty so the explicit action
+// is used, as for EvaluateFIDO2Attestation).
+//
+// The endpoint is resolved like EvaluateIssuer's (session override, then the
+// per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
+// issuer-side entity, and no separate status-list PDP setting exists. With no
+// PDP resolved the result is Trusted=false (fail closed).
+func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
+	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
+	return s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
+		action:      StatusListSignerAction,
+		keyMaterial: keyMaterial,
+		logLabel:    "status_list_signer",
+	})
+}
+
 // evaluateOptions bundles evaluate's request-shaping parameters beyond the
 // required subject/endpoint/role, keeping evaluate's own parameter count
 // down (each field here used to be its own positional parameter).
