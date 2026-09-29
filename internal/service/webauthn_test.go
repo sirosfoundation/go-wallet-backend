@@ -11,6 +11,7 @@ import (
 	"github.com/descope/virtualwebauthn"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -1342,6 +1343,344 @@ func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience covers a Copilot
+// review finding: two tenants can share an OIDC issuer (e.g. a shared
+// multi-tenant IdP domain) while using different client IDs/audiences per
+// app. Issuer alone matching isn't enough proof a token was meant for THIS
+// tenant - the audience the token was actually validated against (recorded
+// by the AS handler in OIDCGateBinding.Audience) must match too.
+func TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-audience"),
+		Name:    "Test Tenant Audience",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-audience-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Audience Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Audience Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Correct issuer, but the audience the token was actually validated
+	// against (a different tenant's client) doesn't match this tenant's -
+	// should fail with ErrOIDCGateRequired even though the issuer matches.
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "some-other-tenants-client",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require the correct audience even when the issuer matches")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_MatchingAudience_Success exercises
+// the other side of the new audience check: a binding whose Audience matches
+// the tenant's own configured audience (defaulting to ClientID, per
+// EffectiveAudience) must be allowed through, not just an empty/unset one.
+func TestWebAuthnService_FinishLogin_OIDCGate_MatchingAudience_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-audience-ok"),
+		Name:    "Test Tenant Audience OK",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-audience-ok-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Audience OK User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Audience OK User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-audience-ok-client", // Matches tenant's EffectiveAudience (ClientID).
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when the audience matches")
+	assert.NotEmpty(t, resp.Token)
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch covers a
+// third Copilot review finding on this PR: Issuer and Audience matching
+// alone isn't enough if two tenants share both but configure different
+// OIDCGate.RequiredClaims - the gate middleware only ever validates a token
+// against the HEADER tenant's RequiredClaims, never the CREDENTIAL's real
+// tenant's. FinishLogin must re-check the credential tenant's own
+// RequiredClaims against the token's actual validated claims.
+func TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims"),
+		Name:    "Test Tenant Claims",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Correct issuer and audience, but the validated claims don't satisfy
+	// this tenant's RequiredClaims (e.g. the token was validated against a
+	// different, more permissive tenant sharing the same issuer/audience).
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-client",
+			Claims:   jwt.MapClaims{"role": "user"}, // Missing/wrong role.
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require the correct claims even when issuer and audience match")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success exercises
+// the other side: a binding whose Claims satisfy the tenant's
+// RequiredClaims must be allowed through.
+func TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims-ok"),
+		Name:    "Test Tenant Claims OK",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-ok-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims OK User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims OK User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-ok-client",
+			Claims:   jwt.MapClaims{"role": "admin"},
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when RequiredClaims are satisfied")
+	assert.NotEmpty(t, resp.Token)
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {

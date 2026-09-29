@@ -22,6 +22,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -395,6 +396,18 @@ type FinishRegistrationRequest struct {
 	// OIDCGateBinding contains optional OIDC identity binding info (set by handler)
 	// This is populated from the OIDC gate middleware result when bind_identity is true
 	OIDCGateBinding *OIDCGateBinding `json:"-"` // Do not bind from JSON
+
+	// ExpectedTenantID, when set by the handler, must match the tenant
+	// BeginRegistration recorded on the challenge (challenge.TenantID).
+	// Handlers set this from their own validated tenant context (e.g. the
+	// X-Tenant-ID header) so that a caller can't run BeginRegistration under
+	// one tenant and FinishRegistration under a different one - which would
+	// otherwise let tenant-scoped policy decisions the handler makes (e.g.
+	// bind_identity enforcement) run against the wrong tenant's config while
+	// the registration itself is still written under whatever tenant the
+	// challenge actually belongs to. Left empty, no check is performed (for
+	// callers that don't have this context). See issue #374 follow-up.
+	ExpectedTenantID string `json:"-"` // Do not bind from JSON
 }
 
 // OIDCGateBinding contains OIDC identity info for binding
@@ -403,6 +416,30 @@ type OIDCGateBinding struct {
 	Subject     string
 	Email       string
 	BindingType string // "registration" or "login"
+
+	// Audience, when set, is the audience the presented token was actually
+	// validated against (the tenant whose gate the caller passed - see
+	// AS PasskeyHandlers.LoginFinish). FinishLogin compares it against the
+	// CREDENTIAL's real tenant's LoginOP audience: without this, two tenants
+	// that share an OIDC issuer but use different client IDs/audiences could
+	// have a token valid for tenant A's app satisfy tenant B's login gate,
+	// since only Issuer was previously compared. Left empty (the default for
+	// any caller that doesn't set it, e.g. internal/api/handlers.go's
+	// FinishWebAuthnLogin), no audience check is performed - purely opt-in.
+	Audience string
+
+	// Claims, when set, are the full validated token claims (the same map
+	// the OIDC gate middleware itself checked against the HEADER tenant's
+	// OIDCGate.RequiredClaims). FinishLogin re-checks them against the
+	// CREDENTIAL's real tenant's own RequiredClaims: Issuer and Audience
+	// matching isn't enough if two tenants share both but configure
+	// different RequiredClaims - a token accepted for a permissive tenant
+	// could otherwise satisfy a stricter tenant's login gate purely because
+	// the gate middleware only ever validated it against the header tenant's
+	// policy. Left nil (the default for any caller that doesn't set it,
+	// e.g. internal/api/handlers.go's FinishWebAuthnLogin), no claims
+	// re-check is performed - purely opt-in, like Audience above.
+	Claims jwt.MapClaims
 }
 
 // FinishRegistrationResponse contains the result of registration
@@ -437,11 +474,22 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 		return nil, errors.New("invalid challenge action")
 	}
 
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
-
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
+
+	// SECURITY: reject if the caller's validated tenant context (set by the
+	// handler) doesn't match the tenant this challenge actually belongs to -
+	// see ExpectedTenantID's doc comment. Checked BEFORE the challenge is
+	// deleted below: otherwise a caller who merely knows a valid challenge ID
+	// could submit it with a mismatched tenant purely to burn the one-time
+	// challenge, denying the legitimate caller (with the matching tenant)
+	// the ability to ever finish it.
+	if req.ExpectedTenantID != "" && domain.TenantID(req.ExpectedTenantID) != tenantID {
+		return nil, ErrTenantMismatch
+	}
+
+	// Delete challenge (one-time use)
+	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Re-validate invite if one was used at BeginRegistration time.
 	// The invite may have been revoked or expired during the challenge window.
@@ -1128,6 +1176,41 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("expected_issuer", loginOP.Issuer),
 				zap.String("actual_issuer", req.OIDCGateBinding.Issuer))
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for wrong OP
+		}
+
+		// SECURITY: when the caller recorded which audience the token was
+		// actually validated against (see OIDCGateBinding.Audience's doc
+		// comment), it must match this tenant's own configured audience too.
+		// Two tenants can share an issuer (e.g. a shared multi-tenant IdP
+		// domain) while using different client IDs/audiences per app; issuer
+		// alone isn't enough to prove the token was meant for THIS tenant.
+		if req.OIDCGateBinding.Audience != "" && req.OIDCGateBinding.Audience != loginOP.EffectiveAudience() {
+			s.logger.Warn("OIDC binding audience mismatch",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("expected_audience", loginOP.EffectiveAudience()),
+				zap.String("actual_audience", req.OIDCGateBinding.Audience))
+			return nil, ErrOIDCGateRequired // Reject with gate required - token was for the wrong app
+		}
+
+		// SECURITY: when the caller recorded the token's full validated
+		// claims (see OIDCGateBinding.Claims's doc comment), re-check them
+		// against THIS tenant's own RequiredClaims. Issuer and Audience
+		// matching alone isn't enough: two tenants can share both while
+		// configuring different RequiredClaims, and the OIDC gate middleware
+		// only ever validated the token against the HEADER tenant's
+		// RequiredClaims - not the credential's real tenant's.
+		if req.OIDCGateBinding.Claims != nil && len(tenant.OIDCGate.RequiredClaims) > 0 {
+			for key, expected := range tenant.OIDCGate.RequiredClaims {
+				actual, exists := req.OIDCGateBinding.Claims[key]
+				if !exists || !oidc.ClaimsMatch(expected, actual) {
+					s.logger.Warn("OIDC binding required-claims mismatch",
+						zap.String("user_id", userID.String()),
+						zap.String("tenant_id", string(tenantID)),
+						zap.String("claim", key))
+					return nil, ErrOIDCGateRequired
+				}
+			}
 		}
 
 		// If bind_identity is enabled, verify the enterprise identity matches
