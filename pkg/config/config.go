@@ -241,6 +241,8 @@ type HTTPClientConfig struct {
 	// token_endpoint/jwks_uri named by a discovery document included, so a
 	// discovery document cannot steer the request to an unlisted internal
 	// host. Cloud metadata endpoints stay blocked regardless.
+	// Only the wallet server's AS reads this setting; the registry has no
+	// identity-provider client and ignores it.
 	// Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated)
 	TrustedIdPHosts []string `yaml:"trusted_idp_hosts" envconfig:"TRUSTED_IDP_HOSTS"`
 }

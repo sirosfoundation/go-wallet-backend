@@ -254,7 +254,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		Issuer:   op.Issuer,
 		Audience: op.ClientID,
 		JWKSURI:  op.JWKSURI,
-	}, nil, h.logger)
+	}, h.httpClient, h.logger)
 
 	result, err := validator.Validate(c.Request.Context(), tokenResp.IDToken)
 	if err != nil {
