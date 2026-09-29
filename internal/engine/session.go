@@ -20,6 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 var (
@@ -813,12 +814,13 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// too whenever the AS is enabled. go-tokenauth's shared
 		// *claims.Result has no "sid" field at all (it's shared with
 		// AS-issued tokens, which have no family concept in this codebase),
-		// so this re-parses the same already-validated raw token
-		// independently to reach that one extra claim - mirrors
-		// pkg/middleware.legacyTokenSID exactly, for the identical reason.
-		// New-style AS-issued tokens (ModeSession) are skipped entirely.
+		// so this reuses legacytoken.SID to re-parse the same
+		// already-validated raw token independently and reach that one
+		// extra claim - the same helper TokenAuthMiddleware itself uses,
+		// for the identical reason. New-style AS-issued tokens (ModeSession)
+		// are skipped entirely.
 		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
-			if sid := legacyTokenSID(m.cfg.JWT.Secret, tokenString); sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
+			if sid := legacytoken.SID(m.cfg.JWT.Secret, tokenString); sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
 				return "", "", "", errors.New("token has been revoked")
 			}
 		}
@@ -876,35 +878,6 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 	}
 
 	return "", "", "", errors.New("invalid token")
-}
-
-// legacyTokenSID re-parses rawToken - a token go-tokenauth has already
-// validated as legacy-mode/HMAC - to read its "sid" (refresh-token family)
-// claim, a wallet-backend-specific concept go-tokenauth's own *claims.Result
-// deliberately doesn't expose. Mirrors pkg/middleware.legacyTokenSID (kept
-// unexported and duplicated rather than shared across packages, for the
-// same reason that one is: this is a narrow, one-caller re-parse of a
-// single extra claim, not worth growing a shared type/module for).
-// Returns "" if the token can't be parsed with m.cfg.JWT.Secret or carries
-// no sid claim at all (e.g. minted before #402/#414).
-func legacyTokenSID(secret, rawToken string) string {
-	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return []byte(secret), nil
-	})
-	if err != nil || !token.Valid {
-		return ""
-	}
-
-	mapClaims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return ""
-	}
-
-	sid, _ := mapClaims["sid"].(string)
-	return sid
 }
 
 func (m *Manager) getCapabilities() []string {

@@ -16,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -916,34 +917,6 @@ func familyRetention(cfg *config.Config) time.Duration {
 	return access
 }
 
-// legacyTokenSID re-parses a legacy HMAC-signed token to extract its "sid"
-// (refresh-token family/session id - see WebAuthnService.generateToken's
-// doc comment) claim. Mirrors pkg/middleware.legacyTokenSID (kept
-// unexported and duplicated rather than shared, for the same reason that
-// one is: go-tokenauth's shared *claims.Result deliberately doesn't expose
-// a wallet-backend-specific claim like "sid", so both this handler's
-// tokenauth_result branch below and TokenAuthMiddleware need their own
-// small re-parse of the one extra claim, independent of that shared type).
-func legacyTokenSID(secret, rawToken string) string {
-	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return []byte(secret), nil
-	})
-	if err != nil || !token.Valid {
-		return ""
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return ""
-	}
-
-	sid, _ := claims["sid"].(string)
-	return sid
-}
-
 // Logout invalidates the current session by blacklisting the JWT and, when
 // it carries one, revoking its whole refresh-token family (#402) - so a
 // refresh token issued alongside it (or produced by any rotation of it)
@@ -982,7 +955,7 @@ func (h *Handlers) Logout(c *gin.Context) {
 			// this codebase, so only ModeLegacy is handled here.
 			if result.Mode == tokenauthclaims.ModeLegacy && h.services.TokenBlacklist != nil {
 				if rawToken, exists := c.Get("token"); exists {
-					if sid := legacyTokenSID(h.cfg.JWT.Secret, rawToken.(string)); sid != "" {
+					if sid := legacytoken.SID(h.cfg.JWT.Secret, rawToken.(string)); sid != "" {
 						expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
 						if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
 							h.logger.Warn("Failed to revoke refresh-token family", zap.Error(err))

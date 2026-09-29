@@ -47,7 +47,7 @@ func (s *stubTenantStore) GetAll(context.Context) ([]*domain.Tenant, error) {
 
 // testTokenAuthConfig returns a minimal config for TokenAuthMiddleware in
 // tests. Only JWT.Secret matters - it's used solely to re-parse a
-// legacy-mode token for its "sid" claim (see legacyTokenSID) - and none of
+// legacy-mode token for its "sid" claim (see legacytoken.SID) - and none of
 // the ES256/EdDSA-signed tokens these tests present are legacy-mode, so
 // its exact value is otherwise irrelevant here.
 func testTokenAuthConfig() *config.Config {
@@ -353,7 +353,7 @@ func createLegacyModeTokenWithSID(secret, userID, jti, sid string) string {
 // new-style vs legacy" tokens (TokenAuthMiddleware's own doc comment), so a
 // WebAuthnService-issued legacy HMAC token reaches THIS middleware instead
 // of the legacy AuthMiddlewareWithBlacklist whenever the AS is enabled.
-// Without checking family revocation here too (via legacyTokenSID's
+// Without checking family revocation here too (via legacytoken.SID's
 // re-parse - go-tokenauth's shared *claims.Result has no "sid" field),
 // revoking a session's refresh-token family on logout would be silently
 // ineffective for exactly this deployment mode.

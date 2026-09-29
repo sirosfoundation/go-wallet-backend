@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -18,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
@@ -54,8 +54,9 @@ type TenantLookup interface {
 // the same family-revocation check (#402) - go-tokenauth's *claims.Result
 // is shared with AS-issued tokens and deliberately doesn't expose a
 // wallet-backend-specific claim like "sid", so this re-parses the same
-// legacy HMAC token go-tokenauth already validated (see legacyTokenSID)
-// rather than growing that shared type/module for one caller's claim.
+// legacy HMAC token go-tokenauth already validated (see
+// legacytoken.SID) rather than growing that shared type/module for one
+// caller's claim.
 func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
@@ -100,7 +101,7 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 		// AS-issued tokens (ModeSession) have no sid/family concept at all;
 		// only ModeLegacy is checked.
 		if blacklist != nil && result.Mode == claims.ModeLegacy {
-			if sid := legacyTokenSID(cfg.JWT.Secret, rawToken); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+			if sid := legacytoken.SID(cfg.JWT.Secret, rawToken); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
 				logger.Warn("Token for revoked refresh-token family used",
 					zap.String("sid", sid),
 				)
@@ -267,31 +268,4 @@ func extractBearer(c *gin.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[1])
-}
-
-// legacyTokenSID re-parses rawToken - a token go-tokenauth has already
-// validated as legacy-mode/HMAC - to read its "sid" (refresh-token family)
-// claim, a wallet-backend-specific concept go-tokenauth's own *claims.Result
-// deliberately doesn't expose (see TokenAuthMiddleware's doc comment).
-// Returns "" if the token can't be parsed with secret or carries no sid
-// claim; callers must treat that as "no family to check", not an error -
-// legacy tokens minted before #402 have no sid at all.
-func legacyTokenSID(secret, rawToken string) string {
-	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return []byte(secret), nil
-	})
-	if err != nil || !token.Valid {
-		return ""
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return ""
-	}
-
-	sid, _ := claims["sid"].(string)
-	return sid
 }
