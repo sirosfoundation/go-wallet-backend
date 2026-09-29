@@ -3766,3 +3766,67 @@ wait:
 	}
 	assert.True(t, sawTrustRequired, "no-PDP mode must still ask the frontend to evaluate trust")
 }
+
+// TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID is the
+// regression test for a fifth Copilot review round on go-wallet-backend
+// PR #401: TrustEvaluationRequest.ResolutionSubjectID (added there for the
+// OID4VP verifier-side frontend fallback, see oid4vp_test.go's
+// TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags)
+// is documented as required whenever RequiresResolution is true - but
+// evaluateTrustViaFrontend here, the analogous no-PDP frontend-fallback path
+// for OID4VCI issuers, never populated it: a DID issuer request reached the
+// frontend with requires_resolution: true and an empty resolution_subject_id,
+// so a frontend genuinely implementing the new contract could not resolve
+// DID issuers at all.
+//
+// Unlike OID4VP's decentralized_identifier:-prefixed client_id, an OID4VCI
+// issuer identifier carries no scheme prefix to strip - the issuer string
+// already IS the bare DID whenever requiresResolution is true - so the fix
+// is simply to also send it as ResolutionSubjectID, not to extract anything.
+func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *testing.T) {
+	const issuer = "did:web:issuer.example"
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: testConfig(), // no issuer PDP configured at all
+		Logger: zap.NewNop(),
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: issuer}
+	info, err := h.evaluateTrust(context.Background(), issuer, metadata, false)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+
+	req := trustEvaluationRequest(t, messages)
+	assert.Equal(t, issuer, req.SubjectID)
+	assert.True(t, req.RequiresResolution, "a did: issuer must ask the frontend to resolve it")
+	assert.Equal(t, issuer, req.ResolutionSubjectID, "ResolutionSubjectID must be populated for a DID issuer, same as for a DID verifier")
+}
