@@ -643,6 +643,55 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 }
 
+// TestUserService_DeleteUser_RevokesTokens proves #383: deleting a user
+// revokes every previously-issued token for that user (via
+// TokenBlacklist.RevokeUser), not just the one that authenticated the
+// deletion request.
+func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	cfg.Security.TokenBlacklist.Enabled = true
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	blacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	svc.SetTokenBlacklist(blacklist)
+
+	username := "revoke-me"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Revoke Me",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// A token issued before deletion (e.g. from a different, still-logged-in
+	// device) must be rejected afterward, even though it was never
+	// individually blacklisted by jti.
+	if blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+		t.Fatal("user should not be revoked before deletion")
+	}
+
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	if !blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+		t.Error("expected a pre-deletion token to be revoked after DeleteUser")
+	}
+
+	// A different, unrelated user must be unaffected.
+	if blacklist.IsUserRevoked(ctx, "some-other-user") {
+		t.Error("DeleteUser must not revoke tokens for unrelated users")
+	}
+}
+
 func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()

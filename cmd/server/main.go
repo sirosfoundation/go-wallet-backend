@@ -247,6 +247,13 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// Wire the same token blacklist the HTTP auth middlewares use, so a
+		// revoked token (or a deleted user's other tokens) is rejected
+		// during the WebSocket handshake too, on both the go-tokenauth and
+		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
+		if backendProvider != nil {
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		}
 		mgr.AddProvider(provider)
 		engineProvider = provider
 	}

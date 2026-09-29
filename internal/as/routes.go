@@ -24,8 +24,13 @@ type ASModule struct {
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
 	OIDCHandler    *OIDCHandlers
-	Logger         *zap.Logger
-	Config         *config.ASConfig
+	// Blacklist checks whether a token has been revoked (via Logout/user
+	// deletion - see #382/#383). Used by the delegation-exchange path in
+	// TokenEndpointHandler so a revoked parent token can't be re-delegated
+	// into a fresh one (#381). Nil if the caller didn't wire one.
+	Blacklist TokenBlacklistChecker
+	Logger    *zap.Logger
+	Config    *config.ASConfig
 }
 
 // NewASModule creates and initializes the AS module.
@@ -37,6 +42,7 @@ func NewASModule(
 	jwtCfg *config.JWTConfig,
 	webauthnSvc *service.WebAuthnService,
 	store storage.Store,
+	blacklist TokenBlacklistChecker,
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
@@ -54,12 +60,20 @@ func NewASModule(
 		return cfg.GetTokenTTL(aud)
 	})
 
-	// Legacy issuer (uses existing HMAC secret).
+	// Legacy issuer (uses existing HMAC secret). Deliberately jwtCfg.Issuer,
+	// NOT the `issuer` var above: legacy appTokens are always minted by
+	// UserService/WebAuthnService's own generateToken with "iss":
+	// jwtCfg.Issuer, regardless of what cfg.AS.Issuer is separately
+	// configured as (the AS's own asymmetric tokenIssuer's identity). Using
+	// `issuer` here previously meant an operator who set cfg.AS.Issuer
+	// differently from cfg.JWT.Issuer got every legacy token rejected by
+	// this issuer, including - silently - LogoutHandler's legacy-token
+	// blacklisting fallback (#391 review, round 3).
 	var legacyIssuer *LegacyTokenIssuer
 	if cfg.Legacy.Enabled {
 		legacyIssuer = NewLegacyTokenIssuer(
 			[]byte(jwtCfg.Secret),
-			issuer,
+			jwtCfg.Issuer,
 			time.Duration(jwtCfg.ExpiryHours)*time.Hour,
 		)
 	}
@@ -98,6 +112,7 @@ func NewASModule(
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
 		OIDCHandler:    oidcHandler,
+		Blacklist:      blacklist,
 		Logger:         logger,
 		Config:         cfg,
 	}, nil
@@ -126,14 +141,19 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	}
 
 	// Token endpoint (requires session cookie).
-	RegisterTokenEndpoint(auth, m.Sessions, m.TokenIssuer, m.Policy,
-		func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
-		m.Config.InsecureCookies,
-		m.Logger,
-	)
+	RegisterTokenEndpoint(auth, TokenEndpointConfig{
+		Store:           m.Sessions,
+		Issuer:          m.TokenIssuer,
+		Policy:          m.Policy,
+		TTLFunc:         func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
+		Audiences:       m.Config.Audiences,
+		Blacklist:       m.Blacklist,
+		InsecureCookies: m.Config.InsecureCookies,
+		Logger:          m.Logger,
+	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

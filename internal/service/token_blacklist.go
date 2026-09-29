@@ -10,26 +10,46 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// TokenBlacklist manages revoked JWT tokens
+// TokenBlacklist manages revoked JWT tokens.
 // Tokens are stored until their expiry time, then automatically cleaned up.
+//
+// It also supports revoking every token for a user in one call (RevokeUser),
+// for use on account deletion (#383): unlike Add, which blacklists one
+// already-known jti, deletion has no way to enumerate every jti ever issued
+// to the user, so it instead records "this user_id is permanently retired"
+// and IsUserRevoked rejects any token for it from then on.
+//
+// A user-revocation entry is never time-expired (unlike the per-jti
+// entries in tokens, which are only ever kept until the token's own exp):
+// user_id values are UUIDs minted fresh by domain.NewUserID() and are never
+// reissued to a different (or the same) user after deletion, so there is no
+// "issued before/after the revocation" window to reason about - the
+// revocation is simply permanent for that ID, and a time-based retention
+// window (an earlier version of this used a fixed 30-day one) risks
+// expiring the marker while a long-lived token for that same user_id is
+// still otherwise valid. The tradeoff is that this map grows by one entry
+// per account ever deleted and is never pruned - acceptable given how
+// small and infrequent that is compared to the tokens map's own entries.
 type TokenBlacklist struct {
 	config config.TokenBlacklistConfig
 	logger *zap.Logger
 
-	mu       sync.RWMutex
-	tokens   map[string]time.Time // jti -> expiry time
-	stopChan chan struct{}
-	wg       sync.WaitGroup
+	mu              sync.RWMutex
+	tokens          map[string]time.Time // jti -> expiry time
+	userRevocations map[string]bool      // userID -> permanently revoked
+	stopChan        chan struct{}
+	wg              sync.WaitGroup
 }
 
 // NewTokenBlacklist creates a new token blacklist
 func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *TokenBlacklist {
 	cfg.SetDefaults()
 	return &TokenBlacklist{
-		config:   cfg,
-		logger:   logger.Named("token-blacklist"),
-		tokens:   make(map[string]time.Time),
-		stopChan: make(chan struct{}),
+		config:          cfg,
+		logger:          logger.Named("token-blacklist"),
+		tokens:          make(map[string]time.Time),
+		userRevocations: make(map[string]bool),
+		stopChan:        make(chan struct{}),
 	}
 }
 
@@ -93,6 +113,9 @@ func (b *TokenBlacklist) cleanup() {
 			zap.Int("remaining", len(b.tokens)),
 		)
 	}
+
+	// userRevocations is intentionally not swept here - see the type's doc
+	// comment for why a user-level revocation is permanent, not time-bound.
 }
 
 // Add adds a token JTI to the blacklist
@@ -145,6 +168,50 @@ func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 	}
 
 	return true
+}
+
+// RevokeUser permanently marks userID as revoked: every token for it,
+// regardless of when issued, is rejected from now on. Used on account
+// deletion (#383) so previously-issued tokens for that user - not just the
+// one used to authenticate the deletion request - stop working immediately
+// rather than lingering until they naturally expire. Combine with
+// IsUserRevoked, which callers check alongside IsBlacklisted.
+func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
+	if !b.config.Enabled {
+		return nil
+	}
+
+	if userID == "" {
+		return nil
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.userRevocations[userID] = true
+
+	b.logger.Debug("All tokens revoked for user", zap.String("user_id", userID))
+
+	return nil
+}
+
+// IsUserRevoked reports whether userID has been permanently revoked (via
+// RevokeUser) - i.e. whether any token for that user, however it validated,
+// should be rejected even though its own jti was never individually
+// blacklisted.
+func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+	if !b.config.Enabled {
+		return false
+	}
+
+	if userID == "" {
+		return false
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	return b.userRevocations[userID]
 }
 
 // Remove removes a token from the blacklist (if needed for admin override)

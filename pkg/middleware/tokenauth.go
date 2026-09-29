@@ -36,7 +36,17 @@ type TenantLookup interface {
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
+//
+// blacklist, when non-nil, is checked for user-level revocation
+// (IsUserRevoked) after a token validates - see #391 review: per-jti
+// revocation is already enforced *inside* v.Validate itself (the
+// go-tokenauth Validator's own Revocation checker, wired in
+// internal/server/providers.go to the same blacklist), but that checker's
+// interface only takes a jti, not a user_id, so DeleteUser's user-level
+// RevokeUser (#383) would otherwise never be consulted for tokens
+// validated through this path - only for tokens validated through the
+// legacy AuthMiddlewareWithBlacklist.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -46,11 +56,26 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			return
 		}
 
-		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC)
+		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
+		// Per-jti revocation is already checked inside Validate itself (see
+		// this function's doc comment).
 		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logger.Debug("Token validation failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		// User-level revocation (#383/#391): rejects any token for a
+		// deleted user, even one whose own jti was never individually
+		// blacklisted. A no-op for anonymous tokens (empty UserID - see
+		// TokenBlacklist.IsUserRevoked).
+		if blacklist != nil && blacklist.IsUserRevoked(c.Request.Context(), result.UserID) {
+			logger.Warn("Token for revoked user used",
+				zap.String("user_id", result.UserID),
+			)
+			c.JSON(401, gin.H{"error": "Token has been revoked"})
 			c.Abort()
 			return
 		}

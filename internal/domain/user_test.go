@@ -18,6 +18,26 @@ func TestNewUserID(t *testing.T) {
 	}
 }
 
+func TestHolderDID(t *testing.T) {
+	tests := []struct {
+		name     string
+		userID   string
+		expected string
+	}{
+		{"uuid", "550e8400-e29b-41d4-a716-446655440000", "did:key:550e8400-e29b-41d4-a716-446655440000"},
+		{"simple id", "user-123", "did:key:user-123"},
+		{"empty", "", "did:key:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HolderDID(tt.userID); got != tt.expected {
+				t.Errorf("HolderDID(%q) = %q, want %q", tt.userID, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestUserIDFromString(t *testing.T) {
 	tests := []struct {
 		name     string

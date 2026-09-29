@@ -446,6 +446,106 @@ func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// fakeEngineBlacklist is a minimal TokenBlacklistChecker test double.
+type fakeEngineBlacklist struct {
+	revoked      map[string]bool
+	revokedUsers map[string]bool
+}
+
+func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
+	return f.revoked[jti]
+}
+
+func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+	return f.revokedUsers[userID]
+}
+
+// TestManager_validateToken_GoTokenauth_RevokedUserDenied proves the #391
+// review fix (round 2): the WebSocket handshake's go-tokenauth path checks
+// user-level revocation itself, since the shared *tokenvalidator.Validator's
+// own Revocation checker only ever sees a jti, never a user_id - so
+// DeleteUser's bulk revocation would otherwise never be consulted here.
+func TestManager_validateToken_GoTokenauth_RevokedUserDenied(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"revoked-user": true}})
+
+	token := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "revoked-user"},
+		TenantID: "test-tenant",
+		TAC:      "r",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	_, _, _, err := m.validateToken(token)
+	assert.Error(t, err)
+}
+
+// TestManager_validateToken_Legacy_RevokedJTIDenied and
+// TestManager_validateToken_Legacy_RevokedUserDenied prove the #391 review
+// fix (round 2): the legacy HMAC handshake path previously performed no
+// revocation check at all - a deleted user's (or explicitly logged-out)
+// legacy token could still establish an engine session.
+func TestManager_validateToken_Legacy_RevokedJTIDenied(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revoked: map[string]bool{"jti-revoked": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"jti":     "jti-revoked",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+func TestManager_validateToken_Legacy_RevokedUserDenied(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"test-user-123": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"jti":     "jti-not-individually-blacklisted",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+// TestManager_validateToken_Legacy_NonRevokedAllowed is the sanity check
+// for the two tests above: the same blacklist wiring still allows a
+// non-revoked legacy token through.
+func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{
+		revoked:      map[string]bool{"some-other-jti": true},
+		revokedUsers: map[string]bool{"some-other-user": true},
+	})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"jti":     "jti-fine",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	userID, _, _, err := m.validateToken(tokenString)
+	require.NoError(t, err)
+	assert.Equal(t, "test-user-123", userID)
+}
+
 // ===== handleFlowStart TAC enforcement tests =====
 
 // stubFlowHandler is a minimal FlowHandler that succeeds immediately,

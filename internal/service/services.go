@@ -81,8 +81,17 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		}
 	}
 
+	userSvc := NewUserService(store, cfg, logger)
+	tokenBlacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	// Wire the blacklist into UserService so DeleteUser can revoke all of a
+	// deleted user's previously-issued tokens (#383), mirroring the
+	// SetSessionCleaner pattern below - but wired here, rather than by an
+	// external caller like cmd/server/main.go does for SetSessionCleaner,
+	// since both objects are already owned by this constructor.
+	userSvc.SetTokenBlacklist(tokenBlacklist)
+
 	return &Services{
-		User:             NewUserService(store, cfg, logger),
+		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
 		UserTenant:       NewUserTenantService(store, logger),
 		WebAuthn:         webauthnSvc,
@@ -95,7 +104,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
 		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
-		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
+		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
