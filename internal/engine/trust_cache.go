@@ -23,11 +23,22 @@ type TrustCacheRecord struct {
 	Trusted        bool
 }
 
-// TrustCache is a tenant-aware, in-memory TTL cache for verifier trust evaluations.
-// It replaces the previous approach of writing to VerifierStore (which polluted the admin registry).
+// TrustCache is a tenant-aware, in-memory TTL cache for verifier trust
+// evaluations. It replaces the previous approach of writing to VerifierStore
+// (which polluted the admin registry).
+//
+// TrustCache itself is agnostic to what the string key represents - callers
+// decide that. OID4VPHandler (see oid4vp.go's evaluateVerifierTrust) keys it
+// by the authenticated identity that scheme-bound signature verification
+// produces (e.g. a verified DID, or a client_id whose request JWT verified
+// against its x5c/attestation cnf key) rather than a bare client-supplied
+// URL, specifically so one verifier's entry can never answer for a
+// different claimed identity that happens to share a URL. It also only ever
+// writes a PDP-backed verdict here, never a client-asserted one - see
+// cacheVerifierTrust's doc comment.
 type TrustCache struct {
 	mu      sync.RWMutex
-	entries map[string]*TrustCacheEntry // key: tenantID + "|" + verifierURL
+	entries map[string]*TrustCacheEntry // key: tenantID + "|" + cacheKey
 	ttl     time.Duration
 	now     func() time.Time // injectable clock for testing
 }
@@ -46,17 +57,17 @@ func NewTrustCache(ttl time.Duration) *TrustCache {
 	}
 }
 
-func trustCacheKey(tenantID domain.TenantID, verifierURL string) string {
-	return string(tenantID) + "|" + verifierURL
+func trustCacheKey(tenantID domain.TenantID, cacheKey string) string {
+	return string(tenantID) + "|" + cacheKey
 }
 
-// Get retrieves a cached trust record for the given tenant and verifier URL.
+// Get retrieves a cached trust record for the given tenant and cache key.
 // Returns nil if not found or expired.
-func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCacheRecord {
+func (c *TrustCache) Get(tenantID domain.TenantID, cacheKey string) *TrustCacheRecord {
 	if c == nil || c.ttl <= 0 {
 		return nil
 	}
-	key := trustCacheKey(tenantID, verifierURL)
+	key := trustCacheKey(tenantID, cacheKey)
 
 	c.mu.RLock()
 	entry, ok := c.entries[key]
@@ -77,11 +88,15 @@ func (c *TrustCache) Get(tenantID domain.TenantID, verifierURL string) *TrustCac
 
 // Set stores a trust evaluation result in the cache.
 // Also sweeps expired entries to prevent unbounded growth.
-func (c *TrustCache) Set(tenantID domain.TenantID, verifierURL string, record *TrustCacheRecord) {
+//
+// Callers must only store PDP-backed verdicts here, never a client-asserted
+// one - TrustCache itself has no way to enforce that; see
+// OID4VPHandler.cacheVerifierTrust for where that rule is enforced.
+func (c *TrustCache) Set(tenantID domain.TenantID, cacheKey string, record *TrustCacheRecord) {
 	if c == nil || c.ttl <= 0 {
 		return
 	}
-	key := trustCacheKey(tenantID, verifierURL)
+	key := trustCacheKey(tenantID, cacheKey)
 	now := c.now()
 
 	c.mu.Lock()
