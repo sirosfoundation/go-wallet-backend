@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1806,6 +1807,94 @@ func TestValidateAuthorizationRequest_X509SANDNS_NoJWTSkipsCheck(t *testing.T) {
 	}
 	err := h.validateAuthorizationRequest(authReq, nil)
 	assert.NoError(t, err)
+}
+
+// x509_san_uri gets the same early, pre-metadata-fetch signature check as
+// x509_san_dns/x509_hash - see the Copilot finding on PR #401
+// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132050300):
+// without it, evaluateVerifierTrust's unconditional client_metadata_uri
+// fetch (which runs before its scheme switch verifies anything) could be
+// triggered by a request whose signature never verifies.
+func TestValidateAuthorizationRequest_X509SANURI_ValidJWT(t *testing.T) {
+	jwtToken, _ := makeSignedJWTWithX5CURISAN(t, "https://verifier.example.com/id")
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com/id",
+		ClientIDScheme: ClientIDSchemeX509SANURI,
+		RequestJWT:     jwtToken,
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+func TestValidateAuthorizationRequest_X509SANURI_InvalidJWT(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com/id",
+		ClientIDScheme: ClientIDSchemeX509SANURI,
+		RequestJWT:     "invalid.jwt.token",
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JWT signature verification failed")
+}
+
+func TestValidateAuthorizationRequest_X509SANURI_NoJWTSkipsCheck(t *testing.T) {
+	h := &OID4VPHandler{}
+	authReq := &AuthorizationRequest{
+		Nonce:          "abc",
+		ResponseMode:   ResponseModeDirectPost,
+		ResponseURI:    "https://verifier.example.com/response",
+		ClientID:       "https://verifier.example.com/id",
+		ClientIDScheme: ClientIDSchemeX509SANURI,
+		// No RequestJWT — the JWT verification step should be skipped
+	}
+	err := h.validateAuthorizationRequest(authReq, nil)
+	assert.NoError(t, err)
+}
+
+// TestOID4VPFlow_X509SANURI_InvalidSignature_NeverFetchesClientMetadata is
+// the end-to-end regression test for the Copilot finding above: driven the
+// way Execute() actually calls these two functions in sequence
+// (validateAuthorizationRequest, then - only if that passes -
+// evaluateVerifierTrust), an x509_san_uri request whose signature doesn't
+// verify must be rejected before ever reaching evaluateVerifierTrust's
+// client_metadata_uri fetch, so the verifier-controlled metadata endpoint
+// must see zero requests.
+func TestOID4VPFlow_X509SANURI_InvalidSignature_NeverFetchesClientMetadata(t *testing.T) {
+	var metadataFetches int32
+	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&metadataFetches, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"client_name":"whatever"}`))
+	}))
+	defer metadataServer.Close()
+
+	h := &OID4VPHandler{
+		BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
+		httpClient:  metadataServer.Client(),
+	}
+	authReq := &AuthorizationRequest{
+		Nonce:             "abc",
+		ResponseMode:      ResponseModeDirectPost,
+		ResponseURI:       "https://verifier.example.com/response",
+		ClientID:          "https://verifier.example.com/id",
+		ClientIDScheme:    ClientIDSchemeX509SANURI,
+		RequestJWT:        "invalid.jwt.token",
+		ClientMetadataURI: metadataServer.URL,
+	}
+
+	err := h.validateAuthorizationRequest(authReq, nil)
+	require.Error(t, err, "an invalidly-signed x509_san_uri request must be rejected before any metadata fetch")
+	assert.Contains(t, err.Error(), "JWT signature verification failed")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&metadataFetches),
+		"client_metadata_uri must never be fetched for a request whose signature doesn't verify")
 }
 
 // --- Tests for inferClientIDScheme new branches ---
@@ -3818,29 +3907,26 @@ func TestRequestedCredentialTypes(t *testing.T) {
 
 // --- #396: DID-scheme frontend fallback must set requires_resolution/request_jwt ---
 
-// TestEvaluateVerifierTrustViaFrontend_DIDScheme_SetsResolutionFlags is the
-// regression test for #396. evaluateVerifierTrust's
-// ClientIDSchemeDID/ClientIDSchemeDecentralizedIdentifier case now sets
-// requiresResolution=true and requestJWT=authReq.RequestJWT on the
-// verifierAuthContext it builds (mirroring
-// OID4VCIHandler.evaluateTrustViaFrontend's issuer-side
-// requiresResolution := strings.HasPrefix(issuer, "did:") in oid4vci.go) -
-// before the fix both were left at their zero values (false/"") all the way
-// through to the frontend.
+// TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags is
+// the regression test for #396, driven end to end through
+// evaluateVerifierTrust itself (not evaluateVerifierTrustViaFrontend
+// directly - an earlier version of this test bypassed the DID case's own
+// control flow, which a Copilot review round on this PR correctly flagged:
+// https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132050371).
 //
-// This drives evaluateVerifierTrustViaFrontend directly with exactly the
-// authCtx the (fixed) DID case now produces, since a real end-to-end DID
-// request cannot reach the frontend fallback path at all in this codebase:
-// DID resolution (h.TrustSvc.ResolveDID, run unconditionally by the switch
-// before either path is chosen) always requires a configured verifier PDP
-// endpoint, and that same endpoint being configured always routes to
-// evaluateVerifierTrustViaPDP instead - see
-// TestEvaluateVerifierTrust_NoPDPConfigured_FallsBackToFrontend's comment
-// for the same reason it uses x509_san_dns rather than a DID. Testing
-// evaluateVerifierTrustViaFrontend directly isolates exactly the wiring #396
-// is about: once authCtx carries the resolution flags a DID case must set,
-// does the frontend actually receive them.
-func TestEvaluateVerifierTrustViaFrontend_DIDScheme_SetsResolutionFlags(t *testing.T) {
+// Getting here for real required a second fix alongside the original
+// requiresResolution/requestJWT assignments: the DID case used to call
+// h.TrustSvc.ResolveDID unconditionally, which always resolves against the
+// same h.Config.Trust.GetVerifierPDPURL() the top-level dispatch checks - so
+// with no PDP configured, ResolveDID would always fail before the switch
+// even finished, and with one configured, dispatch would always choose the
+// PDP path instead. Either way, a did: request could never actually reach
+// evaluateVerifierTrustViaFrontend. The DID case now checks
+// GetVerifierPDPURL() itself and, when empty, skips local resolution
+// entirely (mirroring OID4VCIHandler.evaluateTrustViaFrontend, which never
+// attempts server-side resolution for a did: issuer either) - so this test
+// now drives the real path.
+func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *testing.T) {
 	const (
 		did      = "did:web:verifier.example"
 		clientID = ClientIDSchemeDID + ":" + did
@@ -3873,8 +3959,10 @@ func TestEvaluateVerifierTrustViaFrontend_DIDScheme_SetsResolutionFlags(t *testi
 		Payload: result,
 	}
 
+	cfg := testConfig() // no Trust.PDPURL / Verifier.PDPURL set at all
+	trustCache := NewTrustCache(time.Hour)
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
-		Flow: flow, Config: testConfig(), Logger: zap.NewNop(),
+		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustCache: trustCache,
 	}}
 	authReq := &AuthorizationRequest{
 		ClientID:       clientID,
@@ -3883,22 +3971,22 @@ func TestEvaluateVerifierTrustViaFrontend_DIDScheme_SetsResolutionFlags(t *testi
 		ResponseURI:    "https://verifier.example/response",
 		RequestJWT:     requestJWT,
 	}
-	verifier := &VerifierInfo{Name: authReq.ClientID, ClientIDScheme: authReq.ClientIDScheme}
-	// This is exactly what the fixed DID case in evaluateVerifierTrust's
-	// scheme switch now builds - see its comment there.
-	authCtx := verifierAuthContext{
-		requiresResolution: true,
-		requestJWT:         authReq.RequestJWT,
-	}
 
-	got, err := h.evaluateVerifierTrustViaFrontend(context.Background(), authReq, verifier, authCtx, authReq.ResponseURI)
+	verifier, err := h.evaluateVerifierTrust(context.Background(), authReq)
 	require.NoError(t, err)
-	require.NotNil(t, got)
+	require.NotNil(t, verifier)
+	assert.True(t, verifier.Trusted)
 
 	req := trustEvaluationRequest(t, messages)
+	assert.Equal(t, clientID, req.SubjectID)
 	assert.True(t, req.RequiresResolution, "a did:-scheme verifier must ask the frontend to resolve it")
 	assert.Equal(t, requestJWT, req.RequestJWT, "the frontend needs the signed request JWT to verify against the resolved DID")
+	assert.Nil(t, req.KeyMaterial, "no key material was resolved locally - the frontend resolves it")
 	require.NoError(t, req.Validate())
+
+	// A client-asserted verdict from this path must never be cached either
+	// (same rule as every other no-PDP frontend-fallback request).
+	assert.Zero(t, trustCache.Len())
 }
 
 // --- #397: x509_san_uri must get the same mandatory-signature-verification

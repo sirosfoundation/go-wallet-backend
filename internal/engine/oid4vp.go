@@ -588,6 +588,28 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, fmt.Errorf("client_id_scheme=%s requires a signed request JWT", authReq.ClientIDScheme)
 		}
 
+		if h.Config.Trust.GetVerifierPDPURL() == "" {
+			// No verifier PDP configured at all - the intentional,
+			// permissive dev/no-PDP mode. h.TrustSvc.ResolveDID always
+			// resolves against GetVerifierPDPURL() itself (an empty
+			// trustEndpoint override falls back to exactly this same
+			// config value), so calling it here would only ever fail with
+			// "no trust evaluator configured for DID resolution" - it can
+			// never actually succeed in this mode. Defer DID resolution
+			// and request JWT verification to the frontend/SDK entirely
+			// instead (mirrors OID4VCIHandler.evaluateTrustViaFrontend,
+			// which never attempts server-side resolution for a did:
+			// issuer either): keyMaterial stays nil so the frontend knows
+			// to resolve it, and this request is never cached - there is
+			// no verified identity yet to scope a cache entry to, and
+			// evaluateVerifierTrustViaFrontend never writes to the cache
+			// regardless.
+			requiresResolution = true
+			requestJWT = authReq.RequestJWT
+			cacheable = false
+			break
+		}
+
 		// Resolve DID document to get verification method keys
 		tenantID := ""
 		if h.Flow != nil && h.Flow.Session != nil {
@@ -631,19 +653,11 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		} else {
 			cacheable = false
 		}
-		// This handler has already resolved the DID and verified the request
-		// JWT itself (above), so evaluateVerifierTrustViaPDP never needs
-		// either field. But when NO verifier PDP is configured at all,
-		// evaluateVerifierTrustViaFrontend sends this authCtx on to the
-		// frontend/SDK as a TrustEvaluationRequest - and a did:-scheme
-		// verifier genuinely needs resolution there too (mirrors
-		// OID4VCIHandler.evaluateTrustViaFrontend's issuer-side
-		// requiresResolution := strings.HasPrefix(issuer, "did:") in
-		// oid4vci.go). Without this, the frontend fallback request hardcoded
-		// requires_resolution=false and an empty request_jwt for every
-		// did:-scheme verifier.
-		requiresResolution = true
-		requestJWT = authReq.RequestJWT
+		// This handler has already resolved the DID and verified the
+		// request JWT itself (above, since a verifier PDP is configured),
+		// so evaluateVerifierTrustViaPDP never needs requiresResolution/
+		// requestJWT - only the no-PDP branch above sets them, for
+		// evaluateVerifierTrustViaFrontend's benefit.
 
 	case ClientIDSchemeX509SANDNS:
 		// X.509 scheme: request MUST be JWT-secured; verify signature with x5c
@@ -2054,6 +2068,23 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		}
 		if km.Type != "x5c" {
 			return fmt.Errorf("x509_hash scheme requires x5c in JWT header, got %q", km.Type)
+		}
+	}
+
+	// x509_san_uri has the same risk as x509_san_dns/x509_hash above - but
+	// here it's not just the trust cache: evaluateVerifierTrust fetches
+	// client_metadata_uri (an outbound HTTP request to a verifier-controlled
+	// URL) unconditionally, before its scheme switch ever runs, so an
+	// invalidly-signed x509_san_uri request could otherwise trigger that
+	// fetch before ever being rejected. Verify the JWT signature against its
+	// embedded x5c first, same as its sibling certificate-bound schemes.
+	if authReq.ClientIDScheme == ClientIDSchemeX509SANURI && authReq.RequestJWT != "" {
+		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
+		if err != nil {
+			return fmt.Errorf("x509_san_uri JWT signature verification failed: %w", err)
+		}
+		if km.Type != "x5c" {
+			return fmt.Errorf("x509_san_uri scheme requires x5c in JWT header, got %q", km.Type)
 		}
 	}
 
