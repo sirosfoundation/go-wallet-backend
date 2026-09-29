@@ -229,9 +229,18 @@ func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations(t *testi
 // configuration. Start() now always launches the cleanup loop; this proves
 // an expired ConsumeOnce-written entry is actually swept even with
 // Enabled: false.
+//
+// Exercises the real Start()/cleanupLoop lifecycle (a short
+// CleanupIntervalSeconds, polled for) rather than calling the unexported
+// cleanup() directly: a direct call would pass identically against the old,
+// buggy Start() too, since cleanup() itself was never what was broken - it
+// was Start() skipping the goroutine entirely when disabled. Only actually
+// starting the worker and observing the entry disappear on its own proves
+// the fixed lifecycle, not just that cleanup's own logic is correct
+// (Copilot review on #400, second round).
 func TestTokenBlacklist_ConsumeOnce_EntriesAreCleanedUpEvenWhenDisabled(t *testing.T) {
 	ctx := context.Background()
-	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false, CleanupIntervalSeconds: 1}, zap.NewNop())
 
 	if _, err := b.ConsumeOnce(ctx, "jti-disabled-expired", time.Now().Add(-time.Minute)); err != nil {
 		t.Fatalf("ConsumeOnce: %v", err)
@@ -240,10 +249,16 @@ func TestTokenBlacklist_ConsumeOnce_EntriesAreCleanedUpEvenWhenDisabled(t *testi
 		t.Fatalf("Count() after ConsumeOnce = %d, want 1", b.Count())
 	}
 
-	b.cleanup()
+	b.Start()
+	defer b.Stop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for b.Count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	if b.Count() != 0 {
-		t.Errorf("Count() after cleanup = %d, want 0 (expired ConsumeOnce entry should be swept even when disabled)", b.Count())
+		t.Errorf("Count() after Start()'s cleanup worker ran = %d, want 0 (expired ConsumeOnce entry should be swept even when disabled)", b.Count())
 	}
 }
 

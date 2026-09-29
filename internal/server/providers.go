@@ -114,10 +114,23 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		// WebAuthnService.RefreshAccessToken) is the credential. This handler
 		// existed since refresh tokens were added but, like Logout before
 		// #391, was never actually mounted on any route (#392).
-		refresh := userBase.Group("/session")
-		refresh.Use(middleware.NoCacheMiddleware())
-		{
-			refresh.POST("/refresh", p.handlers.RefreshToken)
+		//
+		// Only mounted when refresh tokens are actually enabled
+		// (JWT.RefreshDays > 0): with the route always present, a deployment
+		// that has them turned off (the checked-in default) would still
+		// answer every call with a 5xx-class status from
+		// WebAuthnService.RefreshAccessToken's ErrRefreshDisabled, which
+		// looks like a server malfunction to callers/monitoring for what is
+		// actually an expected, admin-controlled config choice (Copilot
+		// review on #400 - a 503 fallback still counted as "still a 5xx").
+		// Omitting the route entirely instead answers with gin's ordinary
+		// 404, indistinguishable from any other unsupported endpoint.
+		if p.cfg.JWT.RefreshDays > 0 {
+			refresh := userBase.Group("/session")
+			refresh.Use(middleware.NoCacheMiddleware())
+			{
+				refresh.POST("/refresh", p.handlers.RefreshToken)
+			}
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)

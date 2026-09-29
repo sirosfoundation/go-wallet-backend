@@ -969,6 +969,40 @@ func TestAuthProvider_RegisterRoutes_RefreshTokenReachable(t *testing.T) {
 	}
 }
 
+// TestAuthProvider_RegisterRoutes_RefreshTokenNotMountedWhenDisabled is a
+// regression test for a Copilot review finding on #400 (two rounds): with
+// JWT.RefreshDays <= 0 (the checked-in default), the route used to still be
+// registered, and a request to it surfaced RefreshAccessToken's
+// ErrRefreshDisabled as a 5xx (first a 500, then - still flagged - a 503).
+// Since the config is fixed at startup, the route is now only registered
+// when refresh tokens are actually enabled; this proves POST
+// /user/session/refresh is absent entirely when they're not, so a caller
+// gets gin's ordinary 404 - indistinguishable from any other unsupported
+// endpoint, never mistaken for a server failure.
+func TestAuthProvider_RegisterRoutes_RefreshTokenNotMountedWhenDisabled(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	cfg.JWT.RefreshDays = 0
+	store := newTestMemoryBackend(t)
+
+	provider := NewAuthProvider(cfg, store, logger, nil)
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	if hasRoute(router.Routes(), http.MethodPost, "/user/session/refresh") {
+		t.Fatal("expected POST /user/session/refresh to NOT be registered when refresh tokens are disabled")
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(`{"refreshToken":"anything"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("POST /user/session/refresh with refresh disabled: status = %d, want %d, body = %s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+}
+
 // TestAuthProvider_FinishWebAuthnRegistration_RejectsTenantMismatch is a
 // regression test for issue #395: FinishWebAuthnRegistration (/user/*) had
 // the same tenant/challenge mismatch gap that PR #386 fixed on the

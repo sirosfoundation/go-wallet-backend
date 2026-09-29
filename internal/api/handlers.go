@@ -343,9 +343,15 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
 		case errors.Is(err, service.ErrRefreshDisabled):
 			// Config-driven, expected state (JWT.RefreshDays <= 0) - not a
-			// server malfunction, so it must not surface as a 500 (Copilot
-			// review on #400).
-			c.JSON(503, gin.H{"error": "Token refresh is disabled"})
+			// server malfunction, so it must not surface as any 5xx (a 503
+			// still reads as a server failure to callers/monitoring -
+			// Copilot review on #400, second round). The route itself is
+			// now only mounted when refresh tokens are enabled
+			// (internal/server/providers.go), so this case is unreachable
+			// via HTTP in practice; it's kept as defense in depth for any
+			// other caller of RefreshAccessToken, mapped the same way a
+			// missing route would answer.
+			c.JSON(404, gin.H{"error": "Token refresh is disabled"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to refresh token"})
 		}
