@@ -1090,27 +1090,27 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 		return err != nil
 	}, time.Second, 10*time.Millisecond, "the deleted user's connection should have closed")
 
-	// The survivor must remain fully functional. require.Never calls its
-	// condition synchronously on every tick, so a plain blocking
-	// ReadMessage (no data ever arrives on the happy path) would hang the
-	// very first call forever - it never gets a chance to time out and
-	// move on to the next tick, so the test itself would never complete.
-	// Bound each check with a short per-tick read deadline instead: a
-	// timeout means "still open, nothing to read yet" (expected), while
-	// any other error means the connection actually closed (failure).
-	require.Never(t, func() bool {
-		_ = survivorWS.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-		_, _, err := survivorWS.ReadMessage()
-		if err == nil {
-			return false
-		}
+	// The survivor must remain fully functional: prove it with a single
+	// bounded read, not a require.Never loop of repeated timed-out reads.
+	// gorilla/websocket's Conn latches an internal readErr on the first
+	// read error - including a plain deadline timeout - and every later
+	// NextReader/ReadMessage call just returns that same cached error
+	// without attempting a fresh read (see gorilla/websocket's
+	// Conn.NextReader: "for c.readErr == nil { ... }"). So a loop that
+	// re-arms the deadline and reads again on every tick would go blind to
+	// a real close after its first (expected) timeout: every subsequent
+	// read would keep returning that same latched timeout error forever,
+	// "passing" even if the code under test regressed and closed the
+	// connection moments later.
+	require.NoError(t, survivorWS.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+	_, _, err := survivorWS.ReadMessage()
+	if err != nil {
 		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
-			return false // nothing arrived this tick - the connection is still open
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("an innocent bystander's session must never be closed (ReadMessage returned: %v)", err)
 		}
-		return true // any non-timeout error means it was actually closed
-	}, 200*time.Millisecond, 20*time.Millisecond, "an innocent bystander's session must never be closed")
-	_ = survivorWS.SetReadDeadline(time.Time{})
+	}
+	require.NoError(t, survivorWS.SetReadDeadline(time.Time{}))
 
 	m.sessionsMu.RLock()
 	_, stillPresent := m.userIndex["innocent-bystander"]

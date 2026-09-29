@@ -668,6 +668,24 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 // before it is caught by the scan that necessarily follows (see
 // service.UserService.DeleteUser, which revokes before it cleans up
 // sessions).
+//
+// Known limitation (review, round 2): this recheck - like the identical
+// one validateToken already performs, and like #391's whole handshake
+// defense - only has a blacklist to consult when m.blacklist is set at
+// all, and TokenBlacklist.IsUserRevoked itself always reports false when
+// the optional security.token_blacklist feature is configured disabled
+// (see internal/service/token_blacklist.go). With that feature off,
+// nothing anywhere in the engine - not this recheck, not validateToken,
+// not #391's original fix - can distinguish a deleted user's handshake
+// from anyone else's; CloseUserSessions still closes whatever is already
+// registered at delete time, but a handshake racing the delete can still
+// slip through unregistered-then-registered either way. This isn't a
+// regression from #393: it's the existing, accepted shape of #391's
+// design (revocation checking is entirely opt-in behind that feature
+// flag). Closing it for good would need deletion to be visible to the
+// engine independently of that flag (e.g. manager-owned per-user epoch
+// state checked here unconditionally) - a larger change than this
+// account-deletion fix, tracked as a follow-up rather than done here.
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 

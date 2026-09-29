@@ -50,13 +50,25 @@ func (m MultiSessionCleaner) DeleteByUser(ctx context.Context, userID string) er
 	return first
 }
 
+// TokenRevoker is the subset of *TokenBlacklist that DeleteUser needs to
+// revoke every previously-issued token for a deleted user. Narrowing the
+// field to this interface (rather than the concrete *TokenBlacklist type)
+// lets tests exercise DeleteUser's error-handling around RevokeUser
+// failing - something the production TokenBlacklist implementation itself
+// never actually does today (RevokeUser only ever returns nil, defensively
+// coded for a future implementation - e.g. a persistent store - that
+// might not), so that path would otherwise be untestable dead code.
+type TokenRevoker interface {
+	RevokeUser(ctx context.Context, userID string) error
+}
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
 	cfg            *config.Config
 	logger         *zap.Logger
 	sessionCleaner SessionCleaner
-	tokenBlacklist *TokenBlacklist
+	tokenBlacklist TokenRevoker
 }
 
 // NewUserService creates a new UserService
@@ -74,11 +86,13 @@ func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
 	s.sessionCleaner = sc
 }
 
-// SetTokenBlacklist sets the token blacklist. When set, DeleteUser revokes
+// SetTokenBlacklist sets the token revoker (in production, always the
+// shared *TokenBlacklist - see TokenRevoker's doc comment for why the
+// parameter is the narrower interface). When set, DeleteUser revokes
 // every previously-issued token for the deleted user (not just the single
 // token used to authenticate the deletion request), so they stop working
 // immediately instead of remaining valid until they naturally expire (#383).
-func (s *UserService) SetTokenBlacklist(b *TokenBlacklist) {
+func (s *UserService) SetTokenBlacklist(b TokenRevoker) {
 	s.tokenBlacklist = b
 }
 

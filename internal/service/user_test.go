@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -640,6 +641,62 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 	if mock.userID != user.UUID.String() {
 		t.Errorf("SessionCleaner.DeleteByUser called with %q, want %q", mock.userID, user.UUID.String())
+	}
+}
+
+// erroringSessionCleaner always fails, to exercise DeleteUser's
+// best-effort error handling around the session cleaner.
+type erroringSessionCleaner struct{ err error }
+
+func (e erroringSessionCleaner) DeleteByUser(_ context.Context, _ string) error {
+	return e.err
+}
+
+// erroringTokenRevoker always fails, to exercise DeleteUser's best-effort
+// error handling around the token revoker. The production *TokenBlacklist
+// implementation's own RevokeUser never actually returns a non-nil error
+// today (see TokenRevoker's doc comment), so this fake is the only way to
+// reach that branch at all.
+type erroringTokenRevoker struct{ err error }
+
+func (e erroringTokenRevoker) RevokeUser(_ context.Context, _ string) error {
+	return e.err
+}
+
+// TestUserService_DeleteUser_ContinuesWhenCleanupHooksError proves that a
+// failing SessionCleaner or TokenRevoker never aborts DeleteUser: both are
+// best-effort cleanup steps (like every other cleanup step in this
+// function - credentials, presentations, challenges, invites), so an error
+// from either must be logged and swallowed, and the user deletion itself
+// must still complete.
+func TestUserService_DeleteUser_ContinuesWhenCleanupHooksError(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+	svc.SetSessionCleaner(erroringSessionCleaner{err: errors.New("session cleanup boom")})
+	svc.SetTokenBlacklist(erroringTokenRevoker{err: errors.New("revoke boom")})
+
+	username := "cleanup-hooks-error-user"
+	password := "password123"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Cleanup Hooks Error User",
+		Password:    &password,
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() should not fail when cleanup hooks error, got: %v", err)
+	}
+
+	if _, err := store.Users().GetByID(ctx, user.UUID); err == nil {
+		t.Error("user should still have been deleted despite cleanup hook errors")
 	}
 }
 
