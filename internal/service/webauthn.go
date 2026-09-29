@@ -1195,6 +1195,22 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
+	// Capture whether this credential's CloneWarning was already latched in
+	// storage BEFORE this call, so the security-event log/audit emit below
+	// can distinguish a NEWLY detected counter regression from a lingering
+	// flag left over from a past login. WebAuthnCredentials() (used to
+	// build the credential set handed to go-webauthn above) hydrates the
+	// persisted CloneWarning, and go-webauthn's Authenticator.UpdateCounter
+	// never clears it on a clean, properly-incrementing assertion — so once
+	// latched, credential.Authenticator.CloneWarning stays true on every
+	// subsequent login, not just the one that triggered it. Without this
+	// distinction the block below would emit a "possible cloned
+	// authenticator" event on every single login after the first detected
+	// regression, flooding logs and audit alerts instead of firing once at
+	// the moment of detection.
+	alreadyLatched := matchedCred.Authenticator.CloneWarning
+	newlyDetectedCloneWarning := credential.Authenticator.CloneWarning && !alreadyLatched
+
 	// Update the credential's signature count. CloneWarning is sticky: once
 	// set, a later login with a properly-incrementing counter must not
 	// silently clear it back to false — go-webauthn's per-call Authenticator
@@ -1217,8 +1233,10 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// must never be silently swallowed: log it as a distinct, greppable
 	// security-event line and, when audit is enabled, record it in the
 	// shared SET audit trail so it can be alerted on and investigated
-	// (issue #380).
-	if credential.Authenticator.CloneWarning {
+	// (issue #380). Gated on newlyDetectedCloneWarning, not the raw flag, so
+	// this fires once per actual detection rather than on every subsequent
+	// login.
+	if newlyDetectedCloneWarning {
 		s.logger.Warn("possible cloned authenticator detected",
 			zap.String("security_event", "webauthn_clone_warning"),
 			zap.String("user_id", userID.String()),

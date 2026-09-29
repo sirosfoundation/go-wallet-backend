@@ -1450,6 +1450,19 @@ func TestFullLoginFlow_CloneWarningSurfaced(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, user.WebauthnCredentials, 1)
 	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
+
+	// Review finding on PR #388: WebAuthnCredentials() hydrates the now-true
+	// persisted CloneWarning into every future login's credential, and
+	// go-webauthn's UpdateCounter never clears it — so
+	// credential.Authenticator.CloneWarning stays true on every subsequent
+	// login, not just the one that detected it. Another login whose OWN
+	// counter also regresses relative to the stored baseline (which never
+	// advanced past 10, since UpdateCounter's regression branch doesn't
+	// update SignCount) must NOT emit a second log line: the event should
+	// fire once, at the moment of detection, not flood on every later login.
+	login(5)
+	entries = observed.FilterMessage("possible cloned authenticator detected").All()
+	assert.Len(t, entries, 1, "a lingering CloneWarning must not re-emit the security event on every subsequent login")
 }
 
 // TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin covers a review
