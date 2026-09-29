@@ -65,6 +65,22 @@ func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, user
 	return &challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	filter := bson.D{{Key: "_id", Value: id}}
+	if expectedTenantID != "" {
+		filter = append(filter, bson.E{Key: "tenant_id", Value: expectedTenantID})
+	}
+	err := s.collection.FindOneAndDelete(ctx, filter).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
 	_, err := s.collection.DeleteOne(ctx, idFilter(id))
 	if err != nil {

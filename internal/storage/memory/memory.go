@@ -591,6 +591,18 @@ func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, user
 	return challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || (expectedTenantID != "" && challenge.TenantID != expectedTenantID) {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

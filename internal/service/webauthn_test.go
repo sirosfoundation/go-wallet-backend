@@ -1763,6 +1763,13 @@ func (e *erroringChallengeStore) ConsumeByIDForUser(ctx context.Context, id stri
 	return e.ChallengeStore.ConsumeByIDForUser(ctx, id, userID)
 }
 
+func (e *erroringChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByIDForTenant(ctx, id, expectedTenantID)
+}
+
 // storeWithChallengeOverride wraps *memory.Store, swapping out just the
 // Challenges() accessor so every other collection still behaves like the
 // real in-memory store.

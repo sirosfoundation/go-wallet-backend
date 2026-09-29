@@ -500,15 +500,35 @@ type FinishRegistrationResponse struct {
 
 // FinishRegistration completes WebAuthn registration
 func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishRegistrationRequest) (*FinishRegistrationResponse, error) {
-	// Atomically consume the challenge (single find-and-delete). This closes
-	// the TOCTOU window that a separate GetByID+Delete leaves open: without
-	// it, concurrent callers presenting the same challengeId+assertion can
-	// all read the challenge before any of them deletes it, and all pass
-	// verification (issue #379). ConsumeByID guarantees at most one caller
-	// ever gets a non-nil challenge back for a given ID.
-	challenge, err := s.store.Challenges().ConsumeByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge (single find-and-delete), constrained
+	// to the caller's validated tenant context (set by the handler) as part
+	// of the SAME atomic operation when one was given — see
+	// ExpectedTenantID's doc comment. This closes two TOCTOU windows at
+	// once: a separate GetByID+Delete lets concurrent callers presenting
+	// the same challengeId+assertion all read the challenge before any of
+	// them deletes it, and all pass verification (issue #379); and a
+	// tenant-mismatch check performed only AFTER an unconstrained consume
+	// would let a caller who merely knows a valid challenge ID submit it
+	// with the wrong tenant purely to burn the one-time challenge, denying
+	// the legitimate caller (with the matching tenant) the ability to ever
+	// finish it. ConsumeByIDForTenant guarantees at most one caller ever
+	// gets a non-nil challenge back for a given ID, and a tenant mismatch
+	// never touches the real challenge at all.
+	challenge, err := s.store.Challenges().ConsumeByIDForTenant(ctx, req.ChallengeID, req.ExpectedTenantID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
+			if req.ExpectedTenantID != "" {
+				// Distinguish "doesn't exist" from "tenant mismatch" only
+				// for the caller-facing error code, not the storage query
+				// itself (which is deliberately a single atomic op either
+				// way) — a non-existent challenge and a same-tenant lookup
+				// both already return ErrChallengeNotFound; we only need
+				// ErrTenantMismatch when a tenant context was actually
+				// supplied, matching the error this replaces.
+				if _, getErr := s.store.Challenges().GetByID(ctx, req.ChallengeID); getErr == nil {
+					return nil, ErrTenantMismatch
+				}
+			}
 			return nil, ErrChallengeNotFound
 		}
 		return nil, fmt.Errorf("failed to consume challenge: %w", err)
@@ -524,20 +544,6 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
-
-	// SECURITY: reject if the caller's validated tenant context (set by the
-	// handler) doesn't match the tenant this challenge actually belongs to -
-	// see ExpectedTenantID's doc comment. Checked BEFORE the challenge is
-	// deleted below: otherwise a caller who merely knows a valid challenge ID
-	// could submit it with a mismatched tenant purely to burn the one-time
-	// challenge, denying the legitimate caller (with the matching tenant)
-	// the ability to ever finish it.
-	if req.ExpectedTenantID != "" && domain.TenantID(req.ExpectedTenantID) != tenantID {
-		return nil, ErrTenantMismatch
-	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Re-validate invite if one was used at BeginRegistration time.
 	// The invite may have been revoked or expired during the challenge window.

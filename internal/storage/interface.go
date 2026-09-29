@@ -194,6 +194,21 @@ type ChallengeStore interface {
 	// (deliberately indistinguishable, so a caller can't probe which).
 	ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error)
 
+	// ConsumeByIDForTenant atomically retrieves and deletes a challenge by
+	// ID, additionally constrained to expectedTenantID as part of the SAME
+	// atomic find-and-delete — unless expectedTenantID is empty, in which
+	// case this behaves exactly like plain ConsumeByID with no extra
+	// constraint. This is what FinishRegistration must use when it has a
+	// validated tenant context (e.g. from the X-Tenant-ID header) to check
+	// against the challenge's own tenant: a caller who knows a challenge ID
+	// but names the wrong tenant must not be able to burn that challenge
+	// via a mismatch check performed only AFTER a separate, unconstrained
+	// consume. Returns ErrNotFound if the challenge doesn't exist, was
+	// already consumed, or (when expectedTenantID is non-empty) belongs to
+	// a different tenant (deliberately indistinguishable from the other
+	// cases, so a caller can't probe which).
+	ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error)
+
 	// Delete deletes a challenge
 	Delete(ctx context.Context, id string) error
 
