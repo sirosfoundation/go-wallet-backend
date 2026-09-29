@@ -1624,6 +1624,92 @@ type storeWithUserOverride struct {
 
 func (s *storeWithUserOverride) Users() storage.UserStore { return s.users }
 
+// TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate
+// documents and guards against a review finding on PR #388 / issue #411:
+// FinishLogin used to write
+// matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
+// directly, where matchedCred came from a *domain.User the memory store's
+// GetByID had returned. Because that GetByID returns the SAME pointer it
+// holds internally (not a copy, unlike MongoDB, which always decodes a
+// fresh struct), such a direct assignment mutates the LIVE stored
+// credential immediately — bypassing UpdateCredentialAuthenticator's
+// monotonic max-under-lock update entirely, since by the time that atomic
+// call runs, the value it would compare against has already been
+// overwritten by the very same write it was supposed to be protecting.
+//
+// This is deliberately NOT a full FinishLogin/go-webauthn integration test:
+// go-webauthn's own Authenticator.UpdateCounter, when handed a live-aliased
+// Authenticator (as the in-memory store always produces), incidentally
+// self-protects against the exact scenario a full-flow test would try to
+// construct — its own regression check already sees whatever a concurrent
+// write most recently landed, because it's reading the SAME aliased object,
+// making the extra direct assignment a no-op in every ordering that could
+// be driven deterministically through the public API. Isolating the exact
+// vulnerable CODE PATTERN here — obtain a live pointer via GetByID, mutate
+// SignCount on it directly, only then call UpdateCredentialAuthenticator —
+// is what actually demonstrates the defect precisely and deterministically:
+// it doesn't matter whether the mutation happens to originate from
+// FinishLogin or a similar future call site, this shape is unsafe on the
+// memory backend, period.
+func TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 5}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	t.Run("vulnerable pattern: direct mutation before the atomic call defeats it", func(t *testing.T) {
+		// A concurrent, independent write already advanced the counter to 20.
+		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+		require.NoError(t, err)
+
+		// The vulnerable shape: obtain a live pointer via GetByID (aliased on
+		// the memory backend), then mutate SignCount on it directly — exactly
+		// what FinishLogin used to do — using THIS caller's own, older/lower
+		// reported count (10), before ever calling the atomic update.
+		fetched, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		matchedCred := &fetched.WebauthnCredentials[0]
+		matchedCred.Authenticator.SignCount = 10 // the vulnerable direct write
+
+		// The atomic call now has nothing left to protect: the value it
+		// compares its own input (10) against has already been clobbered to
+		// 10 by the direct write above, so 10 > 10 is false and it does
+		// nothing further — but the damage (20 -> 10) is already done.
+		_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+		require.NoError(t, err)
+
+		got, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount,
+			"demonstrates the defect: the direct mutation lowered the stored counter despite the monotonic update")
+	})
+
+	t.Run("fixed pattern: no direct mutation, atomic call alone cannot regress", func(t *testing.T) {
+		// Reset to the same starting point as the vulnerable sub-test.
+		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+		require.NoError(t, err)
+
+		// The fixed shape: keep the reported count in a local variable (as
+		// FinishLogin does now — see newSignCount in FinishLogin) and never
+		// write it onto the object GetByID returned. Only the atomic call
+		// touches storage.
+		localReportedSignCount := uint32(10)
+		_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", localReportedSignCount, false)
+		require.NoError(t, err)
+
+		got, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+			"without the direct mutation, the monotonic atomic update alone correctly refuses to lower the stored counter")
+	})
+}
+
 // TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace covers a review
 // finding on PR #388: FinishLogin's CloneWarning latch only protected a
 // single request's own in-memory snapshot. The original persistence path
@@ -1848,6 +1934,103 @@ func TestFullLoginFlow_UpdateCredentialAuthenticatorError_DoesNotFailLogin(t *te
 		Credential:  json.RawMessage(assertionResponse),
 	})
 	require.NoError(t, err, "a persistence failure must not fail the login itself")
+}
+
+// TestFullLoginFlow_CloneWarningPersistFailure_StillSurfacesTheSignal covers
+// a review finding on PR #388 / issue #411: when
+// UpdateCredentialAuthenticator itself fails (e.g. a storage outage),
+// `transitioned` stays false, so gating the clone-warning log/audit purely
+// on `transitioned` would silently drop the security signal for the one
+// case it matters most — a genuine detection that couldn't be persisted.
+// FinishLogin must emit a distinct, separately-greppable event
+// ("webauthn_clone_warning_persist_failed") in exactly this case, on top of
+// (not instead of) the generic "Failed to update credential authenticator"
+// error log, and the login must still succeed.
+func TestFullLoginFlow_CloneWarningPersistFailure_StillSurfacesTheSignal(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Persist Failure Clone User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Persist Failure Clone User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(svc *WebAuthnService, counter uint32) {
+		t.Helper()
+		credential.Counter = counter
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err, "a persistence failure must not fail the login itself")
+	}
+
+	// Establish a non-zero baseline counter via a normal (non-erroring) service.
+	normalSvc, err := NewWebAuthnService(baseStore, cfg, logger)
+	require.NoError(t, err)
+	login(normalSvc, 10)
+
+	// Now the atomic persist call fails for this user, AND this login's
+	// assertion is a genuine clone-authenticator regression.
+	wrapped := &storeWithUserOverride{
+		Store: baseStore,
+		users: &erroringUserStore{
+			UserStore:  baseStore.Users(),
+			failUserID: userID.String(),
+			err:        errors.New("simulated storage outage"),
+		},
+	}
+	failingSvc, err := NewWebAuthnService(wrapped, cfg, logger)
+	require.NoError(t, err)
+	login(failingSvc, 3) // lower than the established baseline: a regression
+
+	persistFailedEntries := observed.FilterMessage("possible cloned authenticator detected but the warning failed to persist").All()
+	require.Len(t, persistFailedEntries, 1, "a genuine detection that fails to persist must still emit a distinct security-event line")
+	fields := persistFailedEntries[0].ContextMap()
+	assert.Equal(t, "webauthn_clone_warning_persist_failed", fields["security_event"])
+	assert.Equal(t, userID.String(), fields["user_id"])
+
+	// The normal "confirmed newly latched" line must NOT also fire for this
+	// same detection — transitioned is unreliable when persistence failed,
+	// so it must not be conflated with the confirmed-persisted case.
+	confirmedEntries := observed.FilterMessage("possible cloned authenticator detected").All()
+	assert.Empty(t, confirmedEntries, "the confirmed-persisted clone-warning line must not fire when persistence itself failed")
 }
 
 // ============================================================================

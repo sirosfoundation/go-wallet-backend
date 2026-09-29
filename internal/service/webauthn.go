@@ -1201,19 +1201,21 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// Update the in-memory view of the signature count for logging below;
-	// SignCount and CloneWarning are authoritatively persisted via the
-	// atomic call further down (SignCount is max-only, never decreases the
-	// stored counter). Deliberately NOT also locally setting
-	// matchedCred.Authenticator.CloneWarning here: the memory store's
-	// GetByID returns the same pointer it holds internally rather than a
-	// copy (unlike MongoDB, which always decodes a fresh struct), so a
-	// local mutation here would corrupt the "value immediately before this
-	// write" the atomic call below needs to observe to correctly detect a
-	// genuine false-to-true transition — this was caught by
-	// TestFullLoginFlow_CloneWarningSurfaced starting to fail once this line
-	// was (re-)added during a later refactor; removed again on purpose.
-	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
+	// Keep the assertion's reported counter in a LOCAL value for
+	// logging/the atomic persist call below, rather than mutating
+	// matchedCred/the stored user object directly. This is the same
+	// aliasing hazard already documented (and fixed) for CloneWarning a few
+	// lines below: the memory store's GetByID returns the same pointer it
+	// holds internally rather than a copy (unlike MongoDB, which always
+	// decodes a fresh struct), so writing straight into matchedCred here
+	// would mutate the LIVE stored credential before
+	// UpdateCredentialAuthenticator's max-under-lock update ever runs — if
+	// 20 is stored and this assertion reports a regression to 10, the
+	// stored value would already be lowered to 10 by this line alone,
+	// defeating the monotonic $max/max-under-lock guarantee entirely (and
+	// racing unsynchronized against any other concurrent access to the same
+	// in-memory object). See go-wallet-backend#411.
+	newSignCount := credential.Authenticator.SignCount
 
 	// Log public key diagnostics for successful login
 	if s.logger.Core().Enabled(zap.DebugLevel) {
@@ -1223,7 +1225,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.String("user_id", userID.String()),
 			zap.String("stored_public_key_sha256", storedPublicKeyHash),
 			zap.Int("stored_public_key_len", storedPublicKeyLen),
-			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+			zap.Uint32("sign_count", newSignCount),
 		)
 	}
 
@@ -1256,10 +1258,33 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// detected" and both emit the security event — a duplicate. Gating the
 	// emission on the atomic transition result instead means only the one
 	// call that actually won the race reports it.
-	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, matchedCred.Authenticator.SignCount, credential.Authenticator.CloneWarning)
+	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, newSignCount, credential.Authenticator.CloneWarning)
 	if err != nil {
 		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
-		// Don't fail login for this
+		// Don't fail login for this — but if a clone was genuinely detected
+		// on THIS assertion, the persistence failure must not also silently
+		// swallow the security signal itself. transitioned is unreliable
+		// here (the atomic call never got to compare-and-set), so this is a
+		// distinct, separately-greppable event from the normal
+		// "webauthn_clone_warning" line below — it says "detected, but we
+		// don't know if this made it into storage", not "confirmed newly
+		// latched". See go-wallet-backend#411.
+		if credential.Authenticator.CloneWarning {
+			s.logger.Error("possible cloned authenticator detected but the warning failed to persist",
+				zap.String("security_event", "webauthn_clone_warning_persist_failed"),
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("credential_id", credentialID),
+				zap.Uint32("sign_count", newSignCount),
+				zap.Error(err),
+			)
+			s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+				"user_id":    userID.String(),
+				"tenant_id":  string(tenantID),
+				"sign_count": newSignCount,
+				"persisted":  false,
+			})
+		}
 	}
 
 	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
@@ -1281,12 +1306,12 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.String("user_id", userID.String()),
 			zap.String("tenant_id", string(tenantID)),
 			zap.String("credential_id", credentialID),
-			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+			zap.Uint32("sign_count", newSignCount),
 		)
 		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
 			"user_id":    userID.String(),
 			"tenant_id":  string(tenantID),
-			"sign_count": matchedCred.Authenticator.SignCount,
+			"sign_count": newSignCount,
 		})
 	}
 
