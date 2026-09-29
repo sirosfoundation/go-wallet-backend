@@ -220,9 +220,44 @@ func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations(t *testi
 	}
 }
 
+// TestTokenBlacklist_ConsumeOnce_EntriesAreCleanedUpEvenWhenDisabled is a
+// regression test for a Copilot review finding on go-wallet-backend#400:
+// ConsumeOnce writes entries unconditionally (see its doc comment), but
+// Start() used to skip launching the cleanup goroutine entirely whenever
+// config.Enabled was false - so every successful refresh would permanently
+// grow the map for the life of the process in the (default) disabled
+// configuration. Start() now always launches the cleanup loop; this proves
+// an expired ConsumeOnce-written entry is actually swept even with
+// Enabled: false.
+func TestTokenBlacklist_ConsumeOnce_EntriesAreCleanedUpEvenWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+
+	if _, err := b.ConsumeOnce(ctx, "jti-disabled-expired", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("ConsumeOnce: %v", err)
+	}
+	if b.Count() != 1 {
+		t.Fatalf("Count() after ConsumeOnce = %d, want 1", b.Count())
+	}
+
+	b.cleanup()
+
+	if b.Count() != 0 {
+		t.Errorf("Count() after cleanup = %d, want 0 (expired ConsumeOnce entry should be swept even when disabled)", b.Count())
+	}
+}
+
+func TestTokenBlacklist_StartStop_Enabled(t *testing.T) {
+	b := newTestBlacklist(t) // Enabled: true
+	b.Start()
+	b.Stop()
+}
+
 func TestTokenBlacklist_StartStop_Disabled(t *testing.T) {
-	// Start() on a disabled blacklist logs and returns without launching the
-	// cleanup goroutine; Stop() must still be safe to call afterward.
+	// Start() on a disabled blacklist still launches the cleanup goroutine
+	// (see Start's doc comment - ConsumeOnce needs it regardless of
+	// config.Enabled) and logs accordingly; Stop() must be safe to call
+	// afterward either way.
 	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
 	b.Start()
 	b.Stop()

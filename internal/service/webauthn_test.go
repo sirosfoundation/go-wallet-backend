@@ -547,6 +547,42 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		}
 	})
 
+	// Regression test for a Copilot review finding on #400 (third round): the
+	// refresh token must NOT be consumed when a validation step AFTER
+	// signature/type checking fails (here: the user lookup) - otherwise a
+	// transient storage failure on that lookup would irreversibly burn a
+	// legitimate refresh token, forcing the client to re-authenticate from
+	// scratch instead of simply retrying. Proven by: a failed lookup, then a
+	// second attempt with the SAME token succeeding once the user exists.
+	t.Run("a failed user lookup does not consume the refresh token (retry with the same token can still succeed)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-7"}
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// User does not exist yet: lookup fails, request is rejected.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken (user not found), got %v", err)
+		}
+
+		// Now the user exists (simulating the earlier failure having been
+		// transient). The SAME refresh token must still work - proving it
+		// was never consumed by the failed attempt above.
+		require.NoError(t, store.Users().Create(ctx, user))
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != nil {
+			t.Fatalf("expected the refresh token to still be usable after the earlier failed lookup, got error: %v", err)
+		}
+		if resp.Token == "" {
+			t.Fatal("expected a new access token")
+		}
+	})
+
 	// Regression test for a Copilot review finding on #400: RefreshAccessToken
 	// only rotated tokens and never invalidated the one just used, so a
 	// stolen refresh token could be replayed indefinitely, each replay

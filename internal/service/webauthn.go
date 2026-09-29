@@ -1352,35 +1352,6 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 		return nil, ErrInvalidRefreshToken
 	}
 
-	// Atomically consume the refresh token's jti - see the doc comment
-	// above. This happens BEFORE any of the work below (user lookup, token
-	// minting) so that of two requests racing on the same refresh token,
-	// only the one that actually wins the atomic consume ever mints
-	// replacement tokens; the loser is rejected here regardless of timing.
-	// A jti-less token (shouldn't happen for tokens this service issues)
-	// can't be tracked, so ConsumeOnce treats it as always "first use"
-	// rather than spuriously rejecting it. tokenBlacklist itself is
-	// optional (nil when the caller never wired one in via
-	// SetTokenBlacklist), matching UserService's own pattern - only then is
-	// single-use enforcement skipped entirely.
-	jti, _ := claims["jti"].(string)
-	if s.tokenBlacklist != nil {
-		var expiry time.Time
-		if exp, ok := claims["exp"].(float64); ok {
-			expiry = time.Unix(int64(exp), 0)
-		} else {
-			expiry = time.Now().AddDate(0, 0, s.cfg.JWT.RefreshDays)
-		}
-		firstUse, err := s.tokenBlacklist.ConsumeOnce(ctx, jti, expiry)
-		if err != nil {
-			return nil, fmt.Errorf("failed to consume refresh token: %w", err)
-		}
-		if !firstUse {
-			s.logger.Warn("Refresh token reuse detected", zap.String("jti", jti))
-			return nil, ErrInvalidRefreshToken
-		}
-	}
-
 	// Extract user and tenant info
 	userIDStr, ok := claims["user_id"].(string)
 	if !ok {
@@ -1398,6 +1369,38 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 			zap.String("user_id", userIDStr),
 		)
 		return nil, ErrInvalidRefreshToken
+	}
+
+	// Atomically consume the refresh token's jti - see the doc comment
+	// above. Deliberately placed here: AFTER every non-mutating validation
+	// above (signature, type, user existence) has already succeeded, and
+	// IMMEDIATELY BEFORE minting the replacement pair below. Consuming any
+	// earlier - e.g. right after parsing the token - would irreversibly
+	// burn a legitimate refresh token on a transient failure below it (a
+	// storage hiccup on the user lookup, say), forcing a valid client to
+	// re-authenticate from scratch instead of simply retrying (Copilot
+	// review on #400, third round). This ordering doesn't reopen the
+	// concurrency race ConsumeOnce's atomicity closes: it's still a single
+	// atomic check-and-mark-used call, so of two requests racing on the
+	// same refresh token, only the one that wins it proceeds to mint
+	// tokens - the loser is rejected here regardless of timing, wherever
+	// in the function this call sits.
+	jti, _ := claims["jti"].(string)
+	if s.tokenBlacklist != nil {
+		var expiry time.Time
+		if exp, ok := claims["exp"].(float64); ok {
+			expiry = time.Unix(int64(exp), 0)
+		} else {
+			expiry = time.Now().AddDate(0, 0, s.cfg.JWT.RefreshDays)
+		}
+		firstUse, err := s.tokenBlacklist.ConsumeOnce(ctx, jti, expiry)
+		if err != nil {
+			return nil, fmt.Errorf("failed to consume refresh token: %w", err)
+		}
+		if !firstUse {
+			s.logger.Warn("Refresh token reuse detected", zap.String("jti", jti))
+			return nil, ErrInvalidRefreshToken
+		}
 	}
 
 	// Generate new access token

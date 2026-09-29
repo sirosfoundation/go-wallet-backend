@@ -53,15 +53,23 @@ func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *Tok
 	}
 }
 
-// Start begins the cleanup worker for expired blacklist entries
+// Start begins the cleanup worker for expired blacklist entries.
+//
+// This always launches the cleanup goroutine, even when config.Enabled is
+// false: ConsumeOnce (see its doc comment) writes entries unconditionally,
+// independent of that flag, so a disabled blacklist can still accumulate
+// consumed-refresh-token entries that need periodic sweeping - without
+// this, every successful refresh would permanently grow the map for the
+// life of the process whenever the general blacklist feature happens to be
+// off (Copilot review on go-wallet-backend#400).
 func (b *TokenBlacklist) Start() {
-	if !b.config.Enabled {
-		b.logger.Info("Token blacklist disabled")
-		return
-	}
-
 	b.wg.Add(1)
 	go b.cleanupLoop()
+
+	if !b.config.Enabled {
+		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs for ConsumeOnce-tracked entries")
+		return
+	}
 
 	b.logger.Info("Token blacklist started",
 		zap.Int("cleanup_interval_seconds", b.config.CleanupIntervalSeconds),
