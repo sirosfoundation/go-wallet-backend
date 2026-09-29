@@ -247,8 +247,9 @@ type PresentationConfig struct {
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
 	// unsigned, expired or malformed list also refuses).
 	// Choose enforce-revoked or strict to have the wallet refuse. The signer
-	// is evaluated by go-trust with action.name `status-list-signer`, then
-	// credential-issuer if that is not positive; the
+	// is evaluated by go-trust with action.name `status-list-signer` (a
+	// negative is final; an error falls back to credential-issuer unless
+	// status_list_signer_fallback is false); the
 	// go-trust deployment must define a policy of that name or go-trust applies
 	// its default policy (docs/adr/012-trust-evaluation-architecture.md).
 	// A list without a verifiable, trusted signer key (no x5c/jwk, no PDP
@@ -257,6 +258,15 @@ type PresentationConfig struct {
 	// mdoc credentials are not checked. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_STATUS_CHECK
 	StatusCheck StatusCheckMode `yaml:"status_check" envconfig:"STATUS_CHECK"`
+
+	// StatusListSignerFallback controls what happens when go-trust cannot
+	// answer (transport or evaluation error) the `status-list-signer`
+	// evaluation of a status list's signer: when true (default) the backend
+	// asks once more as `credential-issuer` and trusts the signer if that is
+	// positive; when false the error stands and the list is unverifiable. A
+	// genuine negative decision to `status-list-signer` is always final and
+	// never falls back. Env: WALLET_PRESENTATION_STATUS_LIST_SIGNER_FALLBACK
+	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
 }
 
 // Effective returns the mode to apply, treating the zero value as the default.
@@ -1792,7 +1802,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
-		Presentation: PresentationConfig{StatusCheck: StatusCheckWarn},
+		Presentation: PresentationConfig{StatusCheck: StatusCheckWarn, StatusListSignerFallback: true},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{

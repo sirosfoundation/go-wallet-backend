@@ -1042,9 +1042,11 @@ func (a *actionEvaluator) order() []string {
 
 func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
 	boom := errors.New("pdp down")
+	const sls, iss = "status-list-signer", "credential-issuer"
 	tests := []struct {
 		name        string
 		pdp         string
+		fallback    bool
 		answers     map[string]any
 		wantOrder   []string
 		wantTrusted bool
@@ -1052,21 +1054,23 @@ func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
 		wantError   bool // Reason reports a failed evaluation
 		wantLog     string
 	}{
-		{"first positive: one call", "https://pdp", map[string]any{"status-list-signer": true, "credential-issuer": true},
-			[]string{"status-list-signer"}, true, "status-list-signer", false, ""},
-		{"first negative, issuer positive", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": true},
-			[]string{"status-list-signer", "credential-issuer"}, true, "credential-issuer", false, "status-list-signer did not trust it"},
-		{"first error, issuer positive", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": true},
-			[]string{"status-list-signer", "credential-issuer"}, true, "credential-issuer", false, "status-list-signer evaluation failed"},
-		{"both negative", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": false},
-			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
-		{"both error", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": boom},
-			[]string{"status-list-signer", "credential-issuer"}, false, "", true, ""},
-		{"first error, issuer negative is a negative", "https://pdp", map[string]any{"status-list-signer": boom, "credential-issuer": false},
-			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
-		{"first negative, issuer error is a negative", "https://pdp", map[string]any{"status-list-signer": false, "credential-issuer": boom},
-			[]string{"status-list-signer", "credential-issuer"}, false, "", false, ""},
-		{"no PDP: one call", "", map[string]any{"status-list-signer": true}, nil, false, "", false, ""},
+		{"first positive: one call", "https://pdp", true, map[string]any{sls: true, iss: true},
+			[]string{sls}, true, sls, false, ""},
+		{"first negative is final even if issuer positive", "https://pdp", true, map[string]any{sls: false, iss: true},
+			[]string{sls}, false, "", false, "signer_untrusted_denied"},
+		{"first error, issuer positive: fallback", "https://pdp", true, map[string]any{sls: boom, iss: true},
+			[]string{sls, iss}, true, iss, false, "credential-issuer fallback"},
+		{"first error, issuer negative is a negative", "https://pdp", true, map[string]any{sls: boom, iss: false},
+			[]string{sls, iss}, false, "", false, ""},
+		{"both error", "https://pdp", true, map[string]any{sls: boom, iss: boom},
+			[]string{sls, iss}, false, "", true, ""},
+		{"fallback off, first error: error, one call", "https://pdp", false, map[string]any{sls: boom, iss: true},
+			[]string{sls}, false, "", true, ""},
+		{"fallback off, first positive", "https://pdp", false, map[string]any{sls: true},
+			[]string{sls}, true, sls, false, ""},
+		{"fallback off, first negative", "https://pdp", false, map[string]any{sls: false, iss: true},
+			[]string{sls}, false, "", false, "signer_untrusted_denied"},
+		{"no PDP: one call, no fallback", "", true, map[string]any{sls: true}, nil, false, "", false, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1077,7 +1081,7 @@ func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
 			km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
 			ctx := ContextWithTenant(context.Background(), "tenant-3")
 
-			info, err := svc.EvaluateStatusListSigner(ctx, "https://status.example", "", km)
+			info, err := svc.EvaluateStatusListSigner(ctx, "https://status.example", "", km, tc.fallback)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1099,17 +1103,27 @@ func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
 			if len(ev.calls) > 0 && (ev.calls[0].Role != RoleAny || ev.calls[0].GetAction() != StatusListSignerAction) {
 				t.Errorf("first call must be status-list-signer, got role=%q action=%q", ev.calls[0].Role, ev.calls[0].GetAction())
 			}
-			if tc.wantLog != "" {
+			switch tc.wantLog {
+			case "credential-issuer fallback":
 				var found bool
 				for _, e := range logs.FilterMessageSnippet("credential-issuer fallback").All() {
-					found = found || (strings.Contains(e.Message, tc.wantLog) && e.ContextMap()["signer_trust_action"] == "credential-issuer")
+					m := e.ContextMap()
+					found = found || (m["signer_trust_action"] == "credential-issuer" && m["status_list_signer_error"] != nil)
 				}
 				if !found {
-					t.Errorf("missing fallback log containing %q: %v", tc.wantLog, logs.All())
+					t.Errorf("missing fallback warning: %v", logs.All())
+				}
+			case "signer_untrusted_denied":
+				e := logs.FilterMessage("status list signer denied").All()
+				if len(e) != 1 || e[0].ContextMap()["reason"] != "signer_untrusted_denied" || e[0].ContextMap()["signer_trust_action"] != "status-list-signer" {
+					t.Errorf("missing denied log: %v", logs.All())
 				}
 			}
-			if tc.wantAction == "status-list-signer" && logs.FilterField(zap.String("signer_trust_action", "status-list-signer")).Len() != 1 {
+			if tc.wantAction == sls && logs.FilterField(zap.String("signer_trust_action", sls)).Len() != 1 {
 				t.Errorf("missing signer_trust_action=status-list-signer log")
+			}
+			if tc.wantLog != "credential-issuer fallback" && logs.FilterMessageSnippet("fallback").Len() != 0 {
+				t.Errorf("unexpected fallback log: %v", logs.All())
 			}
 		})
 	}
@@ -1125,18 +1139,18 @@ func TestService_EvaluateStatusListSigner_Endpoint(t *testing.T) {
 		return eval, nil
 	})
 	km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
-	info, err := svc.EvaluateStatusListSigner(context.Background(), "https://status.example", "", km)
+	info, err := svc.EvaluateStatusListSigner(context.Background(), "https://status.example", "", km, true)
 	if err != nil || !info.Trusted || info.Action != StatusListSignerAction || StatusListSignerAction != "status-list-signer" {
 		t.Fatalf("EvaluateStatusListSigner() = %+v, %v", info, err)
 	}
 	if gotEndpoint != "https://issuer-pdp.example.com" {
 		t.Errorf("endpoint = %q, want the issuer PDP", gotEndpoint)
 	}
-	if _, err := svc.EvaluateStatusListSigner(context.Background(), "s", "https://override", km); err != nil || gotEndpoint != "https://override" {
+	if _, err := svc.EvaluateStatusListSigner(context.Background(), "s", "https://override", km, true); err != nil || gotEndpoint != "https://override" {
 		t.Errorf("override endpoint = %q, err %v", gotEndpoint, err)
 	}
 	none := NewService(&config.Config{}, zap.NewNop(), func(string, time.Duration) (TrustEvaluator, error) { return eval, nil })
-	info, err = none.EvaluateStatusListSigner(context.Background(), "s", "", km)
+	info, err = none.EvaluateStatusListSigner(context.Background(), "s", "", km, true)
 	if err != nil || info.Trusted || info.Framework != "none" {
 		t.Errorf("no PDP: %+v, %v", info, err)
 	}

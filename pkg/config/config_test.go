@@ -2635,6 +2635,9 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 			t.Errorf("%q: want a presentation.status_check error, got %v", bad, err)
 		}
 	}
+	if !defaultConfig().Presentation.StatusListSignerFallback {
+		t.Error("status_list_signer_fallback must default to true")
+	}
 	if defaultConfig().Presentation.StatusCheck != StatusCheckWarn {
 		t.Error("default must be warn")
 	}

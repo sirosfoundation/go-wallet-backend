@@ -313,7 +313,7 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 const StatusListSignerAction = "status-list-signer"
 
 // StatusListSignerFallbackAction is the second action tried when the
-// status-list-signer evaluation is not positive.
+// status-list-signer evaluation errors (and the fallback is enabled).
 const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
 
 // evalFailedReasonPrefix starts TrustInfo.Reason when the evaluation itself
@@ -324,25 +324,29 @@ const evalFailedReasonPrefix = "Trust evaluation failed"
 // x5c chain or jwk from a status list's header) may sign status lists for
 // subject (the list's iss claim, else the origin of the list URI).
 //
-// It makes up to two calls with the same subject, key material, endpoint and
-// (tenant) context, and trusts the signer if either is positive:
+// The first call sends action.name "status-list-signer" (Role is left empty so
+// the explicit action is used, as for EvaluateFIDO2Attestation). Its outcome:
 //
-//  1. action.name "status-list-signer" (Role is left empty so the explicit
-//     action is used, as for EvaluateFIDO2Attestation);
-//  2. if that is not positive (negative or error), the credential-issuer role
-//     via EvaluateIssuer, a deliberate compatibility choice so deployments
-//     without a status-list-signer policy keep working.
+//   - positive: trusted, no further call;
+//   - genuine negative: FINAL, the signer is untrusted and no second call is
+//     made ("deny is deny");
+//   - no PDP configured (Framework "none"): untrusted, no second call (it
+//     could not differ);
+//   - error (transport or evaluation failure): if fallbackOnError, a second
+//     call is made as the credential-issuer role via EvaluateIssuer, with the
+//     same subject, key material, endpoint and tenant, and the signer is
+//     trusted if that is positive. A negative there is a negative; an error
+//     there leaves the first error. With fallbackOnError false, the error
+//     stands and no second call is made.
 //
-// The second call is skipped when the first found no PDP configured (it could
-// not differ). TrustInfo.Action names the action that produced a positive
-// result. When both calls fail to trust the signer, a genuine negative from
-// either wins over an evaluation error, so callers can tell "the PDP said no"
-// from "no decision could be had".
+// TrustInfo.Action names the action that produced a positive result, so
+// callers can tell a status-list-signer decision from a fallback one. A
+// negative and an error remain distinguishable through TrustInfo.Reason.
 //
 // The endpoint is resolved like EvaluateIssuer's (session override, then the
 // per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
 // issuer-side entity, and no separate status-list PDP setting exists.
-func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
+func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial, fallbackOnError bool) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
 	first, err := s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
 		action:      StatusListSignerAction,
@@ -361,6 +365,16 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 	if first.Framework == "none" {
 		return first, nil
 	}
+	if !strings.HasPrefix(first.Reason, evalFailedReasonPrefix) {
+		s.logger.Warn("status list signer denied",
+			zap.String("reason", "signer_untrusted_denied"),
+			zap.String("signer_trust_action", StatusListSignerAction),
+			zap.String("status_list_signer_reason", first.Reason))
+		return first, nil
+	}
+	if !fallbackOnError {
+		return first, nil
+	}
 
 	second, err := s.EvaluateIssuer(ctx, subject, trustEndpoint, keyMaterial)
 	if err != nil {
@@ -368,20 +382,12 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 	}
 	if second.Trusted {
 		second.Action = StatusListSignerFallbackAction
-		if strings.HasPrefix(first.Reason, evalFailedReasonPrefix) {
-			s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
-				zap.String("signer_trust_action", StatusListSignerFallbackAction),
-				zap.String("status_list_signer_reason", first.Reason))
-		} else {
-			s.logger.Warn("status list signer trusted via credential-issuer fallback; status-list-signer did not trust it",
-				zap.String("signer_trust_action", StatusListSignerFallbackAction),
-				zap.String("status_list_signer_reason", first.Reason))
-		}
+		s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
+			zap.String("signer_trust_action", StatusListSignerFallbackAction),
+			zap.String("status_list_signer_error", first.Reason))
 		return second, nil
 	}
-
-	// Neither trusted the signer: a genuine negative outranks an error.
-	if strings.HasPrefix(first.Reason, evalFailedReasonPrefix) && !strings.HasPrefix(second.Reason, evalFailedReasonPrefix) {
+	if !strings.HasPrefix(second.Reason, evalFailedReasonPrefix) {
 		return second, nil
 	}
 	return first, nil

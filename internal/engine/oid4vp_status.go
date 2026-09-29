@@ -36,8 +36,9 @@ const (
 
 // statusSignerTrust adapts the go-trust backed TrustService to
 // statuslist.SignerTrust. The call is EvaluateStatusListSigner: action.name
-// "status-list-signer" first, then (if not positive) the credential-issuer
-// role, trusted if either is positive; resource type x5c or jwk, issuer PDP
+// "status-list-signer" first; a negative there is final, and only an error
+// falls back (when presentation.status_list_signer_fallback is on) to the
+// credential-issuer role; resource type x5c or jwk, issuer PDP
 // endpoint. The go-trust deployment must define a policy named
 // status-list-signer (else go-trust applies its default policy; see
 // docs/adr/012). The tenant travels in ctx (trust.ContextWithTenant, set by
@@ -45,12 +46,12 @@ const (
 // configured" and "evaluation failed" come back from the service as
 // untrusted, so they are turned into errors here to keep them apart from a
 // genuine negative decision.
-func statusSignerTrust(svc *TrustService) statuslist.SignerTrust {
+func statusSignerTrust(svc *TrustService, fallbackOnError bool) statuslist.SignerTrust {
 	if svc == nil {
 		return nil
 	}
 	return func(ctx context.Context, subject string, km *trust.KeyMaterial) (bool, error) {
-		info, err := svc.EvaluateStatusListSigner(ctx, subject, "", km)
+		info, err := svc.EvaluateStatusListSigner(ctx, subject, "", km, fallbackOnError)
 		if err != nil {
 			return false, err
 		}
@@ -77,7 +78,7 @@ func sharedStatusChecker(cfg *config.Config, svc *TrustService) *statuslist.Chec
 	k := statusCheckerKey{cfg, svc}
 	c, ok := statusCheckers[k]
 	if !ok {
-		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), statusSignerTrust(svc))
+		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), statusSignerTrust(svc, cfg.Presentation.StatusListSignerFallback))
 		statusCheckers[k] = c
 	}
 	return c

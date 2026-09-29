@@ -424,10 +424,14 @@ type fakeTrustEvaluator struct {
 	gotReq *trust.EvaluationRequest
 	tenant string
 	decide func(*trust.EvaluationRequest) bool // overrides resp when set
+	onCall func()
 }
 
 func (f *fakeTrustEvaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
 	f.gotReq, f.tenant = req, trust.TenantFromContext(ctx)
+	if f.onCall != nil {
+		f.onCall()
+	}
 	if f.decide != nil {
 		return &trust.EvaluationResponse{Decision: f.decide(req)}, nil
 	}
@@ -438,7 +442,7 @@ func (f *fakeTrustEvaluator) SupportedResourceTypes() []trust.ResourceType { ret
 func (f *fakeTrustEvaluator) Healthy() bool                                { return true }
 
 func TestStatusSignerTrust(t *testing.T) {
-	assert.Nil(t, statusSignerTrust(nil))
+	assert.Nil(t, statusSignerTrust(nil, true))
 	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{"AAAA"}}
 
 	svcWith := func(pdp string, ev *fakeTrustEvaluator) *TrustService {
@@ -449,7 +453,7 @@ func TestStatusSignerTrust(t *testing.T) {
 	ctx := trust.ContextWithTenant(context.Background(), "tenant-9")
 
 	ev := &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: true}}
-	ok, err := statusSignerTrust(svcWith("http://pdp", ev))(ctx, "https://status.example", km)
+	ok, err := statusSignerTrust(svcWith("http://pdp", ev), true)(ctx, "https://status.example", km)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	// Dedicated action, not the credential-issuer role; x5c resource; tenant in ctx.
@@ -460,10 +464,9 @@ func TestStatusSignerTrust(t *testing.T) {
 	assert.Equal(t, trust.KeyTypeX5C, ev.gotReq.KeyType)
 	assert.Equal(t, "tenant-9", ev.tenant)
 
-	// A PDP that only trusts the credential-issuer action: the first call
-	// (status-list-signer) is negative, the credential-issuer fallback is
-	// positive, so the signer is trusted. The first call is still
-	// status-list-signer.
+	// A PDP that trusts only credential-issuer: the negative from
+	// status-list-signer is final, so the signer is NOT trusted and the
+	// fallback is never asked.
 	issuerOnly := &fakeTrustEvaluator{}
 	var seen []string
 	issuerOnly.decide = func(req *trust.EvaluationRequest) bool {
@@ -474,25 +477,40 @@ func TestStatusSignerTrust(t *testing.T) {
 		seen = append(seen, name)
 		return name == "credential-issuer"
 	}
-	ok, err = statusSignerTrust(svcWith("http://pdp", issuerOnly))(ctx, "s", km)
+	ok, err = statusSignerTrust(svcWith("http://pdp", issuerOnly), true)(ctx, "s", km)
 	assert.NoError(t, err)
-	assert.True(t, ok, "credential-issuer fallback trusts the signer")
-	assert.Equal(t, []string{"status-list-signer", "credential-issuer"}, seen)
+	assert.False(t, ok, "deny is deny: a negative status-list-signer decision is final")
+	assert.Equal(t, []string{"status-list-signer"}, seen)
 
 	// A genuine negative decision: (false, nil), distinct from an error.
 	ev = &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: false, Reason: "not in any trust list"}}
-	ok, err = statusSignerTrust(svcWith("http://pdp", ev))(ctx, "s", km)
+	ok, err = statusSignerTrust(svcWith("http://pdp", ev), true)(ctx, "s", km)
 	assert.NoError(t, err)
 	assert.False(t, ok)
 
 	// Evaluation failure is reported as an error, not as a negative decision.
 	ev = &fakeTrustEvaluator{err: errors.New("boom")}
-	ok, err = statusSignerTrust(svcWith("http://pdp", ev))(ctx, "s", km)
+	ok, err = statusSignerTrust(svcWith("http://pdp", ev), true)(ctx, "s", km)
 	assert.Error(t, err)
 	assert.False(t, ok)
 
+	// The switch reaches the service: first call errors, fallback on asks a
+	// second time, off does not.
+	for _, fb := range []bool{true, false} {
+		ev = &fakeTrustEvaluator{err: errors.New("boom")}
+		calls := 0
+		ev.onCall = func() { calls++ }
+		_, err = statusSignerTrust(svcWith("http://pdp", ev), fb)(ctx, "s", km)
+		assert.Error(t, err)
+		if fb {
+			assert.Equal(t, 2, calls)
+		} else {
+			assert.Equal(t, 1, calls)
+		}
+	}
+
 	// No PDP configured: an error (unavailable), not a negative decision.
-	ok, err = statusSignerTrust(svcWith("", &fakeTrustEvaluator{}))(ctx, "s", km)
+	ok, err = statusSignerTrust(svcWith("", &fakeTrustEvaluator{}), true)(ctx, "s", km)
 	assert.Error(t, err)
 	assert.False(t, ok)
 }
