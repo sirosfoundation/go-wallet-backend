@@ -1028,7 +1028,17 @@ type verifierAuthContext struct {
 // §5.9.3.6), and any verifier_attestation context.
 func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAuthContext, logger *zap.Logger) *TrustEvaluationRequest {
 	trustReq := &TrustEvaluationRequest{
-		SubjectID:          authReq.ClientID,
+		// didFromClientID strips OpenID4VP 1.0's decentralized_identifier:
+		// prefix when present (a no-op for every other scheme, including
+		// the older did: spelling, which never carries that prefix to
+		// begin with). The frontend passes SubjectID straight to /v1/resolve
+		// when RequiresResolution is true, which needs the bare DID, not
+		// the wire-form client_id - the same reason the server-side PDP
+		// branch above already resolves via didFromClientID(authReq.ClientID)
+		// rather than the raw client_id. The evaluate step doesn't lose the
+		// scheme distinction this strips: buildVerifierEvalContext already
+		// carries the original client_id_scheme in Context separately.
+		SubjectID:          didFromClientID(authReq.ClientID),
 		SubjectType:        SubjectTypeCredentialVerifier,
 		RequiresResolution: authCtx.requiresResolution,
 		RequestJWT:         authCtx.requestJWT,

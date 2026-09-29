@@ -3968,10 +3968,23 @@ func TestRequestedCredentialTypes(t *testing.T) {
 // entirely (mirroring OID4VCIHandler.evaluateTrustViaFrontend, which never
 // attempts server-side resolution for a did: issuer either) - so this test
 // now drives the real path.
+//
+// This exercises the OpenID4VP 1.0 final-spec decentralized_identifier:
+// prefix specifically (not the "did" scheme, whose client_id is already
+// the bare DID with nothing to strip): a third Copilot review round found
+// that an earlier version of this test built its client_id as
+// ClientIDSchemeDID + ":" + did ("did:did:web:...", a bogus double
+// prefix - a copy/paste mistake, not a real wire form) and so never
+// actually caught buildVerifierTrustRequest sending the full,
+// still-prefixed client_id as SubjectID: the frontend passes SubjectID
+// straight to /v1/resolve when RequiresResolution is true, which needs
+// the bare DID, exactly like the server-side PDP branch already resolves
+// via didFromClientID(authReq.ClientID) rather than the raw client_id
+// (https://github.com/sirosfoundation/go-wallet-backend/pull/401#discussion_r4132318509).
 func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *testing.T) {
 	const (
 		did      = "did:web:verifier.example"
-		clientID = ClientIDSchemeDID + ":" + did
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
 	)
 	requestJWT := "header.payload.sig"
 
@@ -4008,7 +4021,7 @@ func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *
 	}}
 	authReq := &AuthorizationRequest{
 		ClientID:       clientID,
-		ClientIDScheme: ClientIDSchemeDID,
+		ClientIDScheme: ClientIDSchemeDecentralizedIdentifier,
 		Nonce:          "n",
 		ResponseURI:    "https://verifier.example/response",
 		RequestJWT:     requestJWT,
@@ -4020,7 +4033,7 @@ func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *
 	assert.True(t, verifier.Trusted)
 
 	req := trustEvaluationRequest(t, messages)
-	assert.Equal(t, clientID, req.SubjectID)
+	assert.Equal(t, did, req.SubjectID, "SubjectID must be the bare DID (with the decentralized_identifier: prefix stripped) - the frontend passes it straight to /v1/resolve")
 	assert.True(t, req.RequiresResolution, "a did:-scheme verifier must ask the frontend to resolve it")
 	assert.Equal(t, requestJWT, req.RequestJWT, "the frontend needs the signed request JWT to verify against the resolved DID")
 	assert.Nil(t, req.KeyMaterial, "no key material was resolved locally - the frontend resolves it")
