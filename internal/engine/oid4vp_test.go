@@ -1872,11 +1872,29 @@ func TestValidateAuthorizationRequest_X509SANURI_NoJWTRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "x509_san_uri scheme requires a signed request JWT")
 }
 
+// runValidateThenEvaluate drives authReq through the same two-step sequence
+// Execute() actually uses (validateAuthorizationRequest, then - only if
+// that passes - evaluateVerifierTrust). The
+// TestOID4VPFlow_*_NeverFetchesClientMetadataBeforeVerification tests below
+// use this instead of calling validateAuthorizationRequest alone: calling
+// only the first step can never actually observe a regression in it, since
+// evaluateVerifierTrust - the only function that fetches client_metadata_uri
+// at all - would then simply never run within the test either, making
+// metadataFetches trivially zero regardless of whether the early rejection
+// this test is supposed to guard still works.
+func runValidateThenEvaluate(t *testing.T, h *OID4VPHandler, authReq *AuthorizationRequest) error {
+	t.Helper()
+	if err := h.validateAuthorizationRequest(authReq, nil); err != nil {
+		return err
+	}
+	_, err := h.evaluateVerifierTrust(context.Background(), authReq)
+	return err
+}
+
 // TestOID4VPFlow_X509SANURI_InvalidSignature_NeverFetchesClientMetadata is
 // the end-to-end regression test for the Copilot finding above: driven the
-// way Execute() actually calls these two functions in sequence
-// (validateAuthorizationRequest, then - only if that passes -
-// evaluateVerifierTrust), an x509_san_uri request whose signature doesn't
+// way Execute() actually calls these two functions in sequence via
+// runValidateThenEvaluate, an x509_san_uri request whose signature doesn't
 // verify must be rejected before ever reaching evaluateVerifierTrust's
 // client_metadata_uri fetch, so the verifier-controlled metadata endpoint
 // must see zero requests.
@@ -1912,8 +1930,19 @@ func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *t
 			}))
 			defer metadataServer.Close()
 
+			conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+				for {
+					if _, _, err := srvConn.ReadMessage(); err != nil {
+						return
+					}
+				}
+			})
+			defer cleanup()
+			session := testSession(conn)
+			flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
 			h := &OID4VPHandler{
-				BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
+				BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
 				httpClient:  metadataServer.Client(),
 			}
 			authReq := &AuthorizationRequest{
@@ -1926,7 +1955,7 @@ func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *t
 				ClientMetadataURI: metadataServer.URL,
 			}
 
-			err := h.validateAuthorizationRequest(authReq, nil)
+			err := runValidateThenEvaluate(t, h, authReq)
 			require.Error(t, err, "must be rejected before any metadata fetch")
 			assert.Contains(t, err.Error(), tt.wantErrMsg)
 			assert.Equal(t, int32(0), atomic.LoadInt32(&metadataFetches),
@@ -1981,8 +2010,19 @@ func TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerificati
 				}))
 				defer metadataServer.Close()
 
+				conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+					for {
+						if _, _, err := srvConn.ReadMessage(); err != nil {
+							return
+						}
+					}
+				})
+				defer cleanup()
+				session := testSession(conn)
+				flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
 				h := &OID4VPHandler{
-					BaseHandler: BaseHandler{Config: testConfig(), Logger: zap.NewNop()},
+					BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
 					httpClient:  metadataServer.Client(),
 				}
 				authReq := &AuthorizationRequest{
@@ -1995,7 +2035,12 @@ func TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerificati
 					ClientMetadataURI: metadataServer.URL,
 				}
 
-				err := h.validateAuthorizationRequest(authReq, nil)
+				// runValidateThenEvaluate (not validateAuthorizationRequest
+				// alone) drives the real Execute() sequence, so a
+				// regression in the early rejection this test guards would
+				// actually reach evaluateVerifierTrust's metadata fetch and
+				// be caught below - see its doc comment.
+				err := runValidateThenEvaluate(t, h, authReq)
 				require.Error(t, err, "must be rejected before any metadata fetch")
 				assert.Contains(t, err.Error(), st.wantSchemeErr)
 				assert.Contains(t, err.Error(), jt.wantErrMsg)
@@ -2098,6 +2143,12 @@ func TestPDPSubjectID_PreservesClientIDSchemePrefix(t *testing.T) {
 			clientID: "deadbeef",
 			scheme:   ClientIDSchemeX509Hash,
 			want:     "x509_hash:deadbeef",
+		},
+		{
+			name:     "x509_hash, prefix already embedded in client_id",
+			clientID: "x509_hash:deadbeef",
+			scheme:   ClientIDSchemeX509Hash,
+			want:     "x509_hash:deadbeef", // must not double-prefix
 		},
 		{
 			name:     "did scheme is untouched - no prefix to add",

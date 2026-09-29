@@ -208,13 +208,18 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 The engine sends `TrustEvaluationRequest` with:
 - `requires_resolution: true` - indicates frontend must resolve DID
 - `request_jwt` - the signed request JWT for frontend to verify
-- `subject_id` - the DID to resolve
+- `resolution_subject_id` - the bare DID to resolve via `/v1/resolve`
+- `subject_id` - the identifier to evaluate via `/v1/evaluate` (for OpenID4VP
+  1.0's `decentralized_identifier:`-prefixed client_id form, this keeps that
+  prefix - it's a different value from `resolution_subject_id` in that case,
+  since `/v1/resolve` and `/v1/evaluate` need different forms of the
+  identifier and one field can't serve both)
 
 Frontend flow:
-1. Call `POST /v1/resolve` with the DID to get the DID document
+1. Call `POST /v1/resolve` with `resolution_subject_id` to get the DID document
 2. Extract verification methods (public keys) from the response
 3. Verify the `request_jwt` signature using the resolved keys
-4. Call `POST /v1/evaluate` with the resolved keys for trust policy check
+4. Call `POST /v1/evaluate` with `subject_id` and the resolved keys for trust policy check
 5. Return `trust_result` action with the trust decision
 
 This ensures that:
@@ -313,7 +318,7 @@ For the engine transport, trust evaluation uses these message types:
   "payload": {
     "trust_evaluation_required": true,
     "request": {
-      "subject_id": "verifier.example.com",
+      "subject_id": "x509_san_dns:verifier.example.com",
       "subject_type": "credential_verifier",
       "key_material": {
         "type": "x5c",
@@ -328,6 +333,15 @@ For the engine transport, trust evaluation uses these message types:
 }
 ```
 
+`subject_id` always carries the `x509_san_dns:`/`x509_san_uri:`/`x509_hash:`
+prefix for these three schemes, even when the wire request presented
+`client_id_scheme` as a separate field with a bare `client_id` (rather than
+the prefix embedded in `client_id` itself) - go-trust's certificate-binding
+check (`ParseClientIDScheme`/`VerifyLeafBinding`) only fires when that
+prefix is present on `Subject.ID`, so the frontend must forward `subject_id`
+to its own `/v1/evaluate` call exactly as received here, never re-derived
+from `context.client_id_scheme` + a stripped value.
+
 **Server → Client (trust request with DID resolution - did scheme):**
 ```json
 {
@@ -340,6 +354,7 @@ For the engine transport, trust evaluation uses these message types:
       "subject_id": "did:web:verifier.example.com",
       "subject_type": "credential_verifier",
       "requires_resolution": true,
+      "resolution_subject_id": "did:web:verifier.example.com",
       "request_jwt": "eyJhbGciOiJFUzI1NiIsInR5cCI6Im9hdXRoLWF1dGh6LXJlcStqd3QifQ...",
       "context": {
         "client_id_scheme": "did",
@@ -350,10 +365,19 @@ For the engine transport, trust evaluation uses these message types:
 }
 ```
 
+`resolution_subject_id` and `subject_id` are the same bare DID here because
+the older `did:` client_id spelling carries no separate scheme prefix to
+strip in the first place. For OpenID4VP 1.0's final `decentralized_identifier:`
+spelling, `subject_id` keeps that prefix (it's what `/v1/evaluate` must see,
+matching what the server-side PDP path evaluates too) while
+`resolution_subject_id` is the prefix-stripped bare DID instead - the two
+fields exist precisely because `/v1/resolve` and `/v1/evaluate` need
+different forms of the identifier and one field can't serve both.
+
 For DID schemes, the frontend must:
-1. Call `/v1/resolve` with `subject_id` to get the DID document
+1. Call `/v1/resolve` with `resolution_subject_id` to get the DID document
 2. Verify `request_jwt` signature using resolved keys
-3. Call `/v1/evaluate` with the verified keys
+3. Call `/v1/evaluate` with `subject_id` and the verified keys
 4. Return the trust result
 
 **Client → Server (trust result):**
