@@ -50,13 +50,25 @@ func (m MultiSessionCleaner) DeleteByUser(ctx context.Context, userID string) er
 	return first
 }
 
+// TokenRevoker is the subset of *TokenBlacklist that DeleteUser needs to
+// revoke every previously-issued token for a deleted user. Narrowing the
+// field to this interface (rather than the concrete *TokenBlacklist type)
+// lets tests exercise DeleteUser's error-handling around RevokeUser
+// failing - something the production TokenBlacklist implementation itself
+// never actually does today (RevokeUser only ever returns nil, defensively
+// coded for a future implementation - e.g. a persistent store - that
+// might not), so that path would otherwise be untestable dead code.
+type TokenRevoker interface {
+	RevokeUser(ctx context.Context, userID string) error
+}
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
 	cfg            *config.Config
 	logger         *zap.Logger
 	sessionCleaner SessionCleaner
-	tokenBlacklist *TokenBlacklist
+	tokenBlacklist TokenRevoker
 }
 
 // NewUserService creates a new UserService
@@ -74,11 +86,13 @@ func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
 	s.sessionCleaner = sc
 }
 
-// SetTokenBlacklist sets the token blacklist. When set, DeleteUser revokes
+// SetTokenBlacklist sets the token revoker (in production, always the
+// shared *TokenBlacklist - see TokenRevoker's doc comment for why the
+// parameter is the narrower interface). When set, DeleteUser revokes
 // every previously-issued token for the deleted user (not just the single
 // token used to authenticate the deletion request), so they stop working
 // immediately instead of remaining valid until they naturally expire (#383).
-func (s *UserService) SetTokenBlacklist(b *TokenBlacklist) {
+func (s *UserService) SetTokenBlacklist(b TokenRevoker) {
 	s.tokenBlacklist = b
 }
 
@@ -320,21 +334,33 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
 	}
 
+	// Revoke all previously-issued tokens for this user (#383) BEFORE
+	// purging sessions below - not after. Logout only ever blacklists the
+	// single token used for that request; without this, any of the deleted
+	// user's other still-valid tokens (a different device, a token minted
+	// before this request's) would keep working until they naturally
+	// expire.
+	//
+	// The ordering matters for engine (WebSocket) sessions specifically
+	// (#393 review): a handshake can pass the engine's own IsUserRevoked
+	// check and then only finish registering itself in
+	// engine.Manager.sessions *after* the cleaner below has already
+	// scanned it. Revoking first means engine.Manager.registerSession's own
+	// recheck (done under the same lock the scan uses) will already see
+	// this user as revoked for any such late registration, and any
+	// registration that instead completed *before* this revocation is
+	// still guaranteed to be present in m.sessions by the time the scan
+	// below runs. Reversing this order would reopen that gap.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		}
+	}
+
 	// Purge active WebSocket sessions (Redis or memory)
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
-		}
-	}
-
-	// Revoke all previously-issued tokens for this user (#383). Logout only
-	// ever blacklists the single token used for that request; without this,
-	// any of the deleted user's other still-valid tokens (a different
-	// device, a token minted before this request's) would keep working
-	// until they naturally expire.
-	if s.tokenBlacklist != nil {
-		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
 		}
 	}
 

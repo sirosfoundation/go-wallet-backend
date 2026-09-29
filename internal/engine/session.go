@@ -173,6 +173,23 @@ type Manager struct {
 	// - see TokenBlacklistChecker's doc comment).
 	blacklist TokenBlacklistChecker
 
+	// revokedUsersMu guards revokedUsers.
+	revokedUsersMu sync.RWMutex
+
+	// revokedUsers is the engine's own, always-on record of users whose
+	// account has been deleted, populated by RevokeUser and consulted by
+	// isUserRevoked. Deliberately independent of blacklist/
+	// TokenBlacklistChecker: that checker no-ops entirely when the
+	// optional security.token_blacklist feature is configured disabled,
+	// which meant session-level closure/rejection at the engine used to
+	// silently stop working too whenever that unrelated feature flag was
+	// off (#403 - filed against #393/#399, now fixed by giving the engine
+	// this signal of its own rather than relying on an optional,
+	// separately-configured feature). TokenBlacklist remains the
+	// mechanism for token-level (HTTP) revocation; this is purely the
+	// engine's session-level one.
+	revokedUsers map[string]struct{}
+
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(sessions):
 	// sessions are only registered post-handshake, so counting only sessions
@@ -193,6 +210,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		},
 		sessions:        make(map[string]*Session),
 		userIndex:       make(map[string]*Session),
+		revokedUsers:    make(map[string]struct{}),
 		flowHandlers:    make(map[Protocol]FlowHandlerFactory),
 		trustService:    NewTrustService(cfg, logger),
 		registryClient:  NewRegistryClient(cfg, logger),
@@ -357,8 +375,14 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		pongTimeout:   pongTimeout,
 	}
 
-	// Register session
-	m.registerSession(session)
+	// Register session. A rejection here means the user was revoked in the
+	// narrow window between validateToken's own check above and this call -
+	// registerSession has already closed the connection itself in that
+	// case, so there is nothing left to unregister.
+	if !m.registerSession(session) {
+		session.logger.Warn("Handshake rejected: user revoked between token validation and session registration")
+		return
+	}
 	defer m.unregisterSession(session)
 
 	// Send handshake complete
@@ -643,8 +667,53 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
-func (m *Manager) registerSession(session *Session) {
+// registerSession adds session to the manager's live-session bookkeeping
+// and returns true, unless userID was revoked between validateToken's own
+// check (in handleNewConnection, immediately before this call) and this
+// call actually acquiring the lock - in which case it closes the
+// connection itself and returns false without registering anything.
+//
+// That recheck closes a narrow TOCTOU window found in review: DeleteUser's
+// session cleaner (see service.UserService.DeleteUser and
+// Manager.CloseUserSessions) only ever closes sessions already present in
+// m.sessions at the moment it runs. Without this recheck, a handshake that
+// passed validateToken just before the user was deleted, but that only
+// finishes registering after CloseUserSessions's scan already ran, would
+// become a permanent zombie - immune to every check #393 exists to add.
+// Rechecking here, atomically with insertion under the same sessionsMu
+// that CloseUserSessions scans under, closes that gap: any session that
+// registers after the revocation is caught here; any that registered
+// before it is caught by the scan that necessarily follows (see
+// service.UserService.DeleteUser, which revokes before it cleans up
+// sessions).
+//
+// This recheck (and validateToken's identical one) used to only have a
+// blacklist to consult when m.blacklist was set at all, and
+// TokenBlacklist.IsUserRevoked always reports false when the optional
+// security.token_blacklist feature is configured disabled - meaning
+// nothing anywhere in the engine could distinguish a deleted user's
+// handshake from anyone else's whenever that unrelated feature flag was
+// off (#403, filed against an earlier version of this fix). Also
+// consulting m.isUserRevoked - the engine's own always-on signal, set by
+// RevokeUser regardless of that feature flag - closes that gap
+// unconditionally: registering after RevokeUser marks the user revoked is
+// always caught here (RevokeUser sets revokedUsers before it scans for
+// and closes existing sessions, so there's no ordering to get wrong);
+// registering before it is caught by that same scan.
+func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
+
+	if session.UserID != "" {
+		revoked := m.isUserRevoked(session.UserID)
+		if !revoked && m.blacklist != nil {
+			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
+		}
+		if revoked {
+			m.sessionsMu.Unlock()
+			session.closeWithReason("account deleted")
+			return false
+		}
+	}
 	defer m.sessionsMu.Unlock()
 
 	// Close existing session for this user (skip for anonymous sessions)
@@ -678,6 +747,7 @@ func (m *Manager) registerSession(session *Session) {
 			m.logger.Warn("Failed to persist session", zap.Error(err))
 		}
 	}
+	return true
 }
 
 func (m *Manager) unregisterSession(session *Session) {
@@ -720,8 +790,11 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// shared Validator's own Revocation checker - see
 		// internal/server.blacklistRevocationChecker); user-level revocation
 		// is not, since that checker's interface only ever sees a jti (see
-		// #391 review, round 2).
-		if m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID) {
+		// #391 review, round 2). Checked against both the optional
+		// TokenBlacklist feature and the engine's own always-on
+		// revokedUsers (#403) - either one saying revoked is enough to
+		// reject.
+		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
 			return "", "", "", errors.New("token has been revoked")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
@@ -761,6 +834,13 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			if m.blacklist.IsUserRevoked(ctx, userID) {
 				return "", "", "", errors.New("token has been revoked")
 			}
+		}
+		// Checked unconditionally (unlike the m.blacklist block above,
+		// which is skipped entirely when no blacklist is wired): the
+		// engine's own revokedUsers works regardless of whether that
+		// optional feature is configured at all (#403).
+		if m.isUserRevoked(userID) {
+			return "", "", "", errors.New("token has been revoked")
 		}
 		return userID, tenantID, "", nil
 	}
@@ -828,6 +908,127 @@ func (m *Manager) CleanupSessions(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	return m.sessionStore.Cleanup(ctx)
+}
+
+// DeleteByUser implements service.SessionCleaner (duck-typed - engine must
+// not import package service): it permanently marks userID revoked for
+// this engine process (see RevokeUser) and closes every live WebSocket
+// session it currently holds for that user, e.g. because the account was
+// just deleted.
+//
+// This is a separate cleaner from the persistent SessionStore's own
+// DeleteByUser (see cmd/server/main.go, which wires both): that one only
+// ever purged the persisted SessionData bookkeeping record, never the
+// *websocket.Conn* itself, so an already-established connection for a
+// deleted user stayed open and usable until it disconnected on its own
+// (#393 - found as a follow-up to #391, which closed the equivalent gap
+// for new handshakes via IsUserRevoked, but not for connections that were
+// already past the handshake).
+//
+// Sessions live on other backend replicas (Redis-backed horizontal
+// scaling) are out of scope here: only this process's own live connections
+// can be closed directly.
+func (m *Manager) DeleteByUser(_ context.Context, userID string) error {
+	m.RevokeUser(userID)
+	return nil
+}
+
+// RevokeUser permanently marks userID revoked for this engine process:
+// every current and future WebSocket session for that user is rejected
+// from now on (see isUserRevoked, consulted by validateToken and
+// registerSession), and any of the user's sessions already live in this
+// process are closed immediately (see CloseUserSessions). This works
+// regardless of whether the optional security.token_blacklist feature is
+// configured at all - see revokedUsers' doc comment for why this exists
+// as the engine's own signal rather than being derived from
+// TokenBlacklistChecker (#403).
+//
+// Like TokenBlacklist's own userRevocations map, this entry is never
+// expired: user IDs (domain.NewUserID()) are never reissued after
+// deletion, so there is no "issued before/after the revocation" window to
+// reason about - the revocation is simply permanent for that ID for the
+// life of this process, and the map only grows by one entry per account
+// ever deleted, which is acceptable given how small and infrequent that
+// is.
+func (m *Manager) RevokeUser(userID string) {
+	if userID == "" {
+		return
+	}
+
+	m.revokedUsersMu.Lock()
+	m.revokedUsers[userID] = struct{}{}
+	m.revokedUsersMu.Unlock()
+
+	m.CloseUserSessions(userID, "account deleted")
+}
+
+// isUserRevoked reports whether userID was marked revoked via RevokeUser.
+// Unlike TokenBlacklistChecker.IsUserRevoked, this never depends on any
+// optional feature configuration - see revokedUsers' doc comment.
+func (m *Manager) isUserRevoked(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	m.revokedUsersMu.RLock()
+	defer m.revokedUsersMu.RUnlock()
+	_, revoked := m.revokedUsers[userID]
+	return revoked
+}
+
+// CloseUserSessions closes every live session belonging to userID (sending
+// a close frame with reason where the connection can still accept one) and
+// returns how many were closed. A user can hold more than one concurrent
+// session (multiple devices), so this closes all of them, not just the one
+// in userIndex ("last connection wins" - see registerSession). Matching is
+// strictly by exact Session.UserID equality (and userID must be non-empty),
+// so this can never close an anonymous session or a different user's
+// session.
+func (m *Manager) CloseUserSessions(userID string, reason string) int {
+	if userID == "" {
+		// Never treat "no user" as "match anonymous sessions" - every
+		// unauthenticated/anonymous session also has an empty UserID, and
+		// closing all of those would be a foot-gun this must not allow.
+		return 0
+	}
+
+	m.sessionsMu.RLock()
+	matches := make([]*Session, 0, 1)
+	for _, s := range m.sessions {
+		if s.UserID == userID {
+			matches = append(matches, s)
+		}
+	}
+	m.sessionsMu.RUnlock()
+
+	for _, s := range matches {
+		s.closeWithReason(reason)
+	}
+	return len(matches)
+}
+
+// closeWithReason sends a WebSocket close frame carrying reason (best
+// effort - the connection may already be broken or busy) and then closes
+// the underlying connection. This unblocks the session's read loop with an
+// error exactly like a client-initiated disconnect, so the Manager's normal
+// per-connection teardown (unregisterSession, flow cancellation, stopping
+// the ping goroutine - see handleSession/handleNewConnection) runs
+// unchanged rather than being duplicated here.
+//
+// Deliberately does NOT take s.sendMu: per gorilla/websocket's own
+// concurrency contract, WriteControl (unlike WriteJSON/WriteMessage, which
+// s.Send serializes via sendMu) may be called concurrently with any other
+// write. Taking sendMu here would let a backpressured client - whose peer
+// never reads, and whose write deadline was cleared after upgrade, see
+// handleNewConnection - block this call, and therefore account deletion,
+// indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
+// this call regardless of whether it succeeds, and Close is unconditional.
+func (s *Session) closeWithReason(reason string) {
+	_ = s.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+		time.Now().Add(time.Second),
+	)
+	_ = s.conn.Close()
 }
 
 // Close closes all sessions
