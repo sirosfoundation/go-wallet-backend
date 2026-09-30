@@ -483,6 +483,31 @@ type StandaloneValidator struct {
 // Close stops the background JWKS refresh and the loopback relay.
 func (v StandaloneValidator) Close() error { v.Stop(); return v.relay.Close() }
 
+// legacyValidatorConfig builds the go-tokenauth legacy (HMAC) configuration
+// shared by every validator constructor. The shared secret alone would
+// accept any HMAC token signed with it whatever its iss, because the
+// validator's top-level Issuer only gates asymmetric tokens, so the accepted
+// legacy issuer is pinned explicitly. Every legacy token is minted with
+// "iss": jwt.issuer (UserService/WebAuthnService.generateToken and
+// as.LegacyTokenIssuer), which can differ from as.issuer - the issuer of the
+// AS's own asymmetric tokens - so jwt.issuer, not the AS issuer, is used.
+//
+// Exactly one issuer is configured: go-tokenauth v0.4.0 enforces
+// Issuers[0] strictly and only checks the rest afterwards, so a second entry
+// could never be reached. Audiences are deliberately not configured on the
+// validator: legacy tokens carry aud = RP ID and audience filtering is
+// applied to new-style tokens only.
+func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.LegacyConfig {
+	lc := tokenvalidator.LegacyConfig{
+		Enabled:    enabled,
+		HMACSecret: []byte(cfg.JWT.Secret),
+	}
+	if cfg.JWT.Issuer != "" {
+		lc.Issuers = []string{cfg.JWT.Issuer}
+	}
+	return lc
+}
+
 // NewStandaloneEngineTokenValidator builds the token validator for an engine
 // running without a backend provider (--mode=engine), where none is otherwise
 // wired. The JWKS location comes from as.external_url (the AS's public base
@@ -511,10 +536,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 		JWKSURL: relay.url,
 		Issuer:  issuer,
 		// Audiences are checked by the engine itself, for new-style tokens only.
-		Legacy: tokenvalidator.LegacyConfig{
-			Enabled:    cfg.LegacyEnabled(),
-			HMACSecret: []byte(cfg.JWT.Secret),
-		},
+		Legacy: legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
 	})
 	v.Start(context.Background())
 	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
@@ -731,10 +753,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
 			// are enforced for new-style tokens only, by
 			// middleware.WithSessionAudiences and the engine/websocket checks.
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
+			Legacy: legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
 			// Same blacklist as everything else in this process (#382/#383) -
 			// without this, AS-issued/legacy tokens validated through
 			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
@@ -1195,10 +1214,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
 			// are enforced for new-style tokens only, by
 			// middleware.WithSessionAudiences and the engine/websocket checks.
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
+			Legacy: legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
 			// See NewBackendProvider's identical wiring (#382/#383). This
 			// provider's own services.TokenBlacklist is fine used as-is here:
 			// it never runs co-hosted with BackendProvider (see cmd/server).

@@ -47,9 +47,16 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		return raw
 	}()
 	hm, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "u", "tenant_id": "t", "exp": time.Now().Add(time.Hour).Unix(),
+		"user_id": "u", "tenant_id": "t", "iss": "legacy", "aud": "rp.example",
+		"exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(secret))
 	require.NoError(t, err)
+	hmBad := func(claims jwt.MapClaims) string {
+		claims["user_id"], claims["tenant_id"], claims["exp"] = "u", "t", time.Now().Add(time.Hour).Unix()
+		raw, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+		require.NoError(t, err)
+		return raw
+	}
 
 	base := func(legacy bool) *config.Config {
 		c := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "legacy"}}
@@ -81,6 +88,22 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		defer func() { _ = v.Close() }()
 		_, err = v.Validate(context.Background(), hm)
 		assert.NoError(t, err)
+	})
+
+	t.Run("legacy on: issuer pinned to jwt.issuer, no audience filtering", func(t *testing.T) {
+		v, err := NewStandaloneEngineTokenValidator(base(true), zap.NewNop())
+		require.NoError(t, err)
+		defer func() { _ = v.Close() }()
+		// as.issuer differs from jwt.issuer here; the legacy issuer is jwt.issuer.
+		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "as-issuer"}))
+		assert.Error(t, err, "the AS issuer is not a legacy issuer")
+		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "someone-else"}))
+		assert.Error(t, err)
+		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{}))
+		assert.Error(t, err, "missing iss")
+		res, err := v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "legacy", "aud": "any-rp-id"}))
+		require.NoError(t, err, "aud (the RP ID) must not be filtered on HMAC tokens")
+		assert.Equal(t, []string{"any-rp-id"}, res.Audience)
 	})
 
 	t.Run("plain-http external_url refused unless allow_http", func(t *testing.T) {
