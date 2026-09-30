@@ -47,6 +47,7 @@ func packList(t *testing.T, bits int, values map[int]int, size int) string {
 type tokenOpts struct {
 	typ, sub string
 	exp, nbf time.Time
+	iat      time.Time // zero: now
 	bits     int
 	values   map[int]int
 	key      *ecdsa.PrivateKey
@@ -60,8 +61,11 @@ func makeToken(t *testing.T, o tokenOpts) string {
 	if o.typ == "" {
 		o.typ = "statuslist+jwt"
 	}
+	if o.iat.IsZero() {
+		o.iat = time.Now()
+	}
 	claims := jwt.MapClaims{
-		"sub": o.sub, "iat": time.Now().Unix(),
+		"sub": o.sub, "iat": o.iat.Unix(),
 		"status_list": map[string]any{"bits": o.bits, "lst": packList(t, o.bits, o.values, 64)},
 	}
 	if !o.exp.IsZero() {
@@ -315,6 +319,39 @@ func TestCheck_RequiresIat(t *testing.T) {
 	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if err == nil || errors.Is(err, ErrRevoked) {
 		t.Fatalf("token without iat must be rejected as unverifiable: %v", err)
+	}
+}
+
+// A token issued after the Checker's clock is rejected (JWT), with no
+// leeway: one second ahead is refused, iat == now is accepted.
+func TestCheck_FutureIat(t *testing.T) {
+	ctx := context.Background()
+	key := newKey(t)
+	base := time.Now()
+	for _, tc := range []struct {
+		name    string
+		iat     time.Time
+		wantErr bool
+	}{
+		{"an hour ahead", base.Add(time.Hour), true},
+		{"one second ahead", base.Add(time.Second), true},
+		{"exactly now", base, false},
+		{"past", base.Add(-time.Minute), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, uri, _ := serve(t, func(u string) string {
+				return makeToken(t, tokenOpts{sub: u, key: key, iat: tc.iat})
+			}, "")
+			c.now = func() time.Time { return base }
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if tc.wantErr {
+				if err == nil || errors.Is(err, ErrRevoked) || !strings.Contains(err.Error(), "iat") {
+					t.Fatalf("future iat must be unverifiable, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 

@@ -251,6 +251,7 @@ func TestCWT_Rejections(t *testing.T) {
 		{"wrong sub", cwtOpts{sub: "https://other/x"}, nil, "does not match", nil},
 		{"missing iat", cwtOpts{noIat: true}, nil, "no iat", nil},
 		{"expired", cwtOpts{exp: time.Now().Add(-time.Minute)}, nil, "expired", nil},
+		{"future iat", cwtOpts{claims: map[int64]any{cwtClaimIat: time.Now().Add(time.Hour).Unix()}}, nil, "issued in the future", nil},
 		{"bad bits", cwtOpts{bits: 3}, nil, "bits", nil},
 		{"unknown alg", cwtOpts{alg: -8}, nil, "unsupported COSE alg", nil},
 		{"alg/key mismatch", cwtOpts{alg: coseAlgES384}, nil, "does not match alg", nil},

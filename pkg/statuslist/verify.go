@@ -363,6 +363,15 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 		return 0, nil, time.Time{}, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
 	}
 	now := c.now()
+	// A token issued in the future is not yet valid, whatever its ttl or exp
+	// say: rejecting it before freshness is derived keeps a pre-issued signed
+	// list from yielding a verdict early. Like exp and nbf below, the
+	// comparison uses this Checker's clock with no clock-skew leeway; the
+	// draft defines none, and a publisher that stamps iat ahead of real time
+	// is misconfigured rather than merely skewed.
+	if time.Unix(*lc.iat, 0).After(now) {
+		return 0, nil, time.Time{}, errors.New("status list token is issued in the future (iat)")
+	}
 	// The ttl claim is the token's freshness window, measured from its iat
 	// (not from when this wallet fetched it). Without ttl, a default window
 	// from now applies. exp and maxCacheTTL cap it.
