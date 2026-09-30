@@ -105,14 +105,21 @@ func TestNewSigningKey_Rejects(t *testing.T) {
 	rk, _ := rsa.GenerateKey(rand.Reader, 2048)
 	_, err = newSigningKey(rk)
 	assert.ErrorContains(t, err, "unsupported key type")
-	_, err = newSigningKey(&signing.PKCS11Signer{}) // stub build: nil public key
-	if err == nil {
-		t.Skip("built with pkcs11 tag")
-	}
+	_, err = newSigningKey(nilPublicSigner{}) // signer exposing no public key
+	assert.Error(t, err)
 	_, err = NewKeyManagerFromSigner(rk)
 	assert.Error(t, err)
 	_, err = newSigningKey(&fakeHSM{inner: &fakeShortEd{}})
 	assert.ErrorContains(t, err, "length")
+}
+
+// nilPublicSigner is a test-local signer whose Public() is nil; it behaves the
+// same in default and -tags pkcs11 builds (unlike signing.PKCS11Signer{}).
+type nilPublicSigner struct{}
+
+func (nilPublicSigner) Public() crypto.PublicKey { return nil }
+func (nilPublicSigner) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
+	return nil, errors.New("x")
 }
 
 type fakeShortEd struct{}
