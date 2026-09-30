@@ -1044,3 +1044,25 @@ func TestWMP_Resume_DoesNotWaitForUnacknowledgedCall(t *testing.T) {
 		t.Fatal("blocked send was not released by resume")
 	}
 }
+
+// Closing the adapter (graceful shutdown) must end live sessions so their SSE
+// handlers return instead of holding http.Server.Shutdown open.
+func TestWMPAdapter_Close_TerminatesSSEHandlers(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer m.Close()
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("u", "t"))
+	w := &syncRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() { a.HandleWMPEvents(w, req); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+
+	a.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SSE handler still streaming after adapter Close")
+	}
+}

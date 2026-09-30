@@ -325,14 +325,16 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	if err := mgr.Shutdown(shutdownCtx); err != nil {
-		logger.Error("Server shutdown error", zap.Error(err))
-	}
-
-	// Stop the engine provider's WMP adapter (cleanup goroutine) and close
-	// the engine manager's live sessions.
+	// Close the engine provider first: it stops the WMP adapter and ends the
+	// live sessions, which terminates their long-lived SSE handlers. Doing it
+	// after mgr.Shutdown would leave http.Server.Shutdown waiting on those
+	// streams for the whole shutdown timeout.
 	if engineProvider != nil {
 		engineProvider.Close()
+	}
+
+	if err := mgr.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Server shutdown error", zap.Error(err))
 	}
 
 	// Cleanup resources

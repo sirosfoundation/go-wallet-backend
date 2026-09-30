@@ -426,6 +426,18 @@ func (a *WMPAdapter) Close() {
 	if a.loopDone != nil {
 		<-a.loopDone
 	}
+	// End every live session. This closes each session's event buffer, which
+	// terminates any SSE handler streaming from it; without it a graceful
+	// HTTP shutdown waits out its whole timeout on those long-lived streams.
+	a.mu.RLock()
+	ids := make([]string, 0, len(a.peers))
+	for sid := range a.peers {
+		ids = append(ids, sid)
+	}
+	a.mu.RUnlock()
+	for _, sid := range ids {
+		a.CloseSession(sid)
+	}
 }
 
 // cleanupLoop periodically removes expired resumption tokens and idle sessions.
