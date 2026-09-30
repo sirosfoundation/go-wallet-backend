@@ -1552,6 +1552,19 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		return nil, errors.New("no credentials selected")
 	}
 
+	// The client is not trusted to have honoured the query it was sent: compare
+	// the consent with it before anything is signed.
+	if err := h.vetConsent(authReq, payload.SelectedCredentials); err != nil {
+		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+		if redirectURI != "" {
+			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage(),
+				map[string]interface{}{"redirect_uri": redirectURI})
+		} else {
+			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
+		}
+		return nil, err
+	}
+
 	return payload.SelectedCredentials, nil
 }
 

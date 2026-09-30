@@ -22,6 +22,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [http_client](#http_client)
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
+- [presentation](#presentation)
 - [Registry Server](#registry-server)
 - [registry.server](#registryserver)
 - [registry.source](#registrysource)
@@ -293,6 +294,14 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
 | `audit.identity_events` | `WALLET_AUDIT_IDENTITY_EVENTS` | string list | IdentityEvents selects which enterprise-identity (OIDC gate) audit events are emitted, by short name: bound, verified, mismatch, gate_bypass. Default: none. Requires enabled. The subject is only ever emitted as a hash. Unknown names are rejected at startup. Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated) |
+
+## presentation
+
+Environment prefix: `WALLET_PRESENTATION`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
 
 ## Registry Server
 
