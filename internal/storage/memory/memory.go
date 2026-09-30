@@ -268,10 +268,6 @@ func deepCopyUser(user *domain.User) *domain.User {
 		displayName := *user.DisplayName
 		cp.DisplayName = &displayName
 	}
-	if user.PasswordHash != nil {
-		passwordHash := *user.PasswordHash
-		cp.PasswordHash = &passwordHash
-	}
 
 	if user.PrivateData != nil {
 		cp.PrivateData = append([]byte(nil), user.PrivateData...)

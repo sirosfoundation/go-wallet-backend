@@ -29,6 +29,10 @@ type OIDCHandlers struct {
 	cfg         *config.ASConfig
 	stateSecret []byte
 	logger      *zap.Logger
+	// httpClient carries the discovery and token-exchange requests to the
+	// tenant's IdP. nil falls back to a bare client (tests only): production
+	// passes the IdP-scoped, address-guarded client (#349).
+	httpClient *http.Client
 }
 
 // NewOIDCHandlers creates OIDC auth handlers.
@@ -42,6 +46,7 @@ func NewOIDCHandlers(
 	sessions SessionStore,
 	cfg *config.ASConfig,
 	stateSecret []byte,
+	httpClient *http.Client,
 	logger *zap.Logger,
 ) *OIDCHandlers {
 	return &OIDCHandlers{
@@ -50,6 +55,7 @@ func NewOIDCHandlers(
 		cfg:         cfg,
 		stateSecret: stateSecret,
 		logger:      logger,
+		httpClient:  httpClient,
 	}
 }
 
@@ -144,7 +150,7 @@ func (h *OIDCHandlers) Login(c *gin.Context) {
 
 	// Build authorization URL.
 	// Uses OIDC discovery to find the authorization endpoint.
-	disc, err := oidc.DiscoverProvider(c.Request.Context(), op.Issuer, nil)
+	disc, err := oidc.DiscoverProvider(c.Request.Context(), op.Issuer, h.httpClient)
 	if err != nil {
 		h.logger.Error("OIDC discovery failed", zap.Error(err), zap.String("issuer", op.Issuer))
 		c.JSON(http.StatusBadGateway, gin.H{"error": "OIDC provider unavailable"})
@@ -229,14 +235,14 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 	}
 
 	// Exchange code for tokens (token endpoint).
-	disc, err := oidc.DiscoverProvider(c.Request.Context(), op.Issuer, nil)
+	disc, err := oidc.DiscoverProvider(c.Request.Context(), op.Issuer, h.httpClient)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "OIDC provider unavailable"})
 		return
 	}
 
 	redirectURI := h.redirectURI()
-	tokenResp, err := exchangeCode(c.Request.Context(), disc.TokenEndpoint, code, op.ClientID, redirectURI, challenge.CodeVerifier)
+	tokenResp, err := exchangeCode(c.Request.Context(), h.httpClient, disc.TokenEndpoint, code, op.ClientID, redirectURI, challenge.CodeVerifier)
 	if err != nil {
 		h.logger.Error("OIDC token exchange failed", zap.Error(err))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "token exchange failed"})
@@ -248,7 +254,7 @@ func (h *OIDCHandlers) Callback(c *gin.Context) {
 		Issuer:   op.Issuer,
 		Audience: op.ClientID,
 		JWKSURI:  op.JWKSURI,
-	}, nil, h.logger)
+	}, h.httpClient, h.logger)
 
 	result, err := validator.Validate(c.Request.Context(), tokenResp.IDToken)
 	if err != nil {

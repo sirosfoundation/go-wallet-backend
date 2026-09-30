@@ -658,14 +658,26 @@ const (
 // For DID schemes, the frontend should first call /v1/resolve to get the DID document.
 type TrustEvaluationRequest struct {
 	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer
-	// URL for issuers), exactly as presented on the wire - including OpenID4VP
-	// 1.0's decentralized_identifier: prefix, when the verifier used it. This
-	// is what /v1/evaluate sees, matching the identifier the server-side PDP
-	// path evaluates too (evaluateVerifierTrustViaPDP sends authReq.ClientID
-	// unchanged) - per docs/client-id-strategy.md, the prefix is stripped for
-	// resolution only, never for evaluation, so a no-PDP and a PDP-backed
-	// flow must evaluate the identical subject. See ResolutionSubjectID for
-	// the (different) identifier /v1/resolve needs.
+	// URL for issuers). This is what /v1/evaluate sees, and it always
+	// matches the identifier the server-side PDP path evaluates too
+	// (evaluateVerifierTrustViaPDP and evaluateVerifierTrustViaFrontend both
+	// build it via oid4vp.go's pdpSubjectID) - a no-PDP and a PDP-backed
+	// flow must evaluate the identical subject.
+	//
+	// For most schemes this is exactly the wire-form client_id, including
+	// OpenID4VP 1.0's decentralized_identifier: prefix when the verifier
+	// used it (per docs/client-id-strategy.md, that prefix is stripped for
+	// resolution only, never for evaluation - see ResolutionSubjectID below
+	// for the different identifier /v1/resolve needs instead).
+	//
+	// For x509_san_dns/x509_san_uri/x509_hash specifically, SubjectID always
+	// carries that scheme's own "<scheme>:" prefix too, even when the wire
+	// form presented client_id_scheme as a separate field with a bare
+	// client_id - go-trust's ParseClientIDScheme/VerifyLeafBinding (its
+	// certificate-binding check) only fire when the prefix is present on
+	// Subject.ID itself, regardless of which wire form the request arrived
+	// in (see pdpSubjectID's doc comment in oid4vp.go for the full
+	// go-trust-side contract this was fixed to satisfy, and #404).
 	SubjectID string `json:"subject_id"`
 	// SubjectType is "credential_verifier" or "credential_issuer"
 	SubjectType string `json:"subject_type"`
@@ -748,7 +760,15 @@ func (km *TrustKeyMaterial) Validate() error {
 type TrustResultPayload struct {
 	// Trusted indicates whether the subject is trusted
 	Trusted bool `json:"trusted"`
-	// Name is the display name from trust evaluation
+	// Name is the display name from trust evaluation. Deprecated for
+	// verifier trust (#406): OID4VPHandler.evaluateVerifierTrustViaFrontend
+	// no longer overrides VerifierInfo.Name from this field - the wallet
+	// backend has no way to distinguish a frontend's own independently-
+	// verified display name from one it merely echoed back from the
+	// verifier's own unauthenticated client_metadata.client_name, so the
+	// displayed name is always the identifier the trust evaluation was
+	// actually about, consistent with the PDP-backed path (#398). Retained
+	// on the wire for backward compatibility and non-verifier callers.
 	Name string `json:"name,omitempty"`
 	// Logo is the logo URL from trust evaluation
 	Logo string `json:"logo,omitempty"`
