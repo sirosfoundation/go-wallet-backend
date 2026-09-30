@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -172,4 +173,26 @@ func TestRemoteASIssuerRefusesEmpty(t *testing.T) {
 	iss, err = remoteASIssuer(c, "x")
 	require.NoError(t, err)
 	assert.Equal(t, "as-iss", iss)
+}
+
+func TestNewStandaloneEngineTokenValidator_WarnsNoRevocation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{})
+	}))
+	defer srv.Close()
+	c := &config.Config{JWT: config.JWTConfig{Secret: "0123456789abcdef0123456789abcdef", Issuer: "legacy"}}
+	c.AS.Enabled = true
+	c.AS.Issuer = "as-issuer"
+	c.AS.ExternalURL = srv.URL
+	c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
+
+	core, logs := observer.New(zap.WarnLevel)
+	v, err := NewStandaloneEngineTokenValidator(c, zap.New(core))
+	require.NoError(t, err)
+	require.NotNil(t, v)
+	defer func() { _ = v.Close() }()
+
+	warns := logs.FilterMessageSnippet("no token revocation source").All()
+	require.Len(t, warns, 1)
+	assert.Equal(t, zap.WarnLevel, warns[0].Level)
 }

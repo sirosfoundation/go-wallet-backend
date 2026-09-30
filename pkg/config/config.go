@@ -110,6 +110,13 @@ type ASConfig struct {
 	// or standalone engine, to locate the AS JWKS. Must be an absolute http(s)
 	// URL without a query or fragment (an empty "?" or "#" is rejected too); a
 	// path prefix is allowed.
+	//
+	// Standalone engine (--mode=engine, no backend) limitation: setting this
+	// lets the engine accept AS-signed session tokens, but a standalone engine
+	// has no revocation source. After a logout or user revocation a token
+	// therefore stays valid at the standalone engine until it expires. Mitigate
+	// with short access token TTLs, or co-host the engine with the backend,
+	// which shares the token blacklist.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 
 	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.

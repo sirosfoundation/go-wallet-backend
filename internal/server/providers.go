@@ -534,6 +534,11 @@ func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.Lega
 // mechanism), otherwise this returns an error so startup fails instead of
 // silently rejecting every connection. Returns (nil, nil) when no validator is
 // needed.
+//
+// Revocation limitation: a standalone engine has no revocation source (no
+// backend token blacklist is wired in, and a shared one is tracked in #407 and
+// #415), so a token stays valid here until it expires even after logout or
+// user revocation. A warning is logged when session tokens are enabled.
 func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
 	if err := requireLegacyIssuer(cfg, "standalone engine"); err != nil {
 		return nil, err
@@ -559,6 +564,8 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 		Legacy: legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
 	})
 	v.Start(context.Background())
+	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
+		zap.String("jwks_source", "as.external_url"))
 	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
 	return &StandaloneValidator{Validator: v, relay: relay}, nil
 }

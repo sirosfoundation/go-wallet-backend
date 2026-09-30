@@ -375,6 +375,7 @@ az container create \
 - [ ] Configure CORS origins
 - [ ] Set `server.trusted_proxies` to your load balancer's addresses (or `["none"]` without one). Unset, every peer is trusted for `X-Forwarded-For`, so a direct caller can pick its own client IP and dodge the per-IP OIDC gate rate limit
 - [ ] Set up monitoring and logging
+- [ ] If running a standalone engine (`--mode=engine`, no backend) with `as.external_url`, read [Token revocation limits](#token-revocation-limits)
 - [ ] Configure health checks
 - [ ] Set resource limits
 - [ ] Enable autoscaling
@@ -488,6 +489,17 @@ cp wallet.db.backup wallet.db
 - Add more instances
 - Use load balancer
 - Required for > 1000 users
+
+### Token revocation limits
+
+Token revocation (logout, revoked user) is enforced through an in-process token blacklist, so it only takes effect in the process that holds it (single-replica limitation, tracked in issues #407 and #415). A shared revocation source is not implemented.
+
+**Standalone engine (`--mode=engine`, no backend provider):** when `as.external_url` is set, the engine accepts AS-signed ES256 session tokens, but it has no revocation checker and no token blacklist is wired into it. Consequence: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**; a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
+
+Mitigations:
+
+- Use short access token TTLs, so the exposure window is bounded by the TTL.
+- Co-host the engine with the backend (the default all-in-one mode), which shares the token blacklist.
 
 ### Database Scaling
 
