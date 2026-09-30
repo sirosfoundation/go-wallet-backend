@@ -455,6 +455,43 @@ func TestContentTypeDispatch(t *testing.T) {
 	}
 }
 
+func TestContentTypeMalformedVsMissing(t *testing.T) {
+	ctx := context.Background()
+	key := newKey(t)
+	run := func(t *testing.T, header []string) error {
+		var uri string
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A nil slice suppresses net/http's content sniffing, so the
+			// response truly carries no Content-Type.
+			w.Header()["Content-Type"] = header
+			_, _ = w.Write([]byte(makeToken(t, tokenOpts{sub: uri, key: key})))
+		}))
+		t.Cleanup(srv.Close)
+		uri = srv.URL + "/statuslists/1"
+		return NewChecker(srv.Client(), false, trustAll).Check(ctx, &Reference{Idx: 1, URI: uri})
+	}
+	// Absent header: the intentional JWT path.
+	if err := run(t, nil); err != nil {
+		t.Fatalf("missing Content-Type: %v", err)
+	}
+	// Malformed non-empty values are unverifiable, never a verdict. The
+	// second one parses to the JWT media type alongside an error.
+	for _, ct := range []string{
+		"/",
+		"application/statuslist+jwt; charset",
+		"application/statuslist+jwt; =x",
+		"application/statuslist+jwt;;",
+		"not a media type",
+	} {
+		t.Run(ct, func(t *testing.T) {
+			err := run(t, []string{ct})
+			if err == nil || errors.Is(err, ErrRevoked) || !strings.Contains(err.Error(), "malformed Content-Type") {
+				t.Fatalf("want malformed Content-Type error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestCWTHelpers(t *testing.T) {
 	if _, ok := toInt64(uint64(1) << 63); ok {
 		t.Error("huge uint64 must not narrow")

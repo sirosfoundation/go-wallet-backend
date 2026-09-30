@@ -260,7 +260,17 @@ func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error)
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("fetch status list: http %d", resp.StatusCode)
 	}
-	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	// A missing Content-Type is distinct from a malformed one: only the
+	// former takes the intentional "read as JWT" path. A non-empty value that
+	// does not parse (including a valid type with an invalid parameter, for
+	// which ParseMediaType returns both a type and an error) is unverifiable.
+	var mt string
+	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
+		var err error
+		if mt, _, err = mime.ParseMediaType(ct); err != nil {
+			return nil, "", fmt.Errorf("status list has malformed Content-Type %q: %w", ct, err)
+		}
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read status list: %w", err)
