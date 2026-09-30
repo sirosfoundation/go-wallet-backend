@@ -17,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
@@ -426,6 +427,14 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Step 2.6: a claimed passkey link must be the caller's own passkey.
 	if err := s.checkCredentialOwnership(ctx, tenantID, userID, req.CredentialID); err != nil {
 		s.emitAuditFailure("credential_not_owned", err)
+		return "", err
+	}
+
+	// Step 2.7: judge the request's bearer token against the user's cut-off at
+	// the point of writing. The middleware admitted the token once, before the
+	// lifecycle checks above; a user-wide cut-off (revoking one instance while
+	// another stays live) landing since then must not still yield a WIA.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
 

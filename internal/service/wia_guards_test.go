@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 func TestWIAService_WIALifetime(t *testing.T) {
@@ -211,4 +212,26 @@ func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_RunsTheCascade(t *testing
 		assert.ErrorIs(t, err, ErrWIAInstanceDeactivated)
 		assert.ErrorIs(t, err, ErrErasureIncomplete)
 	})
+}
+
+// A token admitted before a user-wide cut-off (revoking one instance while
+// another stays live) must not still obtain a WIA: GenerateWIA judges it at the
+// point of signing.
+func TestWIAService_GenerateWIA_RefusesATokenTheCutoffPredates(t *testing.T) {
+	svc, store := newTestWIAServiceWithUsers(t)
+	base := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(base, &domain.User{UUID: uid}))
+	cutoff := time.Now().Truncate(time.Second)
+	require.NoError(t, store.Users().InvalidateAuthBefore(base, uid, cutoff))
+
+	attest := func(ctx context.Context) error {
+		challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		require.NoError(t, err)
+		pop, _ := createTestPop(t, challenge)
+		_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+		return err
+	}
+	assert.ErrorIs(t, attest(tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))), tokengate.ErrRevoked)
+	assert.NoError(t, attest(tokengate.WithSubject(base, uid.String(), cutoff.Add(time.Minute))))
 }

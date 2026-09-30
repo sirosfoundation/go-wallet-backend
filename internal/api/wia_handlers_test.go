@@ -20,6 +20,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -229,6 +230,7 @@ func TestWIAFailure_MapsEveryServiceRefusal(t *testing.T) {
 		{service.ErrWIAChallengeExpired, http.StatusBadRequest, "CHALLENGE_INVALID"},
 		{service.ErrWIACredentialNotOwned, http.StatusForbidden, "CREDENTIAL_NOT_OWNED"},
 		{service.ErrWIAPopInvalid, http.StatusBadRequest, "POP_INVALID"},
+		{tokengate.ErrRevoked, http.StatusUnauthorized, "TOKEN_REVOKED"},
 		{service.ErrWIAUnknownUser, http.StatusForbidden, "UNKNOWN_USER"},
 		{service.ErrWIAInstanceDeactivated, http.StatusForbidden, "INSTANCE_DEACTIVATED"},
 		{service.ErrWIAInstanceNotOwned, http.StatusForbidden, "INSTANCE_NOT_OWNED"},

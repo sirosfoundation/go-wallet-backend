@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // WIAChallenge handles POST /wallet-provider/wia/challenge
@@ -123,6 +124,8 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 // recognise is a 500 WIA_GENERATION_FAILED.
 func wiaFailure(err error) (status int, code, message string) {
 	switch {
+	case errors.Is(err, tokengate.ErrRevoked):
+		return http.StatusUnauthorized, "TOKEN_REVOKED", "Token has been revoked"
 	case errors.Is(err, service.ErrWIAChallengeExpired):
 		return http.StatusBadRequest, "CHALLENGE_INVALID", "Challenge is invalid"
 	case errors.Is(err, service.ErrWIACredentialNotOwned):
