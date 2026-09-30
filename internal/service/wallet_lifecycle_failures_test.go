@@ -103,6 +103,10 @@ func (s *failInstances) UpdateStatus(ctx context.Context, id string, tenantID do
 	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
+func (s *failInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return s.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 type failUsers struct {
 	storage.UserStore
 	f *failStore
@@ -513,6 +517,10 @@ func (a *attestingInstances) UpdateStatus(ctx context.Context, id string, tenant
 	return nil
 }
 
+func (a *attestingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return a.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 type racingInstanceStore struct {
 	storage.Store
 	instances storage.WalletInstanceStore
@@ -606,6 +614,10 @@ func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, 
 	})
 }
 
+func (a *alwaysAttestingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return a.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 // A client attesting fast enough to outrun the bounded sweep must not get a
 // success back for a wallet that still has an active instance: the request is
 // reported as incomplete so repeating it resumes the sweep, and the wallet
@@ -678,6 +690,10 @@ func (s *failInstances) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	return s.WalletInstanceStore.Delete(ctx, id)
+}
+
+func (s *failInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+	return s.Delete(ctx, id)
 }
 
 func (s *failInstances) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {

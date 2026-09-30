@@ -65,6 +65,10 @@ func (s *brokenInstances) UpdateStatus(ctx context.Context, id string, tenantID 
 	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
+func (s *brokenInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return s.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 func lifecycleTestConfig() *config.Config {
 	return &config.Config{
 		Server: config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080", RPName: "Test Wallet"},

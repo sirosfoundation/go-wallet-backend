@@ -481,3 +481,52 @@ func TestWalletInstanceStore_UpdateStatus_WrongTenantIsNotFound(t *testing.T) {
 		t.Fatalf("record was touched by a revocation for another tenant: %v %v", got, err)
 	}
 }
+
+// The id is a global key, so a delete or revocation issued for one user's
+// record must not touch a replacement that took the same id under another
+// tenant or user.
+func TestWalletInstanceStore_OwnerCheckedWrites(t *testing.T) {
+	ctx := context.Background()
+	wis := NewStore().WalletInstances()
+	owner := domain.UserIDFromString("owner")
+	other := domain.UserIDFromString("other")
+
+	seed := func(id string, tenant domain.TenantID, u *domain.UserID) {
+		t.Helper()
+		if err := wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: tenant, UserID: u, Status: domain.InstanceStatusActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seed("i1", "acme", &owner)
+	if err := wis.DeleteForUser(ctx, "i1", "acme", other); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("other user's delete = %v, want ErrNotFound", err)
+	}
+	if err := wis.DeleteForUser(ctx, "i1", "elsewhere", owner); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("other tenant's delete = %v, want ErrNotFound", err)
+	}
+	if _, err := wis.GetByID(ctx, "i1"); err != nil {
+		t.Fatalf("a mismatched delete must leave the record: %v", err)
+	}
+	if err := wis.UpdateStatusForUser(ctx, "i1", "acme", other, domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("other user's revoke = %v, want ErrNotFound", err)
+	}
+	if got, _ := wis.GetByID(ctx, "i1"); got.Status != domain.InstanceStatusActive {
+		t.Fatalf("a mismatched revoke must leave the record active, got %q", got.Status)
+	}
+	if err := wis.UpdateStatusForUser(ctx, "i1", "acme", owner, domain.InstanceStatusRevoked, "x"); err != nil {
+		t.Fatalf("owner revoke: %v", err)
+	}
+	if err := wis.DeleteForUser(ctx, "i1", "acme", owner); err != nil {
+		t.Fatalf("owner delete: %v", err)
+	}
+	if err := wis.DeleteForUser(ctx, "i1", "acme", owner); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("second delete = %v, want ErrNotFound", err)
+	}
+
+	// A record with no user matches no owner.
+	seed("i2", "acme", nil)
+	if err := wis.DeleteForUser(ctx, "i2", "acme", owner); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unowned delete = %v, want ErrNotFound", err)
+	}
+}

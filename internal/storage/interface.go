@@ -415,11 +415,31 @@ type WalletInstanceStore interface {
 	// storage.ErrNotFound, the same as one that does not exist.
 	UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error
 
+	// UpdateStatusForUser is UpdateStatus with the owner in the write's
+	// filter as well: the record is revoked only while it is still in
+	// tenantID AND bound to userID. A sweep that works from a per-user
+	// listing (revoke-all) must use this rather than UpdateStatus, because
+	// the id is a global key and a record that was deleted and attested
+	// again for another user of the same tenant between the listing and the
+	// write would otherwise be revoked under the first user's request. A
+	// record that is not that user's answers storage.ErrNotFound.
+	UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error
+
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteForUser hard-deletes a wallet instance only while it is still in
+	// tenantID and bound to userID, in one atomic ID+tenant+owner predicate.
+	// Account deletion works from a listing, and the id is a global key (the
+	// instance-key thumbprint): if the listed record was removed and the same
+	// thumbprint attested again under another tenant or user before the
+	// delete, a delete by id alone would remove that replacement. A record
+	// that does not match answers storage.ErrNotFound, the same as one that
+	// does not exist; callers treat it as an incomplete cleanup.
+	DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error
 
 	// DeleteIfRemovable hard-deletes a wallet instance only while it is
 	// still removable: live, or bound to no user. It returns

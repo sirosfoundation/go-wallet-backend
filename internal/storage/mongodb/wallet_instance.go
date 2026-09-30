@@ -176,12 +176,27 @@ func (s *WalletInstanceStore) GetAllByUser(ctx context.Context, userID domain.Us
 }
 
 func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
+	return s.updateStatus(ctx, bson.M{"_id": id, "tenant_id": tenantID}, status, reason)
+}
+
+// UpdateStatusForUser is UpdateStatus with the owner in the filter too. See
+// the interface for why a per-user sweep needs it.
+func (s *WalletInstanceStore) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error {
+	return s.updateStatus(ctx, bson.M{"_id": id, "tenant_id": tenantID, "user_id": userID}, status, reason)
+}
+
+// updateStatus applies the revocation to the record matching match, which
+// always carries _id and tenant_id (and user_id for the owner-checked form).
+func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, status domain.InstanceStatus, reason string) error {
 	now := time.Now().UTC()
 
 	// Use a conditional filter to enforce the state transition atomically.
 	// There is one legal transition, active → revoked, and revocation is
 	// terminal.
-	filter := bson.M{"_id": id, "tenant_id": tenantID}
+	filter := bson.M{}
+	for k, v := range match {
+		filter[k] = v
+	}
 	switch status {
 	case domain.InstanceStatusRevoked:
 		// Anything not already revoked may be revoked, which is what makes a
@@ -214,7 +229,7 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, tenan
 	}
 	if res.MatchedCount == 0 {
 		// Distinguish "not found" from "invalid transition" by checking existence.
-		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+		count, cerr := s.collection.CountDocuments(ctx, match)
 		if cerr != nil || count == 0 {
 			return storage.ErrNotFound
 		}
@@ -272,6 +287,19 @@ func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, 
 
 func (s *WalletInstanceStore) Delete(ctx context.Context, id string) error {
 	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// DeleteForUser deletes only while the record is still in tenantID and bound
+// to userID, in one filtered DeleteOne. See the interface for why.
+func (s *WalletInstanceStore) DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error {
+	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": tenantID, "user_id": userID})
 	if err != nil {
 		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
 	}

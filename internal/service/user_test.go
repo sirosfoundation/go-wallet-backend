@@ -1009,6 +1009,10 @@ func (f failInstanceDeletes) Delete(context.Context, string) error {
 	return errors.New("storage is down")
 }
 
+func (f failInstanceDeletes) DeleteForUser(context.Context, string, domain.TenantID, domain.UserID) error {
+	return errors.New("storage is down")
+}
+
 // An account deletion that cannot remove a wallet instance must not report
 // success and must not delete the user record. An instance that outlives its
 // account is permanent: records are keyed by instance-key thumbprint and the
@@ -1110,6 +1114,10 @@ func (l *lateInstances) GetAllByUser(_ context.Context, userID domain.UserID) ([
 
 func (l *lateInstances) Delete(context.Context, string) error {
 	return errors.New("storage is down")
+}
+
+func (l *lateInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+	return l.Delete(ctx, id)
 }
 
 // The first pass can come back empty and the final re-list can then discover

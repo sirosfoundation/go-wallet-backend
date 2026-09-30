@@ -36,6 +36,10 @@ func (s *flakyInstances) Delete(ctx context.Context, id string) error {
 	return s.WalletInstanceStore.Delete(ctx, id)
 }
 
+func (s *flakyInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+	return s.Delete(ctx, id)
+}
+
 type countingRevoker struct{ calls int }
 
 func (r *countingRevoker) RevokeUser(context.Context, string) error { r.calls++; return nil }

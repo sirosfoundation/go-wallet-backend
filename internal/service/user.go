@@ -656,7 +656,16 @@ func (s *UserService) deleteWalletInstances(ctx context.Context, userID domain.U
 		return errs
 	}
 	for _, inst := range instances {
-		if err := s.store.WalletInstances().Delete(ctx, inst.ID); err != nil {
+		// Keyed by id, tenant and owner, not by id alone: the id is a global
+		// key, and if an admin cleanup removed this record after the listing
+		// and the same thumbprint was attested again under another tenant or
+		// user, a delete by id would remove that replacement. A mismatch
+		// leaves the record alone and counts as incomplete; the repeat (or
+		// the second pass) works from a fresh listing.
+		if err := s.store.WalletInstances().DeleteForUser(ctx, inst.ID, inst.TenantID, userID); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				err = fmt.Errorf("record is gone or no longer this user's in tenant %s: %w", inst.TenantID, err)
+			}
 			errs = append(errs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
 		}
 	}

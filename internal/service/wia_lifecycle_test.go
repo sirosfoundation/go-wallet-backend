@@ -227,6 +227,10 @@ func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, 
 	return r.WalletInstanceStore.UpdateStatus(ctx, id, domain.DefaultTenantID, status, reason)
 }
 
+func (r *revokeAllRacingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return r.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 // A revoke-all that wins the race and revokes the just-inserted instance
 // before the re-check gets to it must still surface as "wallet deactivated",
 // not as a generic WIA failure from the refused revoked -> revoked update.

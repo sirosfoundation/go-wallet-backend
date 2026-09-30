@@ -321,7 +321,7 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 					return 0, err
 				}
 			}
-			if err := s.store.WalletInstances().UpdateStatus(ctx, inst.ID, tenantID, domain.InstanceStatusRevoked, reason); err != nil {
+			if err := s.store.WalletInstances().UpdateStatusForUser(ctx, inst.ID, tenantID, userID, domain.InstanceStatusRevoked, reason); err != nil {
 				err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
 				if last != nil {
 					// Revocations already persisted must not keep their

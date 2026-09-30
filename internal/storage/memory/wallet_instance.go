@@ -139,9 +139,24 @@ func (s *WalletInstanceStore) GetAllByUser(_ context.Context, userID domain.User
 func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.updateStatusLocked(id, tenantID, nil, status, reason)
+}
 
+func (s *WalletInstanceStore) UpdateStatusForUser(_ context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateStatusLocked(id, tenantID, &userID, status, reason)
+}
+
+// updateStatusLocked is the shared body of UpdateStatus and
+// UpdateStatusForUser; owner, when non-nil, is part of the match. The caller
+// holds s.mu.
+func (s *WalletInstanceStore) updateStatusLocked(id string, tenantID domain.TenantID, owner *domain.UserID, status domain.InstanceStatus, reason string) error {
 	instance, ok := s.data[id]
 	if !ok || instance.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	if owner != nil && (instance.UserID == nil || *instance.UserID != *owner) {
 		return storage.ErrNotFound
 	}
 
@@ -211,6 +226,20 @@ func (s *WalletInstanceStore) Delete(_ context.Context, id string) error {
 	defer s.mu.Unlock()
 
 	if _, ok := s.data[id]; !ok {
+		return storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return nil
+}
+
+// DeleteForUser deletes only while the record is still in tenantID and bound
+// to userID. See the interface for why the owner travels with the delete.
+func (s *WalletInstanceStore) DeleteForUser(_ context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inst, ok := s.data[id]
+	if !ok || inst.TenantID != tenantID || inst.UserID == nil || *inst.UserID != userID {
 		return storage.ErrNotFound
 	}
 	delete(s.data, id)

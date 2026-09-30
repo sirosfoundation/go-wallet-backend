@@ -127,3 +127,28 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	err = wis.DeleteIfRemovable(ctx, "del-other", "acme")
 	require.True(t, errors.Is(err, storage.ErrNotFound), "got %v", err)
 }
+
+func TestWalletInstanceStore_OwnerCheckedWrites(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	owner := domain.UserIDFromString("owner-checked")
+	other := domain.UserIDFromString("other-checked")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "owned-1", TenantID: "acme", UserID: &owner, Status: domain.InstanceStatusActive,
+	}))
+	require.ErrorIs(t, wis.DeleteForUser(ctx, "owned-1", "acme", other), storage.ErrNotFound)
+	require.ErrorIs(t, wis.DeleteForUser(ctx, "owned-1", "elsewhere", owner), storage.ErrNotFound)
+	_, err := wis.GetByID(ctx, "owned-1")
+	require.NoError(t, err, "a mismatched delete must leave the record")
+
+	require.ErrorIs(t, wis.UpdateStatusForUser(ctx, "owned-1", "acme", other, domain.InstanceStatusRevoked, "x"), storage.ErrNotFound)
+	got, err := wis.GetByID(ctx, "owned-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.InstanceStatusActive, got.Status)
+
+	require.NoError(t, wis.UpdateStatusForUser(ctx, "owned-1", "acme", owner, domain.InstanceStatusRevoked, "x"))
+	require.NoError(t, wis.DeleteForUser(ctx, "owned-1", "acme", owner))
+	require.ErrorIs(t, wis.DeleteForUser(ctx, "owned-1", "acme", owner), storage.ErrNotFound)
+}

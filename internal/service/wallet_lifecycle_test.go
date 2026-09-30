@@ -46,6 +46,10 @@ func (f *failAfterInstances) UpdateStatus(ctx context.Context, id string, tenant
 	return f.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
+func (f *failAfterInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return f.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 // storeWithInstances swaps the wallet-instance store of a storage.Store.
 type storeWithInstances struct {
 	storage.Store

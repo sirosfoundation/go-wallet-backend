@@ -119,6 +119,10 @@ func (s *hookInstances) UpdateStatus(ctx context.Context, id string, tenantID do
 	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
+func (s *hookInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
+	return s.UpdateStatus(ctx, id, tenantID, st, reason)
+}
+
 // The narrow window, made deterministic: a login completes entirely between the
 // revocation's pre-write cut-off and its status write. It sees a live instance,
 // mints a token whose iat is past that first cut-off and returns it. The
