@@ -678,6 +678,15 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		return "", err
 	}
 
+	// Final cut-off check at the mutation boundary. The check in GenerateWIA
+	// ran before the optional native attestation and the signature; a
+	// user-wide revocation (of another instance, which recheckLifecycleAfterWrite
+	// cannot see) landing since then must neither record this instance nor let
+	// the already-admitted bearer walk away with a WIA. Fail closed.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
+	}
+
 	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
@@ -720,6 +729,14 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, firstAttestation); err != nil {
 			return "", err
 		}
+	}
+
+	// Last look before the WIA is released: a cut-off that landed during the
+	// instance write must still stop the token from leaving. The record just
+	// written stays (the revocation cascade owns cleaning it up); only the
+	// credential is withheld.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
 	}
 
 	// Emit audit event

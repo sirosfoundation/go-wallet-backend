@@ -10,6 +10,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
@@ -234,4 +236,65 @@ func TestWIAService_GenerateWIA_RefusesATokenTheCutoffPredates(t *testing.T) {
 	}
 	assert.ErrorIs(t, attest(tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))), tokengate.ErrRevoked)
 	assert.NoError(t, attest(tokengate.WithSubject(base, uid.String(), cutoff.Add(time.Minute))))
+}
+
+// cutoffAdvancingUsers stands in for a user-wide revocation that lands while a
+// request is in flight: GetAuthCutoff reports no cut-off for the first `after`
+// reads and the given cut-off from then on.
+type cutoffAdvancingUsers struct {
+	storage.UserStore
+	after  int
+	cutoff time.Time
+	reads  int
+}
+
+func (u *cutoffAdvancingUsers) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	u.reads++
+	if u.reads <= u.after {
+		return time.Time{}, nil
+	}
+	return u.cutoff, nil
+}
+
+// A revocation landing after GenerateWIA's first cut-off check (before or during
+// signing and the instance write) must still refuse the request, and when it
+// lands before the write it must not record the instance either.
+func TestWIAService_GenerateWIA_RevocationLandingBeforeSigningIsRefused(t *testing.T) {
+	// GenerateWIA's own check is read 1; the signing-boundary check is read 2;
+	// the release check is read 3.
+	for _, tc := range []struct {
+		name         string
+		after        int
+		wantRecorded bool
+	}{
+		{"between the first check and signing", 1, false},
+		{"during the instance write", 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := context.Background()
+			store := memory.NewStore()
+			uid := domain.NewUserID()
+			require.NoError(t, store.Users().Create(base, &domain.User{UUID: uid}))
+			cutoff := time.Now().Truncate(time.Second)
+			users := &cutoffAdvancingUsers{UserStore: store.Users(), after: tc.after, cutoff: cutoff}
+			svc := newTestWIAServiceUsingStores(t, store.WalletInstances(), users)
+
+			challenge, _, err := svc.CreateChallenge(base, domain.DefaultTenantID)
+			require.NoError(t, err)
+			pop, _ := createTestPop(t, challenge)
+			ctx := tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))
+
+			token, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+			assert.ErrorIs(t, err, tokengate.ErrRevoked)
+			assert.Empty(t, token, "no WIA may be released")
+
+			recorded, gerr := store.WalletInstances().GetByUser(base, domain.DefaultTenantID, uid)
+			require.NoError(t, gerr)
+			if tc.wantRecorded {
+				assert.Len(t, recorded, 1)
+			} else {
+				assert.Empty(t, recorded, "a refused request must not record the instance")
+			}
+		})
+	}
 }
