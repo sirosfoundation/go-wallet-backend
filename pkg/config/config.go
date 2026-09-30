@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -1890,14 +1891,23 @@ func (c *Config) loadSecretsFromFiles() error {
 
 // readSecretFile reads a secret value from a file, trimming whitespace.
 // Returns an error if the file cannot be read or is empty.
+//
+// The returned errors deliberately do not name the file: they end up in
+// startup logs, and the configuration key the caller wraps them with already
+// says which secret is meant. (os.ReadFile errors carry the path, so the
+// underlying cause is unwrapped to the bare OS error.)
 func readSecretFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("failed to read secret file: %w", err)
 	}
 	secret := strings.TrimSpace(string(data))
 	if secret == "" {
-		return "", fmt.Errorf("file %s is empty", path)
+		return "", errors.New("secret file is empty")
 	}
 	return secret, nil
 }
