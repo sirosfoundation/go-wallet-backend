@@ -57,6 +57,8 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		c.AS.Legacy.Enabled = legacy
 		c.AS.Issuer = "as-issuer"
 		c.AS.ExternalURL = srv.URL + "/"
+		// The test AS is plain http on loopback.
+		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
 		return c
 	}
 
@@ -79,6 +81,34 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		defer func() { _ = v.Close() }()
 		_, err = v.Validate(context.Background(), hm)
 		assert.NoError(t, err)
+	})
+
+	t.Run("plain-http external_url refused unless allow_http", func(t *testing.T) {
+		c := base(false)
+		c.HTTPClient = config.HTTPClientConfig{}
+		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
+		assert.ErrorContains(t, err, "plain http")
+		assert.Nil(t, v)
+		_, err = newRemoteJWKSRelay(c)
+		assert.Error(t, err)
+	})
+
+	t.Run("guarded client blocks a loopback JWKS host without allow_private_ips", func(t *testing.T) {
+		c := base(false)
+		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true} // plaintext ok, private IPs not
+		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
+		require.NoError(t, err)
+		defer func() { _ = v.Close() }()
+		time.Sleep(200 * time.Millisecond)
+		_, err = v.Validate(context.Background(), es)
+		assert.Error(t, err, "keys must not be fetched from a private address the guard forbids")
+	})
+
+	t.Run("invalid external_url", func(t *testing.T) {
+		c := base(false)
+		c.AS.ExternalURL = "ftp://x"
+		_, err := asJWKSURL(c)
+		assert.Error(t, err)
 	})
 
 	t.Run("legacy off without external_url: refuse to start", func(t *testing.T) {

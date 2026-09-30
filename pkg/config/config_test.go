@@ -2804,3 +2804,29 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 		t.Fatal("empty config must yield no trusted hosts")
 	}
 }
+
+// An https JWKS endpoint that redirects to plain http must be refused at the
+// redirect hop: the guard sits on the transport every hop passes through.
+func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
+	var hops []string
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hops = append(hops, r.URL.String())
+		if r.URL.Scheme == "https" {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"http://evil.example/jwks.json"}},
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		}
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+	})}
+	client := &http.Client{Transport: guard}
+	_, err := client.Get("https://as.example/auth/.well-known/jwks.json")
+	if err == nil {
+		t.Fatal("expected the http redirect hop to be refused")
+	}
+	if len(hops) != 1 {
+		t.Errorf("the plaintext hop must never reach the base transport, hops=%v", hops)
+	}
+}

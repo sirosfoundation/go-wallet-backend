@@ -297,6 +297,10 @@ The only switch is configuration. `as.legacy.enabled` defaults to `true`, so exi
 
 A standalone engine (`--mode=engine`, no backend provider) builds its own JWKS-backed validator from `as.external_url` so ES256 session tokens work and legacy can be switched off; with `as.legacy.enabled=false` and no `as.external_url` it refuses to start instead of rejecting every connection.
 
+### JWKS fetching is guarded
+
+go-tokenauth fetches the AS JWKS with `http.DefaultClient` (no client option in v0.4.0 or v0.5.0), which has no scheme policy and follows HTTPS-to-HTTP redirects. The backend therefore never lets it reach the network: a co-hosted AS serves its own keys to the validator in-process (loopback relay, no fetch), and processes that read a remote AS (isolated wallet-provider, standalone engine) fetch `<as.external_url>/auth/.well-known/jwks.json` with the guarded `http_client` (plaintext, private-address and redirect-hop checks) and relay it to the validator over a loopback-only listener. A plain-`http` `as.external_url` is refused at startup unless `http_client.allow_http` (or `allow_private_ips`) is set; a remote AS on a private address needs `allow_private_ips`.
+
 ### Audience semantics
 
 An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only. Legacy HMAC tokens carry the RP ID as `aud` and are never rejected by an audience list while legacy is enabled (signature, expiry and issuer are still checked). `RequireAudience` and the engine's `wallet-registry`/`wallet-backend` check follow the same rule.

@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -471,10 +470,13 @@ func (p *EngineProvider) Manager() *wsengine.Manager {
 
 // StandaloneValidator is a token validator owned by a standalone engine
 // process; Close stops its JWKS refresh.
-type StandaloneValidator struct{ *tokenvalidator.Validator }
+type StandaloneValidator struct {
+	*tokenvalidator.Validator
+	relay *jwksRelay
+}
 
-// Close stops the background JWKS refresh.
-func (v StandaloneValidator) Close() error { v.Stop(); return nil }
+// Close stops the background JWKS refresh and the loopback relay.
+func (v StandaloneValidator) Close() error { v.Stop(); return v.relay.Close() }
 
 // NewStandaloneEngineTokenValidator builds the token validator for an engine
 // running without a backend provider (--mode=engine), where none is otherwise
@@ -496,8 +498,12 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if issuer == "" {
 		issuer = cfg.JWT.Issuer
 	}
+	relay, err := newRemoteJWKSRelay(cfg)
+	if err != nil {
+		return nil, err
+	}
 	v := tokenvalidator.New(tokenvalidator.Config{
-		JWKSURL: strings.TrimRight(cfg.AS.ExternalURL, "/") + "/auth/.well-known/jwks.json",
+		JWKSURL: relay.url,
 		Issuer:  issuer,
 		// Audiences are checked by the engine itself, for new-style tokens only.
 		Legacy: tokenvalidator.LegacyConfig{
@@ -507,7 +513,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	})
 	v.Start(context.Background())
 	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
-	return &StandaloneValidator{v}, nil
+	return &StandaloneValidator{Validator: v, relay: relay}, nil
 }
 
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
@@ -585,6 +591,7 @@ type BackendProvider struct {
 	metadataResolver *issuermetadata.Resolver
 	asModule         *as.ASModule
 	tokenValidator   *tokenvalidator.Validator
+	jwksRelay        *jwksRelay
 	auditor          *audit.Emitter
 	logger           *zap.Logger
 }
@@ -649,6 +656,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	// Initialize AS module when enabled.
 	var asModule *as.ASModule
 	var tv *tokenvalidator.Validator
+	var relayHandle *jwksRelay
 	if cfg.AS.Enabled {
 		services := service.NewServices(store, cfg, logger)
 		services.TokenBlacklist = authProvider.services.TokenBlacklist
@@ -681,7 +689,17 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		if issuer == "" {
 			issuer = cfg.JWT.Issuer
 		}
-		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+		// The co-hosted AS's own keys are served to the validator in-process
+		// (no network fetch, nothing to intercept).
+		relay, relayErr := newLocalJWKSRelay(asModule.KeyManager.JWKS)
+		if relayErr != nil {
+			_ = asModule.Close()
+			_ = authProvider.Close()
+			_ = store.Close()
+			return nil, fmt.Errorf("failed to start JWKS relay: %w", relayErr)
+		}
+		relayHandle = relay
+		jwksURL := relay.url
 		tv = tokenvalidator.New(tokenvalidator.Config{
 			JWKSURL: jwksURL,
 			Issuer:  issuer,
@@ -732,6 +750,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		metadataResolver: metadataResolver,
 		asModule:         asModule,
 		tokenValidator:   tv,
+		jwksRelay:        relayHandle,
 		auditor:          newAuditEmitter(cfg, logger),
 		logger:           logger,
 	}, nil
@@ -807,6 +826,7 @@ func (p *BackendProvider) Close() error {
 	if p.asModule != nil {
 		_ = p.asModule.Close() // releases HSM sessions
 	}
+	_ = p.jwksRelay.Close()
 	if p.store != nil {
 		return p.store.Close()
 	}
@@ -1087,6 +1107,7 @@ type WalletProviderProvider struct {
 	services       *service.Services
 	wiaRateLimiter *middleware.AuthRateLimiter
 	tokenValidator *tokenvalidator.Validator
+	jwksRelay      *jwksRelay
 }
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
@@ -1114,14 +1135,21 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	// isolated wallet-provider deployments would reject valid AS-issued
 	// access tokens — only legacy HMAC JWTs would work.
 	var tv *tokenvalidator.Validator
+	var relayHandle *jwksRelay
 	if cfg.AS.Enabled {
 		issuer := cfg.AS.Issuer
 		if issuer == "" {
 			issuer = cfg.JWT.Issuer
 		}
-		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+		wpRelay, relayErr := newRemoteJWKSRelay(cfg)
+		if relayErr != nil {
+			services.Stop()
+			_ = store.Close()
+			return nil, relayErr
+		}
+		relayHandle = wpRelay
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL: jwksURL,
+			JWKSURL: wpRelay.url,
 			Issuer:  issuer,
 			// Audiences are NOT passed to the validator: it would also apply
 			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
@@ -1148,6 +1176,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		services:       services,
 		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		tokenValidator: tv,
+		jwksRelay:      relayHandle,
 	}, nil
 }
 
@@ -1207,6 +1236,7 @@ func (p *WalletProviderProvider) Close() error {
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
 	}
+	_ = p.jwksRelay.Close()
 	p.services.Stop()
 	return p.store.Close()
 }
