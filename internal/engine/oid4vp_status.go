@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -99,12 +100,52 @@ func (h *OID4VPHandler) checkPresentationStatus(ctx context.Context, vpToken str
 	if h.statusChecker == nil {
 		return nil
 	}
+	b := h.newStatusBudget()
 	for _, tok := range presentedTokens(vpToken) {
-		if err := h.checkTokenStatus(ctx, tok); err != nil {
+		if err := h.checkTokenStatus(ctx, tok, b); err != nil {
 			return err
 		}
 	}
+	if b.skipped > 0 {
+		h.Logger.Warn("status check budget exhausted; remaining status checks skipped",
+			zap.Int("skipped", b.skipped),
+			zap.Duration("budget", b.total),
+			zap.String("status_check", string(h.statusMode.Effective())))
+	}
 	return nil
+}
+
+// defaultStatusCheckBudget is the total status-check time per presentation
+// when presentation.status_check_budget_seconds is 0.
+const defaultStatusCheckBudget = 30 * time.Second
+
+// errStatusBudgetExhausted marks a check that was skipped or cut off because
+// the per-presentation status-check budget ran out.
+var errStatusBudgetExhausted = errors.New("status check budget exhausted")
+
+// statusBudget is the running time budget of one presentation's checks.
+type statusBudget struct {
+	now     func() time.Time
+	start   time.Time
+	total   time.Duration
+	skipped int
+}
+
+func (h *OID4VPHandler) newStatusBudget() *statusBudget {
+	total := h.statusBudget
+	if total <= 0 {
+		total = defaultStatusCheckBudget
+	}
+	now := h.statusNow
+	if now == nil {
+		now = time.Now
+	}
+	return &statusBudget{now: now, start: now(), total: total}
+}
+
+// remaining is the budget left; <= 0 means exhausted.
+func (b *statusBudget) remaining() time.Duration {
+	return b.total - b.now().Sub(b.start)
 }
 
 // errStatusUndetermined is the redacted class error returned in strict mode
@@ -144,6 +185,9 @@ func (h *OID4VPHandler) statusOutcome(err error, uri string) error {
 	case errors.Is(err, statuslist.ErrNoSignerKey):
 		reason = "no_signer_key"
 		class = statuslist.ErrNoSignerKey
+	case errors.Is(err, errStatusBudgetExhausted):
+		reason = "budget_exhausted"
+		class = errStatusBudgetExhausted
 	case errors.Is(err, statuslist.ErrTrustUnavailable):
 		reason = "trust_unavailable"
 		class = statuslist.ErrTrustUnavailable
@@ -167,7 +211,7 @@ func listHost(uri string) string {
 	return "unknown"
 }
 
-func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string) error {
+func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string, b *statusBudget) error {
 	issuerJWT, _, _ := strings.Cut(strings.TrimSpace(token), "~")
 	parts := strings.Split(issuerJWT, ".")
 	if len(parts) != 3 {
@@ -189,7 +233,23 @@ func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string) erro
 		return h.statusOutcome(fmt.Errorf("credential status claim: %w", err), "")
 	}
 
-	return h.statusOutcome(h.statusChecker.Check(ctx, ref), ref.URI)
+	// The lookup runs under what is left of the presentation's budget so that
+	// unreachable lists cannot consume the flow deadline. An exhausted budget
+	// skips the check; in strict mode that refuses, otherwise it proceeds.
+	rem := b.remaining()
+	if rem <= 0 {
+		b.skipped++
+		return h.statusOutcome(errStatusBudgetExhausted, ref.URI)
+	}
+	cctx, cancel := context.WithTimeout(ctx, rem)
+	defer cancel()
+	err = h.statusChecker.Check(cctx, ref)
+	if err != nil && ctx.Err() == nil && cctx.Err() != nil {
+		// Only the budget expired, not the flow: the check was cut off.
+		b.skipped++
+		err = errStatusBudgetExhausted
+	}
+	return h.statusOutcome(err, ref.URI)
 }
 
 // presentedTokens flattens a vp_token into the individual presentations: a

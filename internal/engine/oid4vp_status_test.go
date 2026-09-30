@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -560,4 +562,112 @@ func TestStatusSignerTrust_ReasonTextIsNotASignal(t *testing.T) {
 	ok, err := statusSignerTrust(svc, false)(context.Background(), "s", &trust.KeyMaterial{Type: "x5c", X5C: []string{"AA"}})
 	assert.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// hangingStatusFixture serves status lists that never answer until the
+// request is cancelled, and mints credentials that each reference a distinct
+// list URI on that server. hits counts requests that reached the server.
+func hangingStatusFixture(t *testing.T, mode config.StatusCheckMode) (h *OID4VPHandler, mint func(i int) string, hits *atomic.Int32) {
+	t.Helper()
+	hits = new(atomic.Int32)
+	done := make(chan struct{})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	t.Cleanup(func() { close(done); srv.Close() })
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h = &OID4VPHandler{
+		BaseHandler:   BaseHandler{Logger: zap.NewNop()},
+		statusChecker: statuslist.NewChecker(srv.Client(), false, func(context.Context, string, *trust.KeyMaterial) (bool, error) { return true, nil }),
+		statusMode:    mode,
+	}
+	mint = func(i int) string {
+		claims := jwt.MapClaims{"iss": "https://issuer", "status": map[string]any{"status_list": map[string]any{"idx": 1, "uri": fmt.Sprintf("%s/lists/%d", srv.URL, i)}}}
+		return signJWT(t, key, map[string]any{"typ": "dc+sd-jwt", "jwk": statusJWK(&key.PublicKey)}, claims) + "~"
+	}
+	return h, mint, hits
+}
+
+// With an injectable clock: once the budget is spent the remaining credentials
+// are skipped without any request. warn and enforce-revoked still proceed;
+// strict fails closed.
+func TestCheckPresentationStatus_BudgetSkipsRemaining(t *testing.T) {
+	for _, tc := range []struct {
+		mode    config.StatusCheckMode
+		wantErr bool
+	}{
+		{config.StatusCheckWarn, false},
+		{config.StatusCheckEnforceRevoked, false},
+		{config.StatusCheckStrict, true},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, mint, hits := hangingStatusFixture(t, tc.mode)
+			h.statusBudget = 10 * time.Second
+			// The clock is at t0 when the budget starts and when the first
+			// check begins, and 11s later for every later reading.
+			var calls int
+			t0 := time.Now()
+			h.statusNow = func() time.Time {
+				calls++
+				if calls <= 2 {
+					return t0
+				}
+				return t0.Add(11 * time.Second)
+			}
+			// Make the first (only) live check fail fast: a cancelled-flow
+			// stand-in is not wanted, so bound it with a short real deadline.
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			vp := strings.Join([]string{mint(1), mint(2), mint(3)}, "\n")
+			err := h.checkPresentationStatus(ctx, vp)
+			if got := hits.Load(); got > 1 {
+				t.Fatalf("%d lists requested; credentials after the exhausted budget must be skipped", got)
+			}
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("wantErr=%v got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// Real clock, small budget: unreachable lists cannot consume the flow
+// deadline, warn still proceeds, strict refuses as undetermined.
+func TestCheckPresentationStatus_BudgetBoundsSlowLists(t *testing.T) {
+	for _, tc := range []struct {
+		mode    config.StatusCheckMode
+		wantErr bool
+	}{
+		{config.StatusCheckWarn, false},
+		{config.StatusCheckStrict, true},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, mint, _ := hangingStatusFixture(t, tc.mode)
+			h.statusBudget = 200 * time.Millisecond
+			// A long flow context: only the budget may stop the checks.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			vp := strings.Join([]string{mint(1), mint(2), mint(3), mint(4)}, "\n")
+			start := time.Now()
+			err := h.checkPresentationStatus(ctx, vp)
+			if el := time.Since(start); el > 5*time.Second {
+				t.Fatalf("status checks took %v, budget not enforced", el)
+			}
+			if ctx.Err() != nil {
+				t.Fatal("flow context must be untouched")
+			}
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("wantErr=%v got %v", tc.wantErr, err)
+			}
+			if tc.wantErr && !errors.Is(err, errStatusBudgetExhausted) {
+				t.Fatalf("strict must refuse with the budget class, got %v", err)
+			}
+		})
+	}
 }

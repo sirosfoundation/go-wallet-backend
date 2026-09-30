@@ -36,6 +36,11 @@ type OID4VPHandler struct {
 	// statusChecker is nil when presentation.status_check is off.
 	statusChecker *statuslist.Checker
 	statusMode    config.StatusCheckMode
+	// statusBudget is the total time one presentation's status checks may
+	// take (presentation.status_check_budget_seconds; <=0 means
+	// defaultStatusCheckBudget). statusNow is the budget clock (nil: time.Now).
+	statusBudget time.Duration
+	statusNow    func() time.Time
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
@@ -59,6 +64,7 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 		httpClient:    httpClient,
 		statusChecker: checker,
 		statusMode:    mode,
+		statusBudget:  time.Duration(cfg.Presentation.StatusCheckBudgetSeconds) * time.Second,
 	}, nil
 }
 

@@ -2659,6 +2659,11 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 	if defaultConfig().Presentation.StatusListMinEntries != 0 {
 		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
 	}
+	cfg.Presentation.StatusCheckBudgetSeconds = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check_budget_seconds") {
+		t.Errorf("Validate must reject a negative status_check_budget_seconds, got %v", err)
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = 0
 	cfg.Presentation.StatusListMinEntries = -1
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_min_entries") {
 		t.Errorf("Validate must reject a negative status_list_min_entries, got %v", err)
