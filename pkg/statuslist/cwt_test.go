@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ type cwtOpts struct {
 	iss       string
 	noIat     bool
 	exp       time.Time
+	claims    map[int64]any // raw overrides applied last (type-violation tests)
 	bits      int
 	values    map[int]int
 	typ       any // default "application/statuslist+cwt"; nil-able via noTyp
@@ -112,6 +114,9 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 	}
 	if !o.exp.IsZero() {
 		claims[cwtClaimExp] = o.exp.Unix()
+	}
+	for k, v := range o.claims {
+		claims[k] = v
 	}
 	payload, err := cbor.Marshal(claims)
 	if err != nil {
@@ -282,6 +287,63 @@ func TestCWT_Rejections(t *testing.T) {
 	}
 }
 
+// A present claim of the wrong CBOR type is rejected, never read as absent.
+func TestCWT_ClaimTypeViolations(t *testing.T) {
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour).Unix()
+	tests := []struct {
+		name  string
+		o     cwtOpts
+		claim string
+	}{
+		{"sub as int", cwtOpts{claims: map[int64]any{cwtClaimSub: 7}}, "sub"},
+		{"iss as int", cwtOpts{claims: map[int64]any{cwtClaimIss: 7}}, "iss"},
+		{"iss as bytes", cwtOpts{claims: map[int64]any{cwtClaimIss: []byte("x")}}, "iss"},
+		{"iss as bool", cwtOpts{claims: map[int64]any{cwtClaimIss: false}}, "iss"},
+		{"exp as text", cwtOpts{claims: map[int64]any{cwtClaimExp: "1"}}, "exp"},
+		{"exp as float", cwtOpts{claims: map[int64]any{cwtClaimExp: 1.5}}, "exp"},
+		{"exp as bytes", cwtOpts{claims: map[int64]any{cwtClaimExp: []byte{1}}}, "exp"},
+		{"iat as text", cwtOpts{claims: map[int64]any{cwtClaimIat: "1"}}, "iat"},
+		{"ttl as text", cwtOpts{claims: map[int64]any{cwtClaimTTL: "900"}}, "ttl"},
+		{"legacy ttl as text", cwtOpts{legacy: true, claims: map[int64]any{cwtClaimLegacyTTL: "900"}}, "ttl"},
+		{"exp too large for int64", cwtOpts{claims: map[int64]any{cwtClaimExp: uint64(1) << 63}}, "exp"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			c, uri, _ := serveCWT(t, func(u string) []byte {
+				o := tc.o
+				o.sub = u
+				if _, ok := o.claims[cwtClaimSub]; ok {
+					o.sub = ""
+				}
+				if o.claims == nil {
+					o.claims = map[int64]any{}
+				}
+				return makeCWT(t, o)
+			}, mediaTypeCWT, func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+				called = true
+				return true, nil
+			})
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if err == nil || errors.Is(err, ErrRevoked) || !errors.Is(err, errCWT) ||
+				!strings.Contains(err.Error(), "claim "+tc.claim) {
+				t.Fatalf("want CWT claim %s type error, got %v", tc.claim, err)
+			}
+			if called {
+				t.Fatal("trust consulted for a malformed token")
+			}
+		})
+	}
+	// Sanity: the same claims with correct types are accepted.
+	c, uri, _ := serveCWT(t, func(u string) []byte {
+		return makeCWT(t, cwtOpts{sub: u, iss: "https://issuer.example", claims: map[int64]any{cwtClaimExp: future}})
+	}, mediaTypeCWT, trustAll)
+	if err := c.Check(ctx, &Reference{Idx: 1, URI: uri}); err != nil {
+		t.Fatalf("valid claims: %v", err)
+	}
+}
+
 func TestCWT_Oversized(t *testing.T) {
 	c, uri, _ := serveCWT(t, func(string) []byte { return make([]byte, maxTokenBytes+2) }, mediaTypeCWT, trustAll)
 	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}); err == nil {
@@ -371,9 +433,6 @@ func TestCWTHelpers(t *testing.T) {
 	}
 	if _, ok := toInt64("x"); ok {
 		t.Error("string is not an int")
-	}
-	if optInt("x") != nil || *optInt(uint64(5)) != 5 {
-		t.Error("optInt")
 	}
 	if _, ok := anyMap("x"); ok {
 		t.Error("anyMap accepted a string")

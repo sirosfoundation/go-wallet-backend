@@ -119,13 +119,58 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 	if !ok || len(lst) == 0 {
 		return 0, nil, time.Time{}, fmt.Errorf("%w status_list has no lst", errCWT)
 	}
-	sub, _ := claims[cwtClaimSub].(string)
-	iss, _ := claims[cwtClaimIss].(string)
-	return c.accept(ctx, uri, km, listClaims{
-		sub: sub, iss: iss,
-		iat: optInt(claims[cwtClaimIat]), exp: optInt(claims[cwtClaimExp]), ttl: optInt(claims[ttlLabel]),
-		bits: int(bits), lst: lst,
-	})
+	// Present-but-invalid claims are rejected, never read as absent: a
+	// text-valued exp would otherwise skip expiry validation and a
+	// malformed iss would change the trust subject.
+	var lc listClaims
+	if lc.sub, err = cwtString(claims, cwtClaimSub, "sub"); err != nil {
+		return 0, nil, time.Time{}, err
+	}
+	if lc.iss, err = cwtString(claims, cwtClaimIss, "iss"); err != nil {
+		return 0, nil, time.Time{}, err
+	}
+	for _, f := range []struct {
+		dst   **int64
+		label int64
+		name  string
+	}{
+		{&lc.iat, cwtClaimIat, "iat"}, {&lc.exp, cwtClaimExp, "exp"},
+		{&lc.ttl, ttlLabel, "ttl"},
+	} {
+		if *f.dst, err = cwtInt(claims, f.label, f.name); err != nil {
+			return 0, nil, time.Time{}, err
+		}
+	}
+	lc.bits, lc.lst = int(bits), lst
+	return c.accept(ctx, uri, km, lc)
+}
+
+// cwtString reads an optional text claim; a present claim of another type is
+// an error.
+func cwtString(claims map[int64]any, label int64, name string) (string, error) {
+	v, ok := claims[label]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("%w claim %s (%d) is %T, want text", errCWT, name, label, v)
+	}
+	return s, nil
+}
+
+// cwtInt reads an optional NumericDate/integer claim; a present claim that is
+// not an integer is an error.
+func cwtInt(claims map[int64]any, label int64, name string) (*int64, error) {
+	v, ok := claims[label]
+	if !ok {
+		return nil, nil
+	}
+	n, ok := toInt64(v)
+	if !ok {
+		return nil, fmt.Errorf("%w claim %s (%d) is %T, want an integer", errCWT, name, label, v)
+	}
+	return &n, nil
 }
 
 type sign1 struct {
@@ -286,11 +331,4 @@ func toInt64(v any) (int64, bool) {
 		return int64(n), true
 	}
 	return 0, false
-}
-
-func optInt(v any) *int64 {
-	if n, ok := toInt64(v); ok {
-		return &n
-	}
-	return nil
 }
