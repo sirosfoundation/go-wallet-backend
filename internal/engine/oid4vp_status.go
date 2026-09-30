@@ -71,7 +71,7 @@ func sharedStatusChecker(cfg *config.Config, svc *TrustService) *statuslist.Chec
 	k := statusCheckerKey{cfg, svc}
 	c, ok := statusCheckers[k]
 	if !ok {
-		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), statusSignerTrust(svc, cfg.Presentation.StatusListSignerFallback))
+		c = statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), statusSignerTrust(svc, cfg.Presentation.StatusListSignerFallback)).WithMinEntries(cfg.Presentation.StatusListMinEntries)
 		statusCheckers[k] = c
 	}
 	return c

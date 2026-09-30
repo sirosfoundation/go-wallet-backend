@@ -289,6 +289,19 @@ type PresentationConfig struct {
 	// never falls back. Env: WALLET_PRESENTATION_STATUS_LIST_SIGNER_FALLBACK
 	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
 
+	// StatusListMinEntries rejects a Token Status List that holds fewer than
+	// this many entries once inflated (bytes*8/bits), before its signer is
+	// evaluated; such a list is unverifiable (strict refuses, the other modes
+	// log and proceed). Default 0: no minimum. The Token Status List draft
+	// (-21) sets no receiver-side minimum, it only notes that a larger list
+	// gives better herd privacy (a privacy recommendation for the Status
+	// Issuer), and real publishers emit smaller lists (the SIROS status
+	// service defaults to 100000 entries). Set e.g. 131072 (16 KiB at 1
+	// bit) only if every status issuer you rely on publishes at least that.
+	// Must not be negative.
+	// Env: WALLET_PRESENTATION_STATUS_LIST_MIN_ENTRIES
+	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
+
 	// DCQLConsentCheck compares the user's consent (selected credential query
 	// ids and disclosed claims) with the DCQL query the backend sent to the
 	// client, before any signing. The frontend is not trusted to have
@@ -2279,6 +2292,9 @@ func (c *Config) Validate() error {
 
 	if err := c.Presentation.StatusCheck.validate(); err != nil {
 		return err
+	}
+	if c.Presentation.StatusListMinEntries < 0 {
+		return fmt.Errorf("invalid presentation.status_list_min_entries %d: must not be negative", c.Presentation.StatusListMinEntries)
 	}
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
 		return err

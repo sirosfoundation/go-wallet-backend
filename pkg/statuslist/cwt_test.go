@@ -525,3 +525,18 @@ func TestCWTHelpers(t *testing.T) {
 		t.Error("empty protected header")
 	}
 }
+
+func TestCWT_MinEntries(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		min     int
+		wantErr bool
+	}{{0, false}, {64, false}, {65, true}} {
+		c, uri, _ := serveCWT(t, func(u string) []byte { return makeCWT(t, cwtOpts{sub: u}) }, mediaTypeCWT, trustAll)
+		c.WithMinEntries(tc.min)
+		err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+		if tc.wantErr != (err != nil) || errors.Is(err, ErrRevoked) {
+			t.Fatalf("min %d: wantErr=%v got %v", tc.min, tc.wantErr, err)
+		}
+	}
+}

@@ -132,6 +132,9 @@ type Checker struct {
 	// allowHTTP permits a plain-http status list URI (development only).
 	allowHTTP bool
 	now       func() time.Time
+	// minEntries is the smallest inflated list (entries = bytes*8/bits) the
+	// Checker accepts; 0 disables the check. See WithMinEntries.
+	minEntries int
 
 	mu         sync.Mutex
 	cache      map[string]cachedList
@@ -154,6 +157,25 @@ type cachedList struct {
 // list as unverifiable.
 func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *Checker {
 	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}, cacheLimit: maxCacheBytes}
+}
+
+// WithMinEntries makes the Checker reject a status list that holds fewer than
+// n entries once inflated (len(list)*8/bits), before the signer is consulted.
+// n <= 0 (the default) disables the check.
+//
+// draft-ietf-oauth-status-list (-21) sets NO receiver-side minimum: §12.1
+// only observes that herd privacy depends on list size ("A larger size
+// results in better privacy but also impacts the performance"), and §13.4
+// leaves sizing to the Status Issuer. A hard minimum would also reject
+// lists real publishers emit (the SIROS status service defaults to 100,000
+// entries), so this is an opt-in deployment policy, not a conformance check.
+// Call it before the Checker is shared; it is not safe to change afterwards.
+func (c *Checker) WithMinEntries(n int) *Checker {
+	if n < 0 {
+		n = 0
+	}
+	c.minEntries = n
+	return c
 }
 
 // Check returns nil only if the entry at ref is VALID in a status list token
@@ -404,6 +426,11 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	list, err := inflate(lc.lst)
 	if err != nil {
 		return 0, nil, time.Time{}, err
+	}
+	if c.minEntries > 0 {
+		if n := len(list) * 8 / lc.bits; n < c.minEntries {
+			return 0, nil, time.Time{}, fmt.Errorf("status list has %d entries, below the configured minimum of %d", n, c.minEntries)
+		}
 	}
 	if err := c.evaluateSigner(ctx, lc.iss, uri, km); err != nil {
 		return 0, nil, time.Time{}, err

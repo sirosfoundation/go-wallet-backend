@@ -2656,6 +2656,17 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("warn rejected: %v", err)
 	}
+	if defaultConfig().Presentation.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	cfg.Presentation.StatusListMinEntries = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_min_entries") {
+		t.Errorf("Validate must reject a negative status_list_min_entries, got %v", err)
+	}
+	cfg.Presentation.StatusListMinEntries = 131072
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("131072 rejected: %v", err)
+	}
 }
 
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {

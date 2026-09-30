@@ -378,3 +378,46 @@ func TestCheck_NotBefore(t *testing.T) {
 		})
 	}
 }
+
+// The minimum list cardinality is an opt-in policy (the draft sets none): off
+// by default, and when set it counts entries (bytes*8/bits) and is applied
+// before the trust service is consulted. The fixtures hold 64 entries.
+func TestCheck_MinEntries(t *testing.T) {
+	ctx := context.Background()
+	key := newKey(t)
+	for _, tc := range []struct {
+		name    string
+		bits    int
+		min     int
+		wantErr bool
+	}{
+		{"default off", 1, 0, false},
+		{"at minimum", 1, 64, false},
+		{"one below minimum", 1, 65, true},
+		{"2-bit entries counted not bytes", 2, 64, false},
+		{"2-bit below minimum", 2, 65, true},
+		{"negative disables", 1, -5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, uri, _ := serve(t, func(u string) string {
+				return makeToken(t, tokenOpts{sub: u, key: key, bits: tc.bits})
+			}, "")
+			trustCalls := 0
+			c.trust = func(context.Context, string, *trust.KeyMaterial) (bool, error) { trustCalls++; return true, nil }
+			c.WithMinEntries(tc.min)
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || errors.Is(err, ErrRevoked) || !strings.Contains(err.Error(), "below the configured minimum") {
+				t.Fatalf("undersized list must be unverifiable, got %v", err)
+			}
+			if trustCalls != 0 {
+				t.Fatalf("trust consulted %d times for an undersized list", trustCalls)
+			}
+		})
+	}
+}
