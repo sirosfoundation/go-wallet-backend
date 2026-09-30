@@ -38,7 +38,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, tenantID, _, tokenID, err := a.manager.validateTokenID(token)
+	userID, tenantID, tac, tokenID, err := a.manager.validateTokenID(token)
 	if err != nil {
 		a.logger.Warn("WMP HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -57,7 +57,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	// Session ID from header (empty for session.create).
 	sessionID := r.Header.Get("Wmp-Session-Id")
 
-	caller := wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID}
+	caller := wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID, TAC: tac}
 
 	// For methods that target an existing session, verify ownership.
 	if sessionID != "" {

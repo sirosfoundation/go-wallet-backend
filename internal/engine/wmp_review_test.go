@@ -1018,3 +1018,40 @@ func TestWMPAdapter_Close_TerminatesSSEHandlers(t *testing.T) {
 		t.Fatal("SSE handler still streaming after adapter Close")
 	}
 }
+
+// A session created with a broad TAC must not authorise flows that the
+// CURRENT request's (reduced) TAC forbids.
+func TestWMP_FlowStart_CurrentRequestTACLimits(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	for _, p := range []Protocol{ProtocolOID4VCI, ProtocolOID4VP} {
+		m.RegisterFlowHandler(p, func(flow *Flow, _ *config.Config, _ *zap.Logger, _ *TrustService, _ *RegistryClient, _ storage.VerifierStore, _ *TrustCache) (FlowHandler, error) {
+			return stubFlowHandler{}, nil
+		})
+	}
+	sid := createWMPSession(t, a)
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+	sess.TAC = claims.TAC("ir") // broad, from session creation
+
+	reduced := wmpCaller{TAC: claims.TAC("r")}
+	resp, err := a.HandleRPCAs(context.Background(), sid, reduced, startFlowBody(sid, string(ProtocolOID4VCI), "f-i"))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp), "reduced token must not issue")
+	sess.flowsMu.RLock()
+	assert.Empty(t, sess.flows)
+	sess.flowsMu.RUnlock()
+
+	resp, err = a.HandleRPCAs(context.Background(), sid, reduced, startFlowBody(sid, string(ProtocolOID4VP), "f-r"))
+	require.NoError(t, err)
+	var ok wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &ok))
+	assert.Nil(t, ok.Error, "reduced token may still present")
+
+	resp, err = a.HandleRPCAs(context.Background(), sid, wmpCaller{TAC: claims.TAC("ir")}, startFlowBody(sid, string(ProtocolOID4VCI), "f-i2"))
+	require.NoError(t, err)
+	var ok2 wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &ok2))
+	assert.Nil(t, ok2.Error, "full token may issue")
+}

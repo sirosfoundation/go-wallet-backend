@@ -402,6 +402,20 @@ type wmpCaller struct {
 	UserID   string
 	TenantID string
 	TokenID  string // jti; may be empty
+	// TAC is the token-authorized-capabilities of THIS request's token. It
+	// bounds what the request may do, independent of the TAC captured when
+	// the session was created, so a session cannot be driven with more
+	// privilege than the token presented now. Empty means legacy auth.
+	TAC claims.TAC
+}
+
+type wmpCallerTACKey struct{}
+
+// requestTAC returns the TAC of the token that authenticated the current
+// request (empty when none, i.e. legacy auth or an in-process call).
+func requestTAC(ctx context.Context) claims.TAC {
+	t, _ := ctx.Value(wmpCallerTACKey{}).(claims.TAC)
+	return t
 }
 
 // NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
@@ -584,7 +598,7 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 	// Update activity timestamp for idle timeout tracking.
 	a.touchSession(sessionID)
 
-	return ws.peer.HandleRequestSync(ctx, body)
+	return ws.peer.HandleRequestSync(context.WithValue(ctx, wmpCallerTACKey{}, caller.TAC), body)
 }
 
 // Events returns a channel of the session's outbound notifications, as the
@@ -1270,10 +1284,16 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	// enforced when the session actually has a TAC to check (empty means
 	// legacy auth, which has no TAC concept), so a token without "i" cannot
 	// start issuance nor one without "r" a presentation.
-	if h.session.TAC != "" {
-		if required, ok := requiredTACForProtocol[protocol]; ok && !h.session.TAC.HasAll(required) {
+	// Both the TAC captured at session creation AND the current request's
+	// TAC must grant the flow, so a reduced-permission token cannot drive a
+	// session created with a broader one.
+	if required, ok := requiredTACForProtocol[protocol]; ok {
+		reqTAC := requestTAC(ctx)
+		if (h.session.TAC != "" && !h.session.TAC.HasAll(required)) ||
+			(reqTAC != "" && !reqTAC.HasAll(required)) {
 			logger.Warn("Rejected WMP flow start - insufficient TAC",
-				zap.String("tac", string(h.session.TAC)),
+				zap.String("session_tac", string(h.session.TAC)),
+				zap.String("request_tac", string(reqTAC)),
 				zap.String("required", required),
 			)
 			return nil, wmp.NewRPCError(wmp.ErrNotAuthorized, map[string]string{
