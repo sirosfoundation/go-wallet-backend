@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/go-jose/go-jose/v4"
@@ -17,9 +18,9 @@ import (
 )
 
 func TestJWKSRelay_ServesAndFailsClosed(t *testing.T) {
-	fail := false
+	var fail atomic.Bool
 	r, err := startJWKSRelay(func(context.Context) ([]byte, error) {
-		if fail {
+		if fail.Load() {
 			return nil, errors.New("down")
 		}
 		return []byte(`{"keys":[]}`), nil
@@ -34,7 +35,7 @@ func TestJWKSRelay_ServesAndFailsClosed(t *testing.T) {
 	assert.Equal(t, 200, resp.StatusCode)
 	assert.JSONEq(t, `{"keys":[]}`, string(b))
 
-	fail = true
+	fail.Store(true)
 	resp, err = http.Get(r.url)
 	require.NoError(t, err)
 	_ = resp.Body.Close()

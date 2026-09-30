@@ -46,6 +46,11 @@ func wsValidator(t *testing.T, legacy bool) (*tokenvalidator.Validator, *ecdsa.P
 
 func wsES256(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Duration) string {
 	t.Helper()
+	return wsES256Aud(t, key, sub, exp, "wallet-backend")
+}
+
+func wsES256Aud(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Duration, aud ...string) string {
+	t.Helper()
 	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "k1"))
 	require.NoError(t, err)
@@ -53,6 +58,9 @@ func wsES256(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Duration)
 		"iat": time.Now().Unix(), "exp": time.Now().Add(exp).Unix()}
 	if sub != "" {
 		claims["sub"] = sub
+	}
+	if len(aud) > 0 {
+		claims["aud"] = aud
 	}
 	raw, err := gojosejwt.Signed(sig).Claims(claims).Serialize()
 	require.NoError(t, err)
@@ -142,9 +150,35 @@ func TestManager_validateToken_AudienceNewStyleOnly(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "legacy-user", uid)
 
-	// New-style token without the audience is refused (wsES256 sets none).
-	_, err = m.validateToken(wsES256(t, key, "u", time.Minute))
+	// New-style token without the configured audience is refused.
+	_, err = m.validateToken(wsES256Aud(t, key, "u", time.Minute, "wallet-registry"))
 	assert.ErrorContains(t, err, "audience")
+}
+
+func TestManager_validateToken_RequiresWalletBackendAudience(t *testing.T) {
+	v, key := wsValidator(t, true)
+	// as.audiences empty and as.audiences containing wallet-registry must both
+	// still require wallet-backend for new-style tokens.
+	for _, auds := range [][]string{nil, {"wallet-registry"}} {
+		cfg := wsCfg(true, true)
+		cfg.AS.Audiences = auds
+		m := NewManager(cfg, zap.NewNop())
+		m.SetTokenValidator(v)
+
+		uid, err := m.validateToken(wsES256Aud(t, key, "u", time.Minute, "wallet-backend", "wallet-registry"))
+		require.NoError(t, err)
+		assert.Equal(t, "u", uid)
+
+		_, err = m.validateToken(wsES256Aud(t, key, "u", time.Minute, "wallet-registry"))
+		assert.ErrorContains(t, err, "audience", "registry-only token must not open the keystore socket")
+
+		_, err = m.validateToken(wsES256Aud(t, key, "u", time.Minute))
+		assert.ErrorContains(t, err, "audience", "token with no audience must be refused")
+
+		uid, err = m.validateToken(wsHMAC(t, wsDualSecret))
+		require.NoError(t, err, "legacy token exempt from audience checks")
+		assert.Equal(t, "legacy-user", uid)
+	}
 }
 
 func TestManager_validateToken_EmptySecretRefused(t *testing.T) {
