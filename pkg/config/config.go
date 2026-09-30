@@ -260,7 +260,10 @@ type PresentationConfig struct {
 	// signer key accepted by the go-trust issuer PDP, and the entry is non-zero, i.e. INVALID, SUSPENDED or application-specific; if
 	// the list cannot be fetched or verified, log a warning and proceed);
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
-	// unsigned, expired or malformed list also refuses).
+	// unsigned, expired or malformed list also refuses, with
+	// CREDENTIAL_STATUS_UNDETERMINED - a neutral "could not be confirmed as
+	// valid" message - rather than CREDENTIAL_REVOKED, which is reserved for a
+	// confirmed revocation).
 	// Choose enforce-revoked or strict to have the wallet refuse. The signer
 	// is evaluated by go-trust with action.name `status-list-signer` (a
 	// negative is final; an error falls back to credential-issuer unless

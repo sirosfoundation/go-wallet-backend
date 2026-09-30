@@ -119,12 +119,16 @@ const (
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
 	// ErrCodeCredentialRevoked is returned when a credential selected for
-	// presentation is not VALID in its Token Status List (or, in strict
-	// mode, its status could not be determined). Clients that do not know the code fall back to the
-	// generic message.
+	// presentation is CONFIRMED not VALID in a verified, trusted Token Status
+	// List. Clients that do not know the code fall back to the generic message.
 	ErrCodeCredentialRevoked ErrorCode = "CREDENTIAL_REVOKED"
-	ErrCodeInternalError     ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests   ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeCredentialStatusUndetermined is returned in strict mode when no
+	// revocation was established but the status could not be confirmed
+	// either (list unreachable, unverifiable or signer untrusted). It must
+	// not be presented as a confirmed revocation.
+	ErrCodeCredentialStatusUndetermined ErrorCode = "CREDENTIAL_STATUS_UNDETERMINED"
+	ErrCodeInternalError                ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests              ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -175,6 +179,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "You do not have any credentials that match this request"
 	case ErrCodeCredentialRevoked:
 		return "A credential you selected is no longer valid (revoked or suspended)"
+	case ErrCodeCredentialStatusUndetermined:
+		return "A selected credential could not be confirmed as valid"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:

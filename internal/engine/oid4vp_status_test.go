@@ -332,7 +332,10 @@ func TestPresentOrRefuse_StrictUnreachableRefuses(t *testing.T) {
 	form := <-posted
 	assert.Equal(t, "access_denied", form.Get("error"))
 	msg := awaitMessage(t, received, string(TypeFlowError))
-	assert.Equal(t, string(ErrCodeCredentialRevoked), msg["error"].(map[string]any)["code"])
+	flowErr := msg["error"].(map[string]any)
+	assert.Equal(t, string(ErrCodeCredentialStatusUndetermined), flowErr["code"])
+	assert.Equal(t, "A selected credential could not be confirmed as valid", flowErr["message"])
+	assert.NotContains(t, flowErr["message"], "revoked")
 }
 
 func TestPresentOrRefuse_SubmitFailure(t *testing.T) {

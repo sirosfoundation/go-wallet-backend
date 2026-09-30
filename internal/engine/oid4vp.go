@@ -239,7 +239,8 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 // the first point at which the backend sees credential content (it never
 // holds the credentials), and nothing has been sent to the verifier yet. On
 // refusal the verifier gets the generic access_denied and skips
-// submitResponse; the wallet gets CREDENTIAL_REVOKED.
+// submitResponse; the wallet gets CREDENTIAL_REVOKED for a confirmed revocation and
+// CREDENTIAL_STATUS_UNDETERMINED when (strict mode) no status was established.
 func (h *OID4VPHandler) presentOrRefuse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) error {
 	if err := h.checkPresentationStatus(ctx, vpToken); err != nil {
 		h.Logger.Warn("presentation refused by credential status check", zap.Error(err))
@@ -248,7 +249,11 @@ func (h *OID4VPHandler) presentOrRefuse(ctx context.Context, authReq *Authorizat
 		if redirectURI != "" {
 			details["redirect_uri"] = redirectURI
 		}
-		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodeCredentialRevoked, ErrCodeCredentialRevoked.UserFacingMessage(), details)
+		code := ErrCodeCredentialStatusUndetermined
+		if errors.Is(err, statuslist.ErrRevoked) {
+			code = ErrCodeCredentialRevoked
+		}
+		_ = h.ErrorWithDetails(StepSubmittingResponse, code, code.UserFacingMessage(), details)
 		return err
 	}
 
