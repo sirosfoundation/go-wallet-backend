@@ -507,8 +507,11 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 
 // Close shuts down the WMP adapter and the engine manager
 func (p *EngineProvider) Close() {
-	// Stop the WMP adapter's cleanup goroutine first, then close the manager
-	// (which closes the live sessions' transports).
+	// Stop the WMP adapter first: it starts draining (new RPC/SSE requests
+	// get 503 and session.create is refused) before its live sessions are
+	// closed and its cleanup goroutine stopped, so nothing can register a
+	// session behind the cleanup. Then close the manager (which closes the
+	// remaining sessions' transports).
 	if p.wmpAdapter != nil {
 		p.wmpAdapter.Close()
 	}

@@ -325,8 +325,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	// Close the engine provider first: it stops the WMP adapter and ends the
-	// live sessions, which terminates their long-lived SSE handlers. Doing it
+	// Close the engine provider first: it puts the WMP adapter into draining
+	// mode (new RPC/SSE requests are rejected with 503 while the listener is
+	// still up), stops it and ends the live sessions, which terminates their long-lived SSE handlers. Doing it
 	// after mgr.Shutdown would leave http.Server.Shutdown waiting on those
 	// streams for the whole shutdown timeout.
 	if engineProvider != nil {

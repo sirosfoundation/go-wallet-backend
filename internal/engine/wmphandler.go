@@ -44,6 +44,7 @@ type WMPAdapter struct {
 	peers            map[string]*wmpSession      // keyed by WMP session ID
 	resumptionTokens map[string]*resumptionEntry // token -> entry with session ID and expiry
 	eventBufs        map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	draining         bool                        // set by Drain/Close; new sessions and requests are refused
 
 	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
 	// bearer token (see reserveSlot).
@@ -440,9 +441,30 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.
 	return a
 }
 
+// Drain marks the adapter as draining: from now on the HTTP handlers answer
+// 503 and session.create / session.resume are refused. It is idempotent and
+// is the first step of Close, but can be called earlier to stop accepting
+// work while the HTTP listener is still up.
+func (a *WMPAdapter) Drain() {
+	a.mu.Lock()
+	a.draining = true
+	a.mu.Unlock()
+}
+
+// isDraining reports whether Drain/Close has been called.
+func (a *WMPAdapter) isDraining() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.draining
+}
+
 // Close stops the cleanup loop and waits for it to exit. Safe to call more
 // than once. Live sessions are closed when the engine Manager is closed.
 func (a *WMPAdapter) Close() {
+	// Refuse new requests and sessions before anything is torn down, so a
+	// session.create racing with shutdown cannot register a session after
+	// the snapshot below and leak it.
+	a.Drain()
 	a.stopOnce.Do(func() { close(a.stopCh) })
 	if a.loopDone != nil {
 		<-a.loopDone
@@ -888,6 +910,15 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	buf := &wmpEventBuffer{}
 
 	a.mu.Lock()
+	if a.draining {
+		// Shutdown began after the request was admitted: nothing will ever
+		// close this session, so refuse it instead of publishing it.
+		a.mu.Unlock()
+		a.teardown(ws)
+		return wmpErrorBytes(req.ID, wmp.ErrRateLimited, map[string]string{
+			"reason": "server shutting down",
+		})
+	}
 	a.peers[sessionID] = ws
 	a.eventBufs[sessionID] = buf
 	a.mu.Unlock()
@@ -1107,7 +1138,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// never tear down the resumed session.
 	a.mu.Lock()
 	_, tokenStillValid := a.resumptionTokens[params.ResumptionToken]
-	if !tokenStillValid || a.peers[params.SessionID] != oldWS {
+	if !tokenStillValid || a.peers[params.SessionID] != oldWS || a.draining {
 		a.mu.Unlock()
 		cancel()
 		_ = ct.Close()

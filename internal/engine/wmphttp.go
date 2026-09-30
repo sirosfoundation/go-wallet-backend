@@ -31,6 +31,11 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if a.isDraining() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Extract and validate JWT from Authorization header.
 	token := a.bearerToken(r)
 	if token == "" {
@@ -102,6 +107,11 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if a.isDraining() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 		return
 	}
 
