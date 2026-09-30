@@ -9,6 +9,7 @@ import (
 
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // EngineProvider.Close must stop the WMP adapter's cleanup goroutine.
@@ -18,7 +19,7 @@ func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	manager := wsengine.NewManager(cfg, logger)
 
 	before := runtime.NumGoroutine()
-	adapter := wsengine.NewWMPAdapter(manager, logger)
+	adapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
 	if runtime.NumGoroutine() <= before {
 		t.Fatal("expected the adapter to start a goroutine")
 	}

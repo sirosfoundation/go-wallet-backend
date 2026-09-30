@@ -926,7 +926,7 @@ func TestWMP_ReplayActiveFlowProgress_RacesWithProgress(t *testing.T) {
 func TestWMPAdapter_CloseStopsCleanupLoop(t *testing.T) {
 	m := testManager()
 	defer m.Close()
-	a := NewWMPAdapter(m, zap.NewNop())
+	a := NewWMPAdapter(m, zap.NewNop(), testBearerToken)
 	select {
 	case <-a.loopDone:
 		t.Fatal("loop should be running before Close")

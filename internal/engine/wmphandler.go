@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -36,6 +37,8 @@ var specToEngineAction = map[string]string{
 type WMPAdapter struct {
 	manager *Manager
 	logger  *zap.Logger
+	// bearerToken extracts the bearer credential from an HTTP request.
+	bearerToken func(*http.Request) string
 
 	mu               sync.RWMutex
 	peers            map[string]*wmpSession      // keyed by WMP session ID
@@ -419,8 +422,12 @@ func requestTAC(ctx context.Context) claims.TAC {
 }
 
 // NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
-func NewWMPAdapter(manager *Manager, logger *zap.Logger) *WMPAdapter {
+// bearerToken extracts the bearer credential from an HTTP request ("" when
+// absent or malformed); it is injected because the engine cannot import
+// pkg/middleware (which depends on the engine through the service layer).
+func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.Request) string) *WMPAdapter {
 	a := &WMPAdapter{
+		bearerToken:      bearerToken,
 		manager:          manager,
 		logger:           logger.Named("wmp"),
 		peers:            make(map[string]*wmpSession),

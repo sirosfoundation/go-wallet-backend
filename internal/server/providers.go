@@ -422,7 +422,7 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
-	wmpAdapter := wsengine.NewWMPAdapter(manager, logger)
+	wmpAdapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
 
 	return &EngineProvider{
 		cfg:              cfg,

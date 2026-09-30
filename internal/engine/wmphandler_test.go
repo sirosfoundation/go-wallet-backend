@@ -25,7 +25,7 @@ import (
 
 func testWMPAdapter() (*WMPAdapter, *Manager) {
 	m := testManager()
-	a := NewWMPAdapter(m, zap.NewNop())
+	a := NewWMPAdapter(m, zap.NewNop(), testBearerToken)
 	return a, m
 }
 

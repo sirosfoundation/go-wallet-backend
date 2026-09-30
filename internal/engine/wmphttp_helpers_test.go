@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,33 +58,9 @@ func TestWriteBodyReadError_Generic400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestExtractBearerToken(t *testing.T) {
-	tests := []struct {
-		name   string
-		header string
-		want   string
-	}{
-		{"valid", "Bearer abc123", "abc123"},
-		{"no prefix", "abc123", ""},
-		{"empty", "", ""},
-		{"basic", "Basic abc123", ""},
-		{"bearer lowercase", "bearer abc", "abc"},
-		{"bearer uppercase", "BEARER abc", "abc"},
-		{"bearer mixed case", "bEaReR abc", "abc"},
-		{"whitespace trimmed", "Bearer  abc ", "abc"},
-		{"scheme only", "Bearer", ""},
-		{"scheme with empty token", "Bearer ", ""},
-		{"no separator", "Bearerabc", ""},
-		{"longer scheme", "Bearers abc", ""},
-		{"leading space", " Bearer abc", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			if tt.header != "" {
-				req.Header.Set("Authorization", tt.header)
-			}
-			assert.Equal(t, tt.want, extractBearerToken(req))
-		})
-	}
+// testBearerToken stands in for middleware.ExtractBearerToken (which the
+// engine package cannot import: pkg/middleware depends on the engine).
+func testBearerToken(r *http.Request) string {
+	_, tok, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	return strings.TrimSpace(tok)
 }
