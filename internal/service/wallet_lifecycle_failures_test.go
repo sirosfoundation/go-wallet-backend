@@ -320,13 +320,13 @@ func TestWalletLifecycle_Cascade_UnownedInstanceAndErrors(t *testing.T) {
 	})
 }
 
-// Wallet instances are per tenant: deactivating the wallet in one tenant
-// erases the holder data of that tenant only. The user-level vault is erased
-// only once no live instance remains anywhere.
+// Wallet instances are per tenant, but erasure is not: nothing is erased, in
+// any tenant, while a live instance remains anywhere. Once none does, the
+// holder data of every tenant and the user-level vault are erased.
 func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("live instance in another tenant keeps the vault", func(t *testing.T) {
+	t.Run("live instance in another tenant keeps everything", func(t *testing.T) {
 		store := memory.NewStore()
 		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 		uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
@@ -339,8 +339,8 @@ func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 		assert.Equal(t, 1, n)
 
 		c, p := countHolderData(t, store, domain.DefaultTenantID, uid)
-		assert.Zero(t, c, "default-tenant credentials erased")
-		assert.Zero(t, p, "default-tenant presentations erased")
+		assert.Equal(t, 1, c, "default-tenant credentials kept while acme is live")
+		assert.Equal(t, 1, p, "default-tenant presentations kept while acme is live")
 		c, p = countHolderData(t, store, "acme", uid)
 		assert.Equal(t, 1, c, "acme credentials untouched")
 		assert.Equal(t, 1, p, "acme presentations untouched")
@@ -387,7 +387,7 @@ func TestWalletLifecycle_Erasure_StoreFailuresAreReportedAndRetryable(t *testing
 				user, _ := fs.Store.Users().GetByID(ctx, uid)
 				assert.NotNil(t, user.PrivateData, "vault kept: cannot prove no live instance elsewhere")
 				c, _ := countHolderData(t, fs.Store, domain.DefaultTenantID, uid)
-				assert.Zero(t, c, "this tenant's holder data is still erased")
+				assert.Equal(t, 1, c, "nothing is erased when the liveness check cannot run")
 			}
 
 			// Retry with everything already revoked re-runs the cascade.

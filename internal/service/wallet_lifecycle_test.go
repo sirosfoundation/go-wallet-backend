@@ -489,3 +489,102 @@ func TestWalletLifecycle_RetryRepairsACutOffOlderThanTheRevocation(t *testing.T)
 		"cut-off %s still predates the revocation at %s, so tokens minted in between stay valid",
 		repaired, revoked.DeactivatedAt)
 }
+
+// failGetByUser fails the per-tenant instance listing the liveness check uses.
+type failGetByUser struct {
+	storage.WalletInstanceStore
+	tenant domain.TenantID
+}
+
+func (f *failGetByUser) GetByUser(ctx context.Context, tid domain.TenantID, uid domain.UserID) ([]*domain.WalletInstance, error) {
+	if tid == f.tenant {
+		return nil, errors.New("db down")
+	}
+	return f.WalletInstanceStore.GetByUser(ctx, tid, uid)
+}
+
+const (
+	tenantA = domain.TenantID("tenant-a")
+	tenantB = domain.TenantID("tenant-b")
+)
+
+// twoTenantFixture seeds a user with a live instance in each of two tenants
+// and holder data in both.
+func twoTenantFixture(t *testing.T) (*WalletLifecycleService, *memory.Store, domain.UserID, string) {
+	t.Helper()
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	holder := "did:example:" + userID.String()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, DID: holder, PrivateData: []byte("vault")}))
+	for _, tid := range []domain.TenantID{tenantA, tenantB} {
+		require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "inst-" + string(tid), TenantID: tid, UserID: &userID, Status: domain.InstanceStatusActive,
+		}))
+		require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+			TenantID: tid, HolderDID: holder, CredentialIdentifier: "cred-" + string(tid), Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+		}))
+		require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+			TenantID: tid, HolderDID: holder, PresentationIdentifier: "pres-" + string(tid), Presentation: "jwt",
+		}))
+	}
+	return svc, store, userID, holder
+}
+
+func holderDataCount(t *testing.T, store storage.Store, tid domain.TenantID, holder string) int {
+	t.Helper()
+	ctx := context.Background()
+	creds, err := store.Credentials().GetAllByHolder(ctx, tid, holder)
+	if err != nil {
+		require.True(t, errors.Is(err, storage.ErrNotFound), err)
+	}
+	pres, err := store.Presentations().GetAllByHolder(ctx, tid, holder)
+	if err != nil {
+		require.True(t, errors.Is(err, storage.ErrNotFound), err)
+	}
+	return len(creds) + len(pres)
+}
+
+// Revoking in tenant A while tenant B still has a live instance erases
+// nothing at all, not even tenant A's credentials and presentations.
+func TestWalletLifecycle_RevokeInOneTenantErasesNothingWhileAnotherIsLive(t *testing.T) {
+	svc, store, _, holder := twoTenantFixture(t)
+	_, err := svc.ChangeStatus(context.Background(), LifecycleActor{Kind: "provider"}, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")
+	require.NoError(t, err)
+	assert.Equal(t, 2, holderDataCount(t, store, tenantA, holder), "tenant A data must survive while tenant B is live")
+	assert.Equal(t, 2, holderDataCount(t, store, tenantB, holder))
+}
+
+// With no live instance anywhere, the holder data of every tenant is erased.
+func TestWalletLifecycle_RevokeLastLiveInstanceErasesAllTenants(t *testing.T) {
+	svc, store, userID, holder := twoTenantFixture(t)
+	ctx := context.Background()
+	actor := LifecycleActor{Kind: "provider"}
+	_, err := svc.ChangeStatus(ctx, actor, tenantB, "inst-"+string(tenantB), domain.InstanceStatusRevoked, "lost")
+	require.NoError(t, err)
+	require.Equal(t, 2, holderDataCount(t, store, tenantA, holder))
+	_, err = svc.ChangeStatus(ctx, actor, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")
+	require.NoError(t, err)
+	assert.Zero(t, holderDataCount(t, store, tenantA, holder))
+	assert.Zero(t, holderDataCount(t, store, tenantB, holder))
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.Nil(t, user.PrivateData)
+}
+
+// A failing liveness check fails closed: nothing is erased.
+func TestWalletLifecycle_LivenessCheckErrorErasesNothing(t *testing.T) {
+	_, store, userID, holder := twoTenantFixture(t)
+	ctx := context.Background()
+	svc := NewWalletLifecycleService(storeWithInstances{Store: store, instances: &failGetByUser{WalletInstanceStore: store.WalletInstances(), tenant: tenantB}}, zap.NewNop(), nil)
+
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrErasureIncomplete), "got %v", err)
+	assert.Equal(t, 2, holderDataCount(t, store, tenantA, holder))
+	assert.Equal(t, 2, holderDataCount(t, store, tenantB, holder))
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.NotNil(t, user.PrivateData)
+}

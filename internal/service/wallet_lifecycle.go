@@ -449,9 +449,11 @@ func (s *WalletLifecycleService) incomplete(userID domain.UserID, errs []error) 
 	return fmt.Errorf("%w: %w", ErrErasureIncomplete, joined)
 }
 
-// eraseWalletData is the SID-AUTH-06 "secure erasure on deactivation" for one
-// tenant: the credentials and presentations the user holds in that tenant are
-// deleted. The user-level state - the encrypted private data and legacy key
+// eraseWalletData is the SID-AUTH-06 "secure erasure on deactivation". It
+// first checks, across every tenant the user belongs to, that no live
+// instance remains; only then are the credentials and presentations the user
+// holds in each tenant deleted (nothing is erased while any live instance
+// remains, and nothing if the check itself fails). The user-level state - the encrypted private data and legacy key
 // blob (the only durable custodians of the user's keys) and pending
 // challenges - is shared by all of the user's tenants, so it is erased only
 // when no non-revoked instance remains in any tenant the user belongs to.
@@ -468,14 +470,16 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if holder == "" {
 		holder = userID.String()
 	}
-	errs := s.eraseHolderData(ctx, tenantID, holder)
-
+	// The global liveness check comes first and gates every erasure: nothing
+	// is erased, in any tenant, while a live instance remains anywhere. A
+	// failed check counts as "live" (fail closed) and is reported.
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
-		return append(errs, err)
+		return []error{err}
 	}
+	var errs []error
 	if s.liveInstanceIn(ctx, tenants, tenantID, userID, &errs) {
-		s.logger.Info("wallet data erased in tenant; user-level data kept, a live instance remains in another tenant",
+		s.logger.Info("wallet data kept: a live instance remains in another tenant",
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
 		return errs
 	}
@@ -489,9 +493,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// wallet needs a new enrollment, and the session that deactivated it
 	// must not be able to write new wallet data afterwards.
 	for _, tid := range tenants {
-		if tid != tenantID {
-			errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
-		}
+		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
 	}
 	// WebAuthn challenges are per user and deleted here. WIA challenges are
 	// not: they are single-use, short-lived nonces that carry only a tenant,
