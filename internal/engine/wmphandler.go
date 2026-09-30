@@ -1275,6 +1275,14 @@ func (h *wmpEngineHandler) SessionClose(_ context.Context, params *wmp.SessionCl
 	h.adapter.CloseSession(h.sessionID)
 }
 
+// logger returns the adapter's logger, or a no-op one for a bare handler.
+func (h *wmpEngineHandler) logger() *zap.Logger {
+	if h.adapter == nil || h.adapter.logger == nil {
+		return zap.NewNop()
+	}
+	return h.adapter.logger
+}
+
 // authorizeProtocol enforces the TAC permission the given flow protocol
 // requires (see requiredTACForProtocol) for the CURRENT request. It applies
 // to every state-changing method, not only FlowStart: a token lacking the
@@ -1314,7 +1322,7 @@ func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (fl
 	if flow == nil {
 		return nil, nil
 	}
-	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.adapter.logger.With(zap.String("flow_id", flowID)))
+	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.logger().With(zap.String("flow_id", flowID)))
 }
 
 // FlowStart handles wmp.flow.start — launches an engine flow goroutine.
@@ -1704,7 +1712,7 @@ func (h *wmpEngineHandler) CapabilityList(_ context.Context, _ *wmp.CapabilityLi
 func (h *wmpEngineHandler) CredentialNotification(ctx context.Context, params *wmp.CredentialNotificationParams) {
 	// Credential notifications are an OID4VCI lifecycle event: they need the
 	// issuance permission, whether or not the flow is still registered.
-	if rpcErr := h.authorizeProtocol(ctx, ProtocolOID4VCI, h.adapter.logger.With(zap.String("flow_id", params.FlowID))); rpcErr != nil {
+	if rpcErr := h.authorizeProtocol(ctx, ProtocolOID4VCI, h.logger().With(zap.String("flow_id", params.FlowID))); rpcErr != nil {
 		_ = h.session.SendNotificationAck(params.FlowID, params.NotificationID, "rejected", "insufficient permissions")
 		return
 	}
