@@ -1109,7 +1109,8 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// lock on the old transport (the client may have disconnected without
 	// acknowledging it); otherwise the write lock below would wait out the
 	// call timeout. Queued notifications are unaffected.
-	if old, ok := oldWS.session.currentTransport().(*wmpSessionTransport); ok {
+	prevTransport := oldWS.session.currentTransport()
+	if old, ok := prevTransport.(*wmpSessionTransport); ok {
 		old.retire()
 	}
 
@@ -1120,6 +1121,10 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	oldWS.session.transportMu.Lock()
 	oldWS.session.transport = wmpTransport
 	oldWS.session.transportMu.Unlock()
+	// Child-flow starts interrupted by retire() are reissued on the new peer.
+	if old, ok := prevTransport.(*wmpSessionTransport); ok {
+		old.handOff(wmpTransport)
+	}
 
 	// Retire the old connection and wait for its pump to move everything it
 	// had queued into the event buffer, before the new pump starts, so
@@ -1734,11 +1739,81 @@ type wmpSessionTransport struct {
 	// held for the full call timeout.
 	retireCtx    context.Context
 	retireCancel context.CancelFunc
+
+	// successor is the transport that replaced this one on session.resume.
+	// handedOff is closed once it is set; a child-flow start that was in
+	// flight when this transport retired waits on it to be reissued there.
+	successor   *wmpSessionTransport
+	handedOff   chan struct{}
+	handoffOnce sync.Once
 }
 
 func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessionTransport {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &wmpSessionTransport{peer: peer, ct: ct, retireCtx: ctx, retireCancel: cancel}
+	return &wmpSessionTransport{peer: peer, ct: ct, retireCtx: ctx, retireCancel: cancel, handedOff: make(chan struct{})}
+}
+
+// handOff records next as the transport that replaced t. Called by
+// session.resume after the engine session's transport has been swapped, so
+// child-flow starts interrupted by retire() can be reissued on next.
+func (t *wmpSessionTransport) handOff(next *wmpSessionTransport) {
+	t.handoffOnce.Do(func() {
+		t.successor = next
+		if t.handedOff != nil {
+			close(t.handedOff)
+		}
+	})
+}
+
+// startChildFlow sends the wmp.flow.start for a sign/match sub-flow and waits
+// for the client's acknowledgement. If the transport is retired by a
+// session.resume while the acknowledgement is pending, the request is NOT
+// reported as a failure (which would make Session.Send fail and end the
+// parent flow before RequestSign/RequestMatch starts waiting for the result,
+// even though the child-flow table survives the resume). Instead it is
+// reissued, under the same child flow ID, on the replacement transport.
+func (t *wmpSessionTransport) startChildFlow(childFlowID, flowType string, params json.RawMessage) error {
+	callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
+	defer cancel()
+	var startResult wmp.FlowStartResult
+	err := t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
+		WMP:      t.wmpMeta(),
+		FlowType: flowType,
+		FlowID:   childFlowID,
+		Params:   params,
+	}, &startResult)
+	if err != nil && t.retireCtx != nil && t.retireCtx.Err() != nil {
+		go t.reissueChildFlow(childFlowID, flowType, params)
+		return nil
+	}
+	return err
+}
+
+// reissueChildFlow waits for the replacement transport and starts the child
+// flow there. On failure the child mapping is dropped and the parent's
+// sign/match wait is left to its own timeout or session end.
+func (t *wmpSessionTransport) reissueChildFlow(childFlowID, flowType string, params json.RawMessage) {
+	timer := time.NewTimer(childFlowStartTimeout)
+	defer timer.Stop()
+	var next *wmpSessionTransport
+	select {
+	case <-t.handedOff:
+		next = t.successor
+	case <-t.handler.session.closeCh:
+		return
+	case <-timer.C:
+	}
+	if next == nil {
+		t.handler.popChildFlow(childFlowID)
+		t.handler.adapter.logger.Warn("child flow start not reissued: no replacement transport",
+			zap.String("child_flow_id", childFlowID))
+		return
+	}
+	if err := next.startChildFlow(childFlowID, flowType, params); err != nil {
+		t.handler.popChildFlow(childFlowID)
+		t.handler.adapter.logger.Warn("child flow start failed on resumed transport",
+			zap.String("child_flow_id", childFlowID), zap.Error(err))
+	}
 }
 
 // retire aborts any in-flight blocking Call on this transport without closing
@@ -1844,16 +1919,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
-		callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
-		defer cancel()
-		var startResult wmp.FlowStartResult
-		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
-			WMP:      t.wmpMeta(),
-			FlowType: wmp.FlowTypeSign,
-			FlowID:   childFlowID,
-			Params:   paramsJSON,
-		}, &startResult)
-		return err
+		return t.startChildFlow(childFlowID, wmp.FlowTypeSign, paramsJSON)
 
 	case *MatchRequestMessage:
 		// Start a nested match sub-flow. Same pattern as sign.
@@ -1868,16 +1934,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
-		callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
-		defer cancel()
-		var startResult wmp.FlowStartResult
-		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
-			WMP:      t.wmpMeta(),
-			FlowType: "match",
-			FlowID:   childFlowID,
-			Params:   paramsJSON,
-		}, &startResult)
-		return err
+		return t.startChildFlow(childFlowID, "match", paramsJSON)
 
 	default:
 		// Fallback for engine messages with no dedicated WMP method
