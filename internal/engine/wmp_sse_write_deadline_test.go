@@ -121,3 +121,45 @@ func TestWMP_SSE_StreamOutlivesServerWriteTimeout(t *testing.T) {
 		t.Fatal("no event after the server WriteTimeout")
 	}
 }
+
+// flushFailWriter accepts writes but fails every flush after the first (the
+// initial header flush), like a connection that drops with data still buffered.
+type flushFailWriter struct {
+	hdr     http.Header
+	flushes int
+}
+
+func (f *flushFailWriter) Header() http.Header         { return f.hdr }
+func (f *flushFailWriter) WriteHeader(int)             {}
+func (f *flushFailWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (f *flushFailWriter) Flush()                      {}
+func (f *flushFailWriter) FlushError() error {
+	f.flushes++
+	if f.flushes > 1 {
+		return http.ErrHandlerTimeout
+	}
+	return nil
+}
+
+// An event whose flush failed must not count as delivered, or a reconnect
+// without Last-Event-ID would skip it for good.
+func TestWMP_SSE_FlushFailureDoesNotAdvanceDelivered(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	buf := a.getOrCreateEventBuffer(sid)
+	buf.append([]byte(`{"x":1}`))
+
+	req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := &flushFailWriter{hdr: http.Header{}}
+
+	done := make(chan struct{})
+	go func() { a.HandleWMPEvents(w, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSE handler did not stop after a failed flush")
+	}
+	assert.Zero(t, buf.delivered(), "a failed flush must not advance deliveredID")
+}

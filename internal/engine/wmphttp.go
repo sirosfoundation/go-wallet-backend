@@ -167,7 +167,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
@@ -195,7 +195,9 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	armWrite := func() { _ = rc.SetWriteDeadline(time.Now().Add(wmpSSEWriteTimeout)) }
 	armWrite()
-	flusher.Flush()
+	if err := rc.Flush(); err != nil {
+		return
+	}
 
 	// Events are appended to the session's buffer as they are emitted (see
 	// pumpEvents), whether or not a client is connected, and IDs are durable
@@ -218,11 +220,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 				return // client gone or too slow: stop, the event stays replayable
 			}
 			cursor = ev.ID
-			buf.markDelivered(ev.ID)
 		}
 		if len(events) > 0 {
 			armWrite()
-			flusher.Flush()
+			// Only a successful flush means the events left the server:
+			// advance the delivered mark after it, never before, so a
+			// connection dropped between Write and Flush cannot make the
+			// next one skip them (a duplicate is safer than a loss).
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			buf.markDelivered(cursor)
 		}
 		select {
 		case <-ctx.Done():
