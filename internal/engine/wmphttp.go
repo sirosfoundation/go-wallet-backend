@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
@@ -23,6 +24,13 @@ const (
 )
 
 const maxWMPRPCBodyBytes = 256 * 1024
+
+// wmpSSEWriteTimeout bounds every individual SSE write/flush. The stream as a
+// whole is long-lived (it outlives the http.Server WriteTimeout), but a
+// client that stops reading must not be able to pin the handler in a blocked
+// socket write indefinitely - closing the event buffer cannot interrupt one.
+// It is a variable so tests can shorten it.
+var wmpSSEWriteTimeout = 15 * time.Second
 
 // HandleWMPRPC handles POST /api/v2/wallet/rpc — a single JSON-RPC request/response.
 func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +188,13 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx
+
+	// Each write+flush gets its own fresh deadline (replacing the
+	// connection-wide WriteTimeout, which would cut the stream off); a
+	// writer without deadline support falls back to the server's own.
+	rc := http.NewResponseController(w)
+	armWrite := func() { _ = rc.SetWriteDeadline(time.Now().Add(wmpSSEWriteTimeout)) }
+	armWrite()
 	flusher.Flush()
 
 	// Events are appended to the session's buffer as they are emitted (see
@@ -198,11 +213,15 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		events, wake := buf.after(cursor)
 		for _, ev := range events {
-			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+			armWrite()
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data); err != nil {
+				return // client gone or too slow: stop, the event stays replayable
+			}
 			cursor = ev.ID
 			buf.markDelivered(ev.ID)
 		}
 		if len(events) > 0 {
+			armWrite()
 			flusher.Flush()
 		}
 		select {

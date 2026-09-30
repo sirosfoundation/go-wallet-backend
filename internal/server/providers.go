@@ -470,17 +470,6 @@ func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
 
-// clearWriteDeadline removes the http.Server WriteTimeout deadline for the
-// request, for long-lived streaming responses (SSE) that would otherwise be
-// cut off mid-stream. A writer that does not support deadlines is left alone
-// (the stream then behaves as before).
-func clearWriteDeadline() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
-		c.Next()
-	}
-}
-
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
@@ -493,9 +482,9 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
 	})
 	// GET /api/v2/wallet/events — SSE stream of WMP notifications (auth via Authorization: Bearer)
-	// The stream outlives the server's WriteTimeout, so it must clear the
-	// write deadline the connection was given.
-	router.GET(wsengine.WMPEventsPath, clearWriteDeadline(), func(c *gin.Context) {
+	// The stream outlives the server's WriteTimeout; the handler itself arms a
+	// fresh bounded write deadline around every write/flush.
+	router.GET(wsengine.WMPEventsPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
 	// GET /.well-known/wmp-configuration — public capability discovery, no auth
