@@ -1503,8 +1503,13 @@ func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing
 		assert.NotContains(t, string(data), TypeHandshakeComplete, "a revoked token must never get handshake_complete")
 	}
 	assert.True(t, hookRan.Load())
-	m.sessionsMu.RLock()
-	defer m.sessionsMu.RUnlock()
-	assert.Empty(t, m.sessions, "the refused session must not stay registered")
-	assert.Empty(t, m.userIndex)
+	// The close frame is written before the handler returns, and the
+	// deferred unregisterSession runs only then, so the client can observe
+	// the closed socket a moment before the bookkeeping is cleaned up.
+	// Wait for that rather than asserting at the instant of close.
+	assert.Eventually(t, func() bool {
+		m.sessionsMu.RLock()
+		defer m.sessionsMu.RUnlock()
+		return len(m.sessions) == 0 && len(m.userIndex) == 0
+	}, 2*time.Second, 5*time.Millisecond, "the refused session must not stay registered")
 }
