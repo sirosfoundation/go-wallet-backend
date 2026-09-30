@@ -163,7 +163,7 @@ func TestGetStatus_Success(t *testing.T) {
 		if r.URL.Path != "/admin/store/status/cat1/5" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"category":"cat1","idx":5,"status":1}`))
+		_, _ = w.Write([]byte(`{"category":"cat1","idx":5,"status":1,"label":"revoked","used":true}`))
 	}))
 	defer srv.Close()
 
@@ -172,7 +172,7 @@ func TestGetStatus_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if entry == nil || entry.Index != 5 || entry.Status != 1 {
+	if entry == nil || entry.Index != 5 || entry.Status != 1 || entry.Label != "revoked" || !entry.Used {
 		t.Errorf("unexpected entry: %+v", entry)
 	}
 }

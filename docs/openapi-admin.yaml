@@ -1022,9 +1022,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-        '400':
-          $ref: '#/components/responses/BadRequest'
+                $ref: '#/components/schemas/R2PSKeyList'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
@@ -1051,7 +1051,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/R2PSPublicKey'
         '404':
           $ref: '#/components/responses/NotFound'
         '400':
@@ -1082,7 +1082,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/R2PSStatusList'
         '404':
           $ref: '#/components/responses/NotFound'
         '400':
@@ -1119,7 +1119,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/R2PSStatusEntry'
         '404':
           $ref: '#/components/responses/NotFound'
         '400':
@@ -1169,7 +1169,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/R2PSStatusUpdate'
         '404':
           $ref: '#/components/responses/NotFound'
         '400':
@@ -1254,6 +1254,98 @@ components:
         service:
           type: string
           example: wallet-backend-admin
+
+    R2PSPublicKey:
+      type: object
+      description: A WSCD public key held by the R2PS service
+      required: [kid]
+      properties:
+        kid:
+          type: string
+        curve:
+          type: string
+          example: P-256
+        pub_key:
+          type: string
+          description: Base64-encoded public key
+        creation_time:
+          type: integer
+          format: int64
+          description: Unix time of key creation
+        client_id:
+          type: string
+
+    R2PSKeyList:
+      type: object
+      required: [count, keys]
+      properties:
+        count:
+          type: integer
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/R2PSPublicKey'
+
+    R2PSStatusEntry:
+      type: object
+      description: The status of one index in an R2PS status list
+      required: [category, idx, status]
+      properties:
+        category:
+          type: string
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
+          description: 0=valid, 1=revoked, 2=suspended
+        label:
+          type: string
+          description: Human-readable status label from R2PS
+        used:
+          type: boolean
+          description: Whether the index has been allocated to a credential
+
+    R2PSStatusListItem:
+      type: object
+      required: [idx, status]
+      properties:
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
+        label:
+          type: string
+
+    R2PSStatusList:
+      type: object
+      required: [category, count, entries]
+      properties:
+        category:
+          type: string
+        count:
+          type: integer
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/R2PSStatusListItem'
+
+    R2PSStatusUpdate:
+      type: object
+      description: Result of a status change
+      required: [category, idx, status]
+      properties:
+        category:
+          type: string
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
 
     ErrorResponse:
       type: object

@@ -159,7 +159,7 @@ func TestR2PSListStatuses_UpstreamError(t *testing.T) {
 
 func TestR2PSGetStatus_Success(t *testing.T) {
 	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"category":"cat1","idx":3,"status":0}`))
+		_, _ = w.Write([]byte(`{"category":"cat1","idx":3,"status":1,"label":"revoked","used":true}`))
 	})
 	defer cleanup()
 
@@ -169,6 +169,13 @@ func TestR2PSGetStatus_Success(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["label"] != "revoked" || got["used"] != true {
+		t.Errorf("label/used not passed through: %v", got)
 	}
 }
 

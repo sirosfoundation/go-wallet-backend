@@ -131,6 +131,8 @@ type StatusEntry struct {
 	Category string `json:"category"`
 	Index    int    `json:"idx"`
 	Status   int    `json:"status"` // 0=valid, 1=revoked, 2=suspended
+	Label    string `json:"label,omitempty"`
+	Used     bool   `json:"used"`
 }
 
 // PublicKeyInfo represents a WSCD public key from R2PS.
