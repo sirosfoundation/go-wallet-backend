@@ -2356,6 +2356,81 @@ func TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated(t 
 	assert.Equal(t, domain.InviteStatusActive, gotInvite.Status)
 }
 
+// TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent
+// covers the ordering of identity:bound (#66): it is emitted only after the
+// user is persisted, so an atomic invite-claim failure leaves no bound record.
+func TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:          domain.TenantID("tenant-invite-fail"),
+		Name:        "Invite Fail Tenant",
+		DisplayName: "Invite Fail Tenant",
+		Enabled:     true,
+	}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenant))
+
+	invite := &domain.Invite{
+		ID:        "invite-1",
+		TenantID:  tenant.ID,
+		Code:      "INVITE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, baseStore.Invites().Create(ctx, invite))
+
+	wrapped := &storeWithInviteOverride{
+		Store: baseStore,
+		invites: &erroringInviteStore{
+			InviteStore: baseStore.Invites(),
+			failCode:    invite.Code,
+			err:         errors.New("simulated atomic claim failure"),
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+	auditEvents := attachIdentityAudit(t, svc, config.AuditIdentityBound)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Invite Fail User",
+		TenantID:    string(tenant.ID),
+		InviteCode:  invite.Code,
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID:     beginResp.ChallengeID,
+		Credential:      json.RawMessage(regResponse),
+		DisplayName:     "Invite Fail User",
+		OIDCGateBinding: &OIDCGateBinding{Issuer: "https://idp.example.com", Subject: "alice"},
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	// The registration was rejected, so the identity was never bound and no
+	// immutable "bound" record may exist for it (#66).
+	assert.Empty(t, auditEvents.URIs(), "a failed registration must not emit identity:bound")
+}
+
 // TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed is
 // the defense-in-depth companion to
 // TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected: even
@@ -2815,6 +2890,8 @@ func TestBEREncodedECDSASignature(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -2892,10 +2969,13 @@ func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require OIDC gate when binding is missing")
+	assert.Equal(t, []string{"urn:siros:audit:identity:gate_bypass"}, auditEvents.URIs())
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -2973,6 +3053,8 @@ func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+	require.Equal(t, []string{"urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "issuer", auditEvents.Payloads()[0]["reason"])
 }
 
 // TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience covers a Copilot
@@ -3398,6 +3480,8 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -3485,10 +3569,15 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrIdentityBindingMismatch, "Should fail when binding doesn't match stored identity")
+	// The identity was bound at registration; the failed login is a mismatch.
+	require.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "identity", auditEvents.Payloads()[1]["reason"])
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -3572,6 +3661,7 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	require.NoError(t, err, "Login should succeed when OIDC binding matches stored identity")
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
+	assert.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:verified"}, auditEvents.URIs())
 }
 
 // ============================================================================

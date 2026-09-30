@@ -86,6 +86,7 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		// Extract Bearer token
 		rawToken := extractBearer(c)
 		if rawToken == "" {
+			logAuthReject(logger, c, "missing_or_malformed_bearer_token")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -96,7 +97,7 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		// this function's doc comment).
 		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
-			logger.Debug("Token validation failed", zap.Error(err))
+			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return

@@ -10,7 +10,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -18,7 +17,6 @@ import (
 )
 
 var (
-	ErrInvalidCredentials     = errors.New("invalid credentials")
 	ErrUserExists             = errors.New("user already exists")
 	ErrPrivateDataConflict    = errors.New("private data conflict")
 	ErrLastWebAuthnCredential = errors.New("cannot delete last webauthn credential")
@@ -117,16 +115,6 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 		UpdatedAt:   time.Now(),
 	}
 
-	// Hash password if provided
-	if req.Password != nil {
-		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
-		if err != nil {
-			return nil, fmt.Errorf("failed to hash password: %w", err)
-		}
-		hashStr := string(hash)
-		user.PasswordHash = &hashStr
-	}
-
 	// Generate DID
 	// TODO: Implement proper DID generation based on key material
 	user.DID = domain.HolderDID(user.UUID.String())
@@ -143,37 +131,6 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 
 	s.logger.Debug("User registered", zap.String("user_id", user.UUID.String()))
 	return user, nil
-}
-
-// Login authenticates a user with username/password
-// Deprecated: Use WebAuthn authentication instead.
-// Password-based authentication will be removed in a future version.
-func (s *UserService) Login(ctx context.Context, username, password string) (*domain.User, string, error) {
-	user, err := s.store.Users().GetByUsername(ctx, username)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, "", ErrInvalidCredentials
-		}
-		return nil, "", fmt.Errorf("failed to get user: %w", err)
-	}
-
-	// Verify password
-	if user.PasswordHash == nil {
-		return nil, "", ErrInvalidCredentials
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(password)); err != nil {
-		return nil, "", ErrInvalidCredentials
-	}
-
-	// Generate JWT token (default tenant for deprecated password login)
-	token, err := s.generateToken(user, domain.DefaultTenantID)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to generate token: %w", err)
-	}
-
-	s.logger.Info("User logged in")
-	return user, token, nil
 }
 
 // GetUserByID retrieves a user by ID

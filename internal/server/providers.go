@@ -40,6 +40,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// gateRateLimiter is shared by the /user/* gates and the AS passkey gates,
+	// so both draw from the same per-IP and per-tenant buckets (#65).
+	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
 
 // NewAuthProvider creates a new auth route provider
@@ -48,13 +51,14 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
-		cfg:            cfg,
-		logger:         logger,
-		store:          store,
-		services:       services,
-		handlers:       handlers,
-		roles:          roles,
-		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
+		cfg:             cfg,
+		logger:          logger,
+		store:           store,
+		services:        services,
+		handlers:        handlers,
+		roles:           roles,
+		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
+		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
 	}
 }
 
@@ -97,6 +101,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
 	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
 	validatorCache := middleware.NewValidatorCache(httpClient, p.logger)
+	gateLimit := p.gateRateLimiter.Middleware()
 
 	// Public auth routes (no authentication required)
 	public := router.Group("/")
@@ -109,6 +114,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		registration := userBase.Group("")
 		registration.Use(
 			middleware.NoCacheMiddleware(),
+			gateLimit,
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
 			p.legacyIssuanceGate(),
 		)
@@ -121,6 +127,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		login := userBase.Group("")
 		login.Use(
 			middleware.NoCacheMiddleware(),
+			gateLimit,
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
 			p.legacyIssuanceGate(),
 		)
@@ -615,7 +622,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			services.WebAuthn,
 			store,
 			services.TokenBlacklist,
-			cfg.HTTPClient.NewHTTPClient(0),
+			// IdP-scoped client: the AS only talks to the operator's OIDC
+			// providers, which http_client.trusted_idp_hosts may place on
+			// private addresses (#349).
+			cfg.HTTPClient.NewIdPHTTPClient(0),
 			logger,
 		)
 		if err != nil {
@@ -627,6 +637,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			}
 			return nil, fmt.Errorf("failed to initialize AS module: %w", err)
 		}
+		asModule.SetOIDCGateRateLimiter(authProvider.gateRateLimiter)
 
 		// Create go-tokenauth validator for protecting resource endpoints.
 		issuer := cfg.AS.Issuer

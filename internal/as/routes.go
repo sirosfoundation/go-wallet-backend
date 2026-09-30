@@ -45,13 +45,17 @@ type ASModule struct {
 	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
 	store          storage.Store
 	validatorCache *middleware.ValidatorCache
+	// gateLimit, when set, rate limits token-bearing requests to the passkey
+	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
+	gateLimit gin.HandlerFunc
 }
 
 // NewASModule creates and initializes the AS module.
 // The ctx parameter controls the lifecycle of background goroutines (session cleanup).
-// httpClient is used for the passkey OIDC gate's issuer discovery and JWKS
-// fetches (see RegisterRoutes) - callers should pass the same configured,
-// SSRF-guarded client used elsewhere (e.g. cfg.HTTPClient.NewHTTPClient(0)),
+// httpClient is used for every request to an OIDC identity provider: the
+// login flow's discovery and token exchange, and the passkey OIDC gate's
+// issuer discovery and JWKS fetches (see RegisterRoutes) - callers should
+// pass a configured, SSRF-guarded client (cfg.HTTPClient.NewIdPHTTPClient(0)),
 // not nil, or those unauthenticated fetches bypass the private-IP/HTTPS
 // guards the rest of the codebase applies. A nil value still works (falls
 // back to a bare client with a short default timeout) for callers that
@@ -133,7 +137,7 @@ func NewASModule(
 	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
 	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
 	// already requires it to be present and >=32 bytes.
-	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), logger)
+	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
 	// RegisterRoutes). See httpClient's doc comment above for why this must
@@ -154,6 +158,24 @@ func NewASModule(
 		store:          store,
 		validatorCache: validatorCache,
 	}, nil
+}
+
+// SetOIDCGateRateLimiter installs the rate limiter that runs in front of the
+// passkey OIDC gates. Call it before RegisterRoutes; the same limiter is
+// meant to be shared with the /user/* gates so both draw from one set of
+// buckets.
+func (m *ASModule) SetOIDCGateRateLimiter(l *middleware.OIDCGateRateLimiter) {
+	if l != nil {
+		m.gateLimit = l.Middleware()
+	}
+}
+
+// gateLimitMiddleware returns the installed limiter, or a pass-through.
+func (m *ASModule) gateLimitMiddleware() gin.HandlerFunc {
+	if m.gateLimit != nil {
+		return m.gateLimit
+	}
+	return func(c *gin.Context) { c.Next() }
 }
 
 // RegisterRoutes registers all AS endpoints on the given router group.
@@ -179,7 +201,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	{
 		// Registration routes (with OIDC registration gate).
 		registration := passkey.Group("")
-		registration.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
 		{
 			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
@@ -187,7 +209,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 		// Login routes (with OIDC login gate).
 		login := passkey.Group("")
-		login.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
 		{
 			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
 			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
