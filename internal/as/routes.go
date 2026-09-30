@@ -44,6 +44,8 @@ type ASModule struct {
 	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
 	store          storage.Store
 	validatorCache *middleware.ValidatorCache
+	// cancel stops the module's background goroutines (session cleanup).
+	cancel context.CancelFunc
 	// gateLimit, when set, rate limits token-bearing requests to the passkey
 	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
 	gateLimit gin.HandlerFunc
@@ -75,10 +77,15 @@ func NewASModule(
 	if err != nil {
 		return nil, err
 	}
-	// Release HSM sessions on every later failure so a retried init cannot
-	// leak them.
+	// The module owns a child context for its background goroutines (session
+	// cleanup) so Close, or a failed construction, can stop them even when
+	// the caller passed a never-cancelled context.
+	ctx, cancel := context.WithCancel(ctx)
+	// Release HSM sessions and stop background goroutines on every later
+	// failure so a retried init cannot leak either.
 	defer func() {
 		if err != nil {
+			cancel()
 			_ = km.Close()
 		}
 	}()
@@ -156,6 +163,7 @@ func NewASModule(
 		Config:         cfg,
 		store:          store,
 		validatorCache: validatorCache,
+		cancel:         cancel,
 	}, nil
 }
 
@@ -311,7 +319,13 @@ var newPKCS11Signer = func(cfg *signing.PKCS11Config) (crypto.Signer, error) {
 
 // Close releases resources held by the module (HSM sessions).
 func (m *ASModule) Close() error {
-	if m == nil || m.KeyManager == nil {
+	if m == nil {
+		return nil
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.KeyManager == nil {
 		return nil
 	}
 	return m.KeyManager.Close()
