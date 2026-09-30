@@ -46,7 +46,9 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 // NewReadOnlyStore connects like NewStore but performs no startup writes: no
 // default tenant, no index creation. It is for a process that only reads, such
 // as a standalone engine looking up a user's token cut-off, so its database
-// principal needs read rights on the users collection and nothing more.
+// principal needs read rights on the users and user_deletion_tombstones
+// collections and nothing more (the cut-off gate reads the tombstone whenever
+// a user has no record, and fails closed if that read is denied).
 func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	return newStore(ctx, cfg, false)
 }

@@ -514,6 +514,13 @@ Expired tombstones are removed by two mechanisms:
   monitor, which can lag by about a minute. Running it on every replica is
   harmless.
 
+A standalone engine (no backend role in the process) opens storage read-only
+and reads the tombstone whenever a token's user has no record, to tell a
+deleted account from an external identity. Its MongoDB principal therefore
+needs read access to both the `users` and `user_deletion_tombstones`
+collections (and nothing else); without the tombstone read, such tokens fail
+closed with a storage error at the handshake.
+
 ## Scaling Guidelines
 
 ### Vertical Scaling

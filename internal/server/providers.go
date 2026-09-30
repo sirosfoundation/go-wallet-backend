@@ -504,7 +504,11 @@ func (p *BackendProvider) TokenGate() *tokengate.Gate {
 // engine that runs without the backend role in the same process. It opens
 // the configured storage backend read-only (backend.NewReadOnly: no default
 // tenant creation, no index creation, so the database principal needs read
-// rights on the users collection only) and uses it for user lookups only. With no persistent storage configured (memory)
+// rights on the users and user_deletion_tombstones collections only: a
+// token whose user has no record is refused if a deletion tombstone exists,
+// so the gate reads the tombstone too and fails closed, refusing the token, if
+// that read is denied) and uses it for user lookups only. With no persistent
+// storage configured (memory)
 // there is nothing to consult: the caller gets a nil gate and must warn that
 // pre-suspension tokens are not cut off at the engine handshake in that
 // deployment.

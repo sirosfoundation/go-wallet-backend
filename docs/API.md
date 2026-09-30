@@ -290,7 +290,9 @@ logs a warning at startup and relies on the token lifetime. There is no
 second source of truth for the cut-off, so such an engine opens the
 configured storage backend read-only - no default-tenant creation and no index
 creation for MongoDB - and its database principal needs read rights on the
-users collection only. Being unable to open it is deliberately
+`users` and `user_deletion_tombstones` collections only (a token whose user
+has no record is checked against the deletion tombstone, and a denied read
+fails closed: the token is refused with a storage error). Being unable to open it is deliberately
 fatal at startup rather than a warning: an engine that came up with the gate
 silently off would accept tokens the lifecycle had already revoked, and
 nothing would say so. A deployment that does not want the dependency leaves
