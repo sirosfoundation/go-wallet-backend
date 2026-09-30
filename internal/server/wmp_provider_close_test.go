@@ -2,6 +2,7 @@ package server
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,26 +13,43 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
+// cleanupLoops counts live WMP adapter cleanup goroutines, by looking for them
+// in a full goroutine dump. Counting goroutines with
+// runtime.NumGoroutine is racy: unrelated goroutines from earlier tests exit
+// concurrently and skew the count in either direction.
+func cleanupLoops() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), "(*WMPAdapter).cleanupLoop")
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
 // EngineProvider.Close must stop the WMP adapter's cleanup goroutine.
 func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := &config.Config{}
 	manager := wsengine.NewManager(cfg, logger)
 
-	before := runtime.NumGoroutine()
+	// Other tests in this package may leave their own adapters running, so
+	// compare against the baseline rather than expecting zero.
+	before := cleanupLoops()
 	adapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
-	if runtime.NumGoroutine() <= before {
-		t.Fatal("expected the adapter to start a goroutine")
+	if cleanupLoops() != before+1 {
+		t.Fatal("expected the adapter to start its cleanup goroutine")
 	}
 
 	provider := &EngineProvider{cfg: cfg, logger: logger, manager: manager, wmpAdapter: adapter}
 	provider.Close()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+	for cleanupLoops() > before && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := runtime.NumGoroutine(); got > before {
-		t.Fatalf("goroutine leaked after Close: before=%d after=%d", before, got)
+	if cleanupLoops() > before {
+		t.Fatal("WMP cleanup goroutine still running after Close")
 	}
 }
