@@ -1541,10 +1541,13 @@ func (r *responseStash) broadcastLocked() {
 // stashAction parks an action for another flow, unless that flow no longer
 // exists (nothing would ever consume it).
 func (s *Session) stashAction(a *FlowActionMessage) {
+	// The read lock is held through the insertion: removeFlow takes the write
+	// lock before dropFlow cleans the stash, so a removal either happens
+	// before this check (nothing is stashed) or waits for the insertion and
+	// its dropFlow then clears the entry. Lock order is flowsMu -> stash.mu.
 	s.flowsMu.RLock()
-	_, ok := s.flows[a.FlowID]
-	s.flowsMu.RUnlock()
-	if !ok {
+	defer s.flowsMu.RUnlock()
+	if _, ok := s.flows[a.FlowID]; !ok {
 		return
 	}
 	r := &s.stash
