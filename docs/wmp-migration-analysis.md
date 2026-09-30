@@ -120,7 +120,7 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 |---------|-----------|----------|
 | OAuth redirects | Connection dies, must reconnect + resume | SSE auto-reconnects with `Last-Event-ID`; POST requests are stateless |
 | Tenant routing | Must establish at handshake, maintain for lifetime | Every POST carries the `Authorization` bearer token; the tenant is derived from its validated claims |
-| Load balancing | Sticky sessions required | Standard HTTP load balancing; SSE can reconnect to any instance |
+| Load balancing | Sticky sessions required | Plain HTTP (no upgrade), but session state is process-local, so RPC POSTs and SSE reconnects still need session affinity to the same instance (see the caveat below); no per-connection upgrade handling |
 | Mobile WebView | Connection lost on background/navigate | SSE reconnects on foreground; pending POSTs just retry |
 | Proxy/firewall | Upgrade negotiation blocked by some | Standard HTTP/2, universally supported |
 | Code complexity | 1200+ lines of connection management | ~200 lines (EventSource + fetch) |
@@ -850,11 +850,17 @@ Week 8: Cleanup
    needed — the `Authorization` header on every SSE connection.
 
 2. ~~Event buffer sizing and eviction policy?~~
-   **Decided**: Flow-scoped buffer with 200-event hard cap per session.
-   Keep all events for active flows; discard completed/errored flow events
-   after 30s grace period. Typical flows produce ~7-15 events, so the cap
-   is generous. Batch issuance (`count=N`) is a single event regardless of
-   batch size — it doesn't multiply events.
+   **Decided (as implemented)**: one session-wide ring buffer holding the
+   last 200 events (`maxWMPBufferedEvents`); when it is full the oldest event
+   is dropped, whichever flow it belongs to. There is no flow-aware
+   retention: events of active flows are not pinned, and events of completed
+   or errored flows are not evicted on a timer. A client that is away long
+   enough for more than 200 events to accumulate loses the oldest ones on
+   replay, including those of a still-active flow; on `wmp.session.resume`
+   the server additionally re-sends the latest `flow.progress` of each active
+   flow so flow state can be recovered. Typical flows produce ~7-15 events, so
+   the cap is generous. Batch issuance (`count=N`) is a single event
+   regardless of batch size. Flow-aware retention would be a future change.
 
 3. ~~Should tenant context be a WMP concept or application-level?~~
    **Decided**: Application-level, derived from the bearer token. WMP itself has
