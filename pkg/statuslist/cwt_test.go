@@ -30,6 +30,7 @@ type cwtOpts struct {
 	iss       string
 	noIat     bool
 	exp       time.Time
+	nbf       time.Time
 	claims    map[int64]any // raw overrides applied last (type-violation tests)
 	bits      int
 	values    map[int]int
@@ -114,6 +115,9 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 	}
 	if !o.exp.IsZero() {
 		claims[cwtClaimExp] = o.exp.Unix()
+	}
+	if !o.nbf.IsZero() {
+		claims[cwtClaimNbf] = o.nbf.Unix()
 	}
 	for k, v := range o.claims {
 		claims[k] = v
@@ -303,6 +307,7 @@ func TestCWT_ClaimTypeViolations(t *testing.T) {
 		{"exp as text", cwtOpts{claims: map[int64]any{cwtClaimExp: "1"}}, "exp"},
 		{"exp as float", cwtOpts{claims: map[int64]any{cwtClaimExp: 1.5}}, "exp"},
 		{"exp as bytes", cwtOpts{claims: map[int64]any{cwtClaimExp: []byte{1}}}, "exp"},
+		{"nbf as text", cwtOpts{claims: map[int64]any{cwtClaimNbf: "1"}}, "nbf"},
 		{"iat as text", cwtOpts{claims: map[int64]any{cwtClaimIat: "1"}}, "iat"},
 		{"ttl as text", cwtOpts{claims: map[int64]any{cwtClaimTTL: "900"}}, "ttl"},
 		{"legacy ttl as text", cwtOpts{legacy: true, claims: map[int64]any{cwtClaimLegacyTTL: "900"}}, "ttl"},
@@ -337,10 +342,33 @@ func TestCWT_ClaimTypeViolations(t *testing.T) {
 	}
 	// Sanity: the same claims with correct types are accepted.
 	c, uri, _ := serveCWT(t, func(u string) []byte {
-		return makeCWT(t, cwtOpts{sub: u, iss: "https://issuer.example", claims: map[int64]any{cwtClaimExp: future}})
+		return makeCWT(t, cwtOpts{sub: u, iss: "https://issuer.example", claims: map[int64]any{cwtClaimExp: future, cwtClaimNbf: 1}})
 	}, mediaTypeCWT, trustAll)
 	if err := c.Check(ctx, &Reference{Idx: 1, URI: uri}); err != nil {
 		t.Fatalf("valid claims: %v", err)
+	}
+}
+
+func TestCWT_NotBefore(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		nbf     time.Time
+		wantErr bool
+	}{
+		{"future nbf rejected", time.Now().Add(time.Hour), true},
+		{"past nbf accepted", time.Now().Add(-time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, uri, _ := serveCWT(t, func(u string) []byte { return makeCWT(t, cwtOpts{sub: u, nbf: tc.nbf}) }, mediaTypeCWT, trustAll)
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if tc.wantErr != (err != nil) || errors.Is(err, ErrRevoked) {
+				t.Fatalf("wantErr=%v got %v", tc.wantErr, err)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "nbf") {
+				t.Fatalf("got %v", err)
+			}
+		})
 	}
 }
 

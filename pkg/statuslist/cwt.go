@@ -35,6 +35,7 @@ const (
 	cwtClaimIss = 1
 	cwtClaimSub = 2
 	cwtClaimExp = 4
+	cwtClaimNbf = 5
 	cwtClaimIat = 6
 	// The draft registers status_list as 65533 and ttl as 65534. vc#703
 	// (SUNET/vc pkg/tokenstatuslist) still emits status_list=65534 and
@@ -135,7 +136,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 		name  string
 	}{
 		{&lc.iat, cwtClaimIat, "iat"}, {&lc.exp, cwtClaimExp, "exp"},
-		{&lc.ttl, ttlLabel, "ttl"},
+		{&lc.nbf, cwtClaimNbf, "nbf"}, {&lc.ttl, ttlLabel, "ttl"},
 	} {
 		if *f.dst, err = cwtInt(claims, f.label, f.name); err != nil {
 			return 0, nil, time.Time{}, err

@@ -311,6 +311,7 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 		Iss        string `json:"iss"`
 		Iat        *int64 `json:"iat"`
 		Exp        *int64 `json:"exp"`
+		Nbf        *int64 `json:"nbf"`
 		TTL        *int64 `json:"ttl"`
 		StatusList *struct {
 			Bits int    `json:"bits"`
@@ -328,17 +329,17 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 		return 0, nil, time.Time{}, fmt.Errorf("status list lst: %w", err)
 	}
 	return c.accept(ctx, uri, km, listClaims{
-		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, ttl: claims.TTL,
+		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, nbf: claims.Nbf, ttl: claims.TTL,
 		bits: claims.StatusList.Bits, lst: lst,
 	})
 }
 
 // listClaims is the form-independent content of a Status List Token.
 type listClaims struct {
-	sub, iss      string
-	iat, exp, ttl *int64
-	bits          int
-	lst           []byte // zlib-compressed, not base64
+	sub, iss           string
+	iat, exp, nbf, ttl *int64
+	bits               int
+	lst                []byte // zlib-compressed, not base64
 }
 
 // accept applies the claim checks shared by the JWT and CWT forms, inflates
@@ -358,6 +359,9 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	expires := now.Add(defaultCacheTTL)
 	if lc.ttl != nil && *lc.ttl > 0 {
 		expires = time.Unix(*lc.iat, 0).Add(time.Duration(*lc.ttl) * time.Second)
+	}
+	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
+		return 0, nil, time.Time{}, errors.New("status list token is not yet valid (nbf)")
 	}
 	if lc.exp != nil {
 		exp := time.Unix(*lc.exp, 0)

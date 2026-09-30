@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +46,7 @@ func packList(t *testing.T, bits int, values map[int]int, size int) string {
 
 type tokenOpts struct {
 	typ, sub string
-	exp      time.Time
+	exp, nbf time.Time
 	bits     int
 	values   map[int]int
 	key      *ecdsa.PrivateKey
@@ -65,6 +66,9 @@ func makeToken(t *testing.T, o tokenOpts) string {
 	}
 	if !o.exp.IsZero() {
 		claims["exp"] = o.exp.Unix()
+	}
+	if !o.nbf.IsZero() {
+		claims["nbf"] = o.nbf.Unix()
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	tok.Header["typ"] = o.typ
@@ -311,5 +315,29 @@ func TestCheck_RequiresIat(t *testing.T) {
 	err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if err == nil || errors.Is(err, ErrRevoked) {
 		t.Fatalf("token without iat must be rejected as unverifiable: %v", err)
+	}
+}
+
+func TestCheck_NotBefore(t *testing.T) {
+	ctx := context.Background()
+	key := newKey(t)
+	for _, tc := range []struct {
+		name    string
+		nbf     time.Time
+		wantErr bool
+	}{
+		{"future nbf rejected", time.Now().Add(time.Hour), true},
+		{"past nbf accepted", time.Now().Add(-time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, uri, _ := serve(t, func(u string) string { return makeToken(t, tokenOpts{sub: u, key: key, nbf: tc.nbf}) }, "")
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if tc.wantErr != (err != nil) || errors.Is(err, ErrRevoked) {
+				t.Fatalf("wantErr=%v got %v", tc.wantErr, err)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "nbf") {
+				t.Fatalf("got %v", err)
+			}
+		})
 	}
 }
