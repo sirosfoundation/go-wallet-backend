@@ -39,8 +39,8 @@ pattern — not streaming.
 **HTTP+SSE as primary transport** with WebSocket as optional fallback:
 
 ```
-POST /wmp/rpc                     → JSON-RPC requests (flow.start, flow.action, etc.)
-GET  /wmp/events?session_id=...   → SSE stream of server notifications (progress, sign/match sub-flow starts, etc.)
+POST /api/v2/wallet/rpc                     → JSON-RPC requests (flow.start, flow.action, etc.)
+GET  /api/v2/wallet/events?session_id=...   → SSE stream of server notifications (progress, sign/match sub-flow starts, etc.)
 ```
 
 This eliminates all WebSocket connection management while preserving the exact
@@ -97,16 +97,16 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 │  Client                                Server                           │
 │  ──────                                ──────                           │
 │                                                                         │
-│  POST /wmp/rpc ───────────────────────►  Handle JSON-RPC request        │
+│  POST /api/v2/wallet/rpc ─────────────►  Handle JSON-RPC request        │
 │    {method: "wmp.session.create"}        Return JSON-RPC response        │
 │  ◄─────────────────────────────────────  {result: {session_id: "..."}}  │
 │                                                                         │
-│  GET /wmp/events?session_id=... ──────►  Open SSE stream                │
-│  ◄─ event: notification ──────────────   Server pushes notifications    │
+│  GET /api/v2/wallet/events ───────────►  Open SSE stream                │
+│  ◄─ event: wmp ───────────────────   Server pushes notifications    │
 │     data: {method: "wmp.flow.progress",  (progress, sub-flow starts,     │
 │            params: {step: "..."}}         complete, etc.)                 │
 │                                                                         │
-│  POST /wmp/rpc ───────────────────────►  Handle action                  │
+│  POST /api/v2/wallet/rpc ─────────────►  Handle action                  │
 │    {method: "wmp.flow.action",           Return acknowledgment          │
 │     params: {action: "consent"}}                                        │
 │  ◄─────────────────────────────────────  {result: {status: "accepted"}} │
@@ -119,7 +119,7 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 | Concern | WebSocket | HTTP+SSE |
 |---------|-----------|----------|
 | OAuth redirects | Connection dies, must reconnect + resume | SSE auto-reconnects with `Last-Event-ID`; POST requests are stateless |
-| Tenant routing | Must establish at handshake, maintain for lifetime | Every POST carries `Authorization` + `X-Tenant-ID` headers |
+| Tenant routing | Must establish at handshake, maintain for lifetime | Every POST carries the `Authorization` bearer token; the tenant is derived from its validated claims |
 | Load balancing | Sticky sessions required | Standard HTTP load balancing; SSE can reconnect to any instance |
 | Mobile WebView | Connection lost on background/navigate | SSE reconnects on foreground; pending POSTs just retry |
 | Proxy/firewall | Upgrade negotiation blocked by some | Standard HTTP/2, universally supported |
@@ -130,7 +130,7 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 ### SSE Reconnection
 
 The native browser `EventSource` API cannot send custom headers (no
-`Authorization`, no `X-Tenant-ID`). We use **`@microsoft/fetch-event-source`**
+`Authorization`). We use **`@microsoft/fetch-event-source`**
 (2.8k stars, MIT, ~3KB) which wraps `fetch()` to provide:
 
 - Custom headers on the SSE connection
@@ -143,10 +143,9 @@ The native browser `EventSource` API cannot send custom headers (no
 import { fetchEventSource } from '@microsoft/fetch-event-source';
 
 const ctrl = new AbortController();
-await fetchEventSource(`/wmp/events?session_id=${sessionId}`, {
+await fetchEventSource(`/api/v2/wallet/events?session_id=${sessionId}`, {
   headers: {
     'Authorization': `Bearer ${token}`,
-    'X-Tenant-ID': tenantId,
   },
   signal: ctrl.signal,
   onmessage(ev) {
@@ -166,13 +165,16 @@ await fetchEventSource(`/wmp/events?session_id=${sessionId}`, {
 The server includes event IDs in each SSE frame:
 
 ```
-id: evt-42
-event: notification
-data: {"method":"wmp.flow.progress","params":{...}}
+id: 42
+event: wmp
+data: {"jsonrpc":"2.0","method":"wmp.flow.progress","params":{...}}
 ```
 
-On reconnect, `fetch-event-source` sends `Last-Event-ID: evt-42` and the
-server replays missed events.
+Event IDs are decimal integers (a per-session counter that survives reconnects
+and `wmp.session.resume`). On reconnect, `fetch-event-source` sends
+`Last-Event-ID: 42` and the server replays the events after that ID. A
+`Last-Event-ID` that is not a decimal integer is ignored and replay falls back
+to the first event not yet written to any connection.
 
 This means **OAuth redirects are a non-issue** — when the user returns from the
 authorization server, the SSE stream reconnects and the server replays any missed
@@ -184,10 +186,11 @@ The go-wmp `httpsse` package already provides the SSE transport. The backend
 exposes two endpoints:
 
 ```go
-// POST /wmp/rpc — handles JSON-RPC requests
+// POST /api/v2/wallet/rpc — handles JSON-RPC requests
 func handleRPC(w http.ResponseWriter, r *http.Request) {
-    sessionID := extractSession(r)  // from header or query
-    tenantID := r.Header.Get("X-Tenant-ID")
+    sessionID := r.Header.Get("Wmp-Session-Id") // empty for session.create
+    // User and tenant come from the validated bearer token, never from a header.
+    userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
     
     var req wmp.Request
     json.NewDecoder(r.Body).Decode(&req)
@@ -199,7 +202,7 @@ func handleRPC(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(result)
 }
 
-// GET /wmp/events — SSE stream for server→client notifications  
+// GET /api/v2/wallet/events — SSE stream for server→client notifications
 func handleEvents(w http.ResponseWriter, r *http.Request) {
     sessionID := r.URL.Query().Get("session_id")
     lastEventID := r.Header.Get("Last-Event-ID")
@@ -213,7 +216,7 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
     
     // Stream new events
     for event := range session.Events() {
-        fmt.Fprintf(w, "id: %s\nevent: notification\ndata: %s\n\n", event.ID, event.Data)
+        fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", event.ID, event.Data)
         flusher.Flush()
     }
 }
@@ -228,26 +231,24 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
   private events: EventSource | null = null;
   private sessionId: string | null = null;
   
-  async connect(token: string, tenantId: string): Promise<void> {
-    // Create session via POST
+  async connect(token: string): Promise<void> {
+    this.token = token;
+    // Create the session via POST. Authentication is inline: params.auth is
+    // required, and the server validates the token (and derives user and
+    // tenant from it) as part of session.create. There is no separate
+    // wmp.session.authenticate step.
     const result = await this.rpc('wmp.session.create', {
       wmp: { version: '0.1' },
-      security: { mode: 'tls' }
+      security: { mode: 'tls' },
+      auth: { type: 'bearer', token }
     });
     this.sessionId = result.wmp.session_id;
     
-    // Authenticate
-    await this.rpc('wmp.session.authenticate', {
-      wmp: { version: '0.1', session_id: this.sessionId },
-      auth: { type: 'bearer', token }
-    });
-    
     // Open SSE stream for notifications (with auth headers)
     this.ctrl = new AbortController();
-    fetchEventSource(`/wmp/events?session_id=${this.sessionId}`, {
+    fetchEventSource(`/api/v2/wallet/events?session_id=${this.sessionId}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
-        'X-Tenant-ID': tenantId,
       },
       signal: this.ctrl.signal,
       onmessage: (ev) => this.handleNotification(JSON.parse(ev.data)),
@@ -274,12 +275,13 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
   }
   
   private async rpc(method: string, params: any): Promise<any> {
-    const resp = await fetch('/wmp/rpc', {
+    const resp = await fetch('/api/v2/wallet/rpc', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${this.token}`,
-        'X-Tenant-ID': this.tenantId,
+        // Required for every method except session.create / session.resume.
+        ...(this.sessionId ? { 'Wmp-Session-Id': this.sessionId } : {}),
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -382,7 +384,7 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 
 | Engine (custom) | WMP (JSON-RPC 2.0) | Notes |
 |----------------|---------------------|-------|
-| `{"type":"handshake","app_token":"..."}` | `wmp.session.create` + `wmp.session.authenticate` | WMP separates session creation from auth |
+| `{"type":"handshake","app_token":"..."}` | `wmp.session.create` with inline `params.auth` | Authentication happens inside `session.create`; `wmp.session.authenticate` is not implemented by this server (it answers method-not-found) |
 | `{"type":"handshake_complete","session_id":"...","capabilities":[...]}` | `SessionCreateResult{WMP, Capabilities, Security}` | WMP capabilities are typed `map[string]json.RawMessage` |
 | `{"type":"flow_start","protocol":"oid4vci",...}` | `wmp.flow.start` with `flow_type:"oid4vci"` | Direct map; WMP adds `timeout` parameter |
 | `{"type":"flow_progress","step":"...","payload":{}}` | `wmp.flow.progress` notification | Direct map |
@@ -645,13 +647,13 @@ The engine's `UserFacingMessage()` function maps to the WMP `ErrorMessage()` pat
 
 | Task | Effort | Priority |
 |------|--------|----------|
-| Add `POST /wmp/rpc` endpoint (JSON-RPC dispatch to `wmp.Peer`) | Medium | P0 |
-| Add `GET /wmp/events` SSE endpoint (session-scoped notification stream) | Medium | P0 |
+| Add `POST /api/v2/wallet/rpc` endpoint (JSON-RPC dispatch to `wmp.Peer`) | Medium | P0 |
+| Add `GET /api/v2/wallet/events` SSE endpoint (session-scoped notification stream) | Medium | P0 |
 | Implement `FlowBridge` (goroutine bridge for engine coroutine handlers) | Medium | P0 |
 | Wire engine `FlowHandlerFactory` to WMP `Profile` registration | Small | P0 |
-| Map engine `HandshakeMessage` to `wmp.session.create` + `wmp.session.authenticate` | Small | P0 |
-| JWT auth middleware for `/wmp/rpc` and `/wmp/events` | Small | P0 |
-| Tenant extraction from request headers | Small | P1 |
+| Map engine `HandshakeMessage` to `wmp.session.create` with inline `params.auth` | Small | P0 |
+| JWT auth middleware for `/api/v2/wallet/rpc` and `/api/v2/wallet/events` | Small | P0 |
+| Tenant derivation from the validated bearer token | Small | P1 |
 | Map engine error codes to WMP error codes | Small | P1 |
 | Rate limiting middleware | Small | P1 |
 
@@ -691,7 +693,7 @@ Features we gain from this migration:
    The root cause of PR #126 bugs ceases to exist.
 2. **No connection management** — browser handles EventSource reconnection natively.
    Eliminates 400+ lines of reconnection logic.
-3. **Standard HTTP semantics** — every request carries auth + tenant headers.
+3. **Standard HTTP semantics** — every request carries the bearer token, from which user and tenant are derived.
    No handshake-time context establishment.
 4. **Standard HTTP load balancing, with one caveat** — the transport is plain
    HTTP (no protocol upgrade), but the current implementation keeps WMP sessions,
@@ -721,22 +723,24 @@ Features we gain from this migration:
 The engine has `TenantID` baked into sessions, propagated via `X-Tenant-ID`
 headers on internal service calls. WMP has no tenant concept.
 
-**With HTTP+SSE this is simpler**: every POST to `/wmp/rpc` carries the
-`X-Tenant-ID` header. The SSE endpoint `/wmp/events` receives it as a query
-parameter or header on connection. No need to establish tenant at handshake
-and maintain it — it's on every request.
+**With HTTP+SSE this is simpler, and the tenant is never client-supplied**:
+every POST to `/api/v2/wallet/rpc` and every GET of `/api/v2/wallet/events`
+carries the `Authorization` bearer token, and the handlers derive the user and
+tenant from that validated token. The backend does not read an `X-Tenant-ID`
+header on these endpoints. A token with no tenant claim is placed in the
+`default` tenant. The engine `Session` stores the tenant; a request may only
+address a session whose user and tenant exactly match the ones derived from its
+token (a mismatch is answered as session-not-found).
+
+Sketch of the enforcement (see `HandleWMPRPC` / `HandleWMPEvents` in
+`internal/engine/wmphttp.go` and `ownsSession` in `internal/engine/wmphandler.go`):
 
 ```go
-func TenantMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        tenantID := r.Header.Get("X-Tenant-ID")
-        if tenantID == "" {
-            http.Error(w, "missing tenant", http.StatusBadRequest)
-            return
-        }
-        ctx := context.WithValue(r.Context(), tenantKey, tenantID)
-        next.ServeHTTP(w, r.WithContext(ctx))
-    })
+userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
+if err != nil { /* 401 */ }
+tenantID = normalizeTenant(tenantID) // "" -> "default"
+if !ownsSession(session, caller{userID, tenantID, tokenID}) {
+    http.Error(w, "session not found", http.StatusNotFound)
 }
 ```
 
@@ -759,7 +763,7 @@ sign response even if the SSE stream briefly disconnected and reconnected.
 Trust evaluation currently works as:
 1. Engine sends `evaluating_trust` progress step (→ SSE notification)
 2. Frontend evaluates trust (calls `/v1/evaluate` or local logic)
-3. Frontend sends `trust_result` action (→ POST `/wmp/rpc`)
+3. Frontend sends `trust_result` action (→ POST `/api/v2/wallet/rpc`)
 
 This maps directly — no change in semantics, just transport.
 
@@ -812,10 +816,10 @@ Week 1-2: go-wmp HTTP+SSE hardening (Phase 1)
   └─ Session tenant/user fields + Redis SessionStore
 
 Week 3-4: Backend HTTP+SSE endpoints (Phase 2)
-  ├─ POST /wmp/rpc endpoint with JSON-RPC dispatch
-  ├─ GET /wmp/events SSE endpoint with reconnect replay
+  ├─ POST /api/v2/wallet/rpc endpoint with JSON-RPC dispatch
+  ├─ GET /api/v2/wallet/events SSE endpoint with reconnect replay
   ├─ FlowBridge implementation (goroutine ↔ WMP events)
-  ├─ JWT auth + tenant middleware
+  ├─ JWT auth with token-derived tenant enforcement
   └─ Run alongside existing WebSocket engine (feature flag)
 
 Week 5-6: Frontend HTTP+SSE transport (Phase 3)
@@ -843,7 +847,7 @@ Week 8: Cleanup
    **Decided**: Use `@microsoft/fetch-event-source` (~3KB, MIT, from Azure).
    Wraps `fetch()` to parse SSE streams with full header control, custom
    reconnection, and built-in Page Visibility API integration. No token-in-URL
-   needed — `Authorization` and `X-Tenant-ID` headers on every SSE connection.
+   needed — the `Authorization` header on every SSE connection.
 
 2. ~~Event buffer sizing and eviction policy?~~
    **Decided**: Flow-scoped buffer with 200-event hard cap per session.
@@ -853,11 +857,15 @@ Week 8: Cleanup
    batch size — it doesn't multiply events.
 
 3. ~~Should tenant context be a WMP concept or application-level?~~
-   **Decided**: Both. `X-Tenant-ID` HTTP header on every request (required
-   for transport-level load balancer routing) **plus** tenant stored in
-   `Session.Metadata["tenant_id"]` at session creation (for server-side
-   consistency and Redis lookup). Middleware validates that the header
-   matches the session's stored tenant on every request.
+   **Decided**: Application-level, derived from the bearer token. WMP itself has
+   no tenant concept. Every RPC and SSE request carries `Authorization:
+   Bearer ...`; the handlers take user and tenant from the validated token
+   (no `X-Tenant-ID` header is read) and the tenant is stored on the engine
+   `Session` at `wmp.session.create`. A request can only address a session
+   whose user and tenant exactly match the token's (a token without a tenant
+   claim maps to `default`). If transport-level load-balancer routing by tenant
+   is wanted, it must be done by the proxy from the token or host name, as the
+   backend does not validate a tenant header.
 
 4. ~~When should the WebSocket transport be fully removed?~~
    **Decided**: No runtime fallback between transports. Transport is a
