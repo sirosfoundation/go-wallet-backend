@@ -672,20 +672,14 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
 	if err != nil {
 		// Remove the reserved flow slot on error
-		session.flowsMu.Lock()
-		delete(session.flows, flowID)
-		session.flowsMu.Unlock()
+		session.removeFlow(flowID, flow)
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
 	flow.Handler = handler
 
-	defer func() {
-		session.flowsMu.Lock()
-		delete(session.flows, flowID)
-		session.flowsMu.Unlock()
-	}()
+	defer session.removeFlow(flowID, flow)
 
 	// Execute flow
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -1499,7 +1493,10 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 // session's memory without limit.
 const (
 	maxStashedActionsPerFlow = 50
-	maxStashedResponses      = 64
+	// maxStashedActionsPerSession bounds parked actions across ALL flows of
+	// a session, so many flows cannot each fill their per-flow allowance.
+	maxStashedActionsPerSession = 200
+	maxStashedResponses         = 64
 )
 
 // responseStash holds client responses read off the session's shared
@@ -1548,11 +1545,38 @@ func (s *Session) stashAction(a *FlowActionMessage) {
 	if r.actions == nil {
 		r.actions = make(map[string][]*FlowActionMessage)
 	}
-	if len(r.actions[a.FlowID]) >= maxStashedActionsPerFlow {
+	if len(r.actions[a.FlowID]) >= maxStashedActionsPerFlow || r.totalActionsLocked() >= maxStashedActionsPerSession {
 		return
 	}
 	r.actions[a.FlowID] = append(r.actions[a.FlowID], a)
 	r.broadcastLocked()
+}
+
+func (r *responseStash) totalActionsLocked() int {
+	n := 0
+	for _, q := range r.actions {
+		n += len(q)
+	}
+	return n
+}
+
+// dropFlow discards everything parked for flowID; called on flow teardown so
+// a finished flow's leftovers cannot linger for the life of the session.
+func (r *responseStash) dropFlow(flowID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.actions, flowID)
+}
+
+// removeFlow unregisters flow (if flowID still maps to it) and clears the
+// flow's parked actions.
+func (s *Session) removeFlow(flowID string, flow *Flow) {
+	s.flowsMu.Lock()
+	if s.flows[flowID] == flow {
+		delete(s.flows, flowID)
+	}
+	s.flowsMu.Unlock()
+	s.stash.dropFlow(flowID)
 }
 
 // takeAction removes and returns the oldest parked action for flowID that is

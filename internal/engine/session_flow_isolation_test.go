@@ -130,3 +130,41 @@ func (r *recordingTransport) snapshot() []interface{} {
 	defer r.mu.Unlock()
 	return append([]interface{}(nil), r.msgs...)
 }
+
+func TestSession_StashActionSessionWideCap(t *testing.T) {
+	s := &Session{flows: map[string]*Flow{}}
+	const flows = 20 // 20 * per-flow cap far exceeds the session cap
+	for i := 0; i < flows; i++ {
+		s.flows[flowName(i)] = &Flow{ID: flowName(i)}
+	}
+	for i := 0; i < flows; i++ {
+		for j := 0; j < maxStashedActionsPerFlow; j++ {
+			s.stashAction(&FlowActionMessage{Message: Message{FlowID: flowName(i)}, Action: "x"})
+		}
+	}
+	s.stash.mu.Lock()
+	total := s.stash.totalActionsLocked()
+	s.stash.mu.Unlock()
+	assert.Equal(t, maxStashedActionsPerSession, total)
+}
+
+func TestSession_RemoveFlowClearsStash(t *testing.T) {
+	s := &Session{flows: map[string]*Flow{}}
+	f1, f2 := &Flow{ID: "a"}, &Flow{ID: "b"}
+	s.flows["a"], s.flows["b"] = f1, f2
+	s.stashAction(&FlowActionMessage{Message: Message{FlowID: "a"}, Action: "x"})
+	s.stashAction(&FlowActionMessage{Message: Message{FlowID: "b"}, Action: "x"})
+
+	s.removeFlow("a", f1)
+
+	s.flowsMu.RLock()
+	_, aOK := s.flows["a"]
+	_, bOK := s.flows["b"]
+	s.flowsMu.RUnlock()
+	assert.False(t, aOK)
+	assert.True(t, bOK)
+	s.stash.mu.Lock()
+	defer s.stash.mu.Unlock()
+	assert.NotContains(t, s.stash.actions, "a", "finished flow's stash must be dropped")
+	assert.Contains(t, s.stash.actions, "b")
+}

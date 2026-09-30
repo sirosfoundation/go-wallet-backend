@@ -1383,11 +1383,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 				logger.Error("Panic in WMP flow handler", zap.Any("panic", r))
 				_ = h.session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 			}
-			h.session.flowsMu.Lock()
-			if h.session.flows[flowID] == flow {
-				delete(h.session.flows, flowID)
-			}
-			h.session.flowsMu.Unlock()
+			h.session.removeFlow(flowID, flow)
 		}()
 
 		flowCtx, cancel := context.WithTimeout(context.Background(), flowTimeout)
