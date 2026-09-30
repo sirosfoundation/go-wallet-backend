@@ -42,9 +42,74 @@ type WMPAdapter struct {
 	resumptionTokens map[string]*resumptionEntry // token -> entry with session ID and expiry
 	eventBufs        map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
 
+	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
+	// bearer token (see reserveSlot).
+	tokenSlotsMu sync.Mutex
+	tokenSlots   map[string]int
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	loopDone chan struct{} // closed when cleanupLoop has exited
+}
+
+// maxWMPSessionsPerToken bounds how many live WMP sessions one bearer token
+// may hold. Anonymous tokens are not indexed by user in the engine (and every
+// user-less session would otherwise be unaccounted), so without this a single
+// token could create sessions without limit.
+const maxWMPSessionsPerToken = 10
+
+// wmpSlot is one reserved unit of the global (Manager.activeConnections) and
+// per-token session budget. release is idempotent, so every teardown path can
+// call it without double-freeing.
+type wmpSlot struct {
+	a    *WMPAdapter
+	key  string
+	once sync.Once
+}
+
+func (s *wmpSlot) release() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.a.tokenSlotsMu.Lock()
+		if s.a.tokenSlots[s.key] <= 1 {
+			delete(s.a.tokenSlots, s.key)
+		} else {
+			s.a.tokenSlots[s.key]--
+		}
+		s.a.tokenSlotsMu.Unlock()
+		s.a.manager.activeConnections.Add(-1)
+	})
+}
+
+// reserveSlot atomically claims a session slot against the engine's global
+// connection limit (shared with WebSocket connections) and the per-token
+// limit. It returns nil if either is exhausted.
+func (a *WMPAdapter) reserveSlot(key string) *wmpSlot {
+	a.tokenSlotsMu.Lock()
+	if a.tokenSlots == nil {
+		a.tokenSlots = make(map[string]int)
+	}
+	if a.tokenSlots[key] >= maxWMPSessionsPerToken {
+		a.tokenSlotsMu.Unlock()
+		return nil
+	}
+	a.tokenSlots[key]++
+	a.tokenSlotsMu.Unlock()
+
+	if a.manager.activeConnections.Add(1) > maxConnections {
+		a.manager.activeConnections.Add(-1)
+		a.tokenSlotsMu.Lock()
+		if a.tokenSlots[key] <= 1 {
+			delete(a.tokenSlots, key)
+		} else {
+			a.tokenSlots[key]--
+		}
+		a.tokenSlotsMu.Unlock()
+		return nil
+	}
+	return &wmpSlot{a: a, key: key}
 }
 
 // maxWMPBufferedEvents bounds how many past SSE events are retained per
@@ -327,6 +392,9 @@ type wmpSession struct {
 	// is compared for sessions with no user identity (anonymous tokens all
 	// have UserID == ""), which user/tenant alone cannot tell apart.
 	ownerTokenID string
+	// slot is the session budget reserved at creation; released once, by
+	// teardown. Shared (not re-reserved) across resumes of the same session.
+	slot *wmpSlot
 }
 
 // wmpCaller is the identity validated from a request's bearer token.
@@ -421,11 +489,25 @@ func (a *WMPAdapter) verifySessionOwnership(sessionID string, caller wmpCaller) 
 	return ownsSession(ws, caller)
 }
 
+// defaultWMPTenant is the tenant a token without a tenant_id claim belongs to
+// (matches pkg/middleware/tokenauth.go).
+const defaultWMPTenant = "default"
+
+func normalizeWMPTenant(t string) string {
+	if t == "" {
+		return defaultWMPTenant
+	}
+	return t
+}
+
 func ownsSession(ws *wmpSession, caller wmpCaller) bool {
 	if ws.session.UserID != caller.UserID {
 		return false
 	}
-	if caller.TenantID != "" && ws.session.TenantID != caller.TenantID {
+	// Exact tenant equality after normalisation. An empty tenant claim must
+	// not act as a wildcard: the HTTP middleware maps a missing tenant_id to
+	// the default tenant, so both sides are compared in that form.
+	if normalizeWMPTenant(ws.session.TenantID) != normalizeWMPTenant(caller.TenantID) {
 		return false
 	}
 	if ws.session.UserID == "" {
@@ -583,6 +665,7 @@ func (a *WMPAdapter) teardown(ws *wmpSession) {
 	_ = ws.transport.Close()
 	ws.session.endSession()
 	a.manager.unregisterSession(ws.session)
+	ws.slot.release()
 }
 
 // closeSessionIfCurrent tears down sessionID's peer.Serve goroutine cleanup,
@@ -655,6 +738,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 				"reason": "invalid or expired token",
 			})
 		}
+		tenantID = normalizeWMPTenant(tenantID)
 	} else {
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "auth required",
@@ -667,6 +751,19 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	if userID == "" && tokenID == "" {
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "anonymous token without jti cannot own a session",
+		})
+	}
+
+	// Reserve a session slot (global + per-token) before allocating anything.
+	slotKey := "jti:" + tokenID
+	if tokenID == "" {
+		slotKey = "user:" + tenantID + ":" + userID
+	}
+	slot := a.reserveSlot(slotKey)
+	if slot == nil {
+		a.logger.Warn("WMP session.create rejected: session limit reached")
+		return wmpErrorBytes(req.ID, wmp.ErrRateLimited, map[string]string{
+			"reason": "too many sessions",
 		})
 	}
 
@@ -718,6 +815,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	// closed the transport): refuse, as the WebSocket handshake does, rather
 	// than storing a dead session and reporting success.
 	if !a.manager.registerSession(session) {
+		slot.release()
 		a.logger.Warn("WMP session.create rejected: user revoked between token validation and session registration")
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "invalid or expired token",
@@ -752,6 +850,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		security:     params.Security,
 		expiresAt:    expiresAt,
 		ownerTokenID: tokenID,
+		slot:         slot,
 	}
 	buf := &wmpEventBuffer{}
 
@@ -949,6 +1048,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		security:     oldWS.security,
 		expiresAt:    oldWS.expiresAt,
 		ownerTokenID: oldWS.ownerTokenID,
+		slot:         oldWS.slot,
 	}
 
 	// Atomically consume the token and install the replacement, but only if
