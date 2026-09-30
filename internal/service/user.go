@@ -319,6 +319,28 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 // The instances themselves say which tenants to sweep, rather than the
 // memberships, because a membership can be gone while an instance of that
 // tenant is not.
+//
+// Failure semantics, which differ deliberately from main (where every cleanup
+// error was logged and the user record deleted regardless; the maintainer has
+// yet to confirm the change):
+//
+//   - ErrDeletionIncomplete, user record kept, safe to repeat: a wallet
+//     instance or holder credential/presentation that could not be removed, a
+//     failed tenant-membership, wallet-instance or user lookup, and a session
+//     cleaner that fails before the permanent revocations below. None of these
+//     has revoked anything for good, so the caller's token still works and the
+//     same request can be sent again; each retry re-derives everything from
+//     the store, so removals that already succeeded are simply not found again.
+//   - ErrDeletionIncomplete after the permanent revocations: only a session
+//     cleaner that fails on its second run, after the token blacklist and the
+//     engine have barred the user id for good. The record is kept, but the
+//     user's own tokens are refused from then on (both revocations last until
+//     the process restarts), so finishing the deletion takes an operator or a
+//     restart, not the user.
+//   - Still best-effort, logged only: pending WebAuthn challenges, invite
+//     used_by references, tenant-membership removal, and the token
+//     blacklist's RevokeUser. A failure of the final Users().Delete answers a
+//     plain error after everything else has been done.
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
 	var instanceErrs []error
 	// dataErrs collects failures that must not be papered over with a 200:
@@ -415,45 +437,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
 	}
 
-	// Revoke all previously-issued tokens for this user (#383) BEFORE
-	// purging sessions below - not after. Logout only ever blacklists the
-	// single token used for that request; without this, any of the deleted
-	// user's other still-valid tokens (a different device, a token minted
-	// before this request's) would keep working until they naturally
-	// expire.
-	//
-	// The ordering matters for engine (WebSocket) sessions specifically
-	// (#393 review): a handshake can pass the engine's own IsUserRevoked
-	// check and then only finish registering itself in
-	// engine.Manager.sessions *after* the cleaner below has already
-	// scanned it. Revoking first means engine.Manager.registerSession's own
-	// recheck (done under the same lock the scan uses) will already see
-	// this user as revoked for any such late registration, and any
-	// registration that instead completed *before* this revocation is
-	// still guaranteed to be present in m.sessions by the time the scan
-	// below runs. Reversing this order would reopen that gap.
-	if s.tokenBlacklist != nil {
-		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
-		}
-	}
-
-	for _, r := range s.userRevokers {
-		r.RevokeUser(userID.String())
-	}
-
-	// Purge active WebSocket sessions (Redis or memory)
-	// A surviving session is not a cosmetic failure here. Deleting the user
-	// record takes the token cut-off with it - it is a field on that record -
-	// and internal/tokengate deliberately passes a token whose user it
-	// cannot find. So a session that outlives this call could go on minting
-	// bearer tokens for an account that is supposed to be gone.
-	if s.sessionCleaner != nil {
-		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
-			dataErrs = append(dataErrs, fmt.Errorf("drop sessions: %w", err))
-		}
-	}
-
 	// Stop short of deleting the user record when a wallet instance was left
 	// behind. Removing it now would strand that instance for good and take
 	// away the caller's only way to ask again; leaving it means the request
@@ -498,6 +481,71 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Error("Account deletion incomplete",
 			zap.Error(errors.Join(outstanding...)), zap.String("user_id", userID.String()))
 		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(outstanding...))
+	}
+
+	// Everything below this point is irreversible for the caller, so it only
+	// runs once the sweep above found nothing outstanding. The token
+	// blacklist's RevokeUser and the engine's Manager.RevokeUser are
+	// permanent for this user id - there is no un-revoke, and neither is
+	// time-scoped - so applying them before the completeness decision above
+	// would lock the caller out of the very retry ErrDeletionIncomplete
+	// promises: every token they could obtain, a fresh login's included,
+	// would be refused until the process restarted.
+	//
+	// The session cleaner runs once ahead of the permanent revocations, so a
+	// cleaner that cannot do its job (Redis down) is still a retryable
+	// failure, and once more after them, which is the ordering #393 needs.
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			s.logger.Error("Account deletion incomplete: sessions could not be dropped",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
+		}
+	}
+
+	// Revoke all previously-issued tokens for this user (#383) BEFORE
+	// purging sessions below - not after. Logout only ever blacklists the
+	// single token used for that request; without this, any of the deleted
+	// user's other still-valid tokens (a different device, a token minted
+	// before this request's) would keep working until they naturally
+	// expire.
+	//
+	// The ordering matters for engine (WebSocket) sessions specifically
+	// (#393 review): a handshake can pass the engine's own IsUserRevoked
+	// check and then only finish registering itself in
+	// engine.Manager.sessions *after* the cleaner below has already
+	// scanned it. Revoking first means engine.Manager.registerSession's own
+	// recheck (done under the same lock the scan uses) will already see
+	// this user as revoked for any such late registration, and any
+	// registration that instead completed *before* this revocation is
+	// still guaranteed to be present in m.sessions by the time the scan
+	// below runs. Reversing this order would reopen that gap.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		}
+	}
+
+	for _, r := range s.userRevokers {
+		r.RevokeUser(userID.String())
+	}
+
+	// Purge active WebSocket sessions (Redis or memory)
+	// A surviving session is not a cosmetic failure here. Deleting the user
+	// record takes the token cut-off with it - it is a field on that record -
+	// and internal/tokengate deliberately passes a token whose user it
+	// cannot find. So a session that outlives this call could go on minting
+	// bearer tokens for an account that is supposed to be gone.
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			// The permanent revocations above are already in force, so this
+			// failure is the one that cannot be retried by the user: their
+			// tokens are refused from here on. It is reported, not swallowed,
+			// and the record is kept for an operator or a restart to finish.
+			s.logger.Error("Account deletion incomplete: sessions could not be dropped after the user was revoked",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
+		}
 	}
 
 	// Memberships come last, once nothing is outstanding anywhere. They are

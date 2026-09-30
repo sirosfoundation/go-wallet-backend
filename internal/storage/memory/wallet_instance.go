@@ -62,9 +62,27 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		if instance.CreatedAt.IsZero() {
 			instance.CreatedAt = time.Now().UTC()
 		}
-		s.data[instance.ID] = instance
+		s.data[instance.ID] = cloneInstance(instance)
 	}
 	return nil
+}
+
+// cloneInstance copies a record, as a database would hand back a fresh
+// decoded struct rather than a pointer into its own storage. Sharing pointers
+// lets a caller's read race a concurrent write and lets a caller's local
+// mutation change the stored record, neither of which can happen against
+// MongoDB, so tests over this store would prove less than they appear to.
+func cloneInstance(in *domain.WalletInstance) *domain.WalletInstance {
+	cp := *in
+	if in.UserID != nil {
+		u := *in.UserID
+		cp.UserID = &u
+	}
+	if in.DeactivatedAt != nil {
+		t := *in.DeactivatedAt
+		cp.DeactivatedAt = &t
+	}
+	return &cp
 }
 
 func (s *WalletInstanceStore) GetByID(_ context.Context, id string) (*domain.WalletInstance, error) {
@@ -72,7 +90,7 @@ func (s *WalletInstanceStore) GetByID(_ context.Context, id string) (*domain.Wal
 	defer s.mu.RUnlock()
 
 	if instance, ok := s.data[id]; ok {
-		return instance, nil
+		return cloneInstance(instance), nil
 	}
 	return nil, storage.ErrNotFound
 }
@@ -84,7 +102,7 @@ func (s *WalletInstanceStore) GetAllByTenant(_ context.Context, tenantID domain.
 	var result []*domain.WalletInstance
 	for _, instance := range s.data {
 		if instance.TenantID == tenantID {
-			result = append(result, instance)
+			result = append(result, cloneInstance(instance))
 		}
 	}
 	return result, nil
@@ -97,7 +115,7 @@ func (s *WalletInstanceStore) GetByUser(_ context.Context, tenantID domain.Tenan
 	var result []*domain.WalletInstance
 	for _, instance := range s.data {
 		if instance.TenantID == tenantID && instance.UserID != nil && *instance.UserID == userID {
-			result = append(result, instance)
+			result = append(result, cloneInstance(instance))
 		}
 	}
 	return result, nil
@@ -112,7 +130,7 @@ func (s *WalletInstanceStore) GetAllByUser(_ context.Context, userID domain.User
 	var result []*domain.WalletInstance
 	for _, instance := range s.data {
 		if instance.UserID != nil && *instance.UserID == userID {
-			result = append(result, instance)
+			result = append(result, cloneInstance(instance))
 		}
 	}
 	return result, nil
