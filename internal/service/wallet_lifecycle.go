@@ -196,8 +196,25 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	if err := s.store.WalletInstances().UpdateStatus(ctx, instanceID, tenantID, target, reason); err != nil {
 		return nil, err
 	}
-	inst.Status = target
-	inst.UpdatedAt = time.Now().UTC()
+	// Work from the record as persisted, not from the copy read before the
+	// write. The write is filtered by instance id and tenant, so an anonymous
+	// instance that an attestation bound to a user between that read and the
+	// write is revoked all the same, and the pre-write copy still says "no
+	// owner": cutting off tokens and running the cascade from it would skip
+	// the very user the revocation now belongs to, leaving their tokens and
+	// sessions alive. The pre-write cut-off above is necessarily blind to a
+	// bind that lands after it; the one below, from the persisted owner, is
+	// what covers it. When the re-read fails the status is already persisted,
+	// so the caller gets ErrErasureIncomplete and the same request, which
+	// re-reads in its idempotent branch above, finishes the job.
+	persisted, err := s.store.WalletInstances().GetByID(ctx, instanceID)
+	if err != nil {
+		inst.Status = target
+		inst.UpdatedAt = time.Now().UTC()
+		s.emitAudit(inst.ID, target, reason, actor)
+		return inst, fmt.Errorf("%w: re-read instance after the status write: %w", ErrErasureIncomplete, err)
+	}
+	inst = persisted
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
 		// Cut the tokens off again, now that the status is persisted. The
