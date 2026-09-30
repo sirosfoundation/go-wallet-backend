@@ -1712,6 +1712,54 @@ func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCom
 	}
 }
 
+// FlowError handles wmp.flow.error notifications. For a server-created child
+// sub-flow (sign/match) it consumes the child mapping and fails the parent
+// RequestSign/RequestMatch immediately instead of letting it wait out its
+// timeout. Errors for any other flow are not child-flow failures and are
+// ignored here.
+func (h *wmpEngineHandler) FlowError(ctx context.Context, params *wmp.FlowErrorParams) {
+	if pending, ok := h.peekChildFlow(params.FlowID); ok {
+		if _, rpcErr := h.authorizeFlow(ctx, pending.parentFlowID); rpcErr != nil {
+			return
+		}
+	}
+	info, ok := h.popChildFlow(params.FlowID)
+	if !ok {
+		return
+	}
+	reason := params.Message
+	if reason == "" {
+		reason = "client reported child flow failure"
+	}
+
+	var delivered bool
+	switch info.flowType {
+	case "sign":
+		resp := &SignResponseMessage{Message: Message{Type: TypeSignResponse, FlowID: info.parentFlowID, MessageID: info.messageID}, Error: reason}
+		select {
+		case h.session.signCh <- resp:
+			delivered = true
+		case <-time.After(flowActionSendWait):
+		case <-ctx.Done():
+		}
+	case "match":
+		resp := &MatchResponseMessage{Message: Message{Type: TypeMatchResponse, FlowID: info.parentFlowID, MessageID: info.messageID}, Error: reason}
+		select {
+		case h.session.matchCh <- resp:
+			delivered = true
+		case <-time.After(flowActionSendWait):
+		case <-ctx.Done():
+		}
+	default:
+		return
+	}
+	if !delivered {
+		h.adapter.logger.Warn("child flow error not delivered (channel full); mapping kept for retry",
+			zap.String("child_flow_id", params.FlowID))
+		h.registerChildFlow(params.FlowID, info.parentFlowID, info.messageID, info.flowType)
+	}
+}
+
 // CapabilityList returns the negotiated capabilities for this session.
 func (h *wmpEngineHandler) CapabilityList(_ context.Context, _ *wmp.CapabilityListParams) (*wmp.CapabilityListResult, error) {
 	h.adapter.mu.RLock()

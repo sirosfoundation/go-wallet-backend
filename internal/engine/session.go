@@ -1352,7 +1352,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	for {
 		wake := s.stash.waitChan()
 		if resp := s.stash.takeSign(messageID); resp != nil {
-			return resp, nil
+			return signResult(resp)
 		}
 		select {
 		case <-ctx.Done():
@@ -1364,12 +1364,20 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		case <-wake:
 		case resp := <-s.signCh:
 			if resp.MessageID == messageID {
-				return resp, nil
+				return signResult(resp)
 			}
 			// Another request's response: park it for its waiter.
 			s.stash.putSign(resp)
 		}
 	}
+}
+
+// signResult turns a client-reported sign failure into an error.
+func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
+	if resp.Error != "" {
+		return nil, errors.New(resp.Error)
+	}
+	return resp, nil
 }
 
 // MatchTimeout is the timeout for credential matching requests.
