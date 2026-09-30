@@ -195,20 +195,34 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 // HandleWMPConfiguration serves the /.well-known/wmp-configuration discovery endpoint.
 // This allows WMP clients to discover server capabilities without establishing a session.
+// The document is the go-wmp library's own WellKnownConfig type, so it always
+// matches the schema wmp.DiscoverConfig expects.
 func (a *WMPAdapter) HandleWMPConfiguration(w http.ResponseWriter, _ *http.Request) {
-	caps := a.serverCapabilities()
+	caps := make(map[string]interface{})
+	for name, raw := range a.serverCapabilities() {
+		var v interface{}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			continue
+		}
+		caps[name] = v
+	}
+	cfg := wmp.WellKnownConfig{
+		SupportedVersions: wmp.SupportedVersions,
+		SecurityModes:     []string{"tls"},
+		Capabilities:      caps,
+		Endpoints: map[string]string{
+			"rpc":    WMPRPCPath,
+			"events": WMPEventsPath,
+		},
+	}
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = fmt.Fprintf(w, `{"version":"%s","security":{"mode":"tls"},"capabilities":%s,"endpoints":{"rpc":"%s","events":"%s"}}`,
-		"1.0", mustMarshalJSON(caps), WMPRPCPath, WMPEventsPath)
-}
-
-func mustMarshalJSON(v interface{}) string {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return "{}"
-	}
-	return string(data)
+	_, _ = w.Write(body)
 }
 
 // writeBodyReadError maps a request-body read failure to 413 when the body

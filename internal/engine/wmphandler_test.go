@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -2648,29 +2649,40 @@ func TestWMP_HTTPEndpoint_Configuration(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
 
-	var cfg map[string]interface{}
+	var cfg wmp.WellKnownConfig
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &cfg))
-	assert.Equal(t, "1.0", cfg["version"])
-	assert.Contains(t, cfg, "security")
-	assert.Contains(t, cfg, "capabilities")
-	require.Contains(t, cfg, "endpoints")
-
-	endpoints, ok := cfg["endpoints"].(map[string]interface{})
-	require.True(t, ok)
-	assert.Equal(t, "/api/v2/wallet/rpc", endpoints["rpc"])
-	assert.Equal(t, "/api/v2/wallet/events", endpoints["events"])
+	assert.Equal(t, wmp.SupportedVersions, cfg.SupportedVersions)
+	assert.Equal(t, []string{"tls"}, cfg.SecurityModes)
+	assert.Contains(t, cfg.Capabilities, "sign")
+	assert.Contains(t, cfg.Capabilities, "flows")
+	assert.Equal(t, "/api/v2/wallet/rpc", cfg.Endpoints["rpc"])
+	assert.Equal(t, "/api/v2/wallet/events", cfg.Endpoints["events"])
 }
 
-func TestMustMarshalJSON_Success(t *testing.T) {
-	got := mustMarshalJSON(map[string]int{"a": 1})
-	assert.JSONEq(t, `{"a":1}`, got)
-}
+// The discovery document must round-trip through the library's own client.
+func TestWMP_HTTPEndpoint_Configuration_DiscoverConfigRoundTrip(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
 
-// TestMustMarshalJSON_MarshalFailure verifies the json.Marshal-failure
-// fallback: a channel value can never be marshaled to JSON, so
-// mustMarshalJSON must return "{}" rather than panicking or propagating the
-// error.
-func TestMustMarshalJSON_MarshalFailure(t *testing.T) {
-	got := mustMarshalJSON(make(chan int))
-	assert.Equal(t, "{}", got)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/wmp-configuration", a.HandleWMPConfiguration)
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	// The httptest certificate is valid for example.com; route that name to
+	// the test server.
+	client := srv.Client()
+	tr := client.Transport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+	client.Transport = tr
+
+	cfg, err := wmp.DiscoverConfigWithClient(context.Background(), "example.com", client)
+	require.NoError(t, err)
+	assert.Equal(t, wmp.SupportedVersions, cfg.SupportedVersions)
+	assert.Equal(t, []string{"tls"}, cfg.SecurityModes)
+	assert.Equal(t, WMPRPCPath, cfg.Endpoints["rpc"])
+	assert.Equal(t, WMPEventsPath, cfg.Endpoints["events"])
+	assert.Contains(t, cfg.Capabilities, "flows")
 }
