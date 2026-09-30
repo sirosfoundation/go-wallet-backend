@@ -615,28 +615,16 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		asModule.SetOIDCGateRateLimiter(authProvider.gateRateLimiter)
 
 		// Create go-tokenauth validator for protecting resource endpoints.
-		issuer := cfg.AS.Issuer
-		if issuer == "" {
-			issuer = cfg.JWT.Issuer
-		}
-		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
-		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
-			// Same blacklist as everything else in this process (#382/#383) -
-			// without this, AS-issued/legacy tokens validated through
-			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
-			// common case) would never consult the blacklist at all, since
-			// go-tokenauth's Validator has its own independent validation
-			// path that AuthMiddlewareWithBlacklist's check is never reached
-			// by.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
-		})
+		jwksURL := tokenJWKSURL(cfg)
+		// Same blacklist as everything else in this process (#382/#383) -
+		// without this, AS-issued/legacy tokens validated through
+		// go-tokenauth (the path taken whenever AS is enabled, i.e. the
+		// common case) would never consult the blacklist at all, since
+		// go-tokenauth's Validator has its own independent validation
+		// path that AuthMiddlewareWithBlacklist's check is never reached
+		// by.
+		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
+			blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
@@ -876,19 +864,41 @@ func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 
 // RegistryProvider provides VCTM registry routes
 type RegistryProvider struct {
-	cfg        *registry.Config
+	cfg        *config.Config
+	rcfg       *registry.Config
 	logger     *zap.Logger
 	store      *registry.Store
 	fetcher    *registry.Fetcher
 	handler    *registry.Handler
 	httpClient *http.Client
 	cancel     context.CancelFunc
+
+	// Authentication (see registry.AuthMiddlewares). validator is nil when
+	// the deployment neither requires auth nor has anything to validate
+	// tokens with.
+	validator *tokenvalidator.Validator
+	tenants   middleware.TenantLookup
+	blacklist middleware.TokenBlacklistChecker
 }
 
-// NewRegistryProvider creates a new registry route provider
-func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryProvider, error) {
+// registryNeedsValidator reports whether a token validator must be built:
+// always when registry.require_auth is set, otherwise only when there is a
+// token source to recognise (an AS to fetch JWKS from, or a legacy HMAC
+// secret).
+func registryNeedsValidator(cfg *config.Config) bool {
+	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != "" ||
+		(cfg.AS.Legacy.Enabled && cfg.JWT.Secret != "")
+}
+
+// NewRegistryProvider creates a new registry route provider. Registry
+// settings come from cfg.Registry; server address, CORS and logging are the
+// backend's, and request authentication uses the same go-tokenauth validator
+// as the other roles (built from as.* / jwt.*, even when as.enabled is false).
+func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvider, error) {
+	rcfg := &cfg.Registry
+
 	// Create store and load cache
-	store := registry.NewStore(cfg.Cache.Path)
+	store := registry.NewStore(rcfg.Cache.Path)
 	if err := store.Load(); err != nil {
 		logger.Warn("Failed to load registry cache, starting fresh", zap.Error(err))
 	} else {
@@ -900,28 +910,50 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 	// Load local VCTM overrides (before remote fetching so they take priority).
 	// Clear any stale cached local entries first so removed override files
 	// don't persist through the cache.
-	if len(cfg.Source.LocalOverrides) > 0 {
+	if len(rcfg.Source.LocalOverrides) > 0 {
 		store.ClearLocal()
-		if err := registry.LoadLocalOverrides(store, cfg.Source.LocalOverrides, logger); err != nil {
+		if err := registry.LoadLocalOverrides(store, rcfg.Source.LocalOverrides, logger); err != nil {
 			return nil, fmt.Errorf("failed to load local VCTM overrides: %w", err)
 		}
 	}
 
-	// Create centralized HTTP client using config
-	httpClient := cfg.HTTPClient.NewHTTPClient(cfg.Source.Timeout)
+	// Create centralized HTTP client using the shared http_client config
+	httpClient := cfg.HTTPClient.NewHTTPClient(rcfg.Source.Timeout)
 
 	// Create handler with HTTP client option
-	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger,
+	handler := registry.NewHandler(store, &rcfg.DynamicCache, &rcfg.ImageEmbed, logger,
 		registry.WithHTTPClient(httpClient))
 
-	return &RegistryProvider{
+	p := &RegistryProvider{
 		cfg:        cfg,
+		rcfg:       rcfg,
 		logger:     logger,
 		store:      store,
 		handler:    handler,
 		httpClient: httpClient,
-	}, nil
+	}
+
+	if registryNeedsValidator(cfg) {
+		// No audience list here: the registry enforces its own audience rule
+		// (registry.AuthMiddlewares) so HMAC tokens are never rejected by it.
+		p.validator = buildTokenValidator(cfg, nil, nil)
+		logger.Info("Registry token validation configured",
+			zap.String("jwks_url", tokenJWKSURL(cfg)),
+			zap.Bool("legacy_hmac", cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""),
+			zap.Bool("require_auth", rcfg.RequireAuth))
+	}
+
+	return p, nil
 }
+
+// SetTenantLookup lets a co-located backend supply its tenant store so tokens
+// of unknown or disabled tenants are rejected on the registry routes as they
+// are elsewhere. Without it any tenant_id claim is accepted.
+func (p *RegistryProvider) SetTenantLookup(t middleware.TenantLookup) { p.tenants = t }
+
+// SetTokenBlacklist lets a co-located backend supply its token blacklist so
+// tokens of revoked users are rejected on the registry routes too.
+func (p *RegistryProvider) SetTokenBlacklist(b middleware.TokenBlacklistChecker) { p.blacklist = b }
 
 func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
@@ -930,15 +962,18 @@ func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 	// Registry routes with its own middleware group
 	group := router.Group("/registry")
 
-	// Add registry-specific JWT middleware
-	if p.cfg.JWT.RequireAuth {
-		group.Use(registry.JWTMiddleware(p.cfg.JWT, p.logger))
-	} else {
-		group.Use(registry.OptionalJWTMiddleware(p.cfg.JWT, p.logger))
-	}
+	// Shared go-tokenauth authentication (sets the authenticated flag and
+	// tenant id read by the rate limiter)
+	group.Use(registry.AuthMiddlewares(registry.AuthConfig{
+		Validator:   p.validator,
+		Tenants:     p.tenants,
+		Blacklist:   p.blacklist,
+		RequireAuth: p.rcfg.RequireAuth,
+		Logger:      p.logger,
+	})...)
 
 	// Add rate limiting
-	rateLimiter := registry.NewRateLimiter(p.cfg.RateLimit)
+	rateLimiter := registry.NewRateLimiter(p.rcfg.RateLimit)
 	group.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handler routes under /registry prefix
@@ -950,7 +985,10 @@ func (p *RegistryProvider) Start(ctx context.Context) error {
 	fetchCtx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 
-	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger, p.httpClient)
+	if p.validator != nil {
+		p.validator.Start(ctx)
+	}
+	p.fetcher = registry.NewFetcher(p.rcfg, p.store, p.logger, p.httpClient)
 	if err := p.fetcher.Start(fetchCtx); err != nil {
 		return fmt.Errorf("failed to start registry fetcher: %w", err)
 	}
@@ -962,6 +1000,9 @@ func (p *RegistryProvider) Close() error {
 	// Stop fetcher
 	if p.cancel != nil {
 		p.cancel()
+	}
+	if p.validator != nil {
+		p.validator.Stop()
 	}
 	if p.fetcher != nil {
 		p.fetcher.Stop()
@@ -989,7 +1030,7 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 		return fmt.Errorf("registry store not initialized")
 	}
 	// Store is file-based cache, check it's loaded
-	if p.store.Count() == 0 && !p.cfg.DynamicCache.Enabled {
+	if p.store.Count() == 0 && !p.rcfg.DynamicCache.Enabled {
 		// If dynamic cache is disabled and store is empty, that may be intentional
 		// Allow this state - the store is still functional
 		return nil
@@ -1041,24 +1082,11 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	// access tokens — only legacy HMAC JWTs would work.
 	var tv *tokenvalidator.Validator
 	if cfg.AS.Enabled {
-		issuer := cfg.AS.Issuer
-		if issuer == "" {
-			issuer = cfg.JWT.Issuer
-		}
-		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
-		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
-			// See NewBackendProvider's identical wiring (#382/#383). This
-			// provider's own services.TokenBlacklist is fine used as-is here:
-			// it never runs co-hosted with BackendProvider (see cmd/server).
-			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
-		})
+		// See NewBackendProvider's identical wiring (#382/#383). This
+		// provider's own services.TokenBlacklist is fine used as-is here:
+		// it never runs co-hosted with BackendProvider (see cmd/server).
+		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
+			blacklistRevocationChecker{blacklist: services.TokenBlacklist})
 		tv.Start(context.Background())
 	}
 

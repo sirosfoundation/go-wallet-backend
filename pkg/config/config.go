@@ -34,6 +34,11 @@ type Config struct {
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
+	// Registry configures the VCTM registry role (--mode=registry). It
+	// replaces the retired standalone registry configuration file
+	// (configs/registry.yaml, REGISTRY_* environment variables).
+	Registry RegistryConfig `yaml:"registry" envconfig:"REGISTRY"`
+
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
 	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
@@ -41,7 +46,57 @@ type Config struct {
 	// never configured". Unexported: never (un)marshaled, so it can't leak
 	// into YAML output or be set by config files/env itself.
 	asEnabledExplicit bool
+
+	// registryExplicit records whether the `registry:` section (YAML) or any
+	// WALLET_REGISTRY_* environment variable was present; see
+	// RegistryExplicit and ApplyLegacyRegistryConfig.
+	registryExplicit bool
+
+	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
+	// alias when it enabled registry.require_auth from the old HMAC-only
+	// `jwt` block: such deployments have no as.external_url yet, and must
+	// keep starting (HMAC tokens only) until they migrate.
+	registryLegacyTolerateNoJWKS bool
+
+	// loadWarnings are non-fatal findings from loading (see Warnings).
+	loadWarnings []string
 }
+
+// Warnings returns non-fatal findings collected while loading the
+// configuration, for the caller to log once a logger exists.
+func (c *Config) Warnings() []string { return c.loadWarnings }
+
+// retiredRegistryKeys are top-level keys of the retired standalone
+// registry.yaml layout that the backend configuration does not define.
+var retiredRegistryKeys = []string{"source", "sources", "cache", "dynamic_cache", "image_embed", "filter", "rate_limit"}
+
+// retiredRegistryLayoutWarning returns a warning when the config file looks
+// like the retired standalone registry.yaml (registry settings at top level
+// instead of under `registry:`), which would otherwise be silently ignored.
+func retiredRegistryLayoutWarning(data []byte) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	if _, ok := raw["registry"]; ok {
+		return ""
+	}
+	var found []string
+	for _, k := range retiredRegistryKeys {
+		if _, ok := raw[k]; ok {
+			found = append(found, k)
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("config file has top-level key(s) %s from the retired standalone registry.yaml layout; "+
+		"they are ignored - move them under a `registry:` section (see docs/MIGRATION.md)", strings.Join(found, ", "))
+}
+
+// RegistryExplicit reports whether the registry section was explicitly
+// configured through the backend config file or WALLET_REGISTRY_* variables.
+func (c *Config) RegistryExplicit() bool { return c.registryExplicit }
 
 // ASConfig contains the new Authorization Server configuration.
 type ASConfig struct {
@@ -1668,6 +1723,19 @@ type RedisConfig struct {
 
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
+	return load(configFile, (*Config).Validate)
+}
+
+// LoadRegistryOnly loads configuration for a process that runs only the
+// registry role. Backend-only requirements (storage, jwt.secret, rp_id, ...)
+// are not enforced; the registry section is validated separately by the
+// caller after any deprecated-alias overlay (see ValidateRegistry and
+// ValidateRegistryStandalone).
+func LoadRegistryOnly(configFile string) (*Config, error) {
+	return load(configFile, (*Config).ValidateRegistryStandalone)
+}
+
+func load(configFile string, validate func(*Config) error) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
 
@@ -1684,6 +1752,10 @@ func Load(configFile string) (*Config, error) {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
+			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
+			if w := retiredRegistryLayoutWarning(data); w != "" {
+				cfg.loadWarnings = append(cfg.loadWarnings, w)
+			}
 		}
 	}
 
@@ -1691,6 +1763,9 @@ func Load(configFile string) (*Config, error) {
 	// Since we removed `default:` tags, this only applies actual env vars
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
+	}
+	if envHasPrefix("WALLET_REGISTRY_") {
+		cfg.registryExplicit = true
 	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
@@ -1702,7 +1777,7 @@ func Load(configFile string) (*Config, error) {
 	}
 
 	// Validate configuration
-	if err := cfg.Validate(); err != nil {
+	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
@@ -1715,6 +1790,26 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasTopLevelKey reports whether the raw YAML has the given top-level key.
+func yamlHasTopLevelKey(data []byte, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	_, ok := raw[key]
+	return ok
+}
+
+// envHasPrefix reports whether any environment variable has the given prefix.
+func envHasPrefix(prefix string) bool {
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
@@ -1813,6 +1908,7 @@ func defaultConfig() *Config {
 	corsConfig.SetDefaults()
 
 	return &Config{
+		Registry: DefaultRegistryConfig(),
 		Server: ServerConfig{
 			Host:       "0.0.0.0",
 			Port:       8080,

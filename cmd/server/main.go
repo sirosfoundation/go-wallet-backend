@@ -3,20 +3,18 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v3"
 
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
-	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -27,7 +25,7 @@ import (
 
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
-	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
+	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "DEPRECATED: path to the old standalone registry configuration file; use the registry: section of --config")
 	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
 	buildTime          = "unknown"
@@ -45,7 +43,8 @@ func main() {
 
 	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider) {
+	needsBackendCfg := roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider)
+	if needsBackendCfg {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
@@ -63,26 +62,30 @@ func main() {
 		}
 	}
 
-	// Load registry configuration (needed for registry role)
-	var registryCfg *registry.Config
+	// Registry role: the registry section lives in the backend config. When
+	// the registry runs alone, only the registry-relevant parts of that config
+	// are required (see config.LoadRegistryOnly).
+	registryOnly := roles.Has(modes.RoleRegistry) && !needsBackendCfg
+	var registryCfg *config.Config // full config used by the registry role
+	var registryWarnings []string
 	if roles.Has(modes.RoleRegistry) {
-		registryCfg, err = loadRegistryConfig(*registryConfigFile)
-		if err != nil {
-			log.Fatalf("Failed to load registry configuration: %v", err)
+		if registryOnly {
+			registryCfg, err = config.LoadRegistryOnly(*configFile)
+			if err != nil {
+				log.Fatalf("Failed to load configuration for registry role: %v", err)
+			}
+		} else {
+			registryCfg = backendCfg
 		}
-		if err := registryCfg.Validate(); err != nil {
+		registryWarnings, err = setupRegistryConfig(registryCfg, *registryConfigFile, registryOnly)
+		if err != nil {
 			log.Fatalf("Invalid registry configuration: %v", err)
 		}
 	}
 
-	// Initialize logger (use backend config if available, otherwise registry)
+	// Initialize logger from the (shared) backend logging config
 	var logger *zap.Logger
-	if backendCfg != nil {
-		logger, err = logging.NewLogger(logging.Config{
-			Level:  backendCfg.Logging.Level,
-			Format: backendCfg.Logging.Format,
-		})
-	} else if registryCfg != nil {
+	if registryCfg != nil {
 		logger, err = logging.NewLogger(logging.Config{
 			Level:  registryCfg.Logging.Level,
 			Format: registryCfg.Logging.Format,
@@ -94,6 +97,15 @@ func main() {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 	defer func() { _ = logger.Sync() }()
+
+	for _, w := range registryWarnings {
+		logger.Warn(w)
+	}
+	if registryCfg != nil {
+		for _, w := range registryCfg.Warnings() {
+			logger.Warn(w)
+		}
+	}
 
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
@@ -179,11 +191,17 @@ func main() {
 			serverCfg.WPPort = backendCfg.Server.WPPort
 		}
 	} else if registryCfg != nil {
-		// Registry-only mode - use registry server config
-		serverCfg.HTTPAddress = registryCfg.Server.Host
-		serverCfg.HTTPPort = registryCfg.Server.Port
+		// Registry-only mode: shared server/logging/CORS settings of the
+		// backend config, listening on server.registry_host/registry_port
+		// (default <host>:8097, as the retired standalone binary did).
+		addr := registryCfg.Server.RegistryAddress()
+		host, port := registryListenAddr(addr)
+		serverCfg.HTTPAddress = host
+		serverCfg.HTTPPort = port
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
 		serverCfg.CORS = registryCfg.Server.CORS
+		serverCfg.TLS = registryCfg.Server.TLS
+		serverCfg.TrustedProxies = registryCfg.Server.TrustedProxies
 	}
 
 	if backendCfg != nil {
@@ -218,6 +236,12 @@ func main() {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
 		if err != nil {
 			logger.Fatal("Failed to create registry provider", zap.Error(err))
+		}
+		// Co-located with the backend: share its tenant store and token
+		// blacklist so revocation and tenant checks apply to the registry too.
+		if backendProvider != nil {
+			provider.SetTenantLookup(backendProvider.Store().Tenants())
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
 		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
@@ -339,23 +363,31 @@ func main() {
 	logger.Info("Server exited")
 }
 
-// loadRegistryConfig loads registry configuration from file and environment
-func loadRegistryConfig(path string) (*registry.Config, error) {
-	cfg := registry.DefaultConfig()
-
-	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to read registry config file: %w", err)
+// setupRegistryConfig applies the deprecated standalone registry
+// configuration (--registry-config, REGISTRY_*) on top of cfg, then validates
+// everything the registry role needs. It returns the deprecation warnings to
+// log once the logger exists.
+func setupRegistryConfig(cfg *config.Config, legacyPath string, standalone bool) ([]string, error) {
+	warnings, err := cfg.ApplyLegacyRegistryConfig(legacyPath, standalone)
+	if err != nil {
+		return nil, err
 	}
-	if err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse registry config file: %w", err)
-		}
+	if err := cfg.ValidateRegistry(); err != nil {
+		return warnings, err
 	}
+	return warnings, nil
+}
 
-	if err := envconfig.Process("REGISTRY", cfg); err != nil {
-		return nil, fmt.Errorf("failed to process registry environment variables: %w", err)
+// registryListenAddr splits a host:port address as returned by
+// config.ServerConfig.RegistryAddress.
+func registryListenAddr(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 8097
 	}
-
-	return cfg, nil
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 8097
+	}
+	return host, port
 }

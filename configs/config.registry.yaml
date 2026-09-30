@@ -1,0 +1,65 @@
+# Configuration for a registry-only deployment (`--mode=registry`), which is
+# also the default of the go-wallet-registry helper image
+# (Dockerfile.registry). Only the parts of the backend configuration the
+# registry role needs are listed; server address, logging and CORS are the
+# backend's own settings.
+#
+# Every key can be set through WALLET_* environment variables, e.g.
+#   WALLET_REGISTRY_SOURCE_URL, WALLET_REGISTRY_REQUIRE_AUTH,
+#   WALLET_SERVER_REGISTRY_PORT, WALLET_AS_EXTERNAL_URL, WALLET_JWT_SECRET.
+
+server:
+  host: "0.0.0.0"
+  # Registry-only processes listen on registry_port (default 8097).
+  registry_port: 8097
+  cors:
+    allowed_origins:
+      - "*"
+
+logging:
+  level: "info"
+  format: "json"
+
+registry:
+  source:
+    url: "https://registry.siros.org/api/v1/schemas.json"
+    poll_interval: 5m
+    timeout: 30s
+  cache:
+    path: "/app/data/vctm-cache.json"
+    max_age: 24h
+  dynamic_cache:
+    enabled: true
+    default_ttl: 1h
+    max_ttl: 24h
+    min_ttl: 5m
+    timeout: 30s
+    # In production, consider restricting to known credential hosts
+    allowed_hosts: []
+  rate_limit:
+    enabled: true
+    authenticated_rpm: 1000
+    unauthenticated_rpm: 100
+    burst_multiplier: 3
+  # When true every request needs a valid access token. The token validator is
+  # built from the as.* / jwt.* settings below (no JWKS override exists).
+  require_auth: false
+
+# Needed only when registry.require_auth is true (or to recognise tokens for
+# the authenticated rate limit). This process does not run the authorization
+# server (as.enabled stays false); it validates the tokens the AS issues.
+as:
+  # Public base URL of the authorization server; JWKS is fetched from
+  # <external_url>/auth/.well-known/jwks.json. New-style (ES256) tokens must
+  # carry the "wallet-registry" audience.
+  external_url: ""
+  # Expected "iss" claim (defaults to jwt.issuer).
+  issuer: ""
+  legacy:
+    # Accept legacy HMAC tokens signed with jwt.secret (never rejected on
+    # audience grounds). Set to false once all clients use AS-issued tokens.
+    enabled: true
+
+# jwt:
+#   secret_path: /run/secrets/jwt_secret   # >= 32 bytes; needed while as.legacy.enabled
+#   issuer: wallet-backend
