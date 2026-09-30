@@ -315,9 +315,17 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 // making it conditional on a separately-configured toggle would leave the
 // checked-in default configuration unable to revoke a session's refresh
 // tokens on logout at all.
+//
+// It returns ctx.Err() without recording anything if ctx is already done,
+// so a caller (Logout) can never mistake an abandoned request for a
+// completed revocation; callers must treat any error as "not revoked" and
+// fail closed.
 func (b *TokenBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
 	if sid == "" {
 		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	b.mu.Lock()

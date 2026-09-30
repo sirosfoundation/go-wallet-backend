@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -486,5 +487,76 @@ func TestLogout_RealLegacyToken_EndToEnd_RPIDAudience(t *testing.T) {
 	}
 	if code := do(http.MethodGet, "/user/session/account-info"); code != http.StatusUnauthorized {
 		t.Errorf("token of a revoked family must be rejected, got %d", code)
+	}
+}
+
+// TestHandlers_Logout_RevokeFamilyFailure_FailsClosed drives Logout down each path with a request
+// context that is already cancelled, which makes RevokeFamily return an
+// error, then retries with a live context to prove the logout is
+// idempotent and succeeds once the blacklist recovers.
+func TestHandlers_Logout_RevokeFamilyFailure_FailsClosed(t *testing.T) {
+	secret := "test-secret"
+	mkToken := func(t *testing.T, jti, sid string) string {
+		t.Helper()
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": "user-1", "jti": jti, "sid": sid,
+			"exp": time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte(secret))
+		if err != nil {
+			t.Fatalf("SignedString: %v", err)
+		}
+		return s
+	}
+
+	for _, tc := range []struct {
+		name      string
+		tokenAuth bool
+	}{
+		{"legacy HMAC path", false},
+		{"tokenauth ModeLegacy path", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handlers, router := setupLogoutTestHandlers(t)
+			sid := "sid-failclosed-" + tc.name
+			raw := mkToken(t, "jti-failclosed", sid)
+
+			router.POST("/logout", func(c *gin.Context) {
+				c.Set("token", raw)
+				if tc.tokenAuth {
+					c.Set("tokenauth_result", &tokenauthclaims.Result{
+						UserID: "user-1", JTI: "jti-failclosed", Mode: tokenauthclaims.ModeLegacy,
+					})
+				}
+				c.Next()
+			}, handlers.Logout)
+
+			cancelled, cancel := context.WithCancel(context.Background())
+			cancel()
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil).WithContext(cancelled))
+
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "Logged out successfully") {
+				t.Errorf("success message must not be returned: %s", w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "Failed to revoke session") {
+				t.Errorf("expected revoke-session error, got %s", w.Body.String())
+			}
+			if handlers.services.TokenBlacklist.IsFamilyRevoked(context.Background(), sid) {
+				t.Error("family must not be revoked after the failure")
+			}
+
+			// Retry once the blacklist has recovered.
+			w = httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("retry: expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if !handlers.services.TokenBlacklist.IsFamilyRevoked(context.Background(), sid) {
+				t.Error("retry: expected the family to be revoked")
+			}
+		})
 	}
 }

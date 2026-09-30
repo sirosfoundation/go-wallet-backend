@@ -500,6 +500,10 @@ revocation recorded on one replica is not seen by the others, so for example a
 stolen refresh token can still be exchanged on a replica that never handled
 the logout until the token expires (refresh tokens live `jwt.refresh_days`).
 
+`POST /user/session/logout` fails closed: if the refresh-token family cannot
+be revoked it answers `500 {"error":"Failed to revoke session"}` instead of
+`200`, and the client should retry (logout is idempotent).
+
 Until a shared revocation store exists (tracked in #407 / #415), either run a
 single replica for the token-issuing role, or route a user's requests to the
 same replica (session affinity) and accept that a restart forgets revocations.
