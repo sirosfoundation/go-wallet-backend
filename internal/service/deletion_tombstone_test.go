@@ -66,10 +66,25 @@ func TestDeleteUser_TombstoneWriteFailureDeletesNothing(t *testing.T) {
 	svc := NewUserService(store, testConfig(), zap.NewNop())
 	revoked := false
 	svc.AddUserRevoker(revokerFunc(func(string) { revoked = true }))
-	uid := seedWalletUser(t, base, domain.DefaultTenantID)
+	uid := seedWalletUser(t, base, domain.DefaultTenantID, "acme")
+	did := "did:example:" + uid.String()
 
 	err := svc.DeleteUser(ctx, uid, uid.String())
 	require.ErrorIs(t, err, ErrDeletionIncomplete)
+	// The documented semantics: a failed tombstone write removes NOTHING, not
+	// merely the user record. Holder data and wallet instances in every
+	// tenant must still be there.
+	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
+		creds, cerr := base.Credentials().GetAllByHolder(ctx, tid, did)
+		require.NoError(t, cerr)
+		assert.Len(t, creds, 1, "credential in tenant %s must survive a failed tombstone write", tid)
+		pres, perr := base.Presentations().GetAllByHolder(ctx, tid, did)
+		require.NoError(t, perr)
+		assert.Len(t, pres, 1, "presentation in tenant %s must survive a failed tombstone write", tid)
+	}
+	insts, ierr := base.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, ierr)
+	assert.Len(t, insts, 1, "the wallet instance must survive a failed tombstone write")
 	_, gerr := base.Users().GetByID(ctx, uid)
 	assert.NoError(t, gerr, "the user record must survive")
 	assert.False(t, revoked, "no permanent revocation may have happened")
@@ -85,6 +100,12 @@ func TestDeleteUser_TombstoneWriteFailureDeletesNothing(t *testing.T) {
 	require.NoError(t, svc.DeleteUser(ctx, uid, uid.String()))
 	_, gerr = base.Users().GetByID(ctx, uid)
 	assert.ErrorIs(t, gerr, storage.ErrNotFound)
+	creds, cerr := base.Credentials().GetAllByHolder(ctx, "acme", did)
+	require.NoError(t, cerr)
+	assert.Empty(t, creds, "the retry erases the holder data")
+	insts, ierr = base.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, ierr)
+	assert.Empty(t, insts, "the retry removes the wallet instance")
 	assert.ErrorIs(t, gate.Check(ctx, uid.String(), time.Now().Add(-time.Hour)), tokengate.ErrAccountDeleted)
 }
 

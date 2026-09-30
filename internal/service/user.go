@@ -333,8 +333,11 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 //
 //   - ErrDeletionIncomplete, user record kept, safe to repeat: the deletion
 //     tombstone (storage.DeletionTombstoneStore) could not be written - it is
-//     written before anything irreversible, and the token gate relies on it
-//     once the record is gone; a wallet
+//     written as soon as the tenant set is known, before the first holder
+//     credential, presentation or wallet instance is removed, so a failed
+//     write removes nothing (a tenant first discovered by the final
+//     re-list is added to it before that tenant is touched), and the token
+//     gate relies on it once the record is gone; a wallet
 //     instance or holder credential/presentation that could not be removed, a
 //     failed tenant-membership, wallet-instance or user lookup, and a session
 //     cleaner that fails before the permanent revocations below. None of these
@@ -428,6 +431,35 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		}
 	}
 
+	// Leave the deletion tombstone before the first irreversible step, which
+	// is the holder-data erasure just below, and before the user record goes:
+	// deleting the record takes the token cut-off with it, and the token gate
+	// refuses a deleted account's still-valid tokens only while a tombstone
+	// stands in for that record (tokengate.Gate.Check). A failed write stops
+	// the deletion here with nothing removed, so the request can simply be
+	// repeated; a retried deletion writes it again, which is idempotent
+	// (earliest DeletedAt, latest ExpiresAt, union of TenantIDs). While the
+	// user record still exists the gate reads its cut-off and never the
+	// tombstone, so a deletion that stops later does not lock the caller out
+	// of the retry.
+	deletedAt := s.now().UTC()
+	putTombstone := func() error {
+		if err := s.store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+			UserID:    userID.String(),
+			TenantIDs: tenantIDs,
+			DeletedAt: deletedAt,
+			ExpiresAt: deletedAt.Add(s.cfg.DeletionTombstoneRetention()),
+		}); err != nil {
+			s.logger.Error("Account deletion incomplete: deletion tombstone could not be written",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: write deletion tombstone: %w", ErrDeletionIncomplete, err)
+		}
+		return nil
+	}
+	if err := putTombstone(); err != nil {
+		return err
+	}
+
 	// Delete any legacy server-side stored credentials and presentations from
 	// each tenant, regardless of whether credential/VC endpoints are currently enabled.
 	// Holder-data failures count too. Reporting an account deleted while the
@@ -486,6 +518,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// An instance discovered only now can be in a tenant the holder-data
 	// loop never visited, so that tenant's credentials and presentations
 	// would survive the account. Sweep those tenants before committing.
+	var lateTenants []domain.TenantID
 	for _, inst := range late {
 		if seen[inst.TenantID] {
 			continue
@@ -494,7 +527,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		// Into tenantIDs as well, so the membership-removal pass at the end
 		// covers this tenant instead of leaving it orphaned.
 		tenantIDs = append(tenantIDs, inst.TenantID)
-		dataErrs = append(dataErrs, s.eraseHolderData(ctx, inst.TenantID, holderDID)...)
+		lateTenants = append(lateTenants, inst.TenantID)
+	}
+	if len(lateTenants) > 0 {
+		// Record the newly found tenants on the tombstone before erasing
+		// anything in them (the store unions the tenant lists).
+		if err := putTombstone(); err != nil {
+			return err
+		}
+	}
+	for _, tid := range lateTenants {
+		dataErrs = append(dataErrs, s.eraseHolderData(ctx, tid, holderDID)...)
 	}
 	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
 
@@ -503,28 +546,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Error("Account deletion incomplete",
 			zap.Error(errors.Join(outstanding...)), zap.String("user_id", userID.String()))
 		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(outstanding...))
-	}
-
-	// Leave the deletion tombstone before anything irreversible happens, and
-	// before the user record goes: deleting the record takes the token
-	// cut-off with it, and the token gate refuses a deleted account's
-	// still-valid tokens only while a tombstone stands in for that record
-	// (tokengate.Gate.Check). A failed write stops the deletion here, with
-	// nothing removed that the caller cannot retry; a retried deletion writes
-	// it again, which is idempotent (earliest DeletedAt, latest ExpiresAt).
-	// While the user record still exists the gate reads its cut-off and never
-	// the tombstone, so a deletion that stops later does not lock the caller
-	// out of the retry.
-	deletedAt := s.now().UTC()
-	if err := s.store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
-		UserID:    userID.String(),
-		TenantIDs: tenantIDs,
-		DeletedAt: deletedAt,
-		ExpiresAt: deletedAt.Add(s.cfg.DeletionTombstoneRetention()),
-	}); err != nil {
-		s.logger.Error("Account deletion incomplete: deletion tombstone could not be written",
-			zap.Error(err), zap.String("user_id", userID.String()))
-		return fmt.Errorf("%w: write deletion tombstone: %w", ErrDeletionIncomplete, err)
 	}
 
 	// Everything below this point is irreversible for the caller, so it only
