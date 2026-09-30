@@ -378,3 +378,38 @@ func TestTokenBlacklist_StartStop_Disabled(t *testing.T) {
 	b.Start()
 	b.Stop()
 }
+
+// TestRevokeFamily_NeverShortensExistingMarker is the regression test for a
+// #414 review finding: re-revoking a family with a smaller retention (e.g.
+// after the configured retention dropped) must not shorten the marker,
+// while a later expiry must extend it.
+func TestRevokeFamily_NeverShortensExistingMarker(t *testing.T) {
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	ctx := context.Background()
+	long := time.Now().Add(400 * 24 * time.Hour)
+	short := time.Now().Add(365 * 24 * time.Hour)
+	longer := time.Now().Add(500 * 24 * time.Hour)
+
+	if err := b.RevokeFamily(ctx, "sid-x", long); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RevokeFamily(ctx, "sid-x", short); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	got := b.families["sid-x"]
+	b.mu.RUnlock()
+	if !got.Equal(long) {
+		t.Errorf("re-revoke with a shorter expiry changed the marker: got %v, want %v", got, long)
+	}
+
+	if err := b.RevokeFamily(ctx, "sid-x", longer); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	got = b.families["sid-x"]
+	b.mu.RUnlock()
+	if !got.Equal(longer) {
+		t.Errorf("re-revoke with a longer expiry must extend: got %v, want %v", got, longer)
+	}
+}

@@ -575,6 +575,9 @@ func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry tim
 	if f.families == nil {
 		f.families = make(map[string]time.Time)
 	}
+	if existing, ok := f.families[sid]; ok && existing.After(expiry) {
+		expiry = existing
+	}
 	f.families[sid] = expiry
 	return nil
 }

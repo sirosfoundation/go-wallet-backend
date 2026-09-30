@@ -316,6 +316,9 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 // checked-in default configuration unable to revoke a session's refresh
 // tokens on logout at all.
 //
+// Re-revoking an already revoked sid keeps the LATER of the existing and
+// requested expiry, so the marker can only ever be extended.
+//
 // It returns ctx.Err() without recording anything if ctx is already done,
 // so a caller (Logout) can never mistake an abandoned request for a
 // completed revocation; callers must treat any error as "not revoked" and
@@ -331,6 +334,12 @@ func (b *TokenBlacklist) RevokeFamily(ctx context.Context, sid string, expiry ti
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Never shorten an existing marker: a re-revoke under a smaller
+	// retention (e.g. config lowered to the floor) must not make tokens
+	// from the original, longer window usable again.
+	if existing, ok := b.families[sid]; ok && existing.After(expiry) {
+		expiry = existing
+	}
 	b.families[sid] = expiry
 
 	b.logger.Debug("Refresh-token family revoked", zap.String("sid", sid))
