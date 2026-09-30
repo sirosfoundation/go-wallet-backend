@@ -292,7 +292,7 @@ Sunset: 2027-10-01T00:00:00Z
 The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. `as.legacy.sunset_date` stays informational (Sunset header) and disables nothing. With `as.legacy.enabled=false`:
 
 - HMAC tokens are refused everywhere: `TokenAuthMiddleware`, the engine handshake (including the standalone-engine HMAC fallback), the keystore websocket, and . No legacy issuer is created.
-- Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (when the AS is enabled) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/finish`. Session-mode clients are unaffected.
+- Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (whether or not this process runs the AS) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/finish`. Session-mode clients are unaffected.
 - One startup log line states whether legacy is enabled.
 
 ### Audience semantics

@@ -1648,6 +1648,7 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 	p.RegisterRoutes(router)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("X-Token-Mode", "session")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

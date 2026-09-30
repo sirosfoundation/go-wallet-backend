@@ -102,6 +102,14 @@ func logAuthReject(logger *zap.Logger, c *gin.Context, reason string, fields ...
 // AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
 func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// This path only understands HMAC tokens: with as.legacy.enabled=false
+		// nothing can validate here (fail closed).
+		if !cfg.LegacyEnabled() {
+			logAuthReject(logger, c, "legacy_tokens_disabled")
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			logAuthReject(logger, c, "missing_authorization_header")

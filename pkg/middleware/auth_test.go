@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -493,5 +494,49 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status %d with lowercase bearer, got %d", http.StatusOK, w.Code)
+	}
+}
+
+func TestAuthMiddlewareWithBlacklist_RefusesHMACWhenLegacyDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "0123456789abcdef0123456789abcdef"}}
+	cfg.AS.Enabled = true // AS on + legacy off => legacy disabled
+	tok := gojwtSigned(t, []byte(cfg.JWT.Secret), map[string]any{"user_id": "u", "tenant_id": "default"})
+
+	w := httptest.NewRecorder()
+	_, r := gin.CreateTestContext(w)
+	reached := false
+	r.GET("/t", AuthMiddlewareWithBlacklist(cfg, nil, nil, zap.NewNop()), func(c *gin.Context) { reached = true })
+	req := httptest.NewRequest("GET", "/t", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	r.ServeHTTP(w, req)
+	if w.Code != 401 || reached {
+		t.Errorf("valid HMAC token must be refused when legacy is disabled, got %d reached=%v", w.Code, reached)
+	}
+}
+
+// A loaded config (as Load() builds it) with as.legacy.enabled=false and the
+// AS disabled in this process must still refuse HMAC on the no-AS path.
+func TestAuthMiddlewareWithBlacklist_LoadedConfigLegacyOff(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	p := dir + "/c.yaml"
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nas:\n  legacy:\n    enabled: false\n"
+	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok := gojwtSigned(t, []byte(cfg.JWT.Secret), map[string]any{"user_id": "u", "tenant_id": "default"})
+	w := httptest.NewRecorder()
+	_, r := gin.CreateTestContext(w)
+	r.GET("/t", AuthMiddlewareWithBlacklist(cfg, nil, nil, zap.NewNop()), func(c *gin.Context) { c.Status(200) })
+	req := httptest.NewRequest("GET", "/t", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	r.ServeHTTP(w, req)
+	if w.Code != 401 {
+		t.Errorf("expected 401, got %d", w.Code)
 	}
 }

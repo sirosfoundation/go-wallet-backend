@@ -69,22 +69,17 @@ func (p *AuthProvider) Name() string         { return "auth" }
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
 // legacyIssuanceGate refuses the /user/* routes that mint HS256 session tokens
-// when the AS is enabled and as.legacy.enabled is false. Without the AS the HMAC tokens are the
-// only session mechanism, so the gate is a no-op.
+// with 410 when legacy is disabled (as.legacy.enabled=false), whether or not
+// this process runs the AS. It must precede any OIDC gate so legacy requests
+// get the 410, not an unrelated OIDC error.
 func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
-	if !p.cfg.AS.Enabled {
-		return func(c *gin.Context) { c.Next() }
-	}
-	return middleware.LegacyIssuanceGate(p.cfg.AS.Legacy.Enabled)
+	return middleware.LegacyIssuanceGate(p.cfg.LegacyEnabled())
 }
 
 // LogLegacyTokenStatus logs once at startup whether legacy (HMAC) session
 // tokens are enabled.
 func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
-	if !cfg.AS.Enabled {
-		return
-	}
-	if cfg.AS.Legacy.Enabled {
+	if cfg.LegacyEnabled() {
 		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
 		return
 	}
@@ -115,8 +110,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		registration.Use(
 			middleware.NoCacheMiddleware(),
 			gateLimit,
-			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
 			p.legacyIssuanceGate(),
+			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
 		)
 		{
 			registration.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
@@ -128,8 +123,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		login.Use(
 			middleware.NoCacheMiddleware(),
 			gateLimit,
-			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
 			p.legacyIssuanceGate(),
+			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
 		)
 		{
 			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)

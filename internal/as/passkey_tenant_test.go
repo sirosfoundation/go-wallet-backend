@@ -33,6 +33,10 @@ import (
 // for issue #374: passkey tenant selection must come from the validated
 // X-Tenant-ID header, never from the request body.
 func setupPasskeyTenantTest(t *testing.T) (*gin.Engine, *memory.Store) {
+	return setupPasskeyTenantTestLegacy(t, true)
+}
+
+func setupPasskeyTenantTestLegacy(t *testing.T, legacy bool) (*gin.Engine, *memory.Store) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -56,7 +60,7 @@ func setupPasskeyTenantTest(t *testing.T) (*gin.Engine, *memory.Store) {
 		t.Fatalf("failed to create webauthn service: %v", err)
 	}
 
-	asCfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
+	asCfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: legacy},
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
@@ -420,5 +424,37 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for known tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// With legacy disabled, legacy-mode requests must get 410 BEFORE the OIDC
+// gate can answer with an OIDC error; session-mode requests still reach it.
+func TestPasskeyRoutes_LegacyDisabled410BeforeOIDCGate(t *testing.T) {
+	router, store := setupPasskeyTenantTestLegacy(t, false)
+	mustCreateTenant(t, store, &domain.Tenant{
+		ID: "gated", Name: "Gated", Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode:           domain.OIDCGateModeBoth,
+			RegistrationOP: &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"},
+			LoginOP:        &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"},
+		},
+	})
+	for _, path := range []string{"/auth/passkey/register/begin", "/auth/passkey/register/finish", "/auth/passkey/login/begin", "/auth/passkey/login/finish"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("X-Tenant-ID", "gated")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "legacy_tokens_disabled") {
+			t.Errorf("%s legacy-mode: expected 410 legacy_tokens_disabled before the OIDC gate, got %d: %s", path, w.Code, w.Body.String())
+		}
+
+		req = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("X-Tenant-ID", "gated")
+		req.Header.Set("X-Token-Mode", "session")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "oidc_gate_required") {
+			t.Errorf("%s session-mode: expected the OIDC gate answer, got %d: %s", path, w.Code, w.Body.String())
+		}
 	}
 }

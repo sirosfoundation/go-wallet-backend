@@ -193,7 +193,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	{
 		// Registration routes (with OIDC registration gate).
 		registration := passkey.Group("")
-		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		registration.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
 		{
 			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
@@ -201,7 +201,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 		// Login routes (with OIDC login gate).
 		login := passkey.Group("")
-		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		login.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
 		{
 			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
 			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
@@ -315,4 +315,21 @@ func (m *ASModule) Close() error {
 		return nil
 	}
 	return m.KeyManager.Close()
+}
+
+// legacyModeGate answers 410 legacy_tokens_disabled to legacy-mode clients (no
+// X-Token-Mode: session) when legacy is disabled. It sits before the OIDC gate
+// so those clients get this answer rather than an unrelated OIDC error;
+// session-mode requests pass through untouched.
+func legacyModeGate(enabled bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if enabled || DetectClientMode(c) == ClientModeSession {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusGone, gin.H{
+			"error":   "legacy_tokens_disabled",
+			"message": "legacy HMAC session tokens are no longer issued; send X-Token-Mode: session",
+		})
+	}
 }
