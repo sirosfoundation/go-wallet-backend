@@ -205,6 +205,11 @@ type Manager struct {
 	// authorization cut-off (optional; see internal/tokengate).
 	tokenGate *tokengate.Gate
 
+	// beforeRegister, when non-nil, runs after the handshake token has been
+	// validated and the session built, but before registerSession. Tests use
+	// it to land a cut-off in exactly that window.
+	beforeRegister func()
+
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
@@ -433,6 +438,10 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		pongTimeout:   pongTimeout,
 	}
 
+	if m.beforeRegister != nil {
+		m.beforeRegister()
+	}
+
 	// Register session. A rejection here means the user was revoked in the
 	// narrow window between validateToken's own check above and this call -
 	// registerSession has already closed the connection itself in that
@@ -449,6 +458,9 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	if err := m.recheckToken(session); err != nil {
 		m.logger.Warn("Session refused after registration", zap.Error(err))
 		m.sendError(conn, "", ErrCodeAuthFailed, "Authorization revoked")
+		// Fail closed: drop the socket right away with a policy-violation
+		// close frame rather than waiting for the deferred teardown.
+		session.closeWithReason("authorization revoked")
 		return
 	}
 

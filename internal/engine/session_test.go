@@ -1460,3 +1460,51 @@ func TestManager_RevokeUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	require.NoError(t, ws2.ReadJSON(&msg))
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
+
+// SID-AUTH-06 race: the cut-off lands after validateToken's gate check but
+// before registerSession. The sweep cannot see the not-yet-indexed session,
+// so the post-registration recheck must refuse it and close the socket
+// immediately rather than leave it connected until a flow starts.
+func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	var hookRan atomic.Bool
+	m.beforeRegister = func() {
+		hookRan.Store(true)
+		require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now()))
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Close() })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   uid.String(),
+		"tenant_id": "t",
+		"iat":       time.Now().Add(-time.Minute).Unix(),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{Message: Message{Type: TypeHandshake}, AppToken: tok}))
+
+	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			break // connection closed: required outcome
+		}
+		assert.NotContains(t, string(data), TypeHandshakeComplete, "a revoked token must never get handshake_complete")
+	}
+	assert.True(t, hookRan.Load())
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	assert.Empty(t, m.sessions, "the refused session must not stay registered")
+	assert.Empty(t, m.userIndex)
+}
