@@ -975,6 +975,57 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, resp.Token)
 	})
+
+	// #402: rotation must carry the family id forward unchanged into BOTH
+	// replacement tokens, or a later Logout could no longer revoke them.
+	t.Run("rotation preserves an existing sid in both the new access and refresh tokens", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		svc.SetTokenBlacklist(NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop()))
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-5"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "sid-preserved-1")
+		require.NoError(t, err)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		assert.Equal(t, "sid-preserved-1", sidClaim(t, resp.Token))
+		assert.Equal(t, "sid-preserved-1", sidClaim(t, resp.RefreshToken))
+
+		// And it survives a second rotation of the rotated token.
+		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		require.NoError(t, err)
+		assert.Equal(t, "sid-preserved-1", sidClaim(t, resp2.Token))
+		assert.Equal(t, "sid-preserved-1", sidClaim(t, resp2.RefreshToken))
+	})
+
+	t.Run("rotating a legacy refresh token with no sid initialises one, shared by both new tokens and kept thereafter", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		svc.SetTokenBlacklist(NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop()))
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-6"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		legacy, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
+		require.NoError(t, err)
+		require.Empty(t, sidClaim(t, legacy), "precondition: legacy token carries no sid")
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: legacy})
+		require.NoError(t, err)
+		newSid := sidClaim(t, resp.RefreshToken)
+		require.NotEmpty(t, newSid, "a sid must be initialised for a pre-#402 family")
+		assert.Equal(t, newSid, sidClaim(t, resp.Token), "access and refresh tokens must share the new sid")
+
+		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		require.NoError(t, err)
+		assert.Equal(t, newSid, sidClaim(t, resp2.RefreshToken), "the initialised sid must be carried forward, not regenerated")
+		assert.Equal(t, newSid, sidClaim(t, resp2.Token))
+	})
 }
 
 // sidClaim parses a legacy HMAC token signed with testJWTSecret and returns
