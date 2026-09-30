@@ -60,22 +60,6 @@ func resumeBody(sessionID, token, lastReceived string) []byte {
 
 // --- registerSession result is honoured ---
 
-func TestHTTPHandshake_RevokedBetweenValidateAndRegister_Returns401(t *testing.T) {
-	m := testManager()
-	defer m.Close()
-	m.SetTokenBlacklist(&revokeOnSecondCheck{})
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/rpc", strings.NewReader(`{"type":"handshake"}`))
-	req.Header.Set("Authorization", "Bearer "+testToken("user-r", "t"))
-	w := httptest.NewRecorder()
-	m.HandleRPC(w, req)
-
-	assert.Equal(t, http.StatusUnauthorized, w.Code)
-	m.sessionsMu.RLock()
-	defer m.sessionsMu.RUnlock()
-	assert.Empty(t, m.sessions, "rejected session must not be stored")
-}
-
 func TestWMP_SessionCreate_RevokedBetweenValidateAndRegister_NotAuthorized(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -635,38 +619,6 @@ func (s *syncRecorder) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Body.String()
-}
-
-// --- sseTransport reconnect race ---
-
-func TestSSETransport_StaleCleanupDoesNotClearNewRegistration(t *testing.T) {
-	tr := newSSETransport(10)
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	req1 := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx1)
-	done1 := make(chan struct{})
-	go func() { tr.serveSSE(httptest.NewRecorder(), req1); close(done1) }()
-
-	require.Eventually(t, func() bool {
-		tr.sseMu.Lock()
-		defer tr.sseMu.Unlock()
-		return tr.sseCtx == ctx1
-	}, time.Second, time.Millisecond)
-
-	// Hold sseMu so the first handler's deferred cleanup blocks; meanwhile
-	// the reconnect registers (as serveSSE does once the old ctx is done).
-	tr.sseMu.Lock()
-	cancel1()
-	time.Sleep(20 * time.Millisecond)
-	ctx2 := context.Background()
-	rec2 := httptest.NewRecorder()
-	tr.sseW, tr.sseFl, tr.sseCtx = rec2, rec2, ctx2
-	tr.sseMu.Unlock()
-
-	<-done1
-	tr.sseMu.Lock()
-	defer tr.sseMu.Unlock()
-	assert.Equal(t, ctx2, tr.sseCtx, "stale cleanup must not clear the new connection")
-	assert.NotNil(t, tr.sseW)
 }
 
 // --- misc buffer / endSession helpers ---

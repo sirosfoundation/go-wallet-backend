@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"go.uber.org/zap"
@@ -234,4 +235,14 @@ func writeBodyReadError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "failed to read body", http.StatusBadRequest)
+}
+
+// extractBearerToken returns the bearer token from the Authorization header,
+// or "" if it is absent or not a Bearer credential.
+func extractBearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(auth, "Bearer ")
 }

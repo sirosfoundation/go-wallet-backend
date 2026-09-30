@@ -84,7 +84,7 @@ func (m *Manager) wsKeepalive() (pingInterval, pongTimeout time.Duration) {
 	return pingInterval, pongTimeout
 }
 
-// Session represents an authenticated session (WebSocket or HTTP+SSE)
+// Session represents an authenticated session (WebSocket or WMP)
 type Session struct {
 	ID       string
 	UserID   string
@@ -1092,7 +1092,7 @@ func (s *Session) closeWithReason(reason string) {
 			time.Now().Add(time.Second),
 		)
 	}
-	// Non-WebSocket transports (HTTP+SSE) have no close frame to carry a
+	// Non-WebSocket transports (WMP) have no close frame to carry a
 	// reason; closing the transport is sufficient to end the session.
 	_ = t.Close()
 }
