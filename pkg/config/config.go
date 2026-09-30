@@ -78,6 +78,9 @@ type ASConfig struct {
 	// with no audiences configured would otherwise reject every request
 	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
+	// When as.legacy.enabled is true this must ALSO include server.rp_id:
+	// legacy (HMAC) tokens carry the RP ID as their audience, and Validate()
+	// rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -2132,6 +2135,16 @@ func (c *Config) Validate() error {
 		if len(c.AS.Audiences) == 0 {
 			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
 		}
+		// Legacy (HMAC) tokens carry "aud": Server.RPID (see
+		// UserService/WebAuthnService.generateToken), and go-tokenauth v0.5
+		// validates that against AS.Audiences. If the RP ID is not among
+		// them, every legacy login token is rejected on its next protected
+		// request - a failure that only shows up at runtime, so refuse it here.
+		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
+			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
+				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",
+				c.Server.RPID)
+		}
 	}
 
 	// Validate WIA configuration
@@ -2375,4 +2388,13 @@ func (c AuditConfig) validateIdentityEvents() error {
 		}
 	}
 	return nil
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

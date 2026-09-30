@@ -624,10 +624,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
+			Legacy:    legacyValidatorConfig(cfg),
 			// Same blacklist as everything else in this process (#382/#383) -
 			// without this, AS-issued/legacy tokens validated through
 			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
@@ -1050,10 +1047,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
-			Legacy: tokenvalidator.LegacyConfig{
-				Enabled:    cfg.AS.Legacy.Enabled,
-				HMACSecret: []byte(cfg.JWT.Secret),
-			},
+			Legacy:    legacyValidatorConfig(cfg),
 			// See NewBackendProvider's identical wiring (#382/#383). This
 			// provider's own services.TokenBlacklist is fine used as-is here:
 			// it never runs co-hosted with BackendProvider (see cmd/server).
@@ -1137,4 +1131,19 @@ func (p *WalletProviderProvider) Close() error {
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
+}
+
+// legacyValidatorConfig builds go-tokenauth's legacy (HMAC) token settings.
+//
+// Issuers is set explicitly to JWT.Issuer: legacy tokens are always minted by
+// UserService/WebAuthnService with "iss": JWT.Issuer, whereas the validator's
+// shared Issuer is the AS issuer (AS.Issuer). go-tokenauth v0.5 falls back to
+// the shared Issuer when Legacy.Issuers is empty, which would reject every
+// legacy token in a deployment that configures the two differently.
+func legacyValidatorConfig(cfg *config.Config) tokenvalidator.LegacyConfig {
+	return tokenvalidator.LegacyConfig{
+		Enabled:    cfg.AS.Legacy.Enabled,
+		HMACSecret: []byte(cfg.JWT.Secret),
+		Issuers:    []string{cfg.JWT.Issuer},
+	}
 }

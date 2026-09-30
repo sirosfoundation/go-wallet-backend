@@ -2758,3 +2758,33 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 		t.Fatal("empty config must yield no trusted hosts")
 	}
 }
+
+func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
+	mk := func(legacy bool, audiences ...string) *Config {
+		cfg := validBaseConfig()
+		cfg.AS.Enabled = true
+		cfg.AS.ExternalURL = "https://wallet.example.com"
+		cfg.AS.Issuer = "https://as.example.com"
+		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
+		cfg.AS.RulesDir = "/tmp/rules"
+		cfg.AS.Audiences = audiences
+		cfg.AS.Legacy.Enabled = legacy
+		return cfg
+	}
+
+	// RP ID missing from the audiences: every legacy login token would be
+	// rejected at runtime, so this must fail at startup.
+	err := mk(true, "wallet-backend").Validate()
+	if err == nil || !strings.Contains(err.Error(), "as.audiences") {
+		t.Fatalf("legacy enabled without rp_id in as.audiences must be rejected, got %v", err)
+	}
+
+	if err := mk(true, "wallet-backend", "localhost").Validate(); err != nil {
+		t.Errorf("rp_id listed in as.audiences must be accepted: %v", err)
+	}
+
+	// With legacy tokens off the RP ID is irrelevant to the AS.
+	if err := mk(false, "wallet-backend").Validate(); err != nil {
+		t.Errorf("legacy disabled must not require rp_id in as.audiences: %v", err)
+	}
+}
