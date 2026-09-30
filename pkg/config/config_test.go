@@ -2840,3 +2840,36 @@ func TestConfig_Validate_AS_LegacyRequiresJWTIssuer(t *testing.T) {
 		t.Errorf("legacy disabled must not require jwt.issuer: %v", err)
 	}
 }
+
+// The role flag alone (--mode=auth / --mode=all: Load -> EnableForRole ->
+// Validate) must yield a valid configuration, including the audience list
+// and, with legacy on, the RP ID.
+func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.JWT.Issuer = "wallet-backend"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.Server.RPID = "wallet.example.com"
+	cfg.AS.Legacy.Enabled = true
+
+	cfg.EnableForRole()
+	if !containsString(cfg.AS.Audiences, "wallet-backend") || !containsString(cfg.AS.Audiences, "wallet.example.com") {
+		t.Fatalf("unexpected default audiences %v", cfg.AS.Audiences)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("role-defaulted config must validate: %v", err)
+	}
+
+	// Legacy off: RP ID not added. Explicit list: untouched.
+	off := validBaseConfig()
+	off.Server.RPID = "wallet.example.com"
+	off.EnableForRole()
+	if containsString(off.AS.Audiences, "wallet.example.com") {
+		t.Errorf("RP ID must not be added when legacy is off: %v", off.AS.Audiences)
+	}
+	ex := validBaseConfig()
+	ex.AS.Audiences = []string{"custom"}
+	ex.EnableForRole()
+	if len(ex.AS.Audiences) != 1 || ex.AS.Audiences[0] != "custom" {
+		t.Errorf("explicit audiences must be preserved: %v", ex.AS.Audiences)
+	}
+}

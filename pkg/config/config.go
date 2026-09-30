@@ -207,6 +207,16 @@ func (c *Config) EnableForRole() {
 	if c.AS.Issuer == "" {
 		c.AS.Issuer = c.JWT.Issuer
 	}
+	// Validate() requires a non-empty audience list when AS is enabled, so
+	// a role flag alone must supply the documented default set. Legacy
+	// (HMAC) tokens carry Server.RPID as their audience, so it is added
+	// while legacy mode is on. An explicitly configured list is left alone.
+	if len(c.AS.Audiences) == 0 {
+		c.AS.Audiences = []string{"wallet-backend", "wallet-engine", "wallet-registry"}
+		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
+			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
+		}
+	}
 }
 
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.

@@ -664,3 +664,24 @@ func TestTokenAuthMiddleware_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.
 		t.Errorf("expected 401 (fail closed), got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// Legacy-mode results are exempt from RequireAudience (their aud is the RP
+// ID, already validated by go-tokenauth); new-style tokens are not.
+func TestRequireAudience_LegacyModeExempt_SessionModeStillEnforced(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	run := func(res *claims.Result) int {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.Use(func(c *gin.Context) { c.Set("tokenauth_result", res); c.Next() })
+		r.Use(RequireAudience("wallet-backend"))
+		r.GET("/t", func(c *gin.Context) { c.Status(200) })
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/t", nil))
+		return w.Code
+	}
+	if code := run(&claims.Result{Mode: claims.ModeLegacy, Audience: []string{"wallet.example.com"}}); code != 200 {
+		t.Errorf("legacy RP-ID audience: expected 200, got %d", code)
+	}
+	if code := run(&claims.Result{Mode: claims.ModeSession, Audience: []string{"wallet.example.com"}}); code != 403 {
+		t.Errorf("session-mode wrong audience: expected 403, got %d", code)
+	}
+}

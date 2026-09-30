@@ -10,11 +10,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // setupLogoutTestHandlers is like setupTestHandlers but with the token
@@ -426,5 +428,63 @@ func TestHandlers_Logout_ASToken_ModeLegacy_UndeterminableSIDFailsClosed(t *test
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestLogout_RealLegacyToken_EndToEnd_RPIDAudience reproduces the review
+// finding that the legacy logout path was unreachable: a WebAuthn-shaped
+// legacy token has aud=Server.RPID (not "wallet-backend"), and the real
+// chain TokenAuthMiddleware -> RequireAudience("wallet-backend") -> Logout
+// used to answer 403 before the family could be revoked.
+func TestLogout_RealLegacyToken_EndToEnd_RPIDAudience(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "wallet.example.com"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, RefreshDays: 7, Issuer: "test-wallet"},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+		},
+	}
+	store := memory.NewStore()
+	services := service.NewServices(store, cfg, logger)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	v := tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet-backend", "wallet-engine", "wallet-registry", "wallet.example.com"},
+		Legacy: tokenvalidator.LegacyConfig{
+			Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
+		},
+	})
+
+	router := gin.New()
+	router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, logger))
+	router.Use(middleware.RequireAudience("wallet-backend"))
+	router.POST("/user/session/logout", handlers.Logout)
+	router.GET("/user/session/account-info", func(c *gin.Context) { c.Status(200) })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1", "tenant_id": "default", "jti": "jti-e2e", "sid": "sid-e2e",
+		"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(method, path string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if code := do(http.MethodPost, "/user/session/logout"); code != http.StatusOK {
+		t.Fatalf("logout with a real legacy token: expected 200, got %d", code)
+	}
+	if !services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-e2e") {
+		t.Error("expected the refresh-token family to be revoked by the registered logout route")
+	}
+	if code := do(http.MethodGet, "/user/session/account-info"); code != http.StatusUnauthorized {
+		t.Errorf("token of a revoked family must be rejected, got %d", code)
 	}
 }

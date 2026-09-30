@@ -258,7 +258,15 @@ func RequireAudience(allowed ...string) gin.HandlerFunc {
 			return
 		}
 
-		if !result.HasAudience(allowed...) {
+		// Legacy (HMAC) tokens are the user-session tokens minted by
+		// WebAuthnService/UserService; their "aud" is always Server.RPID,
+		// never one of the route-group audiences. go-tokenauth already
+		// validated it against AS.Audiences (Config.Validate requires the
+		// RP ID to be listed), so exempt them here - otherwise every real
+		// WebAuthn login token would get 403 on routes (e.g. logout) guarded
+		// by RequireAudience("wallet-backend") unless the RP ID happened to
+		// equal that string.
+		if result.Mode != claims.ModeLegacy && !result.HasAudience(allowed...) {
 			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return
