@@ -30,3 +30,29 @@ func TestStashAction_HoldsFlowReadLockThroughInsertion(t *testing.T) {
 	s.stash.mu.Unlock()
 	<-done
 }
+
+// removeFlow must keep flowsMu held through the stash cleanup so a replacement
+// flow cannot register and stash between the unregistration and the drop.
+func TestRemoveFlow_HoldsFlowLockThroughStashDrop(t *testing.T) {
+	f := &Flow{ID: "f"}
+	s := &Session{flows: map[string]*Flow{"f": f}}
+
+	s.stash.mu.Lock() // block dropFlow
+	done := make(chan struct{})
+	go func() {
+		s.removeFlow("f", f)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		// dropFlow is blocked on stash.mu; flowsMu must still be held.
+		if s.flowsMu.TryRLock() {
+			s.flowsMu.RUnlock()
+			return false
+		}
+		return true
+	}, time.Second, time.Millisecond, "flowsMu must be held through dropFlow")
+
+	s.stash.mu.Unlock()
+	<-done
+}

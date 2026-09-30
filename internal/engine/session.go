@@ -1596,13 +1596,13 @@ func (r *responseStash) dropFlow(flowID string) {
 // when this flow instance is the registered one, so a stale flow's teardown
 // cannot purge the entries of a replacement that reuses the same ID.
 func (s *Session) removeFlow(flowID string, flow *Flow) {
+	// flowsMu stays held through dropFlow: a replacement flow reusing flowID
+	// registers under the same lock, so its stashed actions cannot be deleted
+	// by this (stale) flow's cleanup. Lock order is flowsMu -> stash.mu.
 	s.flowsMu.Lock()
-	current := s.flows[flowID] == flow
-	if current {
+	defer s.flowsMu.Unlock()
+	if s.flows[flowID] == flow {
 		delete(s.flows, flowID)
-	}
-	s.flowsMu.Unlock()
-	if current {
 		s.stash.dropFlow(flowID)
 	}
 }
