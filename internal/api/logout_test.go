@@ -365,10 +365,17 @@ func TestTTLForTokenAuthResult(t *testing.T) {
 // rotation - its own jti never individually blacklisted - was still
 // unexpired and usable again.
 func TestFamilyRetention(t *testing.T) {
+	t.Run("lifetimes beyond the floor are honoured", func(t *testing.T) {
+		cfg := &config.Config{JWT: config.JWTConfig{RefreshDays: 400, ExpiryHours: 24}}
+		if got, want := familyRetention(cfg), 400*24*time.Hour; got != want {
+			t.Errorf("familyRetention() = %v, want %v", got, want)
+		}
+	})
+
 	t.Run("refresh token outlives access token (the common case)", func(t *testing.T) {
 		cfg := &config.Config{JWT: config.JWTConfig{RefreshDays: 7, ExpiryHours: 24}}
 		got := familyRetention(cfg)
-		want := 7 * 24 * time.Hour
+		want := config.MinFamilyRetention
 		if got != want {
 			t.Errorf("familyRetention() = %v, want %v", got, want)
 		}
@@ -377,7 +384,7 @@ func TestFamilyRetention(t *testing.T) {
 	t.Run("access token outlives refresh token (unusual but valid config)", func(t *testing.T) {
 		cfg := &config.Config{JWT: config.JWTConfig{RefreshDays: 1, ExpiryHours: 720}} // 30 days
 		got := familyRetention(cfg)
-		want := 720 * time.Hour
+		want := config.MinFamilyRetention
 		if got != want {
 			t.Errorf("familyRetention() = %v, want %v", got, want)
 		}
@@ -386,7 +393,7 @@ func TestFamilyRetention(t *testing.T) {
 	t.Run("refresh tokens disabled: falls back to the access token's own lifetime", func(t *testing.T) {
 		cfg := &config.Config{JWT: config.JWTConfig{RefreshDays: 0, ExpiryHours: 24}}
 		got := familyRetention(cfg)
-		want := 24 * time.Hour
+		want := config.MinFamilyRetention
 		if got != want {
 			t.Errorf("familyRetention() = %v, want %v", got, want)
 		}

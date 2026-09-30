@@ -120,7 +120,7 @@ Environment prefix: `WALLET_JWT`
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | Path to file containing JWT secret |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer |  |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
-| `jwt.issuer` | `WALLET_JWT_ISSUER` | string |  |
+| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it, and Validate() rejects an empty value in that mode. |
 
 ## as
 

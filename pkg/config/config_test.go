@@ -2769,6 +2769,7 @@ func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
 		cfg.AS.RulesDir = "/tmp/rules"
 		cfg.AS.Audiences = audiences
 		cfg.AS.Legacy.Enabled = legacy
+		cfg.JWT.Issuer = "wallet-backend"
 		return cfg
 	}
 
@@ -2798,5 +2799,44 @@ func TestJWTConfig_MaxTokenLifetime(t *testing.T) {
 	}
 	if got := (JWTConfig{ExpiryHours: 24}).MaxTokenLifetime(); got != 24*time.Hour {
 		t.Errorf("got %v", got)
+	}
+}
+
+// Retention must not shrink when jwt lifetimes are later lowered: tokens
+// minted under the earlier, longer configuration are still outstanding.
+func TestJWTConfig_FamilyRetention_NonShrinkingAcrossConfigChanges(t *testing.T) {
+	before := JWTConfig{RefreshDays: 180, ExpiryHours: 24}
+	after := JWTConfig{RefreshDays: 1, ExpiryHours: 1} // lifetimes reduced
+	if after.FamilyRetention() < before.MaxTokenLifetime() {
+		t.Errorf("retention %v under the reduced config is shorter than tokens minted before it (%v)",
+			after.FamilyRetention(), before.MaxTokenLifetime())
+	}
+	if got := (JWTConfig{RefreshDays: 400}).FamilyRetention(); got != 400*24*time.Hour {
+		t.Errorf("lifetime above the floor must win, got %v", got)
+	}
+}
+
+func TestConfig_Validate_AS_LegacyRequiresJWTIssuer(t *testing.T) {
+	mk := func(legacy bool, jwtIssuer string) *Config {
+		cfg := validBaseConfig()
+		cfg.AS.Enabled = true
+		cfg.AS.ExternalURL = "https://wallet.example.com"
+		cfg.AS.Issuer = "https://as.example.com"
+		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
+		cfg.AS.RulesDir = "/tmp/rules"
+		cfg.AS.Audiences = []string{"wallet-backend", "localhost"}
+		cfg.AS.Legacy.Enabled = legacy
+		cfg.JWT.Issuer = jwtIssuer
+		return cfg
+	}
+	err := mk(true, "").Validate()
+	if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Fatalf("legacy enabled with empty jwt.issuer must be rejected, got %v", err)
+	}
+	if err := mk(true, "wallet-backend").Validate(); err != nil {
+		t.Errorf("non-empty jwt.issuer must be accepted: %v", err)
+	}
+	if err := mk(false, "").Validate(); err != nil {
+		t.Errorf("legacy disabled must not require jwt.issuer: %v", err)
 	}
 }

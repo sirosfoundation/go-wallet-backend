@@ -960,7 +960,8 @@ type JWTConfig struct {
 	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
+	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it, and Validate() rejects an empty value in that mode.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
 // MaxTokenLifetime returns the longer of the configured access-token
@@ -974,6 +975,30 @@ func (c JWTConfig) MaxTokenLifetime() time.Duration {
 		return refresh
 	}
 	return access
+}
+
+// MinFamilyRetention is the floor for how long a refresh-token family
+// revocation marker is kept (365 days).
+//
+// The marker must outlive every token of the family, but the only bound
+// available at logout is the CURRENT configuration, while tokens may have
+// been minted under an earlier, longer one (e.g. jwt.refresh_days lowered
+// after deployment). A retention derived from the current lifetimes alone
+// could therefore expire early and un-revoke older tokens. The floor makes
+// retention non-shrinking across configuration changes for any earlier
+// configuration with token lifetimes up to a year; markers are tiny and
+// swept afterwards, so the cost is negligible. Configurations that ever
+// issued tokens beyond a year are covered by MaxTokenLifetime taking the
+// larger value.
+const MinFamilyRetention = 365 * 24 * time.Hour
+
+// FamilyRetention returns how long to keep a refresh-token family
+// revocation marker: the longer of MaxTokenLifetime and MinFamilyRetention.
+func (c JWTConfig) FamilyRetention() time.Duration {
+	if m := c.MaxTokenLifetime(); m > MinFamilyRetention {
+		return m
+	}
+	return MinFamilyRetention
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -2153,6 +2178,14 @@ func (c *Config) Validate() error {
 		// validates that against AS.Audiences. If the RP ID is not among
 		// them, every legacy login token is rejected on its next protected
 		// request - a failure that only shows up at runtime, so refuse it here.
+		// Legacy tokens are minted with "iss": jwt.issuer and validated
+		// against Legacy.Issuers=[jwt.issuer]; an empty value would mint
+		// tokens with an empty iss and turn go-tokenauth's mandatory issuer
+		// check into a no-op, so require it (as.issuer does not help: it is
+		// not the legacy issuer).
+		if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+			return fmt.Errorf("as: legacy tokens are enabled but jwt.issuer is empty; legacy tokens are issued and validated with jwt.issuer, so set it or disable as.legacy.enabled")
+		}
 		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
 			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
 				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",

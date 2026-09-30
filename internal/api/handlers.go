@@ -904,7 +904,7 @@ func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) t
 // access token from an earlier rotation - its own jti never individually
 // blacklisted - was still unexpired and usable again.
 func familyRetention(cfg *config.Config) time.Duration {
-	return cfg.JWT.MaxTokenLifetime()
+	return cfg.JWT.FamilyRetention()
 }
 
 // Logout invalidates the current session by blacklisting the JWT and, when

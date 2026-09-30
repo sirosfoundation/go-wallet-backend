@@ -149,7 +149,7 @@ func NewASModule(
 		Blacklist:       blacklist,
 		Logger:          logger,
 		Config:          cfg,
-		FamilyRetention: jwtCfg.MaxTokenLifetime() + time.Hour,
+		FamilyRetention: jwtCfg.FamilyRetention() + time.Hour,
 		store:           store,
 		validatorCache:  validatorCache,
 	}, nil
