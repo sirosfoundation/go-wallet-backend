@@ -13,7 +13,9 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -707,6 +709,52 @@ func TestResolve_FallbackDisabled_NoRetry(t *testing.T) {
 	}
 	if attempts != 1 {
 		t.Errorf("fallback disabled must not retry; got %d requests", attempts)
+	}
+}
+
+// TestResolve_4xxRetryMatrix pins the behaviour for every combination of
+// PreferSigned and the 4xx fallback flag: with the flag off only the preferred
+// representation is requested and a 406 is terminal, whichever that
+// representation is; with it on, a 4xx retries the other media type exactly
+// once, including when unsigned is preferred.
+func TestResolve_4xxRetryMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		preferSigned bool
+		fallback     bool
+		want         []string
+	}{
+		{"PreferSigned_FallbackOff", true, false, []string{"application/jwt"}},
+		{"PreferUnsigned_FallbackOff", false, false, []string{"application/json"}},
+		{"PreferSigned_FallbackOn", true, true, []string{"application/jwt", "application/json"}},
+		{"PreferUnsigned_FallbackOn", false, true, []string{"application/json", "application/jwt"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var accepts []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				accepts = append(accepts, r.Header.Get("Accept"))
+				mu.Unlock()
+				w.WriteHeader(http.StatusNotAcceptable)
+			}))
+			defer server.Close()
+
+			pref, fb := tc.preferSigned, tc.fallback
+			r, err := New(Config{AllowHTTP: true, PreferSigned: &pref, FallbackOn4xx: &fb})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+				t.Fatal("expected error for 406")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !reflect.DeepEqual(accepts, tc.want) {
+				t.Errorf("Accept sequence = %v, want %v", accepts, tc.want)
+			}
+		})
 	}
 }
 
