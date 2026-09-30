@@ -358,6 +358,20 @@ write-once, so re-enrolling on that device would be refused for good, and a
 deleted user cannot authenticate to ask again. Repeat the request to finish
 it, as with `ERASURE_INCOMPLETE` on the lifecycle endpoints.
 
+`DELETION_INCOMPLETE` covers: a wallet instance, stored credential or
+presentation that could not be removed; a failed lookup of the user's tenant
+memberships, wallet instances or user record; and a session store that would
+not drop the user's sessions. In all of these nothing has been revoked for
+good yet, so the token the request came on keeps working and the same request
+can be sent again. The permanent token revocation (the in-process token
+blacklist and the engine's revoked-user set) is applied only after the sweep
+found nothing outstanding. The one case that can no longer be retried by the
+user is a session store that fails on its second pass, after that revocation:
+the record is kept and the error is returned, but the user's own tokens are
+refused from then on until the process restarts, so an operator has to finish
+it. Pending challenges, invite references and membership rows are removed on a
+best-effort basis.
+
 ### Credential Management
 
 All credential endpoints require authentication.
