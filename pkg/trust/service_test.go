@@ -20,9 +20,14 @@ type testMockEvaluator struct {
 	returnErr error
 	// For Resolver interface
 	resolveMetadata interface{}
+
+	// gotReq captures the last request passed to Evaluate, so tests can
+	// assert on outbound Role/Action wiring without a real AuthZEN PDP.
+	gotReq *EvaluationRequest
 }
 
-func (m *testMockEvaluator) Evaluate(_ context.Context, _ *EvaluationRequest) (*EvaluationResponse, error) {
+func (m *testMockEvaluator) Evaluate(_ context.Context, req *EvaluationRequest) (*EvaluationResponse, error) {
+	m.gotReq = req
 	if m.returnErr != nil {
 		return nil, m.returnErr
 	}
@@ -455,6 +460,273 @@ func TestService_EvaluateVerifier_Success(t *testing.T) {
 	}
 	if result.Reason != "Not in trusted registry" {
 		t.Errorf("EvaluateVerifier() Reason = %q, want %q", result.Reason, "Not in trusted registry")
+	}
+}
+
+// TestService_EvaluateVerifierWithContext_ForwardsContext pins that
+// EvaluateVerifierWithContext's evalContext reaches the outbound
+// EvaluationRequest.Context unchanged - the whole point of the method (see
+// its doc comment): a direct-to-PDP verifier evaluation must carry the same
+// trust_chain/attestation context a frontend-mediated one always has.
+func TestService_EvaluateVerifierWithContext_ForwardsContext(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	mock := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return mock, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	evalContext := map[string]interface{}{
+		"trust_chain":         []string{"leaf", "anchor"},
+		"attestation_issuer":  "https://issuer.example.com",
+		"attestation_subject": "https://verifier.example.com",
+	}
+
+	result, err := svc.EvaluateVerifierWithContext(context.Background(), "https://verifier.example.com", "", &KeyMaterial{
+		Type: "x5c",
+		X5C:  []string{"deadbeef"},
+	}, evalContext)
+	if err != nil {
+		t.Fatalf("EvaluateVerifierWithContext() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateVerifierWithContext() Trusted = false, want true")
+	}
+
+	if mock.gotReq == nil {
+		t.Fatal("evaluator never received a request")
+	}
+	if got := mock.gotReq.Context["trust_chain"]; got == nil {
+		t.Error("EvaluationRequest.Context missing trust_chain - evalContext was not forwarded")
+	}
+	if got, want := mock.gotReq.Context["attestation_issuer"], evalContext["attestation_issuer"]; got != want {
+		t.Errorf("EvaluationRequest.Context[attestation_issuer] = %v, want %v", got, want)
+	}
+}
+
+// TestService_EvaluateVerifierWithContext_NilContext confirms passing a nil
+// evalContext behaves exactly like plain EvaluateVerifier (no Context set),
+// so EvaluateVerifierWithContext(ctx, id, ep, km, nil) is a safe drop-in.
+func TestService_EvaluateVerifierWithContext_NilContext(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	mock := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return mock, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateVerifierWithContext(context.Background(), "https://verifier.example.com", "", nil, nil)
+	if err != nil {
+		t.Fatalf("EvaluateVerifierWithContext() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateVerifierWithContext() Trusted = false, want true")
+	}
+	if mock.gotReq != nil && mock.gotReq.Context != nil {
+		t.Errorf("EvaluationRequest.Context = %v, want nil when evalContext is nil", mock.gotReq.Context)
+	}
+}
+
+// TestService_EvaluateFIDO2Attestation_NoEndpoint exercises the fail-closed
+// path when no global PDP is configured - FIDO Alliance MDS3 trust data is
+// global (unlike issuer/verifier, it has no per-flow endpoint override), so
+// this always uses cfg.Trust.PDPURL.
+func TestService_EvaluateFIDO2Attestation_NoEndpoint(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL: "",
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = true when no PDP configured, expected fail-closed")
+	}
+	if result.Framework != "none" {
+		t.Errorf("EvaluateFIDO2Attestation() Framework = %q, want none", result.Framework)
+	}
+}
+
+// TestService_EvaluateFIDO2Attestation_Trusted covers the AuthZEN wiring:
+// the AAGUID must be sent as subject.id (the "name" half of the fidomds3
+// registry's name-to-key binding - see go-trust's
+// pkg/registry/fidomds3/registry.go's use of uuid.Parse(req.Subject.ID))
+// and the x5c chain as resource.type=x5c/key.
+func TestService_EvaluateFIDO2Attestation_Trusted(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{decision: true, reason: "AAGUID certified by FIDO MDS3"}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	aaguid := "f8a011f3-8c0a-4d15-8006-17111f9edc7d"
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), aaguid, []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if !result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = false, want true")
+	}
+	if result.Framework != "authzen" {
+		t.Errorf("EvaluateFIDO2Attestation() Framework = %q, want authzen", result.Framework)
+	}
+}
+
+// TestService_EvaluateFIDO2Attestation_ActionName is the regression test for
+// the bug where this call site sent no action.name at all: with Role ==
+// RoleAny (empty string), go-trust's toAuthZENRequest fell all the way
+// through to req.GetAction(), which was also never set - meaning an operator
+// could never attach a go-trust policy (e.g. a fidomds3 AAGUID allow/
+// blocklist) specifically to FIDO2 attestation evaluation. It must now carry
+// the fixed FIDO2AttestationAction action name.
+func TestService_EvaluateFIDO2Attestation_ActionName(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."}); err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleAny {
+		t.Errorf("gotReq.Role = %q, want RoleAny", eval.gotReq.Role)
+	}
+	if eval.gotReq.GetAction() != FIDO2AttestationAction {
+		t.Errorf("gotReq.GetAction() = %q, want %q", eval.gotReq.GetAction(), FIDO2AttestationAction)
+	}
+}
+
+// TestService_EvaluateIssuer_NoExplicitAction and its verifier counterpart
+// guard against regressing the other evaluate() callers while fixing
+// EvaluateFIDO2Attestation above: issuer/verifier evaluation identifies its
+// call site via Role alone (go-trust's toAuthZENRequest prefers Role for
+// action.name), so no explicit Action should ever be set for these.
+func TestService_EvaluateIssuer_NoExplicitAction(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateIssuer(context.Background(), "https://issuer.example.com", "", nil); err != nil {
+		t.Fatalf("EvaluateIssuer() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleCredentialIssuer {
+		t.Errorf("gotReq.Role = %q, want RoleCredentialIssuer", eval.gotReq.Role)
+	}
+	if eval.gotReq.Action != "" {
+		t.Errorf("gotReq.Action = %q, want empty (Role alone identifies this call site)", eval.gotReq.Action)
+	}
+}
+
+func TestService_EvaluateVerifier_NoExplicitAction(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	eval := &testMockEvaluator{decision: true}
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return eval, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	if _, err := svc.EvaluateVerifier(context.Background(), "https://verifier.example.com", "", nil); err != nil {
+		t.Fatalf("EvaluateVerifier() error = %v", err)
+	}
+
+	if eval.gotReq == nil {
+		t.Fatal("Evaluate() was not called")
+	}
+	if eval.gotReq.Role != RoleCredentialVerifier {
+		t.Errorf("gotReq.Role = %q, want RoleCredentialVerifier", eval.gotReq.Role)
+	}
+	if eval.gotReq.Action != "" {
+		t.Errorf("gotReq.Action = %q, want empty (Role alone identifies this call site)", eval.gotReq.Action)
+	}
+}
+
+func TestService_EvaluateFIDO2Attestation_NotTrusted(t *testing.T) {
+	cfg := &config.Config{
+		Trust: config.TrustConfig{
+			PDPURL:  "https://pdp.example.com",
+			Timeout: 10,
+		},
+	}
+	logger := zap.NewNop()
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &testMockEvaluator{decision: false, reason: "no FIDO MDS3 entry for AAGUID"}, nil
+	}
+
+	svc := NewService(cfg, logger, factory)
+
+	result, err := svc.EvaluateFIDO2Attestation(context.Background(), "f8a011f3-8c0a-4d15-8006-17111f9edc7d", []string{"MIIBxxx..."})
+	if err != nil {
+		t.Fatalf("EvaluateFIDO2Attestation() error = %v", err)
+	}
+	if result.Trusted {
+		t.Error("EvaluateFIDO2Attestation() Trusted = true, want false")
+	}
+	if result.Reason != "no FIDO MDS3 entry for AAGUID" {
+		t.Errorf("EvaluateFIDO2Attestation() Reason = %q, want %q", result.Reason, "no FIDO MDS3 entry for AAGUID")
 	}
 }
 

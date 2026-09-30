@@ -18,6 +18,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -27,7 +28,7 @@ import (
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
-	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine (comma-separated or 'all')")
+	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
 	buildTime          = "unknown"
 )
@@ -42,12 +43,23 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend, engine, and admin roles)
+	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) {
+	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider) {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
+		}
+		if roles.Has(modes.RoleAuth) {
+			backendCfg.EnableForRole()
+			// EnableForRole mutates the already-validated config (e.g.
+			// falling back to WalletProvider's signing key for AS), so
+			// re-validate rather than let an invalid resulting state (say,
+			// AS enabled with no signing key anywhere) surface later as a
+			// less actionable failure during provider init.
+			if err := backendCfg.Validate(); err != nil {
+				log.Fatalf("Invalid backend configuration after enabling AS for role: %v", err)
+			}
 		}
 	}
 
@@ -157,15 +169,27 @@ func main() {
 		serverCfg.LoggingLevel = backendCfg.Logging.Level
 		serverCfg.TLS = backendCfg.Server.TLS
 		serverCfg.AdminTLS = backendCfg.Server.AdminTLS
+
+		// Wallet-provider isolation port
+		if backendCfg.Server.WPPort > 0 {
+			serverCfg.WPAddress = backendCfg.Server.WPHost
+			if serverCfg.WPAddress == "" {
+				serverCfg.WPAddress = backendCfg.Server.Host
+			}
+			serverCfg.WPPort = backendCfg.Server.WPPort
+		}
 	} else if registryCfg != nil {
 		// Registry-only mode - use registry server config
 		serverCfg.HTTPAddress = registryCfg.Server.Host
 		serverCfg.HTTPPort = registryCfg.Server.Port
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
+		serverCfg.CORS = registryCfg.Server.CORS
 	}
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+		serverCfg.TrustedProxies = backendCfg.Server.TrustedProxies
+		serverCfg.WarnUntrustedClientIP = backendCfg.Security.OIDCGateRateLimit.PerIP.Enabled
 	} else if registryCfg != nil {
 		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}
@@ -199,6 +223,7 @@ func main() {
 		resources = append(resources, provider)
 	}
 
+	var engineProvider *server.EngineProvider
 	if roles.Has(modes.RoleEngine) {
 		// Wire verifier store from backend if available (for trust caching)
 		var verifierStore storage.VerifierStore
@@ -224,12 +249,32 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
-		mgr.AddProvider(provider)
-
-		// Wire session store into UserService so DeleteUser purges active sessions
+		// Wire the same token blacklist the HTTP auth middlewares use, so a
+		// revoked token (or a deleted user's other tokens) is rejected
+		// during the WebSocket handshake too, on both the go-tokenauth and
+		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
 		if backendProvider != nil {
-			backendProvider.Services().User.SetSessionCleaner(provider.SessionStore())
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
 		}
+		mgr.AddProvider(provider)
+		engineProvider = provider
+	}
+
+	// Wire session stores into UserService so DeleteUser purges AS cookie
+	// sessions and, when the engine runs in this process, active engine
+	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
+	// engine role: a --mode=backend deployment has AS sessions to drop too.
+	// Both engine cleaners are wired: SessionStore() only purges the
+	// persisted SessionData bookkeeping record, while Manager() closes the
+	// live *websocket.Conn* itself - without the latter, a connection that
+	// was already established before the user was deleted stayed open and
+	// usable until it disconnected on its own (#393).
+	if backendProvider != nil {
+		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
+		if engineProvider != nil {
+			cleaners = append(cleaners, engineProvider.SessionStore(), engineProvider.Manager())
+		}
+		backendProvider.Services().User.SetSessionCleaner(cleaners)
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.
@@ -241,6 +286,23 @@ func main() {
 		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
+	}
+
+	// Wallet-provider isolation mode: runs wallet-provider endpoints on a
+	// separate server for PKCS#11 operational isolation.
+	// When co-deployed with backend (no --mode=wallet-provider), routes are
+	// served from the shared HTTP server as usual.
+	if roles.Has(modes.RoleWalletProvider) && !roles.Has(modes.RoleBackend) {
+		provider, err := server.NewWalletProviderProvider(backendCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to create wallet-provider provider", zap.Error(err))
+		}
+		mgr.AddProvider(provider)
+		resources = append(resources, provider)
+
+		logger.Info("Wallet-provider running in isolated mode",
+			zap.Int("port", backendCfg.Server.WPPort),
+			zap.Bool("pkcs11", backendCfg.WalletProvider.PKCS11 != nil))
 	}
 
 	// Set up signal handling

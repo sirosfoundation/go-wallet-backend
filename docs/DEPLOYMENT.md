@@ -373,6 +373,7 @@ az container create \
 - [ ] Set strong JWT secret (min 32 characters)
 - [ ] Enable HTTPS/TLS
 - [ ] Configure CORS origins
+- [ ] Set `server.trusted_proxies` to your load balancer's addresses (or `["none"]` without one). Unset, every peer is trusted for `X-Forwarded-For`, so a direct caller can pick its own client IP and dodge the per-IP OIDC gate rate limit
 - [ ] Set up monitoring and logging
 - [ ] Configure health checks
 - [ ] Set resource limits

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
@@ -24,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func TestGenerateCodeVerifier(t *testing.T) {
@@ -96,7 +98,7 @@ func TestSendPushedAuthorizationRequest_Success(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 	assert.Equal(t, "urn:ietf:params:oauth:request_uri:abc123", requestURI)
 }
@@ -117,7 +119,7 @@ func TestSendPushedAuthorizationRequest_ErrorResponse(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "status 400")
 }
@@ -138,7 +140,7 @@ func TestSendPushedAuthorizationRequest_ErrorInBody(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR error")
 	assert.Contains(t, err.Error(), "bad scope")
@@ -157,7 +159,7 @@ func TestSendPushedAuthorizationRequest_MissingRequestURI(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing request_uri")
 }
@@ -257,7 +259,7 @@ func TestStartAuthorizationFlow_BuildsPARRedirect(t *testing.T) {
 	params.Set("code_challenge", "test-challenge")
 	params.Set("code_challenge_method", "S256")
 
-	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params)
+	requestURI, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, params, clientAuthHeaders{})
 	require.NoError(t, err)
 
 	// Verify the redirect URL would be built correctly
@@ -341,9 +343,88 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 	}
 	h := &OID4VCIHandler{
 		httpClient: httpClient,
+		// The drain-only server above never answers a sign_client_auth
+		// probe, so settle on legacy mode up front: the handler signs DPoP
+		// with h.dpopKey when a test sets one and sends no proof otherwise,
+		// which is what these tests were written against. Tests of the
+		// probe itself (clientauth_test.go) build their own handler.
+		clientAuthMode: clientAuthLegacy,
+		// Likewise treat the one-shot request_attestation as already done
+		// (declined), as Execute would have before reaching the token step.
+		legacyAttestationRequested: true,
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	return h, cleanup
+}
+
+// TestExecute_RenewalMissingCredentialIssuerFails and
+// TestExecute_RenewalMissingConfigurationIDFails cover the credential
+// re-issuance/renewal plan's Phase 1 Slice 2 entry-point validation: a
+// renewal request (RefreshToken set) has no fresh offer to parse, so it
+// must supply CredentialIssuer and SelectedCredentialConfigurationID
+// directly - Execute must reject the request immediately (before any
+// network calls) if either is missing, rather than synthesizing a broken
+// CredentialOffer and failing confusingly downstream.
+func TestExecute_RenewalMissingCredentialIssuerFails(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	err := h.Execute(context.Background(), &FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+		// CredentialIssuer deliberately omitted.
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_issuer")
+}
+
+func TestExecute_RenewalMissingConfigurationIDFails(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	err := h.Execute(context.Background(), &FlowStartMessage{
+		RefreshToken:     "some-refresh-token",
+		CredentialIssuer: "https://issuer.example.com",
+		// SelectedCredentialConfigurationID deliberately omitted.
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selected_credential_configuration_id")
+}
+
+// TestBuildRenewalOffer_Succeeds covers the synthesis success path Execute's
+// Step 1 delegates to for a renewal request: given both required fields, it
+// must build a single-config CredentialOffer naming exactly the credential
+// being renewed, so downstream steps (metadata fetch, trust evaluation,
+// awaitCredentialSelection's auto-select-when-one path) run unchanged.
+func TestBuildRenewalOffer_Succeeds(t *testing.T) {
+	offer, err := buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		CredentialIssuer:                  "https://issuer.example.com",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, offer)
+	assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
+	assert.Equal(t, []string{"PID_SD_JWT"}, offer.CredentialConfigurationIDs)
+}
+
+// TestBuildRenewalOffer_MissingFieldsFail covers both required-field
+// validation branches directly (TestExecute_RenewalMissing* above already
+// cover them end-to-end through Execute).
+func TestBuildRenewalOffer_MissingFieldsFail(t *testing.T) {
+	_, err := buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:                      "some-refresh-token",
+		SelectedCredentialConfigurationID: "PID_SD_JWT",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_issuer")
+
+	_, err = buildRenewalOffer(&FlowStartMessage{
+		RefreshToken:     "some-refresh-token",
+		CredentialIssuer: "https://issuer.example.com",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selected_credential_configuration_id")
 }
 
 func TestExchangeAuthCode_IncludesCodeVerifier(t *testing.T) {
@@ -487,6 +568,26 @@ func TestOAuthServerMetadata_PAREndpointParsing(t *testing.T) {
 	assert.Equal(t, "https://as.example.com/authorize", meta.AuthorizationEndpoint)
 	assert.Equal(t, "https://as.example.com/token", meta.TokenEndpoint)
 	assert.Equal(t, "https://as.example.com/par", meta.PushedAuthorizationRequestEndpoint)
+	assert.False(t, meta.RequirePushedAuthorizationRequests)
+}
+
+func TestOAuthServerMetadata_RequirePARParsing(t *testing.T) {
+	// An AS that mandates PAR (RFC 9126 §5) - e.g. vc-apigw's
+	// require_pushed_authorization_requests:true - must be recognized so
+	// startAuthorizationFlow knows not to fall back to a non-PAR /authorize
+	// request that such an AS has no code path for at all.
+	body := `{
+		"issuer": "https://as.example.com",
+		"authorization_endpoint": "https://as.example.com/authorize",
+		"token_endpoint": "https://as.example.com/token",
+		"pushed_authorization_request_endpoint": "https://as.example.com/par",
+		"require_pushed_authorization_requests": true
+	}`
+
+	var meta oauthServerMetadata
+	err := json.Unmarshal([]byte(body), &meta)
+	require.NoError(t, err)
+	assert.True(t, meta.RequirePushedAuthorizationRequests)
 }
 
 // errRoundTripper always returns an error, used for deterministic network failure tests.
@@ -502,7 +603,7 @@ func TestSendPushedAuthorizationRequest_NetworkError(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), "https://as.example.com/par", url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "PAR request failed")
 }
@@ -520,7 +621,7 @@ func TestSendPushedAuthorizationRequest_InvalidJSON(t *testing.T) {
 	}
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 
-	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{})
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse PAR response")
 }
@@ -743,6 +844,163 @@ func TestExchangePreAuthCode_SendsDPoP(t *testing.T) {
 	assert.Equal(t, "POST", claims["htm"])
 }
 
+// TestExchangeRefreshToken_SendsGrantTypeAndToken covers the credential
+// re-issuance/renewal plan's Phase 1 Slice 2: a renewal must send an
+// ordinary OAuth 2.0 refresh_token grant (grant_type=refresh_token plus the
+// refresh_token itself), structurally identical to exchangePreAuthCode's
+// pre-authorized_code grant otherwise.
+func TestExchangeRefreshToken_SendsGrantTypeAndToken(t *testing.T) {
+	var receivedForm url.Values
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		receivedForm = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "renewed-access-token",
+			TokenType:    "DPoP",
+			RefreshToken: "rotated-refresh-token",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangeRefreshToken(context.Background(), metadata, "original-refresh-token")
+	require.NoError(t, err)
+	assert.Equal(t, "renewed-access-token", token.AccessToken)
+	assert.Equal(t, "rotated-refresh-token", token.RefreshToken)
+
+	assert.Equal(t, "refresh_token", receivedForm.Get("grant_type"))
+	assert.Equal(t, "original-refresh-token", receivedForm.Get("refresh_token"))
+	assert.Empty(t, receivedForm.Get("pre-authorized_code"), "must not send a pre-authorized_code param")
+	assert.Empty(t, receivedForm.Get("code"), "must not send an authorization_code param")
+}
+
+// TestExchangeRefreshToken_SendsDPoP mirrors TestExchangePreAuthCode_SendsDPoP:
+// the renewal's OAuth-transport-layer DPoP proof uses this flow's own
+// ephemeral h.dpopKey (generated fresh per Execute() call, same as every
+// other grant in this file) - deliberately NOT the wallet's persistent
+// credential-holder-binding key. Same-wallet-unit continuity is a separate
+// concern, proven via requestProofs' reissuanceKid instead (see
+// TestRequestProofs_PassesReissuanceKid) - conflating the two would be a
+// design error (see exchangeRefreshToken's doc comment).
+func TestExchangeRefreshToken_SendsDPoP(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "renewed-access-token",
+			TokenType:   "DPoP",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	token, err := h.exchangeRefreshToken(context.Background(), metadata, "original-refresh-token")
+	require.NoError(t, err)
+	assert.Equal(t, "DPoP", token.TokenType)
+	assert.NotEmpty(t, receivedHeaders.Get("DPoP"))
+
+	dpopProof := receivedHeaders.Get("DPoP")
+	tok, err := jwt.Parse(dpopProof, func(tok *jwt.Token) (interface{}, error) {
+		return &key.PublicKey, nil
+	})
+	require.NoError(t, err)
+	claims := tok.Claims.(jwt.MapClaims)
+	assert.Equal(t, "POST", claims["htm"])
+}
+
+// TestExchangeRefreshToken_TokenEndpointError verifies error responses from
+// the refresh grant are surfaced the same way as every other grant (parsed
+// OAuth error, StepExchangingToken failure), not silently swallowed.
+func TestExchangeRefreshToken_TokenEndpointError(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"refresh token expired or revoked"}`))
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h.dpopKey = key
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	_, err = h.exchangeRefreshToken(context.Background(), metadata, "revoked-refresh-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid_grant")
+}
+
+// TestExchangePreAuthCode_SendsAttestationHeaders is a regression test:
+// exchangePreAuthCode (the pre-authorized_code flow — the most common
+// wallet-initiated issuance path) must send the OAuth-Client-Attestation /
+// OAuth-Client-Attestation-PoP headers when an attestation provider is
+// configured, the same as the PAR and authorization_code exchange paths.
+// Before this fix, setClientAuth correctly skipped form-based
+// private_key_jwt auth when attestation was available, but the actual
+// attestation headers were never attached here — so the token request went
+// out with no client authentication at all.
+func TestExchangePreAuthCode_SendsAttestationHeaders(t *testing.T) {
+	var receivedHeaders http.Header
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken: "test-token",
+			TokenType:   "Bearer",
+		})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+
+	h.attestationProvider = &TransportSuppliedAttestation{
+		WIA: "wia.jwt.value",
+		PoP: "pop.jwt.value",
+		ID:  "client-thumbprint-123",
+	}
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "pre-auth-code", "")
+	require.NoError(t, err)
+	assert.Equal(t, "wia.jwt.value", receivedHeaders.Get("OAuth-Client-Attestation"))
+	assert.Equal(t, "pop.jwt.value", receivedHeaders.Get("OAuth-Client-Attestation-PoP"))
+}
+
 func TestExchangeAuthCode_SendsDPoP(t *testing.T) {
 	var receivedHeaders http.Header
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -946,6 +1204,292 @@ func TestUpdateDPoPNonce(t *testing.T) {
 	resp2 := &http.Response{Header: http.Header{}}
 	h.updateDPoPNonce(resp2)
 	assert.Equal(t, "second-nonce", h.dpopNonce)
+}
+
+func TestSameOrigin(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical", "https://a.example", "https://a.example", true},
+		{"path differs, same origin", "https://a.example", "https://a.example/webuild", true},
+		{"default vs explicit https port", "https://a.example", "https://a.example:443", true},
+		{"default vs explicit http port", "http://a.example", "http://a.example:80", true},
+		{"different host", "https://a.example", "https://b.example", false},
+		{"different scheme", "https://a.example", "http://a.example", false},
+		{"different port", "https://a.example:8443", "https://a.example", false},
+		{"malformed url", "://bad", "https://a.example", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, sameOrigin(tt.a, tt.b))
+		})
+	}
+}
+
+func TestIsAttestationChallengeError(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"400 challenge", http.StatusBadRequest, `{"error":"use_attestation_challenge"}`, true},
+		{"401 challenge", http.StatusUnauthorized, `{"error":"use_attestation_challenge"}`, true},
+		{"400 other error", http.StatusBadRequest, `{"error":"invalid_request"}`, false},
+		{"200 with challenge body", http.StatusOK, `{"error":"use_attestation_challenge"}`, false},
+		{"500 with challenge body", http.StatusInternalServerError, `{"error":"use_attestation_challenge"}`, false},
+		{"non-json body", http.StatusBadRequest, `not json`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isAttestationChallengeError(tt.status, []byte(tt.body)))
+		})
+	}
+}
+
+func TestResolveAttestationChallenge_FromHeader(t *testing.T) {
+	h := &OID4VCIHandler{
+		attestationProvider:        &TransportSuppliedAttestation{WIA: "w", PoP: "p"},
+		legacyAttestationRequested: true,
+	}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	resp.Header.Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
+	assert.Equal(t, "hdr-chal", h.attestationChallenge)
+	// A fresh challenge must invalidate a previously replayed WIA+PoP so the
+	// next resolveClientAuth re-requests one bound to the new challenge.
+	assert.Nil(t, h.attestationProvider)
+	assert.False(t, h.legacyAttestationRequested)
+}
+
+func TestResolveAttestationChallenge_FromEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "POST", r.Method)
+		_, _ = w.Write([]byte(`{"attestation_challenge":"ep-chal"}`))
+	}))
+	defer srv.Close()
+
+	h := &OID4VCIHandler{httpClient: srv.Client(), challengeEndpoint: srv.URL}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	// No challenge header present, so the endpoint is consulted.
+	resp := &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}}
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
+	assert.Equal(t, "ep-chal", h.attestationChallenge)
+}
+
+// TestResolveAttestationChallenge_LazyDiscoversEndpoint covers token-only flows
+// (e.g. pre-authorized_code) where AS metadata was never fetched: with no
+// challenge header and no known endpoint, the endpoint is discovered from AS
+// metadata on demand.
+func TestResolveAttestationChallenge_LazyDiscoversEndpoint(t *testing.T) {
+	mux := http.NewServeMux()
+	var base string
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"challenge_endpoint":"` + base + `/challenge"}`))
+	})
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"attestation_challenge":"lazy-chal"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base = srv.URL
+
+	h := &OID4VCIHandler{httpClient: srv.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	metadata := &IssuerMetadata{AuthorizationServers: []string{srv.URL}}
+	assert.True(t, h.resolveAttestationChallenge(context.Background(), resp, metadata))
+	assert.Equal(t, "lazy-chal", h.attestationChallenge)
+	assert.Equal(t, srv.URL+"/challenge", h.challengeEndpoint)
+}
+
+func TestResolveAttestationChallenge_NoneAvailable(t *testing.T) {
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}}
+	assert.False(t, h.resolveAttestationChallenge(context.Background(), resp, nil))
+	assert.Empty(t, h.attestationChallenge)
+}
+
+func TestFetchAttestationChallenge(t *testing.T) {
+	t.Run("success captures DPoP nonce", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("DPoP-Nonce", "dnonce")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"attestation_challenge":"chal-abc"}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "chal-abc", got)
+		assert.Equal(t, "dnonce", h.dpopNonce)
+	})
+
+	t.Run("challenge in response header, empty body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+			// draft-ietf-oauth-attestation-based-client-auth's challenge
+			// endpoint may return an empty body; the challenge lives in the
+			// header only.
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "hdr-chal", got)
+	})
+
+	t.Run("header takes precedence over JSON body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "hdr-chal")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"attestation_challenge":"body-chal"}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		got, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		require.NoError(t, err)
+		assert.Equal(t, "hdr-chal", got)
+	})
+
+	t.Run("empty challenge is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		_, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		assert.Error(t, err)
+	})
+
+	t.Run("non-200 is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		h := &OID4VCIHandler{httpClient: srv.Client()}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+		_, err := h.fetchAttestationChallenge(context.Background(), srv.URL)
+		assert.Error(t, err)
+	})
+}
+
+func TestSendPushedAuthorizationRequest_AttestationChallenge(t *testing.T) {
+	parServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "par-chal")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+	}))
+	defer parServer.Close()
+
+	h := &OID4VCIHandler{httpClient: parServer.Client()}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
+
+	_, err := h.sendPushedAuthorizationRequest(context.Background(), parServer.URL, url.Values{}, clientAuthHeaders{})
+	require.ErrorIs(t, err, errAttestationChallenge)
+	assert.Equal(t, "par-chal", h.attestationChallenge)
+}
+
+func TestExchangeAuthCode_ResourceIndicator(t *testing.T) {
+	tests := []struct {
+		name         string
+		authServer   string
+		issuer       string
+		wantResource string // "" means the resource parameter must be absent
+	}{
+		{"cross-origin AS sends resource", "https://as.example", "https://issuer.example", "https://issuer.example"},
+		{"same-origin AS omits resource", "https://issuer.example", "https://issuer.example/webuild", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotResource string
+			var hasResource bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				gotResource = r.FormValue("resource")
+				_, hasResource = r.Form["resource"]
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer"}`))
+			}))
+			defer srv.Close()
+
+			h, cleanup := testOID4VCIHandler(t, srv.Client())
+			defer cleanup()
+			h.authServerIssuer = tt.authServer
+
+			metadata := &IssuerMetadata{TokenEndpoint: srv.URL, CredentialIssuer: tt.issuer}
+			_, err := h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example/cb", "verifier")
+			require.NoError(t, err)
+
+			if tt.wantResource == "" {
+				assert.False(t, hasResource, "resource must be omitted for same-origin AS/issuer")
+			} else {
+				assert.Equal(t, tt.wantResource, gotResource)
+			}
+		})
+	}
+}
+
+// TestDoTokenExchange_ResourceIndicatorAppliesToAllGrants verifies the RFC 8707
+// resource indicator is emitted for every grant type that goes through the
+// shared token-exchange scaffold, not just the authorization_code callback.
+func TestDoTokenExchange_ResourceIndicatorAppliesToAllGrants(t *testing.T) {
+	grants := []struct {
+		name string
+		call func(h *OID4VCIHandler, m *IssuerMetadata) error
+	}{
+		{"pre-authorized_code", func(h *OID4VCIHandler, m *IssuerMetadata) error {
+			_, err := h.exchangePreAuthCode(context.Background(), m, "code", "")
+			return err
+		}},
+		{"refresh_token", func(h *OID4VCIHandler, m *IssuerMetadata) error {
+			_, err := h.exchangeRefreshToken(context.Background(), m, "rt")
+			return err
+		}},
+	}
+	for _, g := range grants {
+		t.Run(g.name, func(t *testing.T) {
+			var gotResource string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				gotResource = r.FormValue("resource")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer"}`))
+			}))
+			defer srv.Close()
+
+			h, cleanup := testOID4VCIHandler(t, srv.Client())
+			defer cleanup()
+			h.authServerIssuer = "https://as.example" // cross-origin with the issuer below
+
+			metadata := &IssuerMetadata{TokenEndpoint: srv.URL, CredentialIssuer: "https://issuer.example"}
+			require.NoError(t, g.call(h, metadata))
+			assert.Equal(t, "https://issuer.example", gotResource)
+		})
+	}
 }
 
 func TestExchangePreAuthCode_DPoPNonceRetry(t *testing.T) {
@@ -1644,6 +2188,188 @@ func TestRequestCredential_RegularErrorNotWrapped(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid_request")
 }
 
+// TestRequestClientAttestation_WiresProviderFromResponse covers the success
+// path of the engine-driven request_attestation step: the client returns a WIA
+// + PoP, and requestClientAttestation wires them into h.attestationProvider.
+// Also asserts the sign request carries the AS issuer (PoP aud) and client_id.
+func TestRequestClientAttestation_WiresProviderFromResponse(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			ClientAttestation:    "signed.wia.jwt",
+			ClientAttestationPoP: "signed.pop.jwt",
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	// Route the sign_response from the WebSocket client side to signCh
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	h.requestClientAttestation(context.Background())
+
+	require.NotNil(t, h.attestationProvider)
+	require.True(t, h.attestationProvider.Available())
+	assert.Equal(t, "https://wallet.example.com/cb", h.attestationProvider.ClientID())
+	tsa, ok := h.attestationProvider.(*TransportSuppliedAttestation)
+	require.True(t, ok)
+	assert.Equal(t, "signed.wia.jwt", tsa.WIA)
+	assert.Equal(t, "signed.pop.jwt", tsa.PoP)
+
+	// Verify params sent to frontend (received via channel - no data race)
+	receivedParams := <-paramsCh
+	assert.Equal(t, "https://as.example.com", receivedParams.Audience)
+	assert.Equal(t, "https://wallet.example.com/cb", receivedParams.Issuer)
+}
+
+// TestRequestClientAttestation_EmptyResponseLeavesProviderNil covers the
+// declined path: a client that returns no attestation leaves the flow without a
+// client-attestation provider (Tier 3), so issuance proceeds unattested.
+func TestRequestClientAttestation_EmptyResponseLeavesProviderNil(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	h.requestClientAttestation(context.Background())
+
+	assert.Nil(t, h.attestationProvider)
+}
+
+// TestRequestClientAttestation_CancelledContextSkipsRequest covers the
+// already-cancelled context path: requestClientAttestation short-circuits on
+// ctx.Err() before sending any sign request, and sets no provider.
+func TestRequestClientAttestation_CancelledContextSkipsRequest(t *testing.T) {
+	received := make(chan struct{}, 1)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		if _, _, err := srvConn.ReadMessage(); err == nil {
+			received <- struct{}{}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h.requestClientAttestation(ctx)
+
+	assert.Nil(t, h.attestationProvider)
+	select {
+	case <-received:
+		t.Fatal("sign request was sent despite cancelled context")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestRequestClientAttestation_TimeoutLeavesProviderNil covers a client that
+// never answers (e.g. an SDK build predating request_attestation): the step
+// gives up after attestationRequestTimeout rather than Session.RequestSign's
+// 30s default, and leaves the flow without a provider.
+func TestRequestClientAttestation_TimeoutLeavesProviderNil(t *testing.T) {
+	prev := attestationRequestTimeout
+	attestationRequestTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { attestationRequestTimeout = prev })
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		// Read the request but never respond.
+		_, _, _ = srvConn.ReadMessage()
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+	h.authServerIssuer = "https://as.example.com"
+	h.clientID = "https://wallet.example.com/cb"
+
+	start := time.Now()
+	h.requestClientAttestation(context.Background())
+
+	assert.Nil(t, h.attestationProvider)
+	assert.Less(t, time.Since(start), 5*time.Second, "should give up at attestationRequestTimeout, not the 30s sign timeout")
+}
+
 // TestRequestProofs_PassesProofTypesAndCount tests that requestProofs correctly
 // passes proof_types_supported and count to the frontend via the sign request,
 // and validates that the returned proof types are supported.
@@ -1703,7 +2429,7 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 		},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "")
 	require.NoError(t, err)
 	require.Len(t, proofs, 1)
 	assert.Equal(t, "jwt", proofs[0].ProofType)
@@ -1717,6 +2443,71 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 	require.NotNil(t, receivedParams.ProofTypesSupported)
 	_, ok := receivedParams.ProofTypesSupported["jwt"]
 	assert.True(t, ok, "jwt should be in proof_types_supported sent to frontend")
+}
+
+// TestRequestProofs_PassesReissuanceKid covers the credential re-issuance/
+// renewal plan's Phase 1 Slice 2: when a renewal supplies a reissuanceKid,
+// it must reach SignRequestParams.ReissuanceKid so the client knows to sign
+// with the existing keypair instead of generating a fresh one.
+func TestRequestProofs_PassesReissuanceKid(t *testing.T) {
+	paramsCh := make(chan SignRequestParams, 1)
+
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		_, data, err := srvConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var req SignRequestMessage
+		if err := json.Unmarshal(data, &req); err != nil {
+			return
+		}
+		paramsCh <- req.Params
+
+		resp := SignResponseMessage{
+			Message: Message{
+				Type:      TypeSignResponse,
+				FlowID:    req.FlowID,
+				MessageID: req.MessageID,
+			},
+			Proofs: []ProofObject{
+				{ProofType: "jwt", JWT: "proof-1"},
+			},
+		}
+		_ = srvConn.WriteJSON(resp)
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	go func() {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var signMsg SignResponseMessage
+		if err := json.Unmarshal(data, &signMsg); err != nil {
+			return
+		}
+		session.signCh <- &signMsg
+	}()
+
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	config := &CredentialConfig{
+		ProofTypesSupported: map[string]interface{}{
+			"jwt": map[string]interface{}{"alg_values_supported": []string{"ES256"}},
+		},
+	}
+
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "original-credential-kid")
+	require.NoError(t, err)
+	require.Len(t, proofs, 1)
+
+	receivedParams := <-paramsCh
+	assert.Equal(t, "original-credential-kid", receivedParams.ReissuanceKid)
 }
 
 func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
@@ -1777,7 +2568,7 @@ func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
 		},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "test-nonce", "")
 	require.NoError(t, err)
 	require.Len(t, proofs, 1)
 
@@ -1844,7 +2635,7 @@ func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	proofs, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.NoError(t, err)
 	assert.Len(t, proofs, 3)
 
@@ -1901,7 +2692,7 @@ func TestRequestProofs_RejectsUnsupportedProofType(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported proof type")
 	assert.Contains(t, err.Error(), "unknown_type")
@@ -1952,7 +2743,7 @@ func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
 		ProofTypesSupported: map[string]interface{}{"jwt": nil},
 	}
 
-	_, err := h.requestProofs(context.Background(), metadata, config, "nonce")
+	_, err := h.requestProofs(context.Background(), metadata, config, "nonce", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "frontend returned no proofs")
 }
@@ -2595,6 +3386,126 @@ func TestFetchMetadata_MapConversion(t *testing.T) {
 	assert.Equal(t, "urn:credential:pid", meta.Metadata.CredentialConfigurationsSupported["pid"].VCT)
 }
 
+func TestIssuerMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"credential_configurations_supported": {
+			"pid": {"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+			"broken": {"format": {"id": "not-a-string"}, "vct": "urn:example:broken"},
+			"mdl": {"format": "mso_mdoc", "scope": "mdl"}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Equal(t, "https://issuer.example.com/credential", meta.CredentialEndpoint)
+	require.Len(t, meta.CredentialConfigurationsSupported, 2)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["pid"].Format)
+	assert.Equal(t, "urn:eudi:pid:1", meta.CredentialConfigurationsSupported["pid"].VCT)
+	assert.Equal(t, "mso_mdoc", meta.CredentialConfigurationsSupported["mdl"].Format)
+	assert.Equal(t, "mdl", meta.CredentialConfigurationsSupported["mdl"].Scope)
+	_, present := meta.CredentialConfigurationsSupported["broken"]
+	assert.False(t, present)
+}
+
+func TestIssuerMetadata_SkipsCredentialThatFailsToDecode(t *testing.T) {
+	// display.logo must be an object. A string logo makes this one
+	// configuration undecodable; the sibling configuration still loads.
+	raw := []byte(`{
+		"credential_configurations_supported": {
+			"ok": {"format": "dc+sd-jwt", "display": [{"name": "PID", "locale": "en"}]},
+			"bad-logo": {
+				"format": "dc+sd-jwt",
+				"display": [{"name": "Bad", "logo": "https://example.com/logo.png"}]
+			}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	require.Len(t, meta.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["ok"].Format)
+	require.Len(t, meta.CredentialConfigurationsSupported["ok"].Display, 1)
+	assert.Equal(t, "PID", meta.CredentialConfigurationsSupported["ok"].Display[0].Name)
+}
+
+func TestIssuerMetadata_AllBrokenCredentialsYieldEmptyMap(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_configurations_supported": {
+			"broken": {"format": 1}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Empty(t, meta.CredentialConfigurationsSupported)
+}
+
+func TestIssuerMetadata_RejectsNonObjectCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_configurations_supported": [{"format": "dc+sd-jwt"}]}`)
+
+	var meta IssuerMetadata
+	err := json.Unmarshal(raw, &meta)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_configurations_supported")
+}
+
+func TestIssuerMetadata_AbsentCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_endpoint": "https://issuer.example.com/credential"}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Nil(t, meta.CredentialConfigurationsSupported)
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+}
+
+func TestFetchMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{
+					"format": "dc+sd-jwt",
+					"vct":    "urn:eudi:pid:1",
+				},
+				"broken": map[string]interface{}{
+					"format": map[string]interface{}{"id": "not-a-string"},
+					"vct":    "urn:example:broken",
+				},
+			},
+		},
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
+	require.Len(t, meta.Metadata.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.Metadata.CredentialConfigurationsSupported["pid"].Format)
+	assert.NotContains(t, meta.Metadata.CredentialConfigurationsSupported, "broken")
+}
+
 func TestFetchMetadata_ValidatedFlag(t *testing.T) {
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
@@ -2640,4 +3551,431 @@ func TestAuthorizationServer_FallsBackWhenAllEmpty(t *testing.T) {
 		AuthorizationServer:  "https://fallback.example.com",
 	}
 	assert.Equal(t, "https://fallback.example.com", m.authorizationServer())
+}
+
+func TestDPoPPrivateKeyJWK_RoundTrip(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+
+	jwkJSON, err := dpopPrivateKeyJWK(key)
+	require.NoError(t, err)
+
+	parsed, err := parseDPoPPrivateKeyJWK(jwkJSON)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, key.D.Cmp(parsed.D), "private scalar must round-trip exactly")
+	assert.Equal(t, 0, key.X.Cmp(parsed.X), "public X must round-trip exactly")
+	assert.Equal(t, 0, key.Y.Cmp(parsed.Y), "public Y must round-trip exactly")
+
+	// The reconstructed key must produce DPoP proofs that verify against the
+	// original key's public thumbprint - the actual property renewal depends on.
+	proof, err := createDPoPProof(parsed, "POST", "https://issuer.example.com/token", "", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, proof)
+}
+
+func TestParseDPoPPrivateKeyJWK_RejectsWrongCurve(t *testing.T) {
+	_, err := parseDPoPPrivateKeyJWK(`{"kty":"EC","crv":"P-384","x":"AA","y":"AA","d":"AA"}`)
+	assert.Error(t, err)
+}
+
+func TestParseDPoPPrivateKeyJWK_RejectsInvalidJSON(t *testing.T) {
+	_, err := parseDPoPPrivateKeyJWK("not json")
+	assert.Error(t, err)
+}
+
+func TestExecute_RenewalReusesClientSuppliedDPoPKey(t *testing.T) {
+	original, err := generateDPoPKey()
+	require.NoError(t, err)
+	jwkJSON, err := dpopPrivateKeyJWK(original)
+	require.NoError(t, err)
+
+	msg := &FlowStartMessage{
+		RefreshToken: "some-refresh-token",
+		DPoPJWK:      jwkJSON,
+	}
+	require.NotEmpty(t, msg.DPoPJWK)
+
+	reconstructed, err := parseDPoPPrivateKeyJWK(msg.DPoPJWK)
+	require.NoError(t, err)
+	assert.Equal(t, 0, original.D.Cmp(reconstructed.D),
+		"Execute() must reconstruct the exact key a renewal supplies, not generate a fresh one")
+}
+
+func TestDpopJWKForRefreshToken_EmptyWhenNoRefreshToken(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h := &OID4VCIHandler{dpopKey: key}
+	assert.Empty(t, h.dpopJWKForRefreshToken(&TokenResponse{}))
+}
+
+func TestDpopJWKForRefreshToken_ExportsWhenRefreshTokenPresent(t *testing.T) {
+	key, err := generateDPoPKey()
+	require.NoError(t, err)
+	h := &OID4VCIHandler{dpopKey: key}
+	jwkJSON := h.dpopJWKForRefreshToken(&TokenResponse{RefreshToken: "rt"})
+	require.NotEmpty(t, jwkJSON)
+
+	parsed, err := parseDPoPPrivateKeyJWK(jwkJSON)
+	require.NoError(t, err)
+	assert.Equal(t, 0, key.D.Cmp(parsed.D))
+}
+
+// TestParseOffer_AcceptsBothOfferURIForms covers the two spellings of an
+// OpenID4VCI credential offer URI.
+//
+// The authority component of this scheme is always empty, and RFC 3986 lets it
+// be left out entirely, so issuers emit either of:
+//
+//	openid-credential-offer://?credential_offer=...
+//	openid-credential-offer:?credential_offer=...
+//
+// This deployment's own issuer gateway emits the second. Matching on
+// "openid-credential-offer://" therefore skipped the extraction branch and
+// handed the whole URI to json.Unmarshal, which failed instantly with
+// OFFER_PARSE_ERROR - so no offer from that issuer could be redeemed at all.
+func TestParseOffer_AcceptsBothOfferURIForms(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["pid_1_8"],"grants":{"authorization_code":{}}}`
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+	}{
+		{"with authority", "openid-credential-offer://?credential_offer="},
+		{"without authority", "openid-credential-offer:?credential_offer="},
+		// Scheme names are case-insensitive (RFC 3986 section 3.1), so an
+		// issuer is free to emit the scheme in any case and still name this
+		// one.
+		{"uppercase scheme", "OPENID-CREDENTIAL-OFFER:?credential_offer="},
+		{"mixed case scheme with authority", "OpenID-Credential-Offer://?credential_offer="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+			defer cleanup()
+
+			offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+				Offer: tc.prefix + url.QueryEscape(offerJSON),
+			})
+			require.NoError(t, err)
+			require.NotNil(t, offer)
+			assert.Equal(t, "https://issuer.example.com", offer.CredentialIssuer)
+			assert.Equal(t, []string{"pid_1_8"}, offer.CredentialConfigurationIDs)
+		})
+	}
+}
+
+// TestParseOffer_OfferURIWithoutEitherParameter covers the branch's own failure
+// message: an offer URI that carries neither parameter has to say so, rather
+// than fall through and be reported as broken JSON.
+func TestParseOffer_OfferURIWithoutEitherParameter(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+
+	_, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?state=xyz",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither a credential_offer nor a credential_offer_uri")
+}
+
+// TestHasOfferURIScheme pins the scheme match itself: case-insensitive per
+// RFC 3986 section 3.1, authority optional, and nothing else accepted.
+func TestHasOfferURIScheme(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"openid-credential-offer://?credential_offer=%7B%7D", true},
+		{"openid-credential-offer:?credential_offer=%7B%7D", true},
+		{"OPENID-CREDENTIAL-OFFER:?credential_offer=%7B%7D", true},
+		{"OpenID-Credential-Offer://?credential_offer=%7B%7D", true},
+		// A bare JSON offer is not a URI and must fall through to the parser.
+		{`{"credential_issuer":"https://issuer.example.com"}`, false},
+		// Neither a different scheme nor a longer name that merely starts the
+		// same way is this scheme.
+		{"openid-credential-offer-v2:?credential_offer=%7B%7D", false},
+		{"haip://?credential_offer=%7B%7D", false},
+		// The scheme alone, with no ":", is not a URI either.
+		{"openid-credential-offer", false},
+	} {
+		assert.Equal(t, tc.want, hasOfferURIScheme(tc.in), tc.in)
+	}
+}
+
+// TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam is the same fix seen
+// from the credential_offer_uri side: the by-reference form has to be followed
+// for both spellings too, not just the "//" one.
+func TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam(t *testing.T) {
+	const offerJSON = `{"credential_issuer":"https://issuer.example.com",` +
+		`"credential_configuration_ids":["eucc"],"grants":{"authorization_code":{}}}`
+
+	offerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(offerJSON))
+	}))
+	defer offerServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, offerServer.Client())
+	defer cleanup()
+
+	offer, err := h.parseOffer(context.Background(), &FlowStartMessage{
+		Offer: "openid-credential-offer:?credential_offer_uri=" + url.QueryEscape(offerServer.URL),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, offer)
+	assert.Equal(t, []string{"eucc"}, offer.CredentialConfigurationIDs)
+}
+
+// --- evaluateTrust: PDP-configured vs. no-PDP-configured semantics (M-5, #377) ---
+//
+// Exact intended semantics:
+//   - No issuer PDP URL configured at all -> falling back to client-asserted
+//     (frontend) trust evaluation is INTENTIONAL (permissive dev/no-PDP mode).
+//   - A PDP URL IS configured, and the call to it errors (rather than
+//     returning a valid trusted/untrusted verdict) -> MUST fail closed
+//     (untrusted / block issuance), and must NEVER fall back to asking the
+//     frontend/WS client in that case.
+
+// TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed verifies that
+// when an issuer PDP URL is configured and TrustSvc.EvaluateIssuer returns an
+// error (e.g. evaluator construction failure), evaluateTrust fails closed:
+// the issuer is treated as untrusted and the frontend is never asked (no
+// trust_evaluation_required progress message is sent, and no
+// evaluateTrustViaFrontend WaitForActionWithTimeout round-trip occurs).
+func TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "https://pdp.example.com"
+
+	evaluatorErr := errors.New("evaluator construction failed")
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) {
+			return nil, evaluatorErr
+		})
+
+	// Capture every message the handler sends to the "frontend" so we can
+	// assert trust_evaluation_required was never sent.
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Deliberately do NOT queue any trust_result action on session.actionCh:
+	// if the fix regresses and the code falls through to
+	// evaluateTrustViaFrontend, WaitForActionWithTimeout must block until the
+	// bounded context below expires rather than ever getting an answer.
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:     flow,
+		Config:   cfg,
+		Logger:   zap.NewNop(),
+		TrustSvc: trustSvc,
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(ctx, "https://issuer.example.com", metadata, false)
+
+	require.Error(t, err)
+	require.NotNil(t, info)
+	assert.False(t, info.Trusted, "issuer must be treated as untrusted on PDP evaluation error")
+	assert.Contains(t, err.Error(), "trust evaluation error")
+	assert.Contains(t, err.Error(), "issuer.example.com")
+
+	// Drain and inspect whatever the handler sent - it must never have asked
+	// the frontend to evaluate trust. Bounded wait (rather than closing the
+	// channel) since the server-side reader goroutine may still be in flight.
+	drainDeadline := time.After(500 * time.Millisecond)
+drain:
+	for {
+		select {
+		case data := <-messages:
+			assert.NotContains(t, string(data), "trust_evaluation_required",
+				"must never fall back to frontend-mediated trust evaluation on a PDP error")
+		case <-drainDeadline:
+			break drain
+		}
+	}
+}
+
+// TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged is a regression
+// guard: when NO issuer PDP URL is configured at all, evaluateTrust must
+// still fall back to the client-asserted (frontend) trust evaluation path
+// exactly as before this fix - that permissive dev/no-PDP mode is
+// intentional and must not be touched by the fail-closed change above.
+func TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged(t *testing.T) {
+	cfg := testConfig()
+	// cfg.Trust.PDPURL left empty: no PDP configured at all.
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Queue the frontend's verdict up front: evaluateTrustViaFrontend blocks on it.
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eudi"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: cfg,
+		Logger: zap.NewNop(),
+		// TrustSvc intentionally nil: with no PDP configured, evaluateTrust
+		// must never dereference it.
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(context.Background(), "https://issuer.example.com", metadata, false)
+
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+	assert.Equal(t, "eudi", info.Framework)
+
+	// Confirm the frontend really was asked (proving this test exercises the
+	// path it claims to, not a leftover default). evaluateTrust already
+	// returned above, so the message was sent before this point; still allow
+	// a short bounded wait for the reader goroutine to have forwarded it.
+	deadline := time.After(2 * time.Second)
+	sawTrustRequired := false
+wait:
+	for {
+		select {
+		case data := <-messages:
+			if strings.Contains(string(data), "trust_evaluation_required") {
+				sawTrustRequired = true
+				break wait
+			}
+		case <-deadline:
+			break wait
+		}
+	}
+	assert.True(t, sawTrustRequired, "no-PDP mode must still ask the frontend to evaluate trust")
+}
+
+// TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID is the
+// regression test for a fifth Copilot review round on go-wallet-backend
+// PR #401: TrustEvaluationRequest.ResolutionSubjectID (added there for the
+// OID4VP verifier-side frontend fallback, see oid4vp_test.go's
+// TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags)
+// is documented as required whenever RequiresResolution is true - but
+// evaluateTrustViaFrontend here, the analogous no-PDP frontend-fallback path
+// for OID4VCI issuers, never populated it: a DID issuer request reached the
+// frontend with requires_resolution: true and an empty resolution_subject_id,
+// so a frontend genuinely implementing the new contract could not resolve
+// DID issuers at all.
+//
+// Unlike OID4VP's decentralized_identifier:-prefixed client_id, an OID4VCI
+// issuer identifier carries no scheme prefix to strip - the issuer string
+// already IS the bare DID whenever requiresResolution is true - so the fix
+// is simply to also send it as ResolutionSubjectID, not to extract anything.
+func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *testing.T) {
+	const issuer = "did:web:issuer.example"
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: testConfig(), // no issuer PDP configured at all
+		Logger: zap.NewNop(),
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: issuer}
+	info, err := h.evaluateTrust(context.Background(), issuer, metadata, false)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+
+	req := trustEvaluationRequest(t, messages)
+	assert.Equal(t, issuer, req.SubjectID)
+	assert.True(t, req.RequiresResolution, "a did: issuer must ask the frontend to resolve it")
+	assert.Equal(t, issuer, req.ResolutionSubjectID, "ResolutionSubjectID must be populated for a DID issuer, same as for a DID verifier")
+}
+
+// Cleverbase publishes claims both at the configuration level (as an array)
+// and under credential_metadata. The credential must still be usable (#370).
+func TestIssuerMetadata_LegacyClaimsArrayDoesNotDropConfiguration(t *testing.T) {
+	doc := `{"credential_issuer":"https://i.example","credential_endpoint":"https://i.example/c",
+	"credential_configurations_supported":{"hello-world":{"format":"dc+sd-jwt","vct":"x","claims":[],
+	"credential_metadata":{"claims":[]}}}}`
+	var m IssuerMetadata
+	if err := json.Unmarshal([]byte(doc), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg, ok := m.CredentialConfigurationsSupported["hello-world"]
+	if !ok {
+		t.Fatal("configuration with a legacy claims array was dropped")
+	}
+	if cfg.Format != "dc+sd-jwt" || cfg.VCT != "x" {
+		t.Errorf("unexpected config: %+v", cfg)
+	}
+}
+
+// A null credential_configurations_supported must clear a reused value.
+func TestIssuerMetadata_NullCredentialConfigurationsClearsReusedValue(t *testing.T) {
+	var m IssuerMetadata
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":{"a":{"format":"dc+sd-jwt"}}}`), &m))
+	require.Len(t, m.CredentialConfigurationsSupported, 1)
+
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":null}`), &m))
+	assert.Empty(t, m.CredentialConfigurationsSupported)
 }

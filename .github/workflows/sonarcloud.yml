@@ -15,6 +15,12 @@ jobs:
   sonarcloud:
     name: SonarCloud Scan
     runs-on: ubuntu-latest
+    # Same MongoDB service as the Go CI "test" job, so the coverage profile
+    # Sonar sees includes the MongoDB-backed stores instead of skipping them.
+    services:
+      mongodb:
+        image: mongo:7
+        ports: ["27017:27017"]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,6 +35,8 @@ jobs:
         # dedicated "test" job (Go CI workflow); here we only need the profile,
         # so a flaky/failing test must not abort the analysis. The coverage file
         # is still written for the packages whose tests ran.
+        env:
+          TEST_MONGODB: "1"
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./... || true
 
       - name: SonarCloud Scan

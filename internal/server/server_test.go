@@ -442,3 +442,34 @@ func TestManager_ServedByMiddleware(t *testing.T) {
 		}
 	})
 }
+
+// server.trusted_proxies decides whether a caller can choose its own client
+// IP via X-Forwarded-For, which the per-IP rate limits key on.
+func TestConfigureTrustedProxies_ClientIP(t *testing.T) {
+	clientIP := func(proxies []string, remote string) string {
+		m := &Manager{cfg: &ServerConfig{TrustedProxies: proxies}, logger: zap.NewNop()}
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		m.configureTrustedProxies(r)
+		var got string
+		r.GET("/", func(c *gin.Context) { got = c.ClientIP() })
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = remote + ":1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.9")
+		r.ServeHTTP(httptest.NewRecorder(), req)
+		return got
+	}
+
+	if got := clientIP(nil, "198.51.100.7"); got != "203.0.113.9" {
+		t.Errorf("unset keeps gin's legacy trust-all behaviour, got %q", got)
+	}
+	if got := clientIP([]string{"none"}, "198.51.100.7"); got != "198.51.100.7" {
+		t.Errorf("none must ignore X-Forwarded-For, got %q", got)
+	}
+	if got := clientIP([]string{"10.0.0.0/8"}, "198.51.100.7"); got != "198.51.100.7" {
+		t.Errorf("an untrusted peer must not choose its IP, got %q", got)
+	}
+	if got := clientIP([]string{"10.0.0.0/8"}, "10.1.2.3"); got != "203.0.113.9" {
+		t.Errorf("a trusted proxy's X-Forwarded-For must be honoured, got %q", got)
+	}
+}

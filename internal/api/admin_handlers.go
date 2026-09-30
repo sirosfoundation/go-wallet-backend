@@ -4,13 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
@@ -18,16 +21,34 @@ import (
 type AdminHandlers struct {
 	store      storage.Store
 	logger     *zap.Logger
+	audit      *audit.Emitter
 	r2psClient *r2ps.Client
+	allowHTTP  bool // when true, plain HTTP OIDC issuer URLs are permitted (test/dev environments)
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
-func NewAdminHandlers(store storage.Store, logger *zap.Logger, r2psClient *r2ps.Client) *AdminHandlers {
+func NewAdminHandlers(store storage.Store, logger *zap.Logger, auditor *audit.Emitter) *AdminHandlers {
 	return &AdminHandlers{
-		store:      store,
-		logger:     logger,
-		r2psClient: r2psClient,
+		store:  store,
+		logger: logger,
+		audit:  auditor,
 	}
+}
+
+// SetR2PSClient wires the optional R2PS admin client. When nil (the default),
+// the /r2ps proxy routes are not registered. Must be called before
+// RegisterRoutes.
+func (h *AdminHandlers) SetR2PSClient(c *r2ps.Client) {
+	h.r2psClient = c
+}
+
+// SetAllowHTTP configures whether OIDC gate provider issuer URLs may use
+// plain HTTP instead of HTTPS. Defaults to false (HTTPS required). This
+// mirrors the AuthZEN proxy's allowHTTP escape hatch (see
+// AuthZENProxyHandler.allowHTTP) and is wired from the same
+// http_client.allow_http setting so operators have one knob, not two.
+func (h *AdminHandlers) SetAllowHTTP(allow bool) {
+	h.allowHTTP = allow
 }
 
 // TenantRequest represents the request body for creating/updating a tenant
@@ -59,11 +80,12 @@ type OIDCProviderConfigRequest struct {
 
 // OIDCGateRequest represents the OIDC gate configuration in API requests
 type OIDCGateRequest struct {
-	Mode           string                     `json:"mode"` // none, registration, login, both
-	RegistrationOP *OIDCProviderConfigRequest `json:"registration_op,omitempty"`
-	LoginOP        *OIDCProviderConfigRequest `json:"login_op,omitempty"`
-	RequiredClaims map[string]interface{}     `json:"required_claims,omitempty"`
-	BindIdentity   *bool                      `json:"bind_identity,omitempty"`
+	Mode            string                     `json:"mode"` // none, registration, login, both
+	RegistrationOP  *OIDCProviderConfigRequest `json:"registration_op,omitempty"`
+	LoginOP         *OIDCProviderConfigRequest `json:"login_op,omitempty"`
+	RequiredClaims  map[string]interface{}     `json:"required_claims,omitempty"`
+	BindIdentity    *bool                      `json:"bind_identity,omitempty"`
+	TrustAdminClaim *bool                      `json:"trust_admin_claim,omitempty"`
 }
 
 // TenantResponse represents a tenant in API responses
@@ -97,11 +119,12 @@ type OIDCProviderConfigResponse struct {
 
 // OIDCGateResponse represents the OIDC gate configuration in API responses
 type OIDCGateResponse struct {
-	Mode           string                      `json:"mode"`
-	RegistrationOP *OIDCProviderConfigResponse `json:"registration_op,omitempty"`
-	LoginOP        *OIDCProviderConfigResponse `json:"login_op,omitempty"`
-	RequiredClaims map[string]interface{}      `json:"required_claims,omitempty"`
-	BindIdentity   bool                        `json:"bind_identity"`
+	Mode            string                      `json:"mode"`
+	RegistrationOP  *OIDCProviderConfigResponse `json:"registration_op,omitempty"`
+	LoginOP         *OIDCProviderConfigResponse `json:"login_op,omitempty"`
+	RequiredClaims  map[string]interface{}      `json:"required_claims,omitempty"`
+	BindIdentity    bool                        `json:"bind_identity"`
+	TrustAdminClaim bool                        `json:"trust_admin_claim"`
 }
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
@@ -134,9 +157,10 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 		return nil
 	}
 	resp := &OIDCGateResponse{
-		Mode:           string(g.Mode),
-		RequiredClaims: g.RequiredClaims,
-		BindIdentity:   g.BindIdentity,
+		Mode:            string(g.Mode),
+		RequiredClaims:  g.RequiredClaims,
+		BindIdentity:    g.BindIdentity,
+		TrustAdminClaim: g.TrustAdminClaim,
 	}
 	if g.RegistrationOP != nil {
 		resp.RegistrationOP = &OIDCProviderConfigResponse{
@@ -161,9 +185,11 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 	return resp
 }
 
-// applyOIDCGateRequest applies API request to domain OIDCGateConfig
-// Returns an error if the mode is invalid
-func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) error {
+// applyOIDCGateRequest applies API request to domain OIDCGateConfig.
+// allowHTTP permits plain-HTTP issuer URLs (test/dev environments only);
+// pass h.allowHTTP from the calling handler.
+// Returns an error if the mode is invalid.
+func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig, allowHTTP bool) error {
 	if req == nil || gate == nil {
 		return nil
 	}
@@ -202,6 +228,24 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		}
 	}
 
+	// Validate every *effective* provider left on the gate after applying
+	// this request - not just ones the request itself supplied. Without
+	// this, a request that resupplies only RegistrationOP (or neither)
+	// would leave an already-stored LoginOP unvalidated, so a later update
+	// that only changes e.g. `mode` or `trust_admin_claim` could never be
+	// used to catch/reject a pre-existing http:// issuer that predates this
+	// check. See go-wallet-backend#373.
+	if gate.RegistrationOP != nil {
+		if err := validateOIDCIssuerScheme(gate.RegistrationOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("registration_op: %w", err)
+		}
+	}
+	if gate.LoginOP != nil {
+		if err := validateOIDCIssuerScheme(gate.LoginOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("login_op: %w", err)
+		}
+	}
+
 	// Apply required claims
 	if req.RequiredClaims != nil {
 		gate.RequiredClaims = req.RequiredClaims
@@ -212,6 +256,14 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		gate.BindIdentity = *req.BindIdentity
 	}
 
+	// Apply trust_admin_claim: explicit per-tenant opt-in required before the
+	// AS will mint elevated (admin+delegation) session permissions from the
+	// LoginOP's ID token claims. See applyAdminClaimTAC in internal/as/oidc.go
+	// and go-wallet-backend#376.
+	if req.TrustAdminClaim != nil {
+		gate.TrustAdminClaim = *req.TrustAdminClaim
+	}
+
 	// SECURITY: Validate bind_identity configuration
 	// bind_identity=true requires a registration gate (registration or both mode)
 	// because identity binding only happens during FinishRegistration
@@ -219,6 +271,27 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		return fmt.Errorf("bind_identity cannot be enabled with mode 'login': identity binding requires registration gate")
 	}
 
+	return nil
+}
+
+// validateOIDCIssuerScheme requires HTTPS OIDC issuer URLs (go-wallet-backend#373 /
+// M-1): the issuer is used to construct the discovery, authorization, and
+// token endpoints that the AS's OIDC login flow trusts, so a plaintext
+// issuer is trivially interceptable/spoofable by an on-path attacker. Plain
+// HTTP is permitted only when allowHTTP is set, mirroring the escape hatch
+// AuthZENProxyHandler already uses for jwks_uri/logo URLs (test/dev
+// environments, wired from the same http_client.allow_http setting).
+func validateOIDCIssuerScheme(issuer string, allowHTTP bool) error {
+	u, err := url.Parse(issuer)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("issuer must be a valid absolute URL: %q", issuer)
+	}
+	if u.Scheme != "https" && (!allowHTTP || u.Scheme != "http") {
+		if allowHTTP {
+			return fmt.Errorf("issuer must be a valid HTTPS or HTTP URL (allow_http is enabled): %q", issuer)
+		}
+		return fmt.Errorf("issuer must use https:// (got %q)", issuer)
+	}
 	return nil
 }
 
@@ -317,7 +390,7 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 
 	// Apply OIDC gate config if provided
 	if req.OIDCGate != nil {
-		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate, h.allowHTTP); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -330,6 +403,7 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant created", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantCreated, string(tenantID), map[string]any{"name": req.Name})
 	c.JSON(http.StatusCreated, tenantToResponse(tenant))
 }
 
@@ -374,7 +448,7 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 	// Update OIDC gate config if provided
 	if req.OIDCGate != nil {
-		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate, h.allowHTTP); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -388,6 +462,7 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant updated", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantUpdated, string(tenantID), nil)
 	c.JSON(http.StatusOK, tenantToResponse(tenant))
 }
 
@@ -421,6 +496,7 @@ func (h *AdminHandlers) DeleteTenant(c *gin.Context) {
 	}
 
 	h.logger.Info("Tenant deleted", zap.String("tenant_id", string(tenantID)))
+	h.emitAudit(set.EventTenantDeleted, string(tenantID), nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Tenant deleted"})
 }
 
@@ -474,6 +550,7 @@ func (h *AdminHandlers) AddUserToTenant(c *gin.Context) {
 		zap.String("user_id", req.UserID),
 		zap.String("role", role),
 	)
+	h.emitAudit(set.EventUserAdded, req.UserID, map[string]any{"tenant_id": string(tenantID), "role": role})
 	c.JSON(http.StatusOK, gin.H{"message": "User added to tenant"})
 }
 
@@ -493,6 +570,7 @@ func (h *AdminHandlers) RemoveUserFromTenant(c *gin.Context) {
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("user_id", userID.String()),
 	)
+	h.emitAudit(set.EventUserRemoved, userID.String(), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "User removed from tenant"})
 }
 
@@ -691,6 +769,7 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 	h.logger.Info("Issuer created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("identifier", req.CredentialIssuerIdentifier))
+	h.emitAudit(set.EventIssuerCreated, req.CredentialIssuerIdentifier, map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusCreated, issuerToResponse(issuer))
 }
 
@@ -743,6 +822,7 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 	h.logger.Info("Issuer updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
+	h.emitAudit(set.EventIssuerUpdated, fmt.Sprintf("%d", issuerID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, issuerToResponse(issuer))
 }
 
@@ -779,6 +859,7 @@ func (h *AdminHandlers) DeleteIssuer(c *gin.Context) {
 	h.logger.Info("Issuer deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("issuer_id", issuerID))
+	h.emitAudit(set.EventIssuerDeleted, fmt.Sprintf("%d", issuerID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "Issuer deleted"})
 }
 
@@ -923,6 +1004,7 @@ func (h *AdminHandlers) CreateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("name", req.Name))
+	h.emitAudit(set.EventVerifierCreated, verifier.URL, map[string]any{"tenant_id": string(tenantID), "verifier_id": verifier.ID, "name": verifier.Name})
 	c.JSON(http.StatusCreated, verifierToResponse(verifier))
 }
 
@@ -989,6 +1071,7 @@ func (h *AdminHandlers) UpdateVerifier(c *gin.Context) {
 	h.logger.Info("Verifier updated",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
+	h.emitAudit(set.EventVerifierUpdated, fmt.Sprintf("%d", verifierID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, verifierToResponse(verifier))
 }
 
@@ -1025,6 +1108,7 @@ func (h *AdminHandlers) DeleteVerifier(c *gin.Context) {
 	h.logger.Info("Verifier deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.Int64("verifier_id", verifierID))
+	h.emitAudit(set.EventVerifierDeleted, fmt.Sprintf("%d", verifierID), map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "Verifier deleted"})
 }
 
@@ -1064,6 +1148,19 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		tenants.GET("/:id/invites/:invite_id", h.GetInvite)
 		tenants.PUT("/:id/invites/:invite_id", h.UpdateInvite)
 		tenants.DELETE("/:id/invites/:invite_id", h.DeleteInvite)
+
+		// Wallet instance management
+		tenants.GET("/:id/instances", h.ListWalletInstances)
+		tenants.GET("/:id/instances/:instance_id", h.GetWalletInstance)
+		tenants.PUT("/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+		tenants.DELETE("/:id/instances/:instance_id", h.DeleteWalletInstance)
+		tenants.GET("/:id/users/:user_id/instances", h.ListWalletInstancesByUser)
+
+		// User detail
+		tenants.GET("/:id/users/:user_id/detail", h.GetUserDetail)
+
+		// Tenant statistics
+		tenants.GET("/:id/stats", h.GetTenantStats)
 	}
 
 	// R2PS WSCD proxy (only registered when R2PS client is configured)
@@ -1076,5 +1173,13 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 			r2psGroup.GET("/status/:category/:idx", h.R2PSGetStatus)
 			r2psGroup.PUT("/status/:category/:idx", h.R2PSSetStatus)
 		}
+	}
+
+}
+
+// emitAudit is a nil-safe helper for emitting SET audit events.
+func (h *AdminHandlers) emitAudit(event set.EventURI, subject string, data map[string]any) {
+	if h.audit != nil {
+		h.audit.EmitWithSubject(event, subject, data)
 	}
 }

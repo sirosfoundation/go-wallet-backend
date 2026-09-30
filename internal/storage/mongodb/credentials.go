@@ -19,30 +19,7 @@ type CredentialStore struct {
 }
 
 func (s *CredentialStore) getNextID(ctx context.Context) (int64, error) {
-	// Use a counter document for auto-increment
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "credential_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			// Initialize counter
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "credential_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "credential_id")
 }
 
 func (s *CredentialStore) Create(ctx context.Context, credential *domain.VerifiableCredential) error {
@@ -141,28 +118,7 @@ type PresentationStore struct {
 }
 
 func (s *PresentationStore) getNextID(ctx context.Context) (int64, error) {
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "presentation_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "presentation_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "presentation_id")
 }
 
 func (s *PresentationStore) Create(ctx context.Context, presentation *domain.VerifiablePresentation) error {

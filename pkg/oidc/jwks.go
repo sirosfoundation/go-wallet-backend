@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"go.uber.org/zap"
 )
 
@@ -138,11 +139,11 @@ func (k *JWK) ecPublicKey() (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("failed to decode y: %w", err)
 	}
 
-	return &ecdsa.PublicKey{
-		Curve: curve,
-		X:     new(big.Int).SetBytes(xBytes),
-		Y:     new(big.Int).SetBytes(yBytes),
-	}, nil
+	pub, err := jwk.BuildECPublicKeyFromCoordinates(curve, xBytes, yBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse EC public key for %s: %w", k.Crv, err)
+	}
+	return pub, nil
 }
 
 // fetchJWKS fetches a JWKS from the given URI

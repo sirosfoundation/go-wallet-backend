@@ -239,10 +239,11 @@ func TestValidateClientIDScheme(t *testing.T) {
 		{"x509_san_dns", false},         // valid scheme
 		{"x509_san_uri", false},         // valid scheme
 		{"verifier_attestation", false}, // valid scheme
-		{"did", false},                  // valid scheme
-		{"invalid", true},               // invalid scheme
-		{"REDIRECT_URI", true},          // case sensitive
-		{"pre_registered", true},        // wrong format (underscore vs hyphen)
+		{"did", false},
+		{"decentralized_identifier", false}, // OpenID4VP 1.0's name for "did"
+		{"invalid", true},                   // invalid scheme
+		{"REDIRECT_URI", true},              // case sensitive
+		{"pre_registered", true},            // wrong format (underscore vs hyphen)
 	}
 
 	for _, tt := range tests {

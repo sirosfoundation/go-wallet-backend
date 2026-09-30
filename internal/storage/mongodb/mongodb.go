@@ -23,15 +23,17 @@ type Store struct {
 	database *mongo.Database
 	cfg      *config.MongoDBConfig
 
-	users         *UserStore
-	tenants       *TenantStore
-	userTenants   *UserTenantStore
-	credentials   *CredentialStore
-	presentations *PresentationStore
-	challenges    *ChallengeStore
-	issuers       *IssuerStore
-	verifiers     *VerifierStore
-	invites       *InviteStore
+	users           *UserStore
+	tenants         *TenantStore
+	userTenants     *UserTenantStore
+	credentials     *CredentialStore
+	presentations   *PresentationStore
+	challenges      *ChallengeStore
+	issuers         *IssuerStore
+	verifiers       *VerifierStore
+	invites         *InviteStore
+	walletInstances *WalletInstanceStore
+	keyAttestations *KeyAttestationStore
 }
 
 // NewStore creates a new MongoDB store
@@ -92,6 +94,8 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.issuers = &IssuerStore{collection: database.Collection("issuers"), counter: counters}
 	s.verifiers = &VerifierStore{collection: database.Collection("verifiers"), counter: counters}
 	s.invites = &InviteStore{collection: database.Collection("invites")}
+	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
+	s.keyAttestations = &KeyAttestationStore{collection: database.Collection("key_attestations")}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -201,6 +205,24 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create invite indexes: %w", err)
 	}
 
+	// Wallet instances collection indexes
+	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
+	}
+
+	// Key attestations collection indexes
+	_, err = s.keyAttestations.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "wallet_instance_id", Value: 1}}},
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create key attestation indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -230,15 +252,21 @@ func (s *Store) initializeDefaultTenant(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Users() storage.UserStore                 { return s.users }
-func (s *Store) Tenants() storage.TenantStore             { return s.tenants }
-func (s *Store) UserTenants() storage.UserTenantStore     { return s.userTenants }
-func (s *Store) Credentials() storage.CredentialStore     { return s.credentials }
-func (s *Store) Presentations() storage.PresentationStore { return s.presentations }
-func (s *Store) Challenges() storage.ChallengeStore       { return s.challenges }
-func (s *Store) Issuers() storage.IssuerStore             { return s.issuers }
-func (s *Store) Verifiers() storage.VerifierStore         { return s.verifiers }
-func (s *Store) Invites() storage.InviteStore             { return s.invites }
+func (s *Store) Users() storage.UserStore                     { return s.users }
+func (s *Store) Tenants() storage.TenantStore                 { return s.tenants }
+func (s *Store) UserTenants() storage.UserTenantStore         { return s.userTenants }
+func (s *Store) Credentials() storage.CredentialStore         { return s.credentials }
+func (s *Store) Presentations() storage.PresentationStore     { return s.presentations }
+func (s *Store) Challenges() storage.ChallengeStore           { return s.challenges }
+func (s *Store) Issuers() storage.IssuerStore                 { return s.issuers }
+func (s *Store) Verifiers() storage.VerifierStore             { return s.verifiers }
+func (s *Store) Invites() storage.InviteStore                 { return s.invites }
+func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
+func (s *Store) KeyAttestations() storage.KeyAttestationStore { return s.keyAttestations }
+
+// Database returns the underlying MongoDB database for creating additional
+// collections (e.g., WIA challenge store with TTL indexes).
+func (s *Store) Database() *mongo.Database { return s.database }
 
 func (s *Store) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -271,7 +299,13 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
 	var user domain.User
-	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user)
+	// False positive: bson.M is a typed document builder, not a query string.
+	// The key here ("_id.id") is a fixed literal; id.String() is only ever used
+	// as a plain field VALUE, which the driver BSON-encodes as a string and
+	// compares by equality. A string value can never be interpreted as a Mongo
+	// query operator (only "$"-prefixed map KEYS are), so untrusted input
+	// reaching this call site cannot inject query semantics.
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()}).Decode(&user) // codeql[go/sql-injection]
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -362,6 +396,72 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 		return storage.ErrInvalidInput // ETag mismatch
 	}
 	return nil
+}
+
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
+	setFields := bson.M{
+		"updated_at": time.Now(),
+	}
+	// OR-only: only ever include clone_warning in the $set when it's true.
+	// Omitting the field entirely when false leaves whatever is currently
+	// stored untouched — this single UpdateOne is the whole operation, so
+	// there is no read-then-write window at all: it can never overwrite an
+	// existing true with false, regardless of how concurrent calls
+	// interleave.
+	if cloneWarning {
+		setFields["webauthn_credentials.$[cred].authenticator.clone_warning"] = true
+	}
+
+	// SignCount must be monotonic non-decreasing: two concurrent logins can
+	// persist out of order (e.g. a counter=20 assertion lands before a
+	// counter=10 one from an earlier, slower request), and a plain
+	// unconditional overwrite would let the later write lower the stored
+	// baseline — which would falsely flag a subsequent legitimate assertion
+	// as a clone regression, and could let an actually-regressing counter
+	// slip through as "non-regressing" against the artificially-lowered
+	// baseline. $max is MongoDB's atomic "only update if greater" operator:
+	// combined with $set in the same update document, this whole operation
+	// is still a single atomic write.
+	update := bson.M{
+		"$set": setFields,
+		"$max": bson.M{
+			"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
+		},
+	}
+
+	opts := options.FindOneAndUpdate().
+		SetArrayFilters(options.ArrayFilters{
+			Filters: []interface{}{bson.M{"cred.id": credentialID}},
+		}).
+		// Return the PRE-image (the document as it was immediately before
+		// this update was applied), not the default post-image, so we can
+		// inspect what CloneWarning was a moment before this exact write —
+		// this is what makes the returned "transitioned" value a genuine
+		// compare-and-set outcome of the single atomic operation, rather
+		// than a separate, racy read.
+		SetReturnDocument(options.Before)
+
+	var before domain.User
+	err := s.collection.FindOneAndUpdate(ctx, bson.M{"_id.id": id.String()}, update, opts).Decode(&before)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return false, storage.ErrNotFound
+		}
+		return false, fmt.Errorf("failed to update credential authenticator: %w", err)
+	}
+
+	if !cloneWarning {
+		return false, nil
+	}
+	for _, c := range before.WebauthnCredentials {
+		if c.ID == credentialID {
+			return !c.Authenticator.CloneWarning, nil
+		}
+	}
+	// Credential not found in the pre-image: the arrayFilter matched zero
+	// array elements (see the interface doc comment on the silent no-op
+	// case) — conservatively report no transition.
+	return false, nil
 }
 
 // idFilter returns a BSON filter that matches a document by _id.

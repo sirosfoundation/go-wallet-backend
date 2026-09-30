@@ -1,7 +1,11 @@
 package config
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +18,7 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 }
 
@@ -27,7 +31,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -56,7 +60,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -64,6 +68,37 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 				t.Error("Expected validation error for invalid port")
 			}
 		})
+	}
+}
+
+func TestConfig_Validate_EngineWSKeepaliveSubMillisecond(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  func(*Config)
+	}{
+		{"ping interval 500us", func(c *Config) { c.Server.EngineWSPingInterval = 500 * time.Microsecond }},
+		{"pong timeout 500us", func(c *Config) { c.Server.EngineWSPongTimeout = 500 * time.Microsecond }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tt.cfg(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Expected validation error for a sub-millisecond engine WS keepalive value")
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_EngineWSKeepaliveZeroIsValid(t *testing.T) {
+	// 0 is the "use the default" sentinel (see Manager.wsKeepalive), not an
+	// invalid value - must not be rejected the same way a genuinely too-small
+	// positive value is.
+	cfg := validBaseConfig()
+	cfg.Server.EngineWSPingInterval = 0
+	cfg.Server.EngineWSPongTimeout = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() error = %v, want nil for zero-valued (default) engine WS keepalive settings", err)
 	}
 }
 
@@ -76,7 +111,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -95,7 +130,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -114,7 +149,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -196,7 +231,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -217,7 +252,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -253,7 +288,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -274,7 +309,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -340,7 +375,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -354,8 +389,8 @@ jwt:
 	if cfg.Server.Port != 8080 {
 		t.Errorf("Expected port 8080, got %d", cfg.Server.Port)
 	}
-	if cfg.JWT.Secret != "test-secret" {
-		t.Errorf("Expected JWT secret 'test-secret', got %q", cfg.JWT.Secret)
+	if cfg.JWT.Secret != "test-secret-that-is-at-least-32-bytes-long" {
+		t.Errorf("Expected JWT secret 'test-secret-that-is-at-least-32-bytes-long', got %q", cfg.JWT.Secret)
 	}
 }
 
@@ -391,7 +426,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -426,7 +461,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test-secret
+  secret: test-secret-that-is-at-least-32-bytes-long
   expiry_hours: 48
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
@@ -724,7 +759,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 			}
 
 			err := cfg.Validate()
@@ -752,7 +787,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 	}
 
 	err := cfg.Validate()
@@ -771,7 +806,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
 		}
 	}
 
@@ -832,7 +867,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
@@ -870,7 +905,7 @@ server:
 storage:
   type: memory
 jwt:
-  secret: test
+  secret: test-secret-that-is-at-least-32-bytes-long
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
@@ -1343,6 +1378,212 @@ func TestASConfig_GetTokenTTL(t *testing.T) {
 	}
 }
 
+func TestConfig_EnableForRole_FillsDefaults(t *testing.T) {
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.JWT.Issuer = "https://issuer.example"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://issuer.example" {
+		t.Errorf("expected Issuer to fall back to JWT.Issuer, got %q", cfg.AS.Issuer)
+	}
+	// SetDefaults should still run (TTLs, DefaultMaxTAC etc.)
+	if cfg.AS.DefaultTokenTTL == 0 {
+		t.Error("expected EnableForRole to also apply ASConfig.SetDefaults defaults")
+	}
+}
+
+func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(t *testing.T) {
+	// Regression test for a real Copilot review finding: a wallet provider
+	// configured with PKCS11 (which WalletProviderService tries first,
+	// independently of whether a file key is ALSO configured as a runtime
+	// fallback) actually signs WIA/KA with the HSM key. If EnableForRole()
+	// still inherited PrivateKeyPath here, AS would silently sign its own
+	// tokens with the weaker on-disk key instead - a security downgrade,
+	// not just an unsupported configuration. SigningKeyPath must stay empty
+	// so Validate() rejects with an actionable error instead.
+	cfg := &Config{}
+	cfg.WalletProvider.PrivateKeyPath = "/wp/fallback-key.pem"
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true")
+	}
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "" {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/custom/key.pem"
+	cfg.AS.RulesDir = "/custom/rules"
+	cfg.AS.Issuer = "https://custom-issuer.example"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "/custom/key.pem" {
+		t.Errorf("expected explicit SigningKeyPath to be preserved, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+	if cfg.AS.Issuer != "https://custom-issuer.example" {
+		t.Errorf("expected explicit Issuer to be preserved, got %q", cfg.AS.Issuer)
+	}
+}
+
+func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.SigningKeyPath != "" {
+		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	}
+}
+
+func TestConfig_EnableForRole_ExplicitRulesDirPreserved(t *testing.T) {
+	cfg := &Config{}
+	cfg.AS.RulesDir = "/custom/rules"
+
+	cfg.EnableForRole()
+
+	if cfg.AS.RulesDir != "/custom/rules" {
+		t.Errorf("expected explicit RulesDir to be preserved, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_RespectsExplicitFalseInYAML(t *testing.T) {
+	// Regression test: EnableForRole must not override an operator's
+	// explicit `as.enabled: false` - a plain bool can't distinguish that
+	// from "as section never configured" (both are the zero value), which
+	// is why this goes through Load() (the only path that can observe the
+	// raw YAML) rather than constructing a Config{} directly.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if cfg.AS.Enabled {
+		t.Error("expected explicit as.enabled: false in YAML to be preserved, but EnableForRole() overrode it to true")
+	}
+}
+
+func TestConfig_EnableForRole_FillsDefaultsWhenExplicitlyEnabledInYAML(t *testing.T) {
+	// Regression test for EnableForRole()'s own logic: an explicit
+	// as.enabled: true must still get defaults filled in for whatever
+	// fields are empty - only an explicit as.enabled: false should skip
+	// defaulting entirely. Before this fix, EnableForRole() treated ANY
+	// explicit as.enabled (true or false) identically ("fully configured,
+	// don't touch it").
+	//
+	// Constructs Config directly (asEnabledExplicit set as Load() would)
+	// rather than going through Load() itself: Load()'s own Validate() call
+	// requires as.signing_key_path/rules_dir whenever as.enabled: true is
+	// present in YAML, regardless of role - so a YAML fixture reproducing
+	// this scenario would fail at Load() before EnableForRole() ever runs.
+	// That's a separate, pre-existing validation-ordering property (AS
+	// config is validated unconditionally on AS.Enabled, not gated on
+	// whether the auth role was even requested) - out of scope for this fix,
+	// which is specifically about EnableForRole()'s own explicit-true-vs-
+	// false handling.
+	cfg := &Config{asEnabledExplicit: true}
+	cfg.AS.Enabled = true
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled to stay true")
+	}
+	if cfg.AS.SigningKeyPath != "/wp/key.pem" {
+		t.Errorf("expected SigningKeyPath to default to wallet provider's key, got %q", cfg.AS.SigningKeyPath)
+	}
+	if cfg.AS.RulesDir != "/app/rules" {
+		t.Errorf("expected RulesDir default of /app/rules, got %q", cfg.AS.RulesDir)
+	}
+}
+
+func TestConfig_EnableForRole_FillsInWhenYAMLOmitsASEntirely(t *testing.T) {
+	// Contrast with the test above: when the `as:` section is absent
+	// entirely (not just enabled: false), EnableForRole should still turn
+	// it on for the auth role.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  private_key_path: /wp/key.pem
+  wia:
+    enabled: false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	cfg.EnableForRole()
+
+	if !cfg.AS.Enabled {
+		t.Error("expected AS.Enabled = true when as: section is absent entirely")
+	}
+}
+
 func TestConfig_Validate_AS_MissingSigningKey(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
@@ -1493,5 +1734,1003 @@ func TestConfig_Validate_AS_InvalidMaxTACChars(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid character") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReadSecretFile_Success(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(path, []byte("  my-secret-value  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := readSecretFile(path)
+	if err != nil {
+		t.Fatalf("readSecretFile: %v", err)
+	}
+	if val != "my-secret-value" {
+		t.Errorf("expected trimmed secret, got %q", val)
+	}
+}
+
+func TestReadSecretFile_NotFound(t *testing.T) {
+	_, err := readSecretFile("/nonexistent/path/secret.txt")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestReadSecretFile_Empty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, []byte("  \n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := readSecretFile(path)
+	if err == nil {
+		t.Fatal("expected error for empty file")
+	}
+	if !strings.Contains(err.Error(), "is empty") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_AdminToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "admin-token")
+	if err := os.WriteFile(tokenPath, []byte("test-admin-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = tokenPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Server.AdminToken != "test-admin-token" {
+		t.Errorf("admin token = %q, want test-admin-token", cfg.Server.AdminToken)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecret(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "jwt-secret")
+	if err := os.WriteFile(secretPath, []byte("jwt-secret-value"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = secretPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.JWT.Secret != "jwt-secret-value" {
+		t.Errorf("jwt secret = %q, want jwt-secret-value", cfg.JWT.Secret)
+	}
+}
+
+func TestLoadSecretsFromFiles_MongoPassword(t *testing.T) {
+	dir := t.TempDir()
+	passPath := filepath.Join(dir, "mongo-pass")
+	if err := os.WriteFile(passPath, []byte("s3cret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.Storage.MongoDB.PasswordPath = passPath
+	cfg.Storage.MongoDB.URI = "mongodb://user:%PASSWORD%@localhost:27017"
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.Storage.MongoDB.URI != "mongodb://user:s3cret@localhost:27017" {
+		t.Errorf("uri = %q, want password replaced", cfg.Storage.MongoDB.URI)
+	}
+}
+
+func TestLoadSecretsFromFiles_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Server.AdminTokenPath = "/nonexistent/token"
+
+	if err := cfg.loadSecretsFromFiles(); err == nil {
+		t.Fatal("expected error for bad admin token path")
+	}
+}
+
+func TestLoadSecretsFromFiles_NoPaths(t *testing.T) {
+	cfg := defaultConfig()
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles with no paths: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PKCS11PIN(t *testing.T) {
+	dir := t.TempDir()
+	pinPath := filepath.Join(dir, "hsm-pin")
+	if err := os.WriteFile(pinPath, []byte("1234"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: pinPath}
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if cfg.WalletProvider.PKCS11.PIN != "1234" {
+		t.Errorf("pin = %q, want 1234", cfg.WalletProvider.PKCS11.PIN)
+	}
+}
+
+func TestLoadSecretsFromFiles_PKCS11PIN_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{PINPath: "/nonexistent/pin"}
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad PKCS11 PIN path")
+	}
+	if !strings.Contains(err.Error(), "pkcs11") {
+		t.Errorf("error should mention pkcs11: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_JWTSecretBadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.JWT.SecretPath = "/nonexistent/jwt-secret"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad JWT secret path")
+	}
+	if !strings.Contains(err.Error(), "jwt") {
+		t.Errorf("error should mention jwt: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T) {
+	// WIA.Enabled defaults to true, but with no signing keys configured WIA is
+	// inert (no endpoints registered) — the zero-config default must not fail
+	// validation just because wallet_provider_uri wasn't set.
+	cfg := defaultConfig()
+	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
+	cfg.Storage = StorageConfig{Type: "memory"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error on zero-config default: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWhenKeysConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+	// WalletProviderURI intentionally left unset.
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with signing keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_RequiresWalletProviderURIWithPKCS11(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.PKCS11 = &PKCS11SigningConfig{ModulePath: "/usr/lib/softhsm/libsofthsm2.so"}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when WIA is enabled with PKCS11 keys but no wallet_provider_uri")
+	}
+	if !strings.Contains(err.Error(), "wallet_provider_uri is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_PassesWithWalletProviderURI(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresWalletVersion(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	// WalletVersion deliberately left empty.
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	cfg.WalletProvider.CertificatePath = "/path/to/cert.pem"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wallet_version is required") {
+		t.Errorf("expected wallet_version error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_ETSIModeRequiresCertificate(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.WIA.WalletName = "Test Wallet"
+	cfg.WalletProvider.WIA.WalletVersion = "1.0.0"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// CertificatePath deliberately left empty — etsi mode requires x5c.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "certificate_path is required") {
+		t.Errorf("expected certificate_path error, got %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_IETFModeRequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = WIAModeIETF
+	cfg.WalletProvider.WIA.MaxExpirySeconds = 86400
+	cfg.WalletProvider.WIA.WalletProviderURI = "https://wallet.example.com"
+	cfg.WalletProvider.PrivateKeyPath = "/path/to/key.pem"
+	// No CertificatePath, no Issuer.
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "wia.issuer is required") {
+		t.Errorf("expected issuer error, got %v", err)
+	}
+
+	cfg.WalletProvider.WIA.Issuer = "https://wallet-provider.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error once issuer is set: %v", err)
+	}
+}
+
+func TestConfig_Validate_WIA_InvalidMode(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.WalletProvider.WIA.Enabled = true
+	cfg.WalletProvider.WIA.Mode = "bogus"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid wallet_provider.wia.mode") {
+		t.Errorf("expected invalid mode error, got %v", err)
+	}
+}
+
+// TestConfig_Validate_Audit_* are regression tests for a review finding:
+// Config.Validate() didn't check AuditConfig at all, so audit.enabled=true
+// with a missing issuer/key_path/key_id silently disabled the SET audit
+// emitter at startup (NewFromConfig just returns nil) instead of failing
+// fast on the misconfiguration.
+func TestConfig_Validate_Audit_RequiresIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but issuer is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.issuer is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyPath(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyID = "audit-key"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_path is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_path is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_RequiresKeyID(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error when audit is enabled but key_id is missing")
+	}
+	if !strings.Contains(err.Error(), "audit.key_id is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_PassesWhenFullyConfigured(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = true
+	cfg.Audit.Issuer = "https://wallet.example.com"
+	cfg.Audit.KeyPath = "/path/to/key.pem"
+	cfg.Audit.KeyID = "audit-key"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfig_Validate_Audit_DisabledSkipsValidation(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.Enabled = false
+	// issuer/key_path/key_id all left empty — must not fail when disabled.
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityKeys(t *testing.T) {
+	dir := t.TempDir()
+	decPath := filepath.Join(dir, "play-integrity-dec")
+	verPath := filepath.Join(dir, "play-integrity-ver")
+	if err := os.WriteFile(decPath, []byte("dec-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verPath, []byte("ver-key-b64"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = decPath
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = verPath
+
+	if err := cfg.loadSecretsFromFiles(); err != nil {
+		t.Fatalf("loadSecretsFromFiles: %v", err)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKey; got != "dec-key-b64" {
+		t.Errorf("decryption key = %q, want dec-key-b64", got)
+	}
+	if got := cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKey; got != "ver-key-b64" {
+		t.Errorf("verification key = %q, want ver-key-b64", got)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityDecryptionKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityDecryptionKeyPath = "/nonexistent/dec-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad decryption key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_decryption_key_path") {
+		t.Errorf("error should mention google_play_integrity_decryption_key_path: %v", err)
+	}
+}
+
+func TestLoadSecretsFromFiles_PlayIntegrityVerificationKey_BadPath(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WalletProvider.Attestation.NativeAttestation.GooglePlayIntegrityVerificationKeyPath = "/nonexistent/ver-key"
+
+	err := cfg.loadSecretsFromFiles()
+	if err == nil {
+		t.Fatal("expected error for bad verification key path")
+	}
+	if !strings.Contains(err.Error(), "google_play_integrity_verification_key_path") {
+		t.Errorf("error should mention google_play_integrity_verification_key_path: %v", err)
+	}
+}
+
+// SSRF guard tests
+// =============================================================================
+
+// stubConn is the bare minimum net.Conn a successful dial has to return.
+type stubConn struct{ net.Conn }
+
+// recordingDial records the address it was asked to connect to and succeeds.
+func recordingDial(dialed *[]string) dialFunc {
+	return func(_ context.Context, _, addr string) (net.Conn, error) {
+		*dialed = append(*dialed, addr)
+		return stubConn{}, nil
+	}
+}
+
+func staticLookup(ips ...string) lookupFunc {
+	return func(_ context.Context, _ string) ([]net.IP, error) {
+		out := make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			out = append(out, net.ParseIP(ip))
+		}
+		return out, nil
+	}
+}
+
+// The point of the guard: connect to an address that was actually inspected,
+// never to the hostname again.
+func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed), nil)
+
+	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443] - dialling the name would resolve a second time", dialed)
+	}
+}
+
+// A resolver that answers differently the second time is the whole attack:
+// public for the check, internal for the connection. Only one lookup happens,
+// and the address dialled is the one from it.
+func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
+	calls := 0
+	rebinding := func(_ context.Context, _ string) ([]net.IP, error) {
+		calls++
+		if calls == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return []net.IP{net.ParseIP("10.0.0.5")}, nil
+	}
+
+	var dialed []string
+	dial := guardedDial(rebinding, recordingDial(&dialed), nil)
+
+	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolved %d times, want 1", calls)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want [93.184.216.34:443]", dialed)
+	}
+}
+
+func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
+	tests := []struct {
+		name    string
+		ip      string
+		wantErr string
+	}{
+		{"loopback", "127.0.0.1", "private/loopback"},
+		{"ipv6 loopback", "::1", "private/loopback"},
+		{"rfc1918", "10.0.0.5", "private/loopback"},
+		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
+		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cloud metadata", "169.254.169.254", "cloud metadata"},
+		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
+		{"unspecified", "0.0.0.0", "unspecified"},
+		{"unspecified ipv6", "::", "unspecified"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), nil)
+
+			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
+			if err == nil {
+				t.Fatal("expected the dial to be refused")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not mention %q", err, tt.wantErr)
+			}
+			if len(dialed) != 0 {
+				t.Fatalf("connected to %v after refusing", dialed)
+			}
+		})
+	}
+}
+
+// One internal address among public ones still refuses the whole dial: the
+// attacker chooses which answer the client happens to pick otherwise.
+func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed), nil)
+
+	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
+		t.Fatal("expected the dial to be refused")
+	}
+	if len(dialed) != 0 {
+		t.Fatalf("connected to %v after refusing", dialed)
+	}
+}
+
+func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed), nil)
+
+	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 1 || dialed[0] != "93.184.216.34:443" {
+		t.Fatalf("dialed %v, want the IPv4 address for a tcp4 dial", dialed)
+	}
+}
+
+func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
+	var dialed []string
+	failFirst := func(_ context.Context, _, addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		if len(dialed) == 1 {
+			return nil, fmt.Errorf("connection refused")
+		}
+		return stubConn{}, nil
+	}
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst, nil)
+
+	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if len(dialed) != 2 {
+		t.Fatalf("dialed %v, want both addresses tried", dialed)
+	}
+}
+
+// A black-holed address must not hold the whole dial. net.Dialer gets this
+// right for a hostname it resolved itself; dialling checked addresses loses
+// that unless the attempts overlap.
+func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
+	dial := guardedDial(
+		staticLookup("2606:2800:220:1::1", "93.184.216.34"),
+		func(ctx context.Context, _, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "[2606:") {
+				<-ctx.Done() // never answers, as a dead route does not
+				return nil, ctx.Err()
+			}
+			return stubConn{}, nil
+		},
+		nil,
+	)
+
+	start := time.Now()
+	conn, err := dial(context.Background(), "tcp", "dual.example.com:443")
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("dial returned no connection")
+	}
+	// The second attempt starts one fallback delay in; anything near a dialer
+	// timeout means the attempts were serial.
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %s, want roughly one fallback delay", elapsed)
+	}
+}
+
+// https-only guard
+// =============================================================================
+
+func TestSSRFGuard_RefusesPlaintext(t *testing.T) {
+	var reached bool
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		reached = true
+		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+	})}
+
+	req, err := http.NewRequest(http.MethodGet, "http://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("https request refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the https request never reached the transport")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// A proxy makes the dialer blind: it is handed the proxy's address, and for
+// https the target only appears in a CONNECT. The guard has to check the
+// request's own host in that case, or an ambient HTTP_PROXY would quietly
+// forward exactly what the dialer exists to refuse.
+func TestSSRFGuard_ChecksTheTargetOfAProxiedRequest(t *testing.T) {
+	proxyURL, err := url.Parse("http://egress.example.com:3128")
+	if err != nil {
+		t.Fatalf("parsing proxy url: %v", err)
+	}
+
+	var reached bool
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			reached = true
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy:  func(*http.Request) (*url.URL, error) { return proxyURL, nil },
+		lookup: staticLookup("10.0.0.5"),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://internal.example.com/secret", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err == nil {
+		t.Fatal("expected the proxied request to an internal host to be refused")
+	}
+	if reached {
+		t.Fatal("the request reached the transport")
+	}
+
+	guard.lookup = staticLookup("93.184.216.34")
+	req, err = http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("proxied request to a public host refused: %v", err)
+	}
+	if !reached {
+		t.Fatal("the request never reached the transport")
+	}
+}
+
+// Without a proxy the dialer does the checking, and it does it better - one
+// lookup, and it connects to what it checked. No second resolution here.
+func TestSSRFGuard_DoesNotResolveWhenThereIsNoProxy(t *testing.T) {
+	lookups := 0
+	guard := ssrfGuard{
+		base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+		}),
+		proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		lookup: func(context.Context, string) ([]net.IP, error) {
+			lookups++
+			return []net.IP{net.ParseIP("10.0.0.5")}, nil
+		},
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://verifier.example.com/request-object", nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	if _, err := guard.RoundTrip(req); err != nil {
+		t.Fatalf("unproxied request refused: %v", err)
+	}
+	if lookups != 0 {
+		t.Fatalf("resolved %d times without a proxy, want 0", lookups)
+	}
+}
+
+func TestHTTPClientConfig_AllowsPlaintext(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  HTTPClientConfig
+		want bool
+	}{
+		{"default", HTTPClientConfig{}, false},
+		{"allow_http", HTTPClientConfig{AllowHTTP: true}, true},
+		// An internal deployment reaches the in-process registry over
+		// http://localhost, so it cannot also be held to https.
+		{"allow_private_ips", HTTPClientConfig{AllowPrivateIPs: true}, true},
+		// The provider wiring has always folded this into AllowHTTP; keeping
+		// it here is what stops a working deployment from breaking.
+		{"insecure_skip_verify", HTTPClientConfig{InsecureSkipVerify: true}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.AllowsPlaintext(); got != tt.want {
+				t.Fatalf("AllowsPlaintext() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The wiring: which guards a configuration ends up with.
+func TestHTTPClientConfig_NewHTTPClient_GuardWiring(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfg           HTTPClientConfig
+		wantGuard     bool
+		wantHTTPSOnly bool
+	}{
+		{"default", HTTPClientConfig{}, true, true},
+		{"allow_http keeps the address guard", HTTPClientConfig{AllowHTTP: true}, true, false},
+		{"insecure_skip_verify keeps the address guard", HTTPClientConfig{InsecureSkipVerify: true}, true, false},
+		{"an internal deployment has neither", HTTPClientConfig{AllowPrivateIPs: true}, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := tt.cfg.NewHTTPClient(0)
+			guard, isGuarded := client.Transport.(ssrfGuard)
+			if isGuarded != tt.wantGuard {
+				t.Fatalf("guard present = %v, want %v", isGuarded, tt.wantGuard)
+			}
+			if isGuarded && guard.httpsOnly != tt.wantHTTPSOnly {
+				t.Fatalf("httpsOnly = %v, want %v", guard.httpsOnly, tt.wantHTTPSOnly)
+			}
+		})
+	}
+}
+
+// GuardedDialContext is NewHTTPClient's address policy exposed for a caller
+// that dials its own raw connection (HelperService.GetCertificateChain's
+// manual TLS handshake) instead of building an *http.Client. Real addresses
+// are used, not the staticLookup/recordingDial doubles above: unlike
+// guardedDial, GuardedDialContext takes no lookup/dial to inject, matching
+// NewHTTPClient's own use of defaultLookupIP directly.
+func TestHTTPClientConfig_GuardedDialContext(t *testing.T) {
+	t.Run("blocks private/loopback addresses by default", func(t *testing.T) {
+		dial := HTTPClientConfig{}.GuardedDialContext()
+
+		_, err := dial(context.Background(), "tcp", "127.0.0.1:1")
+		if err == nil {
+			t.Fatal("expected the loopback address to be refused")
+		}
+		if !strings.Contains(err.Error(), "private/loopback") {
+			t.Fatalf("error %q does not explain the refusal", err)
+		}
+	})
+
+	t.Run("AllowPrivateIPs skips the address check", func(t *testing.T) {
+		dial := HTTPClientConfig{AllowPrivateIPs: true}.GuardedDialContext()
+
+		// Nothing listens on port 1, so a dial that reaches the OS fails
+		// with a connection error rather than succeeding - the point here
+		// is which error: a policy refusal means the check ran anyway.
+		_, err := dial(context.Background(), "tcp", "127.0.0.1:1")
+		if err == nil {
+			t.Fatal("expected the dial itself to fail (nothing listens on port 1)")
+		}
+		if strings.Contains(err.Error(), "private/loopback") {
+			t.Fatalf("AllowPrivateIPs should skip the address check entirely, got a policy error: %v", err)
+		}
+	})
+}
+
+// A plaintext request must fail before anything is dialled, not after.
+func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
+	client := HTTPClientConfig{}.NewHTTPClient(0)
+
+	_, err := client.Get("http://verifier.example.com/request-object")
+	if err == nil {
+		t.Fatal("expected the plaintext request to be refused")
+	}
+	if !strings.Contains(err.Error(), "https only") {
+		t.Fatalf("error %q does not explain the refusal", err)
+	}
+
+	// The diagnostic has to name every key AllowsPlaintext consults, each with
+	// the prefix it is configured under. Naming only one of the three sends an
+	// operator to change a setting that may already be set, and an unprefixed
+	// key is not one that can be looked up in the configuration reference.
+	for _, key := range []string{
+		"http_client.allow_http",
+		"http_client.allow_private_ips",
+		"http_client.insecure_skip_verify",
+	} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("error %q does not mention %s", err, key)
+		}
+	}
+}
+
+// TestTrustConfig_VerifierCacheTTL pins the one place that decides how long a
+// verifier trust decision may be reused, including the "off" case the engine
+// reads as "do not cache at all".
+func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  TrustConfig
+		want time.Duration
+	}{
+		{"unset means the default", TrustConfig{}, DefaultTrustCacheTTL},
+		{"explicit seconds win", TrustConfig{CacheTTLSeconds: 30}, 30 * time.Second},
+		{"disabled means zero", TrustConfig{CacheDisabled: true}, 0},
+		{"disabled beats an explicit ttl", TrustConfig{CacheDisabled: true, CacheTTLSeconds: 30}, 0},
+		// Negative never reaches here in a running process - Validate
+		// refuses it at startup - but the function still has to answer
+		// something, and the default is the safe answer for a value that
+		// should have been rejected.
+		{"a negative ttl reads as the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.VerifierCacheTTL(); got != tt.want {
+				t.Fatalf("VerifierCacheTTL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A negative trust.cache_ttl_seconds is refused at startup. Someone who
+// writes -1 means "off", and quietly giving them an hour of cached trust
+// decisions is the exact failure this setting exists to cure: an answer that
+// is not the one the operator asked for, with nothing saying so.
+func TestConfig_Validate_RejectsANegativeTrustCacheTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Trust.CacheTTLSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a negative trust.cache_ttl_seconds must be refused")
+	}
+	if !strings.Contains(err.Error(), "cache_disabled") {
+		t.Errorf("the error should point at the way to turn the cache off, got %v", err)
+	}
+
+	// Zero and positive are both fine: zero means the default, and
+	// cache_disabled is the separate switch.
+	cfg.Trust.CacheTTLSeconds = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero must be accepted (it selects the default): %v", err)
+	}
+	cfg.Trust.CacheTTLSeconds = 30
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a positive ttl must be accepted: %v", err)
+	}
+}
+
+// A TTL past the int64 nanosecond range wraps to a negative time.Duration,
+// which the cache reads as "off" - so a number meant to cache for centuries
+// would disable caching instead. Same silent inversion as a negative value,
+// from the opposite end.
+func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
+	cfg := validBaseConfig()
+
+	// The boundary itself still converts to a positive duration.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the largest representable ttl must be accepted: %v", err)
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got <= 0 {
+		t.Fatalf("the boundary must still be a positive duration, got %v", got)
+	}
+
+	// One past it does not.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a ttl that overflows time.Duration must be refused")
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got > 0 {
+		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
+	}
+}
+
+func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
+	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
+		if err := m.validate(); err != nil {
+			t.Errorf("mode %q rejected: %v", m, err)
+		}
+	}
+	if DCQLConsentCheckMode("").Effective() != DCQLConsentCheckWarn {
+		t.Error("zero value must default to warn")
+	}
+	if defaultConfig().Presentation.DCQLConsentCheck != DCQLConsentCheckWarn {
+		t.Error("default config must be warn")
+	}
+	cfg := validBaseConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("base config invalid: %v", err)
+	}
+	cfg.Presentation.DCQLConsentCheck = "enforced"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "dcql_consent_check") {
+		t.Errorf("unknown mode must fail validation, got %v", err)
+	}
+}
+
+func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	ip, tenant := cfg.Security.OIDCGateRateLimit.PerIP, cfg.Security.OIDCGateRateLimit.PerTenant
+	if !ip.Enabled || ip.MaxAttempts != 30 || ip.WindowSeconds != 60 || ip.LockoutSeconds != 60 {
+		t.Errorf("per-IP defaults wrong: %+v", ip)
+	}
+	if !tenant.Enabled || tenant.MaxAttempts != 300 || tenant.WindowSeconds != 60 || tenant.LockoutSeconds != 60 {
+		t.Errorf("per-tenant defaults wrong: %+v", tenant)
+	}
+}
+
+func TestConfig_Validate_TrustedProxies(t *testing.T) {
+	for _, ok := range [][]string{nil, {"none"}, {"10.0.0.0/8", "192.168.1.1", "fd00::/8"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]string{{"10.0.0.0/33"}, {"lb.example.com"}, {"none", "10.0.0.1"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies") {
+			t.Errorf("%v must be rejected, got %v", bad, err)
+		}
+	}
+}
+
+func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.IdentityEvents = []string{"bound"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires audit.enabled") {
+		t.Errorf("identity_events without audit.enabled must be rejected, got %v", err)
+	}
+
+	cfg = validBaseConfig()
+	cfg.Audit = AuditConfig{Enabled: true, Issuer: "https://w", KeyPath: "/k", KeyID: "k", IdentityEvents: []string{"boudn"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Errorf("a misspelt event name must be rejected, got %v", err)
+	}
+
+	cfg.Audit.IdentityEvents = []string{" Bound ", "verified", "mismatch", "gate_bypass"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	if !cfg.Audit.IdentityEventEnabled("bound") || cfg.Audit.IdentityEventEnabled("nope") {
+		t.Error("IdentityEventEnabled mismatch")
+	}
+	if (AuditConfig{}).IdentityEventEnabled("bound") {
+		t.Error("no event may be enabled by default")
+	}
+}
+
+// A trusted IdP host may resolve to a private address (#349); an unlisted
+// host, and the cloud metadata endpoints, may not.
+func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
+	trusted := map[string]struct{}{"idp.internal": {}}
+
+	tests := []struct {
+		name, host, ip string
+		wantErr        bool
+	}{
+		{"trusted host, private ip", "idp.internal", "10.1.2.3", false},
+		{"trusted host, case-insensitive", "IdP.Internal", "127.0.0.1", false},
+		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
+		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
+		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), trusted)
+			_, err := dial(context.Background(), "tcp", tt.host+":443")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
+	c := HTTPClientConfig{TrustedIdPHosts: []string{" IdP.Internal ", ""}}
+	set := c.trustedIdPHostSet()
+	if _, ok := set["idp.internal"]; !ok || len(set) != 1 {
+		t.Fatalf("unexpected set: %v", set)
+	}
+	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
+		t.Fatal("empty config must yield no trusted hosts")
 	}
 }

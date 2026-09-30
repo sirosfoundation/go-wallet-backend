@@ -98,6 +98,21 @@ func (c *OIDCProviderConfig) EffectiveScopes() string {
 	return c.Scopes
 }
 
+// EffectiveAudience returns the audience tokens must be validated against,
+// defaulting to the client ID when Audience is unset. Mirrors the same
+// default middleware.ValidatorCache.GetOrCreate applies when constructing
+// the actual OIDC validator, so this always reflects what a token was (or
+// must be) checked against for this provider.
+func (c *OIDCProviderConfig) EffectiveAudience() string {
+	if c == nil {
+		return ""
+	}
+	if c.Audience != "" {
+		return c.Audience
+	}
+	return c.ClientID
+}
+
 // EffectiveDisplayName returns the display name, falling back to issuer if not set
 func (c *OIDCProviderConfig) EffectiveDisplayName() string {
 	if c == nil {
@@ -125,6 +140,16 @@ type OIDCGateConfig struct {
 
 	// BindIdentity determines whether to persist the enterprise identity link with the wallet user
 	BindIdentity bool `json:"bind_identity" bson:"bind_identity" gorm:"column:oidc_bind_identity;default:false"`
+
+	// TrustAdminClaim opts this tenant in to minting elevated (admin +
+	// delegation) session permissions from the LoginOP's ID token claims
+	// (a "groups"/"roles"/"realm_roles" claim containing "admin"). Off by
+	// default: the AS does not control an IdP's claim semantics, so an IdP
+	// misconfiguration or a compromised/malicious IdP could otherwise mint
+	// full admin access for any authenticated user. Must be explicitly
+	// enabled per tenant, the same way BindIdentity is. See
+	// go-wallet-backend#376.
+	TrustAdminClaim bool `json:"trust_admin_claim" bson:"trust_admin_claim" gorm:"column:oidc_trust_admin_claim;default:false"`
 }
 
 // IsEnabled returns true if OIDC gating is enabled (mode != none)

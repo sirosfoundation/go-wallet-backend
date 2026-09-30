@@ -1,7 +1,7 @@
 # Wallet Protocol Channel Specification
 
-**Version**: 0.1.0 (Draft)  
-**Status**: Design Discussion  
+**Version**: 0.1.0 (Draft)
+**Status**: Design Discussion
 **Date**: 2026-02-18
 
 ## Overview
@@ -112,6 +112,18 @@ Server → Client (failure):
 }
 ```
 
+`app_token` must be scoped to `aud: "wallet-registry"` or `aud:
+"wallet-backend"` - a token requested for any other audience is rejected at
+handshake. Per-flow, starting a flow (`flow_start`) additionally requires a
+specific `tac` on the same token, checked at that point rather than at
+handshake time: `r` for `oid4vp` (presenting an existing credential), `i`
+for `oid4vci` (receiving a new one) - a rejection there uses `flow_error`
+with code `FORBIDDEN` (a permission/tac rejection - not to be confused with
+`AUTHORIZATION_FAILED`, which is specifically an OAuth authorization *flow*
+failure elsewhere in this protocol), not the handshake-level `AUTH_FAILED`
+above. See `docs/authorization-requirements.md` for the full picture,
+including how to request a token with the `tac` your client needs.
+
 ### Keepalive
 
 Clients SHOULD send ping frames every 30 seconds. Servers MUST respond with pong.
@@ -132,16 +144,16 @@ All messages are JSON objects with a common envelope:
 interface Message {
   // Message type - determines interpretation of payload
   type: string;
-  
+
   // Flow identifier for multi-step operations (optional)
   flow_id?: string;
-  
+
   // Correlation ID for request/response pairs (optional)
   message_id?: string;
-  
+
   // Timestamp (ISO 8601, optional)
   timestamp?: string;
-  
+
   // Type-specific payload
   [key: string]: unknown;
 }
@@ -402,6 +414,93 @@ Client → Server:
   "proof_jwt": "eyJ..."
 }
 ```
+
+#### Client Authentication (Signing)
+
+Two further `sign_request` actions let the client authenticate the engine's
+outbound requests to the issuer with a key the backend never holds.
+
+**`sign_client_auth`** (preferred). The engine sends one of these for every
+request that needs client authentication: the PAR request, the token request
+(each DPoP-nonce attempt), and every DPoP-bound resource request (credential,
+deferred credential, notification). The client holds one key that is both its
+Wallet Instance Attestation `cnf` key and its DPoP key, and signs exactly what
+the engine asks for:
+
+```
+Server → Client:
+{
+  "type": "sign_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "action": "sign_client_auth",
+  "params": {
+    "audience": "https://as.example.com",      // present: WIA + fresh PoP wanted (aud)
+    "issuer": "https://wallet.example.com/cb", // PoP iss = the flow's client_id
+    "attestation_challenge": "<server challenge for the attestation PoP, if any>",
+    "htm": "POST",                             // present with htu: DPoP proof wanted
+    "htu": "https://as.example.com/token",
+    "dpop_nonce": "<server nonce, if any>",
+    "ath": "<base64url(SHA-256(access_token)), resource requests only>",
+    "key_id": "<dpop_key_id from a previous flow, renewals only>"
+  }
+}
+
+Client → Server:
+{
+  "type": "sign_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "dpop_key_id": "<client's identifier for the key>",   // always, when supported
+  "dpop_proof": "eyJ...",                                // when htm/htu were given
+  "client_attestation": "eyJ...",                        // when audience was given
+  "client_attestation_pop": "eyJ..."                     //   and a WIA is available
+}
+```
+
+`dpop_key_id` is mandatory whenever the client supports the action, even when
+no proof was asked for. The first `sign_client_auth` of a flow is a probe: an
+empty response (a client that does not know the action) or no response makes
+the engine fall back to an engine-held DPoP key plus a single
+`request_attestation` for the rest of the flow. Once a client has answered
+with `dpop_key_id` the mode is fixed for the flow, and a later signing failure
+is a flow error. A PoP must be freshly signed (new `jti`) for every request.
+
+**`request_attestation`** (legacy fallback). Sent once per flow, after the
+issuer's authorization server is known. The client returns its WIA and a PoP
+with `aud` = `params.audience`, `iss` = `params.issuer`, and the engine
+replays both on the PAR and token requests:
+
+```
+Server → Client:
+{ "type": "sign_request", "action": "request_attestation",
+  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb", "attestation_challenge": "<server challenge, if any>" } }
+
+Client → Server:
+{ "type": "sign_response", "client_attestation": "eyJ...", "client_attestation_pop": "eyJ..." }
+```
+
+Both empty means the client cannot attest and the flow proceeds without
+client attestation. A client must answer every `sign_request` it does not
+understand with an empty `sign_response`, or the engine waits out its
+timeout before falling back.
+
+**Renewal.** When the token response carries a `refresh_token`, `flow_complete`
+also carries the key it is bound to: `dpop_key_id` when the client signed
+(client-held mode), or `dpop_jwk` (the engine's private key as a JWK) in the
+legacy mode. The client stores it with the refresh token and sends the same
+field back on the renewal `flow_start`; with `dpop_key_id` the engine puts it
+in `params.key_id` of every `sign_client_auth` so the client signs with the
+original key.
+
+**Attestation challenge.** When an authorization server rejects a PAR or token
+request with `use_attestation_challenge`, the engine obtains a fresh challenge
+(from the `OAuth-Client-Attestation-Challenge` response header or the AS
+`challenge_endpoint`) and re-sends the request. `params.attestation_challenge`
+(in `sign_client_auth`, or `request_attestation` in legacy mode) then carries
+that challenge, and the client MUST include it as the `challenge` claim of the
+Client Attestation PoP JWT (draft-ietf-oauth-attestation-based-client-auth
+§5.1/§6).
 
 #### Credential Request
 
@@ -772,6 +871,7 @@ Server → Client:
 | Code | Description |
 |------|-------------|
 | `AUTH_FAILED` | Invalid or expired authentication token |
+| `FORBIDDEN` | Token's `tac` doesn't permit the requested action (e.g. `flow_start` for a protocol the token's `tac` doesn't cover) |
 | `INVALID_MESSAGE` | Malformed message |
 | `UNKNOWN_FLOW` | `flow_id` not recognized |
 | `FLOW_TIMEOUT` | Flow exceeded maximum duration |
@@ -1114,19 +1214,19 @@ To support multiple protocols cleanly, the server implements a flow handler inte
 type FlowHandler interface {
     // Protocol returns the protocol identifier
     Protocol() string
-    
+
     // Start initializes a new flow from the start message
     Start(ctx context.Context, msg FlowStartMessage) (*FlowState, error)
-    
+
     // HandleAction processes a client action
     HandleAction(ctx context.Context, state *FlowState, action FlowActionMessage) error
-    
+
     // HandleSignResponse processes a signature from the client
     HandleSignResponse(ctx context.Context, state *FlowState, resp SignResponse) error
-    
+
     // Resume restores a flow from persisted state (for long-running flows)
     Resume(ctx context.Context, state *FlowState) error
-    
+
     // Cancel cleans up a flow
     Cancel(ctx context.Context, state *FlowState) error
 }
@@ -1291,15 +1391,15 @@ type FlowState struct {
     Protocol   string        // "oid4vci", "oid4vp", "vctm"
     Step       string
     StartedAt  time.Time
-    
+
     // OID4VCI state
     Offer      *CredentialOffer
     Metadata   *IssuerMetadata
     TokenResp  *TokenResponse
-    
+
     // OID4VP state
     Request    *AuthorizationRequest
-    
+
     // Pending sign request
     PendingSign *SignRequest
 }

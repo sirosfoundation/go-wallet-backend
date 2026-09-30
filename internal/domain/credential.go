@@ -137,12 +137,16 @@ var ValidClientIDSchemes = map[string]bool{
 	"x509_san_uri":         true,
 	"verifier_attestation": true,
 	"did":                  true,
+	// OpenID4VP 1.0's name for "did". Both spellings are accepted so a
+	// verifier can be configured with whichever its requests actually carry;
+	// the engine treats them as one scheme.
+	"decentralized_identifier": true,
 }
 
 // ValidateClientIDScheme validates that a client_id_scheme value is supported
 func ValidateClientIDScheme(scheme string) error {
 	if !ValidClientIDSchemes[scheme] {
-		return fmt.Errorf("invalid client_id_scheme: %q (must be one of: redirect_uri, pre-registered, x509_san_dns, x509_san_uri, verifier_attestation, did)", scheme)
+		return fmt.Errorf("invalid client_id_scheme: %q (must be one of: redirect_uri, pre-registered, x509_san_dns, x509_san_uri, verifier_attestation, did, decentralized_identifier)", scheme)
 	}
 	return nil
 }

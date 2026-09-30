@@ -5,6 +5,10 @@
 server:
   host: "0.0.0.0"
   port: 8097
+  # CORS is used by the hybrid binary (--mode registry). Defaults to "*" if omitted.
+  cors:
+    allowed_origins:
+      - "*"
 
 # Source configuration - where to fetch VCTMs from
 source:

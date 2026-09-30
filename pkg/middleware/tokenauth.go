@@ -36,21 +36,47 @@ type TenantLookup interface {
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
+//
+// blacklist, when non-nil, is checked for user-level revocation
+// (IsUserRevoked) after a token validates - see #391 review: per-jti
+// revocation is already enforced *inside* v.Validate itself (the
+// go-tokenauth Validator's own Revocation checker, wired in
+// internal/server/providers.go to the same blacklist), but that checker's
+// interface only takes a jti, not a user_id, so DeleteUser's user-level
+// RevokeUser (#383) would otherwise never be consulted for tokens
+// validated through this path - only for tokens validated through the
+// legacy AuthMiddlewareWithBlacklist.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
 		if rawToken == "" {
+			logAuthReject(logger, c, "missing_or_malformed_bearer_token")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
 		}
 
-		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC)
+		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
+		// Per-jti revocation is already checked inside Validate itself (see
+		// this function's doc comment).
 		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
-			logger.Debug("Token validation failed", zap.Error(err))
+			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
+		// User-level revocation (#383/#391): rejects any token for a
+		// deleted user, even one whose own jti was never individually
+		// blacklisted. A no-op for anonymous tokens (empty UserID - see
+		// TokenBlacklist.IsUserRevoked).
+		if blacklist != nil && blacklist.IsUserRevoked(c.Request.Context(), result.UserID) {
+			logger.Warn("Token for revoked user used",
+				zap.String("user_id", result.UserID),
+			)
+			c.JSON(401, gin.H{"error": "Token has been revoked"})
 			c.Abort()
 			return
 		}
@@ -98,9 +124,23 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *z
 			)
 		}
 
-		// Populate context keys for existing handlers
-		c.Set("user_id", result.UserID)
-		c.Set("did", result.DID)
+		// Populate context keys for existing handlers.
+		//
+		// user_id/did are deliberately only set when non-empty: an anonymous
+		// token (see AS's handleAnonymousTokenRequest) validates successfully
+		// with an empty UserID/DID, and the common handler idiom is
+		// `val, exists := c.Get("user_id")`. If we always called c.Set here,
+		// exists would be true even for an anonymous caller — a value of ""
+		// looks like "we know who this is, and it's the empty string" rather
+		// than "no identity at all". Handlers must be able to tell the two
+		// apart via the exists boolean alone, without also remembering to
+		// check for an empty string every time.
+		if result.UserID != "" {
+			c.Set("user_id", result.UserID)
+		}
+		if result.DID != "" {
+			c.Set("did", result.DID)
+		}
 		c.Set("token", rawToken)
 		c.Set("tenant_id", tenantID)
 		c.Set("tenant", tenant)
@@ -131,6 +171,54 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 
 		if !result.TAC.HasAll(required) {
 			c.JSON(403, gin.H{"error": "Insufficient permissions"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// RequireAudience returns middleware that requires the token's "aud" claim
+// to contain at least one of the given values. Must be placed after
+// TokenAuthMiddleware in the middleware chain.
+//
+// This is a separate, narrower check from TokenAuthMiddleware's own
+// audience validation: that only confirms the token's audience is *some*
+// value from the deployment's shared Config.Audiences allowlist (e.g.
+// "wallet-backend" OR "wallet-registry" OR "wallet-engine", whichever the
+// operator configured) - it has no way to restrict a specific route group
+// to a narrower audience than "anything the deployment accepts overall".
+// RequireAudience is that narrower restriction, applied per route group -
+// e.g. the AuthZEN proxy and engine transport only ever need
+// "wallet-registry"/"wallet-backend" (identity-free calls), while general
+// user-facing routes should reject a "wallet-registry"-only token even
+// though the deployment as a whole accepts that audience for other
+// purposes.
+func RequireAudience(allowed ...string) gin.HandlerFunc {
+	if len(allowed) == 0 {
+		// allowed is fixed at route-registration time, not per-request, so
+		// this is always a programming error, never a runtime condition -
+		// panic here (once, at startup) rather than have the match loop
+		// below silently 403 every request forever.
+		panic("middleware: RequireAudience called with no allowed audiences")
+	}
+	return func(c *gin.Context) {
+		v, exists := c.Get("tokenauth_result")
+		if !exists {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+		result, ok := v.(*claims.Result)
+		if !ok || result == nil {
+			c.JSON(401, gin.H{"error": "Not authenticated"})
+			c.Abort()
+			return
+		}
+
+		if !result.HasAudience(allowed...) {
+			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return
 		}

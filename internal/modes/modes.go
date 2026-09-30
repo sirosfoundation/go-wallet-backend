@@ -17,16 +17,17 @@ import (
 type Role string
 
 const (
-	RoleBackend  Role = "backend"
-	RoleRegistry Role = "registry"
-	RoleEngine   Role = "engine"
-	RoleAuth     Role = "auth"
-	RoleStorage  Role = "storage"
-	RoleAdmin    Role = "admin"
+	RoleBackend        Role = "backend"
+	RoleRegistry       Role = "registry"
+	RoleEngine         Role = "engine"
+	RoleAuth           Role = "auth"
+	RoleStorage        Role = "storage"
+	RoleAdmin          Role = "admin"
+	RoleWalletProvider Role = "wallet-provider"
 )
 
 // ValidRoles lists all valid operating roles
-var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage, RoleAdmin}
+var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage, RoleAdmin, RoleWalletProvider}
 
 // IsValid checks if a role string is valid
 func (r Role) IsValid() bool {
@@ -89,7 +90,7 @@ func ParseRoles(s string) (*RoleSet, error) {
 
 	// Handle "all" as a special case
 	if s == "all" {
-		return NewRoleSet([]Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleAdmin}), nil
+		return NewRoleSet(ValidRoles), nil
 	}
 
 	parts := strings.Split(s, ",")

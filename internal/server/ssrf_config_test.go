@@ -161,7 +161,16 @@ func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
 }
 
 // TestNewEngineProvider_AllowHTTPWiring verifies that NewEngineProvider wires
-// AllowHTTP to the metadata resolver correctly.
+// the plaintext policy to the metadata resolver correctly.
+//
+// It resolves through the provider's own resolver, not a copy built here. An
+// earlier version of this test constructed an equivalent resolver and asserted
+// on that, which made it a test of issuermetadata and AllowsPlaintext rather
+// than of the wiring: it passed while the provider's rule changed underneath
+// it, and it would have gone on passing if providers.go regressed to the old
+// AllowHTTP || InsecureSkipVerify expression, because the copy was calling
+// AllowsPlaintext directly. Reproducing the expression under test is not a
+// check of it.
 func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 	logger := zap.NewNop()
 
@@ -182,13 +191,21 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			wantAllow: true,
 		},
 		{
-			name:      "InsecureSkipVerify=true implies AllowHTTP but not AllowPrivateIPs",
+			name:      "InsecureSkipVerify=true permits plaintext but not a loopback address",
 			httpCfg:   config.HTTPClientConfig{InsecureSkipVerify: true},
 			wantAllow: false, // loopback blocked because AllowPrivateIPs is not set
 		},
 		{
-			name:      "AllowHTTP=false blocks HTTP (default)",
+			// AllowPrivateIPs is itself a plaintext-permitting setting: such a
+			// deployment reaches its own registry over http://localhost, so
+			// the resolver must accept the scheme the dialer already allows.
+			name:      "AllowPrivateIPs=true permits plaintext on the private network",
 			httpCfg:   config.HTTPClientConfig{AllowPrivateIPs: true},
+			wantAllow: true,
+		},
+		{
+			name:      "nothing set blocks HTTP (default)",
+			httpCfg:   config.HTTPClientConfig{},
 			wantAllow: false,
 		},
 	}
@@ -200,18 +217,11 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}
 
-			// Reproduce the wiring to verify behavior.
-			client := tc.httpCfg.NewHTTPClient(10 * time.Second)
-			resolver, err := issuermetadata.New(issuermetadata.Config{
-				AllowHTTP:  tc.httpCfg.AllowHTTP || tc.httpCfg.InsecureSkipVerify,
-				HTTPClient: client,
-			})
-			if err != nil {
-				t.Fatalf("failed to create equivalent resolver: %v", err)
+			if provider.metadataResolver == nil {
+				t.Fatal("the provider registered its flow handlers without a metadata resolver")
 			}
-			_ = provider
 
-			_, resolveErr := resolver.Resolve(context.Background(), srv.URL)
+			_, resolveErr := provider.metadataResolver.Resolve(context.Background(), srv.URL)
 			if tc.wantAllow && resolveErr != nil {
 				t.Errorf("expected successful resolution, got: %v", resolveErr)
 			}

@@ -275,3 +275,51 @@ func TestLoadLocalOverrides_ExtractsOrganization(t *testing.T) {
 		t.Errorf("Organization = %q, want %q", entry.Organization, "ACME Corp")
 	}
 }
+
+func TestLoadLocalOverrides_ExtractsAttestationLoS(t *testing.T) {
+	dir := t.TempDir()
+
+	data := []byte(`{"vct": "urn:test:los", "name": "LoS Test", "description": "desc", "attestation_los": "iso_18045_high"}`)
+	fp := filepath.Join(dir, "los.json")
+	if err := os.WriteFile(fp, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(filepath.Join(dir, "cache.json"))
+	logger := zap.NewNop()
+
+	if err := LoadLocalOverrides(store, []string{fp}, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, ok := store.Get("urn:test:los")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.AttestationLoS != "iso_18045_high" {
+		t.Errorf("AttestationLoS = %q, want %q", entry.AttestationLoS, "iso_18045_high")
+	}
+}
+
+func TestLoadLocalOverrides_NoAttestationLoS(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "nolos.json")
+	if err := os.WriteFile(fp, testVCTMJSON("urn:test:nolos", "No LoS"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(filepath.Join(dir, "cache.json"))
+	logger := zap.NewNop()
+
+	if err := LoadLocalOverrides(store, []string{fp}, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, ok := store.Get("urn:test:nolos")
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.AttestationLoS != "" {
+		t.Errorf("AttestationLoS = %q, want empty", entry.AttestationLoS)
+	}
+}

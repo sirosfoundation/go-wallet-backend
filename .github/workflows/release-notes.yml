@@ -1,0 +1,142 @@
+# Opt a repo into AI-generated release notes.
+#
+# Copy to .github/workflows/release-notes.yml in the repo, and make sure the
+# siros-release-notes-bot GitHub App is installed on it.
+#
+# Carries no secrets: the OIDC token is minted per-run by GitHub, and every
+# real credential lives on the service.
+name: Release Notes
+
+on:
+  push:
+    # GitHub Actions filter patterns aren't plain globs — `[0-9]` is a
+    # character range and `+` means "one or more of the preceding character",
+    # so this does match v1.2.3 (and v1.2.3-rc1 via the trailing *).
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)generate. Required for mode=single, ignored for mode=all.'
+        required: false
+      mode:
+        description: 'single = one tag; all = bootstrap the whole file (refuses if it already exists)'
+        type: choice
+        options: [single, all]
+        default: single
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target tag
+        id: target
+        env:
+          MODE: ${{ inputs.mode || 'single' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MODE" = "all" ]; then
+            echo 'tag=' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="$INPUT_TAG"
+          # Only fall back to the ref when it actually *is* a tag — on a manual
+          # dispatch from a branch, github.ref_name is the branch name, and
+          # sending that would ask the service to treat "main" as a release.
+          if [ -z "$TAG" ] && [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error::mode=single needs a tag — pass the 'tag' input, or run this from a tag push."
+            exit 1
+          fi
+
+          # Validate before writing to $GITHUB_OUTPUT. This is what makes the
+          # plain `echo` below safe: bash anchors `$` at end-of-string, and the
+          # character class excludes newlines, so anything reaching $GITHUB_OUTPUT
+          # provably can't smuggle in extra `key=value` lines or a `<<EOF`
+          # delimiter. Escaping would only encode around that risk; rejecting
+          # removes it, and catches typo'd tags with a clearer message besides.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._+-]*$ ]]; then
+            echo "::error::'$TAG' is not a semver tag (expected vX.Y.Z, optionally with a suffix)."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Request release notes
+        env:
+          MODE: ${{ inputs.mode || 'single' }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # Status and body are captured separately rather than piping curl
+          # straight into jq: inside a command substitution, --fail-with-body's
+          # diagnostic body gets swallowed by the substitution and thrown away
+          # when set -e fires, leaving only curl's terse exit code and a jq
+          # parse error. Writing the body to a file keeps it printable.
+          #
+          # `|| true` rather than `|| echo 000`: on a connection failure curl
+          # writes its own "000" to stdout *and* exits non-zero, so the echo
+          # would append a second one and report a nonsense "000000".
+          OIDC_RESPONSE="$RUNNER_TEMP/oidc-response.json"
+          OIDC_STATUS=$(curl -sS -o "$OIDC_RESPONSE" -w '%{http_code}' \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=release-notes-bot" || true)
+          OIDC_STATUS=${OIDC_STATUS:-000}
+
+          if [ "$OIDC_STATUS" != "200" ]; then
+            echo "::error::OIDC token request failed (HTTP $OIDC_STATUS): $(cat "$OIDC_RESPONSE" 2>/dev/null || true)"
+            exit 1
+          fi
+
+          # Handle a non-JSON body explicitly: bare `VAR=$(jq ...)` would fail
+          # under set -e and kill the step before the message below could run.
+          # The body is deliberately NOT printed here — on this endpoint it can
+          # contain the token itself.
+          if ! OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_RESPONSE" 2>/dev/null); then
+            echo "::error::OIDC endpoint returned a 200 that was not valid JSON (body withheld — it may contain the token)."
+            exit 1
+          fi
+          if [ -z "$OIDC_TOKEN" ]; then
+            echo "::error::OIDC response contained no token — check that this job has 'id-token: write'."
+            exit 1
+          fi
+
+          BODY=$(jq -nc \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg mode "$MODE" \
+            --arg tag "$TAG" \
+            '{repo: $repo, mode: $mode} + (if $tag == "" then {} else {tag: $tag} end)')
+
+          RESPONSE="$RUNNER_TEMP/response.json"
+          STATUS=$(curl -sS -o "$RESPONSE" -w '%{http_code}' -X POST \
+            https://release-notes-bot.fly.dev/generate \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$BODY" || true)
+          STATUS=${STATUS:-000}
+
+          if [ "$STATUS" -lt 200 ] || [ "$STATUS" -ge 300 ]; then
+            echo "::error::release-notes-bot returned HTTP $STATUS: $(cat "$RESPONSE" 2>/dev/null || true)"
+            exit 1
+          fi
+
+          # Same guard on the way out: a 2xx with a non-JSON body (a proxy error
+          # page, say) would otherwise die on jq with the body never shown.
+          # Printing it here is safe — this is the service's own response.
+          if ! jq -r '.pull_request // .detail // .' "$RESPONSE" 2>/dev/null; then
+            echo "::error::release-notes-bot returned HTTP $STATUS with a body that isn't JSON:"
+            cat "$RESPONSE" || true
+            exit 1
+          fi

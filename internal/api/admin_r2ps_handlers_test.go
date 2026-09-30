@@ -21,7 +21,8 @@ func setupR2PSTestHandlers(t *testing.T, r2psHandler http.HandlerFunc) (*AdminHa
 	logger := zap.NewNop()
 	store := memory.NewStore()
 	client := r2ps.NewClient(srv.URL)
-	handlers := NewAdminHandlers(store, logger, client)
+	handlers := NewAdminHandlers(store, logger, nil)
+	handlers.SetR2PSClient(client)
 
 	router := gin.New()
 	router.GET("/admin/r2ps/keys", handlers.R2PSListKeys)

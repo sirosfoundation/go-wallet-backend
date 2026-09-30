@@ -15,6 +15,13 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # MongoDB-backed tests (internal/storage/mongodb, internal/as session
+    # store, WIA challenge store) skip themselves unless TEST_MONGODB is set;
+    # run them here so they count for coverage and catch regressions.
+    services:
+      mongodb:
+        image: mongo:7
+        ports: ["27017:27017"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -28,6 +35,8 @@ jobs:
         run: go mod download
 
       - name: Run tests
+        env:
+          TEST_MONGODB: "1"
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
       - name: Upload coverage
@@ -51,9 +60,29 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.10.0
+          version: v2.13.2
           args: --timeout=5m --tests=false
           verify: false
+
+  config-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check docs/CONFIGURATION.md is up to date
+        run: |
+          make gen-config-docs
+          if [ -n "$(git status --porcelain -- docs/CONFIGURATION.md)" ]; then
+            git diff -- docs/CONFIGURATION.md || true
+            echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
+            exit 1
+          fi
 
   build:
     runs-on: ubuntu-latest

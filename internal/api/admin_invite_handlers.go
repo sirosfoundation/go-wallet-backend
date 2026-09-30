@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
@@ -120,6 +121,7 @@ func (h *AdminHandlers) CreateInvite(c *gin.Context) {
 	h.logger.Info("Invite created",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", invite.ID))
+	h.emitAudit(set.EventInviteCreated, invite.ID, map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusCreated, inviteToResponse(invite, true))
 }
 
@@ -249,6 +251,7 @@ func (h *AdminHandlers) UpdateInvite(c *gin.Context) {
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", inviteID),
 		zap.String("action", req.Action))
+	h.emitAudit(set.EventInviteUpdated, inviteID, map[string]any{"tenant_id": string(tenantID), "action": req.Action})
 	c.JSON(http.StatusOK, inviteToResponse(invite, false))
 }
 
@@ -284,5 +287,6 @@ func (h *AdminHandlers) DeleteInvite(c *gin.Context) {
 	h.logger.Info("Invite deleted",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("invite_id", inviteID))
+	h.emitAudit(set.EventInviteDeleted, inviteID, map[string]any{"tenant_id": string(tenantID)})
 	c.JSON(http.StatusOK, gin.H{"message": "Invite deleted"})
 }

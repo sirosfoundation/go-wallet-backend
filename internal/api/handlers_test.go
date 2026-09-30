@@ -558,6 +558,30 @@ func TestHandlers_GenerateKeyAttestation_BadRequest(t *testing.T) {
 	}
 }
 
+func TestHandlers_GenerateKeyAttestation_TooManyJWKS(t *testing.T) {
+	handlers, router := setupTestHandlers(t)
+	router.POST("/key-attestation", handlers.GenerateKeyAttestation)
+
+	// Build a request with 21 JWKs (exceeds MaxJWKSPerRequest=20)
+	jwks := make([]map[string]interface{}, 21)
+	for i := range jwks {
+		jwks[i] = map[string]interface{}{"kty": "EC", "crv": "P-256"}
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"jwks":       jwks,
+		"openid4vci": map[string]string{"nonce": "test-nonce"},
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/key-attestation", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected 400 for too many JWKs, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // =============================================================================
 // Public Tenant Config Tests
 // =============================================================================

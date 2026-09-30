@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
@@ -41,6 +41,7 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/server /app/server
 COPY --from=builder /app/configs /app/configs
+COPY --from=builder /app/rules /app/rules
 
 USER 65532:65532
 
