@@ -1236,6 +1236,17 @@ func (h *wmpEngineHandler) registerChildFlow(childFlowID, parentFlowID, messageI
 	}
 }
 
+func (h *wmpEngineHandler) peekChildFlow(childFlowID string) (childFlowInfo, bool) {
+	t := h.table()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	info, ok := t.flows[childFlowID]
+	if !ok {
+		return childFlowInfo{}, false
+	}
+	return *info, true
+}
+
 func (h *wmpEngineHandler) popChildFlow(childFlowID string) (*childFlowInfo, bool) {
 	t := h.table()
 	t.mu.Lock()
@@ -1257,6 +1268,48 @@ func (h *wmpEngineHandler) SessionClose(_ context.Context, params *wmp.SessionCl
 		zap.String("session_id", h.sessionID),
 		zap.String("reason", reason))
 	h.adapter.CloseSession(h.sessionID)
+}
+
+// authorizeProtocol enforces the TAC permission the given flow protocol
+// requires (see requiredTACForProtocol) for the CURRENT request. It applies
+// to every state-changing method, not only FlowStart: a token lacking the
+// "i"/"r" permission must not be able to drive, cancel or complete an
+// existing flow of that protocol just because it belongs to the same user.
+//
+// Both the TAC captured at session creation and the current request's TAC
+// must grant the permission; an empty TAC means legacy auth (no TAC concept)
+// and is not checked.
+func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Protocol, logger *zap.Logger) *wmp.RPCError {
+	required, ok := requiredTACForProtocol[protocol]
+	if !ok {
+		return nil
+	}
+	reqTAC := requestTAC(ctx)
+	if (h.session.TAC != "" && !h.session.TAC.HasAll(required)) ||
+		(reqTAC != "" && !reqTAC.HasAll(required)) {
+		logger.Warn("Rejected WMP request - insufficient TAC",
+			zap.String("session_tac", string(h.session.TAC)),
+			zap.String("request_tac", string(reqTAC)),
+			zap.String("required", required),
+		)
+		return wmp.NewRPCError(wmp.ErrNotAuthorized, map[string]string{
+			"reason": "insufficient permissions for flow type",
+		})
+	}
+	return nil
+}
+
+// authorizeFlow looks up the flow and enforces its protocol's TAC permission.
+// The returned flow is nil when it is not registered (no authorization
+// decision is made then; callers report their own not-found error).
+func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (flow *Flow, rpcErr *wmp.RPCError) {
+	h.session.flowsMu.RLock()
+	flow = h.session.flows[flowID]
+	h.session.flowsMu.RUnlock()
+	if flow == nil {
+		return nil, nil
+	}
+	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.adapter.logger.With(zap.String("flow_id", flowID)))
 }
 
 // FlowStart handles wmp.flow.start — launches an engine flow goroutine.
@@ -1294,19 +1347,8 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	// Both the TAC captured at session creation AND the current request's
 	// TAC must grant the flow, so a reduced-permission token cannot drive a
 	// session created with a broader one.
-	if required, ok := requiredTACForProtocol[protocol]; ok {
-		reqTAC := requestTAC(ctx)
-		if (h.session.TAC != "" && !h.session.TAC.HasAll(required)) ||
-			(reqTAC != "" && !reqTAC.HasAll(required)) {
-			logger.Warn("Rejected WMP flow start - insufficient TAC",
-				zap.String("session_tac", string(h.session.TAC)),
-				zap.String("request_tac", string(reqTAC)),
-				zap.String("required", required),
-			)
-			return nil, wmp.NewRPCError(wmp.ErrNotAuthorized, map[string]string{
-				"reason": "insufficient permissions for flow type",
-			})
-		}
+	if rpcErr := h.authorizeProtocol(ctx, protocol, logger); rpcErr != nil {
+		return nil, rpcErr
 	}
 
 	// Parse WMP params into engine FlowStartMessage.
@@ -1426,11 +1468,12 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 func (h *wmpEngineHandler) FlowAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
 	flowID := params.FlowID
 
-	// Verify flow exists.
-	h.session.flowsMu.RLock()
-	_, exists := h.session.flows[flowID]
-	h.session.flowsMu.RUnlock()
-	if !exists {
+	// Verify flow exists and that this request's token may drive it.
+	flow, rpcErr := h.authorizeFlow(ctx, flowID)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if flow == nil {
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{
 			"reason": "flow not found or already completed",
 		})
@@ -1544,11 +1587,12 @@ func (h *wmpEngineHandler) FlowAction(ctx context.Context, params *wmp.FlowActio
 // FlowCancel handles wmp.flow.cancel — cancels an active engine flow.
 // Per spec §6.2, returns -31006 with reason "already_terminal" if the flow
 // has already completed.
-func (h *wmpEngineHandler) FlowCancel(_ context.Context, params *wmp.FlowCancelParams) (*wmp.FlowCancelResult, error) {
-	h.session.flowsMu.RLock()
-	flow, exists := h.session.flows[params.FlowID]
-	h.session.flowsMu.RUnlock()
-	if !exists {
+func (h *wmpEngineHandler) FlowCancel(ctx context.Context, params *wmp.FlowCancelParams) (*wmp.FlowCancelResult, error) {
+	flow, rpcErr := h.authorizeFlow(ctx, params.FlowID)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if flow == nil {
 		// Flow not in map — already reached a terminal state.
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{
 			"reason": "already_terminal",
@@ -1576,6 +1620,14 @@ func (h *wmpEngineHandler) FlowCancel(_ context.Context, params *wmp.FlowCancelP
 // channel does not lose the only result and strand the parent flow: delivery
 // waits up to flowActionSendWait (as FlowAction does) before giving up.
 func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCompleteParams) {
+	// A child result drives its parent flow, so the request's token must be
+	// authorised for the PARENT's protocol. Checked before the mapping is
+	// claimed so a denied caller cannot consume it.
+	if pending, ok := h.peekChildFlow(params.FlowID); ok {
+		if _, rpcErr := h.authorizeFlow(ctx, pending.parentFlowID); rpcErr != nil {
+			return
+		}
+	}
 	info, ok := h.popChildFlow(params.FlowID)
 	if !ok {
 		// Not a child flow — top-level flow completion (handled elsewhere).
@@ -1644,7 +1696,13 @@ func (h *wmpEngineHandler) CapabilityList(_ context.Context, _ *wmp.CapabilityLi
 // CredentialNotification handles wmp.credential.notification from the client.
 // It routes the OID4VCI §10 credential lifecycle event to the engine's
 // notification forwarding logic (same path as WebSocket credential_notification).
-func (h *wmpEngineHandler) CredentialNotification(_ context.Context, params *wmp.CredentialNotificationParams) {
+func (h *wmpEngineHandler) CredentialNotification(ctx context.Context, params *wmp.CredentialNotificationParams) {
+	// Credential notifications are an OID4VCI lifecycle event: they need the
+	// issuance permission, whether or not the flow is still registered.
+	if rpcErr := h.authorizeProtocol(ctx, ProtocolOID4VCI, h.adapter.logger.With(zap.String("flow_id", params.FlowID))); rpcErr != nil {
+		_ = h.session.SendNotificationAck(params.FlowID, params.NotificationID, "rejected", "insufficient permissions")
+		return
+	}
 	msg := &CredentialNotificationMessage{
 		Message: Message{
 			Type:   TypeCredentialNotification,
