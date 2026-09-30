@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -69,15 +68,14 @@ func (r *jwksRelay) Close() error {
 // asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json, refusing a
 // plain-http external_url unless the HTTP client policy allows plaintext.
 func asJWKSURL(cfg *config.Config) (string, error) {
-	base := strings.TrimRight(cfg.AS.ExternalURL, "/")
-	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
-		return "", fmt.Errorf("as.external_url %q is not an absolute http(s) URL", cfg.AS.ExternalURL)
+	u, err := cfg.AS.ExternalBaseURL()
+	if err != nil {
+		return "", err
 	}
 	if u.Scheme == "http" && !cfg.HTTPClient.AllowsPlaintext() {
 		return "", fmt.Errorf("as.external_url %q uses plain http; use https or set http_client.allow_http for local development", cfg.AS.ExternalURL)
 	}
-	return base + "/auth/.well-known/jwks.json", nil
+	return u.JoinPath("auth", ".well-known", "jwks.json").String(), nil
 }
 
 // newRemoteJWKSRelay relays the AS JWKS fetched with the guarded HTTP client.

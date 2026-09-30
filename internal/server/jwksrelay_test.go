@@ -70,3 +70,31 @@ func TestRemoteJWKSRelay_UpstreamErrorsAreBadGateway(t *testing.T) {
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
 }
+
+func TestASJWKSURL(t *testing.T) {
+	const tail = "/auth/.well-known/jwks.json"
+	for name, tc := range map[string]struct {
+		in, want string
+		wantErr  bool
+	}{
+		"normal":          {in: "https://as.example", want: "https://as.example" + tail},
+		"trailing slash":  {in: "https://as.example/", want: "https://as.example" + tail},
+		"path prefix":     {in: "https://as.example/wallet/", want: "https://as.example/wallet" + tail},
+		"query":           {in: "https://as.example/?x=1", wantErr: true},
+		"fragment":        {in: "https://as.example/#fragment", wantErr: true},
+		"empty query":     {in: "https://as.example/?", wantErr: true},
+		"empty fragment":  {in: "https://as.example/#", wantErr: true},
+		"plain http deny": {in: "http://as.example", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.Config{AS: config.ASConfig{ExternalURL: tc.in}}
+			got, err := asJWKSURL(cfg)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

@@ -147,7 +147,7 @@ Environment prefix: `WALLET_AS`
 | `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
 | `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader controls whether Deprecation + Sunset headers are sent on legacy token responses. |
 | `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the date after which legacy tokens will no longer be supported. Informational only: used in the Sunset HTTP header. It does not disable anything; use enabled=false for that. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z"). |
-| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs. Required when OIDC is used. |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment (an empty "?" or "#" is rejected too); a path prefix is allowed. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
 ## wallet_provider

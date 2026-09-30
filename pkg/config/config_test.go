@@ -2891,3 +2891,48 @@ func TestConfig_Validate_ExternalURLRequiresExpectedIssuer(t *testing.T) {
 		t.Fatalf("jwt.issuer must satisfy the check: %v", err)
 	}
 }
+
+func TestASConfig_ExternalBaseURL(t *testing.T) {
+	cases := []struct {
+		name, in, wantPath string
+		wantErr            bool
+	}{
+		{"normal", "https://as.example", "", false},
+		{"trailing slash", "https://as.example/", "", false},
+		{"path prefix", "https://as.example/wallet", "/wallet", false},
+		{"path prefix trailing slash", "https://as.example/wallet/", "/wallet", false},
+		{"query", "https://as.example/?a=b", "", true},
+		{"fragment", "https://as.example/#frag", "", true},
+		{"empty query", "https://as.example/?", "", true},
+		{"empty fragment", "https://as.example/#", "", true},
+		{"not absolute", "as.example", "", true},
+		{"bad scheme", "ftp://as.example", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &ASConfig{ExternalURL: tc.in}
+			u, err := a.ExternalBaseURL()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.in)
+				}
+				cfg := &Config{
+					Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+					Storage: StorageConfig{Type: "memory"},
+					JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
+					AS:      ASConfig{ExternalURL: tc.in},
+				}
+				if cfg.Validate() == nil {
+					t.Fatalf("Validate accepted %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Path != tc.wantPath {
+				t.Fatalf("path = %q, want %q", u.Path, tc.wantPath)
+			}
+		})
+	}
+}

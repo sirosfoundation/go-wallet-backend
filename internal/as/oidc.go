@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -447,7 +446,13 @@ func pkceCodeChallengeS256(codeVerifier string) string {
 // redirectURI returns the OIDC callback URI from config.
 // Using a configured value prevents Host header injection attacks.
 func (h *OIDCHandlers) redirectURI() string {
-	return strings.TrimRight(h.cfg.ExternalURL, "/") + "/auth/oidc/callback"
+	// config.Validate already rejected a malformed external_url; an empty
+	// result here makes the OIDC flow fail rather than redirect somewhere odd.
+	u, err := h.cfg.ExternalBaseURL()
+	if err != nil {
+		return ""
+	}
+	return u.JoinPath("auth", "oidc", "callback").String()
 }
 
 // hashNonce returns a base64url-encoded SHA-256 hash of the nonce.

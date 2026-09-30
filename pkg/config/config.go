@@ -106,12 +106,35 @@ type ASConfig struct {
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
-	// Used to construct OIDC redirect URIs. Required when OIDC is used.
+	// Used to construct OIDC redirect URIs and, in an isolated wallet-provider
+	// or standalone engine, to locate the AS JWKS. Must be an absolute http(s)
+	// URL without a query or fragment (an empty "?" or "#" is rejected too); a
+	// path prefix is allowed.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 
 	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
 	// Required for local development over HTTP. NEVER enable in production.
 	InsecureCookies bool `yaml:"insecure_cookies" envconfig:"INSECURE_COOKIES"`
+}
+
+// ExternalBaseURL parses and validates ExternalURL and returns it as a URL
+// whose path has no trailing slash, ready for JoinPath. It rejects anything
+// that is not an absolute http(s) URL with a host, and any query or fragment,
+// including an empty "?" or "#" delimiter that url.Parse would otherwise drop
+// silently. Callers must derive endpoint URLs from the returned fields (for
+// example with JoinPath), never by appending to the raw string.
+func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
+	raw := a.ExternalURL
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("as.external_url %q is not an absolute http(s) URL", raw)
+	}
+	if strings.ContainsAny(raw, "?#") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("as.external_url %q must not contain a query or fragment", raw)
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawPath = strings.TrimRight(u.RawPath, "/")
+	return u, nil
 }
 
 // ASLegacyConfig controls the legacy all-in-one HMAC token sunset.
@@ -2109,6 +2132,12 @@ func (c *Config) Validate() error {
 	// issuer, whichever role consumes it.
 	if c.AS.ExternalURL != "" && c.AS.Issuer == "" && c.JWT.Issuer == "" {
 		return fmt.Errorf("as.external_url requires an expected issuer to validate AS tokens; set as.issuer or jwt.issuer")
+	}
+
+	if c.AS.ExternalURL != "" {
+		if _, err := c.AS.ExternalBaseURL(); err != nil {
+			return err
+		}
 	}
 
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
