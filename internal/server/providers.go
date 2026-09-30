@@ -81,8 +81,10 @@ func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
 	return middleware.LegacyIssuanceGate(p.cfg.LegacyEnabled())
 }
 
-// LogLegacyTokenStatus logs once at startup whether legacy (HMAC) session
-// tokens are enabled.
+// LogLegacyTokenStatus logs whether legacy (HMAC) session tokens are enabled.
+// It is called exactly once per process from cmd/server/main.go, so that every
+// role combination (backend without AS, isolated wallet-provider, standalone
+// engine) logs it; providers must not call it themselves.
 func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
 	if cfg.LegacyEnabled() {
 		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
@@ -821,7 +823,6 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
-		LogLegacyTokenStatus(cfg, logger)
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
 			zap.Strings("audiences", cfg.AS.Audiences),
@@ -1283,7 +1284,6 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
-		LogLegacyTokenStatus(cfg, logger)
 	}
 
 	return &WalletProviderProvider{

@@ -117,3 +117,15 @@ func TestAuthProvider_UserRoutes_410BeforeOIDCGate(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "legacy_tokens_disabled", path)
 	}
 }
+
+// Providers must not log the legacy status themselves: cmd/server/main.go
+// logs it once per process for every role combination.
+func TestProviders_DoNotLogLegacyStatus(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.New(core))
+	require.NoError(t, err)
+	defer func() { _ = p.Close() }()
+	for _, e := range logs.All() {
+		assert.NotContains(t, e.Message, "Legacy HMAC session tokens")
+	}
+}

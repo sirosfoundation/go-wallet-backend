@@ -101,6 +101,10 @@ func main() {
 		zap.Strings("roles", roleStrings),
 	)
 
+	// Every process that loaded the backend config honours as.legacy.enabled,
+	// whatever its roles, so log the legacy status here exactly once.
+	logLegacyStatus(backendCfg, logger)
+
 	// Security configuration validation for production environments
 	// Checks for potentially dangerous configurations and logs warnings
 	isProduction := os.Getenv("ENVIRONMENT") == "production" ||
@@ -371,4 +375,14 @@ func loadRegistryConfig(path string) (*registry.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// logLegacyStatus logs the legacy (HMAC) session-token status once for a
+// process that loaded the backend config; a nil config (registry-only) logs
+// nothing.
+func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
+	if cfg == nil {
+		return
+	}
+	server.LogLegacyTokenStatus(cfg, logger)
 }
