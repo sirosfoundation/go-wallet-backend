@@ -43,7 +43,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 			existing.UserID = instance.UserID
 		}
 		if instance.DeviceInfo != nil {
-			existing.DeviceInfo = instance.DeviceInfo
+			// Copied, so a caller that keeps mutating its own struct cannot
+			// change the stored record.
+			d := *instance.DeviceInfo
+			existing.DeviceInfo = &d
 		}
 		// The passkey link is client-supplied; the first non-empty binding
 		// is kept so a later attestation cannot move the instance to another
@@ -81,6 +84,19 @@ func cloneInstance(in *domain.WalletInstance) *domain.WalletInstance {
 	if in.DeactivatedAt != nil {
 		t := *in.DeactivatedAt
 		cp.DeactivatedAt = &t
+	}
+	// DeviceInfo and SecurityProperties are pointers too, and the latter
+	// holds slices: copy them all, or a caller mutating a returned instance
+	// changes the stored record and races with metadata updates.
+	if in.DeviceInfo != nil {
+		d := *in.DeviceInfo
+		cp.DeviceInfo = &d
+	}
+	if in.SecurityProperties != nil {
+		sp := *in.SecurityProperties
+		sp.KeyStorage = append([]string(nil), in.SecurityProperties.KeyStorage...)
+		sp.UserAuthentication = append([]string(nil), in.SecurityProperties.UserAuthentication...)
+		cp.SecurityProperties = &sp
 	}
 	return &cp
 }

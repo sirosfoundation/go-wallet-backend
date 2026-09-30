@@ -530,3 +530,61 @@ func TestWalletInstanceStore_OwnerCheckedWrites(t *testing.T) {
 		t.Fatalf("unowned delete = %v, want ErrNotFound", err)
 	}
 }
+
+func TestWalletInstanceStore_ReturnedNestedDataIsACopy(t *testing.T) {
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	store := NewStore()
+	wis := store.WalletInstances()
+	in := &domain.WalletInstance{
+		ID: "inst-nested", TenantID: "acme", UserID: &uid,
+		DeviceInfo:         &domain.DeviceInfo{Platform: "ios", Model: "m1"},
+		SecurityProperties: &domain.SecurityProperties{KeyStorage: []string{"high"}, UserAuthentication: []string{"pin"}, Certification: "c"},
+	}
+	if err := wis.Upsert(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	// Mutating the caller's own input after the write must not reach the store.
+	in.DeviceInfo.Model = "input-mutated"
+	in.SecurityProperties.KeyStorage[0] = "input-mutated"
+
+	mutate := func(i *domain.WalletInstance) {
+		i.DeviceInfo.Platform = "hacked"
+		i.SecurityProperties.KeyStorage[0] = "hacked"
+		i.SecurityProperties.UserAuthentication[0] = "hacked"
+		i.SecurityProperties.Certification = "hacked"
+	}
+	byID, err := wis.GetByID(ctx, "inst-nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(byID)
+	byUser, err := wis.GetByUser(ctx, "acme", uid)
+	if err != nil || len(byUser) != 1 {
+		t.Fatalf("GetByUser: %v %d", err, len(byUser))
+	}
+	mutate(byUser[0])
+
+	got, err := wis.GetByID(ctx, "inst-nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeviceInfo.Platform != "ios" || got.DeviceInfo.Model != "m1" {
+		t.Errorf("stored DeviceInfo changed: %+v", got.DeviceInfo)
+	}
+	sp := got.SecurityProperties
+	if sp.KeyStorage[0] != "high" || sp.UserAuthentication[0] != "pin" || sp.Certification != "c" {
+		t.Errorf("stored SecurityProperties changed: %+v", sp)
+	}
+
+	// An update through Upsert copies the incoming DeviceInfo as well.
+	upd := &domain.DeviceInfo{Platform: "android"}
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "inst-nested", TenantID: "acme", DeviceInfo: upd}); err != nil {
+		t.Fatal(err)
+	}
+	upd.Platform = "later-mutation"
+	got, _ = wis.GetByID(ctx, "inst-nested")
+	if got.DeviceInfo.Platform != "android" {
+		t.Errorf("stored DeviceInfo aliases the caller's struct: %+v", got.DeviceInfo)
+	}
+}
