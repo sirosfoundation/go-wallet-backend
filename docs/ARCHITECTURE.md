@@ -169,9 +169,8 @@ WALLET_STORAGE_MONGODB_URI=mongodb://cluster:27017
 
 ### Authentication
 
-1. **Password-based**: bcrypt hashing
-2. **WebAuthn**: Hardware security keys
-3. **JWT**: Stateless session management
+1. **WebAuthn**: Hardware security keys
+2. **JWT**: Stateless session management
 
 ### Authorization
 
@@ -181,7 +180,6 @@ WALLET_STORAGE_MONGODB_URI=mongodb://cluster:27017
 
 ### Data Protection
 
-- Passwords: bcrypt hashed
 - Private data: Encrypted at rest [TODO]
 - Transport: HTTPS/TLS in production
 - Secrets: Environment variables, never committed

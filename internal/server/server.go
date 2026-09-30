@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -105,6 +106,14 @@ type ServerConfig struct {
 
 	// Active roles for status endpoint
 	Roles []string
+
+	// TrustedProxies is server.trusted_proxies: the peers whose
+	// X-Forwarded-For is believed for c.ClientIP(). Empty keeps gin's
+	// trust-everything default; ["none"] trusts no proxy.
+	TrustedProxies []string
+	// WarnUntrustedClientIP makes an unset TrustedProxies log a startup
+	// warning, because something (per-IP rate limiting) relies on ClientIP.
+	WarnUntrustedClientIP bool
 
 	// ServedByHeader is the value for the X-Served-By response header.
 	// Empty string disables the header.
@@ -371,9 +380,35 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// configureTrustedProxies applies server.trusted_proxies to router, which
+// decides whether c.ClientIP() believes X-Forwarded-For. Unset keeps gin's
+// trust-everything default, so it warns while per-IP rate limiting depends
+// on a client IP any direct caller can choose.
+func (m *Manager) configureTrustedProxies(router *gin.Engine) {
+	proxies := m.cfg.TrustedProxies
+	if len(proxies) == 0 {
+		if m.cfg.WarnUntrustedClientIP {
+			m.logger.Warn("server.trusted_proxies is not set: client IPs are taken from X-Forwarded-For sent by any peer, " +
+				"so per-IP rate limits (security.oidc_gate_rate_limit.per_ip) can be bypassed by a direct caller; " +
+				"set it to your load balancer's addresses, or [\"none\"] when there is no proxy")
+		}
+		return
+	}
+	if len(proxies) == 1 && strings.EqualFold(strings.TrimSpace(proxies[0]), "none") {
+		proxies = nil
+	}
+	if err := router.SetTrustedProxies(proxies); err != nil {
+		// Config validation rejects bad entries; reaching here means a
+		// programming error, and silently trusting everyone would defeat the
+		// setting, so refuse to serve.
+		panic(fmt.Sprintf("server.trusted_proxies: %v", err))
+	}
+}
+
 // buildRouter creates a new router with common middleware
 func (m *Manager) buildRouter() *gin.Engine {
 	router := gin.New()
+	m.configureTrustedProxies(router)
 	router.Use(gin.Recovery())
 	router.Use(middleware.BodySizeLimitMiddleware(middleware.MaxBodySize))
 	router.Use(middleware.Prometheus("/status", "/health", "/healthz", "/readyz"))

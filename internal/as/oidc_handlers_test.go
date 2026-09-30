@@ -12,15 +12,19 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -77,8 +81,38 @@ func (m *mockChallengeStore) Create(_ context.Context, c *domain.WebauthnChallen
 func (m *mockChallengeStore) GetByID(_ context.Context, id string) (*domain.WebauthnChallenge, error) {
 	c, ok := m.challenges[id]
 	if !ok {
-		return nil, fmt.Errorf("challenge not found")
+		return nil, storage.ErrNotFound
 	}
+	return c, nil
+}
+
+// ConsumeByID mirrors the real ChallengeStore implementations' contract: a
+// single atomic find-and-delete, returning storage.ErrNotFound (not just any
+// error) when the challenge doesn't exist or was already consumed — callers
+// like OIDCHandlers.Callback rely on this exact error being returned so a
+// storage-layer failure and "already used" aren't silently conflated.
+func (m *mockChallengeStore) ConsumeByID(_ context.Context, id string) (*domain.WebauthnChallenge, error) {
+	c, ok := m.challenges[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	delete(m.challenges, id)
+	return c, nil
+}
+func (m *mockChallengeStore) ConsumeByIDForUser(_ context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	c, ok := m.challenges[id]
+	if !ok || c.UserID != userID {
+		return nil, storage.ErrNotFound
+	}
+	delete(m.challenges, id)
+	return c, nil
+}
+func (m *mockChallengeStore) ConsumeByIDForTenant(_ context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	c, ok := m.challenges[id]
+	if !ok || (expectedTenantID != "" && c.TenantID != expectedTenantID) {
+		return nil, storage.ErrNotFound
+	}
+	delete(m.challenges, id)
 	return c, nil
 }
 func (m *mockChallengeStore) Delete(_ context.Context, id string) error {
@@ -115,7 +149,7 @@ func setupOIDCHandlers(store *mockStore) (*gin.Engine, *MemorySessionStore) {
 	}
 	logger := zap.NewNop()
 
-	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, logger)
+	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, nil, logger)
 
 	router := gin.New()
 	router.GET("/auth/oidc/login", h.Login)
@@ -462,7 +496,7 @@ func TestNewOIDCHandlers(t *testing.T) {
 	cfg := &config.ASConfig{ExternalURL: "https://example.com"}
 	logger := zap.NewNop()
 
-	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, logger)
+	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, nil, logger)
 	if h == nil {
 		t.Fatal("expected non-nil OIDCHandlers")
 	}
@@ -713,6 +747,76 @@ func TestOIDCCallback_StateCookieMismatch(t *testing.T) {
 			t.Errorf("expected 401, got %d: %s", w.Code, w.Body.String())
 		}
 	})
+}
+
+// TestOIDCCallback_MissingCookieDoesNotBurnChallenge covers a review finding
+// on PR #388: validateCallbackState used to consume the challenge
+// (ConsumeByID) BEFORE checking the browser-binding cookie. A request that
+// merely knows/guesses a valid `state` value (e.g. leaked via a referrer
+// header or server logs) but lacks the legitimate browser's cookie could
+// therefore burn the real challenge — the actual browser's later, genuine
+// callback would then be rejected with "invalid or expired state" even
+// though nothing about ITS request was ever compromised. The cookie must be
+// verified before the atomic consume, so a cookie-less request can never
+// affect the legitimate callback.
+func TestOIDCCallback_MissingCookieDoesNotBurnChallenge(t *testing.T) {
+	challengeStore := &mockChallengeStore{
+		challenges: map[string]*domain.WebauthnChallenge{
+			"shared-state": {
+				ID:        "shared-state",
+				TenantID:  "t1",
+				Challenge: "shared-state",
+				Action:    oidcChallengeAction,
+				ExpiresAt: time.Now().Add(time.Hour),
+			},
+		},
+	}
+	store := &mockStore{
+		tenants: &mockTenantStore{
+			tenants: map[domain.TenantID]*domain.Tenant{
+				"t1": {
+					ID:      "t1",
+					Enabled: true,
+					OIDCGate: domain.OIDCGateConfig{
+						Mode: domain.OIDCGateModeLogin,
+						LoginOP: &domain.OIDCProviderConfig{
+							Issuer:   "https://127.0.0.1:1/nonexistent",
+							ClientID: "test-client",
+						},
+					},
+				},
+			},
+		},
+		challenges: challengeStore,
+	}
+	router, _ := setupOIDCHandlers(store)
+
+	// Attacker (or just a stray retry/prefetch): knows the state value, but
+	// has no cookie at all.
+	attackerReq := httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=shared-state&code=authcode", nil)
+	attackerW := httptest.NewRecorder()
+	router.ServeHTTP(attackerW, attackerReq)
+	if attackerW.Code != http.StatusUnauthorized {
+		t.Fatalf("expected the cookie-less attempt to get 401, got %d: %s", attackerW.Code, attackerW.Body.String())
+	}
+
+	// Legitimate request: same state, WITH the correct cookie. Must still be
+	// able to consume the (still-present) challenge and proceed past state
+	// validation — it fails downstream at OIDC discovery (the issuer is
+	// deliberately unreachable), not at the state check, proving the
+	// challenge survived the earlier cookie-less attempt.
+	legitReq := withOIDCStateCookie(
+		httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=shared-state&code=authcode", nil),
+		"shared-state",
+	)
+	legitW := httptest.NewRecorder()
+	router.ServeHTTP(legitW, legitReq)
+	if legitW.Code == http.StatusUnauthorized && strings.Contains(legitW.Body.String(), "invalid or expired state") {
+		t.Fatalf("legitimate callback was rejected as if the challenge had already been consumed: %d: %s", legitW.Code, legitW.Body.String())
+	}
+	if legitW.Code != http.StatusBadGateway {
+		t.Fatalf("expected the legitimate callback to reach OIDC discovery (502), got %d: %s", legitW.Code, legitW.Body.String())
+	}
 }
 
 // TestOIDCCallback_DisabledTenant covers go-wallet-backend#385 (T-4): a
@@ -1099,4 +1203,213 @@ func TestOIDCCallback_TokenExchangeSuccess_IDTokenValidationFails(t *testing.T) 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+// TestOIDCCallback_ConcurrentSingleWinner is a regression test for a
+// challenge-reuse race flagged in review on PR #388: OIDCHandlers.Callback
+// consumed its one-time OIDC login-state challenge via a separate GetByID
+// then Delete, the exact same TOCTOU pattern fixed for the WebAuthn
+// challenge/invite paths in internal/service/webauthn.go (issue #379), but
+// this consumer shares the same ChallengeStore and was missed by that fix.
+//
+// It uses the real, mutex-protected internal/storage/memory.Store (not
+// mockChallengeStore, which is a plain unsynchronized map and unsafe to
+// race under -race) so what's actually under test is the handler correctly
+// calling ChallengeStore.ConsumeByID exactly once per callback, the same
+// atomic primitive the storage-layer concurrency tests exercise directly.
+//
+// The tenant's OIDC issuer is deliberately unreachable: the one caller that
+// wins the race proceeds past state validation and fails later at OIDC
+// discovery (502 "OIDC provider unavailable"), while every losing caller
+// must be rejected immediately at the now-already-consumed challenge (401
+// "invalid or expired state"). Before the fix, multiple concurrent callers
+// could reach the post-validation code path.
+//
+// This is a real timing-dependent race, not a deterministic one: with the
+// vulnerable GetByID+Delete pattern restored, this reliably fails (verified
+// locally, 10/10 runs, each with several winners instead of exactly one) at
+// attempts=64, though — like any race test — a false pass on a sufficiently
+// different/slower machine isn't impossible. attempts=16 was too low to
+// reliably reproduce it (observed both false-pass and genuine failures) —
+// bumped once that was noticed.
+func TestOIDCCallback_ConcurrentSingleWinner(t *testing.T) {
+	memStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("race-tenant"),
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			LoginOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://127.0.0.1:1/nonexistent",
+				ClientID: "test-client",
+			},
+		},
+	}
+	require.NoError(t, memStore.Tenants().Create(ctx, tenant))
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "race-state",
+		TenantID:  string(tenant.ID),
+		Challenge: "race-state",
+		Action:    oidcChallengeAction,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, memStore.Challenges().Create(ctx, challenge))
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.ASConfig{
+		ExternalURL:   "https://auth.example.com",
+		DefaultMaxTAC: "rwl",
+		SessionTTL:    24 * time.Hour,
+	}
+	h := NewOIDCHandlers(memStore, NewMemorySessionStore(), cfg, testStateSecret, nil, zap.NewNop())
+	router := gin.New()
+	router.GET("/auth/oidc/callback", h.Callback)
+
+	const attempts = 64
+	var wg sync.WaitGroup
+	codes := make([]int, attempts)
+	bodies := make([]string, attempts)
+	start := make(chan struct{})
+
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := withOIDCStateCookie(
+				httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=race-state&code=authcode", nil),
+				"race-state",
+			)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			codes[i] = w.Code
+			bodies[i] = w.Body.String()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var rejectedAsConsumed, wonTheRace int
+	for i := range codes {
+		if codes[i] == http.StatusUnauthorized && strings.Contains(bodies[i], "invalid or expired state") {
+			rejectedAsConsumed++
+		} else {
+			wonTheRace++
+			// The winner must have gotten past state validation: it fails
+			// downstream at OIDC discovery, not at the state check.
+			assert.Equal(t, http.StatusBadGateway, codes[i], "the caller that wins the challenge must fail at discovery, not elsewhere: body=%s", bodies[i])
+		}
+	}
+
+	assert.Equal(t, attempts-1, rejectedAsConsumed, "all but one concurrent callback must be rejected for an already-consumed state")
+	assert.Equal(t, 1, wonTheRace, "exactly one concurrent callback must win the challenge and proceed past state validation")
+}
+
+// spyChallengeStore wraps a real storage.ChallengeStore and records which
+// methods were invoked, so a test can assert exactly which primitive a
+// caller used. Unlike TestOIDCCallback_ConcurrentSingleWinner above (a real,
+// timing-dependent race that could in principle false-pass on a fast enough
+// machine or an unlucky scheduler), this gives a deterministic backstop:
+// it fails every time the vulnerable GetByID+Delete pattern is used, with
+// no dependence on goroutines actually overlapping.
+type spyChallengeStore struct {
+	storage.ChallengeStore
+	mu               sync.Mutex
+	getByIDCalls     int
+	consumeByIDCalls int
+	deleteCalls      int
+}
+
+func (s *spyChallengeStore) GetByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	s.getByIDCalls++
+	s.mu.Unlock()
+	return s.ChallengeStore.GetByID(ctx, id)
+}
+
+func (s *spyChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	s.consumeByIDCalls++
+	s.mu.Unlock()
+	return s.ChallengeStore.ConsumeByID(ctx, id)
+}
+
+func (s *spyChallengeStore) Delete(ctx context.Context, id string) error {
+	s.mu.Lock()
+	s.deleteCalls++
+	s.mu.Unlock()
+	return s.ChallengeStore.Delete(ctx, id)
+}
+
+// storeWithSpyChallenges wraps *memory.Store, swapping out just the
+// Challenges() accessor so every other collection still behaves like the
+// real in-memory store.
+type storeWithSpyChallenges struct {
+	*memory.Store
+	challenges storage.ChallengeStore
+}
+
+func (s *storeWithSpyChallenges) Challenges() storage.ChallengeStore { return s.challenges }
+
+// TestOIDCCallback_ConsumesChallengeAtomically is the deterministic
+// companion to TestOIDCCallback_ConcurrentSingleWinner: it asserts
+// OIDCHandlers.Callback consumes the one-time state challenge via exactly
+// one call to ConsumeByID, and never calls the vulnerable GetByID+Delete
+// pair, regardless of scheduling.
+func TestOIDCCallback_ConsumesChallengeAtomically(t *testing.T) {
+	memStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("spy-tenant"),
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			LoginOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://127.0.0.1:1/nonexistent",
+				ClientID: "test-client",
+			},
+		},
+	}
+	require.NoError(t, memStore.Tenants().Create(ctx, tenant))
+
+	spy := &spyChallengeStore{ChallengeStore: memStore.Challenges()}
+	wrapped := &storeWithSpyChallenges{Store: memStore, challenges: spy}
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "spy-state",
+		TenantID:  string(tenant.ID),
+		Challenge: "spy-state",
+		Action:    oidcChallengeAction,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, wrapped.Challenges().Create(ctx, challenge))
+
+	gin.SetMode(gin.TestMode)
+	cfg := &config.ASConfig{
+		ExternalURL:   "https://auth.example.com",
+		DefaultMaxTAC: "rwl",
+		SessionTTL:    24 * time.Hour,
+	}
+	h := NewOIDCHandlers(wrapped, NewMemorySessionStore(), cfg, testStateSecret, nil, zap.NewNop())
+	router := gin.New()
+	router.GET("/auth/oidc/callback", h.Callback)
+
+	req := withOIDCStateCookie(
+		httptest.NewRequest(http.MethodGet, "/auth/oidc/callback?state=spy-state&code=authcode", nil),
+		"spy-state",
+	)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadGateway, w.Code, "sanity: handler should get past state validation and fail at discovery: %s", w.Body.String())
+
+	spy.mu.Lock()
+	defer spy.mu.Unlock()
+	assert.Equal(t, 1, spy.consumeByIDCalls, "Callback must consume the state challenge via the atomic ConsumeByID")
+	assert.Equal(t, 0, spy.getByIDCalls, "Callback must not use GetByID for one-time state consumption — that's the non-atomic pattern issue #379 fixed")
+	assert.Equal(t, 0, spy.deleteCalls, "Callback must not separately Delete the challenge — ConsumeByID already removed it")
 }
