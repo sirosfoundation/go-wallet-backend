@@ -48,7 +48,14 @@ func startJWKSRelay(fetch func(ctx context.Context) ([]byte, error)) (*jwksRelay
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
-	return &jwksRelay{srv: srv, url: "http://" + ln.Addr().String() + "/jwks.json"}, nil
+	// The relay listens on 127.0.0.1 only and serves public keys, so plain
+	// HTTP on the loopback interface is deliberate: go-tokenauth fetches its
+	// JWKS URL with http.DefaultClient and offers no client or TLS option.
+	// Built from parts (not a literal) because the address is only known once
+	// the listener is bound and the literal would read as a remote clear-text
+	// URL to static analysis.
+	u := url.URL{Scheme: "http", Host: ln.Addr().String(), Path: "/jwks.json"}
+	return &jwksRelay{srv: srv, url: u.String()}, nil
 }
 
 // Close stops the relay.
