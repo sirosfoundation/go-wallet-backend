@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"go.uber.org/zap"
 )
@@ -110,7 +111,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
-	userID, tenantID, _, tokenID, err := a.manager.validateTokenID(token)
+	userID, tenantID, tac, tokenID, err := a.manager.validateTokenID(token)
 	if err != nil {
 		a.logger.Warn("WMP SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -126,6 +127,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	// Verify the session belongs to the authenticated user.
 	if !a.verifySessionOwnership(sessionID, wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID}) {
 		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	// Same user and tenant is not enough: the stream carries the flow
+	// notifications of a session that may have been created with broader
+	// privileges than this token holds. The presented token must grant every
+	// capability the session was created with.
+	if !a.tokenCoversSession(sessionID, tac) {
+		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
+			zap.String("request_tac", string(tac)))
+		http.Error(w, "token lacks the session's capabilities", http.StatusForbidden)
 		return
 	}
 
@@ -191,6 +203,20 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		case <-wake:
 		}
 	}
+}
+
+// tokenCoversSession reports whether a token with the given TAC may observe the
+// session: every capability the session was created with must be granted by
+// the token. A session created without a TAC (legacy auth) has nothing to
+// cover. A token with no TAC cannot read a session that has one.
+func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC) bool {
+	a.mu.RLock()
+	ws, ok := a.peers[sessionID]
+	a.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return ws.session.TAC.IsSubsetOf(tac)
 }
 
 // HandleWMPConfiguration serves the /.well-known/wmp-configuration discovery endpoint.

@@ -1,6 +1,10 @@
 package engine
 
 import (
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
+	"net/http"
+	"net/http/httptest"
+
 	"context"
 	"encoding/json"
 	"strings"
@@ -160,4 +164,52 @@ func TestWMP_CredentialNotification_EnforcesIssuanceTAC(t *testing.T) {
 			t.Fatal("expected a rejected ack citing insufficient permissions")
 		}
 	}
+}
+
+// The SSE stream of a session created with a broad token must not be
+// readable with a same-user, same-tenant token that holds fewer capabilities.
+func TestWMP_SSE_RequiresTokenCoveringSessionCapabilities(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+	tokenWith := func(tac string) string {
+		return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "u"},
+			TenantID: "t",
+			TAC:      claims.TAC(tac),
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+
+	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) {
+		p.Auth.Token = tokenWith("ir")
+	})
+	a.mu.RLock()
+	sessTAC := a.peers[sid].session.TAC
+	a.mu.RUnlock()
+	require.Equal(t, claims.TAC("ir"), sessTAC)
+
+	open := func(tok string) *httptest.ResponseRecorder {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+sid, nil).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() { a.HandleWMPEvents(w, req); close(done) }()
+		// A denied request returns at once; an allowed one streams until
+		// its context is cancelled.
+		select {
+		case <-done:
+		case <-time.After(200 * time.Millisecond):
+		}
+		cancel()
+		<-done
+		return w
+	}
+
+	assert.Equal(t, http.StatusForbidden, open(tokenWith("r")).Code, "reduced TAC must be denied")
+	assert.Equal(t, http.StatusForbidden, open(tokenWith("")).Code, "no TAC must be denied")
+	assert.Equal(t, http.StatusOK, open(tokenWith("ir")).Code, "the creating capabilities are allowed")
+	assert.Equal(t, http.StatusOK, open(tokenWith("irw")).Code, "a superset is allowed")
 }
