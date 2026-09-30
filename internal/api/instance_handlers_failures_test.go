@@ -58,11 +58,11 @@ func (s *brokenInstances) GetByUser(ctx context.Context, t domain.TenantID, u do
 	return s.WalletInstanceStore.GetByUser(ctx, t, u)
 }
 
-func (s *brokenInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
+func (s *brokenInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
 	if s.b.failUpdates {
 		return errStoreDown
 	}
-	return s.WalletInstanceStore.UpdateStatus(ctx, id, st, reason)
+	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
 func lifecycleTestConfig() *config.Config {

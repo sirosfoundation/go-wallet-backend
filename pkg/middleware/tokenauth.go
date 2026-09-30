@@ -90,6 +90,9 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, users tok
 		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
+		// Carried to the writes further down, which judge the token against
+		// the user record they load (tokengate.RefuseLoaded).
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), tokengate.IssuedAt(rawToken)))
 
 		tenant, tenantID, ok := resolveTokenTenant(c, tenants, result, logger)
 		if !ok {

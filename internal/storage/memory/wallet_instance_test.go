@@ -98,7 +98,7 @@ func TestWalletInstanceStore_Upsert_NeverReactivatesDeactivated(t *testing.T) {
 	if err := wis.Upsert(ctx, inst); err != nil {
 		t.Fatalf("Upsert first: %v", err)
 	}
-	if err := wis.UpdateStatus(ctx, "inst-revoked", domain.InstanceStatusRevoked, "compromised"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-revoked", "acme", domain.InstanceStatusRevoked, "compromised"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
 	}
 
@@ -216,7 +216,7 @@ func TestWalletInstanceStore_UpdateStatus_Revoke(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	if err := wis.UpdateStatus(ctx, "inst-rev", domain.InstanceStatusRevoked, "policy violation"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-rev", "acme", domain.InstanceStatusRevoked, "policy violation"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
 	}
 
@@ -255,16 +255,16 @@ func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 
 	// Reactivating an active instance is refused before it is even a
 	// transition question.
-	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if err := wis.UpdateStatus(ctx, "inst-term", "acme", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("UpdateStatus(active) on an active instance = %v, want ErrInvalidStatusTransition", err)
 	}
 
-	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusRevoked, "stolen"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-term", "acme", domain.InstanceStatusRevoked, "stolen"); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
 
 	// And there is no way back out of revoked.
-	if err := wis.UpdateStatus(ctx, "inst-term", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if err := wis.UpdateStatus(ctx, "inst-term", "acme", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("UpdateStatus(active) on a revoked instance = %v, want ErrInvalidStatusTransition", err)
 	}
 
@@ -287,7 +287,7 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	if err := store.WalletInstances().Upsert(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", domain.InstanceStatusRevoked, "x"); err != nil {
+	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", "acme", domain.InstanceStatusRevoked, "x"); err != nil {
 		t.Fatal(err)
 	}
 	// A later attestation that now names the passkey records the link but
@@ -376,10 +376,10 @@ func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	if err := wis.UpdateStatus(ctx, "inst-legacy", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if err := wis.UpdateStatus(ctx, "inst-legacy", "acme", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("UpdateStatus(active) = %v, want ErrInvalidStatusTransition", err)
 	}
-	if err := wis.UpdateStatus(ctx, "inst-legacy", domain.InstanceStatusRevoked, "cleanup"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-legacy", "acme", domain.InstanceStatusRevoked, "cleanup"); err != nil {
 		t.Fatalf("revoke a legacy suspended instance: %v", err)
 	}
 	got, err := wis.GetByID(ctx, "inst-legacy")
@@ -433,7 +433,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.UpdateStatus(ctx, "inst-tomb", domain.InstanceStatusRevoked, "stolen"); err != nil {
+	if err := wis.UpdateStatus(ctx, "inst-tomb", "acme", domain.InstanceStatusRevoked, "stolen"); err != nil {
 		t.Fatal(err)
 	}
 	if err := wis.DeleteIfRemovable(ctx, "inst-tomb", "acme"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
@@ -461,5 +461,23 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}
 	if err := wis.DeleteIfRemovable(ctx, "inst-other", "acme"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("another tenant's record must not be reachable, got %v", err)
+	}
+}
+
+// The tenant is part of the write, not only of the caller's earlier read: the
+// id is a global key, so a revocation issued for one tenant must not land on a
+// record another tenant holds under the same id.
+func TestWalletInstanceStore_UpdateStatus_WrongTenantIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	wis := NewStore().WalletInstances()
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "inst-tenant", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if err := wis.UpdateStatus(ctx, "inst-tenant", "other", domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("UpdateStatus in the wrong tenant = %v, want ErrNotFound", err)
+	}
+	got, err := wis.GetByID(ctx, "inst-tenant")
+	if err != nil || got.Status != domain.InstanceStatusActive {
+		t.Fatalf("record was touched by a revocation for another tenant: %v %v", got, err)
 	}
 }

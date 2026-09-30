@@ -427,7 +427,7 @@ func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 	seedInstance(t, h, "owned-revoked", "acme", &userID)
 	seedInstance(t, h, "stray-revoked", "acme", nil)
 	for _, id := range []string{"owned-revoked", "stray-revoked"} {
-		if err := store.WalletInstances().UpdateStatus(context.Background(), id, domain.InstanceStatusRevoked, "test"); err != nil {
+		if err := store.WalletInstances().UpdateStatus(context.Background(), id, "acme", domain.InstanceStatusRevoked, "test"); err != nil {
 			t.Fatal(err)
 		}
 	}

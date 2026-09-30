@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -857,4 +860,25 @@ func TestHandlers_RefreshToken_Disabled(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
 	}
+}
+
+// A request admitted before a revocation, whose write then meets a record the
+// revocation already cut off, is answered 401 rather than restoring erased data
+// or surfacing as a server error.
+func TestHandlers_PrivateDataWrite_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/private-data", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.UpdatePrivateData(c)
+	})
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	body, _ := json.Marshal(map[string]interface{}{"privateData": taggedbinary.TaggedBytes([]byte(`{"x":1}`))})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/private-data", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 }

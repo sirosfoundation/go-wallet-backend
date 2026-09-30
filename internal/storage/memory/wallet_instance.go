@@ -118,12 +118,12 @@ func (s *WalletInstanceStore) GetAllByUser(_ context.Context, userID domain.User
 	return result, nil
 }
 
-func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, status domain.InstanceStatus, reason string) error {
+func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	instance, ok := s.data[id]
-	if !ok {
+	if !ok || instance.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
 

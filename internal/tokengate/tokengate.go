@@ -53,9 +53,15 @@ func New(users UserLookup) *Gate {
 // action and logging out everywhere is meant to include the session that
 // asked for it. An empty userID (anonymous token) always passes, and so does
 // a user the store does not know: the gate only enforces lifecycle cut-offs,
-// it is not an existence check (handlers do that where it matters). A token
-// without a readable iat is refused once a cut-off exists, since it cannot
-// prove it postdates the cut-off.
+// it is not an existence check. That is deliberate and cannot be tightened
+// here: the AS also issues tokens whose subject is an external identity that
+// has no wallet user record (an OIDC-authenticated admin, whose UserID is the
+// IdP's sub), and refusing "no record" would lock all of them out. The price
+// is that deleting a wallet user takes the cut-off record with it; tokens
+// issued before an account deletion are refused by the token blacklist
+// (UserService.SetTokenBlacklist, #383) instead. A token without a readable
+// iat is refused once a cut-off exists, since it cannot prove it postdates
+// the cut-off.
 func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) error {
 	if g == nil || userID == "" {
 		return nil
@@ -86,6 +92,38 @@ func IssuedBeforeCutoff(issuedAt, cutoff time.Time) bool {
 		return false
 	}
 	return issuedAt.Unix() <= cutoff.Unix()
+}
+
+type issuedAtKey struct{}
+
+// WithIssuedAt records, on the request context, the iat of the bearer token
+// that authenticated the request. The middlewares call it once the token has
+// passed Gate.Check, so that a write further down can judge the same token
+// against the record it loads (see RefuseLoaded).
+func WithIssuedAt(ctx context.Context, issuedAt time.Time) context.Context {
+	return context.WithValue(ctx, issuedAtKey{}, issuedAt)
+}
+
+// RefuseLoaded is the write-side half of the gate. Gate.Check runs once, before
+// the handler, so a request that passed it with a token issued just before a
+// revocation can still reach a write after the revocation has erased the
+// wallet: it then loads the fresh user record - which carries the advanced
+// cut-off and write fence, so the store accepts it - and puts erased data
+// back. A write that loads a user therefore calls RefuseLoaded with the
+// cut-off of the record it loaded; the store's fence covers the rest, since a
+// cut-off landing after the load makes the write itself fail.
+//
+// A context without a token iat (an internal caller, a login flow that has no
+// bearer token yet) is not judged.
+func RefuseLoaded(ctx context.Context, cutoff time.Time) error {
+	issuedAt, ok := ctx.Value(issuedAtKey{}).(time.Time)
+	if !ok {
+		return nil
+	}
+	if IssuedBeforeCutoff(issuedAt, cutoff) {
+		return ErrRevoked
+	}
+	return nil
 }
 
 // payloadOf decodes the payload segment of a compact JWS.

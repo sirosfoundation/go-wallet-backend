@@ -15,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
@@ -838,6 +839,9 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
@@ -1163,6 +1167,9 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
 		case errors.Is(err, service.ErrChallengeNotFound):
@@ -1225,6 +1232,9 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -1275,6 +1285,9 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 		credentialID,
 		req.Nickname,
 	); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -1420,4 +1433,15 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 func lifecycleRefusalBody(err error) gin.H {
 	d := service.LifecycleRefusalDetails(err)
 	return gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message}
+}
+
+// abortIfTokenRevoked answers 401 when a write refused the request's bearer
+// token because the user's authorization was cut off after the middleware
+// admitted it (tokengate.RefuseLoaded). It reports whether it answered.
+func abortIfTokenRevoked(c *gin.Context, err error) bool {
+	if !errors.Is(err, tokengate.ErrRevoked) {
+		return false
+	}
+	c.JSON(401, gin.H{"error": "Token has been revoked"})
+	return true
 }

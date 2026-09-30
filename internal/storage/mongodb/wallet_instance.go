@@ -175,13 +175,13 @@ func (s *WalletInstanceStore) GetAllByUser(ctx context.Context, userID domain.Us
 	return instances, nil
 }
 
-func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
+func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
 	now := time.Now().UTC()
 
 	// Use a conditional filter to enforce the state transition atomically.
 	// There is one legal transition, active → revoked, and revocation is
 	// terminal.
-	filter := bson.M{"_id": id}
+	filter := bson.M{"_id": id, "tenant_id": tenantID}
 	switch status {
 	case domain.InstanceStatusRevoked:
 		// Anything not already revoked may be revoked, which is what makes a
@@ -214,7 +214,7 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 	}
 	if res.MatchedCount == 0 {
 		// Distinguish "not found" from "invalid transition" by checking existence.
-		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id})
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
 		if cerr != nil || count == 0 {
 			return storage.ErrNotFound
 		}

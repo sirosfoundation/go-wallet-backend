@@ -909,7 +909,7 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	}
 	const reason = "wallet deactivated during attestation"
 	alreadyRevoked := false
-	if err := s.instances.UpdateStatus(ctx, newID, domain.InstanceStatusRevoked, reason); err != nil {
+	if err := s.instances.UpdateStatus(ctx, newID, tenantID, domain.InstanceStatusRevoked, reason); err != nil {
 		// The only transition to revoked a store refuses is from revoked
 		// itself, and both stores report it as an invalid transition: a
 		// concurrent revoke-all already took the new record with it, which

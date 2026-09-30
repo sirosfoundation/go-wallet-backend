@@ -59,3 +59,15 @@ func TestIssuedAt(t *testing.T) {
 	assert.True(t, IssuedAtFromClaims(jwt.MapClaims{"iat": iat.Unix()}).Equal(iat), "int64")
 	assert.True(t, IssuedAtFromClaims(jwt.MapClaims{}).IsZero())
 }
+
+func TestRefuseLoaded(t *testing.T) {
+	cutoff := time.Now().Truncate(time.Second)
+	ctx := context.Background()
+
+	assert.NoError(t, RefuseLoaded(ctx, cutoff), "no token iat on the context: not judged")
+	assert.NoError(t, RefuseLoaded(WithIssuedAt(ctx, cutoff.Add(-time.Hour)), time.Time{}), "no cut-off refuses nothing")
+	assert.ErrorIs(t, RefuseLoaded(WithIssuedAt(ctx, cutoff.Add(-time.Second)), cutoff), ErrRevoked)
+	assert.ErrorIs(t, RefuseLoaded(WithIssuedAt(ctx, cutoff), cutoff), ErrRevoked, "same second as the cut-off")
+	assert.ErrorIs(t, RefuseLoaded(WithIssuedAt(ctx, time.Time{}), cutoff), ErrRevoked, "an unreadable iat cannot prove it postdates the cut-off")
+	assert.NoError(t, RefuseLoaded(WithIssuedAt(ctx, cutoff.Add(time.Second)), cutoff))
+}

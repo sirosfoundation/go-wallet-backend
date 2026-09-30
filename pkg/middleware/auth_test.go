@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -534,5 +536,36 @@ func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	}
 	if got := call(mint(time.Now())); got != http.StatusOK {
 		t.Fatalf("token issued after the cut-off must pass, got %d", got)
+	}
+}
+
+// The middleware hands the admitted token's iat down to the writes behind it,
+// which judge it against the record they load (tokengate.RefuseLoaded): a
+// cut-off after that iat refuses, one before it does not.
+func TestAuthMiddleware_CarriesTokenIssuedAtToTheHandler(t *testing.T) {
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	store := createTestStore()
+	router := gin.New()
+	router.Use(AuthMiddleware(cfg, store, zap.NewNop()))
+	var later, earlier error
+	router.GET("/test", func(c *gin.Context) {
+		later = tokengate.RefuseLoaded(c.Request.Context(), time.Now().Add(time.Hour))
+		earlier = tokengate.RefuseLoaded(c.Request.Context(), time.Now().Add(-time.Hour))
+		c.Status(http.StatusOK)
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+createTokenWithJTI(secret, "user-123", "jti-iat", time.Now()))
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !errors.Is(later, tokengate.ErrRevoked) {
+		t.Errorf("a cut-off after the token was issued must refuse it, got %v", later)
+	}
+	if earlier != nil {
+		t.Errorf("a cut-off before the token was issued must not refuse it, got %v", earlier)
 	}
 }

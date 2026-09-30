@@ -22,7 +22,7 @@ func seedLifecycleInstance(t *testing.T, s *WebAuthnService, id string, userID d
 		ID: id, TenantID: domain.DefaultTenantID, UserID: &userID, CredentialID: credentialID, Status: domain.InstanceStatusActive,
 	}))
 	if status != domain.InstanceStatusActive {
-		require.NoError(t, s.store.WalletInstances().UpdateStatus(ctx, id, status, "test"))
+		require.NoError(t, s.store.WalletInstances().UpdateStatus(ctx, id, domain.DefaultTenantID, status, "test"))
 	}
 }
 
@@ -146,7 +146,7 @@ func TestMintTokens(t *testing.T) {
 	// A cut-off set in the future (as a revocation landing mid-request would
 	// be, relative to the minted iat) with the passkey's instance revoked:
 	// the precise lifecycle refusal.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second)))
 	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
@@ -178,7 +178,7 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 
 	// No cut-off at all: the minted token is unimpeachable by iat alone, so
 	// only the recheck can see the revocation that landed meanwhile.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "racing"))
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "racing"))
 	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
 		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
 	}, ErrVerificationFailed)

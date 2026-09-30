@@ -2054,6 +2054,9 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
 
 	// Atomically consume the challenge, constrained to this authenticated
 	// caller's own userID as part of the SAME atomic find-and-delete (not a

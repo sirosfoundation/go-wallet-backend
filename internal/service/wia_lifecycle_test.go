@@ -18,7 +18,7 @@ import (
 
 func seedWIAInstance(t *testing.T, instances interface {
 	Upsert(context.Context, *domain.WalletInstance) error
-	UpdateStatus(context.Context, string, domain.InstanceStatus, string) error
+	UpdateStatus(context.Context, string, domain.TenantID, domain.InstanceStatus, string) error
 }, id string, userID domain.UserID, status domain.InstanceStatus) {
 	t.Helper()
 	ctx := context.Background()
@@ -28,7 +28,7 @@ func seedWIAInstance(t *testing.T, instances interface {
 		t.Fatalf("Upsert %s: %v", id, err)
 	}
 	if status != domain.InstanceStatusActive {
-		if err := instances.UpdateStatus(ctx, id, status, "seed"); err != nil {
+		if err := instances.UpdateStatus(ctx, id, domain.DefaultTenantID, status, "seed"); err != nil {
 			t.Fatalf("UpdateStatus %s: %v", id, err)
 		}
 	}
@@ -145,7 +145,7 @@ func (r *racingRevokeInstances) Upsert(ctx context.Context, inst *domain.WalletI
 	}
 	for _, o := range others {
 		if o.ID != inst.ID && o.Status != domain.InstanceStatusRevoked {
-			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.DefaultTenantID, domain.InstanceStatusRevoked, "raced"); err != nil {
 				return err
 			}
 		}
@@ -208,7 +208,7 @@ func (r *revokeAllRacingInstances) Upsert(ctx context.Context, inst *domain.Wall
 	}
 	for _, o := range all {
 		if o.Status != domain.InstanceStatusRevoked {
-			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "revoke-all raced"); err != nil {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.DefaultTenantID, domain.InstanceStatusRevoked, "revoke-all raced"); err != nil {
 				return err
 			}
 		}
@@ -216,7 +216,7 @@ func (r *revokeAllRacingInstances) Upsert(ctx context.Context, inst *domain.Wall
 	return nil
 }
 
-func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
+func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
 	cur, err := r.WalletInstanceStore.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -224,7 +224,7 @@ func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, 
 	if cur.Status == domain.InstanceStatusRevoked {
 		return domain.ErrInvalidStatusTransition
 	}
-	return r.WalletInstanceStore.UpdateStatus(ctx, id, status, reason)
+	return r.WalletInstanceStore.UpdateStatus(ctx, id, domain.DefaultTenantID, status, reason)
 }
 
 // A revoke-all that wins the race and revokes the just-inserted instance
@@ -368,7 +368,7 @@ type revokeOnReattestInstances struct{ storage.WalletInstanceStore }
 
 func (r revokeOnReattestInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
 	if _, err := r.WalletInstanceStore.GetByID(ctx, inst.ID); err == nil {
-		if err := r.WalletInstanceStore.UpdateStatus(ctx, inst.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+		if err := r.WalletInstanceStore.UpdateStatus(ctx, inst.ID, domain.DefaultTenantID, domain.InstanceStatusRevoked, "raced"); err != nil {
 			return err
 		}
 	}
@@ -604,7 +604,7 @@ func (r *racingRevokeOnBind) Upsert(ctx context.Context, inst *domain.WalletInst
 	}
 	for _, o := range others {
 		if o.ID != inst.ID && o.Status != domain.InstanceStatusRevoked {
-			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.InstanceStatusRevoked, "raced"); err != nil {
+			if err := r.WalletInstanceStore.UpdateStatus(ctx, o.ID, domain.DefaultTenantID, domain.InstanceStatusRevoked, "raced"); err != nil {
 				return err
 			}
 		}

@@ -27,7 +27,7 @@ func TestWalletInstanceStore_UpdateStatus_RejectsUnknownStatus(t *testing.T) {
 	// silently written with no transition constraint. Without this check the
 	// filter stays {_id: id} only, since the switch's default case previously
 	// left it unconstrained.
-	err := wis.UpdateStatus(ctx, "inst-unknown-status", domain.InstanceStatus("bogus"), "")
+	err := wis.UpdateStatus(ctx, "inst-unknown-status", "acme", domain.InstanceStatus("bogus"), "")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 
@@ -50,11 +50,11 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 
 	// "active" is refused outright: an instance is active from insert, so
 	// writing it could only ever mean reactivation.
-	err := wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
+	err := wis.UpdateStatus(ctx, "inst-valid-transitions", "acme", domain.InstanceStatusActive, "")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 
-	require.NoError(t, wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusRevoked, "compromised"))
+	require.NoError(t, wis.UpdateStatus(ctx, "inst-valid-transitions", "acme", domain.InstanceStatusRevoked, "compromised"))
 	got, err := wis.GetByID(ctx, "inst-valid-transitions")
 	require.NoError(t, err)
 	require.Equal(t, domain.InstanceStatusRevoked, got.Status)
@@ -62,7 +62,7 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	require.Equal(t, "compromised", got.DeactivationReason)
 
 	// Revoked is terminal: attempting to reactivate must fail.
-	err = wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
+	err = wis.UpdateStatus(ctx, "inst-valid-transitions", "acme", domain.InstanceStatusActive, "")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 }
@@ -83,14 +83,14 @@ func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.
 		Status:   domain.InstanceStatusLegacySuspended,
 	}))
 
-	require.NoError(t, wis.UpdateStatus(ctx, "inst-legacy-suspended", domain.InstanceStatusRevoked, "cleanup"))
+	require.NoError(t, wis.UpdateStatus(ctx, "inst-legacy-suspended", "acme", domain.InstanceStatusRevoked, "cleanup"))
 	got, err := wis.GetByID(ctx, "inst-legacy-suspended")
 	require.NoError(t, err)
 	require.Equal(t, domain.InstanceStatusRevoked, got.Status)
 	require.NotNil(t, got.DeactivatedAt)
 
 	// And it is terminal from there like any other revocation.
-	err = wis.UpdateStatus(ctx, "inst-legacy-suspended", domain.InstanceStatusRevoked, "again")
+	err = wis.UpdateStatus(ctx, "inst-legacy-suspended", "acme", domain.InstanceStatusRevoked, "again")
 	require.Error(t, err, "revoking an already-revoked instance matches nothing")
 }
 
@@ -110,7 +110,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "del-tomb", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
 	}))
-	require.NoError(t, wis.UpdateStatus(ctx, "del-tomb", domain.InstanceStatusRevoked, "stolen"))
+	require.NoError(t, wis.UpdateStatus(ctx, "del-tomb", "acme", domain.InstanceStatusRevoked, "stolen"))
 	err := wis.DeleteIfRemovable(ctx, "del-tomb", "acme")
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition), "got %v", err)
 	_, err = wis.GetByID(ctx, "del-tomb")

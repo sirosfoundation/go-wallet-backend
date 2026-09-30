@@ -73,11 +73,11 @@ func (s *failInstances) GetByUser(ctx context.Context, t domain.TenantID, u doma
 	return s.WalletInstanceStore.GetByUser(ctx, t, u)
 }
 
-func (s *failInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
+func (s *failInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
 	if err := s.f.err("instances.UpdateStatus"); err != nil {
 		return err
 	}
-	return s.WalletInstanceStore.UpdateStatus(ctx, id, st, reason)
+	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
 type failUsers struct {
@@ -476,8 +476,8 @@ type attestingInstances struct {
 	fired  bool
 }
 
-func (a *attestingInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
-	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, st, reason); err != nil {
+func (a *attestingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason); err != nil {
 		return err
 	}
 	if !a.fired && st == domain.InstanceStatusRevoked {
@@ -537,7 +537,7 @@ func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 		ID: id + "-b", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
 	}))
 	// Persisted directly, as another process would have.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, id, domain.InstanceStatusRevoked, "elsewhere"))
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, id, domain.DefaultTenantID, domain.InstanceStatusRevoked, "elsewhere"))
 	cutoff, err := store.Users().GetAuthCutoff(ctx, uid)
 	require.NoError(t, err)
 	require.True(t, cutoff.IsZero(), "no cut-off was recorded by that path")
@@ -566,8 +566,8 @@ type alwaysAttestingInstances struct {
 	n      int
 }
 
-func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
-	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, st, reason); err != nil {
+func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason); err != nil {
 		return err
 	}
 	if st != domain.InstanceStatusRevoked {

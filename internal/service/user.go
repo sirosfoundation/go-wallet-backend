@@ -13,6 +13,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -229,10 +230,23 @@ func (s *UserService) GetPrivateData(ctx context.Context, userID domain.UserID) 
 	return user.PrivateData, user.PrivateDataETag, nil
 }
 
+// refuseIfCutOff judges the request's bearer token against the user record a
+// write has just loaded (SID-AUTH-06). The middleware checked the token once,
+// before the handler; a revocation that landed in between has erased the
+// wallet and advanced the cut-off and the write fence, and the fresh record
+// this write now holds passes the store's fence. Without this, an in-flight
+// request would put private data back after the erasure.
+func refuseIfCutOff(ctx context.Context, user *domain.User) error {
+	return tokengate.RefuseLoaded(ctx, user.AuthInvalidBefore)
+}
+
 // UpdatePrivateData updates user's private data with optimistic locking
 func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserID, data []byte, ifMatch string) (string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		return "", err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
 		return "", err
 	}
 
@@ -570,6 +584,9 @@ func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domai
 	if err != nil {
 		return "", err
 	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return "", err
+	}
 
 	// Check that there's more than one credential
 	if len(user.WebauthnCredentials) <= 1 {
@@ -614,6 +631,9 @@ func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domai
 func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, nickname string) error {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		return err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
 		return err
 	}
 

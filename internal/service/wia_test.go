@@ -565,7 +565,7 @@ func TestWIAService_GenerateWIA_RefusesRevokedInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jwk.Thumbprint: %v", err)
 	}
-	if err := instances.UpdateStatus(ctx, jkt, domain.InstanceStatusRevoked, "compromised device"); err != nil {
+	if err := instances.UpdateStatus(ctx, jkt, domain.DefaultTenantID, domain.InstanceStatusRevoked, "compromised device"); err != nil {
 		t.Fatalf("UpdateStatus: %v", err)
 	}
 

@@ -36,14 +36,14 @@ type failAfterInstances struct {
 	allowed string
 }
 
-func (f *failAfterInstances) UpdateStatus(ctx context.Context, id string, st domain.InstanceStatus, reason string) error {
+func (f *failAfterInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
 	if f.allowed == "" {
 		f.allowed = id
 	}
 	if id != f.allowed {
 		return errors.New("db down")
 	}
-	return f.WalletInstanceStore.UpdateStatus(ctx, id, st, reason)
+	return f.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
 // storeWithInstances swaps the wallet-instance store of a storage.Store.
@@ -76,7 +76,7 @@ func lifecycleFixture(t *testing.T, statuses ...domain.InstanceStatus) (*WalletL
 			ID: "inst-" + string(rune('a'+i)), TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
 		}))
 		if st != domain.InstanceStatusActive {
-			require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-"+string(rune('a'+i)), st, "seed"))
+			require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-"+string(rune('a'+i)), domain.DefaultTenantID, st, "seed"))
 		}
 	}
 	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
@@ -474,7 +474,7 @@ func TestWalletLifecycle_RetryRepairsACutOffOlderThanTheRevocation(t *testing.T)
 	stale, err := store.Users().GetAuthCutoff(ctx, userID)
 	require.NoError(t, err)
 	time.Sleep(1100 * time.Millisecond)
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-a", domain.InstanceStatusRevoked, "stolen"))
+	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-a", domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
 	revoked, err := store.WalletInstances().GetByID(ctx, "inst-a")
 	require.NoError(t, err)
 	require.True(t, stale.Before(*revoked.DeactivatedAt), "fixture must leave the cut-off behind the revocation")
