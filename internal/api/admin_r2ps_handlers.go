@@ -80,7 +80,7 @@ func (h *AdminHandlers) R2PSListStatuses(c *gin.Context) {
 func (h *AdminHandlers) R2PSGetStatus(c *gin.Context) {
 	category := c.Param("category")
 	idx, err := strconv.Atoi(c.Param("idx"))
-	if err != nil {
+	if err != nil || idx < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid index"})
 		return
 	}
@@ -103,17 +103,17 @@ func (h *AdminHandlers) R2PSGetStatus(c *gin.Context) {
 func (h *AdminHandlers) R2PSSetStatus(c *gin.Context) {
 	category := c.Param("category")
 	idx, err := strconv.Atoi(c.Param("idx"))
-	if err != nil {
+	if err != nil || idx < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid index"})
 		return
 	}
 
 	var req struct {
-		Status *int   `json:"status" binding:"required"` // 0=valid, 1=revoked, 2=suspended
+		Status *int   `json:"status"` // required; 0=valid, 1=revoked, 2=suspended
 		Reason string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be 0 (valid), 1 (revoked), or 2 (suspended)"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request body"})
 		return
 	}
 	if req.Status == nil || *req.Status < 0 || *req.Status > 2 {

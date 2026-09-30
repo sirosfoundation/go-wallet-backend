@@ -787,7 +787,11 @@ func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
-	adminHandlers.SetR2PSClient(newR2PSClient(p.cfg))
+	if r2psClient, err := newR2PSClient(p.cfg); err != nil {
+		p.logger.Error("r2ps_admin misconfigured; /admin/r2ps routes disabled", zap.Error(err))
+	} else {
+		adminHandlers.SetR2PSClient(r2psClient)
+	}
 	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 
@@ -868,7 +872,11 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
-	adminHandlers.SetR2PSClient(newR2PSClient(p.cfg))
+	if r2psClient, err := newR2PSClient(p.cfg); err != nil {
+		p.logger.Error("r2ps_admin misconfigured; /admin/r2ps routes disabled", zap.Error(err))
+	} else {
+		adminHandlers.SetR2PSClient(r2psClient)
+	}
 	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 }
@@ -1142,11 +1150,16 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
 }
 
-// newR2PSClient creates an R2PS admin client from config.
-// Returns nil if R2PS admin is not configured.
-func newR2PSClient(cfg *config.Config) *r2ps.Client {
+// newR2PSClient creates an R2PS admin client from config. It returns
+// (nil, nil) if R2PS admin is not configured, and an error if the configured
+// base URL is invalid (or plaintext http without http_client permitting it).
+// The client uses the SSRF-guarded http client built from http_client config.
+func newR2PSClient(cfg *config.Config) (*r2ps.Client, error) {
 	if cfg.R2PSAdmin.BaseURL == "" {
-		return nil
+		return nil, nil
 	}
-	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL)
+	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL,
+		r2ps.WithHTTPClient(cfg.HTTPClient.NewHTTPClient(10*time.Second)),
+		r2ps.WithAllowPlaintext(cfg.HTTPClient.AllowsPlaintext()),
+	)
 }

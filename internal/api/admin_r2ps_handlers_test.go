@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +21,10 @@ func setupR2PSTestHandlers(t *testing.T, r2psHandler http.HandlerFunc) (*AdminHa
 
 	logger := zap.NewNop()
 	store := memory.NewStore()
-	client := r2ps.NewClient(srv.URL)
+	client, err := r2ps.NewClient(srv.URL, r2ps.WithAllowPlaintext(true))
+	if err != nil {
+		t.Fatal(err)
+	}
 	handlers := NewAdminHandlers(store, logger, nil)
 	handlers.SetR2PSClient(client)
 
@@ -295,5 +299,51 @@ func TestR2PSSetStatus_UpstreamError(t *testing.T) {
 	}
 	if resp["error"] != "failed to update R2PS status" {
 		t.Errorf("unexpected error message: %q", resp["error"])
+	}
+}
+
+func TestR2PSGetStatus_NegativeIndex_Returns400(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream should not be called for a negative index")
+	})
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/r2ps/status/cat1/-1", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestR2PSSetStatus_NegativeIndex_Returns400(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream should not be called for a negative index")
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPut, "/admin/r2ps/status/cat1/-1", bytes.NewBufferString(`{"status":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestR2PSSetStatus_MalformedJSON_ReportsInvalidBody(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("upstream should not be called for malformed JSON")
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPut, "/admin/r2ps/status/cat1/3", bytes.NewBufferString(`{not json`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "invalid JSON request body") {
+		t.Errorf("unexpected body: %s", w.Body.String())
 	}
 }

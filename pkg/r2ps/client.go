@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ErrInvalidInput is returned (wrapped) when a caller-supplied argument fails
@@ -19,8 +21,9 @@ var ErrInvalidInput = errors.New("r2ps: invalid input")
 
 // Client is a Go HTTP client for the go-r2ps-service admin API.
 type Client struct {
-	baseURL    string
+	baseURL    *url.URL
 	httpClient *http.Client
+	allowHTTP  bool
 }
 
 // ClientOption configures the R2PS client.
@@ -33,11 +36,35 @@ func WithTimeout(d time.Duration) ClientOption {
 	}
 }
 
+// WithHTTPClient replaces the underlying HTTP client. Production wiring passes
+// the SSRF-guarded client built from http_client configuration
+// (config.HTTPClientConfig.NewHTTPClient). A nil client is ignored.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		if hc != nil {
+			c.httpClient = hc
+		}
+	}
+}
+
+// WithAllowPlaintext permits an http:// base URL. By default only https is
+// accepted. Wire it from HTTPClientConfig.AllowsPlaintext() so the R2PS
+// client follows the same convention as the other outbound clients.
+func WithAllowPlaintext(allow bool) ClientOption {
+	return func(c *Client) {
+		c.allowHTTP = allow
+	}
+}
+
 // NewClient creates a new R2PS admin client.
-// baseURL is the R2PS admin endpoint (e.g. "http://localhost:8444").
-func NewClient(baseURL string, opts ...ClientOption) *Client {
+// baseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444"). It is
+// parsed and validated once here: it must be an absolute https URL (http only
+// with WithAllowPlaintext), have a host, and carry no userinfo, query or
+// fragment. Every request the client makes is derived from this URL plus
+// individually validated path segments, so no per-call argument can change
+// the request host.
+func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
 	c := &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -45,7 +72,26 @@ func NewClient(baseURL string, opts ...ClientOption) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	return c
+	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	if err != nil {
+		return nil, fmt.Errorf("r2ps: invalid base URL: %w", err)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && c.allowHTTP:
+	case u.Scheme == "http":
+		return nil, fmt.Errorf("r2ps: base URL %q must use https (plaintext http is not allowed)", baseURL)
+	default:
+		return nil, fmt.Errorf("r2ps: base URL %q must be an absolute http(s) URL", baseURL)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("r2ps: base URL %q has no host", baseURL)
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("r2ps: base URL %q must not contain userinfo, query or fragment", baseURL)
+	}
+	c.baseURL = u
+	return c, nil
 }
 
 // StatusEntry represents a status list entry from R2PS.
@@ -89,7 +135,31 @@ func isValidPathSegment(s string) bool {
 	if s == "" || s == "." || s == ".." {
 		return false
 	}
-	return !strings.ContainsAny(s, "/\\%")
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || unicode.IsControl(r) || unicode.IsSpace(r) {
+			return false
+		}
+		switch r {
+		case '/', '\\', '%', '?', '#':
+			return false
+		}
+	}
+	return true
+}
+
+// buildURL returns the request URL for the given path segments below the
+// configured base URL. Callers must have validated every segment with
+// isValidPathSegment.
+func (c *Client) buildURL(elem ...string) string {
+	return c.baseURL.JoinPath(elem...).String()
+}
+
+// validateIdx rejects status-list indices that cannot exist upstream.
+func validateIdx(idx int) error {
+	if idx < 0 {
+		return fmt.Errorf("%w: invalid index %d (must be >= 0)", ErrInvalidInput, idx)
+	}
+	return nil
 }
 
 // ListStatuses returns all status entries for a category.
@@ -97,10 +167,7 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "statuses", category)
-	if err != nil {
-		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
-	}
+	reqURL := c.buildURL("admin", "store", "statuses", category)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -130,10 +197,7 @@ func (c *Client) GetClientStatuses(ctx context.Context, clientID, category strin
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "clients", clientID, category)
-	if err != nil {
-		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
-	}
+	reqURL := c.buildURL("admin", "store", "clients", clientID, category)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -158,10 +222,10 @@ func (c *Client) GetStatus(ctx context.Context, category string, idx int) (*Stat
 	if !isValidPathSegment(category) {
 		return nil, fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
-	if err != nil {
-		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
+	if err := validateIdx(idx); err != nil {
+		return nil, err
 	}
+	reqURL := c.buildURL("admin", "store", "status", category, strconv.Itoa(idx))
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -187,10 +251,13 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 	if !isValidPathSegment(category) {
 		return fmt.Errorf("%w: invalid category %q", ErrInvalidInput, category)
 	}
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "status", category, fmt.Sprintf("%d", idx))
-	if err != nil {
-		return fmt.Errorf("r2ps: build request URL: %w", err)
+	if err := validateIdx(idx); err != nil {
+		return err
 	}
+	if status < 0 || status > 2 {
+		return fmt.Errorf("%w: invalid status %d (must be 0, 1 or 2)", ErrInvalidInput, status)
+	}
+	reqURL := c.buildURL("admin", "store", "status", category, strconv.Itoa(idx))
 	body := fmt.Sprintf(`{"status":%d}`, status)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(body))
@@ -199,11 +266,9 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// The request host is always c.baseURL, set once at client construction
-	// and never influenced by per-call arguments — this can't be redirected
-	// to an attacker-chosen destination. category is validated above via
-	// isValidPathSegment before being appended as a path segment.
-	resp, err := c.httpClient.Do(req) // lgtm[go/request-forgery]
+	// The request host comes from the base URL validated in NewClient; the
+	// per-call category/idx are validated path segments below it.
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("r2ps: set status: %w", err)
 	}
@@ -217,12 +282,9 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 
 // ListKeys returns all public keys, optionally filtered by client_id.
 func (c *Client) ListKeys(ctx context.Context, clientID string) ([]PublicKeyInfo, error) {
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "keys")
-	if err != nil {
-		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
-	}
+	reqURL := c.buildURL("admin", "store", "keys")
 	if clientID != "" {
-		reqURL += "?client_id=" + url.QueryEscape(clientID)
+		reqURL += "?" + url.Values{"client_id": {clientID}}.Encode()
 	}
 
 	resp, err := c.doGet(ctx, reqURL)
@@ -249,10 +311,7 @@ func (c *Client) GetKey(ctx context.Context, kid string) (*PublicKeyInfo, error)
 	if !isValidPathSegment(kid) {
 		return nil, fmt.Errorf("%w: invalid kid %q", ErrInvalidInput, kid)
 	}
-	reqURL, err := url.JoinPath(c.baseURL, "admin", "store", "keys", kid)
-	if err != nil {
-		return nil, fmt.Errorf("r2ps: build request URL: %w", err)
-	}
+	reqURL := c.buildURL("admin", "store", "keys", kid)
 	resp, err := c.doGet(ctx, reqURL)
 	if err != nil {
 		return nil, err
@@ -278,11 +337,9 @@ func (c *Client) doGet(ctx context.Context, reqURL string) (*http.Response, erro
 	if err != nil {
 		return nil, fmt.Errorf("r2ps: create request: %w", err)
 	}
-	// reqURL is always built from c.baseURL (fixed at client construction,
-	// never influenced by per-call arguments) plus path segments already
-	// validated by isValidPathSegment in each caller — this can't be
-	// redirected to an attacker-chosen destination.
-	resp, err := c.httpClient.Do(req) // lgtm[go/request-forgery]
+	// reqURL derives from the base URL validated in NewClient plus path
+	// segments validated by the callers.
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("r2ps: request failed: %w", err)
 	}

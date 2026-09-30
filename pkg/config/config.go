@@ -2301,7 +2301,12 @@ func (c *ServerConfig) ResolvedServedBy() string {
 
 // R2PSAdminConfig configures the R2PS admin API client for WSCD/WSCA status queries.
 type R2PSAdminConfig struct {
-	// BaseURL is the R2PS admin endpoint (e.g. "http://r2ps-admin:8444").
+	// BaseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444").
+	// It must be an absolute https URL without userinfo, query or fragment;
+	// plain http is accepted only where http_client permits plaintext
+	// (http_client.allow_http / allow_private_ips). Requests go through the
+	// SSRF-guarded http_client. An invalid value disables the /admin/r2ps
+	// routes and is logged at startup.
 	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
 }
 

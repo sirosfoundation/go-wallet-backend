@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // TestAdminOpenAPIRouteCoverage verifies that every route registered on the admin
@@ -58,6 +59,14 @@ func TestAdminOpenAPIRouteCoverage(t *testing.T) {
 	store := memory.NewStore()
 	logger := zap.NewNop()
 	handlers := api.NewAdminHandlers(store, logger, nil)
+	// A non-nil R2PS client makes RegisterRoutes include the conditional
+	// /admin/r2ps routes so they are held to spec coverage too. It is never
+	// called; only route registration is inspected.
+	r2psClient, err := r2ps.NewClient("https://r2ps.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers.SetR2PSClient(r2psClient)
 	handlers.RegisterRoutes(adminGroup)
 
 	// Add /admin/status which is registered separately in the server

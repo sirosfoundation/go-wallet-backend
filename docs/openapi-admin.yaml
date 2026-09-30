@@ -77,6 +77,8 @@ tags:
     description: Verifier management per tenant
   - name: Invites
     description: Invite code management for controlled registration
+  - name: R2PS
+    description: Proxy to the R2PS admin API (WSCD/WSCA keys and status lists). Routes exist only when r2ps_admin.base_url is configured.
 
 paths:
   /admin/status:
@@ -1001,6 +1003,181 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /admin/r2ps/keys:
+    get:
+      tags: [R2PS]
+      summary: List WSCD public keys
+      description: Lists public keys held by the R2PS service, optionally filtered by client_id.
+      operationId: listR2PSKeys
+      parameters:
+        - name: client_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Keys
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/keys/{kid}:
+    get:
+      tags: [R2PS]
+      summary: Get a WSCD public key
+      operationId: getR2PSKey
+      parameters:
+        - name: kid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The key
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/statuses/{category}:
+    get:
+      tags: [R2PS]
+      summary: List status entries in a category
+      operationId: listR2PSStatuses
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Status entries
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/status/{category}/{idx}:
+    get:
+      tags: [R2PS]
+      summary: Get the status of one index
+      operationId: getR2PSStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Status entry
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [R2PS]
+      summary: Set the status of one index (valid, revoked, suspended)
+      operationId: setR2PSStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: integer
+                  enum: [0, 1, 2]
+                  description: 0=valid, 1=revoked, 2=suspended
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   parameters:

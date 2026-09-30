@@ -290,7 +290,7 @@ Environment prefix: `WALLET_R2PS_ADMIN`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `r2ps_admin.base_url` | `WALLET_R2PS_ADMIN_BASE_URL` | string | BaseURL is the R2PS admin endpoint (e.g. "http://r2ps-admin:8444"). |
+| `r2ps_admin.base_url` | `WALLET_R2PS_ADMIN_BASE_URL` | string | BaseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444"). It must be an absolute https URL without userinfo, query or fragment; plain http is accepted only where http_client permits plaintext (http_client.allow_http / allow_private_ips). Requests go through the SSRF-guarded http_client. An invalid value disables the /admin/r2ps routes and is logged at startup. |
 
 ## audit
 

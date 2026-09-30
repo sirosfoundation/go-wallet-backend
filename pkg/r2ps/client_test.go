@@ -35,7 +35,7 @@ func TestIsValidPathSegment(t *testing.T) {
 }
 
 func TestListStatuses_InvalidCategory(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	_, err := c.ListStatuses(context.Background(), "../secret")
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -52,7 +52,7 @@ func TestListStatuses_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	entries, err := c.ListStatuses(context.Background(), "cat1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -68,7 +68,7 @@ func TestListStatuses_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.ListStatuses(context.Background(), "cat1")
 	if err == nil {
 		t.Fatal("expected error")
@@ -81,7 +81,7 @@ func TestListStatuses_DecodeError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.ListStatuses(context.Background(), "cat1")
 	if err == nil {
 		t.Fatal("expected decode error")
@@ -97,7 +97,7 @@ func TestGetClientStatuses(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	indices, err := c.GetClientStatuses(context.Background(), "client-1", "cat1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -108,7 +108,7 @@ func TestGetClientStatuses(t *testing.T) {
 }
 
 func TestGetClientStatuses_InvalidClientID(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	_, err := c.GetClientStatuses(context.Background(), "../etc", "cat1")
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -116,7 +116,7 @@ func TestGetClientStatuses_InvalidClientID(t *testing.T) {
 }
 
 func TestGetClientStatuses_InvalidCategory(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	_, err := c.GetClientStatuses(context.Background(), "client-1", "../etc")
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -129,7 +129,7 @@ func TestGetClientStatuses_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetClientStatuses(context.Background(), "client-1", "cat1")
 	if err == nil {
 		t.Fatal("expected error")
@@ -142,7 +142,7 @@ func TestGetClientStatuses_DecodeError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetClientStatuses(context.Background(), "client-1", "cat1")
 	if err == nil {
 		t.Fatal("expected decode error")
@@ -150,7 +150,7 @@ func TestGetClientStatuses_DecodeError(t *testing.T) {
 }
 
 func TestGetStatus_InvalidCategory(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	_, err := c.GetStatus(context.Background(), "..", 1)
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -166,7 +166,7 @@ func TestGetStatus_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	entry, err := c.GetStatus(context.Background(), "cat1", 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -182,7 +182,7 @@ func TestGetStatus_NotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	entry, err := c.GetStatus(context.Background(), "cat1", 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -198,7 +198,7 @@ func TestGetStatus_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetStatus(context.Background(), "cat1", 5)
 	if err == nil {
 		t.Fatal("expected error")
@@ -211,7 +211,7 @@ func TestGetStatus_DecodeError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetStatus(context.Background(), "cat1", 5)
 	if err == nil {
 		t.Fatal("expected decode error")
@@ -219,7 +219,7 @@ func TestGetStatus_DecodeError(t *testing.T) {
 }
 
 func TestSetStatus_InvalidCategory(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	err := c.SetStatus(context.Background(), "../etc", 1, 0)
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -238,7 +238,7 @@ func TestSetStatus_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	if err := c.SetStatus(context.Background(), "cat1", 5, 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestSetStatus_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	err := c.SetStatus(context.Background(), "cat1", 5, 1)
 	if err == nil {
 		t.Fatal("expected error")
@@ -269,7 +269,7 @@ func TestListKeys(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	keys, err := c.ListKeys(context.Background(), "client-1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -288,7 +288,7 @@ func TestListKeys_NoFilter(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	keys, err := c.ListKeys(context.Background(), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -304,7 +304,7 @@ func TestListKeys_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.ListKeys(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error")
@@ -317,7 +317,7 @@ func TestListKeys_DecodeError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.ListKeys(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected decode error")
@@ -325,7 +325,7 @@ func TestListKeys_DecodeError(t *testing.T) {
 }
 
 func TestGetKey_InvalidKID(t *testing.T) {
-	c := NewClient("http://example.invalid")
+	c := mustNewClient(t, "http://example.invalid")
 	_, err := c.GetKey(context.Background(), "../etc")
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
@@ -341,7 +341,7 @@ func TestGetKey_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	key, err := c.GetKey(context.Background(), "k1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -357,7 +357,7 @@ func TestGetKey_NotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	key, err := c.GetKey(context.Background(), "k1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -373,7 +373,7 @@ func TestGetKey_ServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetKey(context.Background(), "k1")
 	if err == nil {
 		t.Fatal("expected error")
@@ -386,7 +386,7 @@ func TestGetKey_DecodeError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := mustNewClient(t, srv.URL)
 	_, err := c.GetKey(context.Background(), "k1")
 	if err == nil {
 		t.Fatal("expected decode error")
@@ -394,16 +394,108 @@ func TestGetKey_DecodeError(t *testing.T) {
 }
 
 func TestWithTimeout(t *testing.T) {
-	c := NewClient("http://example.invalid", WithTimeout(5*time.Second))
+	c := mustNewClient(t, "http://example.invalid", WithTimeout(5*time.Second))
 	if c.httpClient.Timeout != 5*time.Second {
 		t.Errorf("expected timeout 5s, got %v", c.httpClient.Timeout)
 	}
 }
 
 func TestDoGet_RequestFailure(t *testing.T) {
-	c := NewClient("http://127.0.0.1:0")
-	_, err := c.doGet(context.Background(), c.baseURL+"/x")
+	c := mustNewClient(t, "http://127.0.0.1:0")
+	_, err := c.doGet(context.Background(), c.buildURL("x"))
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func mustNewClient(t *testing.T, baseURL string, opts ...ClientOption) *Client {
+	t.Helper()
+	c, err := NewClient(baseURL, append([]ClientOption{WithAllowPlaintext(true)}, opts...)...)
+	if err != nil {
+		t.Fatalf("NewClient(%q): %v", baseURL, err)
+	}
+	return c
+}
+
+func TestNewClient_BaseURLValidation(t *testing.T) {
+	bad := []string{
+		"", "r2ps:8444", "ftp://host", "http://", "https://", "https://user:pw@host",
+		"https://host?x=1", "https://host#frag", "https://host?", "http://%zz",
+	}
+	for _, b := range bad {
+		if _, err := NewClient(b, WithAllowPlaintext(true)); err == nil {
+			t.Errorf("NewClient(%q): expected error", b)
+		}
+	}
+	if _, err := NewClient("http://host:8444"); err == nil {
+		t.Error("plaintext http must be rejected by default")
+	}
+	if _, err := NewClient("http://host:8444", WithAllowPlaintext(true)); err != nil {
+		t.Errorf("plaintext http with allow: %v", err)
+	}
+	if _, err := NewClient("https://host:8444/base/"); err != nil {
+		t.Errorf("https: %v", err)
+	}
+}
+
+func TestWithHTTPClient(t *testing.T) {
+	hc := &http.Client{Timeout: 3 * time.Second}
+	c, err := NewClient("https://host", WithHTTPClient(hc))
+	if err != nil || c.httpClient != hc {
+		t.Fatalf("custom client not used: %v", err)
+	}
+	c, _ = NewClient("https://host", WithHTTPClient(nil))
+	if c.httpClient == nil {
+		t.Fatal("nil option must keep default client")
+	}
+}
+
+func TestNegativeIdxAndBadStatus_Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream must not be called: %s", r.URL)
+	}))
+	defer srv.Close()
+	c := mustNewClient(t, srv.URL)
+	ctx := context.Background()
+	if _, err := c.GetStatus(ctx, "cat", -1); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("GetStatus(-1): %v", err)
+	}
+	if err := c.SetStatus(ctx, "cat", -1, 1); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("SetStatus idx -1: %v", err)
+	}
+	if err := c.SetStatus(ctx, "cat", 1, 3); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("SetStatus status 3: %v", err)
+	}
+	if err := c.SetStatus(ctx, "cat", 1, -1); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("SetStatus status -1: %v", err)
+	}
+}
+
+func TestIsValidPathSegment_Dangerous(t *testing.T) {
+	for _, s := range []string{"", ".", "..", "a/b", `a\b`, "%2F", "%2f", "%5C", "..%2fadmin", "a?b", "a#b", "a\x00b", "a\nb", "a\x7fb", "a b", "a\tb"} {
+		if isValidPathSegment(s) {
+			t.Errorf("%q must be rejected", s)
+		}
+	}
+	for _, s := range []string{"cat1", "wscd-key_1", "a.b", "abc123"} {
+		if !isValidPathSegment(s) {
+			t.Errorf("%q must be accepted", s)
+		}
+	}
+}
+
+func TestRequestsStayOnBaseHostAndPrefix(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.RequestURI())
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := mustNewClient(t, srv.URL+"/")
+	ctx := context.Background()
+	_, _ = c.ListKeys(ctx, "a&b=c d")
+	_, _ = c.GetStatus(ctx, "cat", 7)
+	if len(got) != 2 || got[0] != "/admin/store/keys?client_id=a%26b%3Dc+d" || got[1] != "/admin/store/status/cat/7" {
+		t.Errorf("unexpected request URIs: %v", got)
 	}
 }
