@@ -65,7 +65,9 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 		return 0, nil, 0, fmt.Errorf("%w protected header: %v", errCWT, err)
 	}
 
-	typ, _ := headerValue(prot, sign1.unprotected, coseHdrTyp).(string)
+	// typ must be integrity-protected: the unprotected header is not covered
+	// by the signature, so it is not consulted for it.
+	typ, _ := prot[coseHdrTyp].(string)
 	if strings.TrimPrefix(strings.ToLower(typ), "application/") != cwtTypValue {
 		return 0, nil, 0, fmt.Errorf("%w typ is %q, want %q", errCWT, typ, cwtTypValue)
 	}

@@ -265,3 +265,88 @@ func TestEvaluateSigner_NoIdentity(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func TestCache_TenantScoped(t *testing.T) {
+	key := newKey(t)
+	trustCalls := 0
+	c, uri, hits := serve(t, func(u string) string { return makeToken(t, tokenOpts{sub: u, key: key}) }, "")
+	c.trust = func(context.Context, string, *trust.KeyMaterial) (bool, error) { trustCalls++; return true, nil }
+	ref := &Reference{Idx: 1, URI: uri}
+	a := trust.ContextWithTenant(context.Background(), "tenant-a")
+	b := trust.ContextWithTenant(context.Background(), "tenant-b")
+	for _, ctx := range []context.Context{a, a, b, b} {
+		if err := c.Check(ctx, ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if *hits != 2 || trustCalls != 2 {
+		t.Fatalf("want one fetch and one trust evaluation per tenant, got %d fetches %d trust calls", *hits, trustCalls)
+	}
+}
+
+func TestCache_ByteBound(t *testing.T) {
+	key := newKey(t)
+	c, uri, hits := serve(t, func(u string) string { return makeToken(t, tokenOpts{sub: u, key: key}) }, "")
+	ref := &Reference{Idx: 1, URI: uri}
+	ctx := context.Background()
+
+	// A list larger than the whole budget is never cached.
+	c.cacheLimit = 1
+	_ = c.Check(ctx, ref)
+	_ = c.Check(ctx, ref)
+	if *hits != 2 || c.cacheBytes != 0 || len(c.cache) != 0 {
+		t.Fatalf("oversized list cached: hits=%d bytes=%d", *hits, c.cacheBytes)
+	}
+
+	// Budget for exactly one list: a second URI evicts (resets) the first and
+	// the accounted bytes never exceed the limit.
+	c.cacheLimit = 12 // one 8-byte list fits, two do not
+	for _, tenant := range []string{"a", "b", "c"} {
+		_ = c.Check(trust.ContextWithTenant(ctx, tenant), ref)
+		if c.cacheBytes > c.cacheLimit {
+			t.Fatalf("cache holds %d bytes, limit %d", c.cacheBytes, c.cacheLimit)
+		}
+	}
+	if len(c.cache) != 1 {
+		t.Fatalf("want exactly one cached list within the byte budget, got %d", len(c.cache))
+	}
+}
+
+func TestCache_TTLMeasuredFromIat(t *testing.T) {
+	key := newKey(t)
+	mk := func(iatAgo time.Duration, ttl int64) func(string) string {
+		return func(u string) string {
+			tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": time.Now().Add(-iatAgo).Unix(), "ttl": ttl,
+				"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
+			tok.Header["typ"] = "statuslist+jwt"
+			tok.Header["jwk"] = jwkOf(&key.PublicKey)
+			s, _ := tok.SignedString(key)
+			return s
+		}
+	}
+	// iat 10 min ago with ttl 5 min: already stale, used once but not cached.
+	c, uri, hits := serve(t, mk(10*time.Minute, 300), "")
+	for i := 0; i < 2; i++ {
+		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if *hits != 2 {
+		t.Fatalf("stale-by-iat token was cached: %d fetches", *hits)
+	}
+	// iat 100 s ago with ttl 200 s: cached, but only for the remaining ~100 s.
+	c, uri, hits = serve(t, mk(100*time.Second, 200), "")
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
+	c.now = func() time.Time { return time.Now().Add(150 * time.Second) }
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
+	if *hits != 2 {
+		t.Fatalf("cache outlived iat+ttl: %d fetches", *hits)
+	}
+	c.now = func() time.Time { return time.Now().Add(30 * time.Second) }
+	c.cache = map[string]cachedList{}
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
+	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
+	if *hits != 3 {
+		t.Fatalf("token within iat+ttl not cached: %d fetches", *hits)
+	}
+}

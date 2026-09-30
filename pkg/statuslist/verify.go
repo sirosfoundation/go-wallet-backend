@@ -34,8 +34,10 @@ const (
 	// maxCacheTTL caps a publisher-chosen ttl so a revocation is never hidden
 	// for longer than this, whatever the list claims.
 	maxCacheTTL = time.Hour
-	// maxCacheEntries bounds the cache; on overflow it is simply reset.
+	// maxCacheEntries and maxCacheBytes bound the cache (the latter counts
+	// inflated list bytes, which can be large); on overflow it is reset.
 	maxCacheEntries = 256
+	maxCacheBytes   = 64 << 20
 
 	statusListTokenTyp = "statuslist+jwt"
 	mediaTypeJWT       = "application/statuslist+jwt"
@@ -131,8 +133,11 @@ type Checker struct {
 	allowHTTP bool
 	now       func() time.Time
 
-	mu    sync.Mutex
-	cache map[string]cachedList
+	mu         sync.Mutex
+	cache      map[string]cachedList
+	cacheBytes int
+	// cacheLimit is maxCacheBytes; a field so tests can shrink it.
+	cacheLimit int
 }
 
 type cachedList struct {
@@ -148,7 +153,7 @@ type cachedList struct {
 // a nil signerTrust no list can be authoritative and every Check reports the
 // list as unverifiable.
 func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *Checker {
-	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}}
+	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}, cacheLimit: maxCacheBytes}
 }
 
 // Check returns nil only if the entry at ref is VALID in a status list token
@@ -176,7 +181,10 @@ func (c *Checker) Check(ctx context.Context, ref *Reference) error {
 }
 
 func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
-	key := uri
+	// The signer trust decision is tenant-scoped (the tenant travels in ctx),
+	// so a cached, already trust-evaluated list is only reused within the
+	// tenant it was evaluated for.
+	key := trust.TenantFromContext(ctx) + "\x00" + uri
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && c.now().Before(e.expires) {
 		c.mu.Unlock()
@@ -204,12 +212,19 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	c.mu.Lock()
-	if len(c.cache) >= maxCacheEntries {
-		c.cache = map[string]cachedList{}
+	if ttl > 0 && len(list) <= c.cacheLimit {
+		c.mu.Lock()
+		if old, ok := c.cache[key]; ok {
+			c.cacheBytes -= len(old.list)
+		}
+		if len(c.cache) >= maxCacheEntries || c.cacheBytes+len(list) > c.cacheLimit {
+			c.cache = map[string]cachedList{}
+			c.cacheBytes = 0
+		}
+		c.cache[key] = cachedList{bits: bits, list: list, expires: c.now().Add(ttl)}
+		c.cacheBytes += len(list)
+		c.mu.Unlock()
 	}
-	c.cache[key] = cachedList{bits: bits, list: list, expires: c.now().Add(ttl)}
-	c.mu.Unlock()
 	return bits, list, nil
 }
 
@@ -334,21 +349,29 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 		return 0, nil, 0, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
 	}
 	now := c.now()
-	ttl := defaultCacheTTL
+	// The ttl claim is the token's freshness window, measured from its iat
+	// (not from when this wallet fetched it). Without ttl, a default window
+	// from now applies. exp and maxCacheTTL cap it.
+	expires := now.Add(defaultCacheTTL)
 	if lc.ttl != nil && *lc.ttl > 0 {
-		ttl = time.Duration(*lc.ttl) * time.Second
+		expires = time.Unix(*lc.iat, 0).Add(time.Duration(*lc.ttl) * time.Second)
 	}
 	if lc.exp != nil {
 		exp := time.Unix(*lc.exp, 0)
 		if !now.Before(exp) {
 			return 0, nil, 0, errors.New("status list token has expired")
 		}
-		if until := exp.Sub(now); until < ttl {
-			ttl = until
+		if exp.Before(expires) {
+			expires = exp
 		}
 	}
-	if ttl > maxCacheTTL {
-		ttl = maxCacheTTL
+	if limit := now.Add(maxCacheTTL); expires.After(limit) {
+		expires = limit
+	}
+	// A token already past its ttl is still used for this check but not cached.
+	ttl := expires.Sub(now)
+	if ttl < 0 {
+		ttl = 0
 	}
 	switch lc.bits {
 	case 1, 2, 4, 8:

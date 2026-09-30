@@ -582,6 +582,14 @@ POST /evaluation            X-Tenant-ID: <tenant>
   It must not merely mean "is a credential issuer": a credential issuer key
   is not thereby a status list signer, and the service that signs lists is
   normally a different party with a different key.
+- **Typed result.** `TrustInfo.EvaluationFailed` (not the `Reason` text) says
+  the evaluation errored rather than the PDP answering no; `TrustInfo.Framework ==
+  trust.FrameworkNone` says no PDP is configured. The backend never inspects
+  PDP-supplied reason text for control flow.
+- **Caching.** Verified lists are cached per (tenant, list URI), because the trust
+  decision is tenant-scoped; a list is cached until `iat + ttl` (capped by `exp`
+  and one hour), or not at all if already past it. The cache is bounded by entry
+  count and by total inflated bytes (64 MiB).
 - **Call sequence ("deny is deny").** `EvaluateStatusListSigner` first sends
   `status-list-signer`:
   - positive: the signer is trusted, no second call;

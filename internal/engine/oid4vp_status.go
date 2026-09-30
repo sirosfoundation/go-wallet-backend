@@ -27,13 +27,6 @@ type statusCheckerKey struct {
 	svc *TrustService
 }
 
-// Wording of pkg/trust's Service.evaluate for the two "no decision" outcomes,
-// which it reports as Trusted=false rather than as an error.
-const (
-	trustFrameworkNone  = "none"
-	trustFailedReasonPf = "Trust evaluation failed"
-)
-
 // statusSignerTrust adapts the go-trust backed TrustService to
 // statuslist.SignerTrust. The call is EvaluateStatusListSigner: action.name
 // "status-list-signer" first; a negative there is final, and only an error
@@ -58,11 +51,11 @@ func statusSignerTrust(svc *TrustService, fallbackOnError bool) statuslist.Signe
 		if info.Trusted {
 			return true, nil
 		}
-		if info.Framework == trustFrameworkNone {
+		if info.Framework == trust.FrameworkNone {
 			return false, errors.New("no trust PDP configured")
 		}
-		if strings.HasPrefix(info.Reason, trustFailedReasonPf) {
-			return false, errors.New(info.Reason)
+		if info.EvaluationFailed {
+			return false, errors.New("trust evaluation failed")
 		}
 		return false, nil
 	}
@@ -114,6 +107,10 @@ func (h *OID4VPHandler) checkPresentationStatus(ctx context.Context, vpToken str
 	return nil
 }
 
+// errStatusUndetermined is the redacted class error returned in strict mode
+// for a status that could not be determined for any other reason.
+var errStatusUndetermined = errors.New("status list unverifiable")
+
 // statusOutcome applies the configured mode to a check result. Log fields are
 // the list host and an error class; never the token, the claims or the index.
 func (h *OID4VPHandler) statusOutcome(err error, uri string) error {
@@ -132,27 +129,33 @@ func (h *OID4VPHandler) statusOutcome(err error, uri string) error {
 		if !refused {
 			return nil
 		}
-		return fmt.Errorf("credential status (%s): %w", host, err)
+		// Wrap the sentinel, not the detailed error (redaction).
+		return fmt.Errorf("credential status (%s): %w", host, statuslist.ErrRevoked)
 	}
 	msg := "credential status could not be determined; the verifier is responsible for the status check"
 	reason := "list_unverifiable"
+	class := errStatusUndetermined
 	switch {
 	case errors.Is(err, statuslist.ErrSignerUntrusted):
 		// A negative trust decision, not an error: its own greppable event.
 		msg = "credential status list signer not trusted; list ignored"
 		reason = "signer_untrusted"
+		class = statuslist.ErrSignerUntrusted
 	case errors.Is(err, statuslist.ErrNoSignerKey):
 		reason = "no_signer_key"
+		class = statuslist.ErrNoSignerKey
 	case errors.Is(err, statuslist.ErrTrustUnavailable):
 		reason = "trust_unavailable"
+		class = statuslist.ErrTrustUnavailable
 	}
+	// The raw error is deliberately not logged or returned: it can carry the
+	// list URL, claim values or parser detail. Host and class only.
 	h.Logger.Warn(msg,
 		zap.String("status_list_host", host),
 		zap.String("status_check", string(mode)),
-		zap.String("reason", reason),
-		zap.Error(err))
+		zap.String("reason", reason))
 	if mode == config.StatusCheckStrict {
-		return fmt.Errorf("credential status (%s) could not be determined: %w", host, err)
+		return fmt.Errorf("credential status (%s) could not be determined (%s): %w", host, reason, class)
 	}
 	return nil
 }

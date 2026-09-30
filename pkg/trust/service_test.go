@@ -1088,7 +1088,7 @@ func TestService_EvaluateStatusListSigner_TwoCalls(t *testing.T) {
 			if info.Trusted != tc.wantTrusted || info.Action != tc.wantAction {
 				t.Fatalf("trusted=%v action=%q, want %v %q (%+v)", info.Trusted, info.Action, tc.wantTrusted, tc.wantAction, info)
 			}
-			if got := strings.HasPrefix(info.Reason, "Trust evaluation failed"); got != tc.wantError {
+			if got := info.EvaluationFailed; got != tc.wantError {
 				t.Fatalf("error-reason=%v want %v (%q)", got, tc.wantError, info.Reason)
 			}
 			if got := ev.order(); strings.Join(got, ",") != strings.Join(tc.wantOrder, ",") {
@@ -1153,5 +1153,23 @@ func TestService_EvaluateStatusListSigner_Endpoint(t *testing.T) {
 	info, err = none.EvaluateStatusListSigner(context.Background(), "s", "", km, true)
 	if err != nil || info.Trusted || info.Framework != "none" {
 		t.Errorf("no PDP: %+v, %v", info, err)
+	}
+}
+
+// A PDP denial whose reason text merely looks like an evaluation failure is
+// still a denial: the typed EvaluationFailed field, not Reason text, decides.
+func TestService_EvaluateStatusListSigner_ReasonTextIsNotASignal(t *testing.T) {
+	cfg := &config.Config{Trust: config.TrustConfig{Timeout: 10, PDPURL: "https://pdp"}}
+	ev := &testMockEvaluator{decision: false, reason: "Trust evaluation failed: spoofed"}
+	svc := NewService(cfg, zap.NewNop(), func(string, time.Duration) (TrustEvaluator, error) { return ev, nil })
+	info, err := svc.EvaluateStatusListSigner(context.Background(), "s", "", &KeyMaterial{Type: "x5c", X5C: []string{"AA"}}, true)
+	if err != nil || info.Trusted || info.EvaluationFailed {
+		t.Fatalf("a denial must stay a denial: %+v, %v", info, err)
+	}
+	ev2 := &testMockEvaluator{returnErr: errors.New("down")}
+	svc = NewService(cfg, zap.NewNop(), func(string, time.Duration) (TrustEvaluator, error) { return ev2, nil })
+	info, _ = svc.EvaluateStatusListSigner(context.Background(), "s", "", &KeyMaterial{Type: "x5c", X5C: []string{"AA"}}, false)
+	if !info.EvaluationFailed {
+		t.Fatal("an evaluation error must set EvaluationFailed")
 	}
 }

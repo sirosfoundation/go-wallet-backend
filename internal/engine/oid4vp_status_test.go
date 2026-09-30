@@ -514,3 +514,47 @@ func TestStatusSignerTrust(t *testing.T) {
 	assert.Error(t, err)
 	assert.False(t, ok)
 }
+
+func TestStatusOutcome_RedactedErrorsAndLogs(t *testing.T) {
+	secret := errors.New("Get \"https://issuer.example/lists/secret-idx-4711?x=1\": boom")
+	for _, tc := range []struct {
+		err   error
+		class error
+	}{
+		{secret, errStatusUndetermined},
+		{fmt.Errorf("%w: %v", statuslist.ErrTrustUnavailable, secret), statuslist.ErrTrustUnavailable},
+		{fmt.Errorf("%w (%v)", statuslist.ErrSignerUntrusted, secret), statuslist.ErrSignerUntrusted},
+		{fmt.Errorf("%w: %v", statuslist.ErrNoSignerKey, secret), statuslist.ErrNoSignerKey},
+		{fmt.Errorf("%w: %v", statuslist.ErrRevoked, secret), statuslist.ErrRevoked},
+	} {
+		core, logs := observer.New(zap.DebugLevel)
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.New(core)}, statusMode: config.StatusCheckStrict}
+		got := h.statusOutcome(tc.err, "https://issuer.example/lists/1")
+		require.Error(t, got)
+		assert.ErrorIs(t, got, tc.class)
+		assert.NotContains(t, got.Error(), "4711")
+		assert.NotContains(t, got.Error(), "boom")
+		for _, e := range logs.All() {
+			assert.NotContains(t, e.Message+fmt.Sprint(e.ContextMap()), "4711")
+			assert.NotContains(t, e.Message+fmt.Sprint(e.ContextMap()), "boom")
+			assert.NotContains(t, e.ContextMap(), "error", "raw errors must not be logged")
+		}
+
+		// Soft modes log the same redacted fields and do not refuse.
+		if !errors.Is(tc.err, statuslist.ErrRevoked) {
+			h.statusMode = config.StatusCheckEnforceRevoked
+			assert.NoError(t, h.statusOutcome(tc.err, "https://issuer.example/lists/1"))
+		}
+	}
+}
+
+func TestStatusSignerTrust_ReasonTextIsNotASignal(t *testing.T) {
+	// A PDP denial whose Reason merely says "Trust evaluation failed" is a denial.
+	ev := &fakeTrustEvaluator{resp: &trust.EvaluationResponse{Decision: false, Reason: "Trust evaluation failed: not a real failure"}}
+	cfg := &config.Config{}
+	cfg.Trust.PDPURL = "http://pdp"
+	svc := trust.NewService(cfg, zap.NewNop(), func(string, time.Duration) (trust.TrustEvaluator, error) { return ev, nil })
+	ok, err := statusSignerTrust(svc, false)(context.Background(), "s", &trust.KeyMaterial{Type: "x5c", X5C: []string{"AA"}})
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}

@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +116,10 @@ type TrustInfo struct {
 	// Action names the AuthZEN action whose positive decision produced this
 	// result; set only by EvaluateStatusListSigner.
 	Action string `json:"action,omitempty"`
+	// EvaluationFailed is true when no decision could be had (transport or
+	// evaluation error), as opposed to the PDP answering "no". Trusted is
+	// false in both cases; callers must use this field, not Reason text.
+	EvaluationFailed bool `json:"evaluation_failed,omitempty"`
 }
 
 // EvaluatorFactory creates a TrustEvaluator for a given PDP endpoint.
@@ -312,12 +315,15 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 // ("AuthZEN actions used by go-wallet-backend").
 const StatusListSignerAction = "status-list-signer"
 
+// FrameworkNone is TrustInfo.Framework when no PDP endpoint is configured.
+const FrameworkNone = "none"
+
 // StatusListSignerFallbackAction is the second action tried when the
 // status-list-signer evaluation errors (and the fallback is enabled).
 const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
 
-// evalFailedReasonPrefix starts TrustInfo.Reason when the evaluation itself
-// failed (as opposed to the PDP answering "no").
+// evalFailedReasonPrefix starts TrustInfo.Reason (human-readable only) when
+// the evaluation itself failed; TrustInfo.EvaluationFailed is the signal.
 const evalFailedReasonPrefix = "Trust evaluation failed"
 
 // EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
@@ -362,10 +368,10 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 			zap.String("signer_trust_action", StatusListSignerAction))
 		return first, nil
 	}
-	if first.Framework == "none" {
+	if first.Framework == FrameworkNone {
 		return first, nil
 	}
-	if !strings.HasPrefix(first.Reason, evalFailedReasonPrefix) {
+	if !first.EvaluationFailed {
 		s.logger.Warn("status list signer denied",
 			zap.String("reason", "signer_untrusted_denied"),
 			zap.String("signer_trust_action", StatusListSignerAction),
@@ -387,7 +393,7 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 			zap.String("status_list_signer_error", first.Reason))
 		return second, nil
 	}
-	if !strings.HasPrefix(second.Reason, evalFailedReasonPrefix) {
+	if !second.EvaluationFailed {
 		return second, nil
 	}
 	return first, nil
@@ -434,7 +440,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		// This prevents automatic trust bypass when trust evaluation is not properly set up
 		return &TrustInfo{
 			Trusted:   false,
-			Framework: "none",
+			Framework: FrameworkNone,
 			Reason:    "Trust evaluation not configured - no PDP endpoint available",
 		}, nil
 	}
@@ -512,9 +518,10 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			zap.String(logLabel, subjectID),
 			zap.Error(err))
 		return &TrustInfo{
-			Trusted:   false,
-			Framework: "authzen",
-			Reason:    evalFailedReasonPrefix + ": " + err.Error(),
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + err.Error(),
+			EvaluationFailed: true,
 		}, nil
 	}
 

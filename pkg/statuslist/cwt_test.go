@@ -33,6 +33,7 @@ type cwtOpts struct {
 	values    map[int]int
 	typ       any // default "application/statuslist+cwt"; nil-able via noTyp
 	noTyp     bool
+	typUnprot bool // typ only in the unprotected header
 	noX5Chain bool
 	x5cInUnp  bool // put x5chain in the unprotected header
 	untagged  bool
@@ -119,7 +120,11 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 		if o.typ == nil {
 			o.typ = "application/statuslist+cwt"
 		}
-		prot[coseHdrTyp] = o.typ
+		if o.typUnprot {
+			unprot[coseHdrTyp] = o.typ
+		} else {
+			prot[coseHdrTyp] = o.typ
+		}
 	}
 	if !o.noX5Chain {
 		chain := []any{selfSigned(t, o.key)}
@@ -236,6 +241,7 @@ func TestCWT_Rejections(t *testing.T) {
 		{"alg/key mismatch", cwtOpts{alg: coseAlgES384}, nil, "does not match alg", nil},
 		{"wrong typ", cwtOpts{typ: "application/cwt"}, nil, "typ", nil},
 		{"missing typ", cwtOpts{noTyp: true}, nil, "typ", nil},
+		{"typ only in unprotected header", cwtOpts{typUnprot: true}, nil, "typ", nil},
 		{"no key material", cwtOpts{noX5Chain: true}, nil, "", ErrNoSignerKey},
 		{"empty lst", cwtOpts{rawLst: []byte{}}, nil, "lst", nil},
 		{"garbage lst", cwtOpts{rawLst: []byte("not zlib")}, nil, "lst", nil},
