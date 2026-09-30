@@ -1560,23 +1560,40 @@ func (r *responseStash) totalActionsLocked() int {
 	return n
 }
 
-// dropFlow discards everything parked for flowID; called on flow teardown so
-// a finished flow's leftovers cannot linger for the life of the session.
+// dropFlow discards everything parked for flowID - queued actions and the
+// sign/match responses addressed to it; called on flow teardown so a finished
+// flow's leftovers cannot linger for the life of the session (and, for the
+// bounded sign/match maps, eventually fill them).
 func (r *responseStash) dropFlow(flowID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.actions, flowID)
+	for id, m := range r.signs {
+		if m.FlowID == flowID {
+			delete(r.signs, id)
+		}
+	}
+	for id, m := range r.matches {
+		if m.FlowID == flowID {
+			delete(r.matches, id)
+		}
+	}
 }
 
-// removeFlow unregisters flow (if flowID still maps to it) and clears the
-// flow's parked actions.
+// removeFlow unregisters flow (if flowID still maps to it) and clears what
+// was parked for it: actions and sign/match responses. The cleanup only runs
+// when this flow instance is the registered one, so a stale flow's teardown
+// cannot purge the entries of a replacement that reuses the same ID.
 func (s *Session) removeFlow(flowID string, flow *Flow) {
 	s.flowsMu.Lock()
-	if s.flows[flowID] == flow {
+	current := s.flows[flowID] == flow
+	if current {
 		delete(s.flows, flowID)
 	}
 	s.flowsMu.Unlock()
-	s.stash.dropFlow(flowID)
+	if current {
+		s.stash.dropFlow(flowID)
+	}
 }
 
 // takeAction removes and returns the oldest parked action for flowID that is

@@ -168,3 +168,61 @@ func TestSession_RemoveFlowClearsStash(t *testing.T) {
 	assert.NotContains(t, s.stash.actions, "a", "finished flow's stash must be dropped")
 	assert.Contains(t, s.stash.actions, "b")
 }
+
+func TestSession_RemoveFlowClearsSignAndMatchStash(t *testing.T) {
+	s := &Session{flows: map[string]*Flow{}}
+	f1, f2 := &Flow{ID: "a"}, &Flow{ID: "b"}
+	s.flows["a"], s.flows["b"] = f1, f2
+	s.stash.putSign(&SignResponseMessage{Message: Message{FlowID: "a", MessageID: "sa"}})
+	s.stash.putSign(&SignResponseMessage{Message: Message{FlowID: "b", MessageID: "sb"}})
+	s.stash.putMatch(&MatchResponseMessage{Message: Message{FlowID: "a", MessageID: "ma"}})
+	s.stash.putMatch(&MatchResponseMessage{Message: Message{FlowID: "b", MessageID: "mb"}})
+
+	s.removeFlow("a", f1)
+
+	s.stash.mu.Lock()
+	defer s.stash.mu.Unlock()
+	assert.NotContains(t, s.stash.signs, "sa")
+	assert.NotContains(t, s.stash.matches, "ma")
+	assert.Contains(t, s.stash.signs, "sb", "other flows' responses are kept")
+	assert.Contains(t, s.stash.matches, "mb")
+}
+
+// Repeated prompts across many short-lived flows must not fill the bounded
+// sign/match stash for good.
+func TestSession_SignMatchStashDoesNotFillAcrossFlows(t *testing.T) {
+	s := &Session{flows: map[string]*Flow{}}
+	for i := 0; i < 3*maxStashedResponses; i++ {
+		f := &Flow{ID: flowName(i)}
+		s.flows[f.ID] = f
+		s.stash.putSign(&SignResponseMessage{Message: Message{FlowID: f.ID, MessageID: "s" + f.ID}})
+		s.stash.putMatch(&MatchResponseMessage{Message: Message{FlowID: f.ID, MessageID: "m" + f.ID}})
+		s.removeFlow(f.ID, f)
+	}
+	s.stash.mu.Lock()
+	defer s.stash.mu.Unlock()
+	assert.Empty(t, s.stash.signs)
+	assert.Empty(t, s.stash.matches)
+}
+
+// A stale flow's teardown must not purge the stash of a replacement flow that
+// reuses the same ID.
+func TestSession_RemoveStaleFlowKeepsReplacementStash(t *testing.T) {
+	s := &Session{flows: map[string]*Flow{}}
+	old, repl := &Flow{ID: "a"}, &Flow{ID: "a"}
+	s.flows["a"] = repl
+	s.stashAction(&FlowActionMessage{Message: Message{FlowID: "a"}, Action: "x"})
+	s.stash.putSign(&SignResponseMessage{Message: Message{FlowID: "a", MessageID: "sa"}})
+	s.stash.putMatch(&MatchResponseMessage{Message: Message{FlowID: "a", MessageID: "ma"}})
+
+	s.removeFlow("a", old) // not the registered instance
+
+	s.flowsMu.RLock()
+	assert.Same(t, repl, s.flows["a"])
+	s.flowsMu.RUnlock()
+	s.stash.mu.Lock()
+	defer s.stash.mu.Unlock()
+	assert.Contains(t, s.stash.actions, "a")
+	assert.Contains(t, s.stash.signs, "sa")
+	assert.Contains(t, s.stash.matches, "ma")
+}
