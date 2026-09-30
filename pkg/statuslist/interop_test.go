@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net/http"
@@ -70,6 +71,12 @@ func x5cServiceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values
 		tok.Header["jwk"] = jwkOf(&key.PublicKey)
 	case "mismatch":
 		tok.Header["jwk"] = jwkOf(&newKey(t).PublicKey)
+	case "empty":
+		tok.Header["jwk"] = map[string]any{}
+	case "null":
+		tok.Header["jwk"] = nil
+	case "string":
+		tok.Header["jwk"] = "not-a-key"
 	}
 	s, err := tok.SignedString(key)
 	if err != nil {
@@ -174,24 +181,63 @@ func TestCheck_HeaderKeyPrecedence(t *testing.T) {
 	}
 }
 
+// A jwk header member that is present but empty, null or not a key is malformed
+// key material: the list is unverifiable and trust is never consulted.
+func TestCheck_PresentButMalformedJWKIsUnverifiable(t *testing.T) {
+	ctx := context.Background()
+	key := newKey(t)
+	for _, mode := range []string{"empty", "null", "string"} {
+		var uri string
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/statuslist+jwt")
+			tok, _ := x5cServiceToken(t, key, uri, map[int]int{1: 1}, mode)
+			_, _ = w.Write([]byte(tok))
+		}))
+		uri = srv.URL + "/lists/1"
+		called := false
+		c := NewChecker(srv.Client(), false, func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+			called = true
+			return true, nil
+		})
+		err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+		srv.Close()
+		if err == nil || errors.Is(err, ErrRevoked) || called {
+			t.Errorf("jwk %s: want unverifiable without a trust call, got %v (trust called %v)", mode, err, called)
+		}
+	}
+}
+
 func TestCheckJWKMatchesLeaf_Errors(t *testing.T) {
 	key := newKey(t)
 	_, km := x5cServiceToken(t, key, "https://x/1", nil, "")
-	jwk := jwkOf(&key.PublicKey)
-	if err := checkJWKMatchesLeaf(nil, km.X5C[0]); err != nil {
+	jwk, err := json.Marshal(jwkOf(&key.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := json.Marshal(jwkOf(&newKey(t).PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := km.X5C[0]
+	if err := checkJWKMatchesLeaf(nil, leaf); err != nil {
 		t.Errorf("absent jwk: %v", err)
 	}
-	if err := checkJWKMatchesLeaf(jwk, km.X5C[0]); err != nil {
+	if err := checkJWKMatchesLeaf(jwk, leaf); err != nil {
 		t.Errorf("matching jwk: %v", err)
+	}
+	if !errors.Is(checkJWKMatchesLeaf(other, leaf), errKeyMismatch) {
+		t.Error("other key must mismatch")
+	}
+	for name, raw := range map[string]string{
+		"empty object": `{}`, "null": `null`, "string": `"x"`, "array": `[]`,
+		"incomplete key": `{"kty":"EC"}`, "malformed": `{"kty":`,
+	} {
+		if checkJWKMatchesLeaf(json.RawMessage(raw), leaf) == nil {
+			t.Errorf("%s jwk must fail", name)
+		}
 	}
 	if checkJWKMatchesLeaf(jwk, "!!") == nil || checkJWKMatchesLeaf(jwk, base64.StdEncoding.EncodeToString([]byte("x"))) == nil {
 		t.Error("bad leaf must fail")
-	}
-	if checkJWKMatchesLeaf(map[string]any{"kty": "EC"}, km.X5C[0]) == nil {
-		t.Error("bad jwk must fail")
-	}
-	if checkJWKMatchesLeaf(map[string]any{"f": func() {}}, km.X5C[0]) == nil {
-		t.Error("unmarshalable jwk must fail")
 	}
 }
 

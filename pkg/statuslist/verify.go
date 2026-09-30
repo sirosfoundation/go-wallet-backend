@@ -277,8 +277,8 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 		return 0, nil, time.Time{}, errors.New("status list token is not a JWT")
 	}
 	var header struct {
-		Typ string         `json:"typ"`
-		JWK map[string]any `json:"jwk"`
+		Typ string          `json:"typ"`
+		JWK json.RawMessage `json:"jwk"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
 		return 0, nil, time.Time{}, fmt.Errorf("status list header: %w", err)
@@ -414,8 +414,12 @@ func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust
 
 // checkJWKMatchesLeaf requires a jwk header parameter, when present, to be the
 // public key of the x5c leaf certificate.
-func checkJWKMatchesLeaf(jwkParam map[string]any, leaf string) error {
-	if len(jwkParam) == 0 {
+//
+// jwkParam is the raw header member: nil means absent. A present member that is
+// null, empty, not an object or not a usable key is malformed key material and
+// makes the list unverifiable.
+func checkJWKMatchesLeaf(jwkParam json.RawMessage, leaf string) error {
+	if jwkParam == nil {
 		return nil
 	}
 	der, err := base64.StdEncoding.DecodeString(leaf)
@@ -426,12 +430,12 @@ func checkJWKMatchesLeaf(jwkParam map[string]any, leaf string) error {
 	if err != nil {
 		return fmt.Errorf("status list x5c leaf: %w", err)
 	}
-	b, err := json.Marshal(jwkParam)
-	if err != nil {
-		return err
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(jwkParam, &obj); err != nil || len(obj) == 0 {
+		return fmt.Errorf("status list jwk: not a non-empty JSON object")
 	}
 	var jwk jose.JSONWebKey
-	if err := jwk.UnmarshalJSON(b); err != nil {
+	if err := jwk.UnmarshalJSON(jwkParam); err != nil {
 		return fmt.Errorf("status list jwk: %w", err)
 	}
 	type equaler interface{ Equal(crypto.PublicKey) bool }
