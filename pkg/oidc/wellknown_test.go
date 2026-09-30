@@ -84,6 +84,11 @@ func TestNormalizeIssuerURL(t *testing.T) {
 		{"no path, trailing slash", "https://issuer.example.com/", "https://issuer.example.com"},
 		{"meaningful path, no trailing slash", "https://issuer.example.com/tenant", "https://issuer.example.com/tenant"},
 		{"meaningful path, trailing slash preserved", "https://issuer.example.com/tenant/", "https://issuer.example.com/tenant/"},
+		{"query ending in slash is preserved", "https://issuer.example.com/?redirect=https://client/", "https://issuer.example.com?redirect=https://client/"},
+		{"query without path", "https://issuer.example.com?redirect=https://client/", "https://issuer.example.com?redirect=https://client/"},
+		{"fragment ending in slash is preserved", "https://issuer.example.com/#frag/", "https://issuer.example.com#frag/"},
+		{"query and fragment on root path", "https://issuer.example.com/?a=b/#c/", "https://issuer.example.com?a=b/#c/"},
+		{"meaningful path keeps query", "https://issuer.example.com/tenant/?a=b/", "https://issuer.example.com/tenant/?a=b/"},
 		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
 	}
 	for _, tt := range tests {
