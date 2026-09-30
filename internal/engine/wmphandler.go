@@ -40,11 +40,12 @@ type WMPAdapter struct {
 	// bearerToken extracts the bearer credential from an HTTP request.
 	bearerToken func(*http.Request) string
 
-	mu               sync.RWMutex
-	peers            map[string]*wmpSession      // keyed by WMP session ID
-	resumptionTokens map[string]*resumptionEntry // token -> entry with session ID and expiry
-	eventBufs        map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
-	draining         bool                        // set by Drain/Close; new sessions and requests are refused
+	mu                sync.RWMutex
+	peers             map[string]*wmpSession      // keyed by WMP session ID
+	resumptionTokens  map[string]*resumptionEntry // token -> entry with session ID and expiry
+	eventBufs         map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	draining          bool                        // set by Drain/Close; new sessions and requests are refused
+	beforeCreateToken func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
 
 	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
 	// bearer token (see reserveSlot).
@@ -933,6 +934,22 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		a.closeSessionIfCurrent(sessionID, ws)
 	}()
 
+	if a.beforeCreateToken != nil {
+		a.beforeCreateToken(sessionID)
+	}
+	// Issue the token only while this exact peer is still installed: a
+	// revocation, replacement or close in the window since publication must
+	// fail the create rather than report success for a nonexistent session.
+	// This also surfaces a crypto/rand failure instead of an empty token.
+	token, ok := a.issueResumptionTokenIfCurrent(sessionID, ws)
+	if !ok {
+		a.logger.Warn("WMP session.create: session closed or token unavailable during creation", zap.String("session_id", sessionID))
+		a.closeSessionIfCurrent(sessionID, ws)
+		return wmpErrorBytes(req.ID, wmp.ErrInternalError, map[string]string{
+			"reason": "session closed during creation",
+		})
+	}
+
 	result := wmp.SessionCreateResult{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
@@ -940,21 +957,13 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		},
 		Capabilities:    negotiated,
 		Security:        params.Security,
-		ResumptionToken: a.generateResumptionToken(sessionID),
+		ResumptionToken: token,
 	}
 
 	return wmpResponseBytes(req.ID, result)
 }
 
-// generateResumptionToken creates a cryptographically random resumption token
-// and stores the token→sessionID mapping. Per spec §4.5.2, tokens MUST have
-// at least 128 bits of entropy and are rotated on each successful resume.
-func (a *WMPAdapter) generateResumptionToken(sessionID string) string {
-	token, _ := a.issueResumptionToken(sessionID, nil)
-	return token
-}
-
-// issueResumptionTokenIfCurrent issues a token for sessionID only if ws is
+// issueResumptionTokenIfCurrent issues a token (spec §4.5.2: >=128 bits of entropy, rotated on each resume) for sessionID only if ws is
 // still the installed peer, atomically with respect to CloseSession and
 // closeSessionIfCurrent (which remove the peer and its tokens under a.mu).
 func (a *WMPAdapter) issueResumptionTokenIfCurrent(sessionID string, ws *wmpSession) (string, bool) {
