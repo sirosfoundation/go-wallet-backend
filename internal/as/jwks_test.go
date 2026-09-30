@@ -80,21 +80,3 @@ func TestJWKSHandler_MultipleKeys(t *testing.T) {
 
 	assert.Len(t, jwks.Keys, 2)
 }
-
-func TestRegisterMetadataRoute(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	RegisterMetadataRoute(r.Group("/auth"), "https://as.example", "https://as.example/auth/.well-known/jwks.json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest("GET", "/auth"+MetadataPath, nil))
-	if w.Code != 200 {
-		t.Fatalf("got %d", w.Code)
-	}
-	var m map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
-		t.Fatal(err)
-	}
-	if m["issuer"] != "https://as.example" || m["jwks_uri"] != "https://as.example/auth/.well-known/jwks.json" {
-		t.Errorf("unexpected metadata %v", m)
-	}
-}

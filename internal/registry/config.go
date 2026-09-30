@@ -4,7 +4,6 @@ package registry
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -294,40 +293,6 @@ type JWTConfig struct {
 
 	// RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed)
 	RequireAuth bool `yaml:"require_auth" envconfig:"REQUIRE_AUTH"`
-
-	// ASURL is the Authorization Server's base URL (where the AS is mounted,
-	// e.g. https://wallet.example.com/auth). The registry discovers the AS
-	// issuer and jwks_uri from ASURL + /.well-known/oauth-authorization-server
-	// (RFC 8414 style; the metadata jwks_uri must be same-origin). While
-	// discovery has not succeeded, ES256 tokens are refused and discovery is
-	// retried with backoff; HMAC tokens keep working while legacy is enabled.
-	ASURL string `yaml:"as_url" envconfig:"AS_URL"`
-
-	// JWKSURL explicitly sets the AS JWKS endpoint and skips discovery. When
-	// set, ES256 (ES384/EdDSA) session tokens are verified against it.
-	JWKSURL string `yaml:"jwks_url" envconfig:"JWKS_URL"`
-
-	// ASIssuer explicitly sets the expected "iss" of AS-issued (ES256)
-	// tokens (the backend's as.issuer). With jwks_url and no as_issuer it
-	// defaults to Issuer; with discovery it defaults to the metadata issuer.
-	ASIssuer string `yaml:"as_issuer" envconfig:"AS_ISSUER"`
-
-	// Audiences lists accepted "aud" values for new-style (ES256) tokens.
-	// Defaults to ["wallet-registry"] when empty, so AS tokens minted for
-	// other services are refused. Legacy HMAC tokens carry the RP ID as "aud"
-	// and are never filtered by this list.
-	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
-
-	// LegacyEnabled controls whether HMAC (jwt.secret) tokens are accepted.
-	// Defaults to true when unset; false refuses HMAC. Mirror the backend's
-	// as.legacy.enabled.
-	LegacyEnabled *bool `yaml:"legacy_enabled" envconfig:"LEGACY_ENABLED"`
-}
-
-// legacyEnabled reports whether HMAC tokens are acceptable (a secret is
-// configured and legacy is not disabled).
-func (j JWTConfig) legacyEnabled() bool {
-	return j.Secret != "" && (j.LegacyEnabled == nil || *j.LegacyEnabled)
 }
 
 // LoggingConfig contains logging configuration
@@ -481,22 +446,7 @@ func (c *Config) Validate() error {
 		}
 		c.JWT.Secret = secret
 	}
-	for name, raw := range map[string]string{"jwt.jwks_url": c.JWT.JWKSURL, "jwt.as_url": c.JWT.ASURL} {
-		if raw == "" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return fmt.Errorf("%s must be an absolute http(s) URL", name)
-		}
-		if u.Scheme == "http" && !c.HTTPClient.AllowsPlaintext() {
-			return fmt.Errorf("%s must use https (set http_client.allow_http for local development)", name)
-		}
-	}
-	if c.JWT.RequireAuth && c.JWT.JWKSURL == "" && c.JWT.ASURL == "" && c.JWT.LegacyEnabled != nil && !*c.JWT.LegacyEnabled {
-		return fmt.Errorf("JWT authentication is required but jwt.legacy_enabled is false and neither jwt.as_url nor jwt.jwks_url is set: no token could ever validate")
-	}
-	if c.JWT.RequireAuth && c.JWT.Secret == "" && c.JWT.JWKSURL == "" && c.JWT.ASURL == "" {
+	if c.JWT.RequireAuth && c.JWT.Secret == "" {
 		return fmt.Errorf("JWT secret is required when authentication is required (set jwt.secret or jwt.secret_path)")
 	}
 

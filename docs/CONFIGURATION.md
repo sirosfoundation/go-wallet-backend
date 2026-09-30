@@ -438,11 +438,6 @@ Environment prefix: `REGISTRY_JWT`
 | `jwt.secret_path` | `REGISTRY_JWT_SECRET_PATH` | string | SecretPath is an alternative to Secret: path to a file containing the JWT secret. If both Secret and SecretPath are set, SecretPath takes precedence. |
 | `jwt.issuer` | `REGISTRY_JWT_ISSUER` | string | Issuer is the expected issuer claim in the JWT |
 | `jwt.require_auth` | `REGISTRY_JWT_REQUIRE_AUTH` | boolean | RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed) |
-| `jwt.as_url` | `REGISTRY_JWT_AS_URL` | string | ASURL is the Authorization Server's base URL (where the AS is mounted, e.g. https://wallet.example.com/auth). The registry discovers the AS issuer and jwks_uri from ASURL + /.well-known/oauth-authorization-server (RFC 8414 style; the metadata jwks_uri must be same-origin). While discovery has not succeeded, ES256 tokens are refused and discovery is retried with backoff; HMAC tokens keep working while legacy is enabled. |
-| `jwt.jwks_url` | `REGISTRY_JWT_JWKS_URL` | string | JWKSURL explicitly sets the AS JWKS endpoint and skips discovery. When set, ES256 (ES384/EdDSA) session tokens are verified against it. |
-| `jwt.as_issuer` | `REGISTRY_JWT_AS_ISSUER` | string | ASIssuer explicitly sets the expected "iss" of AS-issued (ES256) tokens (the backend's as.issuer). With jwks_url and no as_issuer it defaults to Issuer; with discovery it defaults to the metadata issuer. |
-| `jwt.audiences` | `REGISTRY_JWT_AUDIENCES` | string list | Audiences lists accepted "aud" values for new-style (ES256) tokens. Defaults to ["wallet-registry"] when empty, so AS tokens minted for other services are refused. Legacy HMAC tokens carry the RP ID as "aud" and are never filtered by this list. |
-| `jwt.legacy_enabled` | `REGISTRY_JWT_LEGACY_ENABLED` | boolean | LegacyEnabled controls whether HMAC (jwt.secret) tokens are accepted. Defaults to true when unset; false refuses HMAC. Mirror the backend's as.legacy.enabled. |
 
 ## registry.logging
 

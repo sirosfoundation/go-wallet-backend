@@ -5,7 +5,6 @@ import (
 	"crypto"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -183,13 +182,6 @@ func (m *ASModule) gateLimitMiddleware() gin.HandlerFunc {
 func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
-
-	// Metadata for issuer/jwks_uri discovery by separate processes (e.g. the
-	// registry). Needs the public base URL; without it the jwks_uri cannot
-	// be stated and the route is not registered.
-	if ext := strings.TrimRight(m.Config.ExternalURL, "/"); ext != "" {
-		RegisterMetadataRoute(auth.Group(""), m.TokenIssuer.issuer, ext+"/auth/.well-known/jwks.json")
-	}
 
 	// Passkey authentication (public, no auth — but tenant-scoped).
 	// Tenant comes from the validated X-Tenant-ID header, never from the
