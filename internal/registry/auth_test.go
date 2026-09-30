@@ -201,9 +201,11 @@ func (f fakeTenants) GetByID(_ context.Context, id domain.TenantID) (*domain.Ten
 	return &domain.Tenant{ID: id, Enabled: en}, nil
 }
 
-type fakeBlacklist struct{ revokedUser string }
+type fakeBlacklist struct{ revokedUser, revokedJTI string }
 
-func (fakeBlacklist) IsBlacklisted(context.Context, string) bool { return false }
+func (f fakeBlacklist) IsBlacklisted(_ context.Context, j string) bool {
+	return f.revokedJTI != "" && j == f.revokedJTI
+}
 func (f fakeBlacklist) IsUserRevoked(_ context.Context, u string) bool {
 	return f.revokedUser != "" && u == f.revokedUser
 }
@@ -227,6 +229,62 @@ func TestAuthMiddlewares_StrictWithTenantStoreAndBlacklist(t *testing.T) {
 	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": true}}
 	cfg.Blacklist = fakeBlacklist{revokedUser: "user-1"}
 	assert.Equal(t, http.StatusUnauthorized, probe(t, cfg, tok).status)
+}
+
+func TestAuthMiddlewares_JTIRevocation(t *testing.T) {
+	env := newAuthEnv(t)
+	future := time.Now().Add(time.Hour)
+	es := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", future) // jti-1
+	c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "tenant_id": "acme", "jti": "legacy-jti",
+		"exp": time.Now().Add(time.Hour).Unix()}
+	hs, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(testSecret))
+	require.NoError(t, err)
+	hs = "Bearer " + hs
+
+	for _, require := range []bool{true, false} {
+		cfg := AuthConfig{Validator: env.validator(t, true), RequireAuth: require, Logger: zap.NewNop(),
+			Blacklist: fakeBlacklist{revokedJTI: "jti-1"}}
+		r := probe(t, cfg, es)
+		assert.False(t, r.auth, "asymmetric jti revoked, strict=%v", require)
+		if require {
+			assert.Equal(t, http.StatusUnauthorized, r.status)
+		}
+		cfg.Blacklist = fakeBlacklist{revokedJTI: "legacy-jti"}
+		r = probe(t, cfg, hs)
+		assert.False(t, r.auth, "legacy jti revoked, strict=%v", require)
+		r = probe(t, cfg, es)
+		assert.True(t, r.auth, "other tokens unaffected, strict=%v", require)
+	}
+}
+
+func TestAuthMiddlewares_OptionalTenantAndUserChecks(t *testing.T) {
+	env := newAuthEnv(t)
+	tok := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(time.Hour))
+	cfg := AuthConfig{Validator: env.validator(t, true), Logger: zap.NewNop(),
+		Tenants: fakeTenants{enabled: map[string]bool{"acme": true}}}
+
+	r := probe(t, cfg, tok)
+	assert.Equal(t, http.StatusOK, r.status)
+	assert.True(t, r.auth)
+
+	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": false}}
+	r = probe(t, cfg, tok)
+	assert.Equal(t, http.StatusOK, r.status, "public request is never rejected")
+	assert.False(t, r.auth, "disabled tenant")
+
+	cfg.Tenants = fakeTenants{enabled: map[string]bool{}}
+	assert.False(t, probe(t, cfg, tok).auth, "unknown tenant")
+
+	// token without tenant_id is checked against the default tenant
+	noTen := "Bearer " + env.es256(t, []string{"wallet-registry"}, "", time.Now().Add(time.Hour))
+	cfg.Tenants = fakeTenants{enabled: map[string]bool{"default": true}}
+	assert.True(t, probe(t, cfg, noTen).auth)
+	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": true}}
+	assert.False(t, probe(t, cfg, noTen).auth)
+
+	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": true}}
+	cfg.Blacklist = fakeBlacklist{revokedUser: "user-1"}
+	assert.False(t, probe(t, cfg, tok).auth, "deleted user")
 }
 
 func TestAuthMiddlewares_Optional(t *testing.T) {

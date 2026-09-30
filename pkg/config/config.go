@@ -92,7 +92,7 @@ func retiredRegistryLayoutWarning(data []byte) string {
 		return ""
 	}
 	return fmt.Sprintf("config file has top-level key(s) %s from the retired standalone registry.yaml layout; "+
-		"they are ignored - move them under a `registry:` section (see docs/MIGRATION.md)", strings.Join(found, ", "))
+		"they are ignored - move them under a `registry:` section (see docs/REGISTRY_MIGRATION.md)", strings.Join(found, ", "))
 }
 
 // RegistryExplicit reports whether the registry section was explicitly

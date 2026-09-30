@@ -372,6 +372,13 @@ func setupRegistryConfig(cfg *config.Config, legacyPath string, standalone bool)
 	if err != nil {
 		return nil, err
 	}
+	// The overlay can change server settings (registry_port, TLS, CORS, ...)
+	// after LoadRegistryOnly validated the defaults: revalidate them.
+	if standalone {
+		if err := cfg.ValidateRegistryStandalone(); err != nil {
+			return warnings, err
+		}
+	}
 	if err := cfg.ValidateRegistry(); err != nil {
 		return warnings, err
 	}

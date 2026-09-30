@@ -11,7 +11,7 @@ the backend config and protected by the shared go-tokenauth validator
 
 | Release | Behaviour |
 |---------|-----------|
-| this release | `--registry-config` (default `configs/registry.yaml`), that file and `REGISTRY_*` variables still work as deprecated aliases: they are mapped onto `registry:` and a `DEPRECATED` warning names the new location. If the new `registry:` section (or `WALLET_REGISTRY_*`) is also set, the new section wins entirely and a second warning says the old configuration is ignored. `cmd/registry` and the `registry` Make targets are gone. |
+| this release | `--registry-config` (default `configs/registry.yaml`), that file and `REGISTRY_*` variables still work as deprecated aliases: they are mapped onto `registry:` and a `DEPRECATED` warning names the new location. Keys customised in the new `registry:` section (or `WALLET_REGISTRY_*`) win over the same keys in the deprecated configuration and a second warning lists the conflicting keys; keys left at their defaults are filled from the deprecated configuration. `cmd/registry` and `make build-registry` are gone; `make run-registry` and `make docker-build-registry` remain and now use the main binary. |
 | next release | the aliases and the `--registry-config` flag are removed. |
 
 ## Mapping

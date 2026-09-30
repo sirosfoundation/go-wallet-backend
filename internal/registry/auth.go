@@ -64,7 +64,7 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	}
 
 	if !cfg.RequireAuth {
-		return []gin.HandlerFunc{optionalAuth(cfg.Validator, logger)}
+		return []gin.HandlerFunc{optionalAuth(cfg, logger)}
 	}
 
 	tenants := cfg.Tenants
@@ -81,10 +81,41 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 				c.Abort()
 				return
 			}
+			// Per-jti revocation for every token type (go-tokenauth v0.4.0
+			// only applies its own checker to asymmetric tokens).
+			if cfg.Blacklist != nil && res.JTI != "" && cfg.Blacklist.IsBlacklisted(c.Request.Context(), res.JTI) {
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 			markAuthenticated(c, res)
 			c.Next()
 		},
 	}
+}
+
+// acceptedInOptionalMode applies the same tenant and revocation checks as the
+// strict chain; a failure downgrades the request to unauthenticated.
+func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, logger *zap.Logger) bool {
+	ctx := c.Request.Context()
+	if cfg.Blacklist != nil {
+		if (res.JTI != "" && cfg.Blacklist.IsBlacklisted(ctx, res.JTI)) || cfg.Blacklist.IsUserRevoked(ctx, res.UserID) {
+			logger.Debug("registry token revoked, continuing unauthenticated")
+			return false
+		}
+	}
+	if cfg.Tenants != nil {
+		tid := res.TenantID
+		if tid == "" {
+			tid = string(domain.DefaultTenantID)
+		}
+		t, err := cfg.Tenants.GetByID(ctx, domain.TenantID(tid))
+		if err != nil || t == nil || !t.Enabled {
+			logger.Debug("registry token tenant unknown or disabled, continuing unauthenticated", zap.String("tenant_id", tid))
+			return false
+		}
+	}
+	return true
 }
 
 func resultFrom(c *gin.Context) *claims.Result {
@@ -117,7 +148,8 @@ func markAuthenticated(c *gin.Context, res *claims.Result) {
 }
 
 // optionalAuth recognises valid tokens but never rejects a request.
-func optionalAuth(v *validator.Validator, logger *zap.Logger) gin.HandlerFunc {
+func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
+	v := cfg.Validator
 	return func(c *gin.Context) {
 		c.Set(string(AuthenticatedKey), false)
 
@@ -140,6 +172,10 @@ func optionalAuth(v *validator.Validator, logger *zap.Logger) gin.HandlerFunc {
 		if !audienceAllowed(res) {
 			logger.Debug("registry token audience not permitted, continuing unauthenticated",
 				zap.Strings("aud", res.Audience))
+			c.Next()
+			return
+		}
+		if !acceptedInOptionalMode(c, cfg, res, logger) {
 			c.Next()
 			return
 		}

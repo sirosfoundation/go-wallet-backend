@@ -125,6 +125,13 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-backend"})))
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+regHMAC(t)), "legacy HMAC accepted while enabled")
 
+	// Legacy HMAC from a different issuer is rejected (jwt.issuer is enforced).
+	badIss, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
+		"iss": "someone-else", "user_id": "u", "tenant_id": "acme",
+		"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+badIss))
+
 	// Legacy off: HMAC no longer accepted.
 	cfg.AS.Legacy.Enabled = false
 	p2, err := NewRegistryProvider(cfg, zap.NewNop())
@@ -182,6 +189,10 @@ func TestBuildTokenValidatorHelpers(t *testing.T) {
 	// Legacy HMAC is never validated against an empty key.
 	c.AS.Legacy.Enabled = true
 	c.JWT.Secret = ""
+	assert.Equal(t, []string{"jwt-iss"}, legacyIssuers(c))
+	c.JWT.Issuer = ""
+	assert.Nil(t, legacyIssuers(c))
+	c.JWT.Issuer = "wallet-backend"
 	v := buildTokenValidator(c, nil, nil)
 	_, err := v.Validate(context.Background(), regHMAC(t))
 	assert.Error(t, err)

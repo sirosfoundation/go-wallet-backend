@@ -82,7 +82,7 @@ jwt:
   issuer: "wallet-backend"
 
 # VCTM registry role (--mode=registry, or a role list including "registry").
-# Replaces the retired standalone registry.yaml; see docs/MIGRATION.md.
+# Replaces the retired standalone registry.yaml; see docs/REGISTRY_MIGRATION.md.
 # Server address, logging and CORS are the settings above. Authentication uses
 # the same as.* / jwt.* settings as the other roles.
 registry:

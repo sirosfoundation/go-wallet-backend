@@ -346,7 +346,8 @@ func TestApplyLegacyRegistryConfig_FileMappingStandalone(t *testing.T) {
 
 	// jwt block keeps validating HMAC tokens through the shared stack
 	assert.Equal(t, "0123456789abcdef0123456789abcdef", c.JWT.Secret)
-	assert.Equal(t, "legacy-issuer", c.AS.Issuer)
+	assert.Equal(t, "legacy-issuer", c.JWT.Issuer, "legacy HMAC issuer stays enforced")
+	assert.Equal(t, "", c.AS.Issuer)
 	assert.Contains(t, strings.Join(w, "\n"), "jwt")
 	assert.False(t, c.registryLegacyTolerateNoJWKS)
 
@@ -445,12 +446,33 @@ registry:
 	p := writeFile(t, dir, "registry.yaml", legacyRegistryYAML)
 	w, err := cfg.ApplyLegacyRegistryConfig(p, false)
 	require.NoError(t, err)
-	require.Len(t, w, 2)
+	require.NotEmpty(t, w)
 	assert.Contains(t, w[0], "DEPRECATED")
-	assert.Contains(t, w[1], "takes precedence")
-	assert.Equal(t, "/new/cache.json", cfg.Registry.Cache.Path)
-	assert.Equal(t, DefaultRegistryConfig().Source.URL, cfg.Registry.Source.URL, "legacy source is not merged in")
-	assert.False(t, cfg.Registry.RequireAuth)
+	assert.Contains(t, w[1], "registry.cache.path")
+	assert.Contains(t, w[1], "take precedence")
+	assert.Equal(t, "/new/cache.json", cfg.Registry.Cache.Path, "customised new key wins")
+	assert.Equal(t, "https://legacy.example.org/api/v1/schemas.json", cfg.Registry.Source.URL, "untouched key filled from legacy")
+}
+
+// The helper image always loads configs/config.registry.yaml, which contains a
+// registry: block; legacy REGISTRY_* variables must still apply for the keys
+// that block leaves at their defaults.
+func TestApplyLegacyRegistryConfig_HelperImageBundledConfig(t *testing.T) {
+	bundled, err := os.ReadFile(filepath.Join("..", "..", "configs", "config.registry.yaml"))
+	require.NoError(t, err)
+	p := writeFile(t, t.TempDir(), "config.registry.yaml", string(bundled))
+	cfg, err := LoadRegistryOnly(p)
+	require.NoError(t, err)
+	require.True(t, cfg.RegistryExplicit())
+
+	t.Setenv("REGISTRY_SOURCE_URL", "https://env.example.org/s.json")
+	t.Setenv("REGISTRY_RATE_LIMIT_UNAUTHENTICATED_RPM", "11")
+	w, err := cfg.ApplyLegacyRegistryConfig("", true)
+	require.NoError(t, err)
+	assert.Equal(t, "https://env.example.org/s.json", cfg.Registry.Source.URL)
+	assert.Equal(t, 11, cfg.Registry.RateLimit.UnauthenticatedRPM)
+	require.Len(t, w, 1, "no conflict: only the deprecation warning")
+	assert.Contains(t, w[0], "DEPRECATED")
 }
 
 func TestApplyLegacyRegistryConfig_NewEnvSectionWins(t *testing.T) {
@@ -462,7 +484,7 @@ func TestApplyLegacyRegistryConfig_NewEnvSectionWins(t *testing.T) {
 	p := writeFile(t, dir, "registry.yaml", legacyRegistryYAML)
 	w, err := cfg.ApplyLegacyRegistryConfig(p, true)
 	require.NoError(t, err)
-	assert.Contains(t, strings.Join(w, "\n"), "takes precedence")
+	assert.Contains(t, strings.Join(w, "\n"), "take precedence")
 	assert.Equal(t, "/newenv/c.json", cfg.Registry.Cache.Path)
 }
 

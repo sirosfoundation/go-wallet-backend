@@ -73,6 +73,15 @@ func TestSetupRegistryConfig(t *testing.T) {
 		assert.Contains(t, err.Error(), "as.external_url")
 	})
 
+	t.Run("deprecated overlay is revalidated (port 70000)", func(t *testing.T) {
+		cfg, err := config.LoadRegistryOnly("")
+		require.NoError(t, err)
+		old := write("badport.yaml", "server:\n  port: 70000\n")
+		_, err = setupRegistryConfig(cfg, old, true)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "registry_port")
+	})
+
 	t.Run("invalid registry section", func(t *testing.T) {
 		cfg, err := config.LoadRegistryOnly(write("c.yaml", "registry:\n  cache:\n    path: \"\"\n"))
 		require.NoError(t, err)

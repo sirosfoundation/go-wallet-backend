@@ -52,7 +52,18 @@ func buildTokenValidator(cfg *config.Config, audiences []string, rev revocation.
 			// Never validate HMAC tokens against an empty key.
 			Enabled:    cfg.AS.Legacy.Enabled && len(legacySecret) > 0,
 			HMACSecret: legacySecret,
+			// Legacy tokens are issued with jwt.issuer; without this
+			// go-tokenauth v0.4.0 accepts any issuer for a valid HMAC.
+			Issuers: legacyIssuers(cfg),
 		},
 		Revocation: rev,
 	})
+}
+
+// legacyIssuers returns the accepted issuers of legacy HMAC tokens: jwt.issuer.
+func legacyIssuers(cfg *config.Config) []string {
+	if cfg.JWT.Issuer == "" {
+		return nil
+	}
+	return []string{cfg.JWT.Issuer}
 }

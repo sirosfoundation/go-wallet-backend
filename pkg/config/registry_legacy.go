@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
@@ -57,7 +58,7 @@ func newLegacyRegistryFile() *legacyRegistryFile {
 //     configured, the new section wins and the deprecated configuration is
 //     ignored entirely, with a warning saying so.
 //   - Otherwise the deprecated settings are mapped onto Config.Registry (see
-//     docs/MIGRATION.md for the table). The old `jwt` block is not used for
+//     docs/REGISTRY_MIGRATION.md for the table). The old `jwt` block is not used for
 //     validation any more: jwt.require_auth becomes registry.require_auth, and
 //     jwt.secret / jwt.secret_path / jwt.issuer keep validating legacy HMAC
 //     tokens by mapping to the backend's jwt.* when those are unset.
@@ -103,18 +104,21 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 	warnings := []string{fmt.Sprintf(
 		"DEPRECATED: %s (--registry-config, configs/registry.yaml, REGISTRY_*) will be removed in the next release; "+
 			"move these settings to the `registry:` section of the backend config file (or WALLET_REGISTRY_* variables), "+
-			"see docs/MIGRATION.md", src)}
+			"see docs/REGISTRY_MIGRATION.md", src)}
 
-	if c.registryExplicit {
+	// Per key, the new registry section wins; keys it leaves at their
+	// defaults (for example the bundled helper-image config) are filled from
+	// the deprecated configuration.
+	var conflicts []string
+	mergeLegacyRegistry(reflect.ValueOf(&c.Registry).Elem(), reflect.ValueOf(&f.RegistryConfig).Elem(),
+		reflect.ValueOf(DefaultRegistryConfig()), "registry", &conflicts)
+	if len(conflicts) > 0 {
 		warnings = append(warnings, "both the new `registry:` section (or WALLET_REGISTRY_*) and the deprecated registry "+
-			"configuration are set: the new `registry:` section takes precedence and the deprecated configuration is ignored")
-		return warnings, nil
+			"configuration set "+strings.Join(conflicts, ", ")+": the new `registry:` values take precedence")
 	}
 
-	c.Registry = f.RegistryConfig
-
 	// jwt block: auth is now the shared go-tokenauth validator.
-	if f.JWT.RequireAuth {
+	if f.JWT.RequireAuth && !c.Registry.RequireAuth {
 		c.Registry.RequireAuth = true
 		if c.AS.ExternalURL == "" {
 			c.registryLegacyTolerateNoJWKS = true
@@ -136,10 +140,10 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 			if secret != "" && c.JWT.Secret == "" {
 				c.JWT.Secret = secret
 			}
-			if f.JWT.Issuer != "" && f.JWT.Issuer != "wallet-backend" && c.AS.Issuer == "" {
-				c.AS.Issuer = f.JWT.Issuer
+			if f.JWT.Issuer != "" && f.JWT.Issuer != "wallet-backend" {
+				c.JWT.Issuer = f.JWT.Issuer
 			}
-			warnings = append(warnings, "deprecated registry `jwt` block: secret and issuer are mapped to the backend jwt.secret / as.issuer "+
+			warnings = append(warnings, "deprecated registry `jwt` block: secret and issuer are mapped to the backend jwt.secret / jwt.issuer "+
 				"(legacy HMAC validation); the block itself is no longer used")
 		} else {
 			warnings = append(warnings, "deprecated registry `jwt` block is ignored: tokens are validated with the backend's "+
@@ -173,4 +177,30 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 		}
 	}
 	return warnings, nil
+}
+
+// mergeLegacyRegistry fills every leaf of dst that still has its default value
+// from legacy. Leaves the new configuration customised keep their value; when
+// legacy customised the same leaf too, its path is appended to conflicts.
+func mergeLegacyRegistry(dst, legacy, def reflect.Value, path string, conflicts *[]string) {
+	if dst.Kind() == reflect.Struct {
+		for i := 0; i < dst.NumField(); i++ {
+			if !dst.Field(i).CanSet() {
+				continue // unexported (compiled patterns)
+			}
+			name := strings.Split(dst.Type().Field(i).Tag.Get("yaml"), ",")[0]
+			if name == "" {
+				name = strings.ToLower(dst.Type().Field(i).Name)
+			}
+			mergeLegacyRegistry(dst.Field(i), legacy.Field(i), def.Field(i), path+"."+name, conflicts)
+		}
+		return
+	}
+	if reflect.DeepEqual(dst.Interface(), def.Interface()) {
+		dst.Set(legacy)
+		return
+	}
+	if !reflect.DeepEqual(legacy.Interface(), def.Interface()) && !reflect.DeepEqual(dst.Interface(), legacy.Interface()) {
+		*conflicts = append(*conflicts, path)
+	}
 }
