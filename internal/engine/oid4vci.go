@@ -183,15 +183,15 @@ type CredentialOffer struct {
 
 // IssuerMetadata represents OpenID4VCI issuer metadata
 type IssuerMetadata struct {
-	CredentialIssuer                  string                      `json:"credential_issuer"`
-	CredentialEndpoint                string                      `json:"credential_endpoint"`
-	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
-	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
-	NotificationEndpoint              string                      `json:"notification_endpoint,omitempty"`
-	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
-	AuthorizationServers              []string                    `json:"authorization_servers,omitempty"`
-	Display                           []IssuerDisplay             `json:"display,omitempty"`
-	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	CredentialIssuer                  string                   `json:"credential_issuer"`
+	CredentialEndpoint                string                   `json:"credential_endpoint"`
+	TokenEndpoint                     string                   `json:"token_endpoint,omitempty"`
+	NonceEndpoint                     string                   `json:"nonce_endpoint,omitempty"`
+	NotificationEndpoint              string                   `json:"notification_endpoint,omitempty"`
+	AuthorizationServer               string                   `json:"authorization_server,omitempty"`
+	AuthorizationServers              []string                 `json:"authorization_servers,omitempty"`
+	Display                           []IssuerDisplay          `json:"display,omitempty"`
+	CredentialConfigurationsSupported CredentialConfigurations `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
 	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
 	// Batch credential issuance configuration (OID4VCI §E.1)
@@ -267,7 +267,48 @@ type CredentialConfig struct {
 	Scope               string                 `json:"scope,omitempty"`
 	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
-	Claims              map[string]interface{} `json:"claims,omitempty"`
+	// Claims is the pre-1.0 location of claim metadata; 1.0 moved it under
+	// credential_metadata. Kept raw and unread so an issuer that publishes it
+	// in either shape (some send an array) does not fail the whole document (#370).
+	Claims json.RawMessage `json:"claims,omitempty"`
+}
+
+// CredentialConfigurations is credential_configurations_supported, decoded
+// one entry at a time.
+//
+// A configuration that does not match CredentialConfig is omitted. That
+// includes a format value that is not a string, and any other field in that
+// same object whose JSON type does not match (encoding/json rejects the
+// whole object once one field fails). The rest of the issuer metadata,
+// including every credential that does parse, is kept.
+type CredentialConfigurations map[string]CredentialConfig
+
+// UnmarshalJSON decodes each credential configuration independently.
+//
+// The map itself must be a JSON object. A document-level type error (an
+// array or a scalar in place of the map) is still returned, because there
+// is no individual credential to skip.
+func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		// Clear, as encoding/json does for a map, so a reused value never
+		// keeps the previous document's configurations.
+		*c = nil
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("credential_configurations_supported: %w", err)
+	}
+	parsed := make(CredentialConfigurations, len(raw))
+	for id, entry := range raw {
+		var cfg CredentialConfig
+		if err := json.Unmarshal(entry, &cfg); err != nil {
+			continue
+		}
+		parsed[id] = cfg
+	}
+	*c = parsed
+	return nil
 }
 
 // CredentialDisplay represents credential display information
@@ -1270,6 +1311,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
+	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
 
 	// Look up registered issuer record from backend storage when a lookup is wired.
 	// Errors are non-fatal: the issuer may simply not be registered in this tenant.
@@ -1309,6 +1351,38 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	return &metadataResult{Metadata: &metadata, Validated: result.Validated, RegisteredIssuer: registeredIssuer}, nil
 }
 
+// logIgnoredCredentialConfigurations reports configurations that were present
+// in the resolved document but dropped because they could not be decoded.
+// A broken credential is ignored so issuance can continue with the others;
+// the warning is the only record of what was left out.
+func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]interface{}, parsed CredentialConfigurations) {
+	if h.Logger == nil {
+		return
+	}
+	rawConfigs, ok := source["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for id, entry := range rawConfigs {
+		if _, kept := parsed[id]; kept {
+			continue
+		}
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			h.Logger.Warn("ignoring credential configuration with a broken format",
+				zap.String("credential_configuration_id", id),
+				zap.Error(err))
+			continue
+		}
+		var cfg CredentialConfig
+		if err := json.Unmarshal(encoded, &cfg); err != nil {
+			h.Logger.Warn("ignoring credential configuration with a broken format",
+				zap.String("credential_configuration_id", id),
+				zap.Error(err))
+		}
+	}
+}
+
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
@@ -1331,8 +1405,19 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 		}
 		directResult, err := h.TrustSvc.EvaluateIssuer(evalCtx, issuer, trustEndpoint, keyMaterial)
 		if err != nil {
-			h.Logger.Warn("Server-side issuer trust evaluation failed, falling back to frontend",
+			// A PDP is configured but the evaluation call itself errored (e.g.
+			// evaluator construction failure). This must fail closed: never
+			// fall back to client-asserted (frontend) trust evaluation when a
+			// PDP was supposed to be authoritative.
+			h.Logger.Error("Server-side issuer trust evaluation errored, failing closed",
+				zap.String("issuer", issuer),
 				zap.Error(err))
+			info := &TrustInfo{
+				Trusted:   false,
+				Framework: "none",
+				Reason:    "issuer trust evaluation error",
+			}
+			return info, fmt.Errorf("untrusted issuer %s: trust evaluation error: %w", issuer, err)
 		} else if directResult != nil {
 			info := &TrustInfo{
 				Trusted:      directResult.Trusted,
@@ -1371,7 +1456,9 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 	}
 
 	// Fallback: frontend-mediated trust evaluation (legacy path).
-	// Used when no issuer PDP is configured or server-side evaluation failed.
+	// Only reached when NO issuer PDP URL is configured at all (permissive
+	// dev/no-PDP mode). A configured PDP that errors returns above and never
+	// falls through to here - see the fail-closed branch above.
 	return h.evaluateTrustViaFrontend(ctx, issuer, metadata, metadataValidated, keyMaterial)
 }
 
@@ -1393,6 +1480,19 @@ func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer st
 			"metadata_validated": metadataValidated,
 		},
 	}
+	if requiresResolution {
+		// Unlike OID4VP's decentralized_identifier:-prefixed client_id (see
+		// oid4vp.go's ResolutionSubjectID), an OID4VCI issuer identifier has
+		// no scheme prefix to strip in the first place - issuer already IS
+		// the bare DID whenever requiresResolution is true, so no
+		// didFromClientID-equivalent extraction is needed here. But
+		// ResolutionSubjectID is still required by TrustEvaluationRequest's
+		// documented contract whenever RequiresResolution is true (see
+		// messages.go), and a real frontend implementing that contract has
+		// no reason to fall back to SubjectID on its own - so it must be
+		// populated explicitly here too, not left empty.
+		trustReq.ResolutionSubjectID = issuer
+	}
 
 	// Convert key material for frontend (nil for DID schemes - frontend resolves)
 	if keyMaterial != nil {
@@ -1404,7 +1504,14 @@ func (h *OID4VCIHandler) evaluateTrustViaFrontend(ctx context.Context, issuer st
 	}
 
 	// Send trust evaluation request to frontend
-	// Skip validation for issuers - RequiresResolution doesn't require RequestJWT
+	// Skip the shared TrustEvaluationRequest.Validate() for issuers: unlike
+	// an OID4VP verifier, an OID4VCI issuer has no signed request object for
+	// the frontend to verify, so RequestJWT is never applicable here -
+	// Validate() would reject every DID issuer over a requirement that
+	// genuinely doesn't apply to this flow. ResolutionSubjectID is still
+	// populated above whenever RequiresResolution is true, though: that
+	// part of the contract does apply here too (a real frontend follows the
+	// same documented contract for both issuer and verifier requests).
 	if trustReq.SubjectID == "" {
 		return nil, errors.New("invalid trust evaluation request: SubjectID is required")
 	}

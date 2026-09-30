@@ -7,7 +7,6 @@ Accepted
 ## Context
 
 The wallet backend handles sensitive cryptographic operations including:
-- Password hashing
 - JWT signing and verification
 - WebAuthn credential management
 - DID key generation
@@ -16,7 +15,6 @@ The wallet backend handles sensitive cryptographic operations including:
 
 This project avoids implementing cryptographic primitives, favouring the reuse of existing, well-tested libraries:
 
-- **Password hashing**: `golang.org/x/crypto/bcrypt`
 - **JWT operations**: `github.com/golang-jwt/jwt/v5` and `github.com/lestrrat-go/jwx/v3`
 - **WebAuthn**: `github.com/go-webauthn/webauthn`
 - **DID operations**: Reuse from `github.com/dc4eu/vc` project

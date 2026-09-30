@@ -103,16 +103,16 @@ func inlineJWKS(t *testing.T, pub jose.JSONWebKey) map[string]interface{} {
 // TestResolve_NoSignedMetadata verifies that plain (unsigned) metadata is
 // returned as-is when signed_metadata is absent.
 func TestResolve_NoSignedMetadata(t *testing.T) {
-	meta := map[string]interface{}{
-		"credential_issuer": "https://issuer.example.com",
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-credential-issuer" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(meta) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+		})
 	}))
 	defer server.Close()
 
@@ -121,8 +121,59 @@ func TestResolve_NoSignedMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
-	if got["credential_issuer"] != "https://issuer.example.com" {
+	if got["credential_issuer"] != server.URL {
 		t.Errorf("credential_issuer: got %v", got["credential_issuer"])
+	}
+}
+
+// TestResolve_CredentialIssuerMismatch verifies that a plain-JSON metadata
+// document whose credential_issuer claim does not match the requested issuer
+// URL is rejected (M-5 fix: bind unsigned metadata to the requested issuer).
+func TestResolve_CredentialIssuerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": "https://attacker.example.com",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for credential_issuer mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("expected 'does not match' in error, got: %v", err)
+	}
+}
+
+// TestResolve_CredentialIssuerMissing verifies that a plain-JSON metadata
+// document with no credential_issuer claim at all is rejected.
+func TestResolve_CredentialIssuerMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_endpoint": "https://issuer.example.com/credential",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for missing credential_issuer claim, got nil")
+	}
+	if !strings.Contains(err.Error(), "credential_issuer") {
+		t.Errorf("expected 'credential_issuer' in error, got: %v", err)
 	}
 }
 
@@ -406,10 +457,11 @@ func TestResolve_SignedMetadata_KIDSelection(t *testing.T) {
 
 func TestResolve_Cached(t *testing.T) {
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -427,9 +479,10 @@ func TestResolve_Cached(t *testing.T) {
 }
 
 func TestResolve_TrailingSlashStripped(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -496,14 +549,15 @@ func TestResolve_RejectsNonOKStatus(t *testing.T) {
 // JSON representation: the resolver retries once requesting unsigned JSON.
 func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
 	var attempts int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
 		if strings.HasPrefix(r.Header.Get("Accept"), "application/jwt") {
 			w.WriteHeader(http.StatusNotAcceptable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://issuer.example.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -518,7 +572,7 @@ func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
 	if res.Signed {
 		t.Error("fallback result must be reported as unsigned")
 	}
-	if res.Metadata["credential_issuer"] != "https://issuer.example.com" {
+	if res.Metadata["credential_issuer"] != server.URL {
 		t.Errorf("unexpected metadata: %v", res.Metadata)
 	}
 }
@@ -658,10 +712,14 @@ func TestResolve_FallbackDisabled_NoRetry(t *testing.T) {
 
 func TestResolve_CacheTTLExpiry(t *testing.T) {
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"call": calls}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+			"call":              calls,
+		})
 	}))
 	defer server.Close()
 
@@ -831,9 +889,10 @@ func TestResolveWithInfo_NotValidated_SignedWithoutEvaluator(t *testing.T) {
 // TestResolveWithInfo_NotValidated_UnsignedJSON verifies that ResolveWithInfo
 // reports Validated=false for plain unsigned JSON.
 func TestResolveWithInfo_NotValidated_UnsignedJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
