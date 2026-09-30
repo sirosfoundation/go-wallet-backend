@@ -46,8 +46,13 @@ type AuthProvider struct {
 }
 
 // NewAuthProvider creates a new auth route provider
+// newServices constructs the service aggregate. It is a variable so tests can
+// count constructions: every Services may own an HSM-backed wallet-provider
+// signer, so the backend role must build exactly one.
+var newServices = service.NewServices
+
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
@@ -319,7 +324,7 @@ type StorageProvider struct {
 
 // NewStorageProvider creates a new storage route provider
 func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *StorageProvider {
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &StorageProvider{
 		cfg:      cfg,
@@ -674,8 +679,11 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	var tv *tokenvalidator.Validator
 	var relayHandle *jwksRelay
 	if cfg.AS.Enabled {
-		services := service.NewServices(store, cfg, logger)
-		services.TokenBlacklist = authProvider.services.TokenBlacklist
+		// Reuse the auth provider's Services rather than building a second,
+		// unmanaged one: a separate NewServices would open its own
+		// wallet-provider PKCS#11 signer (HSM session pool) that nothing
+		// would ever stop. authProvider.Close() owns this object's lifetime.
+		services := authProvider.services
 		asModule, err = as.NewASModule(
 			context.Background(),
 			&cfg.AS,
@@ -1136,7 +1144,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key
 	// Attestation generation (registered unconditionally below) still

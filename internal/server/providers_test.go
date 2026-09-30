@@ -1755,3 +1755,43 @@ func TestRequireSessionAuthMechanism(t *testing.T) {
 		t.Errorf("AS enabled must be accepted: %v", err)
 	}
 }
+
+// Every service.Services may open its own wallet-provider PKCS#11 signer
+// (HSM session pool). The combined backend role with the AS enabled must
+// therefore construct exactly two (auth + storage), never a third, unmanaged
+// one for the AS module that nothing would Stop().
+func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	count := 0
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		count++
+		return orig(s, c, l)
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.ASModule() == nil {
+		t.Fatal("expected ASModule to be wired")
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 Services (auth + storage), got %d: an extra one leaks its HSM sessions", count)
+	}
+}
