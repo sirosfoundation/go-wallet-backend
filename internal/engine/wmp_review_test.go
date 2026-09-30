@@ -991,7 +991,9 @@ func TestWMP_Resume_DoesNotWaitForUnacknowledgedCall(t *testing.T) {
 
 	select {
 	case err := <-sendErr:
-		assert.Error(t, err, "the aborted call reports failure")
+		// The interrupted start is handed to the new peer, not reported as a
+		// failure that would end the parent flow.
+		assert.NoError(t, err, "the aborted call is reissued, not failed")
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocked send was not released by resume")
 	}
