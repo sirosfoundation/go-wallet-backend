@@ -328,14 +328,22 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
+	// As for login: inherit the registration token's iat so a cut-off landing
+	// between minting that token and storing this session is not outrun by a
+	// fresh CreatedAt.
+	authenticatedAt := tokengate.IssuedAt(resp.Token)
+	if authenticatedAt.IsZero() {
+		authenticatedAt = now
+	}
 	session := &Session{
-		JTI:       sessionID,
-		UserID:    resp.UUID,
-		TenantID:  resp.TenantID,
-		ACR:       "urn:siros:acr:passkey",
-		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
-		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		JTI:             sessionID,
+		UserID:          resp.UUID,
+		TenantID:        resp.TenantID,
+		ACR:             "urn:siros:acr:passkey",
+		MaxTAC:          TAC(h.cfg.DefaultMaxTAC),
+		CreatedAt:       now,
+		AuthenticatedAt: authenticatedAt,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
