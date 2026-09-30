@@ -1,6 +1,7 @@
 package as
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -150,12 +151,57 @@ func TestOpaqueSigner_FailClosed(t *testing.T) {
 }
 
 func TestEcdsaSigToRaw(t *testing.T) {
-	raw := make([]byte, 64)
-	got, err := ecdsaSigToRaw(raw, 32)
-	require.NoError(t, err)
-	assert.Equal(t, raw, got)
-
 	type rs struct{ R, S *big.Int }
+	mk := func(rb, sb int, rTop, sTop byte) []byte {
+		r := make([]byte, rb)
+		s := make([]byte, sb)
+		for i := range r {
+			r[i] = 0x11
+		}
+		for i := range s {
+			s[i] = 0x22
+		}
+		r[0], s[0] = rTop, sTop
+		der, err := asn1.Marshal(rs{new(big.Int).SetBytes(r), new(big.Int).SetBytes(s)})
+		require.NoError(t, err)
+		return der
+	}
+
+	// Every byte-length edge: short components (leading zeros stripped by DER),
+	// full-width, high bit set (DER adds a 0x00 pad byte).
+	for _, tc := range []struct {
+		name         string
+		rb, sb       int
+		rTop, sTop   byte
+		wantDERLen64 bool
+	}{
+		{"full width, high bits clear", 32, 32, 0x11, 0x22, false},
+		{"full width, high bit set", 32, 32, 0xF1, 0xE2, false},
+		{"r short", 20, 32, 0x11, 0x22, false},
+		{"s short", 32, 1, 0x11, 0x02, false},
+		{"both 29 bytes: DER is exactly 2*size", 29, 29, 0x11, 0x22, true},
+		{"both 1 byte", 1, 1, 0x05, 0x07, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			der := mk(tc.rb, tc.sb, tc.rTop, tc.sTop)
+			if tc.wantDERLen64 {
+				require.Equal(t, 64, len(der), "test vector must hit the ambiguous length")
+			}
+			raw, err := ecdsaSigToRaw(der, 32)
+			require.NoError(t, err)
+			require.Len(t, raw, 64)
+			var p rs
+			_, err = asn1.Unmarshal(der, &p)
+			require.NoError(t, err)
+			assert.Equal(t, 0, new(big.Int).SetBytes(raw[:32]).Cmp(p.R))
+			assert.Equal(t, 0, new(big.Int).SetBytes(raw[32:]).Cmp(p.S))
+		})
+	}
+
+	// A raw 64-byte r||s is not DER and must be rejected, not passed through.
+	_, err := ecdsaSigToRaw(bytes.Repeat([]byte{0x11}, 64), 32)
+	assert.Error(t, err)
+
 	der, _ := asn1.Marshal(rs{big.NewInt(0), big.NewInt(1)})
 	_, err = ecdsaSigToRaw(der, 32)
 	assert.Error(t, err)
@@ -164,11 +210,9 @@ func TestEcdsaSigToRaw(t *testing.T) {
 	assert.Error(t, err)
 	der, _ = asn1.Marshal(rs{big.NewInt(5), big.NewInt(7)})
 	_, err = ecdsaSigToRaw(append(der, 0), 32)
+	assert.Error(t, err, "trailing bytes")
+	_, err = ecdsaSigToRaw(nil, 32)
 	assert.Error(t, err)
-	got, err = ecdsaSigToRaw(der, 32)
-	require.NoError(t, err)
-	assert.Equal(t, byte(5), got[31])
-	assert.Equal(t, byte(7), got[63])
 }
 
 func TestNewConfiguredKeyManager(t *testing.T) {

@@ -249,6 +249,19 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// Standalone engine (no backend provider): build a JWKS-backed
+		// validator so session tokens work and as.legacy.enabled=false does not
+		// leave the handshake with no way to authenticate.
+		if backendProvider == nil {
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
+			if err != nil {
+				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
+			}
+			if sv != nil {
+				provider.SetTokenValidator(sv.Validator)
+				resources = append(resources, sv)
+			}
+		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
 		// during the WebSocket handshake too, on both the go-tokenauth and

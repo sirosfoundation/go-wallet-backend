@@ -299,16 +299,17 @@ func (o *opaqueSigner) SignPayload(payload []byte, alg jose.SignatureAlgorithm) 
 }
 
 // ecdsaSigToRaw converts an ASN.1 DER ECDSA signature (what crypto.Signer
-// returns) to fixed-width r||s. An input that is already exactly 2*size bytes
-// is taken as raw (a DER signature is never that length).
+// returns) to fixed-width r||s, left-padding r and s to size bytes. The input is
+// always parsed as DER and anything that is not exactly one valid DER
+// SEQUENCE of two positive INTEGERs is rejected: a raw r||s of length 2*size is
+// NOT accepted, because a valid DER signature can also be exactly 2*size bytes
+// (e.g. two 29-byte components for P-256) and the two cannot be told apart by
+// length.
 func ecdsaSigToRaw(sig []byte, size int) ([]byte, error) {
-	if len(sig) == 2*size {
-		return sig, nil
-	}
 	var parsed struct{ R, S *big.Int }
 	rest, err := asn1.Unmarshal(sig, &parsed)
 	if err != nil || len(rest) != 0 || parsed.R == nil || parsed.S == nil {
-		return nil, fmt.Errorf("as: malformed ECDSA signature from signer")
+		return nil, fmt.Errorf("as: malformed ECDSA signature from signer (expected ASN.1 DER)")
 	}
 	if parsed.R.Sign() <= 0 || parsed.S.Sign() <= 0 || parsed.R.BitLen() > size*8 || parsed.S.BitLen() > size*8 {
 		return nil, fmt.Errorf("as: ECDSA signature component out of range")

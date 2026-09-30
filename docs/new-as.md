@@ -295,6 +295,8 @@ The only switch is configuration. `as.legacy.enabled` defaults to `true`, so exi
 - Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (whether or not this process runs the AS) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/*`. These 410s sit before any OIDC gate, so legacy-mode requests get `legacy_tokens_disabled` rather than an OIDC error. Session-mode clients are unaffected.
 - One startup log line states whether legacy is enabled.
 
+A standalone engine (`--mode=engine`, no backend provider) builds its own JWKS-backed validator from `as.external_url` so ES256 session tokens work and legacy can be switched off; with `as.legacy.enabled=false` and no `as.external_url` it refuses to start instead of rejecting every connection.
+
 ### Audience semantics
 
 An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only. Legacy HMAC tokens carry the RP ID as `aud` and are never rejected by an audience list while legacy is enabled (signature, expiry and issuer are still checked). `RequireAudience` and the engine's `wallet-registry`/`wallet-backend` check follow the same rule.

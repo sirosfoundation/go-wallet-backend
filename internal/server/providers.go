@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -466,6 +467,47 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 // (#393).
 func (p *EngineProvider) Manager() *wsengine.Manager {
 	return p.manager
+}
+
+// StandaloneValidator is a token validator owned by a standalone engine
+// process; Close stops its JWKS refresh.
+type StandaloneValidator struct{ *tokenvalidator.Validator }
+
+// Close stops the background JWKS refresh.
+func (v StandaloneValidator) Close() error { v.Stop(); return nil }
+
+// NewStandaloneEngineTokenValidator builds the token validator for an engine
+// running without a backend provider (--mode=engine), where none is otherwise
+// wired. The JWKS location comes from as.external_url (the AS's public base
+// URL), so ES256 session tokens can be accepted and, with as.legacy.enabled
+// =false, the engine has a working handshake path. Without as.external_url
+// there is no JWKS: legacy must still be enabled (HMAC is then the only
+// mechanism), otherwise this returns an error so startup fails instead of
+// silently rejecting every connection. Returns (nil, nil) when no validator is
+// needed.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+	if cfg.AS.ExternalURL == "" {
+		if !cfg.LegacyEnabled() {
+			return nil, fmt.Errorf("standalone engine with as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections")
+		}
+		return nil, nil
+	}
+	issuer := cfg.AS.Issuer
+	if issuer == "" {
+		issuer = cfg.JWT.Issuer
+	}
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: strings.TrimRight(cfg.AS.ExternalURL, "/") + "/auth/.well-known/jwks.json",
+		Issuer:  issuer,
+		// Audiences are checked by the engine itself, for new-style tokens only.
+		Legacy: tokenvalidator.LegacyConfig{
+			Enabled:    cfg.LegacyEnabled(),
+			HMACSecret: []byte(cfg.JWT.Secret),
+		},
+	})
+	v.Start(context.Background())
+	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
+	return &StandaloneValidator{v}, nil
 }
 
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
