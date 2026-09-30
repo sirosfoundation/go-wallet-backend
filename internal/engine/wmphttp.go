@@ -51,7 +51,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, tenantID, tac, tokenID, err := a.manager.validateTokenID(token)
+	id, err := a.manager.validateTokenAuth(token)
 	if err != nil {
 		a.logger.Warn("WMP HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -70,7 +70,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	// Session ID from header (empty for session.create).
 	sessionID := r.Header.Get("Wmp-Session-Id")
 
-	caller := wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID, TAC: tac}
+	caller := wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
 
 	// For methods that target an existing session, verify ownership.
 	if sessionID != "" {
@@ -129,7 +129,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
-	userID, tenantID, tac, tokenID, err := a.manager.validateTokenID(token)
+	id, err := a.manager.validateTokenAuth(token)
 	if err != nil {
 		a.logger.Warn("WMP SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -143,7 +143,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the session belongs to the authenticated user.
-	if !a.verifySessionOwnership(sessionID, wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID}) {
+	if !a.verifySessionOwnership(sessionID, wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI}) {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
@@ -152,9 +152,9 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	// notifications of a session that may have been created with broader
 	// privileges than this token holds. The presented token must grant every
 	// capability the session was created with.
-	if !a.tokenCoversSession(sessionID, tac) {
+	if !a.tokenCoversSession(sessionID, id.TAC) {
 		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
-			zap.String("request_tac", string(tac)))
+			zap.String("request_tac", string(id.TAC)))
 		http.Error(w, "token lacks the session's capabilities", http.StatusForbidden)
 		return
 	}
@@ -251,7 +251,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 // tokenCoversSession reports whether a token with the given TAC may observe the
 // session: every capability the session was created with must be granted by
 // the token. A session created without a TAC (legacy auth) has nothing to
-// cover. A token with no TAC cannot read a session that has one.
+// cover. A token with no TAC (including a modern token with an empty TAC)
+// cannot read a session that has one.
 func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC) bool {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]

@@ -94,7 +94,11 @@ type Session struct {
 	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
 	// per-protocol check must treat it as a no-op, exactly like
 	// requireTACIfEnforced does for HTTP routes.
-	TAC         claims.TAC
+	TAC claims.TAC
+	// TACEnforced: the session was created by a modern token, so its TAC is
+	// authoritative even when empty (no permissions). False only for legacy
+	// tokens, which have no TAC concept.
+	TACEnforced bool
 	transport   SessionTransport
 	transportMu sync.RWMutex // guards transport reassignment during session resume
 	flows       map[string]*Flow
@@ -813,16 +817,40 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 // if the token carries none). The WMP adapter binds sessions to it so
 // anonymous callers (UserID == "") cannot address each other's sessions.
 func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
+	id, err := m.validateTokenAuth(tokenString)
+	return id.UserID, id.TenantID, id.TAC, id.JTI, err
+}
+
+// tokenIdentity is what validateTokenAuth learned about a bearer token.
+type tokenIdentity struct {
+	UserID, TenantID string
+	TAC              claims.TAC
+	JTI              string
+	// EnforceTAC reports whether the token's TAC is authoritative: true for
+	// every modern (go-tokenauth session-mode) token, including one whose TAC
+	// is empty - that means "no permissions", not "not applicable". Only a
+	// genuine legacy token (HMAC all-in-one, no TAC concept) is false.
+	EnforceTAC bool
+}
+
+// validateTokenAuth is validateTokenID that also reports token provenance
+// (see tokenIdentity.EnforceTAC).
+func (m *Manager) validateTokenAuth(tokenString string) (tokenIdentity, error) {
+	userID, tenantID, tac, jti, enforce, err := m.validateTokenFull(tokenString)
+	return tokenIdentity{UserID: userID, TenantID: tenantID, TAC: tac, JTI: jti, EnforceTAC: enforce}, err
+}
+
+func (m *Manager) validateTokenFull(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, enforceTAC bool, err error) {
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
 		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 		if err != nil {
-			return "", "", "", "", err
+			return "", "", "", "", false, err
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
 		if !result.HasAudience("wallet-registry", "wallet-backend") {
-			return "", "", "", "", errors.New("token audience not permitted for engine transport")
+			return "", "", "", "", false, errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
 		// shared Validator's own Revocation checker - see
@@ -833,10 +861,10 @@ func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, 
 		// revokedUsers (#403) - either one saying revoked is enough to
 		// reject.
 		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
-			return "", "", "", "", errors.New("token has been revoked")
+			return "", "", "", "", false, errors.New("token has been revoked")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, result.TAC, result.JTI, nil
+		return result.UserID, result.TenantID, result.TAC, result.JTI, result.Mode != claims.ModeLegacy, nil
 	}
 
 	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
@@ -851,7 +879,7 @@ func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, 
 	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
-		return "", "", "", "", err
+		return "", "", "", "", false, err
 	}
 
 	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
@@ -862,15 +890,15 @@ func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, 
 		}
 		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
-			return "", "", "", "", errors.New("invalid token claims: missing user_id or uuid")
+			return "", "", "", "", false, errors.New("invalid token claims: missing user_id or uuid")
 		}
 		if m.blacklist != nil {
 			ctx := context.Background()
 			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
-				return "", "", "", "", errors.New("token has been revoked")
+				return "", "", "", "", false, errors.New("token has been revoked")
 			}
 			if m.blacklist.IsUserRevoked(ctx, userID) {
-				return "", "", "", "", errors.New("token has been revoked")
+				return "", "", "", "", false, errors.New("token has been revoked")
 			}
 		}
 		// Checked unconditionally (unlike the m.blacklist block above,
@@ -878,13 +906,13 @@ func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, 
 		// engine's own revokedUsers works regardless of whether that
 		// optional feature is configured at all (#403).
 		if m.isUserRevoked(userID) {
-			return "", "", "", "", errors.New("token has been revoked")
+			return "", "", "", "", false, errors.New("token has been revoked")
 		}
 		jti, _ = mapClaims["jti"].(string)
-		return userID, tenantID, "", jti, nil
+		return userID, tenantID, "", jti, false, nil
 	}
 
-	return "", "", "", "", errors.New("invalid token")
+	return "", "", "", "", false, errors.New("invalid token")
 }
 
 func (m *Manager) getCapabilities() []string {

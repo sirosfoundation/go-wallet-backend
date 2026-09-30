@@ -213,3 +213,130 @@ func TestWMP_SSE_RequiresTokenCoveringSessionCapabilities(t *testing.T) {
 	assert.Equal(t, http.StatusOK, open(tokenWith("ir")).Code, "the creating capabilities are allowed")
 	assert.Equal(t, http.StatusOK, open(tokenWith("irw")).Code, "a superset is allowed")
 }
+
+// A modern token whose TAC is empty has NO permissions; it must not be
+// treated like a legacy token (which has no TAC concept) and skip the check.
+var tacModernEmpty = wmpCaller{EnforceTAC: true}
+
+func TestWMP_ModernEmptyTAC_RefusedOnEveryStateChangingMethod(t *testing.T) {
+	f := newTACMethodFixture(t)
+	f.a.mu.RLock()
+	h := f.a.peers[f.sid].handler
+	f.a.mu.RUnlock()
+	h.registerChildFlow("child-1", "f-i", "msg-1", "sign")
+	ctx := context.Background()
+
+	for _, action := range []string{"consent", "sign_response", "match_response"} {
+		body := wmpRequest("4", wmp.MethodFlowAction, wmp.FlowActionParams{
+			WMP: f.meta(), FlowID: "f-i", Action: action, Params: json.RawMessage(`{}`),
+		})
+		resp, err := f.a.HandleRPCAs(ctx, f.sid, tacModernEmpty, body)
+		require.NoError(t, err)
+		assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp), action)
+	}
+	assert.Empty(t, f.sess.actionCh)
+	assert.Empty(t, f.sess.signCh)
+	assert.Empty(t, f.sess.matchCh)
+
+	resp, err := f.a.HandleRPCAs(ctx, f.sid, tacModernEmpty,
+		wmpRequest("5", wmp.MethodFlowCancel, wmp.FlowCancelParams{WMP: f.meta(), FlowID: "f-i"}))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp))
+	assert.EqualValues(t, 0, f.handler.cancels.Load())
+
+	resp, err = f.a.HandleRPCAs(ctx, f.sid, tacModernEmpty, startFlowBody(f.sid, string(ProtocolOID4VCI), "f-new"))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp), "flow.start")
+
+	_, err = f.a.HandleRPCAs(ctx, f.sid, tacModernEmpty, wmpNotification(wmp.MethodFlowComplete,
+		wmp.FlowCompleteParams{WMP: f.meta(), FlowID: "child-1", Result: json.RawMessage(`{"jwt":"x"}`)}))
+	require.NoError(t, err)
+	assert.Empty(t, f.sess.signCh)
+	_, stillMapped := h.peekChildFlow("child-1")
+	assert.True(t, stillMapped)
+
+	events, err := f.a.Events(f.sid)
+	require.NoError(t, err)
+	_, err = f.a.HandleRPCAs(ctx, f.sid, tacModernEmpty, wmpNotification(wmp.MethodCredentialNotification,
+		wmp.CredentialNotificationParams{WMP: f.meta(), FlowID: "f-i", NotificationID: "n-1", Event: "credential_accepted"}))
+	require.NoError(t, err)
+	deadline := time.After(2 * time.Second)
+	for done := false; !done; {
+		select {
+		case ev := <-events:
+			done = strings.Contains(string(ev), "insufficient permissions")
+		case <-deadline:
+			t.Fatal("expected a rejected ack citing insufficient permissions")
+		}
+	}
+}
+
+// Legacy tokens (no TAC concept) are unaffected: only the session's own TAC
+// is consulted, so a legacy caller on a legacy session still works.
+func TestWMP_LegacyCaller_SkipsTACCheck(t *testing.T) {
+	f := newTACMethodFixture(t)
+	f.sess.TAC = "" // legacy session
+	f.sess.TACEnforced = false
+	resp, err := f.a.HandleRPCAs(context.Background(), f.sid, wmpCaller{},
+		wmpRequest("5", wmp.MethodFlowCancel, wmp.FlowCancelParams{WMP: f.meta(), FlowID: "f-i"}))
+	require.NoError(t, err)
+	var r wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &r))
+	assert.Nil(t, r.Error)
+	assert.EqualValues(t, 1, f.handler.cancels.Load())
+}
+
+// A session created by a modern token with an empty TAC is authoritative:
+// it can start nothing, even when the later request is also modern-empty.
+func TestWMP_ModernEmptyTAC_SessionCannotStartFlows(t *testing.T) {
+	f := newTACMethodFixture(t)
+	f.sess.TAC = ""
+	f.sess.TACEnforced = true
+	resp, err := f.a.HandleRPCAs(context.Background(), f.sid, wmpCaller{},
+		startFlowBody(f.sid, string(ProtocolOID4VCI), "f-x"))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp))
+}
+
+// End to end over HTTP: a real modern token with no tac claim is refused on
+// a broad session, on RPC and on SSE.
+func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+	tokenWith := func(tac string) string {
+		return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "u"},
+			TenantID: "t", TAC: claims.TAC(tac), ACR: "urn:siros:acr:passkey",
+		})
+	}
+	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.Auth.Token = tokenWith("ir") })
+	h := &blockingHandler{release: make(chan struct{})}
+	defer close(h.release)
+	m.RegisterFlowHandler(ProtocolOID4VCI, func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		return h, nil
+	})
+
+	post := func(tok string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, WMPRPCPath, strings.NewReader(string(startFlowBody(sid, string(ProtocolOID4VCI), "f-h"))))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Wmp-Session-Id", sid)
+		w := httptest.NewRecorder()
+		a.HandleWMPRPC(w, req)
+		return w
+	}
+	w := post(tokenWith(""))
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, w.Body.Bytes()))
+	w = post(tokenWith("ir"))
+	var r wmp.Response
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &r))
+	assert.Nil(t, r.Error)
+
+	req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer "+tokenWith(""))
+	sw := httptest.NewRecorder()
+	a.HandleWMPEvents(sw, req)
+	assert.Equal(t, http.StatusForbidden, sw.Code)
+}

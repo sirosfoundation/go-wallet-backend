@@ -412,14 +412,30 @@ type wmpCaller struct {
 	// the session was created, so a session cannot be driven with more
 	// privilege than the token presented now. Empty means legacy auth.
 	TAC claims.TAC
+	// EnforceTAC is the token's provenance: true for a modern token, whose
+	// TAC is authoritative even when empty (no permissions); false only for a
+	// genuine legacy token, which has no TAC concept. A non-empty TAC is
+	// always enforced.
+	EnforceTAC bool
 }
 
+// wmpCallerTACKey carries the request's wmpTACInfo in the context.
 type wmpCallerTACKey struct{}
+
+type wmpTACInfo struct {
+	TAC     claims.TAC
+	Enforce bool
+}
 
 // requestTAC returns the TAC of the token that authenticated the current
 // request (empty when none, i.e. legacy auth or an in-process call).
 func requestTAC(ctx context.Context) claims.TAC {
-	t, _ := ctx.Value(wmpCallerTACKey{}).(claims.TAC)
+	return requestTACInfo(ctx).TAC
+}
+
+// requestTACInfo returns the request token's TAC and whether it is enforced.
+func requestTACInfo(ctx context.Context) wmpTACInfo {
+	t, _ := ctx.Value(wmpCallerTACKey{}).(wmpTACInfo)
 	return t
 }
 
@@ -628,7 +644,7 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 	// Update activity timestamp for idle timeout tracking.
 	a.touchSession(sessionID)
 
-	return ws.peer.HandleRequestSync(context.WithValue(ctx, wmpCallerTACKey{}, caller.TAC), body)
+	return ws.peer.HandleRequestSync(context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""}), body)
 }
 
 // Events returns a channel of the session's outbound notifications, as the
@@ -780,6 +796,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	// Extract bearer token from auth object.
 	var userID, tenantID, tokenID string
 	var tac claims.TAC
+	var enforceTAC bool
 	if params.Auth != nil && params.Auth.Token != "" {
 		if params.Auth.Type != "" && params.Auth.Type != "bearer" {
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -787,7 +804,9 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 			})
 		}
 		var err error
-		userID, tenantID, tac, tokenID, err = a.manager.validateTokenID(params.Auth.Token)
+		var id tokenIdentity
+		id, err = a.manager.validateTokenAuth(params.Auth.Token)
+		userID, tenantID, tac, tokenID, enforceTAC = id.UserID, id.TenantID, id.TAC, id.JTI, id.EnforceTAC
 		if err != nil {
 			a.logger.Warn("WMP auth failed", zap.Error(err))
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -853,6 +872,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
+		TACEnforced:   enforceTAC,
 		transport:     wmpTransport,
 		flows:         make(map[string]*Flow),
 		logger:        a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
@@ -1369,16 +1389,18 @@ func (h *wmpEngineHandler) logger() *zap.Logger {
 // existing flow of that protocol just because it belongs to the same user.
 //
 // Both the TAC captured at session creation and the current request's TAC
-// must grant the permission; an empty TAC means legacy auth (no TAC concept)
-// and is not checked.
+// must grant the permission. A TAC is skipped only for a genuine legacy token
+// (no TAC concept); a modern token with an empty TAC has no permissions and
+// is refused.
 func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Protocol, logger *zap.Logger) *wmp.RPCError {
 	required, ok := requiredTACForProtocol[protocol]
 	if !ok {
 		return nil
 	}
-	reqTAC := requestTAC(ctx)
-	if (h.session.TAC != "" && !h.session.TAC.HasAll(required)) ||
-		(reqTAC != "" && !reqTAC.HasAll(required)) {
+	req := requestTACInfo(ctx)
+	reqTAC := req.TAC
+	if ((h.session.TACEnforced || h.session.TAC != "") && !h.session.TAC.HasAll(required)) ||
+		((req.Enforce || reqTAC != "") && !reqTAC.HasAll(required)) {
 		logger.Warn("Rejected WMP request - insufficient TAC",
 			zap.String("session_tac", string(h.session.TAC)),
 			zap.String("request_tac", string(reqTAC)),
