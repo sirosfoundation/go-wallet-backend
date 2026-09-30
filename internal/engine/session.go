@@ -31,23 +31,58 @@ var (
 	ErrTooManyPendingFlows = errors.New("too many pending flows")
 )
 
+// TokenBlacklistChecker is the subset of a token blacklist this package
+// needs to reject a revoked token during the WebSocket handshake - either
+// individually by jti (explicit logout) or in bulk for a user (account
+// deletion - see service.TokenBlacklist.RevokeUser). Mirrors
+// pkg/middleware.TokenBlacklistChecker's shape; *service.TokenBlacklist
+// satisfies this.
+//
+// validateToken's go-tokenauth branch relies on the shared
+// *tokenvalidator.Validator (see SetTokenValidator) already having its own
+// per-jti Revocation checker wired to the same blacklist instance (see
+// internal/server.blacklistRevocationChecker) - this field only adds the
+// user-level check that checker's interface can't express, and is the ONLY
+// revocation check at all for the legacy HMAC branch, which the shared
+// Validator never touches (#391 review, round 2: this handshake path was
+// found to bypass both TokenAuthMiddleware's own user-level check and, for
+// legacy tokens, revocation entirely).
+type TokenBlacklistChecker interface {
+	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
+}
+
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
 
 const (
-	// wsPingInterval is how often the server sends a WebSocket ping to the client.
-	// Must be shorter than any intermediate proxy/LB idle timeout (typically 60–120s).
-	wsPingInterval = 30 * time.Second
-
-	// wsPongTimeout is how long the server waits for a pong after sending a ping.
-	// If no pong arrives within pingInterval + pongTimeout, the read deadline fires
-	// and the connection is considered dead.
-	wsPongTimeout = 10 * time.Second
+	// defaultWSPingInterval/defaultWSPongTimeout are the fallback keepalive
+	// tunables used when config.ServerConfig.EngineWSPingInterval/
+	// EngineWSPongTimeout is unset (zero) - e.g. a Config built directly by a
+	// test rather than through config.Load(), which applies the real
+	// defaults. See EngineWSPingInterval's doc comment in pkg/config for why
+	// these particular numbers.
+	defaultWSPingInterval = 3 * time.Second
+	defaultWSPongTimeout  = 5 * time.Second
 
 	// maxConnections is the maximum concurrent WebSocket sessions allowed.
 	maxConnections = 10000
 )
+
+// wsKeepalive resolves this Manager's configured ping interval and pong
+// timeout, falling back to defaultWSPingInterval/defaultWSPongTimeout for
+// whichever one is unset - see their doc comment.
+func (m *Manager) wsKeepalive() (pingInterval, pongTimeout time.Duration) {
+	pingInterval, pongTimeout = m.cfg.Server.EngineWSPingInterval, m.cfg.Server.EngineWSPongTimeout
+	if pingInterval <= 0 {
+		pingInterval = defaultWSPingInterval
+	}
+	if pongTimeout <= 0 {
+		pongTimeout = defaultWSPongTimeout
+	}
+	return pingInterval, pongTimeout
+}
 
 // Session represents an authenticated session (WebSocket or HTTP+SSE)
 type Session struct {
@@ -80,6 +115,14 @@ type Session struct {
 
 	// stopPing signals the ping goroutine to exit.
 	stopPing chan struct{}
+
+	// pingInterval/pongTimeout are this session's resolved keepalive
+	// tunables (see Manager.wsKeepalive) - set once at session creation and
+	// used by pingLoop and the read-deadline resets around it, and reported
+	// to the client via HandshakeCompleteMessage.Config so both sides agree
+	// on the same cadence.
+	pingInterval time.Duration
+	pongTimeout  time.Duration
 }
 
 // Flow represents an active credential flow
@@ -126,6 +169,27 @@ type Manager struct {
 	// When set, validateToken uses it instead of direct HMAC parsing.
 	tokenValidator *tokenvalidator.Validator
 
+	// blacklist checks token/user revocation during the handshake (optional
+	// - see TokenBlacklistChecker's doc comment).
+	blacklist TokenBlacklistChecker
+
+	// revokedUsersMu guards revokedUsers.
+	revokedUsersMu sync.RWMutex
+
+	// revokedUsers is the engine's own, always-on record of users whose
+	// account has been deleted, populated by RevokeUser and consulted by
+	// isUserRevoked. Deliberately independent of blacklist/
+	// TokenBlacklistChecker: that checker no-ops entirely when the
+	// optional security.token_blacklist feature is configured disabled,
+	// which meant session-level closure/rejection at the engine used to
+	// silently stop working too whenever that unrelated feature flag was
+	// off (#403 - filed against #393/#399, now fixed by giving the engine
+	// this signal of its own rather than relying on an optional,
+	// separately-configured feature). TokenBlacklist remains the
+	// mechanism for token-level (HTTP) revocation; this is purely the
+	// engine's session-level one.
+	revokedUsers map[string]struct{}
+
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(sessions):
 	// sessions are only registered post-handshake, so counting only sessions
@@ -146,12 +210,22 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 		},
 		sessions:        make(map[string]*Session),
 		userIndex:       make(map[string]*Session),
+		revokedUsers:    make(map[string]struct{}),
 		flowHandlers:    make(map[Protocol]FlowHandlerFactory),
 		trustService:    NewTrustService(cfg, logger),
 		registryClient:  NewRegistryClient(cfg, logger),
-		trustCache:      NewTrustCache(1 * time.Hour),
+		trustCache:      NewTrustCache(cfg.Trust.VerifierCacheTTL()),
 		notificationSem: make(chan struct{}, maxConcurrentNotifications),
 		sessionStore:    NewMemorySessionStore(logger), // Default to memory
+	}
+	// Say so loudly. Running without the trust cache means every flow asks the
+	// PDP again, which is the point when testing trust configuration and a
+	// needless load on it otherwise - either way an operator should not have
+	// to read the config to find out which mode this process is in.
+	if ttl := cfg.Trust.VerifierCacheTTL(); ttl <= 0 {
+		m.logger.Warn("Verifier trust cache is DISABLED; every flow will re-evaluate with the PDP")
+	} else {
+		m.logger.Debug("Verifier trust cache enabled", zap.Duration("ttl", ttl))
 	}
 	return m
 }
@@ -174,6 +248,14 @@ func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 // SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
+}
+
+// SetTokenBlacklist sets the token blacklist consulted during the
+// WebSocket handshake - see TokenBlacklistChecker's doc comment for what
+// this covers versus what the shared *tokenvalidator.Validator already
+// checks on its own.
+func (m *Manager) SetTokenBlacklist(b TokenBlacklistChecker) {
+	m.blacklist = b
 }
 
 // RegisterFlowHandler registers a handler factory for a protocol
@@ -263,9 +345,10 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// The pong handler resets the read deadline each time the client responds,
 	// keeping the connection alive across idle periods. Browser WebSocket
 	// implementations respond to protocol-level pings automatically.
-	_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+	pingInterval, pongTimeout := m.wsKeepalive()
+	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
 	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
 		return nil
 	})
 
@@ -289,10 +372,18 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		closeCh:       make(chan struct{}, 1), // Buffered to prevent deadlock
 		stopPing:      make(chan struct{}),
 		notifications: newNotificationContextStore(),
+		pingInterval:  pingInterval,
+		pongTimeout:   pongTimeout,
 	}
 
-	// Register session
-	m.registerSession(session)
+	// Register session. A rejection here means the user was revoked in the
+	// narrow window between validateToken's own check above and this call -
+	// registerSession has already closed the connection itself in that
+	// case, so there is nothing left to unregister.
+	if !m.registerSession(session) {
+		session.logger.Warn("Handshake rejected: user revoked between token validation and session registration")
+		return
+	}
 	defer m.unregisterSession(session)
 
 	// Send handshake complete
@@ -304,6 +395,9 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		},
 		SessionID:    session.ID,
 		Capabilities: capabilities,
+		Config: SessionConfig{
+			PingIntervalMs: pingInterval.Milliseconds(),
+		},
 	}
 	if err := session.Send(&completeMsg); err != nil {
 		m.logger.Error("Failed to send handshake complete", zap.Error(err))
@@ -312,7 +406,8 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 
 	session.logger.Info("Session established",
 		zap.String("session_id", session.ID),
-		zap.Strings("capabilities", capabilities))
+		zap.Strings("capabilities", capabilities),
+		zap.Duration("ping_interval", pingInterval))
 
 	// Start ping keepalive goroutine
 	go session.pingLoop()
@@ -321,7 +416,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	m.handleSession(session)
 }
 
-// pingLoop sends WebSocket ping frames at wsPingInterval.
+// pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
 	wst, ok := s.transport.(*wsTransport)
@@ -329,14 +424,14 @@ func (s *Session) pingLoop() {
 		return // non-WebSocket transports don't need ping/pong
 	}
 
-	ticker := time.NewTicker(wsPingInterval)
+	ticker := time.NewTicker(s.pingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			wst.sendMu.Lock()
-			err := wst.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsPongTimeout))
+			err := wst.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
 			wst.sendMu.Unlock()
 			if err != nil {
 				return // connection is dead; ReadMessage will surface the error
@@ -578,8 +673,53 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
-func (m *Manager) registerSession(session *Session) {
+// registerSession adds session to the manager's live-session bookkeeping
+// and returns true, unless userID was revoked between validateToken's own
+// check (in handleNewConnection, immediately before this call) and this
+// call actually acquiring the lock - in which case it closes the
+// connection itself and returns false without registering anything.
+//
+// That recheck closes a narrow TOCTOU window found in review: DeleteUser's
+// session cleaner (see service.UserService.DeleteUser and
+// Manager.CloseUserSessions) only ever closes sessions already present in
+// m.sessions at the moment it runs. Without this recheck, a handshake that
+// passed validateToken just before the user was deleted, but that only
+// finishes registering after CloseUserSessions's scan already ran, would
+// become a permanent zombie - immune to every check #393 exists to add.
+// Rechecking here, atomically with insertion under the same sessionsMu
+// that CloseUserSessions scans under, closes that gap: any session that
+// registers after the revocation is caught here; any that registered
+// before it is caught by the scan that necessarily follows (see
+// service.UserService.DeleteUser, which revokes before it cleans up
+// sessions).
+//
+// This recheck (and validateToken's identical one) used to only have a
+// blacklist to consult when m.blacklist was set at all, and
+// TokenBlacklist.IsUserRevoked always reports false when the optional
+// security.token_blacklist feature is configured disabled - meaning
+// nothing anywhere in the engine could distinguish a deleted user's
+// handshake from anyone else's whenever that unrelated feature flag was
+// off (#403, filed against an earlier version of this fix). Also
+// consulting m.isUserRevoked - the engine's own always-on signal, set by
+// RevokeUser regardless of that feature flag - closes that gap
+// unconditionally: registering after RevokeUser marks the user revoked is
+// always caught here (RevokeUser sets revokedUsers before it scans for
+// and closes existing sessions, so there's no ordering to get wrong);
+// registering before it is caught by that same scan.
+func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
+
+	if session.UserID != "" {
+		revoked := m.isUserRevoked(session.UserID)
+		if !revoked && m.blacklist != nil {
+			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
+		}
+		if revoked {
+			m.sessionsMu.Unlock()
+			session.closeWithReason("account deleted")
+			return false
+		}
+	}
 	defer m.sessionsMu.Unlock()
 
 	// Close existing session for this user (skip for anonymous sessions)
@@ -613,6 +753,7 @@ func (m *Manager) registerSession(session *Session) {
 			m.logger.Warn("Failed to persist session", zap.Error(err))
 		}
 	}
+	return true
 }
 
 func (m *Manager) unregisterSession(session *Session) {
@@ -631,7 +772,14 @@ func (m *Manager) unregisterSession(session *Session) {
 		_ = m.sessionStore.Delete(context.Background(), session.ID)
 	}
 
-	session.logger.Info("Session closed")
+	// "session" (session.logger's bound field) is the user's short ID, not
+	// this session's own - deliberately shared across every reconnect for
+	// that user so log lines from the same user grep together. Without an
+	// explicit session_id here (unlike "Session established", which already
+	// logs one), two rapid reconnects for one user produce two "Session
+	// closed" lines that are indistinguishable from each other, which read
+	// as a session-eviction bug when reconnects were simply frequent.
+	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
 // validateToken authenticates tokenString and returns its identity.
@@ -651,11 +799,25 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		if !result.HasAudience("wallet-registry", "wallet-backend") {
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
+		// Per-jti revocation is already enforced inside Validate itself (the
+		// shared Validator's own Revocation checker - see
+		// internal/server.blacklistRevocationChecker); user-level revocation
+		// is not, since that checker's interface only ever sees a jti (see
+		// #391 review, round 2). Checked against both the optional
+		// TokenBlacklist feature and the engine's own always-on
+		// revokedUsers (#403) - either one saying revoked is enough to
+		// reject.
+		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
+			return "", "", "", errors.New("token has been revoked")
+		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
-	// Legacy path: direct HMAC validation
+	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
+	// above, nothing else in this path ever checks revocation at all, so
+	// both checks below are needed, not just the user-level one (#391
+	// review, round 2).
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
@@ -676,6 +838,22 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
+		}
+		if m.blacklist != nil {
+			ctx := context.Background()
+			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
+				return "", "", "", errors.New("token has been revoked")
+			}
+			if m.blacklist.IsUserRevoked(ctx, userID) {
+				return "", "", "", errors.New("token has been revoked")
+			}
+		}
+		// Checked unconditionally (unlike the m.blacklist block above,
+		// which is skipped entirely when no blacklist is wired): the
+		// engine's own revokedUsers works regardless of whether that
+		// optional feature is configured at all (#403).
+		if m.isUserRevoked(userID) {
+			return "", "", "", errors.New("token has been revoked")
 		}
 		return userID, tenantID, "", nil
 	}
@@ -747,6 +925,131 @@ func (m *Manager) CleanupSessions(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	return m.sessionStore.Cleanup(ctx)
+}
+
+// DeleteByUser implements service.SessionCleaner (duck-typed - engine must
+// not import package service): it permanently marks userID revoked for
+// this engine process (see RevokeUser) and closes every live WebSocket
+// session it currently holds for that user, e.g. because the account was
+// just deleted.
+//
+// This is a separate cleaner from the persistent SessionStore's own
+// DeleteByUser (see cmd/server/main.go, which wires both): that one only
+// ever purged the persisted SessionData bookkeeping record, never the
+// *websocket.Conn* itself, so an already-established connection for a
+// deleted user stayed open and usable until it disconnected on its own
+// (#393 - found as a follow-up to #391, which closed the equivalent gap
+// for new handshakes via IsUserRevoked, but not for connections that were
+// already past the handshake).
+//
+// Sessions live on other backend replicas (Redis-backed horizontal
+// scaling) are out of scope here: only this process's own live connections
+// can be closed directly.
+func (m *Manager) DeleteByUser(_ context.Context, userID string) error {
+	m.RevokeUser(userID)
+	return nil
+}
+
+// RevokeUser permanently marks userID revoked for this engine process:
+// every current and future WebSocket session for that user is rejected
+// from now on (see isUserRevoked, consulted by validateToken and
+// registerSession), and any of the user's sessions already live in this
+// process are closed immediately (see CloseUserSessions). This works
+// regardless of whether the optional security.token_blacklist feature is
+// configured at all - see revokedUsers' doc comment for why this exists
+// as the engine's own signal rather than being derived from
+// TokenBlacklistChecker (#403).
+//
+// Like TokenBlacklist's own userRevocations map, this entry is never
+// expired: user IDs (domain.NewUserID()) are never reissued after
+// deletion, so there is no "issued before/after the revocation" window to
+// reason about - the revocation is simply permanent for that ID for the
+// life of this process, and the map only grows by one entry per account
+// ever deleted, which is acceptable given how small and infrequent that
+// is.
+func (m *Manager) RevokeUser(userID string) {
+	if userID == "" {
+		return
+	}
+
+	m.revokedUsersMu.Lock()
+	m.revokedUsers[userID] = struct{}{}
+	m.revokedUsersMu.Unlock()
+
+	m.CloseUserSessions(userID, "account deleted")
+}
+
+// isUserRevoked reports whether userID was marked revoked via RevokeUser.
+// Unlike TokenBlacklistChecker.IsUserRevoked, this never depends on any
+// optional feature configuration - see revokedUsers' doc comment.
+func (m *Manager) isUserRevoked(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	m.revokedUsersMu.RLock()
+	defer m.revokedUsersMu.RUnlock()
+	_, revoked := m.revokedUsers[userID]
+	return revoked
+}
+
+// CloseUserSessions closes every live session belonging to userID (sending
+// a close frame with reason where the connection can still accept one) and
+// returns how many were closed. A user can hold more than one concurrent
+// session (multiple devices), so this closes all of them, not just the one
+// in userIndex ("last connection wins" - see registerSession). Matching is
+// strictly by exact Session.UserID equality (and userID must be non-empty),
+// so this can never close an anonymous session or a different user's
+// session.
+func (m *Manager) CloseUserSessions(userID string, reason string) int {
+	if userID == "" {
+		// Never treat "no user" as "match anonymous sessions" - every
+		// unauthenticated/anonymous session also has an empty UserID, and
+		// closing all of those would be a foot-gun this must not allow.
+		return 0
+	}
+
+	m.sessionsMu.RLock()
+	matches := make([]*Session, 0, 1)
+	for _, s := range m.sessions {
+		if s.UserID == userID {
+			matches = append(matches, s)
+		}
+	}
+	m.sessionsMu.RUnlock()
+
+	for _, s := range matches {
+		s.closeWithReason(reason)
+	}
+	return len(matches)
+}
+
+// closeWithReason sends a WebSocket close frame carrying reason (best
+// effort - the connection may already be broken or busy) and then closes
+// the underlying connection. This unblocks the session's read loop with an
+// error exactly like a client-initiated disconnect, so the Manager's normal
+// per-connection teardown (unregisterSession, flow cancellation, stopping
+// the ping goroutine - see handleSession/handleNewConnection) runs
+// unchanged rather than being duplicated here.
+//
+// Deliberately does NOT take the transport's sendMu: per gorilla/websocket's own
+// concurrency contract, WriteControl (unlike WriteJSON/WriteMessage, which
+// s.Send serializes via sendMu) may be called concurrently with any other
+// write. Taking sendMu here would let a backpressured client - whose peer
+// never reads, and whose write deadline was cleared after upgrade, see
+// handleNewConnection - block this call, and therefore account deletion,
+// indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
+// this call regardless of whether it succeeds, and Close is unconditional.
+func (s *Session) closeWithReason(reason string) {
+	if wst, ok := s.transport.(*wsTransport); ok {
+		_ = wst.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+			time.Now().Add(time.Second),
+		)
+	}
+	// Non-WebSocket transports (HTTP+SSE) have no close frame to carry a
+	// reason; closing the transport is sufficient to end the session.
+	_ = s.transport.Close()
 }
 
 // Close closes all sessions

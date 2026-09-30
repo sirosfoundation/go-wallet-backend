@@ -361,6 +361,38 @@ func TestOIDCProviderConfig_EffectiveScopes(t *testing.T) {
 	}
 }
 
+func TestOIDCProviderConfig_EffectiveAudience(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *OIDCProviderConfig
+		want   string
+	}{
+		{
+			name:   "nil config",
+			config: nil,
+			want:   "",
+		},
+		{
+			name:   "explicit audience wins",
+			config: &OIDCProviderConfig{Audience: "custom-audience", ClientID: "some-client"},
+			want:   "custom-audience",
+		},
+		{
+			name:   "empty audience falls back to client ID",
+			config: &OIDCProviderConfig{Audience: "", ClientID: "some-client"},
+			want:   "some-client",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.EffectiveAudience(); got != tt.want {
+				t.Errorf("EffectiveAudience() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestOIDCProviderConfig_EffectiveDisplayName(t *testing.T) {
 	tests := []struct {
 		name   string

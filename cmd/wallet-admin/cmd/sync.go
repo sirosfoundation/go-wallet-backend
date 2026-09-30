@@ -39,11 +39,12 @@ type SyncTrustConfig struct {
 
 // SyncOIDCGate defines OIDC gate configuration for a tenant.
 type SyncOIDCGate struct {
-	Mode           string            `yaml:"mode"` // none, registration, login, both
-	RegistrationOP *SyncOIDCProvider `yaml:"registration_op,omitempty"`
-	LoginOP        *SyncOIDCProvider `yaml:"login_op,omitempty"`
-	RequiredClaims map[string]any    `yaml:"required_claims,omitempty"`
-	BindIdentity   *bool             `yaml:"bind_identity,omitempty"`
+	Mode            string            `yaml:"mode"` // none, registration, login, both
+	RegistrationOP  *SyncOIDCProvider `yaml:"registration_op,omitempty"`
+	LoginOP         *SyncOIDCProvider `yaml:"login_op,omitempty"`
+	RequiredClaims  map[string]any    `yaml:"required_claims,omitempty"`
+	BindIdentity    *bool             `yaml:"bind_identity,omitempty"`
+	TrustAdminClaim *bool             `yaml:"trust_admin_claim,omitempty"`
 }
 
 // SyncOIDCProvider defines an OIDC provider configuration for sync.
@@ -89,11 +90,12 @@ type syncTrustConfigResp struct {
 }
 
 type syncOIDCGateResp struct {
-	Mode           string                `json:"mode"`
-	RegistrationOP *syncOIDCProviderResp `json:"registration_op,omitempty"`
-	LoginOP        *syncOIDCProviderResp `json:"login_op,omitempty"`
-	RequiredClaims map[string]any        `json:"required_claims,omitempty"`
-	BindIdentity   bool                  `json:"bind_identity"`
+	Mode            string                `json:"mode"`
+	RegistrationOP  *syncOIDCProviderResp `json:"registration_op,omitempty"`
+	LoginOP         *syncOIDCProviderResp `json:"login_op,omitempty"`
+	RequiredClaims  map[string]any        `json:"required_claims,omitempty"`
+	BindIdentity    bool                  `json:"bind_identity"`
+	TrustAdminClaim bool                  `json:"trust_admin_claim"`
 }
 
 type syncOIDCProviderResp struct {
@@ -441,6 +443,9 @@ func oidcGateNeedsUpdate(desired *SyncOIDCGate, existing *syncOIDCGateResp) bool
 	if desired.BindIdentity != nil && *desired.BindIdentity != existing.BindIdentity {
 		return true
 	}
+	if desired.TrustAdminClaim != nil && *desired.TrustAdminClaim != existing.TrustAdminClaim {
+		return true
+	}
 	if oidcProviderNeedsUpdate(desired.RegistrationOP, existing.RegistrationOP) {
 		return true
 	}
@@ -535,6 +540,9 @@ func buildOIDCGateBody(gate *SyncOIDCGate) map[string]interface{} {
 	}
 	if gate.BindIdentity != nil {
 		body["bind_identity"] = *gate.BindIdentity
+	}
+	if gate.TrustAdminClaim != nil {
+		body["trust_admin_claim"] = *gate.TrustAdminClaim
 	}
 	if gate.RegistrationOP != nil {
 		body["registration_op"] = buildOIDCProviderBody(gate.RegistrationOP)

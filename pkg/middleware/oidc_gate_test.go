@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -364,52 +366,68 @@ func TestValidatorCache_CustomAudience(t *testing.T) {
 	assert.NotNil(t, v)
 }
 
-func TestClaimsMatch(t *testing.T) {
-	tests := []struct {
-		name     string
-		expected interface{}
-		actual   interface{}
-		want     bool
-	}{
-		// Basic type matching
-		{name: "bool true match", expected: true, actual: true, want: true},
-		{name: "bool false match", expected: false, actual: false, want: true},
-		{name: "bool mismatch", expected: true, actual: false, want: false},
-		{name: "string match", expected: "admin", actual: "admin", want: true},
-		{name: "string mismatch", expected: "admin", actual: "user", want: false},
-		{name: "float match", expected: 1.5, actual: 1.5, want: true},
-		{name: "float mismatch", expected: 1.5, actual: 2.5, want: false},
-		{name: "int to float match", expected: 42, actual: float64(42), want: true},
-		{name: "int to float mismatch", expected: 42, actual: float64(43), want: false},
+func TestValidatorCache_EvictsLeastRecentlyUsedWhenFull(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.maxEntries = 2
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
 
-		// String in array matching (common for groups/roles)
-		{name: "string in array", expected: "admin", actual: []interface{}{"admin", "user"}, want: true},
-		{name: "string not in array", expected: "superadmin", actual: []interface{}{"admin", "user"}, want: false},
-		{name: "string vs empty array", expected: "admin", actual: []interface{}{}, want: false},
-
-		// Array subset matching
-		{name: "array exact match", expected: []interface{}{"admin"}, actual: []interface{}{"admin"}, want: true},
-		{name: "array subset match", expected: []interface{}{"admin"}, actual: []interface{}{"admin", "user"}, want: true},
-		{name: "array superset no match", expected: []interface{}{"admin", "superadmin"}, actual: []interface{}{"admin"}, want: false},
-		{name: "array all present", expected: []interface{}{"admin", "user"}, actual: []interface{}{"user", "admin", "guest"}, want: true},
-		{name: "array order independent", expected: []interface{}{"b", "a"}, actual: []interface{}{"a", "b", "c"}, want: true},
-		{name: "array partial missing", expected: []interface{}{"admin", "missing"}, actual: []interface{}{"admin", "user"}, want: false},
-
-		// Single-element array vs scalar
-		{name: "single array vs string", expected: []interface{}{"admin"}, actual: "admin", want: true},
-		{name: "single array vs wrong string", expected: []interface{}{"admin"}, actual: "user", want: false},
-		{name: "multi array vs string no match", expected: []interface{}{"admin", "user"}, actual: "admin", want: false},
-
-		// Type mismatches
-		{name: "string vs bool", expected: "true", actual: true, want: false},
-		{name: "bool vs string", expected: true, actual: "true", want: false},
-		{name: "string vs number", expected: "42", actual: float64(42), want: false},
+	cfg := func(n string) *domain.OIDCProviderConfig {
+		return &domain.OIDCProviderConfig{Issuer: "https://" + n + ".example.com", ClientID: n}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := claimsMatch(tt.expected, tt.actual)
-			assert.Equal(t, tt.want, got, "claimsMatch(%v, %v) = %v, want %v", tt.expected, tt.actual, got, tt.want)
-		})
+	a := cache.GetOrCreate(cfg("a"))
+	clock = clock.Add(time.Second)
+	cache.GetOrCreate(cfg("b"))
+	clock = clock.Add(time.Second)
+	assert.Same(t, a, cache.GetOrCreate(cfg("a"))) // touch a; b is now LRU
+	clock = clock.Add(time.Second)
+	cache.GetOrCreate(cfg("c")) // evicts b
+
+	assert.Equal(t, 2, cache.Len())
+	assert.Same(t, a, cache.GetOrCreate(cfg("a")), "recently used entry must survive")
+}
+
+func TestValidatorCache_DropsIdleEntries(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.idleTTL = time.Minute
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
+
+	old := &domain.OIDCProviderConfig{Issuer: "https://old.example.com", ClientID: "old"}
+	v1 := cache.GetOrCreate(old)
+	clock = clock.Add(2 * time.Minute)
+	cache.GetOrCreate(&domain.OIDCProviderConfig{Issuer: "https://new.example.com", ClientID: "new"})
+
+	assert.Equal(t, 1, cache.Len(), "idle entry must be dropped when a new one is added")
+	assert.NotSame(t, v1, cache.GetOrCreate(old), "an evicted provider gets a fresh validator")
+}
+
+func TestValidatorCache_BoundedUnderChurn(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.maxEntries = 8
+	for i := 0; i < 100; i++ {
+		cache.GetOrCreate(&domain.OIDCProviderConfig{Issuer: fmt.Sprintf("https://idp%d.example.com", i), ClientID: "c"})
 	}
+	assert.LessOrEqual(t, cache.Len(), 8)
+}
+
+// An entry idle past the TTL is a miss for the very lookup that finds it: it
+// must be rebuilt, not revived by that lookup's own touch.
+func TestValidatorCache_IdleEntryIsRebuiltOnLookup(t *testing.T) {
+	cache := NewValidatorCache(nil, zaptest.NewLogger(t))
+	cache.idleTTL = time.Minute
+	clock := time.Now()
+	cache.now = func() time.Time { return clock }
+
+	cfg := &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"}
+	v1 := cache.GetOrCreate(cfg)
+
+	clock = clock.Add(30 * time.Second)
+	assert.Same(t, v1, cache.GetOrCreate(cfg), "within the TTL the entry is reused")
+
+	clock = clock.Add(2 * time.Minute)
+	v2 := cache.GetOrCreate(cfg)
+	assert.NotSame(t, v1, v2, "an entry idle past the TTL must be rebuilt")
+	assert.Equal(t, 1, cache.Len())
 }

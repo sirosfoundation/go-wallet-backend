@@ -240,6 +240,77 @@ type UserStore struct {
 	data map[string]*domain.User
 }
 
+// deepCopyUser returns an independent copy of user, safe to read and even
+// mutate (as long as the mutation is then persisted via Update()) without
+// synchronization. The in-memory map stores *domain.User pointers directly,
+// so handing out that same pointer from a Get* method (as this store used
+// to) means any concurrent writer holding s.mu.Lock() (e.g.
+// UpdateCredentialAuthenticator) can mutate fields - notably
+// WebauthnCredentials[i].Authenticator.SignCount/CloneWarning - while a
+// caller that already released its RLock is still reading through the
+// pointer returned by an earlier Get*, e.g. inside FinishLogin building
+// go-webauthn credentials. That's an unsynchronized concurrent read/write
+// of the same memory: a real Go data race (flagged by `go test -race` once
+// exercised, and reported directly by Copilot review on #388), and it's
+// also a behavioral divergence from the MongoDB backend, whose driver
+// always decodes a fresh, independent copy per call. Deep-copying here
+// closes both: every Get* caller gets its own snapshot, matching Mongo's
+// semantics, and the returned copy can never be mutated by a concurrent
+// writer underneath it.
+func deepCopyUser(user *domain.User) *domain.User {
+	cp := *user
+
+	if user.Username != nil {
+		username := *user.Username
+		cp.Username = &username
+	}
+	if user.DisplayName != nil {
+		displayName := *user.DisplayName
+		cp.DisplayName = &displayName
+	}
+
+	if user.PrivateData != nil {
+		cp.PrivateData = append([]byte(nil), user.PrivateData...)
+	}
+	if user.Keys != nil {
+		cp.Keys = append([]byte(nil), user.Keys...)
+	}
+
+	if user.WebauthnCredentials != nil {
+		creds := make([]domain.WebauthnCredential, len(user.WebauthnCredentials))
+		for i, c := range user.WebauthnCredentials {
+			creds[i] = c
+			if c.CredentialID != nil {
+				creds[i].CredentialID = append([]byte(nil), c.CredentialID...)
+			}
+			if c.PublicKey != nil {
+				creds[i].PublicKey = append([]byte(nil), c.PublicKey...)
+			}
+			if c.Transport != nil {
+				creds[i].Transport = append([]string(nil), c.Transport...)
+			}
+			if c.Authenticator.AAGUID != nil {
+				creds[i].Authenticator.AAGUID = append([]byte(nil), c.Authenticator.AAGUID...)
+			}
+			if c.Nickname != nil {
+				nickname := *c.Nickname
+				creds[i].Nickname = &nickname
+			}
+			if c.LastUseTime != nil {
+				lastUse := *c.LastUseTime
+				creds[i].LastUseTime = &lastUse
+			}
+		}
+		cp.WebauthnCredentials = creds
+	}
+
+	if user.EnterpriseIdentities != nil {
+		cp.EnterpriseIdentities = append([]domain.EnterpriseIdentity(nil), user.EnterpriseIdentities...)
+	}
+
+	return &cp
+}
+
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -262,7 +333,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return user, nil
+	return deepCopyUser(user), nil
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain.User, error) {
@@ -271,7 +342,7 @@ func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain
 
 	for _, user := range s.data {
 		if user.Username != nil && *user.Username == username {
-			return user, nil
+			return deepCopyUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -283,7 +354,7 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 	for _, user := range s.data {
 		if user.DID == did {
-			return user, nil
+			return deepCopyUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -330,6 +401,41 @@ func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, dat
 
 	user.UpdatePrivateData(data)
 	return nil
+}
+
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, exists := s.data[id.String()]
+	if !exists {
+		return false, storage.ErrNotFound
+	}
+
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].ID == credentialID {
+			// Monotonic non-decreasing, matching MongoDB's $max semantics
+			// (see the interface doc comment and the Mongo implementation
+			// for why an unconditional overwrite is unsafe here).
+			if signCount > user.WebauthnCredentials[i].Authenticator.SignCount {
+				user.WebauthnCredentials[i].Authenticator.SignCount = signCount
+			}
+			// Compare-and-set, under the same lock as the read: this is the
+			// authoritative "did I just cause the false->true transition"
+			// answer, safe from the duplicate-event race a caller-side
+			// precomputed comparison would be vulnerable to.
+			transitioned := cloneWarning && !user.WebauthnCredentials[i].Authenticator.CloneWarning
+			// OR-only: never write false over an existing true.
+			if cloneWarning {
+				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
+			}
+			user.UpdatedAt = time.Now()
+			return transitioned, nil
+		}
+	}
+	// User exists but no credential with that ID: silent no-op success,
+	// matching MongoDB's arrayFilter semantics (see interface doc comment).
+	return false, nil
 }
 
 // CredentialStore implements in-memory credential storage
@@ -529,6 +635,42 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || challenge.UserID != userID {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || (expectedTenantID != "" && challenge.TenantID != expectedTenantID) {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
 	return challenge, nil
 }
 

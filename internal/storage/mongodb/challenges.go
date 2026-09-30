@@ -40,6 +40,47 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	return &challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	err := s.collection.FindOneAndDelete(ctx, idFilter(id)).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	filter := bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: userID}}
+	err := s.collection.FindOneAndDelete(ctx, filter).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	filter := bson.D{{Key: "_id", Value: id}}
+	if expectedTenantID != "" {
+		filter = append(filter, bson.E{Key: "tenant_id", Value: expectedTenantID})
+	}
+	err := s.collection.FindOneAndDelete(ctx, filter).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
 	_, err := s.collection.DeleteOne(ctx, idFilter(id))
 	if err != nil {

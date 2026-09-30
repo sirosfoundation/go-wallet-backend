@@ -4,18 +4,25 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/descope/virtualwebauthn"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -239,6 +246,31 @@ func TestWebAuthnService_BeginRegistration(t *testing.T) {
 	})
 }
 
+// TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected
+// covers a review finding on PR #388: an invite code is tenant-scoped
+// (Invites().GetByCode requires a tenantID, and FinishRegistration's atomic
+// invite claim is only reachable when the stored challenge carries a
+// tenantID), but BeginRegistration's invite validation lived entirely
+// inside the `req.TenantID != ""` branch and unconditionally stored
+// req.InviteCode on the challenge regardless. Supplying an invite code with
+// no tenantID therefore skipped invite validation AND consumption
+// entirely, silently creating a global (non-tenant) account while leaving
+// the referenced invite untouched, instead of being rejected. This
+// combination must fail closed at BeginRegistration.
+func TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected(t *testing.T) {
+	svc, _ := setupWebAuthnService(t)
+	ctx := context.Background()
+
+	_, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "No Tenant Invite User",
+		InviteCode:  "some-invite-code",
+		// TenantID intentionally left empty.
+	})
+	if !errors.Is(err, ErrInvalidInvite) {
+		t.Errorf("expected ErrInvalidInvite for an invite code with no tenantID, got %v", err)
+	}
+}
+
 func TestWebAuthnService_BeginLogin(t *testing.T) {
 	svc, _ := setupWebAuthnService(t)
 	ctx := context.Background()
@@ -296,6 +328,73 @@ func TestWebAuthnService_FinishRegistration_Errors(t *testing.T) {
 		_, err := svc.FinishRegistration(ctx, req)
 		if err != ErrChallengeNotFound {
 			t.Errorf("Expected ErrChallengeNotFound, got %v", err)
+		}
+	})
+}
+
+// TestWebAuthnService_FinishRegistration_TenantMismatch is a direct
+// service-level regression test for issue #395 (mirroring PR #386's fix for
+// the analogous /auth/passkey/* bug, #374): FinishRegistration must reject a
+// request whose ExpectedTenantID disagrees with the tenant BeginRegistration
+// actually recorded on the challenge, and must do so BEFORE the one-time
+// challenge is deleted (so a mismatched caller can't burn it out from under
+// the legitimate caller). Exercised directly against the service (not
+// through internal/api or internal/server) so this package's own coverage
+// reflects the check - the handler/route-level regression tests live in
+// internal/server/providers_test.go.
+func TestWebAuthnService_FinishRegistration_TenantMismatch(t *testing.T) {
+	svc, store := setupWebAuthnService(t)
+	ctx := context.Background()
+
+	tenantA := domain.TenantID("tenant-a")
+	tenantB := domain.TenantID("tenant-b")
+	require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantA, Name: "Tenant A", Enabled: true}))
+	require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantB, Name: "Tenant B", Enabled: true}))
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{TenantID: string(tenantA)})
+	require.NoError(t, err)
+
+	t.Run("mismatched ExpectedTenantID is rejected before the challenge is consumed", func(t *testing.T) {
+		_, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID:      beginResp.ChallengeID,
+			Credential:       json.RawMessage(`{}`),
+			ExpectedTenantID: string(tenantB),
+		})
+		if err != ErrTenantMismatch {
+			t.Fatalf("expected ErrTenantMismatch, got %v", err)
+		}
+
+		// The challenge must still exist - a mismatched request must not be
+		// able to burn the one-time challenge for the legitimate caller.
+		if _, err := store.Challenges().GetByID(ctx, beginResp.ChallengeID); err != nil {
+			t.Fatalf("challenge should survive a tenant mismatch, got: %v", err)
+		}
+	})
+
+	t.Run("matching ExpectedTenantID is not rejected as a mismatch", func(t *testing.T) {
+		_, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID:      beginResp.ChallengeID,
+			Credential:       json.RawMessage(`{}`),
+			ExpectedTenantID: string(tenantA),
+		})
+		// The bogus credential will still fail verification further down,
+		// but it must NOT be rejected as a tenant mismatch.
+		if err == ErrTenantMismatch {
+			t.Fatal("matching ExpectedTenantID must not be rejected as a tenant mismatch")
+		}
+	})
+
+	t.Run("empty ExpectedTenantID performs no check (backward compatible)", func(t *testing.T) {
+		beginResp2, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{TenantID: string(tenantA)})
+		require.NoError(t, err)
+
+		_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+			ChallengeID: beginResp2.ChallengeID,
+			Credential:  json.RawMessage(`{}`),
+			// ExpectedTenantID left empty
+		})
+		if err == ErrTenantMismatch {
+			t.Fatal("empty ExpectedTenantID must not trigger a tenant mismatch")
 		}
 	})
 }
@@ -360,6 +459,470 @@ func TestWebAuthnService_ChallengeExpiration(t *testing.T) {
 		if err != ErrChallengeExpired {
 			t.Errorf("Expected ErrChallengeExpired, got %v", err)
 		}
+	})
+}
+
+// TestWebAuthnService_RefreshAccessToken is a regression test for issue
+// #392: RefreshAccessToken/RefreshTokenRequest were fully implemented but
+// api.Handlers.RefreshToken (the handler that calls this method) was never
+// mounted on any route, exactly like Logout before #391. This proves the
+// underlying service logic actually works, now that the handler is wired
+// up (see internal/server/providers.go's new POST /user/session/refresh).
+func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
+	newSvcWithRefresh := func(t *testing.T) (*WebAuthnService, *memory.Store) {
+		t.Helper()
+		cfg := &config.Config{
+			Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+			JWT: config.JWTConfig{
+				Secret:      testJWTSecret,
+				Issuer:      testJWTIssuer,
+				ExpiryHours: testJWTExpiryHours,
+				RefreshDays: 7,
+			},
+		}
+		store := memory.NewStore()
+		svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+		if err != nil {
+			t.Fatalf("Failed to create WebAuthn service: %v", err)
+		}
+		return svc, store
+	}
+
+	// addTenantMembership creates tenantID (enabled) if it doesn't already
+	// exist and records the user as one of its members - needed wherever a
+	// test's refresh token carries a non-default tenant claim, since
+	// RefreshAccessToken now re-validates both that the tenant itself
+	// exists and is enabled (fifth Copilot round) and that the user is
+	// still a member of it (fourth Copilot round) before rotating.
+	addTenantMembership := func(t *testing.T, store *memory.Store, userID domain.UserID, tenantID domain.TenantID) {
+		t.Helper()
+		ctx := context.Background()
+		if _, err := store.Tenants().GetByID(ctx, tenantID); err != nil {
+			require.NoError(t, store.Tenants().Create(ctx, &domain.Tenant{ID: tenantID, Name: string(tenantID), Enabled: true}))
+		}
+		require.NoError(t, store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{
+			UserID:   userID,
+			TenantID: tenantID,
+		}))
+	}
+
+	t.Run("refreshes a valid refresh token into a new access token", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+		require.NotEmpty(t, refreshToken)
+
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		assert.NotEmpty(t, resp.Token, "expected a new access token")
+		assert.NotEmpty(t, resp.RefreshToken, "expected a rotated refresh token")
+		assert.NotEqual(t, refreshToken, resp.RefreshToken, "refresh token should be rotated, not reused")
+
+		// The new access token must actually be usable: parse it and confirm
+		// it carries this user's identity and tenant (as generateToken would
+		// produce), not the refresh token's own claims verbatim.
+		parsed, err := jwt.Parse(resp.Token, func(token *jwt.Token) (interface{}, error) {
+			return []byte(testJWTSecret), nil
+		})
+		require.NoError(t, err)
+		require.True(t, parsed.Valid)
+		claims, ok := parsed.Claims.(jwt.MapClaims)
+		require.True(t, ok)
+		assert.Equal(t, user.UUID.String(), claims["user_id"])
+		assert.Equal(t, "test-tenant", claims["tenant_id"])
+	})
+
+	t.Run("disabled refresh tokens are rejected", func(t *testing.T) {
+		svc, _ := setupWebAuthnService(t) // RefreshDays defaults to 0 (disabled)
+		_, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{RefreshToken: "anything"})
+		// Must be the typed ErrRefreshDisabled, not an ad hoc error: callers
+		// (internal/api.Handlers.RefreshToken) switch on it to avoid
+		// surfacing this expected, config-driven state as a 500 (Copilot
+		// review on #400).
+		if !errors.Is(err, ErrRefreshDisabled) {
+			t.Fatalf("expected ErrRefreshDisabled, got %v", err)
+		}
+	})
+
+	t.Run("malformed refresh token is rejected", func(t *testing.T) {
+		svc, _ := newSvcWithRefresh(t)
+		_, err := svc.RefreshAccessToken(context.Background(), &RefreshTokenRequest{RefreshToken: "not-a-jwt"})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken, got %v", err)
+		}
+	})
+
+	t.Run("an access token cannot be used as a refresh token", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-2"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+
+		accessToken, err := svc.generateToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: accessToken})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken (wrong type claim), got %v", err)
+		}
+	})
+
+	t.Run("refresh token for a since-deleted user is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-3"}
+		if err := store.Users().Create(ctx, user); err != nil {
+			t.Fatalf("failed to create user: %v", err)
+		}
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_ = store.Users().Delete(ctx, user.UUID)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Errorf("expected ErrInvalidRefreshToken for a deleted user, got %v", err)
+		}
+	})
+
+	// Regression test for a Copilot review finding on #400 (third round): the
+	// refresh token must NOT be consumed when a validation step AFTER
+	// signature/type checking fails (here: the user lookup) - otherwise a
+	// transient storage failure on that lookup would irreversibly burn a
+	// legitimate refresh token, forcing the client to re-authenticate from
+	// scratch instead of simply retrying. Proven by: a failed lookup, then a
+	// second attempt with the SAME token succeeding once the user exists.
+	t.Run("a failed user lookup does not consume the refresh token (retry with the same token can still succeed)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-7"}
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// User does not exist yet: lookup fails, request is rejected.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken (user not found), got %v", err)
+		}
+
+		// Now the user exists (simulating the earlier failure having been
+		// transient). The SAME refresh token must still work - proving it
+		// was never consumed by the failed attempt above.
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != nil {
+			t.Fatalf("expected the refresh token to still be usable after the earlier failed lookup, got error: %v", err)
+		}
+		if resp.Token == "" {
+			t.Fatal("expected a new access token")
+		}
+	})
+
+	// Regression test for a Copilot review finding on #400: RefreshAccessToken
+	// only rotated tokens and never invalidated the one just used, so a
+	// stolen refresh token could be replayed indefinitely, each replay
+	// minting another full-lived refresh token. With a TokenBlacklist wired
+	// in (SetTokenBlacklist), the presented refresh token must become
+	// single-use: consumed on successful exchange, rejected on replay - and
+	// this must hold even with TokenBlacklistConfig.Enabled: false (the
+	// checked-in/production default), since a second Copilot round on #400
+	// found that gating consumption on that same opt-in flag left refresh
+	// tokens replayable in the standard configuration despite this method
+	// appearing to enforce single-use. ConsumeOnce is deliberately NOT
+	// gated by it (see its doc comment) - Enabled: false here is the point
+	// of this test, not an oversight.
+	t.Run("a consumed refresh token cannot be replayed, even with the blacklist feature disabled (default config)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-4"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// First use succeeds and rotates the token.
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.RefreshToken)
+
+		// Replaying the SAME (now-consumed) refresh token must be rejected,
+		// despite Enabled: false.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken on refresh-token replay, got %v", err)
+		}
+
+		// The newly rotated refresh token, never having been used, must
+		// still work.
+		resp2, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		require.NoError(t, err)
+		require.NotEmpty(t, resp2.Token)
+	})
+
+	// Regression test for the second Copilot review round on #400: the
+	// check-and-consume sequence must be atomic, so that two concurrent
+	// requests replaying the same refresh token cannot both win the race
+	// (both observing "not yet consumed" and each minting its own
+	// replacement token pair). Exactly one of N concurrent callers sharing
+	// the same refresh token must succeed.
+	t.Run("concurrent replay of the same refresh token: exactly one caller succeeds", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-concurrent"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		const n = 20
+		var wg sync.WaitGroup
+		var successes int64
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				if _, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken}); err == nil {
+					atomic.AddInt64(&successes, 1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		if successes != 1 {
+			t.Fatalf("expected exactly 1 successful refresh out of %d concurrent replays of the same token, got %d", n, successes)
+		}
+	})
+
+	// Regression tests for a Copilot review finding on #400 (fifth round):
+	// a refresh token missing "jti" would reach ConsumeOnce, which
+	// deliberately treats an empty jti as always "first use" (meant for a
+	// hypothetical jti-less token this service issued, not as a bypass),
+	// letting such a token replay freely forever; a token missing "exp"
+	// would fall back to RefreshDays for the blacklist entry's OWN expiry
+	// while the underlying JWT itself never expires, so the same
+	// non-expiring token would become usable again once that blacklist
+	// entry aged out. Both claims are now required outright - every token
+	// this service actually issues (generateRefreshToken) always sets both,
+	// so this only ever rejects a malformed/hand-crafted token.
+	t.Run("a refresh token without a jti claim is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-nojti"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		noJTIToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "test-tenant",
+			"type":      "refresh",
+			"exp":       time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := noJTIToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a missing jti claim, got %v", err)
+		}
+	})
+
+	t.Run("a refresh token without an exp claim is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-noexp"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		noExpToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "test-tenant",
+			"type":      "refresh",
+			"jti":       "no-exp-jti",
+		})
+		signed, err := noExpToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a missing exp claim, got %v", err)
+		}
+	})
+
+	// Regression test for a Copilot review finding on #400 (fourth round):
+	// FinishLogin derives tenantID fresh from the user's CURRENT membership
+	// records every time someone logs in, so removing a user's tenant
+	// membership takes effect at their next login - but RefreshAccessToken
+	// used to just trust whatever tenant_id claim the presented refresh
+	// token already carried, forever, letting a removed user keep
+	// refreshing indefinitely instead of losing access within one
+	// access-token lifetime.
+	t.Run("refresh token for a tenant the user was removed from is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-removed-membership"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		// Membership removed (e.g. an admin removed this user from the
+		// tenant) - the refresh token itself is unchanged, still carrying
+		// the old tenant_id claim.
+		require.NoError(t, store.UserTenants().RemoveMembership(ctx, user.UUID, "test-tenant"))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken after tenant membership was removed, got %v", err)
+		}
+	})
+
+	// Regression test for a Copilot review finding on #400 (fifth round):
+	// pkg/middleware.AuthMiddleware and TokenAuthMiddleware both reject an
+	// authenticated request whose tenant no longer exists or has been
+	// disabled, but RefreshAccessToken didn't apply the same check - a
+	// stolen refresh token for a since-disabled tenant could keep rotating
+	// indefinitely and regain full access the moment that tenant was
+	// re-enabled.
+	t.Run("refresh token for a since-disabled tenant is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-disabled-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		tenant, err := store.Tenants().GetByID(ctx, "test-tenant")
+		require.NoError(t, err)
+		tenant.Enabled = false
+		require.NoError(t, store.Tenants().Update(ctx, tenant))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken after the tenant was disabled, got %v", err)
+		}
+	})
+
+	t.Run("refresh token for a nonexistent tenant is rejected", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-nonexistent-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		// Deliberately not calling addTenantMembership: no such tenant exists.
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("no-such-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		if err != ErrInvalidRefreshToken {
+			t.Fatalf("expected ErrInvalidRefreshToken for a nonexistent tenant, got %v", err)
+		}
+	})
+
+	// The default tenant is exempt from the membership check above, matching
+	// FinishLogin/GetUserTenants' existing "no memberships recorded -> a
+	// legacy default-tenant user" fallback elsewhere in this file - a
+	// default-tenant refresh token must keep working without ever having an
+	// explicit UserTenantMembership row.
+	t.Run("refresh for the default tenant does not require an explicit membership record", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-default-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		// Deliberately no addTenantMembership call.
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+	})
+
+	// A refresh token with an empty (but present) tenant_id claim falls
+	// back to the default tenant, matching pkg/middleware.AuthMiddleware's
+	// own "no tenant_id claim -> default tenant" backward-compatibility
+	// behavior for older tokens.
+	t.Run("refresh with an empty tenant_id claim falls back to the default tenant", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-empty-tenant"}
+		require.NoError(t, store.Users().Create(ctx, user))
+
+		emptyTenantToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id":   user.UUID.String(),
+			"tenant_id": "",
+			"type":      "refresh",
+			"jti":       "empty-tenant-jti",
+			"exp":       time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := emptyTenantToken.SignedString([]byte(testJWTSecret))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: signed})
+		require.NoError(t, err)
+	})
+
+	t.Run("without a TokenBlacklist wired in at all, a refresh token remains reusable (unchanged, pre-existing behavior)", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t) // no SetTokenBlacklist call - tokenBlacklist stays nil
+
+		ctx := context.Background()
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-5"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		refreshToken, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"))
+		require.NoError(t, err)
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
+
+		// No TokenBlacklist wired in at all (nil): single-use enforcement is
+		// skipped entirely, since there's nowhere to track consumed jtis.
+		// services.go always wires one in for the real service; this only
+		// matters for a hand-built WebAuthnService that never calls
+		// SetTokenBlacklist.
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refreshToken})
+		require.NoError(t, err)
 	})
 }
 
@@ -800,6 +1363,1136 @@ func TestFullLoginFlow(t *testing.T) {
 	})
 }
 
+// TestFullLoginFlow_CloneWarningSurfaced covers issue #380: a sign-counter
+// regression (the standard clone-authenticator signal) must not be silently
+// dropped. It logs in once to establish a non-zero baseline counter, then
+// logs in again with a LOWER counter — the classic clone signal — and
+// asserts that (a) the login is still allowed through (we don't block on
+// it), (b) a distinct, greppable "possible cloned authenticator detected"
+// security-event line is logged, and (c) the clone warning is persisted on
+// the stored credential rather than silently dropped.
+func TestFullLoginFlow_CloneWarningSurfaced(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, logger)
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Clone Test User"})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Clone Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(counter uint32) *FinishLoginResponse {
+		t.Helper()
+		credential.Counter = counter
+
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		resp, err := svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err, "login must still succeed even when a clone warning is detected")
+		return resp
+	}
+
+	// Establish a non-zero baseline counter.
+	login(10)
+
+	// A LOWER counter than the stored baseline is the standard
+	// clone-authenticator signal.
+	login(3)
+
+	entries := observed.FilterMessage("possible cloned authenticator detected").All()
+	require.Len(t, entries, 1, "expected exactly one clone-warning security-event log line")
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "webauthn_clone_warning", fields["security_event"])
+	assert.Equal(t, userID.String(), fields["user_id"])
+
+	// The warning must be persisted, not silently dropped.
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	require.Len(t, user.WebauthnCredentials, 1)
+	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
+
+	// Review finding on PR #388: WebAuthnCredentials() hydrates the now-true
+	// persisted CloneWarning into every future login's credential, and
+	// go-webauthn's UpdateCounter never clears it — so
+	// credential.Authenticator.CloneWarning stays true on every subsequent
+	// login, not just the one that detected it. Another login whose OWN
+	// counter also regresses relative to the stored baseline (which never
+	// advanced past 10, since UpdateCounter's regression branch doesn't
+	// update SignCount) must NOT emit a second log line: the event should
+	// fire once, at the moment of detection, not flood on every later login.
+	login(5)
+	entries = observed.FilterMessage("possible cloned authenticator detected").All()
+	assert.Len(t, entries, 1, "a lingering CloneWarning must not re-emit the security event on every subsequent login")
+}
+
+// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin covers a review
+// finding on PR #388: FinishLogin used to unconditionally overwrite the
+// stored CloneWarning with whatever go-webauthn reported for *that*
+// assertion, which reads as if a later, cleanly-incrementing login could
+// silently clear a flag set by an earlier detected clone.
+//
+// In practice, with go-webauthn v0.18.2's current Authenticator.UpdateCounter
+// (a non-regressing counter only advances SignCount and leaves CloneWarning
+// untouched — it's a one-way latch already, and we hydrate the stored
+// CloneWarning back into the Authenticator we hand the library on every call
+// via WebAuthnCredentials()), this specific clearing scenario doesn't
+// currently reproduce end-to-end: this test still passed even with the old
+// unconditional-overwrite code, because the value being written back was
+// already "true" by the time it got there. Verified this by reverting the
+// fix and rerunning this exact test.
+//
+// The fix is kept anyway as defense-in-depth: the "never silently clear a
+// latched clone warning" guarantee should live in our own code, not depend
+// on an undocumented behavior of a third-party library's counter-update
+// logic that could change in a future version. This test locks in that
+// invariant explicitly, independent of go-webauthn's internals.
+func TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	store := memory.NewStore()
+	svc, err := NewWebAuthnService(store, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Clone Latch Test User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Clone Latch Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(counter uint32) {
+		t.Helper()
+		credential.Counter = counter
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err)
+	}
+
+	// Baseline, then a regression that latches CloneWarning=true.
+	login(10)
+	login(3)
+
+	user, err := store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	require.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning, "sanity: clone warning must be set after the regression")
+
+	// A subsequent, cleanly-incrementing login (counter > stored) reports no
+	// clone warning for itself — it must NOT clear the latched flag.
+	login(20)
+
+	user, err = store.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning, "a clean subsequent login must not clear a previously latched clone warning")
+	assert.Equal(t, uint32(20), user.WebauthnCredentials[0].Authenticator.SignCount, "sign count must still advance normally")
+}
+
+// raceInjectingUserStore wraps a real storage.UserStore and, on its SECOND
+// GetByID call — go-webauthn's own internal discoverable-credential lookup,
+// FinishLogin's only other GetByID besides its initial snapshot — invokes
+// onSecondCall once (after taking that call's own snapshot, before
+// returning it) to deterministically simulate a concurrent write landing in
+// storage right after that lookup and before FinishLogin's final persist,
+// without needing actual goroutines to race (see
+// TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace). Firing after that
+// call's own fetch, not before, matters: it must not also change what
+// go-webauthn itself hydrates into the Credential it returns (which would
+// let the *existing* single-request sticky-latch already cover this case,
+// making the test pass without exercising the fix under test at all — this
+// was caught empirically by reverting the fix and observing the test still
+// passed, then fixing the injection point until reverting it made the test
+// fail as expected).
+//
+// GetByID always returns a deep copy of the credential slice, matching a
+// real document-store backend (MongoDB decodes a fresh struct on every
+// read) rather than the wrapped internal/storage/memory implementation's
+// aliasing behavior (its GetByID returns the same pointer stored in its
+// map). Without that copy, this test's "concurrent write" would alias the
+// exact same WebauthnCredentials slice the calling FinishLogin is already
+// holding, mutating it in place regardless of whether the fix under test
+// re-reads anything — which would make the test pass even without the fix,
+// silently proving nothing.
+type raceInjectingUserStore struct {
+	storage.UserStore
+	mu           sync.Mutex
+	calls        int
+	onSecondCall func()
+}
+
+func (s *raceInjectingUserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+
+	// Snapshot BEFORE injecting the "concurrent" write, so this call
+	// (go-webauthn's own discoverable-credential lookup) sees the
+	// pre-race state — matching a real production race where the other
+	// request's write lands sometime during THIS request's own assertion
+	// verification, which happens after go-webauthn's lookup but before
+	// FinishLogin's final persist.
+	user, err := s.UserStore.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	cp := *user
+	cp.WebauthnCredentials = append([]domain.WebauthnCredential(nil), user.WebauthnCredentials...)
+
+	if call == 2 && s.onSecondCall != nil {
+		s.onSecondCall()
+	}
+
+	return &cp, nil
+}
+
+// storeWithUserOverride wraps *memory.Store, swapping out just the Users()
+// accessor so every other collection still behaves like the real in-memory
+// store.
+type storeWithUserOverride struct {
+	*memory.Store
+	users storage.UserStore
+}
+
+func (s *storeWithUserOverride) Users() storage.UserStore { return s.users }
+
+// TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate
+// documents and guards against a review finding on PR #388 / issue #411:
+// FinishLogin used to write
+// matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
+// directly, where matchedCred came from a *domain.User the memory store's
+// GetByID had returned. Because that GetByID returns the SAME pointer it
+// holds internally (not a copy, unlike MongoDB, which always decodes a
+// fresh struct), such a direct assignment mutates the LIVE stored
+// credential immediately — bypassing UpdateCredentialAuthenticator's
+// monotonic max-under-lock update entirely, since by the time that atomic
+// call runs, the value it would compare against has already been
+// overwritten by the very same write it was supposed to be protecting.
+//
+// This is deliberately NOT a full FinishLogin/go-webauthn integration test:
+// go-webauthn's own Authenticator.UpdateCounter, when handed a live-aliased
+// Authenticator (as the in-memory store used to always produce), incidentally
+// self-protects against the exact scenario a full-flow test would try to
+// construct — its own regression check already sees whatever a concurrent
+// write most recently landed, because it was reading the SAME aliased
+// object, making an extra direct assignment a no-op in every ordering that
+// could be driven deterministically through the public API. Isolating the
+// exact code pattern here — obtain a *domain.User via GetByID, mutate
+// SignCount on the object returned, only then call
+// UpdateCredentialAuthenticator — demonstrates precisely and
+// deterministically whether that shape is safe, independent of whether the
+// mutation happens to originate from FinishLogin or a similar future call
+// site.
+//
+// A Copilot review on #388 additionally pointed out that GetByID handing out
+// the live map pointer meant reads through it (e.g. FinishLogin building
+// go-webauthn credentials from the returned user, after its own RLock was
+// already released) were unsynchronized with concurrent writers holding
+// UserStore.mu inside UpdateCredentialAuthenticator — a genuine Go data race,
+// not just a discipline problem. The fix (UserStore.GetByID/GetByUsername/
+// GetByDID now return an independent deep copy — see deepCopyUser in
+// internal/storage/memory/memory.go) closes that at the storage layer
+// itself: mutating the returned object can no longer reach stored state at
+// all, so the "vulnerable pattern" this test used to be able to demonstrate
+// is no longer reachable through the public GetByID API — which is exactly
+// what the first sub-test below now asserts.
+func TestFinishLoginPattern_DirectSignCountMutationDefeatsMonotonicUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 5}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	t.Run("GetByID returns an independent copy: mutating it cannot defeat the atomic update", func(t *testing.T) {
+		// A concurrent, independent write already advanced the counter to 20.
+		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+		require.NoError(t, err)
+
+		// The formerly-vulnerable shape: fetch via GetByID, then mutate
+		// SignCount directly on the object it returned — exactly what
+		// FinishLogin used to do — using this caller's own, older/lower
+		// reported count (10), before ever calling the atomic update.
+		fetched, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		matchedCred := &fetched.WebauthnCredentials[0]
+		matchedCred.Authenticator.SignCount = 10 // mutates fetched's own copy only
+
+		// Confirm the mutation really did land locally (proving this isn't a
+		// vacuous test), but never touched the stored value.
+		require.Equal(t, uint32(10), fetched.WebauthnCredentials[0].Authenticator.SignCount)
+		unaffected, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(20), unaffected.WebauthnCredentials[0].Authenticator.SignCount,
+			"mutating the object returned by GetByID must not reach stored state")
+
+		// The atomic call, using the same stale/lower reported count (10),
+		// correctly refuses to regress the stored counter — same outcome as
+		// the discipline-based "fixed pattern" below, but now guaranteed by
+		// the storage layer rather than by caller discipline.
+		_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+		require.NoError(t, err)
+
+		got, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+			"the monotonic atomic update must not be defeated by mutating a fetched copy")
+	})
+
+	t.Run("fixed pattern: no direct mutation, atomic call alone cannot regress", func(t *testing.T) {
+		// Reset to the same starting point as the sub-test above.
+		_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+		require.NoError(t, err)
+
+		// The fixed shape: keep the reported count in a local variable (as
+		// FinishLogin does now — see newSignCount in FinishLogin) and never
+		// write it onto the object GetByID returned. Only the atomic call
+		// touches storage.
+		localReportedSignCount := uint32(10)
+		_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", localReportedSignCount, false)
+		require.NoError(t, err)
+
+		got, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+			"without the direct mutation, the monotonic atomic update alone correctly refuses to lower the stored counter")
+	})
+}
+
+// TestUserStore_GetByID_ConcurrentReadsDontRaceWithUpdateCredentialAuthenticator
+// is the concurrency reproduction of the Copilot #388 finding: GetByID used
+// to hand back the live map pointer, so a goroutine reading fields off a
+// previously-fetched user (as FinishLogin does once it has left the
+// GetByID call itself, e.g. inside go-webauthn's own credential-building
+// callback) had no synchronization at all with a concurrent
+// UpdateCredentialAuthenticator call mutating
+// WebauthnCredentials[i].Authenticator on that SAME shared object. That's a
+// genuine, `go test -race`-detectable data race, not just a logical bug —
+// this test drives real concurrent goroutines so the race detector can
+// actually observe it. Before the deepCopyUser fix, this test failed
+// immediately under `-race` with "DATA RACE" on
+// WebauthnCredentials[i].Authenticator; after it, GetByID's independent copy
+// means the reader and the writer never touch the same memory, so `-race`
+// (and this test) stays clean.
+func TestUserStore_GetByID_ConcurrentReadsDontRaceWithUpdateCredentialAuthenticator(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Writer: repeatedly advances SignCount and flips CloneWarning, exactly
+	// the fields a concurrent FinishLogin's persistence would touch.
+	go func() {
+		defer wg.Done()
+		for i := uint32(0); i < iterations; i++ {
+			_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", i+2, i%2 == 0)
+			assert.NoError(t, err)
+		}
+	}()
+
+	// Reader: fetches the user and reads exactly the fields FinishLogin
+	// reads off a previously-fetched credential (SignCount, CloneWarning)
+	// after its own GetByID call has already returned (i.e. outside any
+	// lock the store itself might be holding).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			fetched, err := store.Users().GetByID(ctx, user.UUID)
+			assert.NoError(t, err)
+			for j := range fetched.WebauthnCredentials {
+				_ = fetched.WebauthnCredentials[j].Authenticator.SignCount
+				_ = fetched.WebauthnCredentials[j].Authenticator.CloneWarning
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace covers a review
+// finding on PR #388: FinishLogin's CloneWarning latch only protected a
+// single request's own in-memory snapshot. The original persistence path
+// (Users().Update, a whole-document ReplaceOne) meant a second, concurrent
+// request that read the user BEFORE a first request latched
+// CloneWarning=true, but persisted AFTER it, would silently clobber the
+// flag back to false — a classic lost update, distinct from (and on top of)
+// the single-request stickiness covered by
+// TestFullLoginFlow_CloneWarningStaysLatchedAfterCleanLogin. A first
+// mitigation (re-reading the stored value immediately before persisting and
+// OR-ing it in) was flagged in a follow-up review as still racy — a
+// read-then-write pair can never be made airtight no matter how close
+// together the read and write are. The actual fix replaces the
+// whole-document persistence for this path with
+// UserStore.UpdateCredentialAuthenticator, a single atomic, field-scoped
+// update that never writes CloneWarning=false over an existing true — see
+// its doc comment in internal/storage/interface.go.
+//
+// Reproduces the race deterministically (no real goroutines needed) by
+// wrapping UserStore so that exactly between this login's own two internal
+// GetByID calls, a "concurrent" write lands directly in the backing store,
+// setting CloneWarning=true. This login's own assertion is a clean,
+// non-regressing one that never sees a clone warning itself, so without
+// UpdateCredentialAuthenticator's OR-only semantics this would clobber the
+// concurrent write back to false.
+func TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Race Test User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Race Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	credentialIDStr := base64.RawURLEncoding.EncodeToString(credential.ID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+	credential.Counter = 10 // establish a baseline sign count via a normal login
+
+	raceStore := &raceInjectingUserStore{
+		UserStore: baseStore.Users(),
+		onSecondCall: func() {
+			// Simulate a concurrent request's ReplaceOne landing right here,
+			// between this request's own initial snapshot and its final
+			// persist: directly latch CloneWarning=true in the backing
+			// store, bypassing this request's in-memory copy entirely.
+			u, err := baseStore.Users().GetByID(ctx, userID)
+			require.NoError(t, err)
+			for i := range u.WebauthnCredentials {
+				if u.WebauthnCredentials[i].ID == credentialIDStr {
+					u.WebauthnCredentials[i].Authenticator.CloneWarning = true
+				}
+			}
+			require.NoError(t, baseStore.Users().Update(ctx, u))
+		},
+	}
+	wrapped := &storeWithUserOverride{Store: baseStore, users: raceStore}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	// A clean, cleanly-incrementing login on the wrapped store: this
+	// request's OWN assertion never sees a clone warning, but the
+	// "concurrent" write injected mid-flight already latched one.
+	beginLoginResp, err := svc.BeginLogin(ctx)
+	require.NoError(t, err)
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+	credential.Counter = 20
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+	_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+	})
+	require.NoError(t, err)
+
+	final, err := baseStore.Users().GetByID(ctx, userID)
+	require.NoError(t, err)
+	assert.True(t, final.WebauthnCredentials[0].Authenticator.CloneWarning,
+		"a concurrent write that latched CloneWarning=true must survive this request's own ReplaceOne, not be clobbered back to false")
+}
+
+// TestFinishRegistration_ExpectedTenantIDMismatch_RejectsBeforeConsumingChallenge
+// covers the rebase-onto-main fixup: a mismatched ExpectedTenantID (the
+// caller's validated tenant context, e.g. from the X-Tenant-ID header) must
+// be rejected via ErrTenantMismatch, and the real challenge must survive —
+// it must not be consumed by ConsumeByIDForTenant just because the tenant
+// didn't match.
+func TestFinishRegistration_ExpectedTenantIDMismatch_RejectsBeforeConsumingChallenge(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	tenantA := &domain.Tenant{ID: "tenant-a", Name: "Tenant A", DisplayName: "Tenant A", Enabled: true}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenantA))
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Tenant A User",
+		TenantID:    "tenant-a",
+	})
+	require.NoError(t, err)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID:      beginResp.ChallengeID,
+		Credential:       json.RawMessage(`{}`),
+		DisplayName:      "Tenant A User",
+		ExpectedTenantID: "tenant-b",
+	})
+	require.ErrorIs(t, err, ErrTenantMismatch)
+
+	_, err = baseStore.Challenges().GetByID(ctx, beginResp.ChallengeID)
+	assert.NoError(t, err, "challenge should survive a mismatched ExpectedTenantID attempt, not be consumed")
+}
+
+// erroringUserStore wraps a real storage.UserStore and forces
+// UpdateCredentialAuthenticator to return an arbitrary error for one
+// specific user, so tests can exercise FinishLogin's "don't fail login for
+// this" error-logging branch without needing a real storage outage.
+type erroringUserStore struct {
+	storage.UserStore
+	failUserID string
+	err        error
+}
+
+func (e *erroringUserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
+	if id.String() == e.failUserID {
+		return false, e.err
+	}
+	return e.UserStore.UpdateCredentialAuthenticator(ctx, id, credentialID, signCount, cloneWarning)
+}
+
+// TestFullLoginFlow_UpdateCredentialAuthenticatorError_DoesNotFailLogin
+// covers FinishLogin's error-logging branch when the atomic
+// UpdateCredentialAuthenticator persistence call itself fails (e.g. a
+// storage outage): the login must still succeed ("don't fail login for
+// this" — matching the same tolerance the old whole-document Update() had).
+func TestFullLoginFlow_UpdateCredentialAuthenticatorError_DoesNotFailLogin(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Persist Error User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Persist Error User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	wrapped := &storeWithUserOverride{
+		Store: baseStore,
+		users: &erroringUserStore{
+			UserStore:  baseStore.Users(),
+			failUserID: userID.String(),
+			err:        errors.New("simulated storage outage"),
+		},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	beginLoginResp, err := svc.BeginLogin(ctx)
+	require.NoError(t, err)
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+	_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+	})
+	require.NoError(t, err, "a persistence failure must not fail the login itself")
+}
+
+// TestFullLoginFlow_CloneWarningPersistFailure_StillSurfacesTheSignal covers
+// a review finding on PR #388 / issue #411: when
+// UpdateCredentialAuthenticator itself fails (e.g. a storage outage),
+// `transitioned` stays false, so gating the clone-warning log/audit purely
+// on `transitioned` would silently drop the security signal for the one
+// case it matters most — a genuine detection that couldn't be persisted.
+// FinishLogin must emit a distinct, separately-greppable event
+// ("webauthn_clone_warning_persist_failed") in exactly this case, on top of
+// (not instead of) the generic "Failed to update credential authenticator"
+// error log, and the login must still succeed.
+func TestFullLoginFlow_CloneWarningPersistFailure_StillSurfacesTheSignal(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	baseStore := memory.NewStore()
+	setupSvc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	ctx := context.Background()
+
+	beginRegResp, err := setupSvc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "Persist Failure Clone User"})
+	require.NoError(t, err)
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+	finishRegResp, err := setupSvc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Persist Failure Clone User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	authenticator.Options.UserHandle = userID.AsUserHandle()
+	authenticator.AddCredential(credential)
+
+	login := func(svc *WebAuthnService, counter uint32) {
+		t.Helper()
+		credential.Counter = counter
+		beginLoginResp, err := svc.BeginLogin(ctx)
+		require.NoError(t, err)
+		loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+		require.NoError(t, err)
+		assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+		require.NoError(t, err)
+		assertionResponse := virtualwebauthn.CreateAssertionResponse(rp, authenticator, credential, *assertionOptions)
+		_, err = svc.FinishLogin(ctx, &FinishLoginRequest{
+			ChallengeID: beginLoginResp.ChallengeID,
+			Credential:  json.RawMessage(assertionResponse),
+		})
+		require.NoError(t, err, "a persistence failure must not fail the login itself")
+	}
+
+	// Establish a non-zero baseline counter via a normal (non-erroring) service.
+	normalSvc, err := NewWebAuthnService(baseStore, cfg, logger)
+	require.NoError(t, err)
+	login(normalSvc, 10)
+
+	// Now the atomic persist call fails for this user, AND this login's
+	// assertion is a genuine clone-authenticator regression.
+	wrapped := &storeWithUserOverride{
+		Store: baseStore,
+		users: &erroringUserStore{
+			UserStore:  baseStore.Users(),
+			failUserID: userID.String(),
+			err:        errors.New("simulated storage outage"),
+		},
+	}
+	failingSvc, err := NewWebAuthnService(wrapped, cfg, logger)
+	require.NoError(t, err)
+	login(failingSvc, 3) // lower than the established baseline: a regression
+
+	persistFailedEntries := observed.FilterMessage("possible cloned authenticator detected but the warning failed to persist").All()
+	require.Len(t, persistFailedEntries, 1, "a genuine detection that fails to persist must still emit a distinct security-event line")
+	fields := persistFailedEntries[0].ContextMap()
+	assert.Equal(t, "webauthn_clone_warning_persist_failed", fields["security_event"])
+	assert.Equal(t, userID.String(), fields["user_id"])
+
+	// The normal "confirmed newly latched" line must NOT also fire for this
+	// same detection — transitioned is unreliable when persistence failed,
+	// so it must not be conflated with the confirmed-persisted case.
+	confirmedEntries := observed.FilterMessage("possible cloned authenticator detected").All()
+	assert.Empty(t, confirmedEntries, "the confirmed-persisted clone-warning line must not fire when persistence itself failed")
+}
+
+// ============================================================================
+// Storage-layer failure paths for the atomic challenge/invite consumption
+// (issues #379, #378) — a real storage outage on ConsumeByID/MarkCompleted,
+// as opposed to the "already consumed" case covered by the concurrency tests
+// in internal/storage/memory and internal/storage/mongodb.
+// ============================================================================
+
+// erroringChallengeStore wraps a real storage.ChallengeStore and forces
+// ConsumeByID to return an arbitrary (non-ErrNotFound) error for one
+// specific challenge ID, so tests can exercise the generic
+// "failed to consume challenge" error-wrapping branch in
+// FinishRegistration/FinishLogin/FinishAddCredential without needing a real
+// storage outage.
+type erroringChallengeStore struct {
+	storage.ChallengeStore
+	failID string
+	err    error
+}
+
+func (e *erroringChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByID(ctx, id)
+}
+
+func (e *erroringChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByIDForUser(ctx, id, userID)
+}
+
+func (e *erroringChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	if id == e.failID {
+		return nil, e.err
+	}
+	return e.ChallengeStore.ConsumeByIDForTenant(ctx, id, expectedTenantID)
+}
+
+// storeWithChallengeOverride wraps *memory.Store, swapping out just the
+// Challenges() accessor so every other collection still behaves like the
+// real in-memory store.
+type storeWithChallengeOverride struct {
+	*memory.Store
+	challenges storage.ChallengeStore
+}
+
+func (s *storeWithChallengeOverride) Challenges() storage.ChallengeStore { return s.challenges }
+
+func TestConsumeChallenge_GenericStorageError_IsWrapped(t *testing.T) {
+	wantErr := errors.New("simulated storage outage")
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+
+	t.Run("FinishRegistration", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishRegistration(context.Background(), &FinishRegistrationRequest{
+			ChallengeID: "boom-challenge",
+		})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("FinishLogin", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishLogin(context.Background(), &FinishLoginRequest{
+			ChallengeID: "boom-challenge",
+		})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+
+	t.Run("FinishAddCredential", func(t *testing.T) {
+		baseStore := memory.NewStore()
+		userID := domain.NewUserID()
+		require.NoError(t, baseStore.Users().Create(context.Background(), &domain.User{UUID: userID}))
+		wrapped := &storeWithChallengeOverride{
+			Store: baseStore,
+			challenges: &erroringChallengeStore{
+				ChallengeStore: baseStore.Challenges(),
+				failID:         "boom-challenge",
+				err:            wantErr,
+			},
+		}
+		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+		require.NoError(t, err)
+
+		_, err = svc.FinishAddCredential(context.Background(), userID, &FinishAddCredentialRequest{
+			ChallengeID: "boom-challenge",
+		}, "")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrChallengeNotFound)
+		assert.Contains(t, err.Error(), "failed to consume challenge")
+		assert.ErrorIs(t, err, wantErr)
+	})
+}
+
+// erroringInviteStore wraps a real storage.InviteStore and forces
+// MarkCompleted to fail for one specific invite code, regardless of the
+// invite's actual state. This lets a single-threaded test exercise the
+// "atomic invite claim failed, reject registration before the user account
+// is created" branch that fixes issue #378, without needing a second
+// goroutine to actually race it (that race is covered separately by
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner in
+// internal/storage/memory).
+type erroringInviteStore struct {
+	storage.InviteStore
+	failCode string
+	err      error
+}
+
+func (e *erroringInviteStore) MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error {
+	if code == e.failCode {
+		return e.err
+	}
+	return e.InviteStore.MarkCompleted(ctx, tenantID, code, usedBy)
+}
+
+// storeWithInviteOverride wraps *memory.Store, swapping out just the
+// Invites() accessor.
+type storeWithInviteOverride struct {
+	*memory.Store
+	invites storage.InviteStore
+}
+
+func (s *storeWithInviteOverride) Invites() storage.InviteStore { return s.invites }
+
+// TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated
+// covers issue #378: when the atomic invite claim (MarkCompleted) fails —
+// here simulated directly, the concurrent-loser case is covered by
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner — FinishRegistration
+// must reject the registration with ErrInvalidInvite and must NOT have
+// created the user account or tenant membership. Before the W-1 fix,
+// MarkCompleted ran after Users().Create()/AddMembership, so this same
+// failure would have left a committed, usable account behind.
+func TestFinishRegistration_InviteMarkCompletedFails_RejectsBeforeUserCreated(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:          domain.TenantID("tenant-invite-fail"),
+		Name:        "Invite Fail Tenant",
+		DisplayName: "Invite Fail Tenant",
+		Enabled:     true,
+	}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenant))
+
+	invite := &domain.Invite{
+		ID:        "invite-1",
+		TenantID:  tenant.ID,
+		Code:      "INVITE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, baseStore.Invites().Create(ctx, invite))
+
+	wrapped := &storeWithInviteOverride{
+		Store: baseStore,
+		invites: &erroringInviteStore{
+			InviteStore: baseStore.Invites(),
+			failCode:    invite.Code,
+			err:         errors.New("simulated atomic claim failure"),
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Invite Fail User",
+		TenantID:    string(tenant.ID),
+		InviteCode:  invite.Code,
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "Invite Fail User",
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	// No user or membership must have been created: the atomic invite claim
+	// failing must gate user creation, not happen after it.
+	tenantUsers, err := baseStore.UserTenants().GetTenantUsers(ctx, tenant.ID)
+	require.NoError(t, err)
+	assert.Empty(t, tenantUsers, "no tenant membership should exist when the atomic invite claim fails")
+
+	// The invite itself must still read back as untouched (still active) —
+	// erroringInviteStore never delegated to the real MarkCompleted.
+	gotInvite, err := baseStore.Invites().GetByCode(ctx, tenant.ID, invite.Code)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusActive, gotInvite.Status)
+}
+
+// TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent
+// covers the ordering of identity:bound (#66): it is emitted only after the
+// user is persisted, so an atomic invite-claim failure leaves no bound record.
+func TestFinishRegistration_InviteMarkCompletedFails_EmitsNoIdentityBoundEvent(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	tenant := &domain.Tenant{
+		ID:          domain.TenantID("tenant-invite-fail"),
+		Name:        "Invite Fail Tenant",
+		DisplayName: "Invite Fail Tenant",
+		Enabled:     true,
+	}
+	require.NoError(t, baseStore.Tenants().Create(ctx, tenant))
+
+	invite := &domain.Invite{
+		ID:        "invite-1",
+		TenantID:  tenant.ID,
+		Code:      "INVITE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, baseStore.Invites().Create(ctx, invite))
+
+	wrapped := &storeWithInviteOverride{
+		Store: baseStore,
+		invites: &erroringInviteStore{
+			InviteStore: baseStore.Invites(),
+			failCode:    invite.Code,
+			err:         errors.New("simulated atomic claim failure"),
+		},
+	}
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
+	require.NoError(t, err)
+	auditEvents := attachIdentityAudit(t, svc, config.AuditIdentityBound)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{
+		DisplayName: "Invite Fail User",
+		TenantID:    string(tenant.ID),
+		InviteCode:  invite.Code,
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID:     beginResp.ChallengeID,
+		Credential:      json.RawMessage(regResponse),
+		DisplayName:     "Invite Fail User",
+		OIDCGateBinding: &OIDCGateBinding{Issuer: "https://idp.example.com", Subject: "alice"},
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	// The registration was rejected, so the identity was never bound and no
+	// immutable "bound" record may exist for it (#66).
+	assert.Empty(t, auditEvents.URIs(), "a failed registration must not emit identity:bound")
+}
+
+// TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed is
+// the defense-in-depth companion to
+// TestWebAuthnService_BeginRegistration_InviteCodeWithoutTenantRejected: even
+// though BeginRegistration now rejects an invite-code-without-tenant
+// request up front, this constructs a challenge directly in the store
+// (bypassing BeginRegistration entirely, as if one somehow existed from
+// before that guard, or from a future code path that stores a challenge
+// differently) with a non-empty InviteCode but an empty TenantID, and
+// asserts FinishRegistration still fails closed with ErrInvalidInvite
+// rather than silently skipping invite consumption and creating a global
+// account.
+func TestFinishRegistration_ChallengeWithInviteCodeButNoTenant_RejectsClosed(t *testing.T) {
+	baseStore := memory.NewStore()
+	ctx := context.Background()
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
+		JWT:    config.JWTConfig{Secret: testJWTSecret, Issuer: testJWTIssuer, ExpiryHours: testJWTExpiryHours},
+	}
+	svc, err := NewWebAuthnService(baseStore, cfg, zap.NewNop())
+	require.NoError(t, err)
+
+	rp := virtualwebauthn.RelyingParty{ID: testRPID, Name: testRPName, Origin: testRPOrigin}
+	authenticator := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{
+		UserNotVerified: false,
+		UserNotPresent:  false,
+	})
+	credential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+
+	// Use the normal BeginRegistration path (no tenant, no invite code — a
+	// perfectly ordinary global registration) to get a well-formed
+	// challenge and options, then mutate the STORED challenge directly to
+	// carry a non-empty InviteCode. This simulates a challenge somehow
+	// ending up in this shape (e.g. a future code path that constructs one
+	// differently) without needing to hand-build virtualwebauthn/WebAuthn
+	// protocol structs.
+	beginResp, err := svc.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "No Tenant User"})
+	require.NoError(t, err)
+
+	storedChallenge, err := baseStore.Challenges().GetByID(ctx, beginResp.ChallengeID)
+	require.NoError(t, err)
+	storedChallenge.InviteCode = "orphaned-invite-code"
+	require.NoError(t, baseStore.Challenges().Create(ctx, storedChallenge)) // memory Create overwrites by ID
+
+	regOptionsJSON, err := json.Marshal(beginResp.CreateOptions)
+	require.NoError(t, err)
+	regOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+	regResponse := virtualwebauthn.CreateAttestationResponse(rp, authenticator, credential, *regOptions)
+
+	_, err = svc.FinishRegistration(ctx, &FinishRegistrationRequest{
+		ChallengeID: beginResp.ChallengeID,
+		Credential:  json.RawMessage(regResponse),
+		DisplayName: "No Tenant User",
+	})
+	require.ErrorIs(t, err, ErrInvalidInvite)
+
+	userID := domain.UserIDFromString(storedChallenge.UserID)
+	_, err = baseStore.Users().GetByID(ctx, userID)
+	assert.ErrorIs(t, err, storage.ErrNotFound, "no user must be created when a challenge carries an invite code but no tenant")
+}
+
 // ============================================================================
 // BeginAddCredential Tests
 // ============================================================================
@@ -939,9 +2632,22 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 			Credential:  json.RawMessage(`{}`),
 		}
 
+		// Review finding on PR #388: consuming the challenge before checking
+		// ownership let a mismatched caller (user 2, here) permanently burn
+		// user 1's real challenge. The atomic ConsumeByIDForUser fix folds
+		// the ownership check into the same atomic find-and-delete, so
+		// user 2's request must be rejected as "not found" (indistinguishable
+		// from the challenge simply not existing — deliberately, so a caller
+		// can't probe which) WITHOUT consuming it.
 		_, err = setup.service.FinishAddCredential(setup.ctx, userID2, finishReq, "")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "challenge user mismatch")
+		assert.ErrorIs(t, err, ErrChallengeNotFound)
+
+		// The real owner (user 1) must still be able to use their own
+		// challenge afterward — it must not have been consumed by user 2's
+		// mismatched attempt.
+		got, err := setup.store.Challenges().GetByID(setup.ctx, "user1-challenge")
+		require.NoError(t, err, "user 1's challenge must survive a mismatched-owner attempt from user 2")
+		assert.Equal(t, userID1.String(), got.UserID)
 	})
 }
 
@@ -1184,6 +2890,8 @@ func TestBEREncodedECDSASignature(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -1261,10 +2969,13 @@ func TestWebAuthnService_FinishLogin_OIDCGate_MissingBinding(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require OIDC gate when binding is missing")
+	assert.Equal(t, []string{"urn:siros:audit:identity:gate_bypass"}, auditEvents.URIs())
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate enabled for login
 	tenant := &domain.Tenant{
@@ -1342,6 +3053,346 @@ func TestWebAuthnService_FinishLogin_OIDCGate_WrongIssuer(t *testing.T) {
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require correct issuer")
+	require.Equal(t, []string{"urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "issuer", auditEvents.Payloads()[0]["reason"])
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience covers a Copilot
+// review finding: two tenants can share an OIDC issuer (e.g. a shared
+// multi-tenant IdP domain) while using different client IDs/audiences per
+// app. Issuer alone matching isn't enough proof a token was meant for THIS
+// tenant - the audience the token was actually validated against (recorded
+// by the AS handler in OIDCGateBinding.Audience) must match too.
+func TestWebAuthnService_FinishLogin_OIDCGate_WrongAudience(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-audience"),
+		Name:    "Test Tenant Audience",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-audience-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Audience Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Audience Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Correct issuer, but the audience the token was actually validated
+	// against (a different tenant's client) doesn't match this tenant's -
+	// should fail with ErrOIDCGateRequired even though the issuer matches.
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "some-other-tenants-client",
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require the correct audience even when the issuer matches")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_MatchingAudience_Success exercises
+// the other side of the new audience check: a binding whose Audience matches
+// the tenant's own configured audience (defaulting to ClientID, per
+// EffectiveAudience) must be allowed through, not just an empty/unset one.
+func TestWebAuthnService_FinishLogin_OIDCGate_MatchingAudience_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-audience-ok"),
+		Name:    "Test Tenant Audience OK",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-audience-ok-client",
+			},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Audience OK User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Audience OK User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-audience-ok-client", // Matches tenant's EffectiveAudience (ClientID).
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when the audience matches")
+	assert.NotEmpty(t, resp.Token)
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch covers a
+// third Copilot review finding on this PR: Issuer and Audience matching
+// alone isn't enough if two tenants share both but configure different
+// OIDCGate.RequiredClaims - the gate middleware only ever validates a token
+// against the HEADER tenant's RequiredClaims, never the CREDENTIAL's real
+// tenant's. FinishLogin must re-check the credential tenant's own
+// RequiredClaims against the token's actual validated claims.
+func TestWebAuthnService_FinishLogin_OIDCGate_RequiredClaimsMismatch(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims"),
+		Name:    "Test Tenant Claims",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims Test User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims Test User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	// Correct issuer and audience, but the validated claims don't satisfy
+	// this tenant's RequiredClaims (e.g. the token was validated against a
+	// different, more permissive tenant sharing the same issuer/audience).
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-client",
+			Claims:   jwt.MapClaims{"role": "user"}, // Missing/wrong role.
+		},
+	}
+
+	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrOIDCGateRequired, "Should require the correct claims even when issuer and audience match")
+}
+
+// TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success exercises
+// the other side: a binding whose Claims satisfy the tenant's
+// RequiredClaims must be allowed through.
+func TestWebAuthnService_FinishLogin_OIDCGate_MatchingClaims_Success(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+
+	tenant := &domain.Tenant{
+		ID:      domain.TenantID("test-tenant-claims-ok"),
+		Name:    "Test Tenant Claims OK",
+		Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode: domain.OIDCGateModeLogin,
+			RegistrationOP: &domain.OIDCProviderConfig{
+				Issuer:   "https://idp.example.com",
+				ClientID: "tenant-claims-ok-client",
+			},
+			RequiredClaims: map[string]interface{}{"role": "admin"},
+		},
+	}
+	err := setup.store.Tenants().Create(setup.ctx, tenant)
+	require.NoError(t, err)
+
+	beginRegResp, err := setup.service.BeginRegistration(setup.ctx, &BeginRegistrationRequest{
+		DisplayName: "OIDC Gate Claims OK User",
+		TenantID:    string(tenant.ID),
+	})
+	require.NoError(t, err)
+
+	regOptionsJSON, err := json.Marshal(beginRegResp.CreateOptions)
+	require.NoError(t, err)
+	attestationOptions, err := virtualwebauthn.ParseAttestationOptions(string(regOptionsJSON))
+	require.NoError(t, err)
+
+	attestationResponse := virtualwebauthn.CreateAttestationResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*attestationOptions,
+	)
+
+	finishRegResp, err := setup.service.FinishRegistration(setup.ctx, &FinishRegistrationRequest{
+		ChallengeID: beginRegResp.ChallengeID,
+		Credential:  json.RawMessage(attestationResponse),
+		DisplayName: "OIDC Gate Claims OK User",
+	})
+	require.NoError(t, err)
+
+	userID := domain.UserIDFromString(finishRegResp.UUID)
+	setup.authenticator.Options.UserHandle = domain.EncodeUserHandle(tenant.ID, userID)
+	setup.authenticator.AddCredential(setup.credential)
+
+	beginLoginResp, err := setup.service.BeginLogin(setup.ctx)
+	require.NoError(t, err)
+
+	loginOptionsJSON, err := json.Marshal(beginLoginResp.GetOptions)
+	require.NoError(t, err)
+	assertionOptions, err := virtualwebauthn.ParseAssertionOptions(string(loginOptionsJSON))
+	require.NoError(t, err)
+
+	assertionResponse := virtualwebauthn.CreateAssertionResponse(
+		setup.rp,
+		setup.authenticator,
+		setup.credential,
+		*assertionOptions,
+	)
+
+	finishLoginReq := &FinishLoginRequest{
+		ChallengeID: beginLoginResp.ChallengeID,
+		Credential:  json.RawMessage(assertionResponse),
+		OIDCGateBinding: &OIDCGateBinding{
+			Issuer:   "https://idp.example.com",
+			Subject:  "user123",
+			Audience: "tenant-claims-ok-client",
+			Claims:   jwt.MapClaims{"role": "admin"},
+		},
+	}
+
+	resp, err := setup.service.FinishLogin(setup.ctx, finishLoginReq)
+	require.NoError(t, err, "Login should succeed when RequiredClaims are satisfied")
+	assert.NotEmpty(t, resp.Token)
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
@@ -1429,6 +3480,8 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityNotBound(t *testing.T) {
 
 func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -1516,10 +3569,15 @@ func TestWebAuthnService_FinishLogin_OIDCGate_IdentityBindingMismatch(t *testing
 	_, err = setup.service.FinishLogin(setup.ctx, finishLoginReq)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrIdentityBindingMismatch, "Should fail when binding doesn't match stored identity")
+	// The identity was bound at registration; the failed login is a mismatch.
+	require.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:mismatch"}, auditEvents.URIs())
+	assert.Equal(t, "identity", auditEvents.Payloads()[1]["reason"])
 }
 
 func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	auditEvents := attachIdentityAudit(t, setup.service,
+		config.AuditIdentityBound, config.AuditIdentityVerified, config.AuditIdentityMismatch, config.AuditIdentityGateBypass)
 
 	// Create tenant with OIDC gate AND bind_identity enabled
 	tenant := &domain.Tenant{
@@ -1603,6 +3661,7 @@ func TestWebAuthnService_FinishLogin_OIDCGate_Success(t *testing.T) {
 	require.NoError(t, err, "Login should succeed when OIDC binding matches stored identity")
 	assert.NotEmpty(t, resp.Token, "Should receive a valid token")
 	assert.Equal(t, string(tenant.ID), resp.TenantID, "Should return the tenant ID")
+	assert.Equal(t, []string{"urn:siros:audit:identity:bound", "urn:siros:audit:identity:verified"}, auditEvents.URIs())
 }
 
 // ============================================================================

@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func TestGenerateCodeVerifier(t *testing.T) {
@@ -3385,6 +3386,126 @@ func TestFetchMetadata_MapConversion(t *testing.T) {
 	assert.Equal(t, "urn:credential:pid", meta.Metadata.CredentialConfigurationsSupported["pid"].VCT)
 }
 
+func TestIssuerMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"credential_configurations_supported": {
+			"pid": {"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+			"broken": {"format": {"id": "not-a-string"}, "vct": "urn:example:broken"},
+			"mdl": {"format": "mso_mdoc", "scope": "mdl"}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Equal(t, "https://issuer.example.com/credential", meta.CredentialEndpoint)
+	require.Len(t, meta.CredentialConfigurationsSupported, 2)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["pid"].Format)
+	assert.Equal(t, "urn:eudi:pid:1", meta.CredentialConfigurationsSupported["pid"].VCT)
+	assert.Equal(t, "mso_mdoc", meta.CredentialConfigurationsSupported["mdl"].Format)
+	assert.Equal(t, "mdl", meta.CredentialConfigurationsSupported["mdl"].Scope)
+	_, present := meta.CredentialConfigurationsSupported["broken"]
+	assert.False(t, present)
+}
+
+func TestIssuerMetadata_SkipsCredentialThatFailsToDecode(t *testing.T) {
+	// display.logo must be an object. A string logo makes this one
+	// configuration undecodable; the sibling configuration still loads.
+	raw := []byte(`{
+		"credential_configurations_supported": {
+			"ok": {"format": "dc+sd-jwt", "display": [{"name": "PID", "locale": "en"}]},
+			"bad-logo": {
+				"format": "dc+sd-jwt",
+				"display": [{"name": "Bad", "logo": "https://example.com/logo.png"}]
+			}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	require.Len(t, meta.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.CredentialConfigurationsSupported["ok"].Format)
+	require.Len(t, meta.CredentialConfigurationsSupported["ok"].Display, 1)
+	assert.Equal(t, "PID", meta.CredentialConfigurationsSupported["ok"].Display[0].Name)
+}
+
+func TestIssuerMetadata_AllBrokenCredentialsYieldEmptyMap(t *testing.T) {
+	raw := []byte(`{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_configurations_supported": {
+			"broken": {"format": 1}
+		}
+	}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+	assert.Empty(t, meta.CredentialConfigurationsSupported)
+}
+
+func TestIssuerMetadata_RejectsNonObjectCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_configurations_supported": [{"format": "dc+sd-jwt"}]}`)
+
+	var meta IssuerMetadata
+	err := json.Unmarshal(raw, &meta)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credential_configurations_supported")
+}
+
+func TestIssuerMetadata_AbsentCredentialConfigurations(t *testing.T) {
+	raw := []byte(`{"credential_issuer": "https://issuer.example.com", "credential_endpoint": "https://issuer.example.com/credential"}`)
+
+	var meta IssuerMetadata
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	assert.Nil(t, meta.CredentialConfigurationsSupported)
+	assert.Equal(t, "https://issuer.example.com", meta.CredentialIssuer)
+}
+
+func TestFetchMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resolver := &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{
+					"format": "dc+sd-jwt",
+					"vct":    "urn:eudi:pid:1",
+				},
+				"broken": map[string]interface{}{
+					"format": map[string]interface{}{"id": "not-a-string"},
+					"vct":    "urn:example:broken",
+				},
+			},
+		},
+	}
+
+	h := &OID4VCIHandler{metadataResolver: resolver}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
+	require.Len(t, meta.Metadata.CredentialConfigurationsSupported, 1)
+	assert.Equal(t, "dc+sd-jwt", meta.Metadata.CredentialConfigurationsSupported["pid"].Format)
+	assert.NotContains(t, meta.Metadata.CredentialConfigurationsSupported, "broken")
+}
+
 func TestFetchMetadata_ValidatedFlag(t *testing.T) {
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
@@ -3604,4 +3725,257 @@ func TestParseOffer_OfferURIWithoutAuthorityUsesOfferURIParam(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, offer)
 	assert.Equal(t, []string{"eucc"}, offer.CredentialConfigurationIDs)
+}
+
+// --- evaluateTrust: PDP-configured vs. no-PDP-configured semantics (M-5, #377) ---
+//
+// Exact intended semantics:
+//   - No issuer PDP URL configured at all -> falling back to client-asserted
+//     (frontend) trust evaluation is INTENTIONAL (permissive dev/no-PDP mode).
+//   - A PDP URL IS configured, and the call to it errors (rather than
+//     returning a valid trusted/untrusted verdict) -> MUST fail closed
+//     (untrusted / block issuance), and must NEVER fall back to asking the
+//     frontend/WS client in that case.
+
+// TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed verifies that
+// when an issuer PDP URL is configured and TrustSvc.EvaluateIssuer returns an
+// error (e.g. evaluator construction failure), evaluateTrust fails closed:
+// the issuer is treated as untrusted and the frontend is never asked (no
+// trust_evaluation_required progress message is sent, and no
+// evaluateTrustViaFrontend WaitForActionWithTimeout round-trip occurs).
+func TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "https://pdp.example.com"
+
+	evaluatorErr := errors.New("evaluator construction failed")
+	trustSvc := trust.NewService(cfg, zap.NewNop(),
+		func(_ string, _ time.Duration) (trust.TrustEvaluator, error) {
+			return nil, evaluatorErr
+		})
+
+	// Capture every message the handler sends to the "frontend" so we can
+	// assert trust_evaluation_required was never sent.
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Deliberately do NOT queue any trust_result action on session.actionCh:
+	// if the fix regresses and the code falls through to
+	// evaluateTrustViaFrontend, WaitForActionWithTimeout must block until the
+	// bounded context below expires rather than ever getting an answer.
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:     flow,
+		Config:   cfg,
+		Logger:   zap.NewNop(),
+		TrustSvc: trustSvc,
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(ctx, "https://issuer.example.com", metadata, false)
+
+	require.Error(t, err)
+	require.NotNil(t, info)
+	assert.False(t, info.Trusted, "issuer must be treated as untrusted on PDP evaluation error")
+	assert.Contains(t, err.Error(), "trust evaluation error")
+	assert.Contains(t, err.Error(), "issuer.example.com")
+
+	// Drain and inspect whatever the handler sent - it must never have asked
+	// the frontend to evaluate trust. Bounded wait (rather than closing the
+	// channel) since the server-side reader goroutine may still be in flight.
+	drainDeadline := time.After(500 * time.Millisecond)
+drain:
+	for {
+		select {
+		case data := <-messages:
+			assert.NotContains(t, string(data), "trust_evaluation_required",
+				"must never fall back to frontend-mediated trust evaluation on a PDP error")
+		case <-drainDeadline:
+			break drain
+		}
+	}
+}
+
+// TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged is a regression
+// guard: when NO issuer PDP URL is configured at all, evaluateTrust must
+// still fall back to the client-asserted (frontend) trust evaluation path
+// exactly as before this fix - that permissive dev/no-PDP mode is
+// intentional and must not be touched by the fail-closed change above.
+func TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged(t *testing.T) {
+	cfg := testConfig()
+	// cfg.Trust.PDPURL left empty: no PDP configured at all.
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	// Queue the frontend's verdict up front: evaluateTrustViaFrontend blocks on it.
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eudi"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: cfg,
+		Logger: zap.NewNop(),
+		// TrustSvc intentionally nil: with no PDP configured, evaluateTrust
+		// must never dereference it.
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
+	info, err := h.evaluateTrust(context.Background(), "https://issuer.example.com", metadata, false)
+
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+	assert.Equal(t, "eudi", info.Framework)
+
+	// Confirm the frontend really was asked (proving this test exercises the
+	// path it claims to, not a leftover default). evaluateTrust already
+	// returned above, so the message was sent before this point; still allow
+	// a short bounded wait for the reader goroutine to have forwarded it.
+	deadline := time.After(2 * time.Second)
+	sawTrustRequired := false
+wait:
+	for {
+		select {
+		case data := <-messages:
+			if strings.Contains(string(data), "trust_evaluation_required") {
+				sawTrustRequired = true
+				break wait
+			}
+		case <-deadline:
+			break wait
+		}
+	}
+	assert.True(t, sawTrustRequired, "no-PDP mode must still ask the frontend to evaluate trust")
+}
+
+// TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID is the
+// regression test for a fifth Copilot review round on go-wallet-backend
+// PR #401: TrustEvaluationRequest.ResolutionSubjectID (added there for the
+// OID4VP verifier-side frontend fallback, see oid4vp_test.go's
+// TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags)
+// is documented as required whenever RequiresResolution is true - but
+// evaluateTrustViaFrontend here, the analogous no-PDP frontend-fallback path
+// for OID4VCI issuers, never populated it: a DID issuer request reached the
+// frontend with requires_resolution: true and an empty resolution_subject_id,
+// so a frontend genuinely implementing the new contract could not resolve
+// DID issuers at all.
+//
+// Unlike OID4VP's decentralized_identifier:-prefixed client_id, an OID4VCI
+// issuer identifier carries no scheme prefix to strip - the issuer string
+// already IS the bare DID whenever requiresResolution is true - so the fix
+// is simply to also send it as ResolutionSubjectID, not to extract anything.
+func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *testing.T) {
+	const issuer = "did:web:issuer.example"
+
+	messages := make(chan []byte, 16)
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			_, data, err := srvConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+	})
+	defer cleanup()
+
+	session := testSession(conn)
+	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+
+	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
+	require.NoError(t, err)
+	session.actionCh <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
+		Action:  ActionTrustResult,
+		Payload: resultPayload,
+	}
+
+	h := &OID4VCIHandler{BaseHandler: BaseHandler{
+		Flow:   flow,
+		Config: testConfig(), // no issuer PDP configured at all
+		Logger: zap.NewNop(),
+	}}
+
+	metadata := &IssuerMetadata{CredentialIssuer: issuer}
+	info, err := h.evaluateTrust(context.Background(), issuer, metadata, false)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.Trusted)
+
+	req := trustEvaluationRequest(t, messages)
+	assert.Equal(t, issuer, req.SubjectID)
+	assert.True(t, req.RequiresResolution, "a did: issuer must ask the frontend to resolve it")
+	assert.Equal(t, issuer, req.ResolutionSubjectID, "ResolutionSubjectID must be populated for a DID issuer, same as for a DID verifier")
+}
+
+// Cleverbase publishes claims both at the configuration level (as an array)
+// and under credential_metadata. The credential must still be usable (#370).
+func TestIssuerMetadata_LegacyClaimsArrayDoesNotDropConfiguration(t *testing.T) {
+	doc := `{"credential_issuer":"https://i.example","credential_endpoint":"https://i.example/c",
+	"credential_configurations_supported":{"hello-world":{"format":"dc+sd-jwt","vct":"x","claims":[],
+	"credential_metadata":{"claims":[]}}}}`
+	var m IssuerMetadata
+	if err := json.Unmarshal([]byte(doc), &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg, ok := m.CredentialConfigurationsSupported["hello-world"]
+	if !ok {
+		t.Fatal("configuration with a legacy claims array was dropped")
+	}
+	if cfg.Format != "dc+sd-jwt" || cfg.VCT != "x" {
+		t.Errorf("unexpected config: %+v", cfg)
+	}
+}
+
+// A null credential_configurations_supported must clear a reused value.
+func TestIssuerMetadata_NullCredentialConfigurationsClearsReusedValue(t *testing.T) {
+	var m IssuerMetadata
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":{"a":{"format":"dc+sd-jwt"}}}`), &m))
+	require.Len(t, m.CredentialConfigurationsSupported, 1)
+
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":null}`), &m))
+	assert.Empty(t, m.CredentialConfigurationsSupported)
 }

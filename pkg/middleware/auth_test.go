@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -43,6 +44,19 @@ func createExpiredToken(secret string, userID string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": userID,
 		"exp":     time.Now().Add(-time.Hour).Unix(),
+	})
+	tokenString, _ := token.SignedString([]byte(secret))
+	return tokenString
+}
+
+// createTokenWithJTI creates a valid, non-expired token carrying a specific
+// jti and iat, for exercising blacklist/revocation checks.
+func createTokenWithJTI(secret, userID, jti string, issuedAt time.Time) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"jti":     jti,
+		"iat":     issuedAt.Unix(),
+		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
 	tokenString, _ := token.SignedString([]byte(secret))
 	return tokenString
@@ -183,6 +197,143 @@ func TestAuthMiddleware_WrongSecret(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+func TestAuthMiddleware_MissingUserID(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
+
+	// A token that's otherwise valid (correctly signed, not expired) but
+	// carries no "user_id" claim at all.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("SignedString: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
+// createBlacklistTestRouter is like createTestRouter but wires
+// AuthMiddlewareWithBlacklist with a real blacklist, the same way
+// internal/server/providers.go wires it for production request paths (see
+// #382 - AuthMiddleware itself hardcodes a nil blacklist and is
+// deliberately NOT used here).
+func createBlacklistTestRouter(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) *gin.Engine {
+	router := gin.New()
+	router.Use(AuthMiddlewareWithBlacklist(cfg, store, blacklist, logger))
+	router.GET("/test", func(c *gin.Context) {
+		userID, exists := c.Get("user_id")
+		if !exists {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "user_id not found"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"user_id": userID})
+	})
+	return router
+}
+
+func TestAuthMiddlewareWithBlacklist_LoggedOutTokenRejected(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	cfg.Security.TokenBlacklist.Enabled = true
+	store := createTestStore()
+
+	// The real blacklist implementation backing Logout (internal/api/
+	// handlers.go), constructed the same way service.NewServices does,
+	// wired directly into AuthMiddlewareWithBlacklist - not a test double -
+	// proving the actual wired configuration, not just that the middleware
+	// accepts a blacklist when handed one manually.
+	blacklist := service.NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	router := createBlacklistTestRouter(cfg, store, blacklist, logger)
+
+	tokenStr := createTokenWithJTI(secret, "user-123", "jti-logout-1", time.Now())
+
+	// Token works before logout.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 before logout, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Simulate Logout blacklisting this token's jti (see
+	// api.Handlers.Logout).
+	if err := blacklist.Add(context.Background(), "jti-logout-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// The same token must now be rejected.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for logged-out token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAuthMiddlewareWithBlacklist_DeletedUserTokenRejected(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	cfg.Security.TokenBlacklist.Enabled = true
+	store := createTestStore()
+
+	blacklist := service.NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	router := createBlacklistTestRouter(cfg, store, blacklist, logger)
+
+	issuedAt := time.Now().Add(-time.Minute)
+	tokenStr := createTokenWithJTI(secret, "user-456", "jti-predelete", issuedAt)
+
+	// Token works before deletion.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 before deletion, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Simulate account deletion (see UserService.DeleteUser /
+	// SetTokenBlacklist): revokes every token for the user, not just one jti.
+	if err := blacklist.RevokeUser(context.Background(), "user-456"); err != nil {
+		t.Fatalf("RevokeUser: %v", err)
+	}
+
+	// The token issued before deletion must now be rejected, even though its
+	// own jti was never individually blacklisted.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for deleted user's token, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// A token for a different, non-deleted user must still work.
+	otherToken := createTokenWithJTI(secret, "user-789", "jti-other", time.Now())
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+otherToken)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for unrelated user's token, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

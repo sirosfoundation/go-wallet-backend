@@ -71,6 +71,37 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_EngineWSKeepaliveSubMillisecond(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  func(*Config)
+	}{
+		{"ping interval 500us", func(c *Config) { c.Server.EngineWSPingInterval = 500 * time.Microsecond }},
+		{"pong timeout 500us", func(c *Config) { c.Server.EngineWSPongTimeout = 500 * time.Microsecond }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tt.cfg(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Expected validation error for a sub-millisecond engine WS keepalive value")
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_EngineWSKeepaliveZeroIsValid(t *testing.T) {
+	// 0 is the "use the default" sentinel (see Manager.wsKeepalive), not an
+	// invalid value - must not be rejected the same way a genuinely too-small
+	// positive value is.
+	cfg := validBaseConfig()
+	cfg.Server.EngineWSPingInterval = 0
+	cfg.Server.EngineWSPongTimeout = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() error = %v, want nil for zero-valued (default) engine WS keepalive settings", err)
+	}
+}
+
 func TestConfig_Validate_MissingRPID(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{
@@ -2136,7 +2167,7 @@ func staticLookup(ips ...string) lookupFunc {
 // never to the hostname again.
 func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2160,7 +2191,7 @@ func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
 	}
 
 	var dialed []string
-	dial := guardedDial(rebinding, recordingDial(&dialed))
+	dial := guardedDial(rebinding, recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2193,7 +2224,7 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var dialed []string
-			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed))
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), nil)
 
 			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
 			if err == nil {
@@ -2213,7 +2244,7 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 // attacker chooses which answer the client happens to pick otherwise.
 func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
 		t.Fatal("expected the dial to be refused")
@@ -2225,7 +2256,7 @@ func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 
 func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2244,7 +2275,7 @@ func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
 		}
 		return stubConn{}, nil
 	}
-	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst)
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst, nil)
 
 	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2267,6 +2298,7 @@ func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
 			}
 			return stubConn{}, nil
 		},
+		nil,
 	)
 
 	start := time.Now()
@@ -2504,5 +2536,201 @@ func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
 		if !strings.Contains(err.Error(), key) {
 			t.Fatalf("error %q does not mention %s", err, key)
 		}
+	}
+}
+
+// TestTrustConfig_VerifierCacheTTL pins the one place that decides how long a
+// verifier trust decision may be reused, including the "off" case the engine
+// reads as "do not cache at all".
+func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  TrustConfig
+		want time.Duration
+	}{
+		{"unset means the default", TrustConfig{}, DefaultTrustCacheTTL},
+		{"explicit seconds win", TrustConfig{CacheTTLSeconds: 30}, 30 * time.Second},
+		{"disabled means zero", TrustConfig{CacheDisabled: true}, 0},
+		{"disabled beats an explicit ttl", TrustConfig{CacheDisabled: true, CacheTTLSeconds: 30}, 0},
+		// Negative never reaches here in a running process - Validate
+		// refuses it at startup - but the function still has to answer
+		// something, and the default is the safe answer for a value that
+		// should have been rejected.
+		{"a negative ttl reads as the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.VerifierCacheTTL(); got != tt.want {
+				t.Fatalf("VerifierCacheTTL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A negative trust.cache_ttl_seconds is refused at startup. Someone who
+// writes -1 means "off", and quietly giving them an hour of cached trust
+// decisions is the exact failure this setting exists to cure: an answer that
+// is not the one the operator asked for, with nothing saying so.
+func TestConfig_Validate_RejectsANegativeTrustCacheTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Trust.CacheTTLSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a negative trust.cache_ttl_seconds must be refused")
+	}
+	if !strings.Contains(err.Error(), "cache_disabled") {
+		t.Errorf("the error should point at the way to turn the cache off, got %v", err)
+	}
+
+	// Zero and positive are both fine: zero means the default, and
+	// cache_disabled is the separate switch.
+	cfg.Trust.CacheTTLSeconds = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero must be accepted (it selects the default): %v", err)
+	}
+	cfg.Trust.CacheTTLSeconds = 30
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a positive ttl must be accepted: %v", err)
+	}
+}
+
+// A TTL past the int64 nanosecond range wraps to a negative time.Duration,
+// which the cache reads as "off" - so a number meant to cache for centuries
+// would disable caching instead. Same silent inversion as a negative value,
+// from the opposite end.
+func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
+	cfg := validBaseConfig()
+
+	// The boundary itself still converts to a positive duration.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the largest representable ttl must be accepted: %v", err)
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got <= 0 {
+		t.Fatalf("the boundary must still be a positive duration, got %v", got)
+	}
+
+	// One past it does not.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a ttl that overflows time.Duration must be refused")
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got > 0 {
+		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
+	}
+}
+
+func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
+	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
+		if err := m.validate(); err != nil {
+			t.Errorf("mode %q rejected: %v", m, err)
+		}
+	}
+	if DCQLConsentCheckMode("").Effective() != DCQLConsentCheckWarn {
+		t.Error("zero value must default to warn")
+	}
+	if defaultConfig().Presentation.DCQLConsentCheck != DCQLConsentCheckWarn {
+		t.Error("default config must be warn")
+	}
+	cfg := validBaseConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("base config invalid: %v", err)
+	}
+	cfg.Presentation.DCQLConsentCheck = "enforced"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "dcql_consent_check") {
+		t.Errorf("unknown mode must fail validation, got %v", err)
+	}
+}
+
+func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	ip, tenant := cfg.Security.OIDCGateRateLimit.PerIP, cfg.Security.OIDCGateRateLimit.PerTenant
+	if !ip.Enabled || ip.MaxAttempts != 30 || ip.WindowSeconds != 60 || ip.LockoutSeconds != 60 {
+		t.Errorf("per-IP defaults wrong: %+v", ip)
+	}
+	if !tenant.Enabled || tenant.MaxAttempts != 300 || tenant.WindowSeconds != 60 || tenant.LockoutSeconds != 60 {
+		t.Errorf("per-tenant defaults wrong: %+v", tenant)
+	}
+}
+
+func TestConfig_Validate_TrustedProxies(t *testing.T) {
+	for _, ok := range [][]string{nil, {"none"}, {"10.0.0.0/8", "192.168.1.1", "fd00::/8"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]string{{"10.0.0.0/33"}, {"lb.example.com"}, {"none", "10.0.0.1"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies") {
+			t.Errorf("%v must be rejected, got %v", bad, err)
+		}
+	}
+}
+
+func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.IdentityEvents = []string{"bound"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires audit.enabled") {
+		t.Errorf("identity_events without audit.enabled must be rejected, got %v", err)
+	}
+
+	cfg = validBaseConfig()
+	cfg.Audit = AuditConfig{Enabled: true, Issuer: "https://w", KeyPath: "/k", KeyID: "k", IdentityEvents: []string{"boudn"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Errorf("a misspelt event name must be rejected, got %v", err)
+	}
+
+	cfg.Audit.IdentityEvents = []string{" Bound ", "verified", "mismatch", "gate_bypass"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	if !cfg.Audit.IdentityEventEnabled("bound") || cfg.Audit.IdentityEventEnabled("nope") {
+		t.Error("IdentityEventEnabled mismatch")
+	}
+	if (AuditConfig{}).IdentityEventEnabled("bound") {
+		t.Error("no event may be enabled by default")
+	}
+}
+
+// A trusted IdP host may resolve to a private address (#349); an unlisted
+// host, and the cloud metadata endpoints, may not.
+func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
+	trusted := map[string]struct{}{"idp.internal": {}}
+
+	tests := []struct {
+		name, host, ip string
+		wantErr        bool
+	}{
+		{"trusted host, private ip", "idp.internal", "10.1.2.3", false},
+		{"trusted host, case-insensitive", "IdP.Internal", "127.0.0.1", false},
+		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
+		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
+		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), trusted)
+			_, err := dial(context.Background(), "tcp", tt.host+":443")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
+	c := HTTPClientConfig{TrustedIdPHosts: []string{" IdP.Internal ", ""}}
+	set := c.trustedIdPHostSet()
+	if _, ok := set["idp.internal"]; !ok || len(set) != 1 {
+		t.Fatalf("unexpected set: %v", set)
+	}
+	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
+		t.Fatal("empty config must yield no trusted hosts")
 	}
 }

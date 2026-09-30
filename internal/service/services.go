@@ -42,6 +42,13 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		logger.Warn("Failed to create WebAuthn service", zap.Error(err))
 		// Continue without WebAuthn - it will be nil
 	}
+	if webauthnSvc != nil {
+		// Use the shared SET audit emitter constructor so security events
+		// (e.g. clone-authenticator warnings) are audited whenever cfg.Audit
+		// is enabled, consistent with WIA/admin-API auditing.
+		webauthnSvc.SetAuditEmitter(audit.NewFromConfig(cfg, logger))
+		webauthnSvc.SetAuditIdentityConfig(cfg.Audit)
+	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
 
@@ -81,8 +88,23 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		}
 	}
 
+	userSvc := NewUserService(store, cfg, logger)
+	tokenBlacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	// Wire the blacklist into UserService so DeleteUser can revoke all of a
+	// deleted user's previously-issued tokens (#383), mirroring the
+	// SetSessionCleaner pattern below - but wired here, rather than by an
+	// external caller like cmd/server/main.go does for SetSessionCleaner,
+	// since both objects are already owned by this constructor.
+	userSvc.SetTokenBlacklist(tokenBlacklist)
+	// Wire the same blacklist into WebAuthnService so RefreshAccessToken can
+	// consume (single-use) each refresh token as it's exchanged, closing the
+	// replay gap Copilot flagged on #400's newly-exposed refresh route.
+	if webauthnSvc != nil {
+		webauthnSvc.SetTokenBlacklist(tokenBlacklist)
+	}
+
 	return &Services{
-		User:             NewUserService(store, cfg, logger),
+		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
 		UserTenant:       NewUserTenantService(store, logger),
 		WebAuthn:         webauthnSvc,
@@ -95,7 +117,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
 		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
-		TokenBlacklist:   NewTokenBlacklist(cfg.Security.TokenBlacklist, logger),
+		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}

@@ -188,6 +188,8 @@ func main() {
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+		serverCfg.TrustedProxies = backendCfg.Server.TrustedProxies
+		serverCfg.WarnUntrustedClientIP = backendCfg.Security.OIDCGateRateLimit.PerIP.Enabled
 	} else if registryCfg != nil {
 		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}
@@ -247,6 +249,13 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// Wire the same token blacklist the HTTP auth middlewares use, so a
+		// revoked token (or a deleted user's other tokens) is rejected
+		// during the WebSocket handshake too, on both the go-tokenauth and
+		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
+		if backendProvider != nil {
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		}
 		mgr.AddProvider(provider)
 		engineProvider = provider
 	}
@@ -255,10 +264,15 @@ func main() {
 	// sessions and, when the engine runs in this process, active engine
 	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
 	// engine role: a --mode=backend deployment has AS sessions to drop too.
+	// Both engine cleaners are wired: SessionStore() only purges the
+	// persisted SessionData bookkeeping record, while Manager() closes the
+	// live *websocket.Conn* itself - without the latter, a connection that
+	// was already established before the user was deleted stayed open and
+	// usable until it disconnected on its own (#393).
 	if backendProvider != nil {
 		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
 		if engineProvider != nil {
-			cleaners = append(cleaners, engineProvider.SessionStore())
+			cleaners = append(cleaners, engineProvider.SessionStore(), engineProvider.Manager())
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
 	}

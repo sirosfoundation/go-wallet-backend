@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -28,22 +29,56 @@ const (
 	GateTypeLogin GateType = "login"
 )
 
-// ValidatorCache caches OIDC validators per issuer
+const (
+	// DefaultValidatorCacheMaxEntries bounds how many validators (and their
+	// JWKS/discovery caches) are kept. Tenant reconfiguration or deletion
+	// otherwise leaves the old validators cached forever.
+	DefaultValidatorCacheMaxEntries = 256
+	// DefaultValidatorCacheIdleTTL is how long an unused validator is kept.
+	DefaultValidatorCacheIdleTTL = time.Hour
+)
+
+// cachedValidator is a cache entry; lastUsed is unix nanoseconds, updated
+// atomically so cache hits only need the read lock.
+type cachedValidator struct {
+	validator *oidc.Validator
+	lastUsed  atomic.Int64
+}
+
+// ValidatorCache caches OIDC validators per issuer/audience/JWKS URI.
+// Entries unused for the idle TTL are dropped, and the least recently used
+// entry is evicted when the cache is full. Eviction is safe: the next
+// request for that provider simply builds a fresh validator (and re-fetches
+// its JWKS).
 type ValidatorCache struct {
 	mu         sync.RWMutex
-	validators map[string]*oidc.Validator
+	validators map[string]*cachedValidator
 	httpClient *http.Client
 	logger     *zap.Logger
+
+	maxEntries int
+	idleTTL    time.Duration
+	now        func() time.Time
 }
 
 // NewValidatorCache creates a new validator cache.
 // If httpClient is nil, validators will use a default HTTP client.
 func NewValidatorCache(httpClient *http.Client, logger *zap.Logger) *ValidatorCache {
 	return &ValidatorCache{
-		validators: make(map[string]*oidc.Validator),
+		validators: make(map[string]*cachedValidator),
 		httpClient: httpClient,
 		logger:     logger,
+		maxEntries: DefaultValidatorCacheMaxEntries,
+		idleTTL:    DefaultValidatorCacheIdleTTL,
+		now:        time.Now,
 	}
+}
+
+// Len returns the number of cached validators.
+func (c *ValidatorCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.validators)
 }
 
 // GetOrCreate returns an existing validator or creates a new one
@@ -58,19 +93,28 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 	key := config.Issuer + "|" + audience + "|" + config.JWKSURI
 
 	c.mu.RLock()
-	if v, ok := c.validators[key]; ok {
+	if e, ok := c.validators[key]; ok && !c.idleExpired(e) {
+		e.lastUsed.Store(c.now().UnixNano())
 		c.mu.RUnlock()
-		return v
+		return e.validator
 	}
 	c.mu.RUnlock()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Double-check after acquiring write lock
-	if v, ok := c.validators[key]; ok {
-		return v
+	// Double-check after acquiring write lock. An entry that has been idle
+	// past the TTL is a miss: it is dropped here and rebuilt below, so its
+	// JWKS is fetched afresh instead of being kept alive by this very lookup.
+	if e, ok := c.validators[key]; ok {
+		if !c.idleExpired(e) {
+			e.lastUsed.Store(c.now().UnixNano())
+			return e.validator
+		}
+		delete(c.validators, key)
 	}
+
+	c.evictLocked()
 
 	v := oidc.NewValidator(oidc.ValidatorConfig{
 		Issuer:   config.Issuer,
@@ -78,8 +122,36 @@ func (c *ValidatorCache) GetOrCreate(config *domain.OIDCProviderConfig) *oidc.Va
 		JWKSURI:  config.JWKSURI,
 	}, c.httpClient, c.logger)
 
-	c.validators[key] = v
+	e := &cachedValidator{validator: v}
+	e.lastUsed.Store(c.now().UnixNano())
+	c.validators[key] = e
 	return v
+}
+
+// idleExpired reports whether e has gone unused for longer than the idle TTL.
+func (c *ValidatorCache) idleExpired(e *cachedValidator) bool {
+	return c.now().Sub(time.Unix(0, e.lastUsed.Load())) > c.idleTTL
+}
+
+// evictLocked makes room for one new entry: it drops idle entries, then the
+// least recently used ones until below maxEntries. Caller holds c.mu.
+func (c *ValidatorCache) evictLocked() {
+	for k, e := range c.validators {
+		if c.idleExpired(e) {
+			delete(c.validators, k)
+		}
+	}
+	for len(c.validators) >= c.maxEntries && len(c.validators) > 0 {
+		var oldestKey string
+		var oldest int64
+		first := true
+		for k, e := range c.validators {
+			if lu := e.lastUsed.Load(); first || lu < oldest {
+				oldestKey, oldest, first = k, lu, false
+			}
+		}
+		delete(c.validators, oldestKey)
+	}
 }
 
 // OIDCGateMiddleware creates middleware that validates OIDC ID tokens for gated endpoints.
@@ -201,7 +273,7 @@ func OIDCGateMiddleware(validatorCache *ValidatorCache, gateType GateType, logge
 					respondOIDCRequired(c, opConfig, "Missing required claim: "+key)
 					return
 				}
-				if !claimsMatch(expected, actual) {
+				if !oidc.ClaimsMatch(expected, actual) {
 					logger.Debug("Claim mismatch",
 						zap.String("claim", key),
 						zap.Any("expected", expected),
@@ -238,63 +310,6 @@ func respondOIDCRequired(c *gin.Context, opConfig *domain.OIDCProviderConfig, me
 		},
 	})
 	c.Abort()
-}
-
-// claimsMatch compares expected and actual claim values
-// Supports subset matching for arrays (expected values must be present in actual)
-func claimsMatch(expected, actual interface{}) bool {
-	switch e := expected.(type) {
-	case bool:
-		a, ok := actual.(bool)
-		return ok && e == a
-	case string:
-		// String expected value can match either a string or be present in an array
-		if a, ok := actual.(string); ok {
-			return e == a
-		}
-		// Check if string is in array (e.g., expected: "admin", actual: ["admin", "user"])
-		if arr, ok := actual.([]interface{}); ok {
-			for _, v := range arr {
-				if s, ok := v.(string); ok && s == e {
-					return true
-				}
-			}
-		}
-		return false
-	case float64:
-		a, ok := actual.(float64)
-		return ok && e == a
-	case int:
-		a, ok := actual.(float64)
-		return ok && float64(e) == a
-	case []interface{}:
-		// For array expected values, check if all expected values are present in actual
-		a, ok := actual.([]interface{})
-		if !ok {
-			// actual is not an array - check if single expected element matches
-			if len(e) == 1 {
-				return claimsMatch(e[0], actual)
-			}
-			return false
-		}
-		// All expected values must be present in actual (subset matching)
-		for _, ev := range e {
-			found := false
-			for _, av := range a {
-				if claimsMatch(ev, av) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		return true
-	default:
-		// For complex types, use reflect.DeepEqual as fallback
-		return reflect.DeepEqual(expected, actual)
-	}
 }
 
 // GetOIDCGateResult returns the OIDC gate validation result from context

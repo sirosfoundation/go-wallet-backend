@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,9 +18,10 @@ import (
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
-	store  storage.Store
-	logger *zap.Logger
-	audit  *audit.Emitter
+	store     storage.Store
+	logger    *zap.Logger
+	audit     *audit.Emitter
+	allowHTTP bool // when true, plain HTTP OIDC issuer URLs are permitted (test/dev environments)
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
@@ -29,6 +31,15 @@ func NewAdminHandlers(store storage.Store, logger *zap.Logger, auditor *audit.Em
 		logger: logger,
 		audit:  auditor,
 	}
+}
+
+// SetAllowHTTP configures whether OIDC gate provider issuer URLs may use
+// plain HTTP instead of HTTPS. Defaults to false (HTTPS required). This
+// mirrors the AuthZEN proxy's allowHTTP escape hatch (see
+// AuthZENProxyHandler.allowHTTP) and is wired from the same
+// http_client.allow_http setting so operators have one knob, not two.
+func (h *AdminHandlers) SetAllowHTTP(allow bool) {
+	h.allowHTTP = allow
 }
 
 // TenantRequest represents the request body for creating/updating a tenant
@@ -60,11 +71,12 @@ type OIDCProviderConfigRequest struct {
 
 // OIDCGateRequest represents the OIDC gate configuration in API requests
 type OIDCGateRequest struct {
-	Mode           string                     `json:"mode"` // none, registration, login, both
-	RegistrationOP *OIDCProviderConfigRequest `json:"registration_op,omitempty"`
-	LoginOP        *OIDCProviderConfigRequest `json:"login_op,omitempty"`
-	RequiredClaims map[string]interface{}     `json:"required_claims,omitempty"`
-	BindIdentity   *bool                      `json:"bind_identity,omitempty"`
+	Mode            string                     `json:"mode"` // none, registration, login, both
+	RegistrationOP  *OIDCProviderConfigRequest `json:"registration_op,omitempty"`
+	LoginOP         *OIDCProviderConfigRequest `json:"login_op,omitempty"`
+	RequiredClaims  map[string]interface{}     `json:"required_claims,omitempty"`
+	BindIdentity    *bool                      `json:"bind_identity,omitempty"`
+	TrustAdminClaim *bool                      `json:"trust_admin_claim,omitempty"`
 }
 
 // TenantResponse represents a tenant in API responses
@@ -98,11 +110,12 @@ type OIDCProviderConfigResponse struct {
 
 // OIDCGateResponse represents the OIDC gate configuration in API responses
 type OIDCGateResponse struct {
-	Mode           string                      `json:"mode"`
-	RegistrationOP *OIDCProviderConfigResponse `json:"registration_op,omitempty"`
-	LoginOP        *OIDCProviderConfigResponse `json:"login_op,omitempty"`
-	RequiredClaims map[string]interface{}      `json:"required_claims,omitempty"`
-	BindIdentity   bool                        `json:"bind_identity"`
+	Mode            string                      `json:"mode"`
+	RegistrationOP  *OIDCProviderConfigResponse `json:"registration_op,omitempty"`
+	LoginOP         *OIDCProviderConfigResponse `json:"login_op,omitempty"`
+	RequiredClaims  map[string]interface{}      `json:"required_claims,omitempty"`
+	BindIdentity    bool                        `json:"bind_identity"`
+	TrustAdminClaim bool                        `json:"trust_admin_claim"`
 }
 
 func tenantToResponse(t *domain.Tenant) *TenantResponse {
@@ -135,9 +148,10 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 		return nil
 	}
 	resp := &OIDCGateResponse{
-		Mode:           string(g.Mode),
-		RequiredClaims: g.RequiredClaims,
-		BindIdentity:   g.BindIdentity,
+		Mode:            string(g.Mode),
+		RequiredClaims:  g.RequiredClaims,
+		BindIdentity:    g.BindIdentity,
+		TrustAdminClaim: g.TrustAdminClaim,
 	}
 	if g.RegistrationOP != nil {
 		resp.RegistrationOP = &OIDCProviderConfigResponse{
@@ -162,9 +176,11 @@ func oidcGateToResponse(g *domain.OIDCGateConfig) *OIDCGateResponse {
 	return resp
 }
 
-// applyOIDCGateRequest applies API request to domain OIDCGateConfig
-// Returns an error if the mode is invalid
-func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) error {
+// applyOIDCGateRequest applies API request to domain OIDCGateConfig.
+// allowHTTP permits plain-HTTP issuer URLs (test/dev environments only);
+// pass h.allowHTTP from the calling handler.
+// Returns an error if the mode is invalid.
+func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig, allowHTTP bool) error {
 	if req == nil || gate == nil {
 		return nil
 	}
@@ -203,6 +219,24 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		}
 	}
 
+	// Validate every *effective* provider left on the gate after applying
+	// this request - not just ones the request itself supplied. Without
+	// this, a request that resupplies only RegistrationOP (or neither)
+	// would leave an already-stored LoginOP unvalidated, so a later update
+	// that only changes e.g. `mode` or `trust_admin_claim` could never be
+	// used to catch/reject a pre-existing http:// issuer that predates this
+	// check. See go-wallet-backend#373.
+	if gate.RegistrationOP != nil {
+		if err := validateOIDCIssuerScheme(gate.RegistrationOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("registration_op: %w", err)
+		}
+	}
+	if gate.LoginOP != nil {
+		if err := validateOIDCIssuerScheme(gate.LoginOP.Issuer, allowHTTP); err != nil {
+			return fmt.Errorf("login_op: %w", err)
+		}
+	}
+
 	// Apply required claims
 	if req.RequiredClaims != nil {
 		gate.RequiredClaims = req.RequiredClaims
@@ -213,6 +247,14 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		gate.BindIdentity = *req.BindIdentity
 	}
 
+	// Apply trust_admin_claim: explicit per-tenant opt-in required before the
+	// AS will mint elevated (admin+delegation) session permissions from the
+	// LoginOP's ID token claims. See applyAdminClaimTAC in internal/as/oidc.go
+	// and go-wallet-backend#376.
+	if req.TrustAdminClaim != nil {
+		gate.TrustAdminClaim = *req.TrustAdminClaim
+	}
+
 	// SECURITY: Validate bind_identity configuration
 	// bind_identity=true requires a registration gate (registration or both mode)
 	// because identity binding only happens during FinishRegistration
@@ -220,6 +262,27 @@ func applyOIDCGateRequest(req *OIDCGateRequest, gate *domain.OIDCGateConfig) err
 		return fmt.Errorf("bind_identity cannot be enabled with mode 'login': identity binding requires registration gate")
 	}
 
+	return nil
+}
+
+// validateOIDCIssuerScheme requires HTTPS OIDC issuer URLs (go-wallet-backend#373 /
+// M-1): the issuer is used to construct the discovery, authorization, and
+// token endpoints that the AS's OIDC login flow trusts, so a plaintext
+// issuer is trivially interceptable/spoofable by an on-path attacker. Plain
+// HTTP is permitted only when allowHTTP is set, mirroring the escape hatch
+// AuthZENProxyHandler already uses for jwks_uri/logo URLs (test/dev
+// environments, wired from the same http_client.allow_http setting).
+func validateOIDCIssuerScheme(issuer string, allowHTTP bool) error {
+	u, err := url.Parse(issuer)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("issuer must be a valid absolute URL: %q", issuer)
+	}
+	if u.Scheme != "https" && (!allowHTTP || u.Scheme != "http") {
+		if allowHTTP {
+			return fmt.Errorf("issuer must be a valid HTTPS or HTTP URL (allow_http is enabled): %q", issuer)
+		}
+		return fmt.Errorf("issuer must use https:// (got %q)", issuer)
+	}
 	return nil
 }
 
@@ -318,7 +381,7 @@ func (h *AdminHandlers) CreateTenant(c *gin.Context) {
 
 	// Apply OIDC gate config if provided
 	if req.OIDCGate != nil {
-		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate, h.allowHTTP); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -376,7 +439,7 @@ func (h *AdminHandlers) UpdateTenant(c *gin.Context) {
 	}
 	// Update OIDC gate config if provided
 	if req.OIDCGate != nil {
-		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate); err != nil {
+		if err := applyOIDCGateRequest(req.OIDCGate, &tenant.OIDCGate, h.allowHTTP); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}

@@ -4,6 +4,26 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.22.3:start -->
+## [v0.22.3] - 2026-09-24
+
+### Fixed
+
+- Fixed OAuth Client Attestation PoP to include server-provided challenges when required by authorization servers. The engine now detects challenge requirements at PAR and token endpoints, obtains a fresh challenge (from the `OAuth-Client-Attestation-Challenge` response header or by POSTing the AS's `challenge_endpoint`), and retries the request with the challenge embedded in the PoP's `challenge` claim. (#366)
+- Fixed credential issuance to send RFC 8707 resource indicators when the authorization server and credential issuer are on different origins, ensuring the access token's `aud` claim matches the credential endpoint. (#366)
+- Fixed trust evaluation for verifiers identified by DIDs. The query firewall now permits `kid` as a resource type, allowing verifiers that sign requests with a `kid` referencing their DID document to pass authorization checks. Previously, such queries were rejected before reaching the policy decision point. (#363)
+<!-- release-notes:v0.22.3:end -->
+<!-- release-notes:v0.22.2:start -->
+## [v0.22.2] - 2026-09-23
+
+### Fixed
+- CodeQL's `go/sql-injection` exclusion now works correctly using `query-filters` instead of the previously-inert `paths-ignore` configuration. This prevents false positives on MongoDB BSON queries, which cannot be exploited as SQL injection since the driver encodes strings as BSON strings and only map keys (not values) can be operators. The filter is safe because this repository has no SQL database usage. (#362)
+
+### Changed
+- Bumped `github.com/sirosfoundation/go-trust` from v0.20.6 to v0.21.1, adding support for did:jwk resolution, local DID registry configuration (did:key, did:jwk), and accepting `kid` as DID key binding material for DID-based client_ids. All changes are additive with no breaking changes to imported packages. (#364)
+- Updated Go version requirement from 1.26.6 to 1.27 to match go-trust's minimum version. (#364)
+<!-- release-notes:v0.22.2:end -->
+
 <!-- release-notes:v0.22.1:start -->
 ## [v0.22.1] - 2026-09-22
 
