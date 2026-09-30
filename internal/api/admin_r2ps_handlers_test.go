@@ -428,3 +428,24 @@ func TestR2PSSetStatus_EmitsAuditEvent(t *testing.T) {
 		t.Errorf("audit event not emitted; log: %s", logBuf.String())
 	}
 }
+
+func TestR2PSListKeys_EmptyStoreReturnsEmptyArray(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		// Real shape of an empty go-r2ps-service key store.
+		_, _ = w.Write([]byte(`{"keys":null}`))
+	})
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/r2ps/keys", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if string(resp["keys"]) != "[]" {
+		t.Errorf("keys = %s, want []", resp["keys"])
+	}
+}

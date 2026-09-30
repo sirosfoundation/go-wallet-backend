@@ -2,6 +2,7 @@ package r2ps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -560,5 +561,56 @@ func TestStatusError_NotFoundPreserved(t *testing.T) {
 	// GET single-item endpoints keep returning (nil, nil) on 404.
 	if e, err := c.GetStatus(context.Background(), "cat", 1); e != nil || err != nil {
 		t.Fatalf("GetStatus 404: %v %v", e, err)
+	}
+}
+
+func TestListKeys_UpstreamNullKeysNormalisedToEmptyArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"keys":null}`))
+	}))
+	defer srv.Close()
+
+	c := mustNewClient(t, srv.URL)
+	keys, err := c.ListKeys(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if keys == nil || len(keys) != 0 {
+		t.Fatalf("want non-nil empty slice, got %#v", keys)
+	}
+	if b, _ := json.Marshal(keys); string(b) != "[]" {
+		t.Errorf("want [], got %s", b)
+	}
+}
+
+func TestListStatuses_UpstreamNullEntriesNormalisedToEmptyArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"category":"c","count":0,"entries":null}`))
+	}))
+	defer srv.Close()
+
+	c := mustNewClient(t, srv.URL)
+	entries, err := c.ListStatuses(context.Background(), "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entries == nil || len(entries) != 0 {
+		t.Fatalf("want non-nil empty slice, got %#v", entries)
+	}
+}
+
+func TestGetClientStatuses_UpstreamNullIndicesNormalisedToEmptyArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"indices":null}`))
+	}))
+	defer srv.Close()
+
+	c := mustNewClient(t, srv.URL)
+	entries, err := c.GetClientStatuses(context.Background(), "cl", "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entries == nil || len(entries) != 0 {
+		t.Fatalf("want non-nil empty slice, got %#v", entries)
 	}
 }

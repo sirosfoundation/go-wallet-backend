@@ -220,6 +220,11 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("r2ps: decode statuses: %w", err)
 	}
+	// An empty upstream store encodes as null; the documented contract is an
+	// array, so never hand a nil slice to callers that serialise it.
+	if result.Entries == nil {
+		return []StatusListEntry{}, nil
+	}
 	return result.Entries, nil
 }
 
@@ -248,6 +253,9 @@ func (c *Client) GetClientStatuses(ctx context.Context, clientID, category strin
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("r2ps: decode response: %w", err)
+	}
+	if result.Indices == nil {
+		return []StatusListEntry{}, nil
 	}
 	return result.Indices, nil
 }
@@ -338,6 +346,11 @@ func (c *Client) ListKeys(ctx context.Context, clientID string) ([]PublicKeyInfo
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("r2ps: decode keys: %w", err)
+	}
+	// An empty upstream store encodes as {"keys":null}; normalise so the proxy
+	// emits [] as documented by R2PSKeyList.keys.
+	if result.Keys == nil {
+		return []PublicKeyInfo{}, nil
 	}
 	return result.Keys, nil
 }
