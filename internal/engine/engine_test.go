@@ -228,7 +228,7 @@ func TestRegistryClient_SetHandler(t *testing.T) {
 	})
 	rc := NewRegistryClient(&config.Config{}, zap.NewNop())
 	rc.SetHandler(h)
-	assert.Equal(t, "http://registry.internal/registry", rc.registryURL())
+	assert.Equal(t, "https://registry.internal/registry", rc.registryURL())
 	md, err := rc.FetchTypeMetadata(context.Background(), "v1")
 	require.NoError(t, err)
 	require.NotNil(t, md)
