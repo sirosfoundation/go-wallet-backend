@@ -355,6 +355,12 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// success. WalletLifecycleService.eraseWalletData resolves it the same
 	// way, including the fallback for users that have no DID.
 	if user, err := s.store.Users().GetByID(ctx, userID); err == nil {
+		// Mutation-boundary cut-off check (SID-AUTH-06), before anything is
+		// deleted: a request the middleware admitted just before a logout or
+		// revocation advanced the cut-off must not erase the account.
+		if err := refuseIfCutOff(ctx, user); err != nil {
+			return err
+		}
 		if user.DID != "" {
 			holderDID = user.DID
 		} else {

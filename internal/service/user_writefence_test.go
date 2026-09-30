@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
@@ -124,4 +125,36 @@ func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 		require.NoError(t, err)
 		assert.NoError(t, svc.DeleteByCredentialID(after, domain.DefaultTenantID, "did:x", "c1"))
 	})
+}
+
+// DeleteUser is a token-authenticated write that erases the account and all
+// holder data. A request admitted just before a revocation advanced the
+// cut-off must be refused before anything is deleted.
+func TestDeleteUser_RefusesATokenTheCutoffPredates(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), testLogger())
+	uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
+	cutoff := time.Now().Truncate(time.Second)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, cutoff))
+	before := tokengate.WithIssuedAt(ctx, cutoff.Add(-time.Minute))
+	after := tokengate.WithIssuedAt(ctx, cutoff.Add(time.Minute))
+
+	c0, p0 := countHolderData(t, store, "acme", uid)
+	instances0, err := store.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, err)
+
+	err = svc.DeleteUser(before, uid, uid.String())
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err, "the refused request must not delete the account")
+	c1, p1 := countHolderData(t, store, "acme", uid)
+	assert.Equal(t, c0+p0, c1+p1, "holder data must be untouched")
+	instances1, err := store.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, err)
+	assert.Len(t, instances1, len(instances0), "wallet instances must be untouched")
+
+	require.NoError(t, svc.DeleteUser(after, uid, uid.String()), "a fresh token is accepted")
+	_, err = store.Users().GetByID(ctx, uid)
+	assert.ErrorIs(t, err, storage.ErrNotFound)
 }

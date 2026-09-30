@@ -898,3 +898,30 @@ func TestHandlers_UpdateSettings_TokenCutOffAfterAdmission(t *testing.T) {
 	router.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 }
+
+// DeleteUser erases the account; a request admitted before a revocation
+// advanced the cut-off is answered 401 and deletes nothing, while a token
+// issued after the cut-off is accepted.
+func TestHandlers_DeleteUser_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	var issuedAt time.Time
+	router.DELETE("/", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), issuedAt))
+		handlers.DeleteUser(c)
+	})
+	issuedAt = time.Now().Add(-time.Minute)
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	_, err := handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	assert.NoError(t, err, "the refused request must not delete the account")
+
+	issuedAt = time.Now().Add(time.Minute)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	_, err = handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	assert.Error(t, err, "a fresh token deletes the account")
+}

@@ -987,6 +987,9 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		domain.UserIDFromString(userID.(string)),
 		holderDID,
 	); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, service.ErrDeletionIncomplete) {
 			// The account still exists on purpose, so the caller can repeat
 			// the request rather than be left with a stranded wallet
