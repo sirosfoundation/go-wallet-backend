@@ -112,8 +112,9 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if resp == nil {
-		// Notification — no response body.
-		w.WriteHeader(http.StatusNoContent)
+		// Notification — no response body. 202 (not 204): go-wmp's HTTPS+SSE
+		// client accepts only 200 or 202 from WriteMessage.
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 	w.WriteHeader(http.StatusOK)

@@ -188,7 +188,9 @@ exposes two endpoints:
 ```go
 // POST /api/v2/wallet/rpc — handles JSON-RPC requests
 func handleRPC(w http.ResponseWriter, r *http.Request) {
-    sessionID := r.Header.Get("Wmp-Session-Id") // empty for session.create
+    // Wmp-Session-Id header, else params.wmp.session_id from the body (what
+    // go-wmp's HTTPS+SSE client sends); empty for session.create.
+    sessionID := r.Header.Get("Wmp-Session-Id")
     // User and tenant come from the validated bearer token, never from a header.
     userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
     
@@ -198,7 +200,8 @@ func handleRPC(w http.ResponseWriter, r *http.Request) {
     // Dispatch to WMP peer/handler
     result, err := peer.HandleRequest(ctx, &req)
     
-    // Return JSON-RPC response
+    // Return the JSON-RPC response; a notification (no "id") gets an empty
+    // 202 Accepted, which is what go-wmp's client expects (200 or 202 only).
     json.NewEncoder(w).Encode(result)
 }
 

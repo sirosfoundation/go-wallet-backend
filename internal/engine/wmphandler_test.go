@@ -2471,8 +2471,8 @@ func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_RPC_Notification_NoContent verifies that a JSON-RPC
-// notification (no "id" field) gets a 204 with no body, per JSON-RPC
+// TestWMP_HTTPEndpoint_RPC_Notification_Accepted verifies that a JSON-RPC
+// notification (no "id" field) gets a 202 with no body, per JSON-RPC
 // semantics — even though the underlying dispatch fails (unknown flow),
 // notifications never produce an error response.
 //
@@ -2487,7 +2487,7 @@ func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 // fails, which isn't reachable through any input this HTTP endpoint accepts.
 // That fallback branch is defensive dead code from the caller's perspective;
 // no test constructs it.
-func TestWMP_HTTPEndpoint_RPC_Notification_NoContent(t *testing.T) {
+func TestWMP_HTTPEndpoint_RPC_Notification_Accepted(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
@@ -2510,7 +2510,7 @@ func TestWMP_HTTPEndpoint_RPC_Notification_NoContent(t *testing.T) {
 
 	a.HandleWMPRPC(w, req)
 
-	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Equal(t, http.StatusAccepted, w.Code, "go-wmp client accepts only 200/202")
 	assert.Empty(t, w.Body.Bytes())
 }
 
