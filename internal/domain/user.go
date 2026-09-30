@@ -93,7 +93,6 @@ type User struct {
 	Username            *string              `json:"username,omitempty" bson:"username,omitempty"`
 	DisplayName         *string              `json:"display_name,omitempty" bson:"display_name,omitempty"`
 	DID                 string               `json:"did" bson:"did"`
-	PasswordHash        *string              `json:"-" bson:"password_hash,omitempty"`
 	PrivateData         []byte               `json:"private_data,omitempty" bson:"private_data,omitempty"`
 	Keys                []byte               `json:"keys,omitempty" bson:"keys,omitempty"`
 	WalletType          WalletType           `json:"wallet_type" bson:"wallet_type"`
@@ -180,21 +179,7 @@ func (u *User) UpdatePrivateData(data []byte) {
 type RegisterRequest struct {
 	Username    *string    `json:"username,omitempty"`
 	DisplayName string     `json:"display_name"`
-	Password    *string    `json:"password,omitempty"`
 	WalletType  WalletType `json:"wallet_type"`
 	Keys        []byte     `json:"keys,omitempty"`
 	PrivateData []byte     `json:"private_data,omitempty"`
-}
-
-// LoginRequest represents a login request
-type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
-}
-
-// LoginResponse represents a login response
-type LoginResponse struct {
-	Token       string `json:"token"`
-	UserID      string `json:"user_id"`
-	DisplayName string `json:"display_name"`
 }

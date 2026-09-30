@@ -183,15 +183,15 @@ type CredentialOffer struct {
 
 // IssuerMetadata represents OpenID4VCI issuer metadata
 type IssuerMetadata struct {
-	CredentialIssuer                  string                      `json:"credential_issuer"`
-	CredentialEndpoint                string                      `json:"credential_endpoint"`
-	TokenEndpoint                     string                      `json:"token_endpoint,omitempty"`
-	NonceEndpoint                     string                      `json:"nonce_endpoint,omitempty"`
-	NotificationEndpoint              string                      `json:"notification_endpoint,omitempty"`
-	AuthorizationServer               string                      `json:"authorization_server,omitempty"`
-	AuthorizationServers              []string                    `json:"authorization_servers,omitempty"`
-	Display                           []IssuerDisplay             `json:"display,omitempty"`
-	CredentialConfigurationsSupported map[string]CredentialConfig `json:"credential_configurations_supported,omitempty"`
+	CredentialIssuer                  string                   `json:"credential_issuer"`
+	CredentialEndpoint                string                   `json:"credential_endpoint"`
+	TokenEndpoint                     string                   `json:"token_endpoint,omitempty"`
+	NonceEndpoint                     string                   `json:"nonce_endpoint,omitempty"`
+	NotificationEndpoint              string                   `json:"notification_endpoint,omitempty"`
+	AuthorizationServer               string                   `json:"authorization_server,omitempty"`
+	AuthorizationServers              []string                 `json:"authorization_servers,omitempty"`
+	Display                           []IssuerDisplay          `json:"display,omitempty"`
+	CredentialConfigurationsSupported CredentialConfigurations `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
 	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
 	// Batch credential issuance configuration (OID4VCI §E.1)
@@ -267,7 +267,48 @@ type CredentialConfig struct {
 	Scope               string                 `json:"scope,omitempty"`
 	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
-	Claims              map[string]interface{} `json:"claims,omitempty"`
+	// Claims is the pre-1.0 location of claim metadata; 1.0 moved it under
+	// credential_metadata. Kept raw and unread so an issuer that publishes it
+	// in either shape (some send an array) does not fail the whole document (#370).
+	Claims json.RawMessage `json:"claims,omitempty"`
+}
+
+// CredentialConfigurations is credential_configurations_supported, decoded
+// one entry at a time.
+//
+// A configuration that does not match CredentialConfig is omitted. That
+// includes a format value that is not a string, and any other field in that
+// same object whose JSON type does not match (encoding/json rejects the
+// whole object once one field fails). The rest of the issuer metadata,
+// including every credential that does parse, is kept.
+type CredentialConfigurations map[string]CredentialConfig
+
+// UnmarshalJSON decodes each credential configuration independently.
+//
+// The map itself must be a JSON object. A document-level type error (an
+// array or a scalar in place of the map) is still returned, because there
+// is no individual credential to skip.
+func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
+	if strings.TrimSpace(string(data)) == "null" {
+		// Clear, as encoding/json does for a map, so a reused value never
+		// keeps the previous document's configurations.
+		*c = nil
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("credential_configurations_supported: %w", err)
+	}
+	parsed := make(CredentialConfigurations, len(raw))
+	for id, entry := range raw {
+		var cfg CredentialConfig
+		if err := json.Unmarshal(entry, &cfg); err != nil {
+			continue
+		}
+		parsed[id] = cfg
+	}
+	*c = parsed
+	return nil
 }
 
 // CredentialDisplay represents credential display information
@@ -1270,6 +1311,7 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
+	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
 
 	// Look up registered issuer record from backend storage when a lookup is wired.
 	// Errors are non-fatal: the issuer may simply not be registered in this tenant.
@@ -1307,6 +1349,38 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	})
 
 	return &metadataResult{Metadata: &metadata, Validated: result.Validated, RegisteredIssuer: registeredIssuer}, nil
+}
+
+// logIgnoredCredentialConfigurations reports configurations that were present
+// in the resolved document but dropped because they could not be decoded.
+// A broken credential is ignored so issuance can continue with the others;
+// the warning is the only record of what was left out.
+func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]interface{}, parsed CredentialConfigurations) {
+	if h.Logger == nil {
+		return
+	}
+	rawConfigs, ok := source["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for id, entry := range rawConfigs {
+		if _, kept := parsed[id]; kept {
+			continue
+		}
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			h.Logger.Warn("ignoring credential configuration with a broken format",
+				zap.String("credential_configuration_id", id),
+				zap.Error(err))
+			continue
+		}
+		var cfg CredentialConfig
+		if err := json.Unmarshal(encoded, &cfg); err != nil {
+			h.Logger.Warn("ignoring credential configuration with a broken format",
+				zap.String("credential_configuration_id", id),
+				zap.Error(err))
+		}
+	}
 }
 
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
