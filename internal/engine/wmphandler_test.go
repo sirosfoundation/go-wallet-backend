@@ -236,15 +236,13 @@ func TestWMP_SessionCreate_InvalidParams(t *testing.T) {
 	assert.Equal(t, wmp.ErrInvalidParams, rpcResp.Error.Code)
 }
 
-// TestWMP_HandleSessionCreate_MalformedBody covers handleSessionCreate being
-// invoked with a body that isn't valid JSON at all (defensive parse-error
-// path; HandleRPC's own peek-unmarshal would normally catch this first, but
-// handleSessionCreate must handle it safely if reached directly).
+// TestWMP_HandleSessionCreate_MalformedBody covers a body that isn't valid
+// JSON at all: HandleRPC's decode step answers with a JSON-RPC parse error.
 func TestWMP_HandleSessionCreate_MalformedBody(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
-	resp, err := a.handleSessionCreate(context.Background(), []byte("not json"))
+	resp, err := a.HandleRPC(context.Background(), "", "", "", []byte("not json"))
 	require.NoError(t, err)
 
 	var rpcResp wmp.Response

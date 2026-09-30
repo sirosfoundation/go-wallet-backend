@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"go.uber.org/zap"
@@ -36,7 +37,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, tenantID, _, err := a.manager.validateToken(token)
+	userID, tenantID, _, tokenID, err := a.manager.validateTokenID(token)
 	if err != nil {
 		a.logger.Warn("WMP HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -55,9 +56,11 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	// Session ID from header (empty for session.create).
 	sessionID := r.Header.Get("Wmp-Session-Id")
 
+	caller := wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID}
+
 	// For methods that target an existing session, verify ownership.
 	if sessionID != "" {
-		if !a.verifySessionOwnership(sessionID, userID, tenantID) {
+		if !a.verifySessionOwnership(sessionID, caller) {
 			http.Error(w, "session not found", http.StatusNotFound)
 			return
 		}
@@ -70,7 +73,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	// a JSON-RPC error envelope here too rather than plain text, so the
 	// caller (a JSON-RPC client expecting a JSON-RPC response body) doesn't
 	// fail trying to parse it.
-	resp, err := a.HandleRPC(r.Context(), sessionID, userID, tenantID, body)
+	resp, err := a.HandleRPCAs(r.Context(), sessionID, caller, body)
 	if err != nil {
 		a.logger.Error("WMP RPC dispatch failed", zap.Error(err))
 		errResp, marshalErr := wmpErrorBytes(nil, wmp.ErrInternalError, nil)
@@ -107,7 +110,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
-	userID, tenantID, _, err := a.manager.validateToken(token)
+	userID, tenantID, _, tokenID, err := a.manager.validateTokenID(token)
 	if err != nil {
 		a.logger.Warn("WMP SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -121,13 +124,15 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the session belongs to the authenticated user.
-	if !a.verifySessionOwnership(sessionID, userID, tenantID) {
+	if !a.verifySessionOwnership(sessionID, wmpCaller{UserID: userID, TenantID: tenantID, TokenID: tokenID}) {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
 
-	events, err := a.Events(sessionID)
-	if err != nil {
+	a.mu.RLock()
+	buf := a.eventBufs[sessionID]
+	a.mu.RUnlock()
+	if buf == nil {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
@@ -139,12 +144,10 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reject a second concurrent connection for this session rather than
-	// letting it race the first to read from the same events channel: only
-	// one of them would see any given notification, silently splitting the
-	// stream between them. Must run before any header is written — an
-	// implicit 200 from flusher.Flush() below can't be undone afterward.
+	// letting it interleave with the first on the same event stream. Must
+	// run before any header is written — an implicit 200 from
+	// flusher.Flush() below can't be undone afterward.
 	ctx := r.Context()
-	buf := a.getOrCreateEventBuffer(sessionID)
 	if !buf.tryAcquire(ctx) {
 		http.Error(w, "another connection is already streaming events for this session", http.StatusConflict)
 		return
@@ -157,30 +160,35 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // nginx
 	flusher.Flush()
 
-	// Replay events the client missed while disconnected — e.g. a plain SSE
-	// drop, or reconnecting after a wmp.session.resume (which installs a new
-	// ChannelTransport whose own event channel starts empty; the session's
-	// event buffer is what actually survives resume). IDs are durable across
-	// reconnects, unlike a per-connection counter, so the client's
-	// automatically-resent Last-Event-ID header means something here.
+	// Events are appended to the session's buffer as they are emitted (see
+	// pumpEvents), whether or not a client is connected, and IDs are durable
+	// across reconnects and wmp.session.resume. A reconnecting client's
+	// Last-Event-ID selects where to replay from; without one the stream
+	// starts at the first event not yet written to any connection.
+	cursor := buf.delivered()
 	if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
-		for _, ev := range buf.replaySince(lastEventID) {
-			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+		if id, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
+			cursor = id
 		}
-		flusher.Flush()
 	}
+	done := buf.doneCh()
 
 	for {
+		events, wake := buf.after(cursor)
+		for _, ev := range events {
+			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data)
+			cursor = ev.ID
+			buf.markDelivered(ev.ID)
+		}
+		if len(events) > 0 {
+			flusher.Flush()
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case data, ok := <-events:
-			if !ok {
-				return // channel closed
-			}
-			id := buf.append(data)
-			_, _ = fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", id, data)
-			flusher.Flush()
+		case <-done:
+			return // session closed (client close, expiry, revocation, shutdown)
+		case <-wake:
 		}
 	}
 }

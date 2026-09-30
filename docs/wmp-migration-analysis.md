@@ -354,7 +354,8 @@ cannot be re-established. The entire flow is lost.
 
 With HTTP+SSE, losing the token is **recoverable**:
 
-1. The WMP session and in-progress flow survive server-side (Redis)
+1. The WMP session and in-progress flow survive server-side (in the same
+   backend process today; a shared store such as Redis is future work)
 2. The SSE stream disconnects but the flow handler goroutine keeps waiting
 3. When the app returns to foreground and re-authenticates (e.g., via
    refresh token from native bridge storage), the client:
@@ -742,8 +743,15 @@ Features we gain from this migration:
    Eliminates 400+ lines of reconnection logic.
 3. **Standard HTTP semantics** — every request carries auth + tenant headers.
    No handshake-time context establishment.
-4. **Standard load balancing** — no sticky sessions. SSE reconnects can hit any
-   backend instance (session state in Redis).
+4. **Standard HTTP load balancing, with one caveat** — the transport is plain
+   HTTP (no protocol upgrade), but the current implementation keeps WMP sessions,
+   resumption tokens, event buffers, active flows and peers in process-local
+   memory (`WMPAdapter`), so RPC POSTs and SSE reconnects for a session must
+   reach the same backend instance (session affinity, e.g. by the
+   `Wmp-Session-Id` header / `session_id` query parameter). Stateless routing
+   would require moving that state to a shared store first; the existing
+   session store persists metadata only, and another replica answers
+   session-not-found.
 5. **DevTools visibility** — all requests visible in Network tab. SSE events are
    inspectable. No WebSocket frame debugging needed.
 6. **Session resume** — `wmp.session.resume` with `last_message_id` for clean

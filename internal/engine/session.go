@@ -106,6 +106,10 @@ type Session struct {
 	signCh   chan *SignResponseMessage
 	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
+	// closeOnce makes endSession idempotent: the transport-specific read
+	// loop (handleSession) and the WMP adapter's session teardown can both
+	// end the same session.
+	closeOnce sync.Once
 
 	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
 	// contexts keyed by flow ID. It lets the backend forward a client-reported
@@ -442,20 +446,39 @@ func (s *Session) pingLoop() {
 	}
 }
 
+// endSession signals every goroutine blocked on this session (closeCh) and
+// cancels all active flows. It is idempotent and shared by all transports, so
+// a WMP session torn down by the adapter (client close, idle expiry, account
+// revocation, shutdown) stops its flows exactly like a WebSocket disconnect.
+func (s *Session) endSession() {
+	s.closeOnce.Do(func() {
+		if s.closeCh != nil {
+			close(s.closeCh)
+		}
+		s.flowsMu.Lock()
+		for _, flow := range s.flows {
+			if flow.Handler != nil {
+				flow.Handler.Cancel()
+			}
+		}
+		s.flowsMu.Unlock()
+	})
+}
+
+// currentTransport returns the session's transport under transportMu (the
+// transport is swapped on WMP session resume).
+func (s *Session) currentTransport() SessionTransport {
+	s.transportMu.RLock()
+	defer s.transportMu.RUnlock()
+	return s.transport
+}
+
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
 		if session.stopPing != nil {
 			close(session.stopPing) // stop the ping goroutine (WebSocket only)
 		}
-		close(session.closeCh)
-		// Cancel all active flows
-		session.flowsMu.Lock()
-		for _, flow := range session.flows {
-			if flow.Handler != nil {
-				flow.Handler.Cancel()
-			}
-		}
-		session.flowsMu.Unlock()
+		session.endSession()
 	}()
 
 	for {
@@ -726,7 +749,7 @@ func (m *Manager) registerSession(session *Session) bool {
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.UserID]; ok {
 			m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
-			_ = existing.transport.Close()
+			_ = existing.currentTransport().Close()
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
@@ -788,16 +811,24 @@ func (m *Manager) unregisterSession(session *Session) {
 // tac as "not applicable here", not "no permissions", exactly like
 // requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
 func (m *Manager) validateToken(tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
+	userID, tenantID, tac, _, err = m.validateTokenID(tokenString)
+	return
+}
+
+// validateTokenID is validateToken that also returns the token's jti (empty
+// if the token carries none). The WMP adapter binds sessions to it so
+// anonymous callers (UserID == "") cannot address each other's sessions.
+func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
 		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 		if err != nil {
-			return "", "", "", err
+			return "", "", "", "", err
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
 		if !result.HasAudience("wallet-registry", "wallet-backend") {
-			return "", "", "", errors.New("token audience not permitted for engine transport")
+			return "", "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
 		// shared Validator's own Revocation checker - see
@@ -808,10 +839,10 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// revokedUsers (#403) - either one saying revoked is enough to
 		// reject.
 		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
-			return "", "", "", errors.New("token has been revoked")
+			return "", "", "", "", errors.New("token has been revoked")
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, result.TAC, nil
+		return result.UserID, result.TenantID, result.TAC, result.JTI, nil
 	}
 
 	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
@@ -826,7 +857,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 	}, jwt.WithLeeway(config.JWTLeeway))
 
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 
 	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
@@ -837,15 +868,15 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		}
 		tenantID, _ = mapClaims["tenant_id"].(string)
 		if userID == "" {
-			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
+			return "", "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
 		if m.blacklist != nil {
 			ctx := context.Background()
 			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
-				return "", "", "", errors.New("token has been revoked")
+				return "", "", "", "", errors.New("token has been revoked")
 			}
 			if m.blacklist.IsUserRevoked(ctx, userID) {
-				return "", "", "", errors.New("token has been revoked")
+				return "", "", "", "", errors.New("token has been revoked")
 			}
 		}
 		// Checked unconditionally (unlike the m.blacklist block above,
@@ -853,12 +884,13 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// engine's own revokedUsers works regardless of whether that
 		// optional feature is configured at all (#403).
 		if m.isUserRevoked(userID) {
-			return "", "", "", errors.New("token has been revoked")
+			return "", "", "", "", errors.New("token has been revoked")
 		}
-		return userID, tenantID, "", nil
+		jti, _ = mapClaims["jti"].(string)
+		return userID, tenantID, "", jti, nil
 	}
 
-	return "", "", "", errors.New("invalid token")
+	return "", "", "", "", errors.New("invalid token")
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -1040,7 +1072,8 @@ func (m *Manager) CloseUserSessions(userID string, reason string) int {
 // indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
 // this call regardless of whether it succeeds, and Close is unconditional.
 func (s *Session) closeWithReason(reason string) {
-	if wst, ok := s.transport.(*wsTransport); ok {
+	t := s.currentTransport()
+	if wst, ok := t.(*wsTransport); ok {
 		_ = wst.conn.WriteControl(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
@@ -1049,7 +1082,7 @@ func (s *Session) closeWithReason(reason string) {
 	}
 	// Non-WebSocket transports (HTTP+SSE) have no close frame to carry a
 	// reason; closing the transport is sufficient to end the session.
-	_ = s.transport.Close()
+	_ = t.Close()
 }
 
 // Close closes all sessions
@@ -1058,7 +1091,7 @@ func (m *Manager) Close() {
 	defer m.sessionsMu.Unlock()
 
 	for _, session := range m.sessions {
-		_ = session.transport.Close()
+		_ = session.currentTransport().Close()
 	}
 	m.sessions = make(map[string]*Session)
 	m.userIndex = make(map[string]*Session)
@@ -1080,11 +1113,15 @@ func (m *Manager) IsHealthy() bool {
 }
 
 // Send sends a message to the client
+//
+// The read lock is held for the whole send, not just the pointer copy: a
+// concurrent WMP session resume swaps (and closes) the transport under the
+// write lock, so it waits for in-flight sends instead of closing the old
+// transport between the copy and SendJSON and losing the notification.
 func (s *Session) Send(msg interface{}) error {
 	s.transportMu.RLock()
-	t := s.transport
-	s.transportMu.RUnlock()
-	return t.SendJSON(msg)
+	defer s.transportMu.RUnlock()
+	return s.transport.SendJSON(msg)
 }
 
 // SendProgress sends a flow progress message

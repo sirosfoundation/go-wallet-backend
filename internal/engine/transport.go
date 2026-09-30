@@ -201,16 +201,22 @@ func (t *sseTransport) serveSSE(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	reqCtx := r.Context()
 	t.sseW = w
 	t.sseFl = flusher
-	t.sseCtx = r.Context()
+	t.sseCtx = reqCtx
 	t.sseMu.Unlock()
 
 	defer func() {
 		t.sseMu.Lock()
-		t.sseW = nil
-		t.sseFl = nil
-		t.sseCtx = nil
+		// A reconnect may already have replaced this registration (once our
+		// context is done, serveSSE accepts a new connection before this
+		// deferred cleanup runs); only clear it if it is still ours.
+		if t.sseCtx == reqCtx {
+			t.sseW = nil
+			t.sseFl = nil
+			t.sseCtx = nil
+		}
 		t.sseMu.Unlock()
 	}()
 

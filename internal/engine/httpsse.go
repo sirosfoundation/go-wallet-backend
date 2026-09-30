@@ -176,7 +176,15 @@ func (m *Manager) handleHTTPHandshake(w http.ResponseWriter, userID, tenantID st
 		closeCh:   make(chan struct{}, 1),
 	}
 
-	m.registerSession(session)
+	// A false result means the user was revoked between validateToken and
+	// now; registerSession already closed the transport. Refuse the
+	// handshake (as the WebSocket path does) instead of starting a loop on a
+	// closed transport and reporting success.
+	if !m.registerSession(session) {
+		session.logger.Warn("HTTP handshake rejected: user revoked between token validation and session registration")
+		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+		return
+	}
 
 	// Start the message loop (same as WebSocket).
 	go func() {
