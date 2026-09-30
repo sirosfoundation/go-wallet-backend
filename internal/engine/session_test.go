@@ -605,7 +605,7 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *tes
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
 	m := NewManager(cfg, zap.NewNop())
 	v := tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet-registry"},
+		Audiences: []string{"wallet.example.com"},
 		Legacy: tokenvalidator.LegacyConfig{
 			Enabled:    true,
 			HMACSecret: []byte(secret),
@@ -621,14 +621,15 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *tes
 		"jti":       "jti-not-individually-blacklisted-2",
 		"sid":       "sid-revoked-2",
 		"iss":       "test-legacy-issuer",
-		"aud":       "wallet-registry",
+		"aud":       "wallet.example.com",
 		"exp":       time.Now().Add(time.Hour).Unix(),
 	})
 	tokenString, err := token.SignedString([]byte(secret))
 	require.NoError(t, err)
 
 	_, _, _, err = m.validateToken(tokenString)
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "revoked", "must be rejected by the family check, not the audience check")
 }
 
 // ===== handleFlowStart TAC enforcement tests =====
@@ -1399,20 +1400,21 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClos
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "a-different-secret"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet-registry"},
+		Audiences: []string{"wallet.example.com"},
 		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(validatorSecret), Issuers: []string{"test-legacy-issuer"}},
 	}))
 	m.SetTokenBlacklist(&fakeEngineBlacklist{})
 
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "s",
-		"iss": "test-legacy-issuer", "aud": "wallet-registry", "exp": time.Now().Add(time.Hour).Unix(),
+		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
 	})
 	tokenString, err := tok.SignedString([]byte(validatorSecret))
 	require.NoError(t, err)
 
 	_, _, _, err = m.validateToken(tokenString)
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot determine token family")
 }
 
 // A token accepted within go-tokenauth's clock-skew leeway (expired 2s ago)
@@ -1422,7 +1424,7 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied_Inside
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet-registry"},
+		Audiences: []string{"wallet.example.com"},
 		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret), Issuers: []string{"test-legacy-issuer"}},
 	}))
 	bl := &fakeEngineBlacklist{revokedFamilies: map[string]bool{}}
@@ -1430,7 +1432,7 @@ func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied_Inside
 
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "sid-skew",
-		"iss": "test-legacy-issuer", "aud": "wallet-registry", "exp": time.Now().Add(-2 * time.Second).Unix(),
+		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(-2 * time.Second).Unix(),
 	})
 	tokenString, err := tok.SignedString([]byte(secret))
 	require.NoError(t, err)

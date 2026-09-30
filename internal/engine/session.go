@@ -801,7 +801,15 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
-		if !result.HasAudience("wallet-registry", "wallet-backend") {
+		//
+		// Legacy (HMAC) tokens are exempt, exactly like
+		// middleware.RequireAudience: WebAuthnService/UserService always mint
+		// them with aud=Server.RPID, which go-tokenauth preserves in
+		// result.Audience (and has already validated against AS.Audiences),
+		// so requiring wallet-registry/wallet-backend here would reject every
+		// real WebAuthn app token before the family check below ever ran.
+		// Session-mode tokens keep the strict check.
+		if result.Mode != claims.ModeLegacy && !result.HasAudience("wallet-registry", "wallet-backend") {
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
