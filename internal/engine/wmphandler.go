@@ -1793,8 +1793,9 @@ func (h *wmpEngineHandler) CredentialNotification(ctx context.Context, params *w
 			Type:   TypeCredentialNotification,
 			FlowID: params.FlowID,
 		},
-		NotificationID: params.NotificationID,
-		Event:          params.Event,
+		NotificationID:   params.NotificationID,
+		Event:            params.Event,
+		EventDescription: params.EventDescription,
 	}
 	h.adapter.manager.dispatchCredentialNotification(h.session, msg)
 }
