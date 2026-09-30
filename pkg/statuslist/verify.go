@@ -198,21 +198,24 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	}
 	var bits int
 	var list []byte
-	var ttl time.Duration
+	var expires time.Time
 	switch mediaType {
 	case mediaTypeJWT, "":
 		// A missing Content-Type is read as the JWT form, the only one
 		// that ever came without one; a CWT body then fails to parse.
-		bits, list, ttl, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
+		bits, list, expires, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
 	case mediaTypeCWT:
-		bits, list, ttl, err = c.parseCWT(ctx, body, uri)
+		bits, list, expires, err = c.parseCWT(ctx, body, uri)
 	default:
 		err = fmt.Errorf("status list has unsupported media type %q", mediaType)
 	}
 	if err != nil {
 		return 0, nil, err
 	}
-	if ttl > 0 && len(list) <= c.cacheLimit {
+	// expires is an absolute deadline fixed before the (possibly slow) trust
+	// call; it is compared against a fresh clock reading so the cache never
+	// outlives the token deadline.
+	if now := c.now(); expires.After(now) && len(list) <= c.cacheLimit {
 		c.mu.Lock()
 		if old, ok := c.cache[key]; ok {
 			c.cacheBytes -= len(old.list)
@@ -221,7 +224,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 			c.cache = map[string]cachedList{}
 			c.cacheBytes = 0
 		}
-		c.cache[key] = cachedList{bits: bits, list: list, expires: c.now().Add(ttl)}
+		c.cache[key] = cachedList{bits: bits, list: list, expires: expires}
 		c.cacheBytes += len(list)
 		c.mu.Unlock()
 	}
@@ -268,20 +271,20 @@ func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error)
 	return body, mt, nil
 }
 
-func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte, time.Duration, error) {
+func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte, time.Time, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return 0, nil, 0, errors.New("status list token is not a JWT")
+		return 0, nil, time.Time{}, errors.New("status list token is not a JWT")
 	}
 	var header struct {
 		Typ string         `json:"typ"`
 		JWK map[string]any `json:"jwk"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
-		return 0, nil, 0, fmt.Errorf("status list header: %w", err)
+		return 0, nil, time.Time{}, fmt.Errorf("status list header: %w", err)
 	}
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
-		return 0, nil, 0, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
+		return 0, nil, time.Time{}, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
 	}
 	// The list's own header key verifies the JWS; whether that key may
 	// publish status lists is the trust service's decision, taken below once
@@ -289,17 +292,17 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 	// an external status service signs with its own key.
 	km, err := trust.VerifyJWTWithEmbeddedKey(token)
 	if errors.Is(err, trust.ErrNoEmbeddedKey) {
-		return 0, nil, 0, ErrNoSignerKey
+		return 0, nil, time.Time{}, ErrNoSignerKey
 	}
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("status list signature: %w", err)
+		return 0, nil, time.Time{}, fmt.Errorf("status list signature: %w", err)
 	}
 	// Precedence when the header carries both: x5c is what is verified and
 	// trust-evaluated; a jwk that is also present must be the x5c leaf's key,
 	// otherwise the header is inconsistent and the list unverifiable.
 	if km.Type == "x5c" {
 		if err := checkJWKMatchesLeaf(header.JWK, km.X5C[0]); err != nil {
-			return 0, nil, 0, err
+			return 0, nil, time.Time{}, err
 		}
 	}
 
@@ -315,14 +318,14 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 		} `json:"status_list"`
 	}
 	if err := decodeSegment(parts[1], &claims); err != nil {
-		return 0, nil, 0, fmt.Errorf("status list payload: %w", err)
+		return 0, nil, time.Time{}, fmt.Errorf("status list payload: %w", err)
 	}
 	if claims.StatusList == nil {
-		return 0, nil, 0, errors.New("status list token has no status_list claim")
+		return 0, nil, time.Time{}, errors.New("status list token has no status_list claim")
 	}
 	lst, err := base64.RawURLEncoding.DecodeString(claims.StatusList.Lst)
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("status list lst: %w", err)
+		return 0, nil, time.Time{}, fmt.Errorf("status list lst: %w", err)
 	}
 	return c.accept(ctx, uri, km, listClaims{
 		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, ttl: claims.TTL,
@@ -341,12 +344,12 @@ type listClaims struct {
 // accept applies the claim checks shared by the JWT and CWT forms, inflates
 // the list and asks the trust service about the (already signature-verified)
 // signer key km. Only a list that passes all of it is returned.
-func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (int, []byte, time.Duration, error) {
+func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (int, []byte, time.Time, error) {
 	if lc.iat == nil {
-		return 0, nil, 0, errors.New("status list token has no iat")
+		return 0, nil, time.Time{}, errors.New("status list token has no iat")
 	}
 	if lc.sub != uri {
-		return 0, nil, 0, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
+		return 0, nil, time.Time{}, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
 	}
 	now := c.now()
 	// The ttl claim is the token's freshness window, measured from its iat
@@ -359,7 +362,7 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	if lc.exp != nil {
 		exp := time.Unix(*lc.exp, 0)
 		if !now.Before(exp) {
-			return 0, nil, 0, errors.New("status list token has expired")
+			return 0, nil, time.Time{}, errors.New("status list token has expired")
 		}
 		if exp.Before(expires) {
 			expires = exp
@@ -368,24 +371,21 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	if limit := now.Add(maxCacheTTL); expires.After(limit) {
 		expires = limit
 	}
-	// A token already past its ttl is still used for this check but not cached.
-	ttl := expires.Sub(now)
-	if ttl < 0 {
-		ttl = 0
-	}
+	// A token already past its deadline is still used for this check but not
+	// cached (load compares expires against the clock after the trust call).
 	switch lc.bits {
 	case 1, 2, 4, 8:
 	default:
-		return 0, nil, 0, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", lc.bits)
+		return 0, nil, time.Time{}, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", lc.bits)
 	}
 	list, err := inflate(lc.lst)
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, time.Time{}, err
 	}
 	if err := c.evaluateSigner(ctx, lc.iss, uri, km); err != nil {
-		return 0, nil, 0, err
+		return 0, nil, time.Time{}, err
 	}
-	return lc.bits, list, ttl, nil
+	return lc.bits, list, expires, nil
 }
 
 // evaluateSigner asks the trust service whether the list signer may publish

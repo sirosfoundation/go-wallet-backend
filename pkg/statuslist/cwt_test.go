@@ -38,6 +38,7 @@ type cwtOpts struct {
 	x5cInUnp  bool // put x5chain in the unprotected header
 	untagged  bool
 	cwtTag    bool
+	textKeys  bool // draft CDDL: "bits"/"lst" text keys in status_list
 	legacy    bool // vc#703 layout: status_list=65534, ttl=65535
 	badSig    bool
 	rawLst    []byte
@@ -99,6 +100,9 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 		cwtClaimSub: o.sub,
 		ttlLabel:    900,
 		slLabel:     map[int64]any{statusListKeyBits: o.bits, statusListKeyLst: lst},
+	}
+	if o.textKeys {
+		claims[slLabel] = map[string]any{"bits": o.bits, "lst": lst}
 	}
 	if o.iss != "" {
 		claims[cwtClaimIss] = o.iss
@@ -195,16 +199,18 @@ func TestCWT_VerifyAndVerdicts(t *testing.T) {
 	p521, _ := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
 
 	for name, o := range map[string]cwtOpts{
-		"tagged":         {},
-		"untagged":       {untagged: true},
-		"cwt tag":        {cwtTag: true},
-		"x5chain unprot": {x5cInUnp: true},
-		"ES384":          {key: p384},
-		"ES512":          {key: p521},
-		"typ short form": {typ: "statuslist+cwt"},
-		"exp":            {exp: future},
-		"legacy vc#703":  {legacy: true},
-		"1 bit":          {bits: 1},
+		"tagged":                      {},
+		"untagged":                    {untagged: true},
+		"cwt tag":                     {cwtTag: true},
+		"x5chain unprot":              {x5cInUnp: true},
+		"ES384":                       {key: p384},
+		"ES512":                       {key: p521},
+		"typ short form":              {typ: "statuslist+cwt"},
+		"exp":                         {exp: future},
+		"legacy vc#703":               {legacy: true},
+		"1 bit":                       {bits: 1},
+		"text keys (draft CDDL)":      {textKeys: true},
+		"text keys, vc legacy labels": {textKeys: true, legacy: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			o.values = map[int]int{3: 1, 4: 1}
@@ -369,11 +375,17 @@ func TestCWTHelpers(t *testing.T) {
 	if optInt("x") != nil || *optInt(uint64(5)) != 5 {
 		t.Error("optInt")
 	}
-	if _, ok := intKeyMap("x"); ok {
-		t.Error("intKeyMap accepted a string")
+	if _, ok := anyMap("x"); ok {
+		t.Error("anyMap accepted a string")
 	}
-	if m, ok := intKeyMap(map[any]any{uint64(1): "a", "skip": "b"}); !ok || len(m) != 1 {
-		t.Error("intKeyMap map[any]any")
+	for _, m := range []any{map[any]any{"a": 1}, map[int64]any{1: 1}, map[string]any{"a": 1}} {
+		if got, ok := anyMap(m); !ok || len(got) != 1 {
+			t.Errorf("anyMap(%T)", m)
+		}
+	}
+	if member(map[any]any{"bits": 2}, "bits", 1) != 2 || member(map[any]any{uint64(1): 3}, "bits", 1) != 3 ||
+		member(map[any]any{int64(1): 4}, "bits", 1) != 4 || member(map[any]any{"x": 1}, "bits", 1) != nil {
+		t.Error("member lookup")
 	}
 	if _, err := x5chain(7); err == nil {
 		t.Error("bad x5chain type accepted")

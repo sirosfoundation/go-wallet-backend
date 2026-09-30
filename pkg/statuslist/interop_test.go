@@ -350,3 +350,34 @@ func TestCache_TTLMeasuredFromIat(t *testing.T) {
 		t.Fatalf("token within iat+ttl not cached: %d fetches", *hits)
 	}
 }
+
+// The trust call can be slow (PDP plus fallback); the cache deadline is fixed
+// before it and checked against the clock after it, so it never outlives
+// iat+ttl.
+func TestCache_DeadlineNotExtendedBySlowTrust(t *testing.T) {
+	key := newKey(t)
+	c, uri, hits := serve(t, func(u string) string {
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": time.Now().Unix(), "ttl": 60,
+			"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
+		tok.Header["typ"] = "statuslist+jwt"
+		tok.Header["jwk"] = jwkOf(&key.PublicKey)
+		s, _ := tok.SignedString(key)
+		return s
+	}, "")
+	clock := time.Now()
+	c.now = func() time.Time { return clock }
+	// The trust call takes 2 minutes of (fake) time, longer than the ttl.
+	c.trust = func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+		clock = clock.Add(2 * time.Minute)
+		return true, nil
+	}
+	ref := &Reference{Idx: 1, URI: uri}
+	for i := 0; i < 2; i++ {
+		if err := c.Check(context.Background(), ref); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if *hits != 2 || len(c.cache) != 0 {
+		t.Fatalf("list cached past iat+ttl after a slow trust call: hits=%d cached=%d", *hits, len(c.cache))
+	}
+}
