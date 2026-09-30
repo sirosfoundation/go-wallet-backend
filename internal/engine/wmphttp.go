@@ -67,8 +67,17 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Session ID from header (empty for session.create).
+	// Session ID from the Wmp-Session-Id header, else from the request's own
+	// params.wmp.session_id metadata (go-wmp's HTTPS+SSE client does not set
+	// the header; its ServerHandler falls back to the body the same way).
+	// Empty for session.create. When both are present they must agree.
 	sessionID := r.Header.Get("Wmp-Session-Id")
+	if metaID := bodySessionID(body); sessionID == "" {
+		sessionID = metaID
+	} else if metaID != "" && metaID != sessionID {
+		http.Error(w, "session ID mismatch between header and request metadata", http.StatusBadRequest)
+		return
+	}
 
 	caller := wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
 
@@ -109,6 +118,23 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(resp)
+}
+
+// bodySessionID extracts params.wmp.session_id from a JSON-RPC body ("" when
+// absent or the body is not shaped that way; the dispatcher reports parse
+// errors itself).
+func bodySessionID(body []byte) string {
+	var env struct {
+		Params struct {
+			WMP struct {
+				SessionID string `json:"session_id"`
+			} `json:"wmp"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return ""
+	}
+	return env.Params.WMP.SessionID
 }
 
 // HandleWMPEvents handles GET /api/v2/wallet/events — SSE stream of server notifications.
