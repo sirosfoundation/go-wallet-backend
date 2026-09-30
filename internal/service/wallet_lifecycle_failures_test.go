@@ -27,6 +27,11 @@ type failStore struct {
 
 	captureBeforeClear bool
 	captured           *domain.User
+
+	// failNth makes an operation fail on its nth call only (1-based), to hit
+	// the step after one that already succeeded.
+	failNth map[string]int
+	calls   map[string]int
 }
 
 func newFailStore(ops ...string) *failStore {
@@ -41,7 +46,25 @@ func (f *failStore) err(op string) error {
 	if f.fail[op] {
 		return errBoom
 	}
+	if n, ok := f.failNth[op]; ok {
+		if f.calls == nil {
+			f.calls = map[string]int{}
+		}
+		f.calls[op]++
+		if f.calls[op] == n {
+			return errBoom
+		}
+	}
 	return nil
+}
+
+// failOnCall arranges for op to fail on its nth call.
+func (f *failStore) failOnCall(op string, n int) *failStore {
+	if f.failNth == nil {
+		f.failNth = map[string]int{}
+	}
+	f.failNth[op] = n
+	return f
 }
 
 func (f *failStore) WalletInstances() storage.WalletInstanceStore {
@@ -641,4 +664,32 @@ func TestWalletLifecycle_RevokeAllAdvancesTheCutoffAfterTheSweep(t *testing.T) {
 	require.NoError(t, err)
 	again, _ := store.Users().GetByID(ctx, uid)
 	assert.Equal(t, fence+1, again.AuthFence, "only the idempotent erasure writes again")
+}
+
+func (s *failInstances) GetAllByUser(ctx context.Context, u domain.UserID) ([]*domain.WalletInstance, error) {
+	if err := s.f.err("instances.GetAllByUser"); err != nil {
+		return nil, err
+	}
+	return s.WalletInstanceStore.GetAllByUser(ctx, u)
+}
+
+func (s *failInstances) Delete(ctx context.Context, id string) error {
+	if err := s.f.err("instances.Delete"); err != nil {
+		return err
+	}
+	return s.WalletInstanceStore.Delete(ctx, id)
+}
+
+func (s *failInstances) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {
+	if err := s.f.err("instances.GetByID"); err != nil {
+		return nil, err
+	}
+	return s.WalletInstanceStore.GetByID(ctx, id)
+}
+
+func (s *failUsers) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	if err := s.f.err("users.GetAuthCutoff"); err != nil {
+		return time.Time{}, err
+	}
+	return s.UserStore.GetAuthCutoff(ctx, id)
 }

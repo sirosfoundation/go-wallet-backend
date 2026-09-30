@@ -24,7 +24,15 @@ type TenantLookup interface {
 	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
 }
 
-// TokenAuthMiddleware validates Bearer tokens using a go-tokenauth validator
+// TokenAuthMiddleware is TokenAuthMiddlewareWithUsers without the user lookup,
+// so it does not enforce the SID-AUTH-06 token cut-off. It keeps the signature
+// that downstream users of this exported package compile against; use
+// TokenAuthMiddlewareWithUsers to get the cut-off.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+	return TokenAuthMiddlewareWithUsers(v, tenants, nil, blacklist, logger)
+}
+
+// TokenAuthMiddlewareWithUsers validates Bearer tokens using a go-tokenauth validator
 // and populates the Gin context with the same keys that legacy AuthMiddleware
 // sets, so existing handlers work unchanged.
 //
@@ -50,7 +58,7 @@ type TenantLookup interface {
 // RevokeUser (#383) would otherwise never be consulted for tokens
 // validated through this path - only for tokens validated through the
 // legacy AuthMiddlewareWithBlacklist.
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, users tokengate.UserLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+func TokenAuthMiddlewareWithUsers(v *validator.Validator, tenants TenantLookup, users tokengate.UserLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	gate := tokengate.New(users)
 	return func(c *gin.Context) {
 		// Extract Bearer token

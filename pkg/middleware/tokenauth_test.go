@@ -130,7 +130,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, nil, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -163,7 +163,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, nil, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -181,7 +181,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, nil, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -208,7 +208,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, nil, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -233,7 +233,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, nil, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -274,7 +274,7 @@ func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, blacklist, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -309,7 +309,7 @@ func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, nil, blacklist, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -522,7 +522,7 @@ func TestTokenAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	})
 
 	r := gin.New()
-	r.Use(TokenAuthMiddleware(v, tenants, store.Users(), nil, zap.NewNop()))
+	r.Use(TokenAuthMiddlewareWithUsers(v, tenants, store.Users(), nil, zap.NewNop()))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/test", nil)

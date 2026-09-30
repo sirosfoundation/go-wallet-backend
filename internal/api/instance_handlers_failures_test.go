@@ -131,3 +131,51 @@ func TestUpdateWalletInstanceStatus_LifecycleErasureIncompleteIs409(t *testing.T
 		t.Fatalf("the revocation itself must be persisted: %v %v", err, inst)
 	}
 }
+
+type failingCleaner struct{}
+
+func (failingCleaner) DeleteByUser(context.Context, string) error { return errStoreDown }
+
+func TestListMyWalletInstances_Refusals(t *testing.T) {
+	t.Run("no authenticated user", func(t *testing.T) {
+		h, _ := setupLifecycleHandlers(t)
+		if w := doJSON(instanceRoutes(h), http.MethodGet, "/user/session/instances", ""); w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", w.Code)
+		}
+	})
+	t.Run("lifecycle service not wired", func(t *testing.T) {
+		h, _ := setupLifecycleHandlers(t)
+		h.services.WalletLifecycle = nil
+		r := instanceRoutes(h, authMiddleware(domain.NewUserID().String(), "did:x"))
+		w := doJSON(r, http.MethodGet, "/user/session/instances", "")
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "LIFECYCLE_NOT_SUPPORTED") {
+			t.Fatalf("expected 503 LIFECYCLE_NOT_SUPPORTED, got %d %s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("store failure", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		broken := &brokenInstanceStore{Store: memory.NewStore(), failReads: true}
+		services := service.NewServices(broken, lifecycleTestConfig(), zap.NewNop())
+		h := NewHandlersWithStore(services, broken, lifecycleTestConfig(), zap.NewNop(), []string{"test"})
+		r := instanceRoutes(h, authMiddleware(domain.NewUserID().String(), "did:x"))
+		if w := doJSON(r, http.MethodGet, "/user/session/instances", ""); w.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500, got %d %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// A session store that will not drop the user's sessions must not be reported
+// as a successful logout-everywhere: the tokens are cut off, but the request
+// promised the sessions too.
+func TestLogoutEverywhere_SessionCleanerFailureIs500(t *testing.T) {
+	h, _ := setupLifecycleHandlers(t)
+	me := domain.NewUserID()
+	if err := h.store.Users().Create(context.Background(), &domain.User{UUID: me}); err != nil {
+		t.Fatal(err)
+	}
+	h.services.User.SetSessionCleaner(failingCleaner{})
+	r := instanceRoutes(h, authMiddleware(me.String(), "did:x"))
+	if w := doJSON(r, http.MethodPost, "/user/session/logout-all", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d %s", w.Code, w.Body.String())
+	}
+}

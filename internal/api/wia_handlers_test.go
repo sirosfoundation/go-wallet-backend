@@ -8,6 +8,8 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -213,5 +215,30 @@ func TestWIAGenerate_InvalidPopFormat(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "POP_INVALID" {
 		t.Errorf("expected POP_INVALID error, got %v", resp["error"])
+	}
+}
+
+// The refusals the WIA endpoint gives are a stable client contract: each
+// service error keeps its own status and code, and an unknown error is a 500.
+func TestWIAFailure_MapsEveryServiceRefusal(t *testing.T) {
+	cases := []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{service.ErrWIAChallengeExpired, http.StatusBadRequest, "CHALLENGE_INVALID"},
+		{service.ErrWIACredentialNotOwned, http.StatusForbidden, "CREDENTIAL_NOT_OWNED"},
+		{service.ErrWIAPopInvalid, http.StatusBadRequest, "POP_INVALID"},
+		{service.ErrWIAUnknownUser, http.StatusForbidden, "UNKNOWN_USER"},
+		{service.ErrWIAInstanceDeactivated, http.StatusForbidden, "INSTANCE_DEACTIVATED"},
+		{service.ErrWIAInstanceNotOwned, http.StatusForbidden, "INSTANCE_NOT_OWNED"},
+		{fmt.Errorf("wrapped: %w", service.ErrWIAInstanceDeactivated), http.StatusForbidden, "INSTANCE_DEACTIVATED"},
+		{errors.New("storage exploded"), http.StatusInternalServerError, "WIA_GENERATION_FAILED"},
+	}
+	for _, tc := range cases {
+		status, code, message := wiaFailure(tc.err)
+		if status != tc.status || code != tc.code || message == "" {
+			t.Errorf("wiaFailure(%v) = %d %s %q, want %d %s", tc.err, status, code, message, tc.status, tc.code)
+		}
 	}
 }
