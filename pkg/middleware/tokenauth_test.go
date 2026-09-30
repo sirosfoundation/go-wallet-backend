@@ -586,3 +586,28 @@ func TestTokenAuthMiddleware_DeletedAccountTokenIsRevoked(t *testing.T) {
 		t.Fatalf("an identity with no record and no tombstone keeps its behaviour, got %d", got)
 	}
 }
+
+func TestRequireUser(t *testing.T) {
+	run := func(setUser bool, userID string) int {
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			if setUser {
+				c.Set("user_id", userID)
+			}
+		})
+		r.Use(RequireUser())
+		r.GET("/", func(c *gin.Context) { c.Status(200) })
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+		return w.Code
+	}
+	if got := run(false, ""); got != 403 {
+		t.Errorf("no user_id: %d, want 403", got)
+	}
+	if got := run(true, ""); got != 403 {
+		t.Errorf("empty user_id: %d, want 403", got)
+	}
+	if got := run(true, "u1"); got != 200 {
+		t.Errorf("named user: %d, want 200", got)
+	}
+}

@@ -163,6 +163,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
+		// Every route below acts on an account, a wallet or tenant
+		// configuration on a user's behalf; an anonymous token (no user) is
+		// for registry lookups only and is refused here.
+		middleware.RequireUser(),
 	)
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
@@ -339,6 +343,9 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
+		// Stored credentials belong to a user; an anonymous token is for
+		// registry lookups only.
+		middleware.RequireUser(),
 	)
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
@@ -757,6 +764,9 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
 		protected.Use(p.authMiddleware())
+		// Anonymous tokens ARE accepted here (no RequireUser): these are
+		// registry lookups, the one thing an anonymous token is for.
+		//
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
 		// wallet-backend audience - never require a broader one. Only
@@ -1182,7 +1192,7 @@ func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Wallet-provider routes with auth middleware
 	wp := router.Group("/wallet-provider")
-	wp.Use(p.authMiddleware())
+	wp.Use(p.authMiddleware(), middleware.RequireUser())
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.

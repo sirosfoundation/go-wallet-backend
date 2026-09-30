@@ -589,6 +589,13 @@ func runHandleFlowStart(t *testing.T, m *Manager, tac claims.TAC, protocol Proto
 // behavior (e.g. the short-flow_id-vs-log-truncation regression below).
 func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID string) *FlowErrorMessage {
 	t.Helper()
+	return runHandleFlowStartAs(t, m, tac, protocol, flowID, "test-user")
+}
+
+// runHandleFlowStartAs is runHandleFlowStartWithID for a session of the given
+// user; "" is an anonymous session.
+func runHandleFlowStartAs(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID, userID string) *FlowErrorMessage {
+	t.Helper()
 
 	result := make(chan *FlowErrorMessage, 1)
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
@@ -612,6 +619,7 @@ func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol
 
 	session := testSession(conn)
 	session.TAC = tac
+	session.UserID = userID
 
 	m.handleFlowStart(session, &FlowStartMessage{Message: Message{FlowID: flowID}, Protocol: protocol})
 
@@ -1512,4 +1520,25 @@ func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing
 		defer m.sessionsMu.RUnlock()
 		return len(m.sessions) == 0 && len(m.userIndex) == 0
 	}, 2*time.Second, 5*time.Millisecond, "the refused session must not stay registered")
+}
+
+// An anonymous token (no user) is for registry/metadata lookups: it may run the
+// VCTM lookup flow, but not a flow that acts for a wallet.
+func TestManager_handleFlowStart_AnonymousSessionMayOnlyLookUpMetadata(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+	m.RegisterFlowHandler(ProtocolOID4VP, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return stubFlowHandler{}, nil
+	})
+	m.RegisterFlowHandler(ProtocolVCTM, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return stubFlowHandler{}, nil
+	})
+
+	for _, p := range []Protocol{ProtocolOID4VCI, ProtocolOID4VP} {
+		msg := runHandleFlowStartAs(t, m, "rli", p, "", "")
+		require.NotNil(t, msg, "anonymous %s flow must be refused", p)
+		assert.Equal(t, ErrCodeForbidden, msg.Error.Code)
+	}
+	assert.Nil(t, runHandleFlowStartAs(t, m, "r", ProtocolVCTM, "", ""), "a metadata lookup is what anonymous tokens are for")
+	// The same flows are fine for a session that names a user.
+	assert.Nil(t, runHandleFlowStartAs(t, m, "rli", ProtocolOID4VCI, "", "some-user"))
 }

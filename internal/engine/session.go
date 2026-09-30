@@ -636,6 +636,14 @@ var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VCI: "i",
 }
 
+// anonymousProtocols are the flow protocols a session with no user (a token the
+// AS issued without "sub") may run: lookups of public metadata. Everything else
+// acts for a wallet (receives or presents credentials) and needs an identity,
+// so an anonymous session is refused for it at flow start.
+var anonymousProtocols = map[Protocol]bool{
+	ProtocolVCTM: true,
+}
+
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
@@ -672,6 +680,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		logger.Warn("Flow refused: authorization revoked", zap.Error(err))
 		_ = session.SendFlowError(flowID, "", ErrCodeAuthFailed, "Authorization revoked")
 		_ = session.conn.Close()
+		return
+	}
+
+	// An anonymous token is for registry/metadata lookups only: it may not
+	// start a flow that acts for a wallet. The handshake itself stays open to
+	// it, since a lookup flow needs the connection.
+	if session.UserID == "" && !anonymousProtocols[msg.Protocol] {
+		logger.Warn("Flow refused: anonymous session")
+		_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "anonymous tokens are not accepted for protocol: "+string(msg.Protocol))
 		return
 	}
 

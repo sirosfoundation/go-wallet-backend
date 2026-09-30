@@ -98,7 +98,8 @@ func TokenAuthMiddlewareWithUsers(v *validator.Validator, tenants TenantLookup, 
 			return
 		}
 
-		// SID-AUTH-06 token cut-off (anonymous tokens have no user and pass).
+		// SID-AUTH-06 token cut-off. An anonymous token has no user to judge and
+		// passes here; routes that need an identity refuse it with RequireUser.
 		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
@@ -186,6 +187,34 @@ func resolveTokenTenant(c *gin.Context, tenants TenantLookup, result *claims.Res
 		)
 	}
 	return tenant, tenantID, true
+}
+
+// AnonymousTokenMessage is the error the routes that need an identity answer
+// an anonymous token with.
+const AnonymousTokenMessage = "anonymous tokens are not accepted on this route"
+
+// RequireUser refuses a request whose bearer token names no user (an anonymous
+// token: one the AS issued without "sub", or a legacy token with an empty
+// user id) with 403. Anonymous tokens exist for registry lookups and public
+// metadata (the AuthZEN proxy, the registry, VCTM lookups); every route that
+// acts on a wallet, an account or a tenant's configuration on behalf of a
+// user must sit behind it. The token gate cannot do this job: it judges a
+// user against the lifecycle cut-off, and an anonymous token has no user to
+// judge, so without this an anonymous token issued before a revocation or an
+// account deletion would stay usable on wallet-scoped routes until it
+// expires.
+//
+// Must be placed after the authentication middleware, which sets "user_id"
+// only for a token that names a user.
+func RequireUser() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if userID, _ := c.Get("user_id"); userID == nil || userID == "" {
+			c.JSON(403, gin.H{"error": AnonymousTokenMessage})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
 
 // MustHaveTAC returns middleware that requires the token to contain all
