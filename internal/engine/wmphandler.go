@@ -919,22 +919,38 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 // and stores the token→sessionID mapping. Per spec §4.5.2, tokens MUST have
 // at least 128 bits of entropy and are rotated on each successful resume.
 func (a *WMPAdapter) generateResumptionToken(sessionID string) string {
+	token, _ := a.issueResumptionToken(sessionID, nil)
+	return token
+}
+
+// issueResumptionTokenIfCurrent issues a token for sessionID only if ws is
+// still the installed peer, atomically with respect to CloseSession and
+// closeSessionIfCurrent (which remove the peer and its tokens under a.mu).
+func (a *WMPAdapter) issueResumptionTokenIfCurrent(sessionID string, ws *wmpSession) (string, bool) {
+	return a.issueResumptionToken(sessionID, ws)
+}
+
+// issueResumptionToken creates and stores a token. With a non-nil ws the peer
+// check and the insertion happen under one a.mu critical section.
+func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession) (string, bool) {
 	b := make([]byte, 32) // 256 bits
 	if _, err := rand.Read(b); err != nil {
 		// Should never happen with crypto/rand
 		a.logger.Error("failed to generate resumption token", zap.Error(err))
-		return ""
+		return "", ws == nil
 	}
 	token := base64.RawURLEncoding.EncodeToString(b)
 
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ws != nil && a.peers[sessionID] != ws {
+		return "", false
+	}
 	a.resumptionTokens[token] = &resumptionEntry{
 		sessionID: sessionID,
 		expiresAt: time.Now().Add(resumptionTokenTTL),
 	}
-	a.mu.Unlock()
-
-	return token
+	return token, true
 }
 
 // serverCapabilities builds the capability map from registered flow handlers.
@@ -1154,8 +1170,16 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		a.closeSessionIfCurrent(params.SessionID, ws)
 	}()
 
-	// Issue a new rotated token.
-	newToken := a.generateResumptionToken(params.SessionID)
+	// Issue a new rotated token, but only while this exact peer is still the
+	// installed one: CloseSession removes the peer and its tokens under a.mu,
+	// so checking and issuing under the same lock gives close and resume a
+	// single linearization point (no token for a session that no longer
+	// exists, and no "resumed: true" for it either).
+	newToken, stillCurrent := a.issueResumptionTokenIfCurrent(params.SessionID, ws)
+	if !stillCurrent {
+		a.logger.Warn("WMP session.resume: session closed during resume", zap.String("session_id", params.SessionID))
+		return invalidToken()
+	}
 
 	// Echo the negotiated capabilities and security from the original session
 	// per spec §4.5.1 / §4.5.3. MissedMessages is the number of events after
