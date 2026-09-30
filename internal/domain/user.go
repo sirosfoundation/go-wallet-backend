@@ -46,6 +46,21 @@ func UserIDFromUserHandle(handle []byte) UserID {
 	return UserID{ID: string(handle)}
 }
 
+// HolderDID returns the canonical holder DID for a user, derived
+// deterministically from their user_id alone. This is the single source of
+// truth for "which holder identity does this user's stored credentials live
+// under" - every place that resolves a caller's holder DID (JWT issuance in
+// UserService/WebAuthnService, and request-time resolution in
+// api.Handlers.getHolderDID) must derive it exactly this way. Branching on
+// which claim a token happens to carry (some carry both "did" and
+// "user_id", others carry only "user_id") previously gave the same
+// physical user two different holder identities depending on which token
+// type authenticated the request, making their stored credentials
+// invisible under the other (see go-wallet-backend#384).
+func HolderDID(userID string) string {
+	return "did:key:" + userID
+}
+
 // EnterpriseIdentity stores a bound enterprise IdP identity
 type EnterpriseIdentity struct {
 	// TenantID is the tenant this binding belongs to
@@ -78,7 +93,6 @@ type User struct {
 	Username            *string              `json:"username,omitempty" bson:"username,omitempty"`
 	DisplayName         *string              `json:"display_name,omitempty" bson:"display_name,omitempty"`
 	DID                 string               `json:"did" bson:"did"`
-	PasswordHash        *string              `json:"-" bson:"password_hash,omitempty"`
 	PrivateData         []byte               `json:"private_data,omitempty" bson:"private_data,omitempty"`
 	Keys                []byte               `json:"keys,omitempty" bson:"keys,omitempty"`
 	WalletType          WalletType           `json:"wallet_type" bson:"wallet_type"`
@@ -176,21 +190,7 @@ func (u *User) UpdatePrivateData(data []byte) {
 type RegisterRequest struct {
 	Username    *string    `json:"username,omitempty"`
 	DisplayName string     `json:"display_name"`
-	Password    *string    `json:"password,omitempty"`
 	WalletType  WalletType `json:"wallet_type"`
 	Keys        []byte     `json:"keys,omitempty"`
 	PrivateData []byte     `json:"private_data,omitempty"`
-}
-
-// LoginRequest represents a login request
-type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
-}
-
-// LoginResponse represents a login response
-type LoginResponse struct {
-	Token       string `json:"token"`
-	UserID      string `json:"user_id"`
-	DisplayName string `json:"display_name"`
 }

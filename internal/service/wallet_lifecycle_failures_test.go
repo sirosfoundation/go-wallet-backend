@@ -178,9 +178,9 @@ func (s *failChallenges) DeleteByUserID(ctx context.Context, id string) error {
 	return s.ChallengeStore.DeleteByUserID(ctx, id)
 }
 
-type erroringSessionCleaner struct{}
+type failingSessionCleaner struct{}
 
-func (erroringSessionCleaner) DeleteByUser(context.Context, string) error { return errBoom }
+func (failingSessionCleaner) DeleteByUser(context.Context, string) error { return errBoom }
 
 // seedWalletUser creates a user with a DID, private data, a challenge, one
 // active instance, and credentials/presentations in the given tenants.
@@ -274,7 +274,7 @@ func TestWalletLifecycle_Cascade_UnownedInstanceAndErrors(t *testing.T) {
 	t.Run("session drop failure: erasure still runs, reported as incomplete", func(t *testing.T) {
 		store := memory.NewStore()
 		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
-		svc.SetSessionCleaner(erroringSessionCleaner{})
+		svc.SetSessionCleaner(failingSessionCleaner{})
 		uid := seedWalletUser(t, store, domain.DefaultTenantID)
 		inst, err := svc.ChangeStatus(ctx, provider, domain.DefaultTenantID, "inst-"+uid.String(), domain.InstanceStatusRevoked, "")
 		assert.ErrorIs(t, err, ErrErasureIncomplete)

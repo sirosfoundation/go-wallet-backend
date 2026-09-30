@@ -209,6 +209,43 @@ func TestResolveClientAuth_ClientHeld_NonceRetrySignsAgainWithNonce(t *testing.T
 	assert.Equal(t, "instance-key-1", reqs[1].Params.KeyID, "later requests name the settled key")
 }
 
+func TestResolveClientAuth_ClientHeld_AttestationChallengeRetry(t *testing.T) {
+	client := supportingClient()
+
+	var mu sync.Mutex
+	var attempts int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-abc")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+	}))
+	defer srv.Close()
+
+	h, _, cleanup := newClientAuthHandler(t, srv.Client(), client)
+	defer cleanup()
+
+	token, err := h.exchangePreAuthCode(context.Background(), &IssuerMetadata{TokenEndpoint: srv.URL}, "code", "")
+	require.NoError(t, err)
+	assert.Equal(t, "at", token.AccessToken)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Empty(t, reqs[0].Params.AttestationChallenge, "first PoP carries no challenge yet")
+	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge, "retry must carry the server challenge")
+	assert.Equal(t, "chal-abc", h.attestationChallenge)
+}
+
 func TestResolveClientAuth_ClientHeld_ResourceRequestCarriesATHOnly(t *testing.T) {
 	client := supportingClient()
 	var got http.Header

@@ -4,7 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 func TestTrustCache_SetAndGet(t *testing.T) {
@@ -175,4 +180,96 @@ func TestTrustCache_SweepOnSet(t *testing.T) {
 	if got := cache.Get("t3", "url3"); got == nil || got.Name != "d" {
 		t.Errorf("new entry missing after sweep, got %+v", got)
 	}
+}
+
+// TestTrustCache_DisabledNeverCaches pins what config.TrustConfig.CacheDisabled
+// buys: with a non-positive TTL nothing is stored and nothing is returned, so
+// every evaluation reaches the PDP.
+//
+// This is the switch that makes trust configuration testable. With the cache
+// on, a denial is reused for the whole TTL without consulting the PDP at all,
+// so fixing a whitelist or a key and redeploying changes nothing until it
+// expires - and no log says the answer was stale.
+func TestTrustCache_DisabledNeverCaches(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		c := NewTrustCache(ttl)
+		c.Set(domain.DefaultTenantID, "https://verifier.example", &TrustCacheRecord{
+			URL:     "https://verifier.example",
+			Trusted: true,
+		})
+		// Checked before any Get, and this ordering is the whole test: an
+		// entry written with a zero TTL is already expired, so a later Get
+		// would evict it and report a miss even if Set had stored it. Only
+		// Len here tells "never stored" from "stored and instantly stale".
+		if c.Len() != 0 {
+			t.Fatalf("ttl %v: expected nothing stored, got %d entries", ttl, c.Len())
+		}
+		if got := c.Get(domain.DefaultTenantID, "https://verifier.example"); got != nil {
+			t.Fatalf("ttl %v: expected a miss, got %+v", ttl, got)
+		}
+	}
+}
+
+// A denial is cached exactly like an approval, so disabling the cache has to
+// suppress both - that is the case the switch exists for.
+func TestTrustCache_DisabledDoesNotCacheDenials(t *testing.T) {
+	c := NewTrustCache(0)
+	c.Set(domain.DefaultTenantID, "https://verifier.example", &TrustCacheRecord{
+		URL:     "https://verifier.example",
+		Trusted: false,
+	})
+	if c.Len() != 0 {
+		t.Fatalf("expected the denial not to be stored, got %d entries", c.Len())
+	}
+	if got := c.Get(domain.DefaultTenantID, "https://verifier.example"); got != nil {
+		t.Fatalf("expected a miss for a cached denial, got %+v", got)
+	}
+}
+
+// A nil cache is what a handler holds when the manager never set one; every
+// exported method must behave like a disabled one rather than panic. Get and
+// Set guard the receiver explicitly; Len does not touch any field before
+// acquiring c.mu, so a bare nil check is required there too - c.mu.RLock()
+// on a nil *TrustCache panics on the implicit dereference of c, and nothing
+// else in this file was exercising Len on a nil receiver to catch that.
+func TestTrustCache_NilIsSafe(t *testing.T) {
+	var c *TrustCache
+	c.Set(domain.DefaultTenantID, "https://verifier.example", &TrustCacheRecord{Trusted: true})
+	if got := c.Get(domain.DefaultTenantID, "https://verifier.example"); got != nil {
+		t.Fatalf("expected nil from a nil cache, got %+v", got)
+	}
+	if got := c.Len(); got != 0 {
+		t.Fatalf("expected 0 from a nil cache, got %d", got)
+	}
+}
+
+// NewManager must wire the configured TTL into the cache it builds. Every
+// other test here exercises TrustCache and VerifierCacheTTL directly, so all
+// of them would still pass if the constructor went back to a hardcoded hour
+// and quietly ignored the configuration - which is the only way this feature
+// can break without anything noticing.
+func TestNewManager_WiresTheConfiguredTrustCacheTTL(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cfg  config.TrustConfig
+		want time.Duration
+	}{
+		{"disabled", config.TrustConfig{CacheDisabled: true}, 0},
+		{"custom ttl", config.TrustConfig{CacheTTLSeconds: 42}, 42 * time.Second},
+		{"unset means the default", config.TrustConfig{}, config.DefaultTrustCacheTTL},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(&config.Config{Trust: tt.cfg}, zap.NewNop())
+			require.NotNil(t, m.trustCache)
+			assert.Equal(t, tt.want, m.trustCache.ttl,
+				"the manager's cache must use the configured TTL, not a literal of its own")
+		})
+	}
+
+	// And the disabled one really is off, not an instantly-expiring entry:
+	// Set must store nothing at all.
+	m := NewManager(&config.Config{Trust: config.TrustConfig{CacheDisabled: true}}, zap.NewNop())
+	m.trustCache.Set("tenant", "https://verifier.example", &TrustCacheRecord{Trusted: true})
+	assert.Zero(t, m.trustCache.Len(), "a disabled cache must not store")
+	assert.Nil(t, m.trustCache.Get("tenant", "https://verifier.example"))
 }

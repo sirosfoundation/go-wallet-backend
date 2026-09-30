@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -140,6 +141,18 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 		return
 	}
 
+	// SECURITY: the tenant that actually governs this registration is
+	// whichever tenant BeginRegistration recorded on the challenge - not
+	// necessarily this request's current tenant context. Without this, a
+	// caller could begin under tenant A and finish the very same challenge
+	// under tenant B: the bind_identity check below would then run against
+	// B's policy (and B's OIDC issuer) while the registration is still
+	// written under A regardless of what B required, or vice versa. This
+	// mirrors StartWebAuthnRegistration's tenant source and the /auth/passkey
+	// path's RegisterFinish fix (issue #374); see #395.
+	tenantIDForCheck, _ := h.getTenantID(c)
+	req.ExpectedTenantID = string(tenantIDForCheck)
+
 	// SECURITY: Check if identity binding is required for this tenant
 	// This must be validated BEFORE checking oidcResult to prevent bypass
 	tenantVal, tenantExists := c.Get("tenant")
@@ -207,6 +220,8 @@ func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
 			c.JSON(400, gin.H{"error": "Verification failed"})
 		case errors.Is(err, service.ErrAAGUIDBlacklisted):
 			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
+		case errors.Is(err, service.ErrTenantMismatch):
+			c.JSON(403, gin.H{"error": "tenant mismatch"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to complete registration"})
 		}
@@ -252,19 +267,14 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 	}
 
 	// Check if OIDC gate authentication result is present
-	// Note: For login, we can't get tenant ID from request - it's determined from the credential
-	// The middleware sets the result in context, and the service will verify it matches the user's bound identity
-	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
-		// Extract email from claims if available
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		req.OIDCGateBinding = &service.OIDCGateBinding{
-			Issuer:  oidcResult.Issuer,
-			Subject: oidcResult.Subject,
-			Email:   email,
-		}
+	// Note: For login, we can't get tenant ID from request - it's determined
+	// from the credential. Builds Issuer/Subject/Email/Audience/Claims the
+	// same way internal/as.PasskeyHandlers.LoginFinish does - shared to
+	// avoid duplicating this tenant-aware binding construction between the
+	// two login paths (see middleware.BuildLoginOIDCGateBinding's doc
+	// comment, and #386/#408/#409).
+	if binding := middleware.BuildLoginOIDCGateBinding(c); binding != nil {
+		req.OIDCGateBinding = binding
 	}
 
 	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
@@ -328,6 +338,17 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrInvalidRefreshToken):
 			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
+		case errors.Is(err, service.ErrRefreshDisabled):
+			// Config-driven, expected state (JWT.RefreshDays <= 0) - not a
+			// server malfunction, so it must not surface as any 5xx (a 503
+			// still reads as a server failure to callers/monitoring -
+			// Copilot review on #400, second round). The route itself is
+			// now only mounted when refresh tokens are enabled
+			// (internal/server/providers.go), so this case is unreachable
+			// via HTTP in practice; it's kept as defense in depth for any
+			// other caller of RefreshAccessToken, mapped the same way a
+			// missing route would answer.
+			c.JSON(404, gin.H{"error": "Token refresh is disabled"})
 		default:
 			c.JSON(500, gin.H{"error": "Failed to refresh token"})
 		}
@@ -339,18 +360,25 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 
 // Storage handlers - Credentials
 
-// getHolderDID retrieves the holder DID from context
+// getHolderDID retrieves the canonical holder DID for the authenticated
+// caller. It is always derived from user_id via domain.HolderDID, never
+// trusted from the token's own "did" claim: legacy HMAC tokens carry both
+// "did" and "user_id" (with did == domain.HolderDID(user_id) - see
+// UserService.generateToken / WebAuthnService.generateToken), but AS-issued
+// tokens (internal/as/token.go) carry only "sub"/user_id and no "did" claim
+// at all. Preferring "did" when present used to give the same physical user
+// two different holder identities depending on which token type
+// authenticated the request, making their previously stored credentials
+// invisible under the other (#384). Deriving from user_id alone, always,
+// keeps both token types resolving to the same identity - and reproduces
+// the exact value legacy tokens' own "did" claim already carried, so
+// existing stored credentials stay reachable.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
-	did, exists := c.Get("did")
-	if exists && did.(string) != "" {
-		return did.(string), true
-	}
-	// Fallback to user_id if did is not set
 	userID, exists := c.Get("user_id")
 	if !exists {
 		return "", false
 	}
-	return userID.(string), true
+	return domain.HolderDID(userID.(string)), true
 }
 
 // getTenantID retrieves the tenant ID from context.
@@ -828,9 +856,65 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	c.Status(204)
 }
 
+// maxConfiguredASTokenTTL returns the longest lifetime the AS is configured
+// to issue an access token for, across DefaultTokenTTL and every
+// per-audience override in AudienceTTLs - used by Logout to size a
+// blacklist entry for an AS-issued token whose actual expiry isn't exposed
+// by go-tokenauth's validation result. Falls back to DefaultTokenTTL alone
+// (2m by default - see config.ASConfig.SetDefaults) if AS isn't configured
+// at all, which is harmless: an AS-disabled deployment never reaches this
+// code path (see Logout's tokenauth_result branch).
+func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
+	longest := cfg.AS.DefaultTokenTTL
+	for _, ttl := range cfg.AS.AudienceTTLs {
+		if ttl > longest {
+			longest = ttl
+		}
+	}
+	return longest
+}
+
+// ttlForTokenAuthResult returns the lifetime to size a logout blacklist
+// entry for, given the mode go-tokenauth validated the token as. Its own
+// Validator "auto-detects new-style vs legacy" (see TokenAuthMiddleware's
+// doc comment), so tokenauth_result is populated for both kinds of token,
+// not just AS-issued ones, and each has its own, very different, configured
+// lifetime - see maxConfiguredASTokenTTL's doc comment and #391 review,
+// round 3.
+func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) time.Duration {
+	if result.Mode == tokenauthclaims.ModeLegacy {
+		return time.Duration(cfg.JWT.ExpiryHours) * time.Hour
+	}
+	return maxConfiguredASTokenTTL(cfg)
+}
+
 // Logout invalidates the current session by blacklisting the JWT
 func (h *Handlers) Logout(c *gin.Context) {
-	// Get the token from context (set by auth middleware)
+	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
+	// - the path taken whenever AS is enabled), the raw token may be
+	// ES256/EdDSA-signed and the legacy HMAC re-parse below silently fails
+	// to extract its claims, so the jti never reaches the blacklist at all
+	// (#391 review). TokenAuthMiddleware already validated the token and
+	// left the result in context; use its jti directly instead of
+	// re-parsing.
+	if v, exists := c.Get("tokenauth_result"); exists {
+		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
+			if result.JTI != "" && h.services.TokenBlacklist != nil {
+				expiry := time.Now().Add(ttlForTokenAuthResult(h.cfg, result) + time.Minute)
+				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
+					h.logger.Warn("Failed to blacklist token", zap.Error(err))
+				} else {
+					h.logger.Info("User logged out, token blacklisted",
+						zap.String("jti", result.JTI),
+					)
+				}
+			}
+			c.JSON(200, gin.H{"message": "Logged out successfully"})
+			return
+		}
+	}
+
+	// Legacy HMAC path: get the token from context (set by auth middleware)
 	tokenString, exists := c.Get("token")
 	if !exists {
 		// No token? Already logged out effectively
@@ -879,7 +963,11 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	holderDID := userID.(string) // Using userID as holderDID
+	// Use the same canonical holder DID resolution as every other credential
+	// operation (see getHolderDID) - not the raw user_id - so this actually
+	// finds and deletes the credentials/presentations that were stored under
+	// it (#384).
+	holderDID, _ := h.getHolderDID(c)
 
 	if err := h.services.User.DeleteUser(
 		c.Request.Context(),
@@ -910,7 +998,6 @@ type AccountInfoResponse struct {
 	UUID                string                   `json:"uuid"`
 	Username            *string                  `json:"username,omitempty"`
 	DisplayName         *string                  `json:"displayName,omitempty"`
-	HasPassword         bool                     `json:"hasPassword"`
 	Settings            AccountSettings          `json:"settings"`
 	WebauthnCredentials []WebauthnCredentialInfo `json:"webauthnCredentials"`
 }
@@ -964,7 +1051,6 @@ func (h *Handlers) GetAccountInfo(c *gin.Context) {
 		UUID:        user.UUID.String(),
 		Username:    user.Username,
 		DisplayName: user.DisplayName,
-		HasPassword: user.PasswordHash != nil,
 		Settings: AccountSettings{
 			OpenIDRefreshTokenMaxAgeInSeconds: user.OpenIDRefreshTokenMaxAge,
 		},

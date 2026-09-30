@@ -1,7 +1,7 @@
 # Wallet Protocol Channel Specification
 
-**Version**: 0.1.0 (Draft)  
-**Status**: Design Discussion  
+**Version**: 0.1.0 (Draft)
+**Status**: Design Discussion
 **Date**: 2026-02-18
 
 ## Overview
@@ -144,16 +144,16 @@ All messages are JSON objects with a common envelope:
 interface Message {
   // Message type - determines interpretation of payload
   type: string;
-  
+
   // Flow identifier for multi-step operations (optional)
   flow_id?: string;
-  
+
   // Correlation ID for request/response pairs (optional)
   message_id?: string;
-  
+
   // Timestamp (ISO 8601, optional)
   timestamp?: string;
-  
+
   // Type-specific payload
   [key: string]: unknown;
 }
@@ -437,6 +437,7 @@ Server → Client:
   "params": {
     "audience": "https://as.example.com",      // present: WIA + fresh PoP wanted (aud)
     "issuer": "https://wallet.example.com/cb", // PoP iss = the flow's client_id
+    "attestation_challenge": "<server challenge for the attestation PoP, if any>",
     "htm": "POST",                             // present with htu: DPoP proof wanted
     "htu": "https://as.example.com/token",
     "dpop_nonce": "<server nonce, if any>",
@@ -473,7 +474,7 @@ replays both on the PAR and token requests:
 ```
 Server → Client:
 { "type": "sign_request", "action": "request_attestation",
-  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb" } }
+  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb", "attestation_challenge": "<server challenge, if any>" } }
 
 Client → Server:
 { "type": "sign_response", "client_attestation": "eyJ...", "client_attestation_pop": "eyJ..." }
@@ -491,6 +492,15 @@ legacy mode. The client stores it with the refresh token and sends the same
 field back on the renewal `flow_start`; with `dpop_key_id` the engine puts it
 in `params.key_id` of every `sign_client_auth` so the client signs with the
 original key.
+
+**Attestation challenge.** When an authorization server rejects a PAR or token
+request with `use_attestation_challenge`, the engine obtains a fresh challenge
+(from the `OAuth-Client-Attestation-Challenge` response header or the AS
+`challenge_endpoint`) and re-sends the request. `params.attestation_challenge`
+(in `sign_client_auth`, or `request_attestation` in legacy mode) then carries
+that challenge, and the client MUST include it as the `challenge` claim of the
+Client Attestation PoP JWT (draft-ietf-oauth-attestation-based-client-auth
+§5.1/§6).
 
 #### Credential Request
 
@@ -1204,19 +1214,19 @@ To support multiple protocols cleanly, the server implements a flow handler inte
 type FlowHandler interface {
     // Protocol returns the protocol identifier
     Protocol() string
-    
+
     // Start initializes a new flow from the start message
     Start(ctx context.Context, msg FlowStartMessage) (*FlowState, error)
-    
+
     // HandleAction processes a client action
     HandleAction(ctx context.Context, state *FlowState, action FlowActionMessage) error
-    
+
     // HandleSignResponse processes a signature from the client
     HandleSignResponse(ctx context.Context, state *FlowState, resp SignResponse) error
-    
+
     // Resume restores a flow from persisted state (for long-running flows)
     Resume(ctx context.Context, state *FlowState) error
-    
+
     // Cancel cleans up a flow
     Cancel(ctx context.Context, state *FlowState) error
 }
@@ -1381,15 +1391,15 @@ type FlowState struct {
     Protocol   string        // "oid4vci", "oid4vp", "vctm"
     Step       string
     StartedAt  time.Time
-    
+
     // OID4VCI state
     Offer      *CredentialOffer
     Metadata   *IssuerMetadata
     TokenResp  *TokenResponse
-    
+
     // OID4VP state
     Request    *AuthorizationRequest
-    
+
     // Pending sign request
     PendingSign *SignRequest
 }

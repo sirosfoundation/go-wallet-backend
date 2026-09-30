@@ -3,6 +3,7 @@ package as
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,6 +14,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // ASModule is the top-level authorization server module that wires together
@@ -28,12 +30,37 @@ type ASModule struct {
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
 	OIDCHandler    *OIDCHandlers
-	Logger         *zap.Logger
-	Config         *config.ASConfig
+	// Blacklist checks whether a token has been revoked (via Logout/user
+	// deletion - see #382/#383). Used by the delegation-exchange path in
+	// TokenEndpointHandler so a revoked parent token can't be re-delegated
+	// into a fresh one (#381). Nil if the caller didn't wire one.
+	Blacklist TokenBlacklistChecker
+	Logger    *zap.Logger
+	Config    *config.ASConfig
+
+	// store and validatorCache back the tenant-header and OIDC-gate
+	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
+	// only AS route group that operates on tenant-scoped data before the
+	// caller has a session, so it needs the same tenant perimeter as the
+	// /user/* routes (see pkg/middleware.TenantHeaderMiddleware and
+	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
+	store          storage.Store
+	validatorCache *middleware.ValidatorCache
+	// gateLimit, when set, rate limits token-bearing requests to the passkey
+	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
+	gateLimit gin.HandlerFunc
 }
 
 // NewASModule creates and initializes the AS module.
 // The ctx parameter controls the lifecycle of background goroutines (session cleanup).
+// httpClient is used for every request to an OIDC identity provider: the
+// login flow's discovery and token exchange, and the passkey OIDC gate's
+// issuer discovery and JWKS fetches (see RegisterRoutes) - callers should
+// pass a configured, SSRF-guarded client (cfg.HTTPClient.NewIdPHTTPClient(0)),
+// not nil, or those unauthenticated fetches bypass the private-IP/HTTPS
+// guards the rest of the codebase applies. A nil value still works (falls
+// back to a bare client with a short default timeout) for callers that
+// genuinely have no such client (e.g. tests).
 // Returns an error if the signing key cannot be loaded.
 func NewASModule(
 	ctx context.Context,
@@ -41,6 +68,8 @@ func NewASModule(
 	jwtCfg *config.JWTConfig,
 	webauthnSvc *service.WebAuthnService,
 	store storage.Store,
+	blacklist TokenBlacklistChecker,
+	httpClient *http.Client,
 	logger *zap.Logger,
 ) (*ASModule, error) {
 	// Key manager.
@@ -58,12 +87,20 @@ func NewASModule(
 		return cfg.GetTokenTTL(aud)
 	})
 
-	// Legacy issuer (uses existing HMAC secret).
+	// Legacy issuer (uses existing HMAC secret). Deliberately jwtCfg.Issuer,
+	// NOT the `issuer` var above: legacy appTokens are always minted by
+	// UserService/WebAuthnService's own generateToken with "iss":
+	// jwtCfg.Issuer, regardless of what cfg.AS.Issuer is separately
+	// configured as (the AS's own asymmetric tokenIssuer's identity). Using
+	// `issuer` here previously meant an operator who set cfg.AS.Issuer
+	// differently from cfg.JWT.Issuer got every legacy token rejected by
+	// this issuer, including - silently - LogoutHandler's legacy-token
+	// blacklisting fallback (#391 review, round 3).
 	var legacyIssuer *LegacyTokenIssuer
 	if cfg.Legacy.Enabled {
 		legacyIssuer = NewLegacyTokenIssuer(
 			[]byte(jwtCfg.Secret),
-			issuer,
+			jwtCfg.Issuer,
 			time.Duration(jwtCfg.ExpiryHours)*time.Hour,
 		)
 	}
@@ -91,8 +128,15 @@ func NewASModule(
 	// Passkey handlers.
 	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, legacyIssuer, cfg, logger)
 
-	// OIDC handlers.
-	oidcHandler := NewOIDCHandlers(store, sessions, cfg, logger)
+	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
+	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
+	// already requires it to be present and >=32 bytes.
+	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
+
+	// Shared cache of OIDC validators for the passkey gate (see
+	// RegisterRoutes). See httpClient's doc comment above for why this must
+	// be the caller's configured client, not nil, in production.
+	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
 		KeyManager:     km,
@@ -103,9 +147,30 @@ func NewASModule(
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
 		OIDCHandler:    oidcHandler,
+		Blacklist:      blacklist,
 		Logger:         logger,
 		Config:         cfg,
+		store:          store,
+		validatorCache: validatorCache,
 	}, nil
+}
+
+// SetOIDCGateRateLimiter installs the rate limiter that runs in front of the
+// passkey OIDC gates. Call it before RegisterRoutes; the same limiter is
+// meant to be shared with the /user/* gates so both draw from one set of
+// buckets.
+func (m *ASModule) SetOIDCGateRateLimiter(l *middleware.OIDCGateRateLimiter) {
+	if l != nil {
+		m.gateLimit = l.Middleware()
+	}
+}
+
+// gateLimitMiddleware returns the installed limiter, or a pass-through.
+func (m *ASModule) gateLimitMiddleware() gin.HandlerFunc {
+	if m.gateLimit != nil {
+		return m.gateLimit
+	}
+	return func(c *gin.Context) { c.Next() }
 }
 
 // RegisterRoutes registers all AS endpoints on the given router group.
@@ -114,13 +179,29 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
 
-	// Passkey authentication (public, no auth).
+	// Passkey authentication (public, no auth — but tenant-scoped).
+	// Tenant comes from the validated X-Tenant-ID header, never from the
+	// request body, mirroring the /user/* routes (see providers.go's
+	// AuthProvider.RegisterRoutes). Without this, a caller could pick any
+	// tenant's data via a body field with no validation at all (issue #374).
 	passkey := auth.Group("/passkey")
+	passkey.Use(middleware.TenantHeaderMiddleware(m.store))
 	{
-		passkey.POST("/login/begin", m.PasskeyHandler.LoginBegin)
-		passkey.POST("/login/finish", m.PasskeyHandler.LoginFinish)
-		passkey.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
-		passkey.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
+		// Registration routes (with OIDC registration gate).
+		registration := passkey.Group("")
+		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		{
+			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
+			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
+		}
+
+		// Login routes (with OIDC login gate).
+		login := passkey.Group("")
+		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		{
+			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
+			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
+		}
 	}
 
 	// OIDC authentication (public, no auth — redirects to IdP).
@@ -131,15 +212,20 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	}
 
 	// Token endpoint (requires session cookie).
-	RegisterTokenEndpoint(auth, m.Sessions, m.TokenIssuer, m.Policy,
-		func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
-		m.Config.InsecureCookies,
-		m.TokenGate,
-		m.Logger,
-	)
+	RegisterTokenEndpoint(auth, TokenEndpointConfig{
+		Store:           m.Sessions,
+		Issuer:          m.TokenIssuer,
+		Policy:          m.Policy,
+		TTLFunc:         func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
+		Audiences:       m.Config.Audiences,
+		Blacklist:       m.Blacklist,
+		Gate:            m.TokenGate,
+		InsecureCookies: m.Config.InsecureCookies,
+		Logger:          m.Logger,
+	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

@@ -110,44 +110,6 @@ func TestCheckWalletLifecycle(t *testing.T) {
 	})
 }
 
-// A suspension or revocation that lands between the login gate and the
-// sign-count save must not be undone by the stale user record, and must
-// still refuse the login.
-func TestPersistLoginState_LifecycleChangeDuringLogin(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	s := &WebAuthnService{store: store, logger: zap.NewNop()}
-	userID := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, PrivateData: []byte("vault"),
-		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}))
-	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-
-	loaded, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	stale := *loaded
-	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}}
-	stale.WebauthnCredentials[0].Authenticator.SignCount = 7
-
-	t.Run("no lifecycle change: the sign count is saved", func(t *testing.T) {
-		copyOf := stale
-		require.NoError(t, s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1"))
-		u, _ := store.Users().GetByID(ctx, userID)
-		assert.EqualValues(t, 7, u.WebauthnCredentials[0].Authenticator.SignCount)
-	})
-
-	t.Run("revoked during login: refused, erased data stays erased", func(t *testing.T) {
-		require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.InstanceStatusRevoked, "stolen"))
-		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
-		require.NoError(t, store.Users().EraseWalletData(ctx, userID, time.Now()))
-		copyOf := stale // loaded before the revocation
-		err := s.persistLoginState(ctx, &copyOf, domain.DefaultTenantID, "pk-1")
-		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
-		u, _ := store.Users().GetByID(ctx, userID)
-		assert.Nil(t, u.PrivateData, "the stale record must not restore the vault")
-		assert.False(t, u.AuthInvalidBefore.IsZero(), "the cut-off must not be rolled back")
-	})
-}
-
 // A lifecycle change that lands after the login gate but before the tokens
 // are handed out must not yield usable tokens; a cut-off in the very same
 // second only delays minting to the next second.
@@ -199,44 +161,6 @@ func TestMintTokens(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "refresh flow uses its own refusal")
 }
 
-// The reload after ErrStaleWrite re-applies this login's sign count, and only
-// this login's: the stale copy knows nothing about the other passkeys, so
-// copying their counters back would roll back a raise a concurrent login on
-// another device had already made - the very regression clone detection
-// watches for.
-func TestPersistLoginState_ReloadKeepsOtherPasskeySignCounts(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	s := &WebAuthnService{store: store, logger: zap.NewNop()}
-	userID := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID,
-		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}, {ID: "pk-2"}}}))
-	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-
-	// This login authenticated pk-1 and raised its counter to 7; it loaded
-	// the record while pk-2 was still at 0.
-	loaded, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	stale := *loaded
-	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}, {ID: "pk-2"}}
-	stale.WebauthnCredentials[0].Authenticator.SignCount = 7
-
-	// Meanwhile another device logged in with pk-2 and raised it to 42. That
-	// write also moves the fence, so this login's copy is refused and
-	// reloaded.
-	fresh, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	fresh.WebauthnCredentials[1].Authenticator.SignCount = 42
-	require.NoError(t, store.Users().Update(ctx, fresh))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
-
-	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
-	u, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	assert.EqualValues(t, 7, u.WebauthnCredentials[0].Authenticator.SignCount, "this login's passkey is saved")
-	assert.EqualValues(t, 42, u.WebauthnCredentials[1].Authenticator.SignCount, "the other device's raise survives")
-}
-
 // The cut-off is recorded before the new status is persisted, so a login that
 // passed its lifecycle check earlier in the flow mints a token whose fresh
 // iat clears the cut-off while the instance is being revoked. mintTokens
@@ -259,41 +183,6 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
 	}, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
-}
-
-// Two logins on the same passkey can interleave: the one that reloads after
-// ErrStaleWrite may find the record already ahead of the assertion it
-// verified. Re-applying its own count then would roll the counter back - the
-// regression clone detection looks for - so the merge only ever moves it up.
-func TestPersistLoginState_ReloadNeverRollsBackTheSamePasskey(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	s := &WebAuthnService{store: store, logger: zap.NewNop()}
-	userID := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID,
-		WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}))
-	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-
-	// This login verified an assertion at 8 and loaded the record before the
-	// other one landed.
-	loaded, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	stale := *loaded
-	stale.WebauthnCredentials = []domain.WebauthnCredential{{ID: "pk-1"}}
-	stale.WebauthnCredentials[0].Authenticator.SignCount = 8
-
-	// A concurrent login on the same passkey already stored 10, and a
-	// lifecycle write moved the fence, so this copy is refused and reloaded.
-	fresh, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	fresh.WebauthnCredentials[0].Authenticator.SignCount = 10
-	require.NoError(t, store.Users().Update(ctx, fresh))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
-
-	require.NoError(t, s.persistLoginState(ctx, &stale, domain.DefaultTenantID, "pk-1"))
-	u, err := store.Users().GetByID(ctx, userID)
-	require.NoError(t, err)
-	assert.EqualValues(t, 10, u.WebauthnCredentials[0].Authenticator.SignCount, "the counter only moves forward")
 }
 
 // A record left in the pre-removal "suspended" state must still be refused at

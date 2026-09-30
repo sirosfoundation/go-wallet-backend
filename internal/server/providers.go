@@ -42,6 +42,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// gateRateLimiter is shared by the /user/* gates and the AS passkey gates,
+	// so both draw from the same per-IP and per-tenant buckets (#65).
+	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
 
 // NewAuthProvider creates a new auth route provider
@@ -50,13 +53,14 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
-		cfg:            cfg,
-		logger:         logger,
-		store:          store,
-		services:       services,
-		handlers:       handlers,
-		roles:          roles,
-		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
+		cfg:             cfg,
+		logger:          logger,
+		store:           store,
+		services:        services,
+		handlers:        handlers,
+		roles:           roles,
+		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
+		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
 	}
 }
 
@@ -76,6 +80,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Create HTTP client and OIDC validator cache for gate middleware
 	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
 	validatorCache := middleware.NewValidatorCache(httpClient, p.logger)
+	gateLimit := p.gateRateLimiter.Middleware()
 
 	// Public auth routes (no authentication required)
 	public := router.Group("/")
@@ -88,6 +93,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		registration := userBase.Group("")
 		registration.Use(
 			middleware.NoCacheMiddleware(),
+			gateLimit,
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
 		)
 		{
@@ -99,11 +105,41 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		login := userBase.Group("")
 		login.Use(
 			middleware.NoCacheMiddleware(),
+			gateLimit,
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
 		)
 		{
 			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
 			login.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
+		}
+
+		// Refresh route: exchanges a still-valid refresh token for a new
+		// access token (and a rotated refresh token). Deliberately NOT behind
+		// authMiddleware()/TokenAuthMiddleware - the entire point of a
+		// refresh token is to obtain a new access token once the old one has
+		// expired, so requiring a currently-valid access token here would be
+		// self-defeating. No OIDC gate either: possessing the long-lived
+		// refresh token (itself a signed, type-checked JWT - see
+		// WebAuthnService.RefreshAccessToken) is the credential. This handler
+		// existed since refresh tokens were added but, like Logout before
+		// #391, was never actually mounted on any route (#392).
+		//
+		// Only mounted when refresh tokens are actually enabled
+		// (JWT.RefreshDays > 0): with the route always present, a deployment
+		// that has them turned off (the checked-in default) would still
+		// answer every call with a 5xx-class status from
+		// WebAuthnService.RefreshAccessToken's ErrRefreshDisabled, which
+		// looks like a server malfunction to callers/monitoring for what is
+		// actually an expected, admin-controlled config choice (Copilot
+		// review on #400 - a 503 fallback still counted as "still a 5xx").
+		// Omitting the route entirely instead answers with gin's ordinary
+		// 404, indistinguishable from any other unsupported endpoint.
+		if p.cfg.JWT.RefreshDays > 0 {
+			refresh := userBase.Group("/session")
+			refresh.Use(middleware.NoCacheMiddleware())
+			{
+				refresh.POST("/refresh", p.handlers.RefreshToken)
+			}
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)
@@ -145,6 +181,16 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.GET("/private-data", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetPrivateData)
 			session.POST("/private-data", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdatePrivateData)
 			session.DELETE("/", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
+			// Logout: blacklists the caller's own current token (see
+			// api.Handlers.Logout / #382). This handler existed since the
+			// blacklist itself was added but was never actually registered
+			// on any route - the write side of the blacklist was as
+			// unreachable as the read side (AuthMiddleware's hardcoded nil)
+			// that #382 is about. No TAC restriction ("" - trivially
+			// satisfied): revoking your own already-presented token isn't a
+			// read/write/list/insert/delete on any object, just proof you
+			// hold a valid token at all.
+			session.POST("/logout", requireTACIfEnforced(p.tokenValidator, ""), p.handlers.Logout)
 
 			// WebAuthn credential management
 			session.POST("/webauthn/register-begin", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.StartAddWebAuthnCredential)
@@ -233,9 +279,13 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.services.TokenBlacklist, p.logger)
 	}
-	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
+	// latter hardcodes a nil blacklist, which is exactly what left Logout's
+	// blacklist writes (see api.Handlers.Logout) never actually checked by
+	// anything (#382).
+	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
 }
 
 // requireTACIfEnforced returns MustHaveTAC(required) when tv is non-nil (the
@@ -262,6 +312,7 @@ type StorageProvider struct {
 	cfg            *config.Config
 	logger         *zap.Logger
 	store          backend.Backend
+	services       *service.Services
 	handlers       *api.Handlers
 	tokenValidator *tokenvalidator.Validator
 }
@@ -274,6 +325,7 @@ func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.L
 		cfg:      cfg,
 		logger:   logger,
 		store:    store,
+		services: services,
 		handlers: handlers,
 	}
 }
@@ -309,9 +361,14 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.services.TokenBlacklist, p.logger)
 	}
-	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
+	// provider is combined with an AuthProvider under BackendProvider,
+	// p.services.TokenBlacklist is overwritten to share that AuthProvider's
+	// instance, so a token blacklisted via Logout/DeleteUser is honored here
+	// too, not just on /user/session routes.
+	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
 }
 
 // =============================================================================
@@ -408,6 +465,17 @@ func (p *EngineProvider) SessionCleaner() service.SessionCleaner {
 	return p.manager
 }
 
+// Manager returns the engine's WebSocket session manager for cross-provider
+// wiring. It duck-types service.SessionCleaner (via its DeleteByUser
+// method), so it can be wired into service.MultiSessionCleaner exactly like
+// SessionStore() is - see cmd/server/main.go. Unlike SessionStore(), which
+// only ever purges the persisted SessionData bookkeeping record, the
+// Manager itself closes the live *websocket.Conn* for the deleted user
+// (#393).
+func (p *EngineProvider) Manager() *wsengine.Manager {
+	return p.manager
+}
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
@@ -446,6 +514,18 @@ func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate
 	return tokengate.New(store.Users()), store, nil
 }
 
+// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its
+// handshake honors revocation (both per-jti and per-user) the same way the
+// HTTP auth middlewares do - see wsengine.TokenBlacklistChecker's doc
+// comment for exactly what this covers versus what a shared
+// *tokenvalidator.Validator (see SetTokenValidator) already checks on its
+// own (#391 review, round 2: the engine's own token validation was found to
+// bypass revocation entirely on the legacy path, and user-level revocation
+// even on the go-tokenauth path).
+func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
+	p.manager.SetTokenBlacklist(b)
+}
+
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
@@ -471,6 +551,22 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 		return fmt.Errorf("engine manager not healthy")
 	}
 	return nil
+}
+
+// blacklistRevocationChecker adapts *service.TokenBlacklist to
+// go-tokenauth's revocation.Checker interface (IsRevoked vs. the service
+// package's own IsBlacklisted method name), so a token revoked via
+// Logout/DeleteUser (#382/#383) is honored for AS-issued (and legacy)
+// tokens validated through go-tokenauth's Validator - the path taken
+// whenever AS is enabled - not only for tokens validated through the
+// standalone legacy path (middleware.AuthMiddlewareWithBlacklist).
+type blacklistRevocationChecker struct {
+	blacklist *service.TokenBlacklist
+}
+
+// IsRevoked implements revocation.Checker.
+func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
+	return c.blacklist.IsBlacklisted(ctx, jti)
 }
 
 // =============================================================================
@@ -539,25 +635,44 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
+	// Auth provider is constructed before the AS module and storage provider
+	// below so its Services.TokenBlacklist (created, and Start()-ed, right
+	// here) can be handed to both of them instead of each building its own,
+	// unshared instance - see #382/#383: a token blacklisted via Logout or
+	// DeleteUser (both served by authProvider.handlers) must be honored by
+	// every request path in this process, not only the one that happened to
+	// construct the blacklist it was written to.
+	authProvider := NewAuthProvider(cfg, store, logger, roles)
+
 	// Initialize AS module when enabled.
 	var asModule *as.ASModule
 	var tv *tokenvalidator.Validator
 	if cfg.AS.Enabled {
 		services := service.NewServices(store, cfg, logger)
+		services.TokenBlacklist = authProvider.services.TokenBlacklist
 		asModule, err = as.NewASModule(
 			context.Background(),
 			&cfg.AS,
 			&cfg.JWT,
 			services.WebAuthn,
 			store,
+			services.TokenBlacklist,
+			// IdP-scoped client: the AS only talks to the operator's OIDC
+			// providers, which http_client.trusted_idp_hosts may place on
+			// private addresses (#349).
+			cfg.HTTPClient.NewIdPHTTPClient(0),
 			logger,
 		)
 		if err != nil {
+			if closeErr := authProvider.Close(); closeErr != nil {
+				logger.Error("Failed to close auth provider after AS module initialization failure", zap.Error(closeErr))
+			}
 			if closeErr := store.Close(); closeErr != nil {
 				logger.Error("Failed to close store after AS module initialization failure", zap.Error(closeErr))
 			}
 			return nil, fmt.Errorf("failed to initialize AS module: %w", err)
 		}
+		asModule.SetOIDCGateRateLimiter(authProvider.gateRateLimiter)
 
 		// Create go-tokenauth validator for protecting resource endpoints.
 		issuer := cfg.AS.Issuer
@@ -573,6 +688,14 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 				Enabled:    cfg.AS.Legacy.Enabled,
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
+			// Same blacklist as everything else in this process (#382/#383) -
+			// without this, AS-issued/legacy tokens validated through
+			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
+			// common case) would never consult the blacklist at all, since
+			// go-tokenauth's Validator has its own independent validation
+			// path that AuthMiddlewareWithBlacklist's check is never reached
+			// by.
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
@@ -581,10 +704,13 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		)
 	}
 
-	authProvider := NewAuthProvider(cfg, store, logger, roles)
 	authProvider.tokenValidator = tv
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
 	storageProvider.tokenValidator = tv
+	// Share the auth provider's blacklist instance (see the comment above
+	// authProvider's construction) rather than storageProvider's own,
+	// never-Start()-ed one.
+	storageProvider.services.TokenBlacklist = authProvider.services.TokenBlacklist
 
 	return &BackendProvider{
 		auth:             authProvider,
@@ -653,9 +779,10 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.Services().TokenBlacklist, p.logger)
 	}
-	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+	// See AuthProvider.authMiddleware's comment - same fix (#382).
+	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
 }
 
 // Close shuts down the backend provider
@@ -723,6 +850,7 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 		// Admin status changes share the self-service cascade (SID-AUTH-06).
 		adminHandlers.SetLifecycle(svcs.WalletLifecycle)
 	}
+	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 
 	// Cache management endpoint — useful in test environments where the
@@ -829,6 +957,7 @@ func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 		lifecycle.SetSessionCleaner(p.sessionCleaner)
 	}
 	adminHandlers.SetLifecycle(lifecycle)
+	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 }
 
@@ -1016,6 +1145,10 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 				Enabled:    cfg.AS.Legacy.Enabled,
 				HMACSecret: []byte(cfg.JWT.Secret),
 			},
+			// See NewBackendProvider's identical wiring (#382/#383). This
+			// provider's own services.TokenBlacklist is fine used as-is here:
+			// it never runs co-hosted with BackendProvider (see cmd/server).
+			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
 	}
@@ -1039,9 +1172,13 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.logger)
+		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.store.Users(), p.services.TokenBlacklist, p.logger)
 	}
-	return middleware.AuthMiddleware(p.cfg, p.store, p.logger)
+	// See AuthProvider.authMiddleware's comment - same fix (#382). This
+	// provider never runs co-hosted with BackendProvider (see cmd/server -
+	// it's only ever constructed standalone), so its own Services.
+	// TokenBlacklist is fine used as-is.
+	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
 }
 
 func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {

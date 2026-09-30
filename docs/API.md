@@ -47,49 +47,10 @@ Health check endpoint.
 
 ### User Management
 
-#### POST /user/register
+#### POST /user/register and POST /user/login
 
-Register a new user.
-
-**Request:**
-```json
-{
-  "username": "alice",
-  "display_name": "Alice Smith",
-  "password": "secret123",
-  "wallet_type": "db"
-}
-```
-
-**Response:**
-```json
-{
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "did": "did:key:550e8400-e29b-41d4-a716-446655440000",
-  "display_name": "Alice Smith"
-}
-```
-
-#### POST /user/login
-
-Login with username and password.
-
-**Request:**
-```json
-{
-  "username": "alice",
-  "password": "secret123"
-}
-```
-
-**Response:**
-```json
-{
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "display_name": "Alice Smith"
-}
-```
+Removed. Password authentication no longer exists; both endpoints return
+HTTP 410 Gone. Use the WebAuthn endpoints below.
 
 #### POST /user/webauthn/register/start
 

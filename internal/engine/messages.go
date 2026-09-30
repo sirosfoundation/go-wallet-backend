@@ -212,8 +212,34 @@ type HandshakeMessage struct {
 // HandshakeCompleteMessage is sent by server on successful authentication
 type HandshakeCompleteMessage struct {
 	Message
-	SessionID    string   `json:"session_id"`
-	Capabilities []string `json:"capabilities"`
+	SessionID    string        `json:"session_id"`
+	Capabilities []string      `json:"capabilities"`
+	Config       SessionConfig `json:"config"`
+}
+
+// SessionConfig carries server-controlled tunables the client should adopt,
+// delivered via HandshakeCompleteMessage right after authentication succeeds.
+// This is deliberately the seed of a general post-auth config/capability
+// handshake rather than a one-off field: anywhere the client would
+// otherwise have to hardcode a value that only works if it happens to match
+// what the server independently assumes, that value belongs here instead -
+// PingIntervalMs is just the first case (see its own doc comment for why it
+// specifically had to stop being independently guessed by each side).
+// Add new fields as zero-value-safe (a client on an older SDK release
+// ignores fields it doesn't know about; a client talking to an older server
+// that never sends a given field sees its zero value and should fall back
+// to its own hardcoded default).
+type SessionConfig struct {
+	// PingIntervalMs is how often the CLIENT should send its own WebSocket
+	// ping frames, in milliseconds - mirrors the server's own keepalive
+	// cadence (config.ServerConfig.EngineWSPingInterval) so neither side has
+	// to independently guess a value low enough to satisfy whatever
+	// intermediary (Fly.io's edge proxy, in production - see that config
+	// field's doc comment) would otherwise consider the connection idle and
+	// close it. A client that has never received this (e.g. its very first
+	// connection, before any handshake has completed) should use its own
+	// conservative hardcoded default rather than wait for it.
+	PingIntervalMs int64 `json:"ping_interval_ms"`
 }
 
 // FlowStartMessage initiates a credential flow
@@ -473,6 +499,11 @@ type SignRequestParams struct {
 	DPoPNonce string `json:"dpop_nonce,omitempty"`
 	ATH       string `json:"ath,omitempty"`
 	KeyID     string `json:"key_id,omitempty"`
+	// AttestationChallenge, when set, is a server-provided challenge the client
+	// MUST include as the `challenge` claim of the Client Attestation PoP JWT
+	// (draft-ietf-oauth-attestation-based-client-auth). Set after an AS rejects
+	// a PAR/token request with `use_attestation_challenge`.
+	AttestationChallenge string `json:"attestation_challenge,omitempty"`
 }
 
 // CredentialRef references a credential for signing
@@ -626,7 +657,27 @@ const (
 // The frontend should call POST /v1/evaluate with this data and return the result.
 // For DID schemes, the frontend should first call /v1/resolve to get the DID document.
 type TrustEvaluationRequest struct {
-	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer URL for issuers)
+	// SubjectID is the identifier to evaluate (client_id for verifiers, issuer
+	// URL for issuers). This is what /v1/evaluate sees, and it always
+	// matches the identifier the server-side PDP path evaluates too
+	// (evaluateVerifierTrustViaPDP and evaluateVerifierTrustViaFrontend both
+	// build it via oid4vp.go's pdpSubjectID) - a no-PDP and a PDP-backed
+	// flow must evaluate the identical subject.
+	//
+	// For most schemes this is exactly the wire-form client_id, including
+	// OpenID4VP 1.0's decentralized_identifier: prefix when the verifier
+	// used it (per docs/client-id-strategy.md, that prefix is stripped for
+	// resolution only, never for evaluation - see ResolutionSubjectID below
+	// for the different identifier /v1/resolve needs instead).
+	//
+	// For x509_san_dns/x509_san_uri/x509_hash specifically, SubjectID always
+	// carries that scheme's own "<scheme>:" prefix too, even when the wire
+	// form presented client_id_scheme as a separate field with a bare
+	// client_id - go-trust's ParseClientIDScheme/VerifyLeafBinding (its
+	// certificate-binding check) only fire when the prefix is present on
+	// Subject.ID itself, regardless of which wire form the request arrived
+	// in (see pdpSubjectID's doc comment in oid4vp.go for the full
+	// go-trust-side contract this was fixed to satisfy, and #404).
 	SubjectID string `json:"subject_id"`
 	// SubjectType is "credential_verifier" or "credential_issuer"
 	SubjectType string `json:"subject_type"`
@@ -636,6 +687,15 @@ type TrustEvaluationRequest struct {
 	// RequiresResolution indicates the frontend should call /v1/resolve first.
 	// Set to true for DID schemes where key material must be resolved from DID document.
 	RequiresResolution bool `json:"requires_resolution,omitempty"`
+	// ResolutionSubjectID is the identifier the frontend should resolve via
+	// /v1/resolve when RequiresResolution is true: the bare DID, with any
+	// client_id_scheme prefix (e.g. decentralized_identifier:) already
+	// stripped. This is deliberately a separate field from SubjectID -
+	// /v1/resolve needs the bare DID, but /v1/evaluate needs the original,
+	// unstripped identifier (see SubjectID's doc comment above), and one
+	// field cannot serve both requirements at once. Empty whenever
+	// RequiresResolution is false.
+	ResolutionSubjectID string `json:"resolution_subject_id,omitempty"`
 	// RequestJWT is the signed request JWT for DID schemes.
 	// Frontend should verify this JWT using keys obtained from /v1/resolve.
 	RequestJWT string `json:"request_jwt,omitempty"`
@@ -653,9 +713,14 @@ func (r *TrustEvaluationRequest) Validate() error {
 		return fmt.Errorf("TrustEvaluationRequest: SubjectType must be %q or %q, got %q",
 			SubjectTypeCredentialIssuer, SubjectTypeCredentialVerifier, r.SubjectType)
 	}
-	// RequiresResolution requires RequestJWT for DID schemes
+	// RequiresResolution requires RequestJWT and ResolutionSubjectID: the
+	// frontend cannot call /v1/resolve at all without knowing what to
+	// resolve, or verify what it resolves against without the request JWT.
 	if r.RequiresResolution && r.RequestJWT == "" {
 		return errors.New("TrustEvaluationRequest: RequestJWT is required when RequiresResolution is true")
+	}
+	if r.RequiresResolution && r.ResolutionSubjectID == "" {
+		return errors.New("TrustEvaluationRequest: ResolutionSubjectID is required when RequiresResolution is true")
 	}
 	// Validate key material if provided
 	if r.KeyMaterial != nil {
@@ -695,7 +760,15 @@ func (km *TrustKeyMaterial) Validate() error {
 type TrustResultPayload struct {
 	// Trusted indicates whether the subject is trusted
 	Trusted bool `json:"trusted"`
-	// Name is the display name from trust evaluation
+	// Name is the display name from trust evaluation. Deprecated for
+	// verifier trust (#406): OID4VPHandler.evaluateVerifierTrustViaFrontend
+	// no longer overrides VerifierInfo.Name from this field - the wallet
+	// backend has no way to distinguish a frontend's own independently-
+	// verified display name from one it merely echoed back from the
+	// verifier's own unauthenticated client_metadata.client_name, so the
+	// displayed name is always the identifier the trust evaluation was
+	// actually about, consistent with the PDP-backed path (#398). Retained
+	// on the wire for backward compatibility and non-verifier callers.
 	Name string `json:"name,omitempty"`
 	// Logo is the logo URL from trust evaluation
 	Logo string `json:"logo,omitempty"`

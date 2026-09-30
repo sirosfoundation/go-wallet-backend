@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +32,7 @@ type Config struct {
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
+	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
@@ -206,6 +208,56 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	return c.DefaultTokenTTL
 }
 
+// DCQLConsentCheckMode selects how the engine treats a consent that does not
+// fit the DCQL query the backend sent to the client.
+type DCQLConsentCheckMode string
+
+const (
+	// DCQLConsentCheckOff performs no comparison.
+	DCQLConsentCheckOff DCQLConsentCheckMode = "off"
+	// DCQLConsentCheckWarn (the default) logs a structured warning naming the
+	// reason class and query id, and proceeds.
+	DCQLConsentCheckWarn DCQLConsentCheckMode = "warn"
+	// DCQLConsentCheckEnforce refuses the presentation before any signing:
+	// the verifier gets access_denied and the client a PRESENTATION_ERROR.
+	DCQLConsentCheckEnforce DCQLConsentCheckMode = "enforce"
+)
+
+// Effective returns the mode to apply, treating the zero value as the default.
+func (m DCQLConsentCheckMode) Effective() DCQLConsentCheckMode {
+	if m == "" {
+		return DCQLConsentCheckWarn
+	}
+	return m
+}
+
+func (m DCQLConsentCheckMode) validate() error {
+	switch m.Effective() {
+	case DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce:
+		return nil
+	}
+	return fmt.Errorf("invalid presentation.dcql_consent_check %q: must be one of off, warn, enforce", string(m))
+}
+
+// PresentationConfig controls checks the engine applies to what the wallet is
+// about to present in an OpenID4VP flow.
+type PresentationConfig struct {
+	// DCQLConsentCheck compares the user's consent (selected credential query
+	// ids and disclosed claims) with the DCQL query the backend sent to the
+	// client, before any signing. The frontend is not trusted to have
+	// honoured the query. Values: `off` (no check);
+	// `warn` (default: log a warning with the reason class and query id, never
+	// refuse; claim-path matching can disagree with a real verifier's
+	// notion of a path, so a deployer opts into enforcement);
+	// `enforce` (refuse with PRESENTATION_ERROR and answer the verifier
+	// access_denied, without signing). Nothing about claim names or values is
+	// logged. Not enforced: credential_sets satisfaction (only that no query
+	// outside every option is selected), `values` constraints, and the
+	// contents of the resulting vp_token. Unknown values fail at startup.
+	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
+	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
+}
+
 // HTTPClientConfig contains HTTP client configuration for outbound requests
 type HTTPClientConfig struct {
 	// ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080)
@@ -231,6 +283,19 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
+	// providers that may resolve to private/loopback/link-local addresses.
+	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC
+	// discovery, token exchange and JWKS fetches), never to the client used
+	// for issuers, verifiers and other counterparties. Matching is by exact,
+	// case-insensitive hostname of every request, redirect hops and the
+	// token_endpoint/jwks_uri named by a discovery document included, so a
+	// discovery document cannot steer the request to an unlisted internal
+	// host. Cloud metadata endpoints stay blocked regardless.
+	// Only the wallet server's AS reads this setting; the registry has no
+	// identity-provider client and ignores it.
+	// Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated)
+	TrustedIdPHosts []string `yaml:"trusted_idp_hosts" envconfig:"TRUSTED_IDP_HOSTS"`
 }
 
 // NewHTTPClient creates an *http.Client from the configuration, applying proxy,
@@ -249,13 +314,10 @@ type HTTPClientConfig struct {
 //     cannot be downgraded to a network any observer on the path can read or
 //     rewrite.
 //
-// Both guards reach only what is fetched through this client. One production
-// path builds its own and is governed by neither:
-//
-//   - internal/as's OIDC discovery and token exchange, which construct a bare
-//     http.Client, so neither the address nor the scheme policy applies.
-//     Bringing it under this configuration is separate work: it would change
-//     which IdP addresses an existing deployment can reach.
+// Both guards reach only what is fetched through this client. internal/as's
+// OIDC discovery and token exchange use NewIdPHTTPClient, which applies the
+// same policy but lets the operator's TrustedIdPHosts sit on private
+// addresses.
 //
 // internal/service.HelperService.GetCertificateChain also dials TLS directly
 // rather than through an http.Client (it reads a certificate chain off a
@@ -269,6 +331,33 @@ type HTTPClientConfig struct {
 // address this process never saw. A deployment that relies on an egress proxy
 // should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
+	return c.newHTTPClient(timeoutOverride, nil)
+}
+
+// NewIdPHTTPClient is NewHTTPClient for talking to the operator's OIDC
+// identity providers: the same address and scheme policy, except that the
+// hostnames in TrustedIdPHosts may resolve to private addresses. Use it for
+// the AS's OIDC discovery, token exchange and JWKS fetches, and nothing that
+// dials a host a counterparty chose.
+func (c HTTPClientConfig) NewIdPHTTPClient(timeoutOverride time.Duration) *http.Client {
+	return c.newHTTPClient(timeoutOverride, c.trustedIdPHostSet())
+}
+
+// trustedIdPHostSet returns TrustedIdPHosts as a lowercase set, or nil.
+func (c HTTPClientConfig) trustedIdPHostSet() map[string]struct{} {
+	if len(c.TrustedIdPHosts) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(c.TrustedIdPHosts))
+	for _, h := range c.TrustedIdPHosts {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			set[h] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHosts map[string]struct{}) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -297,12 +386,13 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext)
+		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
 		roundTripper = ssrfGuard{
 			base:      transport,
 			proxy:     transport.Proxy,
 			lookup:    defaultLookupIP,
 			httpsOnly: !c.AllowsPlaintext(),
+			trusted:   trustedHosts,
 		}
 	}
 
@@ -328,7 +418,7 @@ func (c HTTPClientConfig) GuardedDialContext() func(ctx context.Context, network
 	if c.AllowPrivateIPs {
 		return baseDialer.DialContext
 	}
-	return guardedDial(defaultLookupIP, baseDialer.DialContext)
+	return guardedDial(defaultLookupIP, baseDialer.DialContext, nil)
 }
 
 // AllowsPlaintext reports whether this configuration permits non-TLS (plain
@@ -369,7 +459,10 @@ func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
 // public address for the check and an internal one a moment later for the
 // connection, and the guard above would have inspected an address that is
 // never dialled.
-func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
+//
+// trusted names hosts (lowercase) that may resolve to private ranges; see
+// HTTPClientConfig.TrustedIdPHosts. The metadata endpoints stay blocked.
+func guardedDial(lookup lookupFunc, dial dialFunc, trusted map[string]struct{}) dialFunc {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -379,7 +472,7 @@ func guardedDial(lookup lookupFunc, dial dialFunc) dialFunc {
 		if err != nil {
 			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 		}
-		if err := checkAddresses(host, ips); err != nil {
+		if err := checkAddressesFor(host, ips, trusted); err != nil {
 			return nil, err
 		}
 
@@ -505,6 +598,14 @@ func matchesNetwork(network string, ip net.IP) bool {
 // deployment's own network, and the cloud metadata endpoints named separately
 // so the refusal says which rule was hit.
 func checkAddresses(host string, ips []net.IP) error {
+	return checkAddressesFor(host, ips, nil)
+}
+
+// checkAddressesFor is checkAddresses, except that a host in trusted is
+// allowed private, loopback and link-local addresses. Cloud metadata
+// endpoints and unspecified addresses are refused for every host.
+func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) error {
+	_, isTrusted := trusted[strings.ToLower(host)]
 	if len(ips) == 0 {
 		return fmt.Errorf("no addresses found for %s", host)
 	}
@@ -514,7 +615,7 @@ func checkAddresses(host string, ips []net.IP) error {
 		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
 		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
@@ -548,6 +649,7 @@ type ssrfGuard struct {
 	proxy     func(*http.Request) (*url.URL, error)
 	lookup    lookupFunc
 	httpsOnly bool
+	trusted   map[string]struct{}
 }
 
 func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -569,7 +671,7 @@ func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DNS lookup failed for %s: %w", host, err)
 		}
-		if err := checkAddresses(host, ips); err != nil {
+		if err := checkAddressesFor(host, ips, g.trusted); err != nil {
 			return nil, err
 		}
 	}
@@ -590,19 +692,52 @@ func (g ssrfGuard) proxied(req *http.Request) bool {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host           string `yaml:"host" envconfig:"HOST"`
-	Port           int    `yaml:"port" envconfig:"PORT"`
-	AdminHost      string `yaml:"admin_host" envconfig:"ADMIN_HOST"`             // Admin API bind address (defaults to Host)
-	AdminPort      int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`             // Internal admin API port (0 to disable)
-	EngineHost     string `yaml:"engine_host" envconfig:"ENGINE_HOST"`           // WebSocket engine bind address (defaults to Host)
-	EnginePort     int    `yaml:"engine_port" envconfig:"ENGINE_PORT"`           // WebSocket engine port (defaults to Port if 0)
-	RegistryHost   string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
-	RegistryPort   int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
-	WPHost         string `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
-	WPPort         int    `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
-	AdminToken     string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
-	AdminTokenPath string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
-	RPID           string `yaml:"rp_id" envconfig:"RP_ID"`
+	Host       string `yaml:"host" envconfig:"HOST"`
+	Port       int    `yaml:"port" envconfig:"PORT"`
+	AdminHost  string `yaml:"admin_host" envconfig:"ADMIN_HOST"`   // Admin API bind address (defaults to Host)
+	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
+	EngineHost string `yaml:"engine_host" envconfig:"ENGINE_HOST"` // WebSocket engine bind address (defaults to Host)
+	EnginePort int    `yaml:"engine_port" envconfig:"ENGINE_PORT"` // WebSocket engine port (defaults to Port if 0)
+	// TrustedProxies lists the proxy addresses or CIDRs whose X-Forwarded-For
+	// (and X-Real-IP) headers are believed when determining the client IP,
+	// which the per-IP rate limits depend on. Use ["none"] to trust no proxy
+	// (the client IP is then the TCP peer, which is right when clients connect
+	// directly).
+	// BACKWARDS COMPATIBILITY: when unset, gin's original behaviour is kept and
+	// every peer is trusted. That lets any direct caller choose its own client
+	// IP by sending X-Forwarded-For, so the per-IP limits can be bypassed (the
+	// per-tenant limit still holds), and a warning is logged at startup while
+	// per-IP limiting is enabled. It stays the default so an upgrade does not
+	// put every client behind a load balancer into one rate-limit bucket.
+	// Production deployments should set this: to the load balancer's addresses
+	// behind one, or ["none"] without one.
+	// Env: WALLET_SERVER_TRUSTED_PROXIES (comma-separated)
+	TrustedProxies []string `yaml:"trusted_proxies" envconfig:"TRUSTED_PROXIES"`
+	// EngineWSPingInterval is how often the server sends a WebSocket ping to
+	// the client, and (via HandshakeCompleteMessage.Config) the interval the
+	// client is told to use for its own pings - see that message's doc
+	// comment for why both directions need to agree on this rather than
+	// each hardcoding its own guess. Defaults to 3s: found empirically (raw
+	// idle-TLS-connection tests against production Fly.io apps, not
+	// documentation - Fly's own docs don't state a number) that Fly.io's
+	// edge closes a connection with no traffic on it after ~5-6s, far
+	// sooner than the 30s this used to be hardcoded to, which is why every
+	// engine WebSocket on Fly was silently reconnecting every few seconds.
+	// Deployments behind a more permissive proxy/LB can raise this.
+	EngineWSPingInterval time.Duration `yaml:"engine_ws_ping_interval" envconfig:"ENGINE_WS_PING_INTERVAL"`
+	// EngineWSPongTimeout is how long the server waits for a pong after
+	// sending a ping before treating the connection as dead. Unlike
+	// EngineWSPingInterval, this doesn't need to be short to keep an
+	// intermediary from seeing the connection go idle - the ping itself is
+	// what does that - so it stays generous.
+	EngineWSPongTimeout time.Duration `yaml:"engine_ws_pong_timeout" envconfig:"ENGINE_WS_PONG_TIMEOUT"`
+	RegistryHost        string        `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
+	RegistryPort        int           `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	WPHost              string        `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
+	WPPort              int           `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
+	AdminToken          string        `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
+	AdminTokenPath      string        `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
+	RPID                string        `yaml:"rp_id" envconfig:"RP_ID"`
 	// RPOrigin is the legacy single-origin setting. Kept for backward compatibility.
 	// New deployments should use RPOrigins. When both are set, RPOrigin is prepended.
 	RPOrigin  string   `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
@@ -1108,6 +1243,21 @@ type TrustConfig struct {
 	// TLS certificate. Set this when the PDP is signed by an internal/private CA.
 	CACertPath string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 
+	// CacheDisabled turns the engine's in-memory verifier trust cache off, so
+	// every flow asks the PDP again.
+	//
+	// For testing, not for production. A trust decision - including a denial -
+	// is otherwise reused for CacheTTLSeconds, which makes iterating on trust
+	// configuration nearly impossible: fix the whitelist or the keys, redeploy
+	// the PDP, retry, and the wallet is still refused by a cached answer, with
+	// nothing in any log to say the answer was stale. It also means a PDP that
+	// is briefly unreachable takes a verifier down for the rest of the TTL.
+	CacheDisabled bool `yaml:"cache_disabled" envconfig:"CACHE_DISABLED"`
+
+	// CacheTTLSeconds is how long a verifier trust decision is reused.
+	// Zero selects the default of one hour. Ignored when CacheDisabled.
+	CacheTTLSeconds int `yaml:"cache_ttl_seconds" envconfig:"CACHE_TTL_SECONDS"`
+
 	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
 	// When not set, inherits the global trust configuration.
 	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
@@ -1115,6 +1265,38 @@ type TrustConfig struct {
 	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
 	// When not set, inherits the global trust configuration.
 	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
+}
+
+// DefaultTrustCacheTTL is how long a verifier trust decision is reused when
+// TrustConfig.CacheTTLSeconds says nothing.
+const DefaultTrustCacheTTL = time.Hour
+
+// MaxTrustCacheTTLSeconds is the largest CacheTTLSeconds that survives the
+// conversion to a time.Duration, which counts nanoseconds in an int64 - about
+// 292 years. Anything larger wraps to a negative duration, which the cache
+// reads as "off", so a number meant to say "cache for a very long time" would
+// silently mean the opposite. Config.Validate refuses those.
+const MaxTrustCacheTTLSeconds = int(math.MaxInt64 / int64(time.Second))
+
+// VerifierCacheTTL is how long the engine may reuse a verifier trust decision.
+//
+// Zero means "do not cache at all", which is what CacheDisabled selects; the
+// engine's cache treats a non-positive TTL as off rather than as an instantly
+// expiring entry, so there is one meaning for the value and one place that
+// decides it.
+//
+// A negative CacheTTLSeconds reads as the default here, but Config.Validate
+// refuses it before a process gets this far: it is the one value whose intent
+// ("off") differs from what this returns, so it is rejected at startup rather
+// than guessed at.
+func (t TrustConfig) VerifierCacheTTL() time.Duration {
+	if t.CacheDisabled {
+		return 0
+	}
+	if t.CacheTTLSeconds > 0 {
+		return time.Duration(t.CacheTTLSeconds) * time.Second
+	}
+	return DefaultTrustCacheTTL
 }
 
 // NewPDPHTTPClient creates an *http.Client for use with operator-configured PDP endpoints.
@@ -1297,6 +1479,11 @@ type SecurityConfig struct {
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
+	// OIDCGateRateLimit limits requests that present a token to the OIDC
+	// registration/login gates (#65). Two independent buckets: per client IP
+	// and per tenant; a request must fit in both.
+	OIDCGateRateLimit OIDCGateRateLimitConfig `yaml:"oidc_gate_rate_limit" envconfig:"OIDC_GATE_RATE_LIMIT"`
+
 	// AAGUIDBlacklist contains AAGUID blacklist configuration for WebAuthn
 	AAGUIDBlacklist AAGUIDBlacklistConfig `yaml:"aaguid_blacklist" envconfig:"AAGUID_BLACKLIST"`
 
@@ -1346,6 +1533,57 @@ type AuthRateLimitConfig struct {
 
 	// LockoutSeconds is how long to lock out after exceeding the limit
 	// Default: 300 (5 minutes)
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// OIDCGateRateLimitConfig configures rate limiting in front of the OIDC gates.
+//
+// Token validation is the expensive part of a gated request (discovery and
+// JWKS fetches, signature checks), so the limiter runs before it. It only
+// counts requests that carry a bearer token, so tenants without a gate are
+// unaffected. A failed validation costs the client extra tokens (three in
+// total instead of one), so guessing is dearer than valid use.
+//
+// Two buckets, because either alone fails badly: per-IP alone lets one
+// tenant's attackers lock out everyone behind a shared NAT; per-tenant alone
+// lets a single client exhaust a whole tenant. Client-IP keying relies on
+// gin's trusted-proxy handling being correct behind a load balancer.
+type OIDCGateRateLimitConfig struct {
+	// PerIP limits by client IP.
+	PerIP OIDCGateIPLimitConfig `yaml:"per_ip" envconfig:"PER_IP"`
+	// PerTenant limits by tenant.
+	PerTenant OIDCGateTenantLimitConfig `yaml:"per_tenant" envconfig:"PER_TENANT"`
+}
+
+// OIDCGateIPLimitConfig is the per-client-IP bucket of the OIDC gate limiter.
+// It has the same shape as AuthRateLimitConfig but its own documentation and
+// defaults; convert with AuthRateLimitConfig(c).
+type OIDCGateIPLimitConfig struct {
+	// Enabled controls whether the per-IP limit is active. Default: true
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// MaxAttempts is the number of token-bearing gate requests one client IP
+	// may make per window. Default: 30
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+	// WindowSeconds is the rate-limit window in seconds. Default: 60
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+	// LockoutSeconds is how long a client IP is refused after exceeding the
+	// limit, and the Retry-After it is sent. Default: 60
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// OIDCGateTenantLimitConfig is the per-tenant bucket of the OIDC gate limiter.
+// It has the same shape as AuthRateLimitConfig but its own documentation and
+// defaults; convert with AuthRateLimitConfig(c).
+type OIDCGateTenantLimitConfig struct {
+	// Enabled controls whether the per-tenant limit is active. Default: true
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// MaxAttempts is the number of token-bearing gate requests one tenant
+	// may receive per window, across all clients. Default: 300
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+	// WindowSeconds is the rate-limit window in seconds. Default: 60
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+	// LockoutSeconds is how long a tenant is refused after exceeding the
+	// limit, and the Retry-After it is sent. Default: 60
 	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
 }
 
@@ -1576,16 +1814,19 @@ func defaultConfig() *Config {
 
 	return &Config{
 		Server: ServerConfig{
-			Host:         "0.0.0.0",
-			Port:         8080,
-			AdminPort:    8081, // Internal admin API port
-			EnginePort:   8082, // WebSocket engine port
-			RegistryPort: 8097, // VCTM registry port
-			RPID:         "localhost",
-			RPOrigin:     "http://localhost:8080",
-			RPOrigins:    nil,
-			RPName:       "Wallet Backend",
-			CORS:         corsConfig,
+			Host:       "0.0.0.0",
+			Port:       8080,
+			AdminPort:  8081, // Internal admin API port
+			EnginePort: 8082, // WebSocket engine port
+			// See EngineWSPingInterval's doc comment for where 3s/5s come from.
+			EngineWSPingInterval: 3 * time.Second,
+			EngineWSPongTimeout:  5 * time.Second,
+			RegistryPort:         8097, // VCTM registry port
+			RPID:                 "localhost",
+			RPOrigin:             "http://localhost:8080",
+			RPOrigins:            nil,
+			RPName:               "Wallet Backend",
+			CORS:                 corsConfig,
 		},
 		Storage: StorageConfig{
 			Type: "memory",
@@ -1630,6 +1871,10 @@ func defaultConfig() *Config {
 				WindowSeconds:  60,
 				LockoutSeconds: 300,
 			},
+			OIDCGateRateLimit: OIDCGateRateLimitConfig{
+				PerIP:     OIDCGateIPLimitConfig{Enabled: true, MaxAttempts: 30, WindowSeconds: 60, LockoutSeconds: 60},
+				PerTenant: OIDCGateTenantLimitConfig{Enabled: true, MaxAttempts: 300, WindowSeconds: 60, LockoutSeconds: 60},
+			},
 			AAGUIDBlacklist: AAGUIDBlacklistConfig{
 				Enabled:       false, // Disabled by default
 				AAGUIDs:       []string{},
@@ -1654,6 +1899,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
+		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -1693,10 +1939,34 @@ func defaultConfig() *Config {
 	}
 }
 
+// validateTrustedProxies rejects entries that are neither an IP, a CIDR nor
+// the literal "none", so a typo fails at startup instead of at first request.
+func (c ServerConfig) validateTrustedProxies() error {
+	for _, p := range c.TrustedProxies {
+		p = strings.TrimSpace(p)
+		if strings.EqualFold(p, "none") {
+			if len(c.TrustedProxies) != 1 {
+				return fmt.Errorf("server.trusted_proxies: \"none\" cannot be combined with other entries")
+			}
+			continue
+		}
+		if net.ParseIP(p) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("server.trusted_proxies: %q is not an IP address, CIDR or \"none\"", p)
+		}
+	}
+	return nil
+}
+
 // Validate validates the configuration
 func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
+	}
+	if err := c.Server.validateTrustedProxies(); err != nil {
+		return err
 	}
 
 	// Validate wallet-provider port when explicitly configured
@@ -1714,6 +1984,28 @@ func (c *Config) Validate() error {
 
 	if c.Server.RPID == "" {
 		return fmt.Errorf("rp_id is required")
+	}
+
+	// Sub-millisecond values are silently unrepresentable on the wire:
+	// HandshakeCompleteMessage.Config reports PingIntervalMs via
+	// time.Duration.Milliseconds(), which truncates a positive
+	// sub-millisecond duration to 0 - the client would then see "unset"
+	// and fall back to its own hardcoded default while the server keeps
+	// pinging at the (much faster) configured cadence, exactly the
+	// client/server disagreement this whole mechanism exists to prevent.
+	// 0 itself is the legitimate "use the default" sentinel (see
+	// Manager.wsKeepalive) and is not rejected here.
+	if c.Server.EngineWSPingInterval != 0 && c.Server.EngineWSPingInterval < time.Millisecond {
+		return fmt.Errorf(
+			"server.engine_ws_ping_interval must be at least 1ms (or 0 to use the default) - got %s",
+			c.Server.EngineWSPingInterval,
+		)
+	}
+	if c.Server.EngineWSPongTimeout != 0 && c.Server.EngineWSPongTimeout < time.Millisecond {
+		return fmt.Errorf(
+			"server.engine_ws_pong_timeout must be at least 1ms (or 0 to use the default) - got %s",
+			c.Server.EngineWSPongTimeout,
+		)
 	}
 
 	if len(c.Server.GetRPOrigins()) == 0 {
@@ -1905,10 +2197,20 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
+		return err
+	}
+
 	// Validate audit configuration — without this, cfg.Audit.Enabled=true
 	// with a missing issuer/key_path/key_id silently disables the SET audit
 	// emitter at startup (NewFromConfig just returns nil) instead of failing
 	// fast on the actual misconfiguration.
+	if err := c.Audit.validateIdentityEvents(); err != nil {
+		return err
+	}
+	if len(c.Audit.IdentityEvents) > 0 && !c.Audit.Enabled {
+		return fmt.Errorf("audit.identity_events requires audit.enabled")
+	}
 	if c.Audit.Enabled {
 		if c.Audit.Issuer == "" {
 			return fmt.Errorf("audit.issuer is required when audit is enabled")
@@ -1919,6 +2221,24 @@ func (c *Config) Validate() error {
 		if c.Audit.KeyID == "" {
 			return fmt.Errorf("audit.key_id is required when audit is enabled")
 		}
+	}
+
+	// A negative TTL is refused rather than quietly rounded up to the
+	// default. Someone who writes -1 here means "off", and silently giving
+	// them an hour of cached trust decisions is the exact failure this
+	// setting exists to cure: an answer that is not what the operator asked
+	// for, with nothing anywhere saying so. trust.cache_disabled is the way
+	// to say off.
+	if c.Trust.CacheTTLSeconds < 0 {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not be negative (set trust.cache_disabled to turn the cache off)", c.Trust.CacheTTLSeconds)
+	}
+	// And not so large that it wraps. A value past the int64 nanosecond
+	// range becomes a negative duration, which the cache reads as "off" -
+	// so without this, a number meant to cache for centuries would disable
+	// caching instead, which is the same silent inversion as the negative
+	// case above.
+	if c.Trust.CacheTTLSeconds > MaxTrustCacheTTLSeconds {
+		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not exceed %d (a larger value overflows time.Duration and would silently disable the cache)", c.Trust.CacheTTLSeconds, MaxTrustCacheTTLSeconds)
 	}
 
 	return nil
@@ -1988,4 +2308,53 @@ type AuditConfig struct {
 	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
 	// KeyID is the kid used in SET JWS headers.
 	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
+	// IdentityEvents selects which enterprise-identity (OIDC gate) audit events
+	// are emitted, by short name: bound, verified, mismatch, gate_bypass.
+	// Default: none. Requires enabled. The subject is only ever emitted as a
+	// hash. Unknown names are rejected at startup.
+	// Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated)
+	IdentityEvents []string `yaml:"identity_events" envconfig:"IDENTITY_EVENTS"`
+}
+
+// Names accepted in AuditConfig.IdentityEvents.
+const (
+	// AuditIdentityBound: an OIDC identity was bound to a wallet at registration.
+	AuditIdentityBound = "bound"
+	// AuditIdentityVerified: a bound identity was verified at login.
+	AuditIdentityVerified = "verified"
+	// AuditIdentityMismatch: a login was refused because the presented identity,
+	// issuer, audience or required claims did not match.
+	AuditIdentityMismatch = "mismatch"
+	// AuditIdentityGateBypass: a login gate was required but no token was presented.
+	AuditIdentityGateBypass = "gate_bypass"
+)
+
+// validAuditIdentityEvents is the set of names IdentityEvents may contain.
+var validAuditIdentityEvents = map[string]struct{}{
+	AuditIdentityBound:      {},
+	AuditIdentityVerified:   {},
+	AuditIdentityMismatch:   {},
+	AuditIdentityGateBypass: {},
+}
+
+// IdentityEventEnabled reports whether the named identity event is selected.
+func (c AuditConfig) IdentityEventEnabled(name string) bool {
+	for _, e := range c.IdentityEvents {
+		if strings.EqualFold(strings.TrimSpace(e), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateIdentityEvents rejects unknown event names, so a typo cannot
+// silently leave an intended audit event switched off.
+func (c AuditConfig) validateIdentityEvents() error {
+	for _, e := range c.IdentityEvents {
+		name := strings.ToLower(strings.TrimSpace(e))
+		if _, ok := validAuditIdentityEvents[name]; !ok {
+			return fmt.Errorf("audit.identity_events: unknown event %q (valid: bound, verified, mismatch, gate_bypass)", e)
+		}
+	}
+	return nil
 }

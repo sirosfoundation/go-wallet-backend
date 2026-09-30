@@ -19,9 +19,17 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// TokenBlacklistChecker is an interface for checking if a token is blacklisted
+// TokenBlacklistChecker is an interface for checking if a token is
+// blacklisted, either individually by jti (e.g. an explicit logout) or in
+// bulk for every token belonging to a user (e.g. an account deletion, which
+// has no way to enumerate every jti it ever issued - see
+// TokenBlacklist.RevokeUser). Shared by both the legacy HMAC path
+// (AuthMiddlewareWithBlacklist) and the go-tokenauth path
+// (TokenAuthMiddleware), so a revocation is honored regardless of which
+// authenticated the request.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -38,6 +46,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			logAuthReject(logger, c, "missing_authorization_header")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -46,6 +55,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			logAuthReject(logger, c, "malformed_authorization_header")
 			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
 			c.Abort()
 			return
@@ -53,6 +63,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		providedToken := strings.TrimSpace(parts[1])
 		if providedToken == "" {
+			logAuthReject(logger, c, "empty_bearer_token")
 			c.JSON(401, gin.H{"error": "Token required"})
 			c.Abort()
 			return
@@ -60,7 +71,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		// Constant-time comparison to prevent timing attacks
 		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
-			logger.Warn("Invalid admin token attempt")
+			logAuthReject(logger, c, "invalid_admin_token")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -77,12 +88,27 @@ func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger)
 	return AuthMiddlewareWithBlacklist(cfg, store, nil, logger)
 }
 
+// logAuthReject records why a request was refused by an authentication
+// middleware. Rejections used to be visible only as a JSON body on the
+// client, which is unreachable when debugging wrapper apps or platforms
+// without client-side request logs (#301). Never pass the token itself.
+func logAuthReject(logger *zap.Logger, c *gin.Context, reason string, fields ...zap.Field) {
+	base := []zap.Field{
+		zap.String("reason", reason),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+		zap.String("client_ip", c.ClientIP()),
+	}
+	logger.Warn("Authentication rejected", append(base, fields...)...)
+}
+
 // AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
 func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	gate := tokengate.New(store.Users())
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			logAuthReject(logger, c, "missing_authorization_header")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -91,6 +117,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || parts[0] != "Bearer" {
+			logAuthReject(logger, c, "malformed_authorization_header")
 			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
 			c.Abort()
 			return
@@ -98,6 +125,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 
 		tokenString := strings.TrimSpace(parts[1])
 		if tokenString == "" {
+			logAuthReject(logger, c, "empty_bearer_token")
 			c.JSON(401, gin.H{"error": "Token required"})
 			c.Abort()
 			return
@@ -113,6 +141,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		})
 
 		if err != nil || !token.Valid {
+			logAuthReject(logger, c, "invalid_token", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -121,12 +150,28 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// Extract claims
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok {
+			logAuthReject(logger, c, "invalid_token_claims")
 			c.JSON(401, gin.H{"error": "Invalid token claims"})
 			c.Abort()
 			return
 		}
 
-		// Check if token is blacklisted (if blacklist is configured)
+		// Get user_id from claims
+		userID, ok := claims["user_id"].(string)
+		if !ok {
+			logAuthReject(logger, c, "missing_user_id_claim")
+			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
+			c.Abort()
+			return
+		}
+
+		// Check if the token is blacklisted (if a checker is configured) -
+		// either individually by jti (explicit logout) or in bulk for every
+		// token belonging to this user (account deletion - see
+		// TokenBlacklist.RevokeUser). Without this second check, deleting a
+		// user would only invalidate the one token used to request the
+		// deletion, leaving any other still-valid token for that user usable
+		// until it naturally expires (#383).
 		if blacklist != nil {
 			jti, _ := claims["jti"].(string)
 			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
@@ -137,14 +182,15 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				c.Abort()
 				return
 			}
-		}
 
-		// Get user_id from claims
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
-			c.Abort()
-			return
+			if blacklist.IsUserRevoked(c.Request.Context(), userID) {
+				logger.Warn("Token for revoked user used",
+					zap.String("user_id", userID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// SID-AUTH-06: refuse tokens issued before the user's wallet was

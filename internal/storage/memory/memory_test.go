@@ -3,6 +3,8 @@ package memory
 import (
 	"context"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,6 +353,217 @@ func TestUserStore_UpdatePrivateData(t *testing.T) {
 	err = users.UpdatePrivateData(ctx, user.UUID, newData, "")
 	if err != nil {
 		t.Fatalf("UpdatePrivateData() error = %v", err)
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_SetsFields covers the basic
+// happy path: SignCount is a plain overwrite, CloneWarning=true is set.
+func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true)
+	if err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if !transitioned {
+		t.Error("transitioned should be true: this call moved CloneWarning from false to true")
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 5 {
+		t.Errorf("SignCount = %d, want 5", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+	if !got.WebauthnCredentials[0].Authenticator.CloneWarning {
+		t.Error("CloneWarning should be true")
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly covers
+// the exact property PR #388's review demanded: this method must never
+// write CloneWarning=false over an existing true, no matter what value a
+// later call passes.
+func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// First call latches CloneWarning=true.
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true)
+	if err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if !transitioned {
+		t.Error("first call should report transitioned=true")
+	}
+
+	// A later call with cloneWarning=false (a clean, non-regressing login)
+	// must NOT clear it, and must not itself report a transition.
+	transitioned, err = users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	if err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	if transitioned {
+		t.Error("a call with cloneWarning=false must never report transitioned=true")
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if !got.WebauthnCredentials[0].Authenticator.CloneWarning {
+		t.Error("CloneWarning must stay true — a call with cloneWarning=false must never clear it")
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 10 {
+		t.Errorf("SignCount = %d, want 10 (SignCount itself is a plain overwrite)", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic covers a
+// review finding on PR #388: SignCount must never decrease, since two
+// concurrent logins can persist out of order (a higher counter landing
+// before a lower one from an earlier, slower request). An unconditional
+// overwrite would let the later, lower write regress the stored baseline.
+func TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if _, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+	// A lower counter arriving after must not decrease the stored baseline.
+	if _, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false); err != nil {
+		t.Fatalf("UpdateCredentialAuthenticator() error = %v", err)
+	}
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.WebauthnCredentials[0].Authenticator.SignCount != 20 {
+		t.Errorf("SignCount = %d, want 20 (a lower value must never decrease the stored counter)", got.WebauthnCredentials[0].Authenticator.SignCount)
+	}
+}
+
+func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	_, err := users.UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	if err != storage.ErrNotFound {
+		t.Errorf("expected ErrNotFound for a nonexistent user, got %v", err)
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound covers the
+// documented silent no-op case: the user exists, but no credential with the
+// given ID does. This matches MongoDB's arrayFilter semantics, which can't
+// distinguish "matched the document but zero array elements" from "document
+// not found" (see the interface doc comment) — must succeed with no error
+// and transitioned=false, not ErrNotFound.
+func TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "some-other-cred"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "nonexistent-cred", 1, true)
+	if err != nil {
+		t.Errorf("expected no error for an existing user with a nonexistent credential ID, got %v", err)
+	}
+	if transitioned {
+		t.Error("transitioned should be false when the credential ID doesn't exist")
+	}
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
+// the review finding that a caller-side "was this already latched" check
+// (computed from a separately-read snapshot) can let concurrent callers
+// duplicate a one-time side effect: many goroutines race to call
+// UpdateCredentialAuthenticator(cloneWarning=true) on the same credential,
+// and exactly one of them must see transitioned=true.
+func TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	users := store.Users()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			transitioned, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 1, true)
+			if err == nil && transitioned {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent calls to report transitioned=true, got %d", attempts, got)
 	}
 }
 
@@ -758,6 +971,234 @@ func TestChallengeStore_Delete(t *testing.T) {
 	_, err = challenges.GetByID(ctx, "challenge-delete")
 	if err != storage.ErrNotFound {
 		t.Error("Challenge should be deleted")
+	}
+}
+
+// TestChallengeStore_ConsumeByID verifies the atomic find-and-delete
+// primitive introduced to fix issue #379 (non-atomic challenge consumption):
+// a successful ConsumeByID returns the challenge and removes it.
+func TestChallengeStore_ConsumeByID(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "challenge-consume",
+		UserID:    "user-456",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	consumed, err := challenges.ConsumeByID(ctx, "challenge-consume")
+	if err != nil {
+		t.Fatalf("ConsumeByID() error = %v", err)
+	}
+	if consumed.Challenge != "random-challenge" {
+		t.Errorf("Challenge = %q, want %q", consumed.Challenge, "random-challenge")
+	}
+
+	// The challenge must be gone after a single consume.
+	if _, err := challenges.GetByID(ctx, "challenge-consume"); err != storage.ErrNotFound {
+		t.Error("challenge should have been deleted by ConsumeByID")
+	}
+}
+
+func TestChallengeStore_ConsumeByID_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByID(ctx, "nonexistent")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByID() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByIDForUser covers the atomic ownership-scoped
+// consume added for issue #379's FinishAddCredential fix: a matching userID
+// succeeds and removes the challenge; a mismatched userID gets ErrNotFound
+// and leaves the real owner's challenge untouched.
+func TestChallengeStore_ConsumeByIDForUser(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "add-cred-challenge",
+		UserID:    "user-owner",
+		Challenge: "random-challenge",
+		Action:    "add_credential",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mismatched userID: must fail, and must NOT consume the challenge.
+	if _, err := challenges.ConsumeByIDForUser(ctx, "add-cred-challenge", "user-attacker"); err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForUser() with wrong userID should return ErrNotFound, got %v", err)
+	}
+	if _, err := challenges.GetByID(ctx, "add-cred-challenge"); err != nil {
+		t.Errorf("challenge should survive a mismatched-owner attempt, GetByID() error = %v", err)
+	}
+
+	// Matching userID: must succeed and consume it.
+	consumed, err := challenges.ConsumeByIDForUser(ctx, "add-cred-challenge", "user-owner")
+	if err != nil {
+		t.Fatalf("ConsumeByIDForUser() error = %v", err)
+	}
+	if consumed.UserID != "user-owner" {
+		t.Errorf("consumed.UserID = %q, want user-owner", consumed.UserID)
+	}
+	if _, err := challenges.GetByID(ctx, "add-cred-challenge"); err != storage.ErrNotFound {
+		t.Error("challenge should be consumed after a matching-owner ConsumeByIDForUser")
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForUser_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByIDForUser(ctx, "nonexistent", "user-owner")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForUser() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByIDForTenant covers the atomic tenant-scoped
+// consume added when this branch was rebased onto main's #386 (tenant
+// mismatch must be checked as part of the same atomic consume, not after):
+// a matching tenant succeeds; a mismatched tenant gets ErrNotFound and
+// leaves the challenge untouched; an empty expectedTenantID behaves like
+// plain ConsumeByID (no constraint).
+func TestChallengeStore_ConsumeByIDForTenant(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "register-challenge",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mismatched tenant: must fail, and must NOT consume the challenge.
+	if _, err := challenges.ConsumeByIDForTenant(ctx, "register-challenge", "tenant-b"); err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForTenant() with wrong tenant should return ErrNotFound, got %v", err)
+	}
+	if _, err := challenges.GetByID(ctx, "register-challenge"); err != nil {
+		t.Errorf("challenge should survive a mismatched-tenant attempt, GetByID() error = %v", err)
+	}
+
+	// Matching tenant: must succeed and consume it.
+	consumed, err := challenges.ConsumeByIDForTenant(ctx, "register-challenge", "tenant-a")
+	if err != nil {
+		t.Fatalf("ConsumeByIDForTenant() error = %v", err)
+	}
+	if consumed.TenantID != "tenant-a" {
+		t.Errorf("consumed.TenantID = %q, want tenant-a", consumed.TenantID)
+	}
+	if _, err := challenges.GetByID(ctx, "register-challenge"); err != storage.ErrNotFound {
+		t.Error("challenge should be consumed after a matching-tenant ConsumeByIDForTenant")
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_EmptyExpectedTenantIDIsNoConstraint(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "global-challenge",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "random-challenge",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Empty expectedTenantID: no constraint, must succeed regardless of the
+	// challenge's actual tenant.
+	if _, err := challenges.ConsumeByIDForTenant(ctx, "global-challenge", ""); err != nil {
+		t.Errorf("ConsumeByIDForTenant() with empty expectedTenantID should succeed, got %v", err)
+	}
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_NotFound(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	_, err := challenges.ConsumeByIDForTenant(ctx, "nonexistent", "tenant-a")
+	if err != storage.ErrNotFound {
+		t.Errorf("ConsumeByIDForTenant() for nonexistent challenge should return ErrNotFound, got %v", err)
+	}
+}
+
+// TestChallengeStore_ConsumeByID_ConcurrentSingleWinner reproduces the W-2 /
+// issue #379 race directly against the storage layer: many goroutines race
+// to consume the exact same challenge ID concurrently. With the old
+// GetByID-then-Delete pattern every one of them could observe the challenge
+// before any deletion landed; ConsumeByID's single atomic operation must
+// ensure exactly one of them gets a non-nil challenge back.
+func TestChallengeStore_ConsumeByID_ConcurrentSingleWinner(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	challenges := store.Challenges()
+
+	const id = "race-challenge"
+	challenge := &domain.WebauthnChallenge{
+		ID:        id,
+		UserID:    "user-race",
+		Challenge: "random-challenge",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+	if err := challenges.Create(ctx, challenge); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if c, err := challenges.ConsumeByID(ctx, id); err == nil && c != nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent ConsumeByID calls to succeed, got %d", attempts, got)
+	}
+
+	// The challenge must not be consumable again afterwards.
+	if _, err := challenges.ConsumeByID(ctx, id); err != storage.ErrNotFound {
+		t.Errorf("challenge should already be consumed, ConsumeByID() error = %v", err)
 	}
 }
 
@@ -1875,6 +2316,102 @@ func TestChallengeStore_DeleteByUserID(t *testing.T) {
 	// user-B's challenge should remain
 	if _, err := challenges.GetByID(ctx, "c3"); err != nil {
 		t.Error("Challenge c3 should still exist")
+	}
+}
+
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner exercises the atomic
+// primitive that the W-1 / issue #378 fix in FinishRegistration relies on:
+// many goroutines race to claim the same single-use invite code via
+// MarkCompleted. Exactly one must win; every other caller must observe
+// storage.ErrNotFound (the invite is no longer "active"), which is what lets
+// the service reject a racing registration before it creates a user account.
+func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	invites := store.Invites()
+
+	const code = "RACE-CODE"
+	invite := &domain.Invite{
+		ID:        "invite-race",
+		TenantID:  domain.DefaultTenantID,
+		Code:      code,
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := invites.Create(ctx, invite); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	const attempts = 32
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for i := range attempts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			userID := domain.UserIDFromString("racer")
+			if err := invites.MarkCompleted(ctx, domain.DefaultTenantID, code, userID); err == nil {
+				successes.Add(1)
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := successes.Load(); got != 1 {
+		t.Errorf("expected exactly 1 of %d concurrent MarkCompleted calls to succeed, got %d", attempts, got)
+	}
+
+	got, err := invites.GetByID(ctx, "invite-race")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != domain.InviteStatusCompleted {
+		t.Errorf("invite status = %q, want %q", got.Status, domain.InviteStatusCompleted)
+	}
+}
+
+// TestInviteStore_MarkCompleted_ExpiredInviteRejected covers a review
+// finding on PR #388: MarkCompleted's atomic predicate only checked
+// Status == Active, not expiry. An invite that passed an earlier
+// IsUsable() check (status active AND not expired) could tick over its
+// expiry while a slow caller (e.g. WebAuthn verification) is still in
+// flight, and MarkCompleted would still succeed since expiry wasn't part
+// of the same atomic check. The expiry condition must be checked under
+// the same lock as the status check, not as a separate earlier read.
+func TestInviteStore_MarkCompleted_ExpiredInviteRejected(t *testing.T) {
+	ctx := t.Context()
+	store := NewStore()
+	invites := store.Invites()
+
+	invite := &domain.Invite{
+		ID:        "invite-expired",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "EXPIRED-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(-time.Minute), // active status, but expired
+	}
+	if err := invites.Create(ctx, invite); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	userID := domain.UserIDFromString("racer")
+	err := invites.MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID)
+	if err != storage.ErrNotFound {
+		t.Errorf("MarkCompleted() on an expired-but-active invite should return ErrNotFound, got %v", err)
+	}
+
+	// The invite must remain untouched — still active, not completed.
+	got, err := invites.GetByID(ctx, "invite-expired")
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if got.Status != domain.InviteStatusActive {
+		t.Errorf("invite status = %q, want %q (MarkCompleted must not have claimed an expired invite)", got.Status, domain.InviteStatusActive)
 	}
 }
 

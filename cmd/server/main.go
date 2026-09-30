@@ -188,6 +188,8 @@ func main() {
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+		serverCfg.TrustedProxies = backendCfg.Server.TrustedProxies
+		serverCfg.WarnUntrustedClientIP = backendCfg.Security.OIDCGateRateLimit.PerIP.Enabled
 	} else if registryCfg != nil {
 		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}
@@ -265,6 +267,13 @@ func main() {
 				resources = append(resources, closer)
 			}
 		}
+		// Wire the same token blacklist the HTTP auth middlewares use, so a
+		// revoked token (or a deleted user's other tokens) is rejected
+		// during the WebSocket handshake too, on both the go-tokenauth and
+		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
+		if backendProvider != nil {
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		}
 		mgr.AddProvider(provider)
 		engineProvider = provider
 	}
@@ -281,6 +290,10 @@ func main() {
 		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
 		if engineProvider != nil {
 			cleaners = append(cleaners, engineProvider.SessionCleaner())
+			// Account deletion (unlike wallet-instance revocation or "log
+			// out everywhere", which share the cleaner above) also bars the
+			// user from reconnecting to this engine at all (#393/#403).
+			backendProvider.Services().User.AddUserRevoker(engineProvider.Manager())
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
 		backendProvider.Services().WalletLifecycle.SetSessionCleaner(cleaners)

@@ -3,6 +3,8 @@ package domain
 import (
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 func TestNewUserID(t *testing.T) {
@@ -15,6 +17,26 @@ func TestNewUserID(t *testing.T) {
 
 	if id1.ID == id2.ID {
 		t.Error("NewUserID() should generate unique IDs")
+	}
+}
+
+func TestHolderDID(t *testing.T) {
+	tests := []struct {
+		name     string
+		userID   string
+		expected string
+	}{
+		{"uuid", "550e8400-e29b-41d4-a716-446655440000", "did:key:550e8400-e29b-41d4-a716-446655440000"},
+		{"simple id", "user-123", "did:key:user-123"},
+		{"empty", "", "did:key:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HolderDID(tt.userID); got != tt.expected {
+				t.Errorf("HolderDID(%q) = %q, want %q", tt.userID, got, tt.expected)
+			}
+		})
 	}
 }
 
@@ -137,17 +159,15 @@ func TestWalletType_Constants(t *testing.T) {
 func TestUser_Fields(t *testing.T) {
 	username := "testuser"
 	displayName := "Test User"
-	passwordHash := "hashedpassword"
 
 	user := User{
-		UUID:         NewUserID(),
-		Username:     &username,
-		DisplayName:  &displayName,
-		DID:          "did:key:test",
-		PasswordHash: &passwordHash,
-		WalletType:   WalletTypeDB,
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
+		UUID:        NewUserID(),
+		Username:    &username,
+		DisplayName: &displayName,
+		DID:         "did:key:test",
+		WalletType:  WalletTypeDB,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
 
 	if user.Username == nil || *user.Username != username {
@@ -202,12 +222,10 @@ func TestWebauthnCredential_Fields(t *testing.T) {
 
 func TestRegisterRequest_Fields(t *testing.T) {
 	username := "newuser"
-	password := "secret123"
 
 	req := RegisterRequest{
 		Username:    &username,
 		DisplayName: "New User",
-		Password:    &password,
 		WalletType:  WalletTypeClient,
 		Keys:        []byte("keydata"),
 		PrivateData: []byte("privatedata"),
@@ -223,41 +241,6 @@ func TestRegisterRequest_Fields(t *testing.T) {
 
 	if req.WalletType != WalletTypeClient {
 		t.Error("RegisterRequest.WalletType not set correctly")
-	}
-}
-
-func TestLoginRequest_Fields(t *testing.T) {
-	req := LoginRequest{
-		Username: "testuser",
-		Password: "password123",
-	}
-
-	if req.Username != "testuser" {
-		t.Error("LoginRequest.Username not set correctly")
-	}
-
-	if req.Password != "password123" {
-		t.Error("LoginRequest.Password not set correctly")
-	}
-}
-
-func TestLoginResponse_Fields(t *testing.T) {
-	resp := LoginResponse{
-		Token:       "jwt-token-here",
-		UserID:      "user-123",
-		DisplayName: "Test User",
-	}
-
-	if resp.Token != "jwt-token-here" {
-		t.Error("LoginResponse.Token not set correctly")
-	}
-
-	if resp.UserID != "user-123" {
-		t.Error("LoginResponse.UserID not set correctly")
-	}
-
-	if resp.DisplayName != "Test User" {
-		t.Error("LoginResponse.DisplayName not set correctly")
 	}
 }
 
@@ -384,4 +367,29 @@ func TestUser_EnterpriseIdentityMethods(t *testing.T) {
 			t.Fatalf("Expected 3 identities, got %d", len(user.EnterpriseIdentities))
 		}
 	})
+}
+
+// TestUser_BSONDecodeIgnoresLegacyPasswordHash guards the removal of the
+// password_hash field (#162): stored documents that still carry it must
+// keep decoding, because no data migration is performed.
+func TestUser_BSONDecodeIgnoresLegacyPasswordHash(t *testing.T) {
+	legacy := bson.M{
+		"_id":           bson.M{"id": "user-1"},
+		"username":      "legacy",
+		"did":           "did:example:legacy",
+		"password_hash": "$2a$10$abcdefghijklmnopqrstuv",
+		"wallet_type":   string(WalletTypeDB),
+	}
+	raw, err := bson.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("bson.Marshal: %v", err)
+	}
+
+	var u User
+	if err := bson.Unmarshal(raw, &u); err != nil {
+		t.Fatalf("decoding legacy document with password_hash failed: %v", err)
+	}
+	if u.Username == nil || *u.Username != "legacy" || u.DID != "did:example:legacy" {
+		t.Errorf("unexpected decoded user: %+v", u)
+	}
 }

@@ -200,6 +200,12 @@ func DefaultWalletRules() []sexp.Element {
 			sexp.NewAtom("jwk"),
 			sexp.NewAtom("x5c"),
 			sexp.NewAtom("x509_san_dns"),
+			// "kid" names a verification method instead of carrying key
+			// material, which is how a DID-based client_id points at the
+			// method that signed its request rather than inlining a key the
+			// wallet can already resolve from the DID. Same subject shape
+			// (type "key", a DID id) as the entries above.
+			sexp.NewAtom("kid"),
 		},
 	}
 

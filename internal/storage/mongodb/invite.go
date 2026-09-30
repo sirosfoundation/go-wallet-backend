@@ -78,6 +78,12 @@ func (s *InviteStore) MarkCompleted(ctx context.Context, tenantID domain.TenantI
 			{Key: "tenant_id", Value: string(tenantID)},
 			{Key: "code", Value: code},
 			{Key: "status", Value: string(domain.InviteStatusActive)},
+			// Expiry must be part of the same atomic filter as the active-status
+			// check, not a separate earlier read: otherwise an invite that ticks
+			// over its expiry between an earlier IsUsable() check and this call
+			// (e.g. while WebAuthn verification is still in flight) would still
+			// be claimable here.
+			{Key: "expires_at", Value: bson.M{"$gt": now}},
 		},
 		bson.M{
 			"$set": bson.M{

@@ -10,7 +10,6 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -18,7 +17,6 @@ import (
 )
 
 var (
-	ErrInvalidCredentials     = errors.New("invalid credentials")
 	ErrUserExists             = errors.New("user already exists")
 	ErrPrivateDataConflict    = errors.New("private data conflict")
 	ErrLastWebAuthnCredential = errors.New("cannot delete last webauthn credential")
@@ -52,12 +50,36 @@ func (m MultiSessionCleaner) DeleteByUser(ctx context.Context, userID string) er
 	return first
 }
 
+// TokenRevoker is the subset of *TokenBlacklist that DeleteUser needs to
+// revoke every previously-issued token for a deleted user. Narrowing the
+// field to this interface (rather than the concrete *TokenBlacklist type)
+// lets tests exercise DeleteUser's error-handling around RevokeUser
+// failing - something the production TokenBlacklist implementation itself
+// never actually does today (RevokeUser only ever returns nil, defensively
+// coded for a future implementation - e.g. a persistent store - that
+// might not), so that path would otherwise be untestable dead code.
+type TokenRevoker interface {
+	RevokeUser(ctx context.Context, userID string) error
+}
+
+// UserRevoker permanently bars a deleted user from (re)connecting to an
+// in-process token-independent session holder - in production, the WebSocket
+// engine's Manager.RevokeUser (#393/#403). It is deliberately separate from
+// SessionCleaner: SessionCleaner is also what wallet-instance revocation
+// (SID-AUTH-06) and "log out everywhere" use, which must drop sessions but
+// leave the user free to log in again on other devices.
+type UserRevoker interface {
+	RevokeUser(userID string)
+}
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
 	cfg            *config.Config
 	logger         *zap.Logger
 	sessionCleaner SessionCleaner
+	tokenBlacklist TokenRevoker
+	userRevokers   []UserRevoker
 }
 
 // NewUserService creates a new UserService
@@ -73,6 +95,22 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 // When set, DeleteUser will purge active sessions for the deleted user.
 func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
 	s.sessionCleaner = sc
+}
+
+// AddUserRevoker registers a component that must permanently reject the
+// deleted user from now on; DeleteUser calls it before purging sessions.
+func (s *UserService) AddUserRevoker(r UserRevoker) {
+	s.userRevokers = append(s.userRevokers, r)
+}
+
+// SetTokenBlacklist sets the token revoker (in production, always the
+// shared *TokenBlacklist - see TokenRevoker's doc comment for why the
+// parameter is the narrower interface). When set, DeleteUser revokes
+// every previously-issued token for the deleted user (not just the single
+// token used to authenticate the deletion request), so they stop working
+// immediately instead of remaining valid until they naturally expire (#383).
+func (s *UserService) SetTokenBlacklist(b TokenRevoker) {
+	s.tokenBlacklist = b
 }
 
 // Register registers a new user
@@ -96,19 +134,9 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 		UpdatedAt:   time.Now(),
 	}
 
-	// Hash password if provided
-	if req.Password != nil {
-		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
-		if err != nil {
-			return nil, fmt.Errorf("failed to hash password: %w", err)
-		}
-		hashStr := string(hash)
-		user.PasswordHash = &hashStr
-	}
-
 	// Generate DID
 	// TODO: Implement proper DID generation based on key material
-	user.DID = fmt.Sprintf("did:key:%s", user.UUID.String())
+	user.DID = domain.HolderDID(user.UUID.String())
 
 	// Compute private data ETag
 	if len(user.PrivateData) > 0 {
@@ -122,37 +150,6 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 
 	s.logger.Debug("User registered", zap.String("user_id", user.UUID.String()))
 	return user, nil
-}
-
-// Login authenticates a user with username/password
-// Deprecated: Use WebAuthn authentication instead.
-// Password-based authentication will be removed in a future version.
-func (s *UserService) Login(ctx context.Context, username, password string) (*domain.User, string, error) {
-	user, err := s.store.Users().GetByUsername(ctx, username)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, "", ErrInvalidCredentials
-		}
-		return nil, "", fmt.Errorf("failed to get user: %w", err)
-	}
-
-	// Verify password
-	if user.PasswordHash == nil {
-		return nil, "", ErrInvalidCredentials
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(password)); err != nil {
-		return nil, "", ErrInvalidCredentials
-	}
-
-	// Generate JWT token (default tenant for deprecated password login)
-	token, err := s.generateToken(user, domain.DefaultTenantID)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to generate token: %w", err)
-	}
-
-	s.logger.Info("User logged in")
-	return user, token, nil
 }
 
 // GetUserByID retrieves a user by ID
@@ -402,6 +399,33 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Clear user reference from consumed invites
 	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
+	}
+
+	// Revoke all previously-issued tokens for this user (#383) BEFORE
+	// purging sessions below - not after. Logout only ever blacklists the
+	// single token used for that request; without this, any of the deleted
+	// user's other still-valid tokens (a different device, a token minted
+	// before this request's) would keep working until they naturally
+	// expire.
+	//
+	// The ordering matters for engine (WebSocket) sessions specifically
+	// (#393 review): a handshake can pass the engine's own IsUserRevoked
+	// check and then only finish registering itself in
+	// engine.Manager.sessions *after* the cleaner below has already
+	// scanned it. Revoking first means engine.Manager.registerSession's own
+	// recheck (done under the same lock the scan uses) will already see
+	// this user as revoked for any such late registration, and any
+	// registration that instead completed *before* this revocation is
+	// still guaranteed to be present in m.sessions by the time the scan
+	// below runs. Reversing this order would reopen that gap.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		}
+	}
+
+	for _, r := range s.userRevokers {
+		r.RevokeUser(userID.String())
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)

@@ -10,6 +10,11 @@ server:
   engine_port: 8082
   # registry_host: "0.0.0.0" # Bind registry to all interfaces (uses 'host' by default)
   registry_port: 8097
+  # Peers whose X-Forwarded-For is believed for the client IP (per-IP rate limits).
+  # UNSET = trust every peer (legacy default): any direct caller can pick its own IP
+  # and dodge the per-IP limit. Set it in production: your load balancer's
+  # addresses/CIDRs, or ["none"] when clients connect directly.
+  # trusted_proxies: ["10.0.0.0/8"]
   rp_id: "wallet.example.com"
   rp_origin: "https://wallet.example.com"
   # rp_origins allows multiple WebAuthn RP origins (e.g. for Android/iOS native app wrappers).

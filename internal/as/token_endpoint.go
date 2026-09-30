@@ -1,6 +1,7 @@
 package as
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -11,12 +12,34 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
+// TokenBlacklistChecker is the token blacklist capability this package
+// needs: checking whether a token has been revoked before it can be used
+// to mint a delegated token - either the parent token's own jti (an
+// explicit logout/revocation) or, in bulk, every token belonging to its
+// subject (account deletion - see service.TokenBlacklist.RevokeUser) - and
+// writing a new revocation (Add), used by LogoutHandler to blacklist the
+// specific token being logged out. Mirrors pkg/middleware.
+// TokenBlacklistChecker's read methods plus service.TokenBlacklist's own
+// Add; *service.TokenBlacklist satisfies this.
+type TokenBlacklistChecker interface {
+	IsBlacklisted(ctx context.Context, jti string) bool
+	IsUserRevoked(ctx context.Context, userID string) bool
+	Add(ctx context.Context, jti string, expiry time.Time) error
+}
+
 // tokenDeps groups the shared dependencies for token issuance handlers.
 type tokenDeps struct {
-	issuer  *TokenIssuer
-	policy  PolicyEngine
-	ttlFunc func(string) time.Duration
-	logger  *zap.Logger
+	issuer *TokenIssuer
+	policy PolicyEngine
+	// ttlFunc, audiences and blacklist are used differently across the two
+	// token-issuance paths: ttlFunc for both; audiences and blacklist only
+	// by handleDelegationTokenRequest, which is the only path that verifies
+	// an already-issued Bearer token rather than trusting a server-side
+	// session record.
+	ttlFunc   func(string) time.Duration
+	audiences []string
+	blacklist TokenBlacklistChecker
+	logger    *zap.Logger
 	// gate refuses delegating tokens issued before the user's SID-AUTH-06
 	// cut-off (optional; nil enforces nothing).
 	gate *tokengate.Gate
@@ -29,6 +52,29 @@ type TokenResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
+// TokenEndpointConfig groups the dependencies for the /auth/token endpoint.
+// Grouped into a struct (rather than individual parameters) to keep
+// TokenEndpointHandler/RegisterTokenEndpoint's own signatures within reason
+// - #381 added Audiences and Blacklist on top of the existing dependencies,
+// which pushed the plain-parameter-list form over the usual limit.
+type TokenEndpointConfig struct {
+	Store   SessionStore
+	Issuer  *TokenIssuer
+	Policy  PolicyEngine
+	TTLFunc func(string) time.Duration
+	// Audiences and Blacklist are used only by the delegation-exchange path
+	// (handleDelegationTokenRequest), which is the only one that verifies an
+	// already-issued Bearer token rather than trusting a server-side session
+	// record - see #381/#382.
+	Audiences       []string
+	Blacklist       TokenBlacklistChecker
+	InsecureCookies bool
+	// Gate refuses delegating tokens issued before the user's SID-AUTH-06
+	// cut-off (optional; nil enforces nothing).
+	Gate   *tokengate.Gate
+	Logger *zap.Logger
+}
+
 // TokenEndpointHandler creates the handler for POST /auth/token.
 //
 // Two authentication paths:
@@ -38,17 +84,18 @@ type TokenResponse struct {
 //     a valid session is still required either way.)
 //  2. Bearer token (no cookie) → delegation: the bearer token must contain
 //     the 'k' (delegate) permission, and the issued token is downscoped.
-func TokenEndpointHandler(
-	store SessionStore,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	insecureCookies bool,
-	gate *tokengate.Gate,
-	logger *zap.Logger,
-) gin.HandlerFunc {
-	opts := CookieOptions{Insecure: insecureCookies}
-	deps := &tokenDeps{issuer: issuer, policy: policy, ttlFunc: ttlFunc, logger: logger, gate: gate}
+func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
+	opts := CookieOptions{Insecure: cfg.InsecureCookies}
+	store := cfg.Store
+	deps := &tokenDeps{
+		issuer:    cfg.Issuer,
+		policy:    cfg.Policy,
+		ttlFunc:   cfg.TTLFunc,
+		audiences: cfg.Audiences,
+		blacklist: cfg.Blacklist,
+		logger:    cfg.Logger,
+		gate:      cfg.Gate,
+	}
 	return func(c *gin.Context) {
 		var req TokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -272,11 +319,41 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	// Parse the delegating token without audience restriction — we need its claims.
-	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, nil)
+	// Parse the delegating token, restricted to this AS's own accepted
+	// audiences (config.ASConfig.Audiences - the same list go-tokenauth's
+	// Validator enforces for every other resource-endpoint request, see
+	// NewBackendProvider). Without this, a token minted for any audience at
+	// all could be replayed here to mint a delegated token for a completely
+	// different one (T-1). An empty deps.audiences skips the check, exactly
+	// like ParseAndVerify's own "when empty, audience validation is skipped"
+	// behavior for every other caller.
+	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, deps.audiences)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid delegating token"})
 		return
+	}
+
+	// A revoked parent token must not be usable to mint a fresh, differently
+	// -jti'd token - otherwise logout/account deletion (#382/#383) would not
+	// actually stop re-delegation. Checks both the parent's own jti
+	// (individually blacklisted, e.g. by AS logout - see LogoutHandler) and
+	// its subject in bulk (account deletion - see
+	// service.TokenBlacklist.RevokeUser): checking jti alone missed a
+	// different, not-yet-blacklisted delegation-capable token for the same
+	// deleted user still being exchangeable here (#391 review). Only fails
+	// closed when a blacklist is actually wired (deps.blacklist != nil);
+	// ASModule always wires one from NewBackendProvider, so this is only
+	// ever nil in tests that don't care.
+	if deps.blacklist != nil {
+		ctx := c.Request.Context()
+		if parentClaims.ID != "" && deps.blacklist.IsBlacklisted(ctx, parentClaims.ID) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
+			return
+		}
+		if deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
+			return
+		}
 	}
 
 	// SID-AUTH-06: a delegating token issued before the user's wallet was
@@ -426,15 +503,6 @@ func issueToken(
 }
 
 // RegisterTokenEndpoint registers POST /auth/token on the given router group.
-func RegisterTokenEndpoint(
-	group *gin.RouterGroup,
-	store SessionStore,
-	issuer *TokenIssuer,
-	policy PolicyEngine,
-	ttlFunc func(string) time.Duration,
-	insecureCookies bool,
-	gate *tokengate.Gate,
-	logger *zap.Logger,
-) {
-	group.POST("/token", TokenEndpointHandler(store, issuer, policy, ttlFunc, insecureCookies, gate, logger))
+func RegisterTokenEndpoint(group *gin.RouterGroup, cfg TokenEndpointConfig) {
+	group.POST("/token", TokenEndpointHandler(cfg))
 }

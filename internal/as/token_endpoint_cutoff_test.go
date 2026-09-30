@@ -57,7 +57,10 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 	}
 	sessions := NewMemorySessionStore()
 	router := gin.New()
-	RegisterTokenEndpoint(router.Group("/auth"), sessions, issuer, AllowAllPolicy{}, ttl, true, tokengate.New(users), zap.NewNop())
+	RegisterTokenEndpoint(router.Group("/auth"), TokenEndpointConfig{
+		Store: sessions, Issuer: issuer, Policy: AllowAllPolicy{}, TTLFunc: ttl,
+		InsecureCookies: true, Gate: tokengate.New(users), Logger: zap.NewNop(),
+	})
 
 	newSession := func(jti string, createdAt time.Time) {
 		if err := sessions.Create(context.Background(), &Session{
@@ -163,8 +166,11 @@ func TestTokenEndpoint_CutoffDuringIssuanceIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	RegisterTokenEndpoint(router.Group("/auth"), sessions, NewTokenIssuer(km, "test-issuer", ttl),
-		&cutoffOnEvaluate{users: users, uid: uid}, ttl, true, tokengate.New(users), zap.NewNop())
+	RegisterTokenEndpoint(router.Group("/auth"), TokenEndpointConfig{
+		Store: sessions, Issuer: NewTokenIssuer(km, "test-issuer", ttl),
+		Policy:  &cutoffOnEvaluate{users: users, uid: uid},
+		TTLFunc: ttl, InsecureCookies: true, Gate: tokengate.New(users), Logger: zap.NewNop(),
+	})
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader(`{"aud":"wallet-backend"}`))
 	req.Header.Set("Content-Type", "application/json")
