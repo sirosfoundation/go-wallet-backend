@@ -335,6 +335,18 @@ func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.L
 	}
 }
 
+// Close releases what the storage provider's own Services aggregate owns. That
+// is only the wallet-provider signer (a PKCS#11 session pool when an HSM is
+// configured): the aggregate is never Start()-ed, and its TokenBlacklist is
+// replaced by the auth provider's, which AuthProvider.Close already stops, so
+// calling services.Stop() here would stop that shared blacklist a second time.
+func (p *StorageProvider) Close() error {
+	if p.services != nil && p.services.WalletProvider != nil {
+		p.services.WalletProvider.Close()
+	}
+	return nil
+}
+
 func (p *StorageProvider) Transport() Transport { return TransportHTTP }
 func (p *StorageProvider) Name() string         { return "storage" }
 
@@ -884,6 +896,9 @@ func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 func (p *BackendProvider) Close() error {
 	if p.auth != nil {
 		_ = p.auth.Close()
+	}
+	if p.storage != nil {
+		_ = p.storage.Close() // releases the storage aggregate's HSM sessions
 	}
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()

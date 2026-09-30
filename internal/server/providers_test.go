@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -1793,6 +1794,58 @@ func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected 2 Services (auth + storage), got %d: an extra one leaks its HSM sessions", count)
+	}
+}
+
+type closeCountingSigner struct {
+	crypto.Signer
+	closed *int
+}
+
+func (s closeCountingSigner) Close() error { *s.closed++; return nil }
+
+// Both Services aggregates (auth + storage) own a wallet-provider signer, and
+// BackendProvider.Close must close each exactly once.
+func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	var closes []*int
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		svc := orig(s, c, l)
+		n := new(int)
+		closes = append(closes, n)
+		svc.WalletProvider = service.NewWalletProviderServiceWithSigner(c, l, closeCountingSigner{Signer: key, closed: n})
+		return svc
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	if len(closes) != 2 {
+		t.Fatalf("expected 2 signer pools (auth + storage), got %d", len(closes))
+	}
+	_ = p.Close()
+	for i, n := range closes {
+		if *n != 1 {
+			t.Errorf("signer pool %d closed %d times, want exactly 1", i, *n)
+		}
 	}
 }
 
