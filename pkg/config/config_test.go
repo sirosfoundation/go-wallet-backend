@@ -2871,3 +2871,23 @@ func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
 		}
 	})
 }
+
+func TestConfig_Validate_ExternalURLRequiresExpectedIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.ExternalURL = "https://as.example.com"
+	cfg.loaded = true // legacy disabled (as.legacy.enabled=false), so the legacy-issuer rule does not apply
+	cfg.JWT.Issuer = ""
+	cfg.AS.Issuer = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "as.external_url requires an expected issuer") {
+		t.Fatalf("expected issuer error, got %v", err)
+	}
+	cfg.AS.Issuer = "https://as.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("as.issuer must satisfy the check: %v", err)
+	}
+	cfg.AS.Issuer = ""
+	cfg.JWT.Issuer = "wallet-backend"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("jwt.issuer must satisfy the check: %v", err)
+	}
+}

@@ -9,7 +9,7 @@ import (
 
 func gojwtSigned(t *testing.T, secret []byte, claims map[string]any) string {
 	t.Helper()
-	m := gojwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix()}
+	m := gojwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix(), "iss": "test-issuer"}
 	for k, v := range claims {
 		m[k] = v
 	}

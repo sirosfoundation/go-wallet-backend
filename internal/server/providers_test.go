@@ -1449,6 +1449,7 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 // AuthMiddlewareWithBlacklist parses.
 func createLegacyTestToken(secret, userID, tenantID, jti string) string {
 	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss":       "test",
 		"user_id":   userID,
 		"tenant_id": tenantID,
 		"jti":       jti,

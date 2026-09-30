@@ -27,6 +27,7 @@ func createTestConfig(jwtSecret string) *config.Config {
 	return &config.Config{
 		JWT: config.JWTConfig{
 			Secret:      jwtSecret,
+			Issuer:      "test-issuer",
 			ExpiryHours: 1,
 		},
 	}
@@ -34,6 +35,7 @@ func createTestConfig(jwtSecret string) *config.Config {
 
 func createValidToken(secret string, userID string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
@@ -43,6 +45,7 @@ func createValidToken(secret string, userID string) string {
 
 func createExpiredToken(secret string, userID string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"exp":     time.Now().Add(-time.Hour).Unix(),
 	})
@@ -54,6 +57,7 @@ func createExpiredToken(secret string, userID string) string {
 // jti and iat, for exercising blacklist/revocation checks.
 func createTokenWithJTI(secret, userID, jti string, issuedAt time.Time) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"jti":     jti,
 		"iat":     issuedAt.Unix(),
@@ -211,6 +215,7 @@ func TestAuthMiddleware_MissingUserID(t *testing.T) {
 	// A token that's otherwise valid (correctly signed, not expired) but
 	// carries no "user_id" claim at all.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": "test-issuer",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 	tokenStr, err := token.SignedString([]byte(secret))
@@ -499,7 +504,7 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 
 func TestAuthMiddlewareWithBlacklist_RefusesHMACWhenLegacyDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "0123456789abcdef0123456789abcdef"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "0123456789abcdef0123456789abcdef", Issuer: "test-issuer"}}
 	cfg.AS.Enabled = true // AS on + legacy off => legacy disabled
 	tok := gojwtSigned(t, []byte(cfg.JWT.Secret), map[string]any{"user_id": "u", "tenant_id": "default"})
 
@@ -538,5 +543,44 @@ func TestAuthMiddlewareWithBlacklist_LoadedConfigLegacyOff(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != 401 {
 		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestAuthMiddlewareWithBlacklist_LegacyIssuerPinned(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "0123456789abcdef0123456789abcdef"
+	serve := func(cfg *config.Config, tok string) int {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.GET("/t", AuthMiddlewareWithBlacklist(cfg, nil, nil, zap.NewNop()), func(c *gin.Context) { c.Status(200) })
+		req := httptest.NewRequest("GET", "/t", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	mint := func(claims map[string]any) string {
+		h := jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix()}
+		for k, v := range claims {
+			h[k] = v
+		}
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, h).SignedString([]byte(secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "wallet-backend"}}
+	// The token is refused at the issuer check, before any store lookup, so a
+	// nil store is fine for the rejection cases; the accepted case is covered
+	// by the other tests with a real store.
+	if code := serve(cfg, mint(map[string]any{"user_id": "u", "tenant_id": "default"})); code != 401 {
+		t.Errorf("missing iss: got %d want 401", code)
+	}
+	if code := serve(cfg, mint(map[string]any{"user_id": "u", "tenant_id": "default", "iss": "other"})); code != 401 {
+		t.Errorf("mismatched iss: got %d want 401", code)
+	}
+	empty := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	if code := serve(empty, mint(map[string]any{"user_id": "u", "tenant_id": "default", "iss": ""})); code != 401 {
+		t.Errorf("empty jwt.issuer must fail closed: got %d want 401", code)
 	}
 }

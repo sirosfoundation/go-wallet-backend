@@ -544,9 +544,9 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 		}
 		return nil, nil
 	}
-	issuer := cfg.AS.Issuer
-	if issuer == "" {
-		issuer = cfg.JWT.Issuer
+	issuer, err := remoteASIssuer(cfg, "standalone engine")
+	if err != nil {
+		return nil, err
 	}
 	relay, err := newRemoteJWKSRelay(cfg)
 	if err != nil {
@@ -668,6 +668,22 @@ func requireLegacyIssuer(cfg *config.Config, role string) error {
 		return fmt.Errorf("%s: jwt.issuer must not be empty while legacy HMAC session tokens are enabled (as.legacy.enabled): without it any token signed with jwt.secret would be accepted regardless of iss; set jwt.issuer or disable legacy tokens", role)
 	}
 	return nil
+}
+
+// remoteASIssuer returns the expected issuer for a validator of tokens from a
+// remote AS (as.issuer, falling back to jwt.issuer) and refuses an empty
+// value: the validator would then leave the issuer of JWKS-signed tokens
+// unrestricted. It applies whether or not legacy HMAC tokens are enabled, and
+// is checked before any relay or validator is created.
+func remoteASIssuer(cfg *config.Config, role string) (string, error) {
+	issuer := cfg.AS.Issuer
+	if issuer == "" {
+		issuer = cfg.JWT.Issuer
+	}
+	if issuer == "" {
+		return "", fmt.Errorf("%s: an expected issuer is required to validate tokens from the remote AS JWKS; set as.issuer or jwt.issuer", role)
+	}
+	return issuer, nil
 }
 
 // NewBackendProvider creates a combined auth+storage provider
@@ -1233,9 +1249,11 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		}
 		logger.Warn("wallet-provider: as.external_url is not set; ES256 session tokens cannot be validated, using legacy HMAC validation only")
 	} else if cfg.AS.Enabled {
-		issuer := cfg.AS.Issuer
-		if issuer == "" {
-			issuer = cfg.JWT.Issuer
+		issuer, issuerErr := remoteASIssuer(cfg, "wallet-provider")
+		if issuerErr != nil {
+			services.Stop()
+			_ = store.Close()
+			return nil, issuerErr
 		}
 		wpRelay, relayErr := newRemoteJWKSRelay(cfg)
 		if relayErr != nil {

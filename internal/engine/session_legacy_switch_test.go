@@ -19,6 +19,7 @@ const legacySwitchSecret = "0123456789abcdef0123456789abcdef"
 func legacySwitchToken(t *testing.T, aud string) string {
 	t.Helper()
 	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "u", "tenant_id": "t", "aud": aud, "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(legacySwitchSecret))
 	require.NoError(t, err)
@@ -26,7 +27,7 @@ func legacySwitchToken(t *testing.T, aud string) string {
 }
 
 func legacySwitchCfg(asEnabled, legacy bool) *config.Config {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: legacySwitchSecret}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: legacySwitchSecret, Issuer: "test-issuer"}}
 	cfg.AS.Enabled = asEnabled
 	cfg.AS.Legacy.Enabled = legacy
 	return cfg
@@ -64,4 +65,27 @@ func TestManager_validateToken_LegacyExemptFromAudience(t *testing.T) {
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{}))
 	_, _, _, err = m.validateToken(legacySwitchToken(t, "rp.example.com"))
 	assert.Error(t, err)
+}
+
+func TestManager_validateToken_LegacyIssuerPinned(t *testing.T) {
+	mint := func(claims jwt.MapClaims) string {
+		claims["user_id"], claims["tenant_id"], claims["exp"] = "u", "t", time.Now().Add(time.Hour).Unix()
+		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(legacySwitchSecret))
+		require.NoError(t, err)
+		return tok
+	}
+	m := NewManager(legacySwitchCfg(false, true), zap.NewNop())
+	uid, _, _, err := m.validateToken(mint(jwt.MapClaims{"iss": "test-issuer"}))
+	require.NoError(t, err)
+	assert.Equal(t, "u", uid)
+	_, _, _, err = m.validateToken(mint(jwt.MapClaims{}))
+	assert.Error(t, err, "missing iss")
+	_, _, _, err = m.validateToken(mint(jwt.MapClaims{"iss": "someone-else"}))
+	assert.Error(t, err, "mismatched iss")
+
+	cfg := legacySwitchCfg(false, true)
+	cfg.JWT.Issuer = ""
+	m = NewManager(cfg, zap.NewNop())
+	_, _, _, err = m.validateToken(mint(jwt.MapClaims{"iss": ""}))
+	assert.Error(t, err, "empty jwt.issuer must fail closed")
 }

@@ -150,3 +150,26 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		assert.Nil(t, v)
 	})
 }
+
+func TestRemoteASIssuerRefusesEmpty(t *testing.T) {
+	c := &config.Config{}
+	c.AS.ExternalURL = "https://as.example.com"
+	c.AS.Enabled = true // AS on + legacy off: the requireLegacyIssuer guard does not apply
+
+	v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
+	assert.ErrorContains(t, err, "expected issuer is required")
+	assert.Nil(t, v)
+
+	_, err = remoteASIssuer(c, "x")
+	assert.Error(t, err)
+
+	c.JWT.Issuer = "jwt-iss"
+	iss, err := remoteASIssuer(c, "x")
+	require.NoError(t, err)
+	assert.Equal(t, "jwt-iss", iss)
+
+	c.AS.Issuer = "as-iss"
+	iss, err = remoteASIssuer(c, "x")
+	require.NoError(t, err)
+	assert.Equal(t, "as-iss", iss)
+}

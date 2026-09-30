@@ -70,6 +70,7 @@ func wsES256Aud(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Durati
 func wsHMAC(t *testing.T, secret string) string {
 	t.Helper()
 	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "legacy-user", "tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(secret))
 	require.NoError(t, err)
@@ -77,7 +78,7 @@ func wsHMAC(t *testing.T, secret string) string {
 }
 
 func wsCfg(asEnabled, legacyEnabled bool) *config.Config {
-	c := &config.Config{JWT: config.JWTConfig{Secret: wsDualSecret}}
+	c := &config.Config{JWT: config.JWTConfig{Secret: wsDualSecret, Issuer: "test-issuer"}}
 	c.AS.Enabled = asEnabled
 	c.AS.Legacy = config.ASLegacyConfig{Enabled: legacyEnabled}
 	return c
@@ -143,6 +144,7 @@ func TestManager_validateToken_AudienceNewStyleOnly(t *testing.T) {
 
 	// Legacy HMAC token carries the RP ID as aud: never filtered.
 	hm, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "legacy-user", "aud": "rp.example.com", "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(wsDualSecret))
 	require.NoError(t, err)
@@ -187,4 +189,27 @@ func TestManager_validateToken_EmptySecretRefused(t *testing.T) {
 	m := NewManager(cfg, zap.NewNop())
 	_, err := m.validateToken(wsHMAC(t, ""))
 	assert.Error(t, err)
+}
+
+func TestManager_validateToken_LegacyIssuerPinned(t *testing.T) {
+	mint := func(claims jwt.MapClaims) string {
+		claims["user_id"], claims["tenant_id"], claims["exp"] = "legacy-user", "default", time.Now().Add(time.Hour).Unix()
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(wsDualSecret))
+		require.NoError(t, err)
+		return s
+	}
+	m := NewManager(wsCfg(false, true), zap.NewNop())
+	uid, err := m.validateToken(mint(jwt.MapClaims{"iss": "test-issuer"}))
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-user", uid)
+	_, err = m.validateToken(mint(jwt.MapClaims{}))
+	assert.Error(t, err, "missing iss")
+	_, err = m.validateToken(mint(jwt.MapClaims{"iss": "someone-else"}))
+	assert.Error(t, err, "mismatched iss")
+
+	cfg := wsCfg(false, true)
+	cfg.JWT.Issuer = ""
+	m = NewManager(cfg, zap.NewNop())
+	_, err = m.validateToken(mint(jwt.MapClaims{"iss": ""}))
+	assert.Error(t, err, "empty jwt.issuer must fail closed")
 }

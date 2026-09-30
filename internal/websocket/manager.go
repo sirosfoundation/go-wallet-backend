@@ -351,12 +351,18 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 	if m.cfg.JWT.Secret == "" {
 		return "", errors.New("jwt secret not configured")
 	}
+	// Legacy HMAC tokens are all minted with iss = jwt.issuer; pin it. An empty
+	// jwt.issuer would disable the check (golang-jwt treats "" as "no
+	// expectation"), so fail closed.
+	if m.cfg.JWT.Issuer == "" {
+		return "", errors.New("jwt issuer not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
 
 	if err != nil {
 		return "", err

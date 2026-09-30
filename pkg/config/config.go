@@ -2103,6 +2103,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("jwt.issuer is required while legacy session tokens are enabled (as.legacy.enabled=true); set jwt.issuer or disable legacy tokens")
 	}
 
+	// A remote AS JWKS (as.external_url) is validated against as.issuer or
+	// jwt.issuer; with both empty the issuer of JWKS-signed tokens would be
+	// unrestricted. Role-independent: external_url is only meaningful with an
+	// issuer, whichever role consumes it.
+	if c.AS.ExternalURL != "" && c.AS.Issuer == "" && c.JWT.Issuer == "" {
+		return fmt.Errorf("as.external_url requires an expected issuer to validate AS tokens; set as.issuer or jwt.issuer")
+	}
+
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
 	if c.Server.CORS.AllowCredentials {
 		for _, origin := range c.Server.CORS.AllowedOrigins {
