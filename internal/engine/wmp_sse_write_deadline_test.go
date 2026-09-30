@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -75,8 +76,60 @@ func TestWMP_SSE_SlowClientWriteIsBounded(t *testing.T) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	require.NotEmpty(t, w.deadlines)
-	for _, d := range w.deadlines {
-		assert.False(t, d.IsZero(), "the deadline must never be cleared")
+	assert.Positive(t, w.writes, "the write that was bounded must have been attempted")
+	assert.False(t, w.deadlines[len(w.deadlines)-1].IsZero(), "the blocked write ran under an armed deadline")
+}
+
+// A healthy stream that is idle for longer than the write timeout must still
+// deliver a later event: the deadline is cleared after each successful flush
+// rather than left to expire.
+func TestWMP_SSE_IdleStreamSurvivesWriteTimeout(t *testing.T) {
+	old := wmpSSEWriteTimeout
+	wmpSSEWriteTimeout = 100 * time.Millisecond
+	defer func() { wmpSSEWriteTimeout = old }()
+
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	buf := a.getOrCreateEventBuffer(sid)
+
+	ts := httptest.NewServer(http.HandlerFunc(a.HandleWMPEvents))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	lines := make(chan string, 16)
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "data: ") {
+				lines <- sc.Text()
+			}
+		}
+		close(lines)
+	}()
+
+	buf.append([]byte(`{"first":true}`))
+	select {
+	case l := <-lines:
+		assert.Contains(t, l, "first")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no first event")
+	}
+
+	time.Sleep(4 * wmpSSEWriteTimeout) // idle well past the write timeout
+	buf.append([]byte(`{"late":true}`))
+	select {
+	case l, ok := <-lines:
+		require.True(t, ok, "idle stream was closed by an expired write deadline")
+		assert.Contains(t, l, "late")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no event after the idle period")
 	}
 }
 
@@ -162,4 +215,63 @@ func TestWMP_SSE_FlushFailureDoesNotAdvanceDelivered(t *testing.T) {
 		t.Fatal("SSE handler did not stop after a failed flush")
 	}
 	assert.Zero(t, buf.delivered(), "a failed flush must not advance deliveredID")
+}
+
+// recordingWriter accepts every write and flush and records the deadlines set.
+type recordingWriter struct {
+	hdr       http.Header
+	mu        sync.Mutex
+	deadlines []time.Time
+	written   int
+}
+
+func (r *recordingWriter) Header() http.Header { return r.hdr }
+func (r *recordingWriter) WriteHeader(int)     {}
+func (r *recordingWriter) Flush()              {}
+func (r *recordingWriter) SetWriteDeadline(t time.Time) error {
+	r.mu.Lock()
+	r.deadlines = append(r.deadlines, t)
+	r.mu.Unlock()
+	return nil
+}
+func (r *recordingWriter) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	r.written += len(p)
+	r.mu.Unlock()
+	return len(p), nil
+}
+func (r *recordingWriter) state() (last time.Time, n, written int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n = len(r.deadlines); n > 0 {
+		last = r.deadlines[n-1]
+	}
+	return last, n, r.written
+}
+
+// While the stream is idle after a successful flush no write deadline may be
+// left armed (SetWriteDeadline is persistent), both after the initial flush
+// and after an event flush.
+func TestWMP_SSE_DeadlineClearedAfterSuccessfulFlush(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	buf := a.getOrCreateEventBuffer(sid)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := &recordingWriter{hdr: http.Header{}}
+	done := make(chan struct{})
+	go func() { a.HandleWMPEvents(w, req); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	require.Eventually(t, func() bool { _, n, _ := w.state(); return n >= 2 }, 2*time.Second, 5*time.Millisecond)
+	last, _, _ := w.state()
+	assert.True(t, last.IsZero(), "deadline must be cleared after the initial flush")
+
+	buf.append([]byte(`{"x":1}`))
+	require.Eventually(t, func() bool { _, _, n := w.state(); return n > 0 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { last, _, _ := w.state(); return last.IsZero() }, 2*time.Second, 5*time.Millisecond,
+		"deadline must be cleared after the event flush")
 }

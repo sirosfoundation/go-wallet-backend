@@ -192,12 +192,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	// Each write+flush gets its own fresh deadline (replacing the
 	// connection-wide WriteTimeout, which would cut the stream off); a
 	// writer without deadline support falls back to the server's own.
+	// SetWriteDeadline is persistent, so the deadline is cleared after every
+	// successful flush: an idle healthy stream must not expire before the
+	// next event, while a write to a non-reading client is still bounded.
 	rc := http.NewResponseController(w)
 	armWrite := func() { _ = rc.SetWriteDeadline(time.Now().Add(wmpSSEWriteTimeout)) }
+	clearWrite := func() { _ = rc.SetWriteDeadline(time.Time{}) }
 	armWrite()
 	if err := rc.Flush(); err != nil {
 		return
 	}
+	clearWrite()
 
 	// Events are appended to the session's buffer as they are emitted (see
 	// pumpEvents), whether or not a client is connected, and IDs are durable
@@ -230,6 +235,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 			if err := rc.Flush(); err != nil {
 				return
 			}
+			clearWrite()
 			buf.markDelivered(cursor)
 		}
 		select {
