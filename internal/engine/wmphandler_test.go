@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1834,6 +1835,7 @@ type cancellableFlowHandler struct {
 	flow      *Flow
 	cancelled chan struct{}
 	release   chan struct{}
+	once      sync.Once
 }
 
 func (h *cancellableFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
@@ -1841,9 +1843,13 @@ func (h *cancellableFlowHandler) Execute(ctx context.Context, msg *FlowStartMess
 	return nil
 }
 
+// Cancel is idempotent, like real handlers' (context cancel): session
+// teardown cancels active flows again after an explicit wmp.flow.cancel.
 func (h *cancellableFlowHandler) Cancel() {
-	close(h.cancelled)
-	close(h.release)
+	h.once.Do(func() {
+		close(h.cancelled)
+		close(h.release)
+	})
 }
 
 // matchFlowHandler requests a DCQL credential match and reports what it
