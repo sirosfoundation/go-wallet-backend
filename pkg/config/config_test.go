@@ -18,7 +18,7 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 }
 
@@ -31,7 +31,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -60,7 +60,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -111,7 +111,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -130,7 +130,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -149,7 +149,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -231,7 +231,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -252,7 +252,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -288,7 +288,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -309,7 +309,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -759,7 +759,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -787,7 +787,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -806,7 +806,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 		}
 	}
 
@@ -1918,7 +1918,7 @@ func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T
 	cfg := defaultConfig()
 	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
 	cfg.Storage = StorageConfig{Type: "memory"}
-	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"}
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error on zero-config default: %v", err)
@@ -2829,4 +2829,45 @@ func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
 	if len(hops) != 1 {
 		t.Errorf("the plaintext hop must never reach the base transport, hops=%v", hops)
 	}
+}
+
+// Legacy HMAC tokens are pinned to jwt.issuer, so an empty one while legacy
+// is enabled would accept any token signed with the shared secret.
+func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
+	t.Run("legacy on and empty issuer is rejected", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Fatalf("expected jwt.issuer error, got %v", err)
+		}
+	})
+	t.Run("AS on, legacy on and empty jwt.issuer is rejected even with as.issuer", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		cfg.AS.Enabled = true
+		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.Legacy.Enabled = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Fatalf("expected jwt.issuer error, got %v", err)
+		}
+	})
+	t.Run("legacy off may omit it", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		cfg.AS.Enabled = true
+		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.Legacy.Enabled = false
+		cfg.AS.SigningKeyPath = filepath.Join(t.TempDir(), "as.key")
+		cfg.AS.RulesDir = t.TempDir()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("legacy off with empty jwt.issuer must be valid: %v", err)
+		}
+	})
+	t.Run("normal config", func(t *testing.T) {
+		if err := validBaseConfig().Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

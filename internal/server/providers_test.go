@@ -1795,3 +1795,49 @@ func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
 		t.Fatalf("expected 2 Services (auth + storage), got %d: an extra one leaks its HSM sessions", count)
 	}
 }
+
+// With legacy HMAC tokens enabled, an empty jwt.issuer would leave the
+// accepted legacy issuer list empty and accept any token signed with the
+// shared secret. Every validator constructor refuses it; with legacy off the
+// issuer may be empty.
+func TestConstructors_RefuseLegacyWithEmptyJWTIssuer(t *testing.T) {
+	legacyOn := func() *config.Config {
+		return &config.Config{JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}}
+	}
+	for name, ext := range map[string]string{"no external_url": "", "external_url": "https://as.example.org"} {
+		cfg := legacyOn()
+		cfg.AS.ExternalURL = ext
+		if _, err := NewStandaloneEngineTokenValidator(cfg, zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Errorf("standalone engine (%s): expected jwt.issuer rejection, got %v", name, err)
+		}
+	}
+	if _, err := NewBackendProvider(legacyOn(), zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewBackendProvider: expected jwt.issuer rejection, got %v", err)
+	}
+	asOn := legacyOn()
+	asOn.AS.Enabled = true
+	asOn.AS.Legacy.Enabled = true
+	if _, err := NewBackendProvider(asOn, zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewBackendProvider (AS on): expected jwt.issuer rejection, got %v", err)
+	}
+	if _, err := NewWalletProviderProvider(legacyOn(), zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewWalletProviderProvider: expected jwt.issuer rejection, got %v", err)
+	}
+
+	// Legacy off: no HMAC path, so an empty jwt.issuer is fine.
+	off := legacyOn()
+	off.AS.Enabled = true
+	off.AS.Issuer = "https://as.example.org"
+	if err := requireLegacyIssuer(off, "backend"); err != nil {
+		t.Errorf("legacy off with empty jwt.issuer must be accepted: %v", err)
+	}
+	if _, err := NewStandaloneEngineTokenValidator(off, zap.NewNop()); err != nil && strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("standalone engine, legacy off: must not demand jwt.issuer: %v", err)
+	}
+	// A normal configuration passes.
+	ok := legacyOn()
+	ok.JWT.Issuer = "wallet-backend"
+	if err := requireLegacyIssuer(ok, "backend"); err != nil {
+		t.Errorf("normal config rejected: %v", err)
+	}
+}

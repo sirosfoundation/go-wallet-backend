@@ -974,7 +974,12 @@ type JWTConfig struct {
 	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
+	// Issuer is the "iss" of legacy HMAC session tokens, and the only issuer
+	// the validators accept on them. Default: "wallet-backend". It may be
+	// empty only when legacy tokens are disabled (as.legacy.enabled=false);
+	// with legacy enabled, an empty value is refused at validation and when
+	// the validators are built.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -2090,6 +2095,12 @@ func (c *Config) Validate() error {
 	}
 	if len(c.JWT.Secret) < 32 {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
+	}
+	// Legacy HMAC tokens are pinned to jwt.issuer; with it empty the
+	// validator would accept any token signed with the shared secret whatever
+	// its iss. With legacy disabled there is no HMAC path and it may be empty.
+	if c.LegacyEnabled() && c.JWT.Issuer == "" {
+		return fmt.Errorf("jwt.issuer is required while legacy session tokens are enabled (as.legacy.enabled=true); set jwt.issuer or disable legacy tokens")
 	}
 
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins

@@ -497,6 +497,11 @@ func (v StandaloneValidator) Close() error { v.Stop(); return v.relay.Close() }
 // could never be reached. Audiences are deliberately not configured on the
 // validator: legacy tokens carry aud = RP ID and audience filtering is
 // applied to new-style tokens only.
+//
+// An empty jwt.issuer with legacy enabled would leave the list empty and
+// accept any issuer; callers must have passed requireLegacyIssuer first (the
+// constructors do, before opening any resource), so that state is refused
+// rather than reached here.
 func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.LegacyConfig {
 	lc := tokenvalidator.LegacyConfig{
 		Enabled:    enabled,
@@ -518,6 +523,9 @@ func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.Lega
 // silently rejecting every connection. Returns (nil, nil) when no validator is
 // needed.
 func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+	if err := requireLegacyIssuer(cfg, "standalone engine"); err != nil {
+		return nil, err
+	}
 	if cfg.AS.ExternalURL == "" {
 		if !cfg.LegacyEnabled() {
 			return nil, fmt.Errorf("standalone engine with as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections")
@@ -632,6 +640,20 @@ type BackendProvider struct {
 func requireSessionAuthMechanism(cfg *config.Config, role string) error {
 	if !cfg.AS.Enabled && !cfg.LegacyEnabled() {
 		return fmt.Errorf("%s role serves protected routes but as.enabled=false and as.legacy.enabled=false leave no way to authenticate session tokens; enable the AS (as.enabled=true) or set as.legacy.enabled=true", role)
+	}
+	return requireLegacyIssuer(cfg, role)
+}
+
+// requireLegacyIssuer refuses to build any token validator while legacy HMAC
+// tokens are enabled and jwt.issuer is empty. The legacy issuer list would be
+// empty, and the validator would then accept any token signed with the shared
+// secret whatever its iss (the AS issuer only gates asymmetric tokens). It is
+// checked before any resource is opened so every constructor fails closed,
+// independent of config validation. With legacy disabled there is no HMAC
+// path and jwt.issuer may be empty.
+func requireLegacyIssuer(cfg *config.Config, role string) error {
+	if cfg.LegacyEnabled() && cfg.JWT.Issuer == "" {
+		return fmt.Errorf("%s: jwt.issuer must not be empty while legacy HMAC session tokens are enabled (as.legacy.enabled): without it any token signed with jwt.secret would be accepted regardless of iss; set jwt.issuer or disable legacy tokens", role)
 	}
 	return nil
 }

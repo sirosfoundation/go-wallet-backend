@@ -120,7 +120,7 @@ Environment prefix: `WALLET_JWT`
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | Path to file containing JWT secret |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer |  |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
-| `jwt.issuer` | `WALLET_JWT_ISSUER` | string |  |
+| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" of legacy HMAC session tokens, and the only issuer the validators accept on them. Default: "wallet-backend". It may be empty only when legacy tokens are disabled (as.legacy.enabled=false); with legacy enabled, an empty value is refused at validation and when the validators are built. |
 
 ## as
 
