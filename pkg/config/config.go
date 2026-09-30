@@ -247,7 +247,8 @@ const (
 // about to present in an OpenID4VP flow.
 type PresentationConfig struct {
 	// StatusCheck controls the Token Status List (draft-ietf-oauth-status-list)
-	// check on presented SD-JWT VCs that carry a `status.status_list` claim.
+	// check on presented JWT-shaped credentials (SD-JWT VC / JWT VC) that carry a
+	// `status.status_list` claim.
 	// The verifier, not the wallet, is responsible for the authoritative
 	// check, and a list may be reachable by the issuer and verifier but not
 	// by the wallet, so the default never blocks a presentation. Values:
@@ -256,8 +257,10 @@ type PresentationConfig struct {
 	// a revoked credential, but never refuse; a revocation logs
 	// "credential status revoked");
 	// `enforce-revoked` (refuse with CREDENTIAL_REVOKED only when the list
-	// was fetched, its JWS verified against the x5c/jwk in its header, that
-	// signer key accepted by the go-trust issuer PDP, and the entry is non-zero, i.e. INVALID, SUSPENDED or application-specific; if
+	// was fetched, verified (a JWT list: its JWS against the x5c/jwk in its
+	// header; a CWT list: its COSE_Sign1 against the x5chain in its headers),
+	// that signer key accepted by the go-trust issuer PDP, and the entry is
+	// non-zero, i.e. INVALID, SUSPENDED or application-specific; if
 	// the list cannot be fetched or verified, log a warning and proceed);
 	// `strict` (refuse unless the entry is positively VALID: an unreachable,
 	// unsigned, expired or malformed list also refuses, with
@@ -270,7 +273,7 @@ type PresentationConfig struct {
 	// status_list_signer_fallback is false); the
 	// go-trust deployment must define a policy of that name or go-trust applies
 	// its default policy (docs/adr/012-trust-evaluation-architecture.md).
-	// A list without a verifiable, trusted signer key (no x5c/jwk, no PDP
+	// A list without a verifiable, trusted signer key (no x5c/jwk/x5chain, no PDP
 	// configured, negative or failed trust decision) is unverifiable and never
 	// produces a verdict in any mode.
 	// mdoc credentials are not checked. Unknown values fail at startup.
