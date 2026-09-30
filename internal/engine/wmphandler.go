@@ -44,6 +44,7 @@ type WMPAdapter struct {
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	loopDone chan struct{} // closed when cleanupLoop has exited
 }
 
 // maxWMPBufferedEvents bounds how many past SSE events are retained per
@@ -268,6 +269,21 @@ const wmpSessionIdleTimeout = 10 * time.Minute
 // duration the token is invalid and the client must create a new session.
 const resumptionTokenTTL = 10 * time.Minute
 
+// capSeconds converts a client-supplied number of seconds to a Duration,
+// capped at limit. The cap is applied to the integer BEFORE multiplying, so
+// values near MaxInt cannot overflow time.Duration into a negative (and thus
+// uncapped) value. Non-positive input yields 0 ("not set").
+func capSeconds(seconds int, limit time.Duration) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	maxSeconds := int64(limit / time.Second)
+	if int64(seconds) >= maxSeconds {
+		return limit
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // maxFlowIDLength limits client-supplied flow IDs to prevent memory abuse.
 const maxFlowIDLength = 128
 
@@ -329,18 +345,26 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger) *WMPAdapter {
 		resumptionTokens: make(map[string]*resumptionEntry),
 		eventBufs:        make(map[string]*wmpEventBuffer),
 		stopCh:           make(chan struct{}),
+		loopDone:         make(chan struct{}),
 	}
 	go a.cleanupLoop()
 	return a
 }
 
-// Close stops the cleanup loop.
+// Close stops the cleanup loop and waits for it to exit. Safe to call more
+// than once. Live sessions are closed when the engine Manager is closed.
 func (a *WMPAdapter) Close() {
 	a.stopOnce.Do(func() { close(a.stopCh) })
+	if a.loopDone != nil {
+		<-a.loopDone
+	}
 }
 
 // cleanupLoop periodically removes expired resumption tokens and idle sessions.
 func (a *WMPAdapter) cleanupLoop() {
+	if a.loopDone != nil {
+		defer close(a.loopDone)
+	}
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -650,11 +674,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 
 	// Compute session expiry from client TTL (capped).
 	var expiresAt time.Time
-	if params.TTL > 0 {
-		ttl := time.Duration(params.TTL) * time.Second
-		if ttl > maxSessionTTL {
-			ttl = maxSessionTTL
-		}
+	if ttl := capSeconds(params.TTL, maxSessionTTL); ttl > 0 {
 		expiresAt = time.Now().Add(ttl)
 	}
 
@@ -822,7 +842,12 @@ func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) 
 	defer ws.session.flowsMu.RUnlock()
 
 	for _, flow := range ws.session.flows {
-		if flow.State == "" {
+		// State is written under flow.mu (BaseHandler.Progress); flowsMu only
+		// protects the map itself.
+		flow.mu.RLock()
+		state := flow.State
+		flow.mu.RUnlock()
+		if state == "" {
 			continue
 		}
 		_ = peer.Notify(context.Background(), wmp.MethodFlowProgress, &wmp.FlowProgressParams{
@@ -831,7 +856,7 @@ func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) 
 				SessionID: sessionID,
 			},
 			FlowID: flow.ID,
-			Step:   string(flow.State),
+			Step:   string(state),
 		})
 	}
 }
@@ -902,10 +927,10 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// correlation carry over from the session being resumed.
 	ct := wmp.NewChannelTransport(50, 200)
 	handler := &wmpEngineHandler{
-		adapter:    a,
-		sessionID:  params.SessionID,
-		session:    oldWS.session,
-		childFlows: oldWS.handler.takeChildFlows(),
+		adapter:   a,
+		sessionID: params.SessionID,
+		session:   oldWS.session,
+		children:  oldWS.handler.table(), // shared, not moved: a losing resume leaves it untouched
 	}
 	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
 	wmpTransport := newWMPSessionTransport(peer, ct)
@@ -962,6 +987,21 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	_ = oldWS.transport.Close()
 	<-oldWS.pumpDone
 
+	// Re-check revocation now that the replacement transport is installed.
+	// The caller's token was validated before this point; an account
+	// revocation that closed the OLD transport (and finished its scan of live
+	// sessions) before the swap above would otherwise leave this resumed
+	// session open. Revocation marks the user before it closes sessions, so
+	// either the mark is visible here, or the closing scan runs after the swap
+	// and closes the new transport.
+	if a.manager.userRevoked(caller.UserID) {
+		a.logger.Warn("WMP session.resume rejected: user revoked", zap.String("session_id", params.SessionID))
+		a.closeSessionIfCurrent(params.SessionID, ws)
+		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
+			"reason": "invalid or expired token",
+		})
+	}
+
 	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone)
 	go func() {
 		_ = peer.Serve(sessionCtx)
@@ -1009,8 +1049,27 @@ type wmpEngineHandler struct {
 	sessionID string
 	session   *Session
 
-	childFlowsMu sync.Mutex
-	childFlows   map[string]*childFlowInfo // childFlowID → info
+	// children holds outstanding sub-flow correlation state. It is shared
+	// (by pointer) between a session's successive connections' handlers, so
+	// resuming needs no transfer step that a losing concurrent resume could
+	// corrupt. Lazily created; see table().
+	childOnce sync.Once
+	children  *childFlowTable
+}
+
+// childFlowTable is the child-flow correlation map with its lock.
+type childFlowTable struct {
+	mu    sync.Mutex
+	flows map[string]*childFlowInfo // childFlowID → info
+}
+
+func (h *wmpEngineHandler) table() *childFlowTable {
+	h.childOnce.Do(func() {
+		if h.children == nil {
+			h.children = &childFlowTable{}
+		}
+	})
+	return h.children
 }
 
 // childFlowInfo tracks a nested sub-flow (sign or match) so that when
@@ -1023,34 +1082,26 @@ type childFlowInfo struct {
 }
 
 func (h *wmpEngineHandler) registerChildFlow(childFlowID, parentFlowID, messageID, flowType string) {
-	h.childFlowsMu.Lock()
-	defer h.childFlowsMu.Unlock()
-	if h.childFlows == nil {
-		h.childFlows = make(map[string]*childFlowInfo)
+	t := h.table()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.flows == nil {
+		t.flows = make(map[string]*childFlowInfo)
 	}
-	h.childFlows[childFlowID] = &childFlowInfo{
+	t.flows[childFlowID] = &childFlowInfo{
 		parentFlowID: parentFlowID,
 		messageID:    messageID,
 		flowType:     flowType,
 	}
 }
 
-// takeChildFlows hands the outstanding child-flow correlation state to the
-// handler of a resumed connection (the old handler is retired).
-func (h *wmpEngineHandler) takeChildFlows() map[string]*childFlowInfo {
-	h.childFlowsMu.Lock()
-	defer h.childFlowsMu.Unlock()
-	m := h.childFlows
-	h.childFlows = nil
-	return m
-}
-
 func (h *wmpEngineHandler) popChildFlow(childFlowID string) (*childFlowInfo, bool) {
-	h.childFlowsMu.Lock()
-	defer h.childFlowsMu.Unlock()
-	info, ok := h.childFlows[childFlowID]
+	t := h.table()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	info, ok := t.flows[childFlowID]
 	if ok {
-		delete(h.childFlows, childFlowID)
+		delete(t.flows, childFlowID)
 	}
 	return info, ok
 }
@@ -1111,44 +1162,11 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		}
 	}
 
-	// Check concurrent flow limit and duplicate IDs. Both under flowsMu with
-	// the registration below, so a repeated client-supplied flow_id can
-	// neither overwrite a live flow's map entry (bypassing the limit) nor
-	// cause one flow's completion to delete the other's registration.
-	h.session.flowsMu.Lock()
-	if _, dup := h.session.flows[flowID]; dup {
-		h.session.flowsMu.Unlock()
-		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
-			"reason": "flow_id already in use",
-		})
-	}
-	if len(h.session.flows) >= MaxPendingFlowsPerSession {
-		h.session.flowsMu.Unlock()
-		return nil, wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{
-			"reason": "too many pending flows",
-		})
-	}
-
-	// Create and register engine flow.
-	flow := &Flow{
-		ID:        flowID,
-		Protocol:  protocol,
-		Session:   h.session,
-		State:     FlowStep("started"),
-		StartTime: time.Now(),
-		Data:      make(map[string]interface{}),
-	}
-	h.session.flows[flowID] = flow
-	h.session.flowsMu.Unlock()
-
 	// Parse WMP params into engine FlowStartMessage.
 	var startMsg FlowStartMessage
 	if params.Params != nil {
 		if err := json.Unmarshal(params.Params, &startMsg); err != nil {
 			logger.Warn("invalid flow_start params", zap.Error(err))
-			h.session.flowsMu.Lock()
-			delete(h.session.flows, flowID)
-			h.session.flowsMu.Unlock()
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
 				"reason": "invalid flow params",
 			})
@@ -1157,26 +1175,63 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	startMsg.FlowID = flowID
 	startMsg.Protocol = protocol
 
-	// Create engine handler via factory.
+	// checkSlot rejects a duplicate client-supplied flow_id (which would
+	// overwrite a live flow's map entry, bypassing the limit, and let either
+	// flow's completion delete the other's registration) and enforces the
+	// concurrent-flow limit. Callers hold flowsMu.
+	checkSlot := func() *wmp.RPCError {
+		if _, dup := h.session.flows[flowID]; dup {
+			return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "flow_id already in use"})
+		}
+		if len(h.session.flows) >= MaxPendingFlowsPerSession {
+			return wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{"reason": "too many pending flows"})
+		}
+		return nil
+	}
+
+	// Early rejection before doing any work.
+	h.session.flowsMu.RLock()
+	rpcErr := checkSlot()
+	h.session.flowsMu.RUnlock()
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	// Build the flow and its handler BEFORE the flow becomes visible in
+	// session.flows: a concurrent wmp.flow.cancel/action (or session
+	// teardown) must never observe a registered flow whose Handler is not yet
+	// set - it would report "cancelled" and then let the handler run anyway.
+	flow := &Flow{
+		ID:        flowID,
+		Protocol:  protocol,
+		Session:   h.session,
+		State:     FlowStep("started"),
+		StartTime: time.Now(),
+		Data:      make(map[string]interface{}),
+	}
 	m := h.adapter.manager
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
 	if err != nil {
-		h.session.flowsMu.Lock()
-		delete(h.session.flows, flowID)
-		h.session.flowsMu.Unlock()
 		return nil, wmp.NewRPCError(wmp.ErrInternalError, map[string]string{
 			"reason": "failed to create flow handler",
 		})
 	}
 	flow.Handler = handler
 
+	// Publish atomically with the authoritative duplicate/limit check.
+	h.session.flowsMu.Lock()
+	if rpcErr := checkSlot(); rpcErr != nil {
+		h.session.flowsMu.Unlock()
+		handler.Cancel()
+		return nil, rpcErr
+	}
+	h.session.flows[flowID] = flow
+	h.session.flowsMu.Unlock()
+
 	// Determine flow timeout: client-supplied (spec §6.2) or server default.
 	flowTimeout := defaultFlowTimeout
-	if params.Timeout > 0 {
-		clientTimeout := time.Duration(params.Timeout) * time.Second
-		if clientTimeout < flowTimeout {
-			flowTimeout = clientTimeout
-		}
+	if clientTimeout := capSeconds(params.Timeout, defaultFlowTimeout); clientTimeout > 0 {
+		flowTimeout = clientTimeout
 	}
 
 	// Launch the engine flow goroutine. The engine handler calls

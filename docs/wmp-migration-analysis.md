@@ -40,7 +40,7 @@ pattern — not streaming.
 
 ```
 POST /wmp/rpc                     → JSON-RPC requests (flow.start, flow.action, etc.)
-GET  /wmp/events?session_id=...   → SSE stream of server notifications (progress, sign_request, etc.)
+GET  /wmp/events?session_id=...   → SSE stream of server notifications (progress, sign/match sub-flow starts, etc.)
 ```
 
 This eliminates all WebSocket connection management while preserving the exact
@@ -54,7 +54,7 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 |------|----------|-----|
 | OID4VP | Stub | Fully implemented (DCQL matching, consent, VP signing) |
 | Trust evaluation | Server-side only | Delegated to frontend via progress step + `trust_result` action |
-| Credential matching | Not implemented | Privacy-preserving DCQL `match_request`/`match_response` |
+| Credential matching | Not implemented | Privacy-preserving DCQL matching via a nested `match` sub-flow |
 | Issuer metadata | External fetch | `RegistryClient` with local resolution for registered issuers |
 | Flow actions | `select_credential`, `consent` | + `trust_result`, `credentials_matched`, `decline`, `provide_pin`, `authorization_complete` |
 | Session store | Memory only | + Redis option for horizontal scaling |
@@ -103,12 +103,12 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 │                                                                         │
 │  GET /wmp/events?session_id=... ──────►  Open SSE stream                │
 │  ◄─ event: notification ──────────────   Server pushes notifications    │
-│     data: {method: "wmp.flow.progress",  (progress, sign_request,       │
-│            params: {step: "..."}}         match_request, complete, etc.) │
+│     data: {method: "wmp.flow.progress",  (progress, sub-flow starts,     │
+│            params: {step: "..."}}         complete, etc.)                 │
 │                                                                         │
 │  POST /wmp/rpc ───────────────────────►  Handle action                  │
 │    {method: "wmp.flow.action",           Return acknowledgment          │
-│     params: {action: "sign_response"}}                                  │
+│     params: {action: "consent"}}                                        │
 │  ◄─────────────────────────────────────  {result: {status: "accepted"}} │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -389,10 +389,10 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 | `{"type":"flow_action","action":"...","payload":{}}` | `wmp.flow.action` request | WMP returns `FlowActionResult`; engine is fire-and-forget |
 | `{"type":"flow_complete","credentials":[...]}` | `wmp.flow.complete` notification | WMP result is generic `json.RawMessage` |
 | `{"type":"flow_error","error":{"code":"...","message":"..."}}` | `wmp.flow.error` notification | WMP uses integer codes; engine uses strings |
-| `{"type":"sign_request","action":"...","params":{}}` | **No direct equivalent** | See "Sign Convention" below |
-| `{"type":"sign_response","proof_jwt":"..."}` | **No direct equivalent** | See "Sign Convention" below |
-| `{"type":"match_request","dcql_query":{}}` | **No direct equivalent** | See "Match Convention" below |
-| `{"type":"match_response","matches":[...]}` | **No direct equivalent** | See "Match Convention" below |
+| `{"type":"sign_request","action":"...","params":{}}` | Nested `sign` sub-flow: server sends `wmp.flow.start` (`flow_type:"sign"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"sign_response","proof_jwt":"..."}` | Nested `sign` sub-flow: server sends `wmp.flow.start` (`flow_type:"sign"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"match_request","dcql_query":{}}` | Nested `match` sub-flow: server sends `wmp.flow.start` (`flow_type:"match"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"match_response","matches":[...]}` | Nested `match` sub-flow: server sends `wmp.flow.start` (`flow_type:"match"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
 | `{"type":"push","push_type":"credential_ready"}` | `wmp.message.deliver` notification | WMP is more general |
 | `{"type":"error","code":"..."}` | JSON-RPC error response | Standard JSON-RPC framing |
 | No cancel | `wmp.flow.cancel` request | WMP already has this |
@@ -464,6 +464,10 @@ func (p *Profile) HandleAction(ctx context.Context, params *FlowActionParams) (*
 Use a **goroutine bridge** that converts WMP events into channel sends,
 allowing the engine's coroutine-style handlers to run unchanged:
 
+> Historical design sketch: it models sign/match as a `sign_request` progress
+> step answered by `flow.action`. The implementation instead uses nested
+> sub-flows; see "Sign and Match Convention" below.
+
 ```go
 type FlowBridge struct {
     peer     wmp.PeerContext
@@ -511,104 +515,50 @@ func (b *FlowBridge) RequestSign(ctx context.Context, action string, signParams 
 
 This preserves the engine's linear flow logic while using WMP as the wire protocol.
 
-### Sign Convention
+### Sign and Match Convention (as implemented)
 
-WMP does not have dedicated `sign_request`/`sign_response` message types.
-There are two options:
-
-#### Option A: Flow Progress + Action (Recommended)
-
-Use `wmp.flow.progress` as the "request" and `wmp.flow.action` as the "response":
+WMP has no dedicated sign/match message types. The implementation
+(`wmpSessionTransport.SendJSON` in `internal/engine/wmphandler.go`) uses
+**nested sub-flows**, not progress/action round trips:
 
 ```
-Server → Client: wmp.flow.progress notification
+Server → Client: wmp.flow.start request (blocks until the client acks it,
+                 bounded by childFlowStartTimeout)
 {
   "wmp": {"version": "0.1", "session_id": "..."},
-  "flow_id": "flow-123",
-  "step": "sign_request",
-  "payload": {
-    "message_id": "sign-001",
+  "flow_type": "sign",                  // or "match"
+  "flow_id": "<child-flow-uuid>",       // server-chosen, distinct from the parent
+  "params": {                           // openid4x.SignSubFlowParams
     "action": "generate_proof",
-    "params": {
-      "audience": "https://issuer.example.com",
-      "nonce": "n-0S6_WzA2Mj",
-      "proof_type": "jwt"
-    }
+    "parent_flow_id": "flow-123",
+    "audience": "https://issuer.example.com",
+    "nonce": "n-0S6_WzA2Mj",
+    "proof_type": "jwt"
   }
 }
+// match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123"}
 
-Client → Server: wmp.flow.action request
+Client → Server: result of flow.start (acknowledges the child flow)
+
+Client → Server: wmp.flow.complete notification for the CHILD flow_id
 {
   "wmp": {"version": "0.1", "session_id": "..."},
-  "flow_id": "flow-123",
-  "action": "sign_response",
-  "params": {
-    "message_id": "sign-001",
-    "proof_jwt": "eyJ..."
-  }
+  "flow_id": "<child-flow-uuid>",
+  "result": { "proof_jwt": "eyJ..." }   // match: {"matches": [...]}
 }
 ```
 
-**Pros**: Uses existing WMP methods, no protocol extension needed.  
-**Cons**: `flow.action` returns a result (synchronous), which means the server
-acknowledges receiving the signature — this is actually correct behavior.
+`FlowComplete` looks the child flow ID up, tags the result with the parent
+flow and message IDs, and delivers it to the engine's blocking
+`RequestSign`/`RequestMatch`. The child-flow table survives
+`wmp.session.resume`, so a result sent after a reconnect still reaches the
+parent flow. Delivery to a full channel waits briefly and keeps the mapping
+so the client can retry.
 
-#### Option B: Custom Methods via MethodHandler
-
-Register `wmp.sign.request` and `wmp.match.request` as custom methods:
-
-```go
-type SignProfile struct { ... }
-
-func (p *SignProfile) Methods() []string {
-    return []string{"wmp.sign.request", "wmp.match.request"}
-}
-
-func (p *SignProfile) HandleMethod(ctx context.Context, method string, params json.RawMessage) (interface{}, error) {
-    // ...
-}
-```
-
-**Pros**: Clean separation, explicit semantics.  
-**Cons**: Adds methods outside the WMP spec; may confuse interop.
-
-**Recommendation**: Option A. The `flow.progress` → `flow.action` round-trip
-maps naturally to the engine's `RequestSign` → `sign_response` pattern. The
-`step` field disambiguates sign requests from other progress notifications.
-
-### Match Convention
-
-Same pattern as signing — use flow progress/action:
-
-```
-Server → Client: wmp.flow.progress notification
-{
-  "flow_id": "flow-123",
-  "step": "match_request",
-  "payload": {
-    "message_id": "match-001",
-    "dcql_query": { ... }
-  }
-}
-
-Client → Server: wmp.flow.action request
-{
-  "flow_id": "flow-123",
-  "action": "match_response",
-  "params": {
-    "message_id": "match-001",
-    "matches": [
-      {
-        "credential_query_id": "id_card",
-        "credential_id": "local-cred-1",
-        "format": "vc+sd-jwt",
-        "vct": "https://example.com/id-card",
-        "available_claims": ["given_name", "family_name"]
-      }
-    ]
-  }
-}
-```
+For backwards compatibility the server also accepts the engine-native
+`wmp.flow.action` with `action: "sign_response"` / `"match_response"`
+(carrying `message_id`) on the parent flow; new clients should use the
+child `wmp.flow.complete`.
 
 ### Trust Evaluation Convention
 
@@ -713,8 +663,8 @@ The engine's `UserFacingMessage()` function maps to the WMP `ErrorMessage()` pat
 |------|--------|----------|
 | `OIDFlowHTTPTransport` class (~200 LoC: fetch + EventSource) | Medium | P0 |
 | JSON-RPC 2.0 request/response helpers | Small | P0 |
-| Map existing sign handler to `flow.action` with action `sign_response` | Small | P0 |
-| Map existing match handler to `flow.action` with action `match_response` | Small | P0 |
+| Handle nested `sign` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
+| Handle nested `match` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
 | Map incoming SSE `flow.progress` to existing event callbacks | Small | P0 |
 | Handle `Last-Event-ID` for reconnection after OAuth redirect | Small | P0 |
 | Transport selection: prefer HTTP+SSE, fall back to WebSocket | Small | P1 |
@@ -919,10 +869,14 @@ Week 8: Cleanup
    - No automatic fallback logic in the frontend — the deployment config
      determines which transport class is instantiated
 
-5. ~~Should `wmp.flow.progress` with `step: "sign_request"` be promoted
-   to a first-class WMP method (`wmp.sign.request`)?~~
-   **Decided**: Keep as flow progress/action. The generic `step` field is
-   more flexible, doesn't require WMP spec changes, and maps directly to
-   the engine's existing `RequestSign`/`RequestMatch` pattern. If interop
-   with other WMP implementations becomes a concern, promote to first-class
-   methods at that point.
+5. ~~Should sign/match requests be a progress step, a first-class WMP method
+   (`wmp.sign.request`), or something else?~~
+   **Decided**: Neither. Sign and match requests are **nested sub-flows**: the
+   server sends `wmp.flow.start` with `flow_type` `sign` or `match` and a
+   fresh child `flow_id` (parent referenced by `parent_flow_id` in the
+   params), and the client returns the result with `wmp.flow.complete` for
+   the child flow, which the engine routes to `RequestSign`/`RequestMatch`.
+   This needs no WMP spec change and keeps requests and results correlated
+   by flow ID. The earlier "progress step + `sign_response` action" design is
+   obsolete (the action form is still accepted for compatibility). See "Sign
+   and Match Convention".

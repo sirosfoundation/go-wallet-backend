@@ -329,6 +329,12 @@ func main() {
 		logger.Error("Server shutdown error", zap.Error(err))
 	}
 
+	// Stop the engine provider's WMP adapter (cleanup goroutine) and close
+	// the engine manager's live sessions.
+	if engineProvider != nil {
+		engineProvider.Close()
+	}
+
 	// Cleanup resources
 	for _, r := range resources {
 		if err := r.Close(); err != nil {

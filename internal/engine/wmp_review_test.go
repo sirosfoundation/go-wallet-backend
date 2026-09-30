@@ -710,3 +710,297 @@ func TestWMP_Events_SubscriptionClosesWithSession(t *testing.T) {
 		}
 	}, time.Second, 5*time.Millisecond)
 }
+
+// --- second review round ---
+
+func TestCapSeconds(t *testing.T) {
+	const maxInt = int(^uint(0) >> 1)
+	assert.Equal(t, time.Duration(0), capSeconds(0, time.Hour))
+	assert.Equal(t, time.Duration(0), capSeconds(-5, time.Hour))
+	assert.Equal(t, 90*time.Second, capSeconds(90, time.Hour))
+	assert.Equal(t, time.Hour, capSeconds(3600, time.Hour))
+	assert.Equal(t, time.Hour, capSeconds(3601, time.Hour))
+	assert.Equal(t, 24*time.Hour, capSeconds(maxInt, 24*time.Hour), "MaxInt seconds must cap, not overflow to a negative duration")
+	assert.Equal(t, 24*time.Hour, capSeconds(maxInt/2, 24*time.Hour))
+}
+
+func TestWMP_SessionCreate_HugeTTLIsCapped(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	const maxInt = int(^uint(0) >> 1)
+	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.TTL = maxInt })
+
+	a.mu.RLock()
+	exp := a.peers[sid].expiresAt
+	a.mu.RUnlock()
+	require.False(t, exp.IsZero())
+	assert.True(t, exp.After(time.Now()), "expiry must be in the future, not wrapped negative")
+	assert.WithinDuration(t, time.Now().Add(maxSessionTTL), exp, time.Minute)
+}
+
+func TestWMP_FlowStart_HugeTimeoutIsCapped(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	const maxInt = int(^uint(0) >> 1)
+	h := &blockingHandler{release: make(chan struct{})}
+	defer close(h.release)
+	m.RegisterFlowHandler("blocker", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		return h, nil
+	})
+	sid := createWMPSession(t, a)
+	body := wmpRequest("3", wmp.MethodFlowStart, wmp.FlowStartParams{
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: sid}, FlowType: "blocker", FlowID: "f", Timeout: maxInt,
+	})
+	resp, err := a.HandleRPC(context.Background(), sid, "", "", body)
+	require.NoError(t, err)
+	var r wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &r))
+	require.Nil(t, r.Error)
+	// The flow must still be running (a wrapped-negative timeout would have
+	// expired its context immediately, but blockingHandler only exits on
+	// release or ctx.Done, so check the flow is still registered).
+	time.Sleep(50 * time.Millisecond)
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+	sess.flowsMu.RLock()
+	_, running := sess.flows["f"]
+	sess.flowsMu.RUnlock()
+	assert.True(t, running)
+}
+
+func TestWMP_Resume_LosingConcurrentResumeKeepsChildFlows(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, token, _ := createSessionFull(t, a, "u", "t", nil)
+	a.mu.RLock()
+	old := a.peers[sid]
+	a.mu.RUnlock()
+	old.handler.registerChildFlow("child-1", "parent", "msg-1", "sign")
+
+	var wg sync.WaitGroup
+	var okCount atomic.Int32
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := a.HandleRPC(context.Background(), "", "u", "t", resumeBody(sid, token, ""))
+			require.NoError(t, err)
+			var r wmp.Response
+			require.NoError(t, json.Unmarshal(resp, &r))
+			if r.Error == nil {
+				okCount.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), okCount.Load(), "exactly one concurrent resume may win the one-time token")
+
+	a.mu.RLock()
+	cur := a.peers[sid]
+	a.mu.RUnlock()
+	info, ok := cur.handler.popChildFlow("child-1")
+	require.True(t, ok, "losing resumes must not discard outstanding child flows")
+	assert.Equal(t, "parent", info.parentFlowID)
+	// The retired handler shares the same table, so late frames still route.
+	old.handler.registerChildFlow("child-2", "p2", "m2", "match")
+	_, ok = cur.handler.popChildFlow("child-2")
+	assert.True(t, ok)
+}
+
+func TestWMP_Resume_RejectedWhenUserRevokedAtCommit(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, token, _ := createSessionFull(t, a, "victim", "t", nil)
+
+	// Revocation lands after the token was validated by the HTTP layer
+	// (HandleRPC takes the already-validated caller) but before the resume
+	// commits: the revoked mark is set while the session-closing scan of
+	// RevokeUser has not (yet) reached this session.
+	m.revokedUsersMu.Lock()
+	m.revokedUsers["victim"] = struct{}{}
+	m.revokedUsersMu.Unlock()
+
+	resp, err := a.HandleRPC(context.Background(), "", "victim", "t", resumeBody(sid, token, ""))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp))
+
+	require.Eventually(t, func() bool {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		_, still := a.peers[sid]
+		return !still
+	}, time.Second, 5*time.Millisecond, "revoked user's resumed session must be torn down")
+	m.sessionsMu.RLock()
+	_, engineStill := m.sessions[sid]
+	m.sessionsMu.RUnlock()
+	assert.False(t, engineStill)
+}
+
+func TestManager_UserRevoked(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+	assert.False(t, m.userRevoked(""))
+	assert.False(t, m.userRevoked("u"))
+	m.revokedUsersMu.Lock()
+	m.revokedUsers["u"] = struct{}{}
+	m.revokedUsersMu.Unlock()
+	assert.True(t, m.userRevoked("u"))
+	m.SetTokenBlacklist(&revokeOnSecondCheck{})
+	_ = m.userRevoked("v")
+	assert.True(t, m.userRevoked("v"), "blacklist consulted")
+}
+
+// A concurrent wmp.flow.cancel can only see fully-constructed flows: the
+// flow becomes visible in session.flows with its Handler already set. Run
+// with -race.
+func TestWMP_FlowStart_HandlerSetBeforeFlowVisible(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	h := &blockingHandler{release: make(chan struct{})}
+	defer close(h.release)
+	m.RegisterFlowHandler("blocker", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		time.Sleep(20 * time.Millisecond) // widen the old factory window
+		return h, nil
+	})
+	sid := createWMPSession(t, a)
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+
+	stop := make(chan struct{})
+	var sawNilHandler atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			sess.flowsMu.RLock()
+			if f, ok := sess.flows["racy"]; ok && f.Handler == nil {
+				sawNilHandler.Store(true)
+			}
+			sess.flowsMu.RUnlock()
+		}
+	}()
+
+	resp, err := a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "blocker", "racy"))
+	require.NoError(t, err)
+	var r wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &r))
+	require.Nil(t, r.Error)
+	close(stop)
+	wg.Wait()
+	assert.False(t, sawNilHandler.Load(), "flow visible before its handler was set")
+
+	// Cancel now reaches the handler.
+	cancelBody := wmpRequest("4", wmp.MethodFlowCancel, wmp.FlowCancelParams{
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: sid}, FlowID: "racy",
+	})
+	_, err = a.HandleRPC(context.Background(), sid, "", "", cancelBody)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), h.cancels.Load())
+}
+
+func TestWMP_FlowStart_FactoryErrorAndBadParamsLeaveNoFlow(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	m.RegisterFlowHandler("failing", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		return nil, assert.AnError
+	})
+	sid := createWMPSession(t, a)
+	resp, err := a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "failing", "f1"))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrInternalError, rpcErrCode(t, resp))
+
+	bad := wmpRequest("5", wmp.MethodFlowStart, map[string]interface{}{
+		"wmp": wmp.Metadata{Version: wmp.Version, SessionID: sid}, "flow_type": "failing", "flow_id": "f2", "params": "not-an-object",
+	})
+	resp, err = a.HandleRPC(context.Background(), sid, "", "", bad)
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrInvalidParams, rpcErrCode(t, resp))
+
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+	sess.flowsMu.RLock()
+	defer sess.flowsMu.RUnlock()
+	assert.Empty(t, sess.flows)
+}
+
+// Resume replay reads Flow.State under flow.mu while a handler is
+// concurrently reporting progress. Run with -race.
+func TestWMP_ReplayActiveFlowProgress_RacesWithProgress(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	a.mu.RLock()
+	ws := a.peers[sid]
+	a.mu.RUnlock()
+
+	flow := &Flow{ID: "f", Session: ws.session, State: "started"}
+	ws.session.flowsMu.Lock()
+	ws.session.flows["f"] = flow
+	ws.session.flowsMu.Unlock()
+	bh := &BaseHandler{Flow: flow}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = bh.Progress(FlowStep("step"), nil)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		a.replayActiveFlowProgress(sid, ws.peer)
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// --- adapter lifecycle ---
+
+func TestWMPAdapter_CloseStopsCleanupLoop(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+	a := NewWMPAdapter(m, zap.NewNop())
+	select {
+	case <-a.loopDone:
+		t.Fatal("loop should be running before Close")
+	default:
+	}
+	a.Close()
+	select {
+	case <-a.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup goroutine still running after Close")
+	}
+	a.Close() // idempotent
+}
+
+func TestWMP_Resume_AfterFullRevocationIsSessionNotFound(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, token, _ := createSessionFull(t, a, "victim2", "t", nil)
+	m.RevokeUser("victim2")
+	require.Eventually(t, func() bool {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		_, still := a.peers[sid]
+		return !still
+	}, time.Second, 5*time.Millisecond)
+	resp, err := a.HandleRPC(context.Background(), "", "victim2", "t", resumeBody(sid, token, ""))
+	require.NoError(t, err)
+	assert.Equal(t, wmp.ErrSessionNotFound, rpcErrCode(t, resp))
+}

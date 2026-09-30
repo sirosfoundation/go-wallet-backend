@@ -733,11 +733,7 @@ func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
 	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
-		if revoked {
+		if m.userRevoked(session.UserID) {
 			m.sessionsMu.Unlock()
 			session.closeWithReason("account deleted")
 			return false
@@ -1009,6 +1005,18 @@ func (m *Manager) RevokeUser(userID string) {
 	m.revokedUsersMu.Unlock()
 
 	m.CloseUserSessions(userID, "account deleted")
+}
+
+// userRevoked reports whether userID is revoked according to either the
+// engine's own always-on set or the optional token blacklist.
+func (m *Manager) userRevoked(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	if m.isUserRevoked(userID) {
+		return true
+	}
+	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
 }
 
 // isUserRevoked reports whether userID was marked revoked via RevokeUser.
