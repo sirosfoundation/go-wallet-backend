@@ -1657,3 +1657,45 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 		t.Fatalf("expected 200 from the default tenant's passkey register/begin, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// A role that serves protected routes must refuse to start when a loaded
+// config disables both the AS and legacy HMAC tokens: it would otherwise
+// answer 401 to every request, valid session tokens included.
+func TestRequireSessionAuthMechanism(t *testing.T) {
+	load := func(t *testing.T, asYAML string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n" + asYAML
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+
+	bad := load(t, "as:\n  enabled: false\n  external_url: https://as.example.com\n  legacy:\n    enabled: false\n")
+	for _, role := range []string{"backend", "wallet-provider"} {
+		err := requireSessionAuthMechanism(bad, role)
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled") {
+			t.Errorf("%s: expected rejection, got %v", role, err)
+		}
+	}
+	if _, err := NewWalletProviderProvider(bad, zap.NewNop()); err == nil {
+		t.Error("NewWalletProviderProvider must reject as.enabled=false + as.legacy.enabled=false")
+	}
+	if _, err := NewBackendProvider(bad, zap.NewNop(), []string{"backend"}); err == nil {
+		t.Error("NewBackendProvider must reject as.enabled=false + as.legacy.enabled=false")
+	}
+
+	// Legacy on (the default) leaves HMAC usable.
+	if err := requireSessionAuthMechanism(load(t, "as:\n  enabled: false\n"), "backend"); err != nil {
+		t.Errorf("legacy enabled must be accepted: %v", err)
+	}
+	// AS enabled leaves a JWKS validator, whatever legacy says.
+	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
+		t.Errorf("AS enabled must be accepted: %v", err)
+	}
+}

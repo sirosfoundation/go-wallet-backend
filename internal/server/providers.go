@@ -596,8 +596,24 @@ type BackendProvider struct {
 	logger           *zap.Logger
 }
 
+// requireSessionAuthMechanism refuses to start a role that serves protected
+// routes when no session-token mechanism is left: with as.enabled=false the
+// role builds no JWKS validator, and with as.legacy.enabled=false the HMAC
+// fallback is refused too, so every protected request would return 401. A
+// remote-AS validator is only built for the standalone engine, so the
+// operator must either enable the AS or keep legacy tokens on.
+func requireSessionAuthMechanism(cfg *config.Config, role string) error {
+	if !cfg.AS.Enabled && !cfg.LegacyEnabled() {
+		return fmt.Errorf("%s role serves protected routes but as.enabled=false and as.legacy.enabled=false leave no way to authenticate session tokens; enable the AS (as.enabled=true) or set as.legacy.enabled=true", role)
+	}
+	return nil
+}
+
 // NewBackendProvider creates a combined auth+storage provider
 func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) (*BackendProvider, error) {
+	if err := requireSessionAuthMechanism(cfg, "backend"); err != nil {
+		return nil, err
+	}
 	// Initialize storage backend
 	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	store, err := backend.New(initCtx, cfg)
@@ -1112,6 +1128,9 @@ type WalletProviderProvider struct {
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
 func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletProviderProvider, error) {
+	if err := requireSessionAuthMechanism(cfg, "wallet-provider"); err != nil {
+		return nil, err
+	}
 	store, err := backend.New(context.Background(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create backend: %w", err)

@@ -134,7 +134,8 @@ type ASLegacyConfig struct {
 // It follows as.legacy.enabled (default true; false refuses HMAC everywhere
 // and stops legacy issuance). For a Config that did not come through Load()
 // (tests, programmatic use) a disabled AS means HMAC is the only mechanism
-// and stays enabled.
+// and stays enabled. The backend and wallet-provider roles refuse to start
+// when this is false and as.enabled is false too (no token mechanism left).
 func (c *Config) LegacyEnabled() bool {
 	if c.loaded {
 		return c.AS.Legacy.Enabled
