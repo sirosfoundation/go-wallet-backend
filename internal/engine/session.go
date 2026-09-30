@@ -106,6 +106,10 @@ type Session struct {
 	signCh   chan *SignResponseMessage
 	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
+	// stash parks client responses that arrived on the shared channels above
+	// but belong to a different concurrent flow/request than the waiter that
+	// read them, so no flow can consume (and lose) another flow's input.
+	stash responseStash
 	// closeOnce makes endSession idempotent: the transport-specific read
 	// loop (handleSession) and the WMP adapter's session teardown can both
 	// end the same session.
@@ -1352,6 +1356,10 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	timer := time.NewTimer(3 * time.Minute)
 	defer timer.Stop()
 	for {
+		wake := s.stash.waitChan()
+		if resp := s.stash.takeSign(messageID); resp != nil {
+			return resp, nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -1359,11 +1367,13 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 			return nil, ErrSignTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
+		case <-wake:
 		case resp := <-s.signCh:
 			if resp.MessageID == messageID {
 				return resp, nil
 			}
-			// Wrong message ID, keep waiting
+			// Another request's response: park it for its waiter.
+			s.stash.putSign(resp)
 		}
 	}
 }
@@ -1400,24 +1410,33 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 	defer timer.Stop()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrMatchTimeout
-		case <-s.closeCh:
-			return nil, errors.New("session closed")
-		case resp := <-s.matchCh:
-			// Verify both flow_id and message_id for proper correlation
-			if resp.FlowID == flowID && resp.MessageID == messageID {
-				// Check for error in response
-				if resp.Error != "" {
-					return nil, errors.New(resp.Error)
+		wake := s.stash.waitChan()
+		resp := s.stash.takeMatch(flowID, messageID)
+		if resp == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-timer.C:
+				return nil, ErrMatchTimeout
+			case <-s.closeCh:
+				return nil, errors.New("session closed")
+			case <-wake:
+				continue
+			case r := <-s.matchCh:
+				// Verify both flow_id and message_id for proper correlation
+				if r.FlowID != flowID || r.MessageID != messageID {
+					// Another request's response: park it for its waiter.
+					s.stash.putMatch(r)
+					continue
 				}
-				return resp, nil
+				resp = r
 			}
-			// Wrong flow_id or message_id, keep waiting
 		}
+		// Check for error in response
+		if resp.Error != "" {
+			return nil, errors.New(resp.Error)
+		}
+		return resp, nil
 	}
 }
 
@@ -1439,6 +1458,10 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 	defer timer.Stop()
 
 	for {
+		wake := s.stash.waitChan()
+		if action := s.stash.takeAction(flowID, expectedActions); action != nil {
+			return action, nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -1446,9 +1469,13 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 			return nil, ErrFlowTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
+		case <-wake:
 		case action := <-s.actionCh:
 			if action.FlowID != flowID {
-				continue // Wrong flow
+				// Another concurrent flow's action: park it for that flow's
+				// waiter instead of discarding it.
+				s.stashAction(action)
+				continue
 			}
 			// Check if action is expected
 			if len(expectedActions) > 0 {
@@ -1466,4 +1493,138 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 			return action, nil
 		}
 	}
+}
+
+// Bounds for parked responses, so a misbehaving client cannot grow a
+// session's memory without limit.
+const (
+	maxStashedActionsPerFlow = 50
+	maxStashedResponses      = 64
+)
+
+// responseStash holds client responses read off the session's shared
+// channels by a waiter they were not meant for. Each waiter drains its own
+// entries first (takeAction/takeSign/takeMatch), so concurrent flows on one
+// session behave as if each had a private queue. The zero value is ready.
+type responseStash struct {
+	mu      sync.Mutex
+	actions map[string][]*FlowActionMessage // by flow ID
+	signs   map[string]*SignResponseMessage // by message ID
+	matches map[string]*MatchResponseMessage
+	wake    chan struct{}
+}
+
+// waitChan returns a channel closed on the next put. Callers must obtain it
+// BEFORE checking the stash so a put in between is never missed.
+func (r *responseStash) waitChan() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.wake == nil {
+		r.wake = make(chan struct{})
+	}
+	return r.wake
+}
+
+// broadcastLocked wakes every waiter. Callers must hold r.mu.
+func (r *responseStash) broadcastLocked() {
+	if r.wake != nil {
+		close(r.wake)
+	}
+	r.wake = make(chan struct{})
+}
+
+// stashAction parks an action for another flow, unless that flow no longer
+// exists (nothing would ever consume it).
+func (s *Session) stashAction(a *FlowActionMessage) {
+	s.flowsMu.RLock()
+	_, ok := s.flows[a.FlowID]
+	s.flowsMu.RUnlock()
+	if !ok {
+		return
+	}
+	r := &s.stash
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.actions == nil {
+		r.actions = make(map[string][]*FlowActionMessage)
+	}
+	if len(r.actions[a.FlowID]) >= maxStashedActionsPerFlow {
+		return
+	}
+	r.actions[a.FlowID] = append(r.actions[a.FlowID], a)
+	r.broadcastLocked()
+}
+
+// takeAction removes and returns the oldest parked action for flowID that is
+// one of expected (any, if expected is empty). Parked actions for the flow
+// that are not expected are dropped, as WaitForAction always did.
+func (r *responseStash) takeAction(flowID string, expected []string) *FlowActionMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q := r.actions[flowID]
+	for i, a := range q {
+		ok := len(expected) == 0
+		for _, e := range expected {
+			if a.Action == e {
+				ok = true
+				break
+			}
+		}
+		if ok {
+			rest := q[i+1:]
+			if len(rest) == 0 {
+				delete(r.actions, flowID)
+			} else {
+				r.actions[flowID] = rest
+			}
+			return a
+		}
+	}
+	delete(r.actions, flowID)
+	return nil
+}
+
+func (r *responseStash) putSign(m *SignResponseMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.signs == nil {
+		r.signs = make(map[string]*SignResponseMessage)
+	}
+	if len(r.signs) >= maxStashedResponses {
+		return
+	}
+	r.signs[m.MessageID] = m
+	r.broadcastLocked()
+}
+
+func (r *responseStash) takeSign(messageID string) *SignResponseMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.signs[messageID]
+	delete(r.signs, messageID)
+	return m
+}
+
+func (r *responseStash) putMatch(m *MatchResponseMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.matches == nil {
+		r.matches = make(map[string]*MatchResponseMessage)
+	}
+	if len(r.matches) >= maxStashedResponses {
+		return
+	}
+	r.matches[m.MessageID] = m
+	r.broadcastLocked()
+}
+
+func (r *responseStash) takeMatch(flowID, messageID string) *MatchResponseMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.matches[messageID]
+	if m == nil || m.FlowID != flowID {
+		return nil
+	}
+	delete(r.matches, messageID)
+	return m
 }
