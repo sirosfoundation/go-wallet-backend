@@ -291,6 +291,8 @@ Environment prefix: `WALLET_R2PS_ADMIN`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `r2ps_admin.base_url` | `WALLET_R2PS_ADMIN_BASE_URL` | string | BaseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444"). It must be an absolute https URL without userinfo, query or fragment; plain http is accepted only where http_client permits plaintext (http_client.allow_http / allow_private_ips). Requests go through the SSRF-guarded http_client. An invalid value disables the /admin/r2ps routes and is logged at startup. |
+| `r2ps_admin.token` | `WALLET_R2PS_ADMIN_TOKEN` | string | Token is the bearer token sent as "Authorization: Bearer" on every request to the R2PS admin API. go-r2ps-service's admin listener requires one (a JWT accepted via R2PS_ADMIN_JWKS_URL with list/read/ write TAC, or its static R2PS_ADMIN_DEV_TOKEN). Prefer token_file so the secret is not in the config file or environment. The token is never logged. Whether the server requires auth cannot be known from here, so an empty token is allowed (e.g. network-isolated deployments without token auth); the server then answers 401 if it does require one. |
+| `r2ps_admin.token_file` | `WALLET_R2PS_ADMIN_TOKEN_FILE` | string | TokenFile is a path to a file containing the bearer token (surrounding whitespace is trimmed). Takes precedence over token. |
 
 ## audit
 

@@ -1028,7 +1028,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
-          description: R2PS service unreachable or returned an error
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
           content:
             application/json:
               schema:
@@ -1059,7 +1059,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
-          description: R2PS service unreachable or returned an error
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
           content:
             application/json:
               schema:
@@ -1083,12 +1083,14 @@ paths:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
-          description: R2PS service unreachable or returned an error
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
           content:
             application/json:
               schema:
@@ -1125,7 +1127,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
-          description: R2PS service unreachable or returned an error
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
           content:
             application/json:
               schema:
@@ -1168,12 +1170,14 @@ paths:
             application/json:
               schema:
                 type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '502':
-          description: R2PS service unreachable or returned an error
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
           content:
             application/json:
               schema:

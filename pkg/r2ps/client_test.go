@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,7 +94,7 @@ func TestGetClientStatuses(t *testing.T) {
 		if r.URL.Path != "/admin/store/clients/client-1/cat1" {
 			t.Errorf("unexpected path %q", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"indices":[1,2,3]}`))
+		_, _ = w.Write([]byte(`{"client_id":"client-1","category":"cat1","indices":[{"idx":1,"status":0,"label":"valid"},{"idx":2,"status":1,"label":"revoked"},{"idx":3,"status":2,"label":"suspended"}]}`))
 	}))
 	defer srv.Close()
 
@@ -102,7 +103,7 @@ func TestGetClientStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(indices) != 3 {
+	if len(indices) != 3 || indices[1].Idx != 2 || indices[1].Status != 1 || indices[1].Label != "revoked" {
 		t.Errorf("unexpected indices: %+v", indices)
 	}
 }
@@ -497,5 +498,67 @@ func TestRequestsStayOnBaseHostAndPrefix(t *testing.T) {
 	_, _ = c.GetStatus(ctx, "cat", 7)
 	if len(got) != 2 || got[0] != "/admin/store/keys?client_id=a%26b%3Dc+d" || got[1] != "/admin/store/status/cat/7" {
 		t.Errorf("unexpected request URIs: %v", got)
+	}
+}
+
+func TestBearerToken_SentOnEveryRequest(t *testing.T) {
+	const tok = "s3cret-token"
+	var methods []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+tok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		methods = append(methods, r.Method)
+		_, _ = w.Write([]byte(`{"keys":[],"entries":[],"indices":[]}`))
+	}))
+	defer srv.Close()
+
+	c := mustNewClient(t, srv.URL, WithBearerToken("  "+tok+"\n"))
+	ctx := context.Background()
+	if _, err := c.ListKeys(ctx, ""); err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if err := c.SetStatus(ctx, "cat", 1, 1); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	if len(methods) != 2 {
+		t.Fatalf("expected 2 authorized requests, got %v", methods)
+	}
+
+	// Without a token the fake server answers 401, and the token never
+	// appears in the error text.
+	anon := mustNewClient(t, srv.URL)
+	err := anon.SetStatus(ctx, "cat", 1, 1)
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 StatusError, got %v", err)
+	}
+	wrong := mustNewClient(t, srv.URL, WithBearerToken("other-secret"))
+	if _, err := wrong.ListKeys(ctx, ""); err == nil || strings.Contains(err.Error(), "other-secret") {
+		t.Fatalf("expected error without token text, got %v", err)
+	}
+}
+
+func TestStatusError_NotFoundPreserved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := mustNewClient(t, srv.URL)
+	err := c.SetStatus(context.Background(), "cat", 1, 1)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != 404 {
+		t.Fatalf("expected StatusError 404, got %v", err)
+	}
+	if errors.Is(&StatusError{Op: "x", StatusCode: 500}, ErrNotFound) {
+		t.Fatal("500 must not match ErrNotFound")
+	}
+	// GET single-item endpoints keep returning (nil, nil) on 404.
+	if e, err := c.GetStatus(context.Background(), "cat", 1); e != nil || err != nil {
+		t.Fatalf("GetStatus 404: %v %v", e, err)
 	}
 }

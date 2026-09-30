@@ -6,10 +6,15 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/sirosfoundation/go-siros-set/set"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
+
+// EventR2PSStatusChanged is the SET audit event for an admin-initiated status
+// change (revoke/suspend/reactivate) on the R2PS service.
+const EventR2PSStatusChanged = set.EventURI("urn:siros:audit:r2ps:status_changed")
 
 const errR2PSQueryFailed = "failed to query R2PS service"
 
@@ -20,6 +25,10 @@ const errR2PSQueryFailed = "failed to query R2PS service"
 func r2psErrorResponse(c *gin.Context, err error, fallbackMsg string) {
 	if errors.Is(err, r2ps.ErrInvalidInput) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, r2ps.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found in R2PS service"})
 		return
 	}
 	c.JSON(http.StatusBadGateway, gin.H{"error": fallbackMsg})
@@ -133,6 +142,13 @@ func (h *AdminHandlers) R2PSSetStatus(c *gin.Context) {
 		zap.Int("status", *req.Status),
 		zap.String("reason", req.Reason),
 	)
+
+	h.emitAudit(EventR2PSStatusChanged, category+"/"+strconv.Itoa(idx), map[string]any{
+		"category": category,
+		"idx":      idx,
+		"status":   *req.Status,
+		"reason":   req.Reason,
+	})
 
 	c.JSON(http.StatusOK, gin.H{
 		"category": category,

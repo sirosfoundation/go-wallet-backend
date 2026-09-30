@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1158,7 +1159,17 @@ func newR2PSClient(cfg *config.Config) (*r2ps.Client, error) {
 	if cfg.R2PSAdmin.BaseURL == "" {
 		return nil, nil
 	}
+	token := cfg.R2PSAdmin.Token
+	if f := cfg.R2PSAdmin.TokenFile; f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			// Report the path, never any file content.
+			return nil, fmt.Errorf("r2ps_admin: read token_file %q: %w", f, err)
+		}
+		token = string(b)
+	}
 	return r2ps.NewClient(cfg.R2PSAdmin.BaseURL,
+		r2ps.WithBearerToken(token),
 		r2ps.WithHTTPClient(cfg.HTTPClient.NewHTTPClient(10*time.Second)),
 		r2ps.WithAllowPlaintext(cfg.HTTPClient.AllowsPlaintext()),
 	)

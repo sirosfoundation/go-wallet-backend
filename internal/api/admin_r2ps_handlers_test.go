@@ -1,8 +1,15 @@
 package api
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"log/slog"
+
 	"bytes"
 	"encoding/json"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -345,5 +352,72 @@ func TestR2PSSetStatus_MalformedJSON_ReportsInvalidBody(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "invalid JSON request body") {
 		t.Errorf("unexpected body: %s", w.Body.String())
+	}
+}
+
+func TestR2PSSetStatus_Upstream404_Returns404(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPut, "/admin/r2ps/status/cat1/3", bytes.NewBufferString(`{"status":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestR2PSListStatuses_Upstream404_Returns404(t *testing.T) {
+	_, router, cleanup := setupR2PSTestHandlers(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	defer cleanup()
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/admin/r2ps/statuses/cat1", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestR2PSSetStatus_EmitsAuditEvent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	auditor := audit.New("test-issuer", signer, logger)
+
+	client, err := r2ps.NewClient(srv.URL, r2ps.WithAllowPlaintext(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewAdminHandlers(memory.NewStore(), zap.NewNop(), auditor)
+	h.SetR2PSClient(client)
+	router := gin.New()
+	router.PUT("/admin/r2ps/status/:category/:idx", h.R2PSSetStatus)
+
+	req := httptest.NewRequest(http.MethodPut, "/admin/r2ps/status/cat1/3", bytes.NewBufferString(`{"status":1,"reason":"key compromise"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(logBuf.String(), "urn:siros:audit:r2ps:status_changed") {
+		t.Errorf("audit event not emitted; log: %s", logBuf.String())
 	}
 }

@@ -19,11 +19,32 @@ import (
 // from upstream/network failures (502).
 var ErrInvalidInput = errors.New("r2ps: invalid input")
 
+// ErrNotFound matches (via errors.Is) a *StatusError whose upstream status was
+// 404, so callers can map it to a 404 of their own.
+var ErrNotFound = errors.New("r2ps: not found")
+
+// StatusError is returned when the R2PS service answers with an unexpected
+// HTTP status. It preserves the upstream status code.
+type StatusError struct {
+	Op         string
+	StatusCode int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("r2ps: %s: status %d", e.Op, e.StatusCode)
+}
+
+// Is reports a 404 as ErrNotFound.
+func (e *StatusError) Is(target error) bool {
+	return target == ErrNotFound && e.StatusCode == http.StatusNotFound
+}
+
 // Client is a Go HTTP client for the go-r2ps-service admin API.
 type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
 	allowHTTP  bool
+	token      string
 }
 
 // ClientOption configures the R2PS client.
@@ -53,6 +74,17 @@ func WithHTTPClient(hc *http.Client) ClientOption {
 func WithAllowPlaintext(allow bool) ClientOption {
 	return func(c *Client) {
 		c.allowHTTP = allow
+	}
+}
+
+// WithBearerToken makes the client send "Authorization: Bearer <token>" on
+// every request. go-r2ps-service's admin listener requires a bearer token
+// (a JWT validated against R2PS_ADMIN_JWKS_URL, or its static development
+// token). The token is never logged or included in error strings. An empty
+// token means no Authorization header is sent.
+func WithBearerToken(token string) ClientOption {
+	return func(c *Client) {
+		c.token = strings.TrimSpace(token)
 	}
 }
 
@@ -175,7 +207,7 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("r2ps: list statuses: status %d", resp.StatusCode)
+		return nil, &StatusError{Op: "list statuses", StatusCode: resp.StatusCode}
 	}
 
 	var result struct {
@@ -189,8 +221,9 @@ func (c *Client) ListStatuses(ctx context.Context, category string) ([]StatusLis
 	return result.Entries, nil
 }
 
-// GetClientStatuses returns all status list indices for a given client in a category.
-func (c *Client) GetClientStatuses(ctx context.Context, clientID, category string) ([]int, error) {
+// GetClientStatuses returns the status list entries (idx, status, label) for a
+// given client in a category.
+func (c *Client) GetClientStatuses(ctx context.Context, clientID, category string) ([]StatusListEntry, error) {
 	if !isValidPathSegment(clientID) {
 		return nil, fmt.Errorf("%w: invalid client_id %q", ErrInvalidInput, clientID)
 	}
@@ -205,11 +238,11 @@ func (c *Client) GetClientStatuses(ctx context.Context, clientID, category strin
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("r2ps: get client statuses: status %d", resp.StatusCode)
+		return nil, &StatusError{Op: "get client statuses", StatusCode: resp.StatusCode}
 	}
 
 	var result struct {
-		Indices []int `json:"indices"`
+		Indices []StatusListEntry `json:"indices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("r2ps: decode response: %w", err)
@@ -236,7 +269,7 @@ func (c *Client) GetStatus(ctx context.Context, category string, idx int) (*Stat
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("r2ps: get status: status %d", resp.StatusCode)
+		return nil, &StatusError{Op: "get status", StatusCode: resp.StatusCode}
 	}
 
 	var entry StatusEntry
@@ -265,6 +298,7 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 		return fmt.Errorf("r2ps: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 
 	// The request host comes from the base URL validated in NewClient; the
 	// per-call category/idx are validated path segments below it.
@@ -275,7 +309,7 @@ func (c *Client) SetStatus(ctx context.Context, category string, idx int, status
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("r2ps: set status: status %d", resp.StatusCode)
+		return &StatusError{Op: "set status", StatusCode: resp.StatusCode}
 	}
 	return nil
 }
@@ -294,7 +328,7 @@ func (c *Client) ListKeys(ctx context.Context, clientID string) ([]PublicKeyInfo
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("r2ps: list keys: status %d", resp.StatusCode)
+		return nil, &StatusError{Op: "list keys", StatusCode: resp.StatusCode}
 	}
 
 	var result struct {
@@ -322,7 +356,7 @@ func (c *Client) GetKey(ctx context.Context, kid string) (*PublicKeyInfo, error)
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("r2ps: get key: status %d", resp.StatusCode)
+		return nil, &StatusError{Op: "get key", StatusCode: resp.StatusCode}
 	}
 
 	var key PublicKeyInfo
@@ -337,6 +371,7 @@ func (c *Client) doGet(ctx context.Context, reqURL string) (*http.Response, erro
 	if err != nil {
 		return nil, fmt.Errorf("r2ps: create request: %w", err)
 	}
+	c.authorize(req)
 	// reqURL derives from the base URL validated in NewClient plus path
 	// segments validated by the callers.
 	resp, err := c.httpClient.Do(req)
@@ -344,4 +379,11 @@ func (c *Client) doGet(ctx context.Context, reqURL string) (*http.Response, erro
 		return nil, fmt.Errorf("r2ps: request failed: %w", err)
 	}
 	return resp, nil
+}
+
+// authorize attaches the bearer token, if one is configured.
+func (c *Client) authorize(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 }
