@@ -27,7 +27,6 @@ This guide helps you migrate from the TypeScript-based `wallet-backend-server` t
 
 - [x] User registration and login
 - [x] JWT authentication
-- [x] Password hashing (bcrypt)
 - [x] DID generation
 - [x] Credential storage
 - [x] Presentation storage

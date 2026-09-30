@@ -680,7 +680,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// so the cache is scoped to this specific certificate, not just the
 		// domain it claims.
 		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
-			verifiedIdentity = "x509_san_dns:" + authReq.ClientID + ":" + fp
+			verifiedIdentity = pdpSubjectID(authReq) + ":" + fp
 		} else {
 			cacheable = false
 		}
@@ -708,7 +708,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// so the cache is scoped to this specific certificate, not just the
 		// URI it claims.
 		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
-			verifiedIdentity = "x509_san_uri:" + authReq.ClientID + ":" + fp
+			verifiedIdentity = pdpSubjectID(authReq) + ":" + fp
 		} else {
 			cacheable = false
 		}
@@ -738,7 +738,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// previously-trusted) client_id hash would reuse a cached verdict
 		// the PDP never evaluated for that certificate.
 		if fp := keyMaterialFingerprint(keyMaterial); fp != "" {
-			verifiedIdentity = "x509_hash:" + authReq.ClientID + ":" + fp
+			verifiedIdentity = pdpSubjectID(authReq) + ":" + fp
 		} else {
 			cacheable = false
 		}
@@ -949,7 +949,10 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	// request) would reach the PDP with no way to validate it.
 	evalContext := buildVerifierEvalContext(authReq, authCtx, h.Logger)
 
-	directResult, err := h.TrustSvc.EvaluateVerifierWithContext(evalCtx, authReq.ClientID, trustEndpoint, tkm, evalContext)
+	// pdpSubjectID (not the raw authReq.ClientID) is what go-trust's own
+	// contract requires for x509_san_dns/x509_san_uri/x509_hash - see its
+	// doc comment (#404).
+	directResult, err := h.TrustSvc.EvaluateVerifierWithContext(evalCtx, pdpSubjectID(authReq), trustEndpoint, tkm, evalContext)
 	if err != nil {
 		// Fail closed: a PDP error is never equivalent to "no PDP
 		// configured" and must never fall back to asking the client.
@@ -1028,17 +1031,21 @@ type verifierAuthContext struct {
 // §5.9.3.6), and any verifier_attestation context.
 func buildVerifierTrustRequest(authReq *AuthorizationRequest, authCtx verifierAuthContext, logger *zap.Logger) *TrustEvaluationRequest {
 	trustReq := &TrustEvaluationRequest{
-		// SubjectID keeps the original, wire-form client_id (including
-		// OpenID4VP 1.0's decentralized_identifier: prefix, when present)
-		// unchanged - this is what /v1/evaluate must see, matching
-		// evaluateVerifierTrustViaPDP below, which evaluates authReq.ClientID
-		// unchanged. Per docs/client-id-strategy.md's client-id-strategy
-		// table, the prefix is stripped for resolution only, never for
-		// evaluation: a no-PDP and a PDP-backed flow must evaluate the same
-		// subject. See ResolutionSubjectID below for what /v1/resolve
-		// actually needs - a DIFFERENT identifier that one field can't also
-		// serve.
-		SubjectID:          authReq.ClientID,
+		// SubjectID is pdpSubjectID(authReq): the original, wire-form
+		// client_id for every scheme except x509_san_dns/x509_san_uri/
+		// x509_hash, which need their client_id_scheme prefix present (or
+		// re-applied, if the wire form carried it as a separate parameter
+		// instead) for go-trust's ParseClientIDScheme/VerifyLeafBinding to
+		// actually run (#404) - see pdpSubjectID's doc comment. This is
+		// what /v1/evaluate must see, matching evaluateVerifierTrustViaPDP
+		// below, which evaluates the identical pdpSubjectID(authReq). Per
+		// docs/client-id-strategy.md's client-id-strategy table, the
+		// decentralized_identifier: prefix specifically is stripped for
+		// resolution only, never for evaluation: a no-PDP and a PDP-backed
+		// flow must evaluate the same subject. See ResolutionSubjectID
+		// below for what /v1/resolve actually needs - a DIFFERENT
+		// identifier that one field can't also serve.
+		SubjectID:          pdpSubjectID(authReq),
 		SubjectType:        SubjectTypeCredentialVerifier,
 		RequiresResolution: authCtx.requiresResolution,
 		RequestJWT:         authCtx.requestJWT,
@@ -1169,10 +1176,22 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaFrontend(ctx context.Context, au
 		verifier.TrustedStatus = string(domain.TrustStatusUntrusted)
 	}
 
-	// Override name/logo from trust evaluation if provided
-	if trustResult.Name != "" {
-		verifier.Name = trustResult.Name
-	}
+	// Unlike Trusted/Framework/Reason above - which this permissive no-PDP
+	// dev-mode path has always accepted from the frontend at face value,
+	// since there is no PDP to check them against and configuring no PDP
+	// at all is an explicit operator choice to trust that path's
+	// evaluation - the displayed name is not overridden from
+	// trustResult.Name here (#406). Consistent with #398's fix to the
+	// PDP-backed path: this wallet-backend has no way to tell a frontend's
+	// own independently-verified display name apart from one it simply
+	// echoed back from the verifier's own unauthenticated
+	// client_metadata.client_name, so verifier.Name stays whatever it was
+	// already set to (authReq.ClientID, per evaluateVerifierTrust - the
+	// identifier this evaluation was actually about) rather than trusting
+	// an asserted string either path received. logo_uri is unaffected here
+	// too, same as #398 left client_metadata.logo_uri alone on the
+	// PDP-backed path - a separate, narrower field, out of this fix's
+	// scope.
 	if trustResult.Logo != "" {
 		verifier.Logo = &LogoInfo{URI: trustResult.Logo}
 	}
@@ -1924,6 +1943,54 @@ func didFromClientID(clientID string) string {
 	return strings.TrimPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":")
 }
 
+// pdpSubjectID returns the identifier sent as the AuthZEN Subject.ID for a
+// verifier trust evaluation: to go-trust's PDP directly
+// (evaluateVerifierTrustViaPDP), and to whatever a no-PDP frontend fallback
+// forwards to its own /v1/evaluate call (buildVerifierTrustRequest's
+// SubjectID) - both consumers need the identical value go-trust's own
+// contract expects.
+//
+// For x509_san_dns/x509_san_uri/x509_hash, go-trust's ParseClientIDScheme
+// only recognizes the client_id_scheme claim - and therefore only invokes
+// VerifyLeafBinding to check the presented certificate is actually bound to
+// it, rather than merely chained to a trusted CA - when Subject.ID itself
+// carries the "<scheme>:" prefix (see go-trust's
+// pkg/registry/clientid.go's ParseClientIDScheme/VerifyLeafBinding, and
+// pkg/registry/static/whitelist.go's isCertificateArrayResourceType doc
+// comment: "'x5c' is what real callers (e.g. go-wallet-backend) always
+// send, encoding the client_id_scheme in Subject.ID instead").
+//
+// This wallet accepts client_id on the wire two ways (see
+// inferClientIDScheme): the client_id_scheme prefix already embedded in
+// client_id itself (OpenID4VP 1.0 final - e.g. "x509_san_dns:example.com"),
+// or a bare client_id with client_id_scheme as a separate parameter (the
+// earlier draft convention, still supported - e.g. client_id="example.com",
+// client_id_scheme="x509_san_dns"). Only the first form happened to already
+// satisfy go-trust's contract by accident, because nothing here ever
+// stripped the embedded prefix; the second form sent a bare value with no
+// prefix at all, so ParseClientIDScheme could never recognize it and
+// VerifyLeafBinding was silently never invoked - the certificate was
+// trusted on chain validity alone, never checked against the claimed
+// SAN/hash (#404).
+//
+// strings.TrimPrefix first strips any pre-existing prefix before
+// re-applying it, so a client_id already carrying it (the first wire form)
+// is never double-prefixed.
+func pdpSubjectID(authReq *AuthorizationRequest) string {
+	var prefix string
+	switch authReq.ClientIDScheme {
+	case ClientIDSchemeX509SANDNS:
+		prefix = ClientIDSchemeX509SANDNS + ":"
+	case ClientIDSchemeX509SANURI:
+		prefix = ClientIDSchemeX509SANURI + ":"
+	case ClientIDSchemeX509Hash:
+		prefix = ClientIDSchemeX509Hash + ":"
+	default:
+		return authReq.ClientID
+	}
+	return prefix + strings.TrimPrefix(authReq.ClientID, prefix)
+}
+
 func inferClientIDScheme(clientID string) string {
 	switch {
 	case strings.HasPrefix(clientID, ClientIDSchemeDecentralizedIdentifier+":"):
@@ -2076,9 +2143,18 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §7.3: For x509_san_dns, verify JWT signature against x5c before
-	// anything else (including trust cache). This prevents cached trust from
-	// bypassing signature verification on tampered requests.
-	if authReq.ClientIDScheme == ClientIDSchemeX509SANDNS && authReq.RequestJWT != "" {
+	// anything else (including trust cache and evaluateVerifierTrust's
+	// unconditional client_metadata_uri fetch). This prevents cached trust
+	// from bypassing signature verification on tampered requests. A missing
+	// RequestJWT is rejected here too, not just an invalid one (#405): the
+	// scheme switch's own "requires a signed request JWT" check runs after
+	// that fetch, so leaving a missing JWT unrejected here let an entirely
+	// unauthenticated x509_san_dns request still trigger it - the same class
+	// of gap #401 fixed for x509_san_uri.
+	if authReq.ClientIDScheme == ClientIDSchemeX509SANDNS {
+		if authReq.RequestJWT == "" {
+			return errors.New("x509_san_dns scheme requires a signed request JWT")
+		}
 		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
 		if err != nil {
 			return fmt.Errorf("x509_san_dns JWT signature verification failed: %w", err)
@@ -2088,12 +2164,17 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		}
 	}
 
-	// x509_hash has the same trust-cache-bypass risk as x509_san_dns above -
-	// verify the JWT signature against its embedded x5c before anything else,
-	// rather than only inside evaluateVerifierTrust's scheme switch (which
-	// runs after the in-memory trust cache check and so would never fire for
-	// a client_id already cached as trusted under a tampered request).
-	if authReq.ClientIDScheme == ClientIDSchemeX509Hash && authReq.RequestJWT != "" {
+	// x509_hash has the same trust-cache-bypass and unauthenticated-fetch
+	// risk as x509_san_dns above - verify the JWT signature against its
+	// embedded x5c before anything else, rather than only inside
+	// evaluateVerifierTrust's scheme switch (which runs after both the
+	// in-memory trust cache check and the client_metadata_uri fetch, so
+	// would never fire in time to prevent either for a tampered or entirely
+	// unsigned request). See #405.
+	if authReq.ClientIDScheme == ClientIDSchemeX509Hash {
+		if authReq.RequestJWT == "" {
+			return errors.New("x509_hash scheme requires a signed request JWT")
+		}
 		km, err := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
 		if err != nil {
 			return fmt.Errorf("x509_hash JWT signature verification failed: %w", err)
@@ -2108,13 +2189,10 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	// client_metadata_uri (an outbound HTTP request to a verifier-controlled
 	// URL) unconditionally, before its scheme switch ever runs, so an
 	// invalidly-signed - or entirely unsigned - x509_san_uri request could
-	// otherwise trigger that fetch before ever being rejected. Unlike
-	// x509_san_dns/x509_hash above (whose early checks only run when a
-	// RequestJWT is present, leaving a missing one to be rejected later,
-	// inside evaluateVerifierTrust's scheme switch, by which point the
-	// fetch has already happened), reject a missing RequestJWT here too,
-	// not just an invalid one, so no unauthenticated x509_san_uri request -
-	// signed or not - ever reaches that fetch.
+	// otherwise trigger that fetch before ever being rejected. Reject a
+	// missing RequestJWT here too, not just an invalid one, so no
+	// unauthenticated x509_san_uri request - signed or not - ever reaches
+	// that fetch.
 	if authReq.ClientIDScheme == ClientIDSchemeX509SANURI {
 		if authReq.RequestJWT == "" {
 			return errors.New("x509_san_uri scheme requires a signed request JWT")

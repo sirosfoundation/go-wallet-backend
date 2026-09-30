@@ -2167,7 +2167,7 @@ func staticLookup(ips ...string) lookupFunc {
 // never to the hostname again.
 func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2191,7 +2191,7 @@ func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
 	}
 
 	var dialed []string
-	dial := guardedDial(rebinding, recordingDial(&dialed))
+	dial := guardedDial(rebinding, recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2224,7 +2224,7 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var dialed []string
-			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed))
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), nil)
 
 			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
 			if err == nil {
@@ -2244,7 +2244,7 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 // attacker chooses which answer the client happens to pick otherwise.
 func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
 		t.Fatal("expected the dial to be refused")
@@ -2256,7 +2256,7 @@ func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 
 func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2275,7 +2275,7 @@ func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
 		}
 		return stubConn{}, nil
 	}
-	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst)
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst, nil)
 
 	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2298,6 +2298,7 @@ func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
 			}
 			return stubConn{}, nil
 		},
+		nil,
 	)
 
 	start := time.Now()
@@ -2640,5 +2641,43 @@ func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "dcql_consent_check") {
 		t.Errorf("unknown mode must fail validation, got %v", err)
+	}
+}
+
+// A trusted IdP host may resolve to a private address (#349); an unlisted
+// host, and the cloud metadata endpoints, may not.
+func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
+	trusted := map[string]struct{}{"idp.internal": {}}
+
+	tests := []struct {
+		name, host, ip string
+		wantErr        bool
+	}{
+		{"trusted host, private ip", "idp.internal", "10.1.2.3", false},
+		{"trusted host, case-insensitive", "IdP.Internal", "127.0.0.1", false},
+		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
+		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
+		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), trusted)
+			_, err := dial(context.Background(), "tcp", tt.host+":443")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
+	c := HTTPClientConfig{TrustedIdPHosts: []string{" IdP.Internal ", ""}}
+	set := c.trustedIdPHostSet()
+	if _, ok := set["idp.internal"]; !ok || len(set) != 1 {
+		t.Fatalf("unexpected set: %v", set)
+	}
+	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
+		t.Fatal("empty config must yield no trusted hosts")
 	}
 }

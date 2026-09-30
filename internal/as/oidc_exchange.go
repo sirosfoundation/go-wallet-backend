@@ -27,7 +27,7 @@ type oidcTokenResponse struct {
 // intercepted in transit (e.g. via an open redirect or a leaky referrer)
 // could be redeemed by an attacker who never had a client secret to begin
 // with, since this is a public client.
-func exchangeCode(ctx context.Context, tokenEndpoint, code, clientID, redirectURI, codeVerifier string) (*oidcTokenResponse, error) {
+func exchangeCode(ctx context.Context, client *http.Client, tokenEndpoint, code, clientID, redirectURI, codeVerifier string) (*oidcTokenResponse, error) {
 	data := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
@@ -43,7 +43,9 @@ func exchangeCode(ctx context.Context, tokenEndpoint, code, clientID, redirectUR
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("as: token exchange request failed: %w", err)
