@@ -560,3 +560,111 @@ func TestHandlers_Logout_RevokeFamilyFailure_FailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware is the
+// regression test for the #414 review finding that a failed family
+// revocation was not actually retryable: Logout used to blacklist the
+// access token's jti BEFORE revoking the family, so the auth middleware
+// rejected the very same token on the retry and the refresh token stayed
+// usable. It drives the real auth middleware (not just the handler): the
+// first attempt has its request context cancelled after authentication
+// (making RevokeFamily fail), the retry runs normally.
+func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tc := range []struct {
+		name      string
+		tokenAuth bool
+	}{
+		{"legacy HMAC path", false},
+		{"tokenauth ModeLegacy path", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := zap.NewNop()
+			cfg := &config.Config{
+				Server: config.ServerConfig{RPID: "wallet.example.com"},
+				JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, RefreshDays: 7, Issuer: "test-wallet"},
+				Security: config.SecurityConfig{
+					TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+				},
+			}
+			store := memory.NewStore()
+			services := service.NewServices(store, cfg, logger)
+			handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+			router := gin.New()
+			if tc.tokenAuth {
+				v := tokenvalidator.New(tokenvalidator.Config{
+					Audiences: []string{"wallet-backend", "wallet.example.com"},
+					Legacy: tokenvalidator.LegacyConfig{
+						Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
+					},
+				})
+				router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, logger))
+				router.Use(middleware.RequireAudience("wallet-backend"))
+			} else {
+				router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, store, services.TokenBlacklist, logger))
+			}
+
+			// Simulates a recovering store: while failing is true the
+			// request context is already cancelled by the time Logout
+			// runs (authentication itself has already succeeded).
+			failing := true
+			router.Use(func(c *gin.Context) {
+				if failing {
+					ctx, cancel := context.WithCancel(c.Request.Context())
+					cancel()
+					c.Request = c.Request.WithContext(ctx)
+				}
+				c.Next()
+			})
+			router.POST("/user/session/logout", handlers.Logout)
+
+			jti, sid := "jti-retry-"+tc.name, "sid-retry-"+tc.name
+			tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": "user-1", "tenant_id": "default", "jti": jti, "sid": sid,
+				"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+			}).SignedString([]byte(cfg.JWT.Secret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			logout := func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/user/session/logout", nil)
+				req.Header.Set("Authorization", "Bearer "+tok)
+				router.ServeHTTP(w, req)
+				return w
+			}
+			ctx := context.Background()
+
+			// Attempt 1: family revocation fails -> 500, nothing recorded.
+			if w := logout(); w.Code != http.StatusInternalServerError {
+				t.Fatalf("attempt 1: expected 500, got %d: %s", w.Code, w.Body.String())
+			}
+			if services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+				t.Fatal("a failed logout must not blacklist the access token's jti")
+			}
+			if services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
+				t.Fatal("family must not be revoked after the failure")
+			}
+
+			// Attempt 2: the store has recovered; the SAME token must still
+			// get through the real auth middleware and complete the logout.
+			failing = false
+			if w := logout(); w.Code != http.StatusOK {
+				t.Fatalf("retry with the same token: expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if !services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
+				t.Error("retry: expected the family to be revoked")
+			}
+			if !services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+				t.Error("a successful logout must blacklist the access token's jti")
+			}
+
+			// The token is now dead through the real middleware.
+			if w := logout(); w.Code != http.StatusUnauthorized {
+				t.Errorf("after logout the token must be rejected, got %d", w.Code)
+			}
+		})
+	}
+}
