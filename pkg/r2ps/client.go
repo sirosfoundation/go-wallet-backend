@@ -63,7 +63,10 @@ func WithTimeout(d time.Duration) ClientOption {
 func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) {
 		if hc != nil {
-			c.httpClient = hc
+			// Copy so redirect hardening (and WithTimeout) never mutate the
+			// caller's client.
+			cp := *hc
+			c.httpClient = &cp
 		}
 	}
 }
@@ -103,6 +106,13 @@ func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	// The upstream admin API has fixed endpoints: never follow redirects. A
+	// followed 301/302/303 would turn a PUT into a GET (reported as success)
+	// and could forward the bearer token to another host. Every 3xx is
+	// returned as-is and surfaces as a *StatusError (502 at the API layer).
+	c.httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil {

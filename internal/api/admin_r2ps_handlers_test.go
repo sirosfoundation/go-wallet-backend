@@ -449,3 +449,52 @@ func TestR2PSListKeys_EmptyStoreReturnsEmptyArray(t *testing.T) {
 		t.Errorf("keys = %s, want []", resp["keys"])
 	}
 }
+
+func TestR2PSSetStatus_Redirect_Returns502_NoAudit(t *testing.T) {
+	for _, code := range []int{301, 302, 303, 307} {
+		var hits int
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			w.WriteHeader(http.StatusOK)
+		}))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL, code)
+		}))
+
+		var logBuf bytes.Buffer
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		auditor := audit.New("test-issuer", signer, slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		client, err := r2ps.NewClient(srv.URL, r2ps.WithAllowPlaintext(true), r2ps.WithBearerToken("tok"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := NewAdminHandlers(memory.NewStore(), zap.NewNop(), auditor)
+		h.SetR2PSClient(client)
+		router := gin.New()
+		router.PUT("/admin/r2ps/status/:category/:idx", h.R2PSSetStatus)
+
+		req := httptest.NewRequest(http.MethodPut, "/admin/r2ps/status/cat1/3", bytes.NewBufferString(`{"status":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		srv.Close()
+		target.Close()
+
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("%d: expected 502, got %d", code, w.Code)
+		}
+		if hits != 0 {
+			t.Errorf("%d: redirect target contacted", code)
+		}
+		if strings.Contains(logBuf.String(), "urn:siros:audit:r2ps:status_changed") {
+			t.Errorf("%d: status change audited despite redirect", code)
+		}
+	}
+}

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -443,8 +445,11 @@ func TestNewClient_BaseURLValidation(t *testing.T) {
 func TestWithHTTPClient(t *testing.T) {
 	hc := &http.Client{Timeout: 3 * time.Second}
 	c, err := NewClient("https://host", WithHTTPClient(hc))
-	if err != nil || c.httpClient != hc {
+	if err != nil || c.httpClient.Timeout != 3*time.Second {
 		t.Fatalf("custom client not used: %v", err)
+	}
+	if c.httpClient == hc || hc.CheckRedirect != nil {
+		t.Fatal("caller's client must be copied, not mutated")
 	}
 	c, _ = NewClient("https://host", WithHTTPClient(nil))
 	if c.httpClient == nil {
@@ -612,5 +617,64 @@ func TestGetClientStatuses_UpstreamNullIndicesNormalisedToEmptyArray(t *testing.
 	}
 	if entries == nil || len(entries) != 0 {
 		t.Fatalf("want non-nil empty slice, got %#v", entries)
+	}
+}
+
+func TestClient_RedirectsNotFollowed(t *testing.T) {
+	codes := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect}
+	ops := map[string]func(c *Client) error{
+		"PUT": func(c *Client) error { return c.SetStatus(context.Background(), "cat", 1, 1) },
+		"GET": func(c *Client) error { _, err := c.ListStatuses(context.Background(), "cat"); return err },
+		"GetStatus": func(c *Client) error {
+			_, err := c.GetStatus(context.Background(), "cat", 1)
+			return err
+		},
+		"GetKey":   func(c *Client) error { _, err := c.GetKey(context.Background(), "k"); return err },
+		"ListKeys": func(c *Client) error { _, err := c.ListKeys(context.Background(), ""); return err },
+		"GetClientStatuses": func(c *Client) error {
+			_, err := c.GetClientStatuses(context.Background(), "cl", "cat")
+			return err
+		},
+	}
+	for _, code := range codes {
+		for name, op := range ops {
+			for _, custom := range []bool{false, true} {
+				t.Run(name+"/"+strconv.Itoa(code), func(t *testing.T) {
+					var hits atomic.Int32
+					target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						hits.Add(1)
+						w.WriteHeader(http.StatusOK)
+						_, _ = w.Write([]byte(`{}`))
+					}))
+					defer target.Close()
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						http.Redirect(w, r, target.URL+"/elsewhere", code)
+					}))
+					defer srv.Close()
+
+					opts := []ClientOption{WithAllowPlaintext(true), WithBearerToken("secret")}
+					var orig *http.Client
+					if custom {
+						orig = &http.Client{}
+						opts = append(opts, WithHTTPClient(orig))
+					}
+					c, err := NewClient(srv.URL, opts...)
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = op(c)
+					var se *StatusError
+					if !errors.As(err, &se) || se.StatusCode != code {
+						t.Fatalf("expected StatusError %d, got %v", code, err)
+					}
+					if hits.Load() != 0 {
+						t.Fatalf("redirect target contacted %d times", hits.Load())
+					}
+					if orig != nil && orig.CheckRedirect != nil {
+						t.Fatal("caller's http.Client was mutated")
+					}
+				})
+			}
+		}
 	}
 }
