@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // flakyStore fails wallet-instance deletes while failDeletes is set.
@@ -137,4 +139,87 @@ func TestDeleteUser_CleanerFailingAfterRevocationKeepsTheRecord(t *testing.T) {
 	assert.Equal(t, 1, ur.calls)
 	_, gerr := fs.Store.Users().GetByID(ctx, uid)
 	assert.NoError(t, gerr, "the record is kept")
+}
+
+// failingCutoffUsers fails InvalidateAuthBefore while set.
+type failingCutoffStore struct {
+	storage.Store
+	fail bool
+}
+
+type failingCutoffUsers struct {
+	storage.UserStore
+	f *failingCutoffStore
+}
+
+func (s *failingCutoffStore) Users() storage.UserStore {
+	return &failingCutoffUsers{s.Store.Users(), s}
+}
+
+func (u *failingCutoffUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	if u.f.fail {
+		return errors.New("user store is down")
+	}
+	return u.UserStore.InvalidateAuthBefore(ctx, id, t)
+}
+
+// With the token blacklist disabled the gate is the only thing standing
+// between an incompletely deleted account and its old bearer tokens. The
+// cut-off is on the record before the irreversible phase, so old tokens are
+// refused and a fresh login can repeat the deletion.
+func TestDeleteUser_IncompleteAfterRevocationRefusesOldTokensWithoutBlacklist(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+	base := time.Now().UTC().Truncate(time.Second)
+	clock := base
+	svc.now = func() time.Time { return clock }
+	svc.SetSessionCleaner(&scriptedCleaner{failOn: map[int]bool{2: true}})
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+	gate := tokengate.New(store.Users())
+
+	oldIat := base.Add(-time.Minute)
+	require.NoError(t, gate.Check(ctx, uid.String(), oldIat), "token is valid before the deletion")
+
+	require.ErrorIs(t, svc.DeleteUser(tokengate.WithIssuedAt(ctx, oldIat), uid, uid.String()), ErrDeletionIncomplete)
+	_, gerr := store.Users().GetByID(ctx, uid)
+	require.NoError(t, gerr, "the record is kept")
+	assert.ErrorIs(t, gate.Check(ctx, uid.String(), oldIat), tokengate.ErrRevoked, "old token refused with no blacklist")
+
+	// A fresh login after the cut-off passes the gate and can retry.
+	clock = base.Add(5 * time.Second)
+	freshIat := clock
+	require.NoError(t, gate.Check(ctx, uid.String(), freshIat))
+	svc.SetSessionCleaner(&scriptedCleaner{})
+	require.NoError(t, svc.DeleteUser(tokengate.WithIssuedAt(ctx, freshIat), uid, uid.String()))
+	_, gerr = store.Users().GetByID(ctx, uid)
+	assert.ErrorIs(t, gerr, storage.ErrNotFound)
+	assert.ErrorIs(t, gate.Check(ctx, uid.String(), freshIat), tokengate.ErrAccountDeleted, "the tombstone takes over once the record is gone")
+}
+
+// A cut-off that cannot be stored stops the deletion before anything
+// irreversible, leaving the caller's token usable for the retry.
+func TestDeleteUser_CutoffAdvanceFailureIsRetryableAndIrreversibleFree(t *testing.T) {
+	ctx := context.Background()
+	fs := &failingCutoffStore{Store: memory.NewStore(), fail: true}
+	svc := NewUserService(fs, testConfig(), zap.NewNop())
+	bl, ur := &countingRevoker{}, &countingUserRevoker{}
+	svc.SetTokenBlacklist(bl)
+	svc.AddUserRevoker(ur)
+	cleaner := &scriptedCleaner{}
+	svc.SetSessionCleaner(cleaner)
+	uid := domain.NewUserID()
+	require.NoError(t, fs.Store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+
+	require.ErrorIs(t, svc.DeleteUser(ctx, uid, uid.String()), ErrDeletionIncomplete)
+	assert.Zero(t, bl.calls)
+	assert.Zero(t, ur.calls)
+	assert.Equal(t, 1, cleaner.calls, "only the pre-revocation cleaner run happened")
+	cutoff, err := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.IsZero(), "no cut-off, so the caller's token still works")
+
+	fs.fail = false
+	require.NoError(t, svc.DeleteUser(ctx, uid, uid.String()))
 }

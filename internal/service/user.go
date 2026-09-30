@@ -347,6 +347,12 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 //     user's own tokens are refused from then on (both revocations last until
 //     the process restarts), so finishing the deletion takes an operator or a
 //     restart, not the user.
+//   - The token cut-off (User.AuthInvalidBefore) is advanced, durably, just
+//     before those revocations, and a failure to do so is a retryable
+//     ErrDeletionIncomplete. From then on every token issued before it is
+//     refused by the gate even with the blacklist disabled, whichever later
+//     step fails; a token from a fresh login still passes and can repeat the
+//     request.
 //   - Still best-effort, logged only: pending WebAuthn challenges, invite
 //     used_by references, tenant-membership removal, and the token
 //     blacklist's RevokeUser. A failure of the final Users().Delete answers a
@@ -539,6 +545,26 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 				zap.Error(err), zap.String("user_id", userID.String()))
 			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
 		}
+	}
+
+	// Advance the token cut-off on the user record, durably, before the first
+	// irreversible step. The tombstone does not do this job: while the record
+	// exists the gate reads only its cut-off (tokengate.Gate.Check), so a
+	// deletion that stops after this point - the second cleaner call below
+	// failing - would otherwise leave every old bearer token valid wherever
+	// the token blacklist is disabled or was lost with a restart. With the
+	// cut-off stored on the record, old tokens are refused by the gate itself,
+	// and a token issued after it (a fresh login) still passes, so the caller
+	// can repeat the request. It runs after the first cleaner call and not
+	// before it, so the retryable failures above never cost the caller their
+	// token. A failure stops the deletion here, before anything irreversible;
+	// the cut-off only ever moves forward, so repeating it is idempotent. A
+	// record that vanished meanwhile (ErrNotFound) is already covered by the
+	// tombstone.
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, s.now().UTC()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
+			zap.Error(err), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: advance token cut-off: %w", ErrDeletionIncomplete, err)
 	}
 
 	// Revoke all previously-issued tokens for this user (#383) BEFORE
