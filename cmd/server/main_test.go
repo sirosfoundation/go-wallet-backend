@@ -96,3 +96,26 @@ func TestSetupRegistryConfig(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func TestLoggingConfig(t *testing.T) {
+	assert.Nil(t, loggingConfig(nil, nil))
+
+	backend, err := config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	backend.Logging.Level = "debug"
+	backend.Logging.Format = "text"
+	reg, err := config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	reg.Logging.Level = "warn"
+
+	got := loggingConfig(backend, nil)
+	require.NotNil(t, got)
+	assert.Equal(t, "debug", got.Level, "backend roles without registry keep their logging config")
+	assert.Equal(t, "text", got.Format)
+
+	got = loggingConfig(backend, reg)
+	assert.Equal(t, "debug", got.Level, "backend config wins when both are loaded")
+
+	got = loggingConfig(nil, reg)
+	assert.Equal(t, "warn", got.Level)
+}

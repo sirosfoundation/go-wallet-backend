@@ -357,12 +357,17 @@ func (c *Config) ValidateRegistry() error {
 	if err := c.Registry.Validate(); err != nil {
 		return err
 	}
+	// A legacy HMAC secret that would be used to validate tokens must satisfy
+	// the shared length rule even when authentication is optional.
+	if c.AS.Legacy.Enabled && c.JWT.Secret != "" && len(c.JWT.Secret) < 32 {
+		return fmt.Errorf("jwt.secret must be at least 32 bytes (it validates legacy HMAC tokens while as.legacy.enabled is true; set as.legacy.enabled=false to disable them)")
+	}
 	if !c.Registry.RequireAuth {
 		return nil
 	}
 
 	var missing []string
-	if c.AS.ExternalURL == "" && !c.registryLegacyTolerateNoJWKS {
+	if c.AS.ExternalURL == "" && (!c.registryLegacyTolerateNoJWKS || !c.AS.Legacy.Enabled) {
 		missing = append(missing, "as.external_url (public base URL of the authorization server; JWKS is fetched from <as.external_url>/auth/.well-known/jwks.json)")
 	}
 	if c.AS.Issuer == "" && c.JWT.Issuer == "" {

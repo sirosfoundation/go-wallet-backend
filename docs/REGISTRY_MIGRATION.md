@@ -11,7 +11,7 @@ the backend config and protected by the shared go-tokenauth validator
 
 | Release | Behaviour |
 |---------|-----------|
-| this release | `--registry-config` (default `configs/registry.yaml`), that file and `REGISTRY_*` variables still work as deprecated aliases: they are mapped onto `registry:` and a `DEPRECATED` warning names the new location. Keys customised in the new `registry:` section (or `WALLET_REGISTRY_*`) win over the same keys in the deprecated configuration and a second warning lists the conflicting keys; keys left at their defaults are filled from the deprecated configuration. `cmd/registry` and `make build-registry` are gone; `make run-registry` and `make docker-build-registry` remain and now use the main binary. |
+| this release | `--registry-config` (default `configs/registry.yaml`), that file and `REGISTRY_*` variables still work as deprecated aliases: they are mapped onto `registry:` and a `DEPRECATED` warning names the new location. Keys set explicitly in the new `registry:` section or through `WALLET_REGISTRY_*` (presence in the file / environment, even if the value equals the default, e.g. `dynamic_cache.enabled: false` or `require_auth: false`) win over the same keys in the deprecated configuration, and a second warning lists the conflicting keys; keys the new configuration does not set are filled from the deprecated configuration. The helper image config `configs/config.registry.yaml` only sets `registry.dynamic_cache.enabled: true` (as the retired image did), so all other `REGISTRY_*` variables keep applying. `cmd/registry` and `make build-registry` are gone; `make run-registry` and `make docker-build-registry` remain and now use the main binary. |
 | next release | the aliases and the `--registry-config` flag are removed. |
 
 ## Mapping
@@ -61,7 +61,7 @@ roles, also when the process does not run the authorization server:
 Deployments that migrate through the deprecated alias with the old HMAC-only
 `jwt.require_auth: true` and no `as.external_url` keep starting (with a warning)
 and continue to accept HMAC tokens; set `as.external_url` to accept AS-issued
-tokens. Old registry secrets shorter than 32 bytes are no longer accepted.
+tokens. Old registry secrets shorter than 32 bytes are no longer accepted; this is checked whenever legacy HMAC validation would use the secret (`as.legacy.enabled`), also with `require_auth: false`. The missing-`as.external_url` tolerance for the alias only applies while `as.legacy.enabled` is true.
 
 ## Example
 

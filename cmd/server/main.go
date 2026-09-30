@@ -85,11 +85,8 @@ func main() {
 
 	// Initialize logger from the (shared) backend logging config
 	var logger *zap.Logger
-	if registryCfg != nil {
-		logger, err = logging.NewLogger(logging.Config{
-			Level:  registryCfg.Logging.Level,
-			Format: registryCfg.Logging.Format,
-		})
+	if logCfg := loggingConfig(backendCfg, registryCfg); logCfg != nil {
+		logger, err = logging.NewLogger(*logCfg)
 	} else {
 		logger, err = zap.NewProduction()
 	}
@@ -397,4 +394,18 @@ func registryListenAddr(addr string) (string, int) {
 		port = 8097
 	}
 	return host, port
+}
+
+// loggingConfig picks the logging settings: the backend config when any
+// backend role runs, otherwise the registry-only config; nil when neither is
+// loaded.
+func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
+	src := backendCfg
+	if src == nil {
+		src = registryCfg
+	}
+	if src == nil {
+		return nil
+	}
+	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
 }

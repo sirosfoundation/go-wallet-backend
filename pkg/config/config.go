@@ -53,6 +53,10 @@ type Config struct {
 	// RegistryExplicit and ApplyLegacyRegistryConfig.
 	registryExplicit bool
 
+	// registryYAML is the decoded `registry:` mapping of the config file, used
+	// to tell keys the operator set explicitly from defaults.
+	registryYAML map[string]any
+
 	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
 	// alias when it enabled registry.require_auth from the old HMAC-only
 	// `jwt` block: such deployments have no as.external_url yet, and must
@@ -1754,6 +1758,7 @@ func load(configFile string, validate func(*Config) error) (*Config, error) {
 			}
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
+			cfg.registryYAML = yamlRegistrySection(data)
 			if w := retiredRegistryLayoutWarning(data); w != "" {
 				cfg.loadWarnings = append(cfg.loadWarnings, w)
 			}
@@ -1801,6 +1806,36 @@ func yamlHasTopLevelKey(data []byte, key string) bool {
 	}
 	_, ok := raw[key]
 	return ok
+}
+
+// yamlRegistrySection returns the raw `registry:` mapping of the YAML, or nil.
+func yamlRegistrySection(data []byte) map[string]any {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	m, _ := raw["registry"].(map[string]any)
+	return m
+}
+
+// registryKeyExplicit reports whether the registry key at the given YAML path
+// (relative to `registry:`) was set in the config file, or via the matching
+// WALLET_REGISTRY_* environment variable.
+func (c *Config) registryKeyExplicit(yamlPath []string, envName string) bool {
+	if _, ok := os.LookupEnv(envName); ok {
+		return true
+	}
+	var cur any = c.registryYAML
+	for _, k := range yamlPath {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		if cur, ok = m[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // envHasPrefix reports whether any environment variable has the given prefix.

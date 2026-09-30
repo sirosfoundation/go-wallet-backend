@@ -20,30 +20,18 @@ logging:
   level: "info"
   format: "json"
 
+# Only keys that differ from the built-in defaults are listed, so deprecated
+# REGISTRY_* variables (and any other key) still apply to everything else. See
+# docs/CONFIGURATION.md for all registry.* keys; the cache defaults to
+# data/vctm-cache.json, which is /app/data in the image (WORKDIR /app).
 registry:
-  source:
-    url: "https://registry.siros.org/api/v1/schemas.json"
-    poll_interval: 5m
-    timeout: 30s
-  cache:
-    path: "data/vctm-cache.json"  # relative: /app/data in the image (WORKDIR /app), ./data on hosts
-    max_age: 24h
   dynamic_cache:
+    # Enabled in the image, as the retired registry image did. Restrict with
+    # allowed_hosts in production.
     enabled: true
-    default_ttl: 1h
-    max_ttl: 24h
-    min_ttl: 5m
-    timeout: 30s
-    # In production, consider restricting to known credential hosts
-    allowed_hosts: []
-  rate_limit:
-    enabled: true
-    authenticated_rpm: 1000
-    unauthenticated_rpm: 100
-    burst_multiplier: 3
-  # When true every request needs a valid access token. The token validator is
-  # built from the as.* / jwt.* settings below (no JWKS override exists).
-  require_auth: false
+  # true: every request needs a valid access token, validated from the as.* /
+  # jwt.* settings below (no JWKS override exists).
+  # require_auth: true
 
 # Needed only when registry.require_auth is true (or to recognise tokens for
 # the authenticated rate limit). This process does not run the authorization

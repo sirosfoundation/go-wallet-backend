@@ -656,3 +656,56 @@ func TestFilterConfig_Matches(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyLegacyRegistryConfig_ExplicitDefaultsWin(t *testing.T) {
+	dir := t.TempDir()
+	newCfg := writeFile(t, dir, "config.yaml", `
+jwt:
+  secret: "0123456789abcdef0123456789abcdef"
+registry:
+  dynamic_cache:
+    enabled: false
+  require_auth: false
+`)
+	old := writeFile(t, dir, "registry.yaml", "dynamic_cache:\n  enabled: true\njwt:\n  require_auth: true\n")
+
+	cfg, err := Load(newCfg)
+	require.NoError(t, err)
+	w, err := cfg.ApplyLegacyRegistryConfig(old, false)
+	require.NoError(t, err)
+	assert.False(t, cfg.Registry.DynamicCache.Enabled, "explicit registry.dynamic_cache.enabled=false beats the old config")
+	assert.False(t, cfg.Registry.RequireAuth, "explicit registry.require_auth=false beats jwt.require_auth=true")
+	assert.Contains(t, strings.Join(w, "\n"), "registry.dynamic_cache.enabled")
+
+	// same through the environment
+	t.Setenv("WALLET_REGISTRY_DYNAMIC_CACHE_ENABLED", "false")
+	t.Setenv("WALLET_REGISTRY_REQUIRE_AUTH", "false")
+	plain := writeFile(t, dir, "plain.yaml", "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n")
+	cfg, err = Load(plain)
+	require.NoError(t, err)
+	_, err = cfg.ApplyLegacyRegistryConfig(old, false)
+	require.NoError(t, err)
+	assert.False(t, cfg.Registry.DynamicCache.Enabled)
+	assert.False(t, cfg.Registry.RequireAuth)
+}
+
+func TestValidateRegistry_ShortSecretAndTolerance(t *testing.T) {
+	c := defaultConfig()
+	c.AS.Legacy.Enabled = true
+	c.JWT.Secret = "short"
+	assert.ErrorContains(t, c.ValidateRegistry(), "at least 32 bytes")
+	c.AS.Legacy.Enabled = false
+	require.NoError(t, c.ValidateRegistry(), "legacy off: secret unused")
+	c.AS.Legacy.Enabled = true
+	c.JWT.Secret = ""
+	require.NoError(t, c.ValidateRegistry(), "no secret: legacy validator not built")
+
+	// the no-JWKS tolerance only applies while legacy validation stays enabled
+	c = defaultConfig()
+	c.Registry.RequireAuth = true
+	c.registryLegacyTolerateNoJWKS = true
+	c.JWT.Secret = strings.Repeat("s", 32)
+	require.NoError(t, c.ValidateRegistry())
+	c.AS.Legacy.Enabled = false
+	assert.ErrorContains(t, c.ValidateRegistry(), "as.external_url")
+}

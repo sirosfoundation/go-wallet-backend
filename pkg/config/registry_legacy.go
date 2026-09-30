@@ -110,15 +110,15 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 	// defaults (for example the bundled helper-image config) are filled from
 	// the deprecated configuration.
 	var conflicts []string
-	mergeLegacyRegistry(reflect.ValueOf(&c.Registry).Elem(), reflect.ValueOf(&f.RegistryConfig).Elem(),
-		reflect.ValueOf(DefaultRegistryConfig()), "registry", &conflicts)
+	c.mergeLegacyRegistry(reflect.ValueOf(&c.Registry).Elem(), reflect.ValueOf(&f.RegistryConfig).Elem(),
+		reflect.ValueOf(DefaultRegistryConfig()), nil, nil, &conflicts)
 	if len(conflicts) > 0 {
 		warnings = append(warnings, "both the new `registry:` section (or WALLET_REGISTRY_*) and the deprecated registry "+
 			"configuration set "+strings.Join(conflicts, ", ")+": the new `registry:` values take precedence")
 	}
 
 	// jwt block: auth is now the shared go-tokenauth validator.
-	if f.JWT.RequireAuth && !c.Registry.RequireAuth {
+	if f.JWT.RequireAuth && !c.registryKeyExplicit([]string{"require_auth"}, "WALLET_REGISTRY_REQUIRE_AUTH") {
 		c.Registry.RequireAuth = true
 		if c.AS.ExternalURL == "" {
 			c.registryLegacyTolerateNoJWKS = true
@@ -179,28 +179,36 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 	return warnings, nil
 }
 
-// mergeLegacyRegistry fills every leaf of dst that still has its default value
-// from legacy. Leaves the new configuration customised keep their value; when
-// legacy customised the same leaf too, its path is appended to conflicts.
-func mergeLegacyRegistry(dst, legacy, def reflect.Value, path string, conflicts *[]string) {
+// mergeLegacyRegistry fills every leaf of dst the new configuration did not
+// set explicitly (key absent from the `registry:` YAML mapping and its
+// WALLET_REGISTRY_* variable unset) from legacy. Explicitly set leaves keep
+// their value, even if it equals the default; when legacy customised the same
+// leaf to a different value, its path is appended to conflicts.
+func (c *Config) mergeLegacyRegistry(dst, legacy, def reflect.Value, yamlPath, envParts []string, conflicts *[]string) {
 	if dst.Kind() == reflect.Struct {
 		for i := 0; i < dst.NumField(); i++ {
 			if !dst.Field(i).CanSet() {
 				continue // unexported (compiled patterns)
 			}
-			name := strings.Split(dst.Type().Field(i).Tag.Get("yaml"), ",")[0]
+			f := dst.Type().Field(i)
+			name := strings.Split(f.Tag.Get("yaml"), ",")[0]
 			if name == "" {
-				name = strings.ToLower(dst.Type().Field(i).Name)
+				name = strings.ToLower(f.Name)
 			}
-			mergeLegacyRegistry(dst.Field(i), legacy.Field(i), def.Field(i), path+"."+name, conflicts)
+			env := f.Tag.Get("envconfig")
+			if env == "" {
+				env = strings.ToUpper(f.Name)
+			}
+			c.mergeLegacyRegistry(dst.Field(i), legacy.Field(i), def.Field(i),
+				append(append([]string{}, yamlPath...), name), append(append([]string{}, envParts...), env), conflicts)
 		}
 		return
 	}
-	if reflect.DeepEqual(dst.Interface(), def.Interface()) {
+	if !c.registryKeyExplicit(yamlPath, "WALLET_REGISTRY_"+strings.Join(envParts, "_")) {
 		dst.Set(legacy)
 		return
 	}
 	if !reflect.DeepEqual(legacy.Interface(), def.Interface()) && !reflect.DeepEqual(dst.Interface(), legacy.Interface()) {
-		*conflicts = append(*conflicts, path)
+		*conflicts = append(*conflicts, "registry."+strings.Join(yamlPath, "."))
 	}
 }
