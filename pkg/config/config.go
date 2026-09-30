@@ -2050,6 +2050,12 @@ func (c *Config) Validate() error {
 	// with a missing issuer/key_path/key_id silently disables the SET audit
 	// emitter at startup (NewFromConfig just returns nil) instead of failing
 	// fast on the actual misconfiguration.
+	if err := c.Audit.validateIdentityEvents(); err != nil {
+		return err
+	}
+	if len(c.Audit.IdentityEvents) > 0 && !c.Audit.Enabled {
+		return fmt.Errorf("audit.identity_events requires audit.enabled")
+	}
 	if c.Audit.Enabled {
 		if c.Audit.Issuer == "" {
 			return fmt.Errorf("audit.issuer is required when audit is enabled")
@@ -2147,4 +2153,53 @@ type AuditConfig struct {
 	KeyPath string `yaml:"key_path" envconfig:"KEY_PATH"`
 	// KeyID is the kid used in SET JWS headers.
 	KeyID string `yaml:"key_id" envconfig:"KEY_ID"`
+	// IdentityEvents selects which enterprise-identity (OIDC gate) audit events
+	// are emitted, by short name: bound, verified, mismatch, gate_bypass.
+	// Default: none. Requires enabled. The subject is only ever emitted as a
+	// hash. Unknown names are rejected at startup.
+	// Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated)
+	IdentityEvents []string `yaml:"identity_events" envconfig:"IDENTITY_EVENTS"`
+}
+
+// Names accepted in AuditConfig.IdentityEvents.
+const (
+	// AuditIdentityBound: an OIDC identity was bound to a wallet at registration.
+	AuditIdentityBound = "bound"
+	// AuditIdentityVerified: a bound identity was verified at login.
+	AuditIdentityVerified = "verified"
+	// AuditIdentityMismatch: a login was refused because the presented identity,
+	// issuer, audience or required claims did not match.
+	AuditIdentityMismatch = "mismatch"
+	// AuditIdentityGateBypass: a login gate was required but no token was presented.
+	AuditIdentityGateBypass = "gate_bypass"
+)
+
+// validAuditIdentityEvents is the set of names IdentityEvents may contain.
+var validAuditIdentityEvents = map[string]struct{}{
+	AuditIdentityBound:      {},
+	AuditIdentityVerified:   {},
+	AuditIdentityMismatch:   {},
+	AuditIdentityGateBypass: {},
+}
+
+// IdentityEventEnabled reports whether the named identity event is selected.
+func (c AuditConfig) IdentityEventEnabled(name string) bool {
+	for _, e := range c.IdentityEvents {
+		if strings.EqualFold(strings.TrimSpace(e), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateIdentityEvents rejects unknown event names, so a typo cannot
+// silently leave an intended audit event switched off.
+func (c AuditConfig) validateIdentityEvents() error {
+	for _, e := range c.IdentityEvents {
+		name := strings.ToLower(strings.TrimSpace(e))
+		if _, ok := validAuditIdentityEvents[name]; !ok {
+			return fmt.Errorf("audit.identity_events: unknown event %q (valid: bound, verified, mismatch, gate_bypass)", e)
+		}
+	}
+	return nil
 }
