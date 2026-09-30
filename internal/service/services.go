@@ -47,6 +47,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// (e.g. clone-authenticator warnings) are audited whenever cfg.Audit
 		// is enabled, consistent with WIA/admin-API auditing.
 		webauthnSvc.SetAuditEmitter(audit.NewFromConfig(cfg, logger))
+		webauthnSvc.SetAuditIdentityConfig(cfg.Audit)
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())

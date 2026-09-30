@@ -78,30 +78,11 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
 		return
 	}
-	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		binding := &service.OIDCGateBinding{
-			Issuer:  oidcResult.Issuer,
-			Subject: oidcResult.Subject,
-			Email:   email,
-			// Record the full validated claims too, so FinishLogin can
-			// re-check them against the credential's real tenant's own
-			// RequiredClaims - see OIDCGateBinding.Claims's doc comment.
-			Claims: oidcResult.Claims,
-		}
-		// Record which audience this token was actually validated against
-		// (this request's header tenant's LoginOP) so FinishLogin can compare
-		// it against the credential's real tenant's own configured audience -
-		// issuer alone doesn't prove the token was meant for that tenant if
-		// two tenants share an IdP domain. See OIDCGateBinding.Audience.
-		if headerTenant, ok := middleware.GetTenant(c); ok {
-			if loginOP := headerTenant.OIDCGate.GetLoginOP(); loginOP != nil {
-				binding.Audience = loginOP.EffectiveAudience()
-			}
-		}
+	// Builds Issuer/Subject/Email/Audience/Claims the same way
+	// internal/api/handlers.go's FinishWebAuthnLogin does - shared to avoid
+	// duplicating this tenant-aware binding construction between the two
+	// login paths (see middleware.BuildLoginOIDCGateBinding's doc comment).
+	if binding := middleware.BuildLoginOIDCGateBinding(c); binding != nil {
 		req.OIDCGateBinding = binding
 	}
 
