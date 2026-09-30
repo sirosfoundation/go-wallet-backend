@@ -525,6 +525,20 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		}, nil
 	}
 
+	if resp.Failed {
+		// The evaluator reports a PDP/build failure in-band (no Go error):
+		// that is a failed evaluation, not a denial.
+		s.logger.Warn("Trust evaluation failed",
+			zap.String(logLabel, subjectID),
+			zap.String("reason", resp.Reason))
+		return &TrustInfo{
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + resp.Reason,
+			EvaluationFailed: true,
+		}, nil
+	}
+
 	return &TrustInfo{
 		Trusted:   resp.Decision,
 		Framework: "authzen",

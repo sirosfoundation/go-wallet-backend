@@ -130,6 +130,10 @@ type EvaluationResponse struct {
 	TrustMetadata interface{}
 	// Chain contains the validated certificate chain, if applicable.
 	Chain []*x509.Certificate
+	// Failed is true when no decision could be had (PDP unreachable, error
+	// response, request could not be built). Decision is then false, but it
+	// is not a denial: callers must not treat it as one.
+	Failed bool
 }
 
 // ToTrustDecision converts EvaluationResponse to trustapi.TrustDecision.

@@ -160,6 +160,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) 
 		return &trust.EvaluationResponse{
 			Decision: false,
 			Reason:   fmt.Sprintf("failed to build AuthZEN request: %v", err),
+			Failed:   true,
 		}, nil
 	}
 
@@ -171,6 +172,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, req *trust.EvaluationRequest) 
 		return &trust.EvaluationResponse{
 			Decision: false,
 			Reason:   fmt.Sprintf("AuthZEN PDP error: %v", err),
+			Failed:   true,
 		}, nil
 	}
 
