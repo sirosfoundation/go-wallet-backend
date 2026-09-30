@@ -1542,3 +1542,24 @@ func TestManager_handleFlowStart_AnonymousSessionMayOnlyLookUpMetadata(t *testin
 	// The same flows are fine for a session that names a user.
 	assert.Nil(t, runHandleFlowStartAs(t, m, "rli", ProtocolOID4VCI, "", "some-user"))
 }
+
+// TestManager_NilTokenGate pins the documented no-gate behavior of a
+// standalone engine with memory/no storage (NewStandaloneTokenGate returns a
+// nil gate): the legacy handshake branch and recheckToken must not
+// dereference it.
+func TestManager_NilTokenGate(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+	m.SetTokenGate(nil)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u-1", "tenant_id": "t-1", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	s, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	userID, _, _, err := m.validateToken(s)
+	require.NoError(t, err)
+	assert.Equal(t, "u-1", userID)
+
+	assert.NoError(t, m.recheckToken(&Session{UserID: "u-1", tokenIssuedAt: time.Now()}))
+}
