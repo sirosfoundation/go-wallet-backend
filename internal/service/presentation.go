@@ -86,6 +86,10 @@ func (s *PresentationService) GetAll(ctx context.Context, tenantID domain.Tenant
 
 // Delete removes a presentation
 func (s *PresentationService) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error {
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, presentationIdentifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
@@ -103,6 +107,10 @@ func (s *PresentationService) Delete(ctx context.Context, tenantID domain.Tenant
 
 // DeleteByCredentialID removes all presentations containing a specific credential
 func (s *PresentationService) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Presentations().DeleteByCredentialID(ctx, tenantID, holderDID, credentialID); err != nil {
 		return fmt.Errorf("failed to delete presentations by credential: %w", err)
 	}

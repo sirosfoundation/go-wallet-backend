@@ -552,6 +552,9 @@ func (h *Handlers) DeleteCredential(c *gin.Context) {
 	tenantID, _ := h.getTenantID(c)
 
 	if err := h.services.Credential.Delete(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return

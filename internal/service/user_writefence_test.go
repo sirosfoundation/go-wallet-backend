@@ -101,4 +101,27 @@ func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 		assert.ErrorIs(t, svc.Store(before, domain.DefaultTenantID, p), tokengate.ErrRevoked)
 		assert.NoError(t, svc.Store(after, domain.DefaultTenantID, p))
 	})
+	t.Run("credential delete", func(t *testing.T) {
+		svc := NewCredentialService(store, testConfig(), testLogger())
+		assert.ErrorIs(t, svc.Delete(before, domain.DefaultTenantID, "did:x", "c1"), tokengate.ErrRevoked)
+		_, err := svc.GetByIdentifier(base, domain.DefaultTenantID, "did:x", "c1")
+		require.NoError(t, err, "the refused delete must not land")
+		assert.NoError(t, svc.Delete(after, domain.DefaultTenantID, "did:x", "c1"))
+	})
+	t.Run("presentation delete", func(t *testing.T) {
+		svc := NewPresentationService(store, testLogger())
+		assert.ErrorIs(t, svc.Delete(before, domain.DefaultTenantID, "did:x", "p1"), tokengate.ErrRevoked)
+		_, err := svc.Get(base, domain.DefaultTenantID, "did:x", "p1")
+		require.NoError(t, err, "the refused delete must not land")
+		assert.NoError(t, svc.Delete(after, domain.DefaultTenantID, "did:x", "p1"))
+	})
+	t.Run("presentation delete by credential", func(t *testing.T) {
+		svc := NewPresentationService(store, testLogger())
+		p := &domain.VerifiablePresentation{HolderDID: "did:x", PresentationIdentifier: "p2", Presentation: "jwt"}
+		require.NoError(t, svc.Store(after, domain.DefaultTenantID, p))
+		assert.ErrorIs(t, svc.DeleteByCredentialID(before, domain.DefaultTenantID, "did:x", "c1"), tokengate.ErrRevoked)
+		_, err := svc.Get(base, domain.DefaultTenantID, "did:x", "p2")
+		require.NoError(t, err)
+		assert.NoError(t, svc.DeleteByCredentialID(after, domain.DefaultTenantID, "did:x", "c1"))
+	})
 }

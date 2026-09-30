@@ -160,6 +160,10 @@ func (s *CredentialService) Delete(ctx context.Context, tenantID domain.TenantID
 		return errors.New("credential_identifier is required")
 	}
 
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, credentialIdentifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return err
