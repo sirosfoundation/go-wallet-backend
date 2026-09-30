@@ -67,7 +67,15 @@ func TestExtractBearerToken(t *testing.T) {
 		{"no prefix", "abc123", ""},
 		{"empty", "", ""},
 		{"basic", "Basic abc123", ""},
-		{"bearer lowercase", "bearer abc", ""},
+		{"bearer lowercase", "bearer abc", "abc"},
+		{"bearer uppercase", "BEARER abc", "abc"},
+		{"bearer mixed case", "bEaReR abc", "abc"},
+		{"whitespace trimmed", "Bearer  abc ", "abc"},
+		{"scheme only", "Bearer", ""},
+		{"scheme with empty token", "Bearer ", ""},
+		{"no separator", "Bearerabc", ""},
+		{"longer scheme", "Bearers abc", ""},
+		{"leading space", " Bearer abc", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

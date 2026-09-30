@@ -237,12 +237,16 @@ func writeBodyReadError(w http.ResponseWriter, err error) {
 	http.Error(w, "failed to read body", http.StatusBadRequest)
 }
 
+// authSchemeBearer is the HTTP authentication scheme name (RFC 6750).
+const authSchemeBearer = "Bearer"
+
 // extractBearerToken returns the bearer token from the Authorization header,
-// or "" if it is absent or not a Bearer credential.
+// or "" if it is absent or not a Bearer credential. The scheme is matched
+// case-insensitively (RFC 7235 section 2.1).
 func extractBearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
+	parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], authSchemeBearer) {
 		return ""
 	}
-	return strings.TrimPrefix(auth, "Bearer ")
+	return strings.TrimSpace(parts[1])
 }
