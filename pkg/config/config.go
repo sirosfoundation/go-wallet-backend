@@ -293,7 +293,10 @@ type HTTPClientConfig struct {
 	// that really is down or missing. Default: true. Set false for strict
 	// content negotiation, where any non-200 is terminal.
 	// Env: WALLET_HTTP_CLIENT_METADATA_FALLBACK_ON_4XX
-	MetadataFallbackOn4xx bool `yaml:"metadata_fallback_on_4xx" envconfig:"METADATA_FALLBACK_ON_4XX"`
+	// Only the wallet server builds an issuer-metadata resolver; the registry
+	// server shares this struct but never reads the field (docs:"wallet-only"
+	// keeps it out of the registry reference).
+	MetadataFallbackOn4xx bool `yaml:"metadata_fallback_on_4xx" envconfig:"METADATA_FALLBACK_ON_4XX" docs:"wallet-only"`
 
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
