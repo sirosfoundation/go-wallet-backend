@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,9 +13,16 @@ import (
 
 // maxWMPRPCBodyBytes is the maximum allowed body size for WMP JSON-RPC requests.
 // JSON-RPC messages are small; 256KB is generous for any flow action payload.
+// Public paths of the WMP endpoints, as mounted by the server router and
+// advertised by the /.well-known/wmp-configuration discovery document.
+const (
+	WMPRPCPath    = "/api/v2/wallet/rpc"
+	WMPEventsPath = "/api/v2/wallet/events"
+)
+
 const maxWMPRPCBodyBytes = 256 * 1024
 
-// HandleWMPRPC handles POST /wmp/rpc — a single JSON-RPC request/response.
+// HandleWMPRPC handles POST /api/v2/wallet/rpc — a single JSON-RPC request/response.
 func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -36,9 +44,11 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read body (bounded to RPC-appropriate size).
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxWMPRPCBodyBytes))
+	// http.MaxBytesReader (not io.LimitReader) so an oversized body fails
+	// with 413 instead of being silently truncated into a confusing parse error.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWMPRPCBodyBytes))
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		writeBodyReadError(w, err)
 		return
 	}
 
@@ -84,7 +94,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resp)
 }
 
-// HandleWMPEvents handles GET /wmp/events — SSE stream of server notifications.
+// HandleWMPEvents handles GET /api/v2/wallet/events — SSE stream of server notifications.
 func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -181,8 +191,8 @@ func (a *WMPAdapter) HandleWMPConfiguration(w http.ResponseWriter, _ *http.Reque
 	caps := a.serverCapabilities()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
-	_, _ = fmt.Fprintf(w, `{"version":"%s","security":{"mode":"tls"},"capabilities":%s,"endpoints":{"rpc":"/wmp/rpc","events":"/wmp/events"}}`,
-		"1.0", mustMarshalJSON(caps))
+	_, _ = fmt.Fprintf(w, `{"version":"%s","security":{"mode":"tls"},"capabilities":%s,"endpoints":{"rpc":"%s","events":"%s"}}`,
+		"1.0", mustMarshalJSON(caps), WMPRPCPath, WMPEventsPath)
 }
 
 func mustMarshalJSON(v interface{}) string {
@@ -191,4 +201,15 @@ func mustMarshalJSON(v interface{}) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// writeBodyReadError maps a request-body read failure to 413 when the body
+// exceeded the http.MaxBytesReader limit, and 400 otherwise.
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "failed to read body", http.StatusBadRequest)
 }

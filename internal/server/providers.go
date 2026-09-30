@@ -478,11 +478,11 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 
 	// WMP JSON-RPC endpoints — same engine, same auth, same security posture.
 	// POST /api/v2/wallet/rpc — JSON-RPC 2.0 request/response (auth via Authorization: Bearer)
-	router.POST("/api/v2/wallet/rpc", func(c *gin.Context) {
+	router.POST(wsengine.WMPRPCPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
 	})
 	// GET /api/v2/wallet/events — SSE stream of WMP notifications (auth via Authorization: Bearer)
-	router.GET("/api/v2/wallet/events", func(c *gin.Context) {
+	router.GET(wsengine.WMPEventsPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
 	// GET /.well-known/wmp-configuration — public capability discovery, no auth

@@ -36,9 +36,11 @@ func (m *Manager) HandleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read request body (bounded).
-	body, err := io.ReadAll(io.LimitReader(r.Body, MaxHTTPResponseBodyBytes))
+	// http.MaxBytesReader so an oversized body fails with 413 rather than
+	// being silently truncated and mis-parsed.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxHTTPResponseBodyBytes))
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		writeBodyReadError(w, err)
 		return
 	}
 

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,6 +54,41 @@ func expiredToken(userID string) string {
 }
 
 // --- HandleRPC tests ---
+
+func TestHandleRPC_OversizedBody_Returns413(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	body := bytes.Repeat([]byte("x"), MaxHTTPResponseBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/rpc", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := httptest.NewRecorder()
+
+	m.HandleRPC(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("boom") }
+
+func TestWriteBodyReadError_Generic400(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeBodyReadError(w, errors.New("boom"))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestHandleRPC_BodyReadError_Returns400(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/wallet/rpc", failingReader{})
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := httptest.NewRecorder()
+	m.HandleRPC(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
 
 func TestHandleRPC_Handshake_CreatesSession(t *testing.T) {
 	m := testManager()

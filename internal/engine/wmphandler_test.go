@@ -2439,10 +2439,8 @@ func TestWMP_HTTPEndpoint_RPC_SessionOwnershipMismatch(t *testing.T) {
 }
 
 // TestWMP_HTTPEndpoint_RPC_OversizedBody verifies that a request body larger
-// than maxWMPRPCBodyBytes is bounded (silently truncated by the
-// io.LimitReader) rather than read into memory unbounded, and that the
-// resulting truncated/invalid JSON is handled gracefully as a JSON-RPC parse
-// error rather than a crash or hang.
+// than maxWMPRPCBodyBytes is rejected with 413 (http.MaxBytesReader) rather
+// than read into memory unbounded or silently truncated into a parse error.
 func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2457,11 +2455,7 @@ func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 
 	a.HandleWMPRPC(w, req)
 
-	assert.Equal(t, http.StatusOK, w.Code)
-	var rpcResp wmp.Response
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &rpcResp))
-	require.NotNil(t, rpcResp.Error, "truncated body should yield a JSON-RPC parse error, not a crash")
-	assert.Equal(t, wmp.ErrParseError, rpcResp.Error.Code)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
 // TestWMP_HTTPEndpoint_RPC_Notification_NoContent verifies that a JSON-RPC
@@ -2659,8 +2653,8 @@ func TestWMP_HTTPEndpoint_Configuration(t *testing.T) {
 
 	endpoints, ok := cfg["endpoints"].(map[string]interface{})
 	require.True(t, ok)
-	assert.Equal(t, "/wmp/rpc", endpoints["rpc"])
-	assert.Equal(t, "/wmp/events", endpoints["events"])
+	assert.Equal(t, "/api/v2/wallet/rpc", endpoints["rpc"])
+	assert.Equal(t, "/api/v2/wallet/events", endpoints["events"])
 }
 
 func TestMustMarshalJSON_Success(t *testing.T) {
