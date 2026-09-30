@@ -41,7 +41,20 @@ pattern — not streaming.
 ```
 POST /api/v2/wallet/rpc                     → JSON-RPC requests (flow.start, flow.action, etc.)
 GET  /api/v2/wallet/events?session_id=...   → SSE stream of server notifications (progress, sign/match sub-flow starts, etc.)
+GET  /api/v2/wallet/rpc/events?session_id=  → the same stream (alias, see Discovery below)
+GET  /.well-known/wmp-configuration         → discovery document (absolute endpoint URLs)
 ```
+
+**Discovery.** go-wmp's HTTPS+SSE client (`httpsse.NewClientTransport`) takes a
+single absolute `https` base URL, POSTs JSON-RPC to it and opens the stream at
+`base + "/events"`. The discovery document therefore advertises
+`endpoints.rpc = <external-url>/api/v2/wallet/rpc` and
+`endpoints.events = <external-url>/api/v2/wallet/rpc/events`, and the server
+serves the stream at both `/api/v2/wallet/events` and `/api/v2/wallet/rpc/events`.
+The external URL comes from `server.external_urls.engine_url` (if http/https),
+else `as.external_url`; with neither, the discovery endpoint returns 503
+rather than advertising unusable relative URLs. JSON-RPC notifications are
+answered `202 Accepted` with an empty body (the client accepts only 200/202).
 
 This eliminates all WebSocket connection management while preserving the exact
 same WMP protocol semantics. go-wmp already has an `httpsse` transport package.

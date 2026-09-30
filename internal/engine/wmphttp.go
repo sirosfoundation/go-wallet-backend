@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -18,9 +20,17 @@ import (
 // JSON-RPC messages are small; 256KB is generous for any flow action payload.
 // Public paths of the WMP endpoints, as mounted by the server router and
 // advertised by the /.well-known/wmp-configuration discovery document.
+//
+// go-wmp's HTTPS+SSE client (httpsse.NewClientTransport) takes ONE base URL,
+// POSTs JSON-RPC to it and opens the SSE stream at base + "/events". So the
+// RPC path doubles as that base and the stream is ALSO served at
+// WMPRPCPath + "/events" (WMPClientEventsPath), which is the events endpoint
+// the discovery document advertises. WMPEventsPath remains as the original
+// alias for existing clients.
 const (
-	WMPRPCPath    = "/api/v2/wallet/rpc"
-	WMPEventsPath = "/api/v2/wallet/events"
+	WMPRPCPath          = "/api/v2/wallet/rpc"
+	WMPEventsPath       = "/api/v2/wallet/events"
+	WMPClientEventsPath = WMPRPCPath + "/events"
 )
 
 const maxWMPRPCBodyBytes = 256 * 1024
@@ -275,6 +285,21 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// SetExternalURL sets the public base URL (scheme://host[:port][/prefix])
+// under which the WMP endpoints are reachable; the discovery document
+// advertises absolute URLs built from it. Only http(s) URLs with a host and
+// no query or fragment are accepted.
+func (a *WMPAdapter) SetExternalURL(raw string) error {
+	u, err := url.Parse(strings.TrimRight(raw, "/"))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid WMP external URL %q", raw)
+	}
+	a.mu.Lock()
+	a.externalURL = u.String()
+	a.mu.Unlock()
+	return nil
+}
+
 // tokenCoversSession reports whether a token with the given TAC may observe the
 // session: every capability the session was created with must be granted by
 // the token. A session created without a TAC (legacy auth) has nothing to
@@ -294,7 +319,19 @@ func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC) bool {
 // This allows WMP clients to discover server capabilities without establishing a session.
 // The document is the go-wmp library's own WellKnownConfig type, so it always
 // matches the schema wmp.DiscoverConfig expects.
+//
+// The endpoints are absolute https URLs derived from the configured external
+// URL (SetExternalURL), because go-wmp's client rejects relative ones. Without
+// a usable external URL the endpoint fails closed with 503 rather than
+// advertising something no client can consume.
 func (a *WMPAdapter) HandleWMPConfiguration(w http.ResponseWriter, _ *http.Request) {
+	a.mu.RLock()
+	base := a.externalURL
+	a.mu.RUnlock()
+	if base == "" {
+		http.Error(w, "WMP discovery unavailable: no external URL configured", http.StatusServiceUnavailable)
+		return
+	}
 	caps := make(map[string]interface{})
 	for name, raw := range a.serverCapabilities() {
 		var v interface{}
@@ -308,8 +345,8 @@ func (a *WMPAdapter) HandleWMPConfiguration(w http.ResponseWriter, _ *http.Reque
 		SecurityModes:     []string{"tls"},
 		Capabilities:      caps,
 		Endpoints: map[string]string{
-			"rpc":    WMPRPCPath,
-			"events": WMPEventsPath,
+			"rpc":    base + WMPRPCPath,
+			"events": base + WMPClientEventsPath,
 		},
 	}
 	body, err := json.Marshal(cfg)
@@ -331,4 +368,11 @@ func writeBodyReadError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "failed to read body", http.StatusBadRequest)
+}
+
+// HasExternalURL reports whether SetExternalURL has succeeded.
+func (a *WMPAdapter) HasExternalURL() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.externalURL != ""
 }

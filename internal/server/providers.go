@@ -423,6 +423,20 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
 	wmpAdapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
+	// Public base URL for the WMP discovery document: the engine's external
+	// URL when it is an http(s) one, else the AS's. Unset/invalid leaves
+	// /.well-known/wmp-configuration failing closed (503).
+	for _, candidate := range []string{cfg.Server.ExternalURLs.EngineURL, cfg.AS.ExternalURL} {
+		if candidate == "" {
+			continue
+		}
+		if err := wmpAdapter.SetExternalURL(candidate); err == nil {
+			break
+		}
+	}
+	if !wmpAdapter.HasExternalURL() {
+		logger.Warn("No usable external URL configured (server.external_urls.engine_url or as.external_url); /.well-known/wmp-configuration will return 503")
+	}
 
 	return &EngineProvider{
 		cfg:              cfg,
@@ -485,6 +499,11 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	// The stream outlives the server's WriteTimeout; the handler itself arms a
 	// fresh bounded write deadline around every write/flush.
 	router.GET(wsengine.WMPEventsPath, func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
+	})
+	// GET /api/v2/wallet/rpc/events — the same stream at the URL go-wmp's
+	// HTTPS+SSE client derives from the advertised rpc endpoint (base + "/events").
+	router.GET(wsengine.WMPClientEventsPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
 	// GET /.well-known/wmp-configuration — public capability discovery, no auth

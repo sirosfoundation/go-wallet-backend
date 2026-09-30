@@ -44,6 +44,7 @@ type WMPAdapter struct {
 	peers             map[string]*wmpSession      // keyed by WMP session ID
 	resumptionTokens  map[string]*resumptionEntry // token -> entry with session ID and expiry
 	eventBufs         map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	externalURL       string                      // public base URL for discovery (SetExternalURL)
 	draining          bool                        // set by Drain/Close; new sessions and requests are refused
 	beforeCreateToken func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
 

@@ -17,6 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/httpsse"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2648,6 +2649,7 @@ readLoop:
 func TestWMP_HTTPEndpoint_Configuration(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
+	require.NoError(t, a.SetExternalURL("https://wallet.example.com/"))
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/wmp-configuration", nil)
 	w := httptest.NewRecorder()
@@ -2663,17 +2665,40 @@ func TestWMP_HTTPEndpoint_Configuration(t *testing.T) {
 	assert.Equal(t, []string{"tls"}, cfg.SecurityModes)
 	assert.Contains(t, cfg.Capabilities, "sign")
 	assert.Contains(t, cfg.Capabilities, "flows")
-	assert.Equal(t, "/api/v2/wallet/rpc", cfg.Endpoints["rpc"])
-	assert.Equal(t, "/api/v2/wallet/events", cfg.Endpoints["events"])
+	assert.Equal(t, "https://wallet.example.com/api/v2/wallet/rpc", cfg.Endpoints["rpc"])
+	assert.Equal(t, "https://wallet.example.com/api/v2/wallet/rpc/events", cfg.Endpoints["events"])
 }
 
-// The discovery document must round-trip through the library's own client.
+// Without a usable external URL the discovery document cannot advertise
+// absolute endpoints, so it fails closed instead of misleading clients.
+func TestWMP_HTTPEndpoint_Configuration_NoExternalURL_FailsClosed(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	w := httptest.NewRecorder()
+	a.HandleWMPConfiguration(w, httptest.NewRequest(http.MethodGet, "/.well-known/wmp-configuration", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	for _, bad := range []string{"", "/api", "ftp://x.example", "https://", "https://x.example/?q=1", "https://x.example/#f", "::"} {
+		assert.Error(t, a.SetExternalURL(bad), bad)
+	}
+	assert.False(t, a.HasExternalURL())
+	require.NoError(t, a.SetExternalURL("https://x.example/prefix"))
+	assert.True(t, a.HasExternalURL())
+}
+
+// The discovery document must be consumable by the library's own client: its
+// endpoints feed httpsse.NewClientTransport, which POSTs to the advertised
+// rpc URL and derives the SSE URL as rpc + "/events".
 func TestWMP_HTTPEndpoint_Configuration_DiscoverConfigRoundTrip(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/wmp-configuration", a.HandleWMPConfiguration)
+	mux.HandleFunc(WMPRPCPath, a.HandleWMPRPC)
+	mux.HandleFunc(WMPEventsPath, a.HandleWMPEvents)
+	mux.HandleFunc(WMPClientEventsPath, a.HandleWMPEvents)
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()
 
@@ -2686,13 +2711,49 @@ func TestWMP_HTTPEndpoint_Configuration_DiscoverConfigRoundTrip(t *testing.T) {
 	}
 	client.Transport = tr
 
-	cfg, err := wmp.DiscoverConfigWithClient(context.Background(), "example.com", client)
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	require.NoError(t, err)
+	host := "example.com:" + port
+	require.NoError(t, a.SetExternalURL("https://"+host))
+
+	cfg, err := wmp.DiscoverConfigWithClient(context.Background(), host, client)
 	require.NoError(t, err)
 	assert.Equal(t, wmp.SupportedVersions, cfg.SupportedVersions)
 	assert.Equal(t, []string{"tls"}, cfg.SecurityModes)
-	assert.Equal(t, WMPRPCPath, cfg.Endpoints["rpc"])
-	assert.Equal(t, WMPEventsPath, cfg.Endpoints["events"])
+	assert.Equal(t, "https://"+host+WMPRPCPath, cfg.Endpoints["rpc"])
+	assert.Equal(t, cfg.Endpoints["rpc"]+"/events", cfg.Endpoints["events"])
 	assert.Contains(t, cfg.Capabilities, "flows")
+
+	// Drive the whole bundled client off the discovered endpoint alone.
+	hdr := http.Header{"Authorization": {"Bearer " + testToken("user-1", "tenant-a")}}
+	ct, err := httpsse.NewClientTransport(cfg.Endpoints["rpc"], httpsse.WithHTTPClient(client), httpsse.WithHeaders(hdr))
+	require.NoError(t, err)
+	defer ct.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, ct.WriteMessage(ctx, wmpRequest("1", wmp.MethodSessionCreate, wmp.SessionCreateParams{
+		WMP:      wmp.Metadata{Version: wmp.Version},
+		Security: wmp.SecurityMode{Mode: "tls"},
+		Auth:     &wmp.AuthObject{Type: "bearer", Token: testToken("user-1", "tenant-a")},
+	})))
+	raw, err := ct.ReadMessage(ctx)
+	require.NoError(t, err)
+	var resp wmp.Response
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	require.Nil(t, resp.Error)
+	var created wmp.SessionCreateResult
+	require.NoError(t, json.Unmarshal(resp.Result, &created))
+	sid := created.WMP.SessionID
+
+	// SSE at the URL the client derives itself.
+	require.NoError(t, ct.ConnectSSE(ctx, sid))
+
+	// A notification carrying only params.wmp.session_id (no header) is
+	// accepted: 202, which WriteMessage treats as success.
+	require.NoError(t, ct.WriteMessage(ctx, wmpNotification(wmp.MethodFlowAction, wmp.FlowActionParams{
+		WMP: wmp.Metadata{Version: wmp.Version, SessionID: sid}, FlowID: "nope", Action: "consent",
+	})))
 }
 
 // FlowError.Details (e.g. OID4VP's redirect_uri) must reach the WMP client.
