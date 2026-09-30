@@ -1316,6 +1316,21 @@ func (h *wmpEngineHandler) peekChildFlow(childFlowID string) (childFlowInfo, boo
 	return *info, true
 }
 
+// purgeChildFlows drops every child mapping owned by parentFlowID. It runs
+// when the parent flow is torn down (completion, timeout, cancellation), so a
+// child that never completed cannot leave its entry behind for the session's
+// lifetime.
+func (h *wmpEngineHandler) purgeChildFlows(parentFlowID string) {
+	t := h.table()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, info := range t.flows {
+		if info.parentFlowID == parentFlowID {
+			delete(t.flows, id)
+		}
+	}
+}
+
 func (h *wmpEngineHandler) popChildFlow(childFlowID string) (*childFlowInfo, bool) {
 	t := h.table()
 	t.mu.Lock()
@@ -1510,6 +1525,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 				_ = h.session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 			}
 			h.session.removeFlow(flowID, flow)
+			h.purgeChildFlows(flowID)
 		}()
 
 		flowCtx, cancel := context.WithTimeout(context.Background(), flowTimeout)
@@ -1915,6 +1931,16 @@ func (t *wmpSessionTransport) startChildFlow(childFlowID, flowType string, param
 	return err
 }
 
+// startChildFlowOrForget is startChildFlow, dropping the child mapping when
+// the start fails outright so a failed start leaves nothing behind.
+func (t *wmpSessionTransport) startChildFlowOrForget(childFlowID, flowType string, params json.RawMessage) error {
+	if err := t.startChildFlow(childFlowID, flowType, params); err != nil {
+		t.handler.popChildFlow(childFlowID)
+		return err
+	}
+	return nil
+}
+
 // reissueChildFlow waits for the replacement transport and starts the child
 // flow there. On failure the child mapping is dropped and the parent's
 // sign/match wait is left to its own timeout or session end.
@@ -2043,9 +2069,10 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		}
 		paramsJSON, err := json.Marshal(subFlowParams)
 		if err != nil {
+			t.handler.popChildFlow(childFlowID)
 			return err
 		}
-		return t.startChildFlow(childFlowID, wmp.FlowTypeSign, paramsJSON)
+		return t.startChildFlowOrForget(childFlowID, wmp.FlowTypeSign, paramsJSON)
 
 	case *MatchRequestMessage:
 		// Start a nested match sub-flow. Same pattern as sign.
@@ -2058,9 +2085,10 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		}
 		paramsJSON, err := json.Marshal(matchParams)
 		if err != nil {
+			t.handler.popChildFlow(childFlowID)
 			return err
 		}
-		return t.startChildFlow(childFlowID, "match", paramsJSON)
+		return t.startChildFlowOrForget(childFlowID, "match", paramsJSON)
 
 	default:
 		// Fallback for engine messages with no dedicated WMP method

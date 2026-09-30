@@ -1087,3 +1087,86 @@ func TestWMP_FlowComplete_MalformedResultReportsError(t *testing.T) {
 		t.Fatal("no match response delivered")
 	}
 }
+
+// --- child mapping lifecycle ---
+
+func childFlowCount(h *wmpEngineHandler) int {
+	t := h.table()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.flows)
+}
+
+// A sub-flow whose start fails outright must not leave its mapping behind.
+func TestWMP_ChildFlowStartFailure_RemovesMapping(t *testing.T) {
+	for _, msg := range []interface{}{
+		&SignRequestMessage{Message: Message{FlowID: "p", MessageID: "m"}, Action: SignActionSignClientAuth},
+		&MatchRequestMessage{Message: Message{FlowID: "p", MessageID: "m"}},
+	} {
+		ct := wmp.NewChannelTransport(1, 1)
+		handler := &wmpEngineHandler{sessionID: "s", adapter: &WMPAdapter{logger: zap.NewNop()}}
+		peer := wmp.NewPeer(ct, handler)
+		tr := newWMPSessionTransport(peer, ct)
+		tr.handler = handler
+		ctx, cancel := context.WithCancel(context.Background())
+		go peer.Serve(ctx)
+		go func() { // the client rejects the child flow start
+			var req struct {
+				ID json.RawMessage `json:"id"`
+			}
+			select {
+			case data := <-ct.Out():
+				if json.Unmarshal(data, &req) == nil {
+					b, _ := json.Marshal(wmp.NewErrorResponse(req.ID, wmp.NewRPCError(wmp.ErrFlowError, nil)))
+					_ = ct.Push(b)
+				}
+			case <-ctx.Done():
+			}
+		}()
+
+		require.Error(t, tr.SendJSON(msg))
+		cancel()
+		assert.Equal(t, 0, childFlowCount(handler), "%T", msg)
+	}
+}
+
+// Tearing the parent flow down purges its unfinished children (and only its).
+func TestWMP_ParentTeardown_PurgesChildMappings(t *testing.T) {
+	h := &wmpEngineHandler{adapter: &WMPAdapter{logger: zap.NewNop()}}
+	h.registerChildFlow("c1", "parent", "m1", "sign")
+	h.registerChildFlow("c2", "parent", "m2", "match")
+	h.registerChildFlow("c3", "other", "m3", "sign")
+
+	h.purgeChildFlows("parent")
+	assert.Equal(t, 1, childFlowCount(h))
+	_, ok := h.peekChildFlow("c3")
+	assert.True(t, ok)
+}
+
+// End to end: a flow that ends while its acknowledged child never completes
+// must not leave the mapping in the table.
+func TestWMP_FlowEnd_PurgesUnfinishedChild(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	bh := &blockingHandler{release: make(chan struct{})}
+	m.RegisterFlowHandler("blocker", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		return bh, nil
+	})
+	sid := createWMPSession(t, a)
+	a.mu.RLock()
+	h := a.peers[sid].handler
+	a.mu.RUnlock()
+
+	resp, err := a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "blocker", "f1"))
+	require.NoError(t, err)
+	var first wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &first))
+	require.Nil(t, first.Error)
+
+	h.registerChildFlow("c1", "f1", "m1", "sign")
+	h.registerChildFlow("c2", "other", "m2", "sign")
+	close(bh.release) // the parent ends; c1 never completed
+	require.Eventually(t, func() bool { return childFlowCount(h) == 1 }, time.Second, 5*time.Millisecond)
+	_, ok := h.peekChildFlow("c2")
+	assert.True(t, ok)
+}
