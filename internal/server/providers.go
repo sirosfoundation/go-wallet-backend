@@ -590,7 +590,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			services.WebAuthn,
 			store,
 			services.TokenBlacklist,
-			cfg.HTTPClient.NewHTTPClient(0),
+			// IdP-scoped client: the AS only talks to the operator's OIDC
+			// providers, which http_client.trusted_idp_hosts may place on
+			// private addresses (#349).
+			cfg.HTTPClient.NewIdPHTTPClient(0),
 			logger,
 		)
 		if err != nil {

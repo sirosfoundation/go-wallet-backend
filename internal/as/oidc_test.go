@@ -42,7 +42,7 @@ func TestExchangeCode_Success(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	resp, err := exchangeCode(t.Context(), ts.URL, "test-code", "client-1", "https://example.com/callback", "test-verifier")
+	resp, err := exchangeCode(t.Context(), nil, ts.URL, "test-code", "client-1", "https://example.com/callback", "test-verifier")
 	if err != nil {
 		t.Fatalf("exchangeCode: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestExchangeCode_MissingIDToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCode(t.Context(), ts.URL, "code", "client", "https://example.com/cb", "verifier")
+	_, err := exchangeCode(t.Context(), nil, ts.URL, "code", "client", "https://example.com/cb", "verifier")
 	if err == nil {
 		t.Fatal("expected error for missing id_token")
 	}
@@ -77,7 +77,7 @@ func TestExchangeCode_ErrorResponse(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCode(t.Context(), ts.URL, "bad-code", "client", "https://example.com/cb", "verifier")
+	_, err := exchangeCode(t.Context(), nil, ts.URL, "bad-code", "client", "https://example.com/cb", "verifier")
 	if err == nil {
 		t.Fatal("expected error for bad status")
 	}

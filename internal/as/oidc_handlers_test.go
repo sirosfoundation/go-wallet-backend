@@ -149,7 +149,7 @@ func setupOIDCHandlers(store *mockStore) (*gin.Engine, *MemorySessionStore) {
 	}
 	logger := zap.NewNop()
 
-	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, logger)
+	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, nil, logger)
 
 	router := gin.New()
 	router.GET("/auth/oidc/login", h.Login)
@@ -496,7 +496,7 @@ func TestNewOIDCHandlers(t *testing.T) {
 	cfg := &config.ASConfig{ExternalURL: "https://example.com"}
 	logger := zap.NewNop()
 
-	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, logger)
+	h := NewOIDCHandlers(store, sessions, cfg, testStateSecret, nil, logger)
 	if h == nil {
 		t.Fatal("expected non-nil OIDCHandlers")
 	}
@@ -1264,7 +1264,7 @@ func TestOIDCCallback_ConcurrentSingleWinner(t *testing.T) {
 		DefaultMaxTAC: "rwl",
 		SessionTTL:    24 * time.Hour,
 	}
-	h := NewOIDCHandlers(memStore, NewMemorySessionStore(), cfg, testStateSecret, zap.NewNop())
+	h := NewOIDCHandlers(memStore, NewMemorySessionStore(), cfg, testStateSecret, nil, zap.NewNop())
 	router := gin.New()
 	router.GET("/auth/oidc/callback", h.Callback)
 
@@ -1394,7 +1394,7 @@ func TestOIDCCallback_ConsumesChallengeAtomically(t *testing.T) {
 		DefaultMaxTAC: "rwl",
 		SessionTTL:    24 * time.Hour,
 	}
-	h := NewOIDCHandlers(wrapped, NewMemorySessionStore(), cfg, testStateSecret, zap.NewNop())
+	h := NewOIDCHandlers(wrapped, NewMemorySessionStore(), cfg, testStateSecret, nil, zap.NewNop())
 	router := gin.New()
 	router.GET("/auth/oidc/callback", h.Callback)
 
