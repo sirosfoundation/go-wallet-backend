@@ -1004,3 +1004,43 @@ func TestWMP_Resume_AfterFullRevocationIsSessionNotFound(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, wmp.ErrSessionNotFound, rpcErrCode(t, resp))
 }
+
+// A sign/match send blocks in Peer.Call until the client acknowledges the
+// sub-flow start, while holding Session.Send's read lock. A resume must abort
+// that call instead of waiting out the call timeout for the write lock.
+func TestWMP_Resume_DoesNotWaitForUnacknowledgedCall(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, token, _ := createSessionFull(t, a, "u", "t", nil)
+
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- sess.Send(&SignRequestMessage{
+			Message: Message{Type: TypeSignRequest, FlowID: "f", MessageID: "m"},
+		})
+	}()
+	// Let the Call start and block (nobody acknowledges it).
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-sendErr:
+		t.Fatalf("send returned before resume: %v", err)
+	default:
+	}
+
+	start := time.Now()
+	res, rpcErr := doResume(t, a, "u", "t", resumeBody(sid, token, ""))
+	require.Nil(t, rpcErr)
+	assert.True(t, res.Resumed)
+	assert.Less(t, time.Since(start), 5*time.Second, "resume must not wait for the unacknowledged call")
+
+	select {
+	case err := <-sendErr:
+		assert.Error(t, err, "the aborted call reports failure")
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked send was not released by resume")
+	}
+}

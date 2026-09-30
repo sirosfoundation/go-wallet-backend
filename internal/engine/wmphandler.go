@@ -1072,6 +1072,14 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		buf = a.getOrCreateEventBuffer(params.SessionID)
 	}
 
+	// Abort any blocking sign/match Call still holding Session.Send's read
+	// lock on the old transport (the client may have disconnected without
+	// acknowledging it); otherwise the write lock below would wait out the
+	// call timeout. Queued notifications are unaffected.
+	if old, ok := oldWS.session.currentTransport().(*wmpSessionTransport); ok {
+		old.retire()
+	}
+
 	// Rewire the engine session's transport to the new peer/channel. The
 	// write lock waits for in-flight Session.Send calls (which hold the read
 	// lock for the whole send), so nothing is written to the old transport
@@ -1625,10 +1633,36 @@ type wmpSessionTransport struct {
 	peer    *wmp.Peer
 	ct      *wmp.ChannelTransport
 	handler *wmpEngineHandler
+
+	// retireCtx is cancelled by retire when a session resume supersedes this
+	// transport. Blocking Peer.Call sends (sign/match sub-flow starts) derive
+	// their context from it so an unacknowledged call cannot keep
+	// Session.Send's read lock - and therefore the resume's write lock -
+	// held for the full call timeout.
+	retireCtx    context.Context
+	retireCancel context.CancelFunc
 }
 
 func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessionTransport {
-	return &wmpSessionTransport{peer: peer, ct: ct}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &wmpSessionTransport{peer: peer, ct: ct, retireCtx: ctx, retireCancel: cancel}
+}
+
+// retire aborts any in-flight blocking Call on this transport without closing
+// the underlying channel, so queued notifications are still drained into the
+// event buffer by the resume. Safe to call more than once.
+func (t *wmpSessionTransport) retire() {
+	if t.retireCancel != nil {
+		t.retireCancel()
+	}
+}
+
+// callContext is the parent context for blocking Peer.Call sends.
+func (t *wmpSessionTransport) callContext() context.Context {
+	if t.retireCtx != nil {
+		return t.retireCtx
+	}
+	return context.Background()
 }
 
 // SendJSON intercepts engine message structs and translates them to WMP
@@ -1706,7 +1740,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
-		callCtx, cancel := context.WithTimeout(ctx, childFlowStartTimeout)
+		callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
 		defer cancel()
 		var startResult wmp.FlowStartResult
 		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
@@ -1730,7 +1764,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if err != nil {
 			return err
 		}
-		callCtx, cancel := context.WithTimeout(ctx, childFlowStartTimeout)
+		callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
 		defer cancel()
 		var startResult wmp.FlowStartResult
 		err = t.peer.Call(callCtx, wmp.MethodFlowStart, &wmp.FlowStartParams{
