@@ -1439,13 +1439,35 @@ func TestFullLoginFlow(t *testing.T) {
 // newTestVirtualWebAuthnSetup, which fixes RefreshDays at 0/disabled) so a
 // refresh token actually gets minted.
 func TestFullLoginFlow_MintsSharedRefreshTokenFamily(t *testing.T) {
+	finishLoginResp := fullLoginFlowWithRefreshDays(t, 7)
+	require.NotEmpty(t, finishLoginResp.Token)
+	require.NotEmpty(t, finishLoginResp.RefreshToken)
+
+	accessSid := sidClaim(t, finishLoginResp.Token)
+	refreshSid := sidClaim(t, finishLoginResp.RefreshToken)
+	assert.NotEmpty(t, accessSid, "expected FinishLogin's access token to carry a sid claim")
+	assert.Equal(t, accessSid, refreshSid, "access and refresh tokens from the same login must share the same sid")
+	assert.Equal(t, accessSid, finishLoginResp.SID, "FinishLoginResponse.SID must expose the family id for the AS session")
+}
+
+// With refresh tokens disabled there is no family: no sid claim, no exposed SID.
+func TestFullLoginFlow_RefreshDisabled_NoFamily(t *testing.T) {
+	finishLoginResp := fullLoginFlowWithRefreshDays(t, 0)
+	require.NotEmpty(t, finishLoginResp.Token)
+	assert.Empty(t, finishLoginResp.RefreshToken)
+	assert.Empty(t, finishLoginResp.SID)
+	assert.Empty(t, sidClaim(t, finishLoginResp.Token))
+}
+
+func fullLoginFlowWithRefreshDays(t *testing.T, refreshDays int) *FinishLoginResponse {
+	t.Helper()
 	cfg := &config.Config{
 		Server: config.ServerConfig{RPName: testRPName, RPID: testRPID, RPOrigin: testRPOrigin},
 		JWT: config.JWTConfig{
 			Secret:      testJWTSecret,
 			Issuer:      testJWTIssuer,
 			ExpiryHours: testJWTExpiryHours,
-			RefreshDays: 7,
+			RefreshDays: refreshDays,
 		},
 	}
 	store := memory.NewStore()
@@ -1496,15 +1518,7 @@ func TestFullLoginFlow_MintsSharedRefreshTokenFamily(t *testing.T) {
 		Credential:  json.RawMessage(assertionResponse),
 	})
 	require.NoError(t, err)
-
-	require.NotEmpty(t, finishLoginResp.Token)
-	require.NotEmpty(t, finishLoginResp.RefreshToken)
-
-	accessSid := sidClaim(t, finishLoginResp.Token)
-	refreshSid := sidClaim(t, finishLoginResp.RefreshToken)
-	assert.NotEmpty(t, accessSid, "expected FinishLogin's access token to carry a sid claim")
-	assert.Equal(t, accessSid, refreshSid, "access and refresh tokens from the same login must share the same sid")
-	assert.Equal(t, accessSid, finishLoginResp.SID, "FinishLoginResponse.SID must expose the family id for the AS session")
+	return finishLoginResp
 }
 
 // TestFullLoginFlow_CloneWarningSurfaced covers issue #380: a sign-counter

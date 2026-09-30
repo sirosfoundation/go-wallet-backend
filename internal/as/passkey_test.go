@@ -353,3 +353,32 @@ func TestPasskeyLoginFinish_RecordsRefreshTokenFamilyOnSession(t *testing.T) {
 	}
 	t.Fatal("session cookie not set")
 }
+
+// Session-mode clients never receive the appToken/refresh token, so no
+// family is recorded on their session.
+func TestPasskeyLoginFinish_SessionMode_DoesNotRecordFamily(t *testing.T) {
+	mock := &mockWebAuthn{
+		finishLoginResp: &service.FinishLoginResponse{UUID: "user-123", TenantID: "tenant-1", SID: "sid-family-43"},
+	}
+	router, store := setupPasskeyHandlers(mock)
+
+	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Token-Mode", "session")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieInsecure {
+			sess, _ := store.Get(context.Background(), c.Value)
+			if sess == nil || sess.FamilyID != "" {
+				t.Fatalf("session-mode session must not record a family, got %+v", sess)
+			}
+			return
+		}
+	}
+	t.Fatal("session cookie not set")
+}

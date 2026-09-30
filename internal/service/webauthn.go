@@ -1508,7 +1508,13 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// to the refresh token minted alongside it below (and to every token
 	// produced by rotating that refresh token - see RefreshAccessToken),
 	// so Logout can revoke the whole family in one call (#402).
-	sid := generateChallengeID()
+	// No refresh token means no family to revoke beyond the access token's
+	// own jti, so no sid is minted or exposed then (avoids year-long
+	// revocation markers for nothing).
+	sid := ""
+	if s.cfg.JWT.RefreshDays > 0 {
+		sid = generateChallengeID()
+	}
 
 	// Generate JWT token with tenant_id included for security boundary
 	token, err := s.generateToken(user, tenantID, sid)
@@ -1845,7 +1851,7 @@ func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTo
 	// at all; start tracking a family for it from this rotation onward
 	// rather than leaving it (and every further rotation downstream of it)
 	// permanently outside Logout's reach.
-	if sid == "" {
+	if sid == "" && s.cfg.JWT.RefreshDays > 0 {
 		sid = generateChallengeID()
 	}
 
