@@ -524,6 +524,21 @@ Expired tombstones are removed by two mechanisms:
 - Use load balancer
 - Required for > 1000 users
 
+### Single-replica limits
+
+Some state is held per process, not shared between replicas. Running more than
+one replica is supported, but these limits apply:
+
+- **Per-user lifecycle lock.** `WalletLifecycleService.LockUser` serializes, per
+  user, a first attestation's instance write with the revocation cascade's
+  "is anything still live? then erase" step. The lock is an in-process mutex:
+  it serializes work within one process, not across replicas. The cross-replica
+  window is covered by the WIA post-write recheck
+  (`revokeIfWalletDeactivatedMeanwhile`): after it writes an instance, the WIA
+  path re-reads the wallet's state, and an instance inserted after a
+  concurrent erasure on another replica is revoked again (and the erasure
+  re-run) instead of being kept. No external lock service is required.
+
 ### Database Scaling
 
 - MongoDB sharding
