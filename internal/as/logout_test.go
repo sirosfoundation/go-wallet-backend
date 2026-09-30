@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 )
 
@@ -448,7 +449,12 @@ func TestLogoutHandler_FamilyRevokeErrorFailsClosed(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", w.Code)
 	}
-	// Session is still revoked and the cookie cleared.
+	// Session is still revoked, and the cookie is KEPT so a retry can work.
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == sessionCookieInsecure && ck.MaxAge < 0 {
+			t.Error("session cookie must not be cleared when family revocation fails")
+		}
+	}
 	if s, _ := store.Get(context.Background(), "sess-fam-err"); s == nil || !s.Revoked {
 		t.Error("session should be revoked even when family revocation fails")
 	}
@@ -458,5 +464,86 @@ func TestLogoutHandler_SessionLookupErrorFailsClosed(t *testing.T) {
 	w := logoutWithFamily(t, failingGetStore{NewMemorySessionStore()}, &fakeBlacklist{}, "whatever")
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 when the session (family) cannot be looked up, got %d", w.Code)
+	}
+}
+
+// TestLogoutHandler_RetryAfterFailedFamilyRevocation proves the advertised
+// idempotent retry works: the first DELETE fails family revocation (500,
+// session already revoked), a second with the same cookie must not 401 and
+// must revoke the family.
+func TestLogoutHandler_RetryAfterFailedFamilyRevocation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemorySessionStore()
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-retry", UserID: "user-1", FamilyID: "sid-retry",
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	bl := &fakeBlacklist{familyErr: errors.New("boom")}
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, bl, time.Hour, true, zap.NewNop()))
+	do := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-retry"})
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := do(); w.Code != http.StatusInternalServerError {
+		t.Fatalf("first attempt: expected 500, got %d", w.Code)
+	}
+	bl.familyErr = nil
+	if w := do(); w.Code != http.StatusNoContent {
+		t.Fatalf("retry: expected 204, got %d", w.Code)
+	}
+	if _, ok := bl.families["sid-retry"]; !ok {
+		t.Error("retry must revoke the family")
+	}
+}
+
+// TestLogoutHandler_RevokesSIDFromLegacyBearerForPreSIDSession covers a
+// session created before #402 (empty FamilyID) whose refresh token was
+// rotated: the replacement tokens carry a fresh sid that only the bearer
+// knows. Logout must revoke it, even when the access token has expired.
+func TestLogoutHandler_RevokesSIDFromLegacyBearerForPreSIDSession(t *testing.T) {
+	secret := []byte("test-legacy-secret-32-bytes-long!")
+	legacyIssuer := NewLegacyTokenIssuer(secret, "test-issuer", time.Hour)
+	mint := func(user string, exp time.Time) string {
+		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"jti": "j1", "sub": user, "user_id": user, "tenant_id": "t",
+			"sid": "sid-rotated", "exp": exp.Unix(),
+		}).SignedString(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	run := func(bearer string) *fakeBlacklist {
+		gin.SetMode(gin.TestMode)
+		store := NewMemorySessionStore()
+		_ = store.Create(context.Background(), &Session{
+			JTI: "sess-pre", UserID: "user-1", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		})
+		bl := &fakeBlacklist{}
+		router := gin.New()
+		router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, bl, time.Hour, true, zap.NewNop()))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pre"})
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", w.Code)
+		}
+		return bl
+	}
+
+	if bl := run(mint("user-1", time.Now().Add(time.Hour))); bl.families["sid-rotated"].IsZero() {
+		t.Error("sid from a live legacy bearer must be revoked")
+	}
+	if bl := run(mint("user-1", time.Now().Add(-time.Hour))); bl.families["sid-rotated"].IsZero() {
+		t.Error("sid from an expired legacy bearer must still be revoked")
+	}
+	if bl := run(mint("someone-else", time.Now().Add(time.Hour))); len(bl.families) != 0 {
+		t.Errorf("a stranger's bearer must not revoke any family, got %v", bl.families)
 	}
 }

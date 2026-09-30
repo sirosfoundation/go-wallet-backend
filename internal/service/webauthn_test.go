@@ -1026,6 +1026,32 @@ func TestWebAuthnService_RefreshAccessToken(t *testing.T) {
 		assert.Equal(t, newSid, sidClaim(t, resp2.RefreshToken), "the initialised sid must be carried forward, not regenerated")
 		assert.Equal(t, newSid, sidClaim(t, resp2.Token))
 	})
+
+	// AS logout for a pre-#402 session has no stored FamilyID; it recovers
+	// the sid from the replacement access token (internal/as LogoutHandler)
+	// and revokes it. The replacement refresh token must then be rejected.
+	t.Run("after rotating a pre-sid token, revoking the sid from the replacement access token rejects the replacement refresh token", func(t *testing.T) {
+		svc, store := newSvcWithRefresh(t)
+		ctx := context.Background()
+		blacklist := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+		svc.SetTokenBlacklist(blacklist)
+
+		user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:test-refresh-sid-7"}
+		require.NoError(t, store.Users().Create(ctx, user))
+		addTenantMembership(t, store, user.UUID, "test-tenant")
+
+		legacy, err := svc.generateRefreshToken(user, domain.TenantID("test-tenant"), "")
+		require.NoError(t, err)
+		resp, err := svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: legacy})
+		require.NoError(t, err)
+
+		sid := sidClaim(t, resp.Token)
+		require.NotEmpty(t, sid)
+		require.NoError(t, blacklist.RevokeFamily(ctx, sid, time.Now().Add(time.Hour)))
+
+		_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: resp.RefreshToken})
+		assert.ErrorIs(t, err, ErrInvalidRefreshToken)
+	})
 }
 
 // sidClaim parses a legacy HMAC token signed with testJWTSecret and returns
