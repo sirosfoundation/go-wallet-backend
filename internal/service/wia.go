@@ -696,6 +696,11 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	// would silently undo an admin revocation the next time this instance
 	// successfully re-attests. See the guard in GenerateWIA above.
 	if s.instances != nil {
+		// Serialize the write and its re-check with the lifecycle cascade's
+		// liveness check and erasure (go-wallet-backend#330, in-process).
+		if s.lifecycle != nil && userID != nil {
+			defer s.lifecycle.LockUser(*userID)()
+		}
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
 			ID:                jkt,
@@ -972,7 +977,7 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	// re-runs the cascade.
 	if s.lifecycle != nil && !alreadyRevoked {
 		inserted.Status = domain.InstanceStatusRevoked
-		if err := s.lifecycle.CascadeForRevoked(ctx, tenantID, inserted, LifecycleActor{Kind: "provider"}); err != nil {
+		if err := s.lifecycle.CascadeForRevokedLocked(ctx, tenantID, inserted, LifecycleActor{Kind: "provider"}); err != nil {
 			s.logger.Error("cascade after revoking a raced first attestation did not complete", zap.Error(err), zap.String("jkt", newID))
 			return fmt.Errorf("%w: wallet deactivated during attestation: %w", ErrWIAInstanceDeactivated, err)
 		}

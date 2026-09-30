@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sirosfoundation/go-siros-set/set"
@@ -67,6 +68,56 @@ type WalletLifecycleService struct {
 	logger         *zap.Logger
 	audit          *audit.Emitter
 	sessionCleaner SessionCleaner
+	// locks serializes, per user and within this process, a first
+	// attestation's instance write with the cascade's "is anything live?
+	// then erase" step (see LockUser). Across processes the WIA post-write
+	// re-check (revokeIfWalletDeactivatedMeanwhile) is what keeps the wallet
+	// consistent: a record inserted after the erasure is revoked again.
+	locks userLocks
+}
+
+// userLocks is a set of per-user mutexes, dropped again when idle.
+type userLocks struct {
+	mu sync.Mutex
+	m  map[domain.UserID]*userLockEntry
+}
+
+type userLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (l *userLocks) lock(id domain.UserID) func() {
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[domain.UserID]*userLockEntry{}
+	}
+	e := l.m[id]
+	if e == nil {
+		e = &userLockEntry{}
+		l.m[id] = e
+	}
+	e.refs++
+	l.mu.Unlock()
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		l.mu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(l.m, id)
+		}
+		l.mu.Unlock()
+	}
+}
+
+// LockUser takes the user's lifecycle lock and returns its release. It is
+// held by the cascade while it decides whether anything is live and erases,
+// and by WIAService from the instance write to the end of its post-write
+// re-check, so a first attestation cannot land between the cascade's liveness
+// check and the erasure. The lock is not reentrant: a holder calls
+// CascadeForRevokedLocked, not CascadeForRevoked.
+func (s *WalletLifecycleService) LockUser(userID domain.UserID) func() {
+	return s.locks.lock(userID)
 }
 
 // NewWalletLifecycleService creates a WalletLifecycleService. auditor may be nil.
@@ -382,6 +433,15 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	if inst.UserID == nil {
 		return nil
 	}
+	defer s.LockUser(*inst.UserID)()
+	return s.cascadeLocked(ctx, tenantID, inst, actor)
+}
+
+// cascadeLocked is cascade for a caller that already holds LockUser.
+func (s *WalletLifecycleService) cascadeLocked(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
+	if inst.UserID == nil {
+		return nil
+	}
 	userID := *inst.UserID
 	var errs []error
 	// The status is normally persisted only after cutOffTokens, but a
@@ -410,6 +470,13 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	}
 	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
 	return s.incomplete(userID, errs)
+}
+
+// CascadeForRevokedLocked is CascadeForRevoked for a caller that already holds
+// LockUser for the instance's user (WIAService, which holds it across its
+// instance write and re-check).
+func (s *WalletLifecycleService) CascadeForRevokedLocked(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
+	return s.cascadeLocked(ctx, tenantID, inst, actor)
 }
 
 // CascadeForRevoked runs the revocation cascade for an instance whose
