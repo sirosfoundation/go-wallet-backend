@@ -1716,7 +1716,10 @@ func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCom
 	case "sign":
 		var resp SignResponseMessage
 		if params.Result != nil {
-			_ = json.Unmarshal(params.Result, &resp)
+			if err := json.Unmarshal(params.Result, &resp); err != nil {
+				// Never turn undecodable data into a zero-value success.
+				resp = SignResponseMessage{Error: "malformed sign result from client: " + err.Error()}
+			}
 		}
 		resp.FlowID = info.parentFlowID
 		resp.MessageID = info.messageID
@@ -1730,7 +1733,9 @@ func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCom
 	case "match":
 		var resp MatchResponseMessage
 		if params.Result != nil {
-			_ = json.Unmarshal(params.Result, &resp)
+			if err := json.Unmarshal(params.Result, &resp); err != nil {
+				resp = MatchResponseMessage{Error: "malformed match result from client: " + err.Error()}
+			}
 		}
 		resp.FlowID = info.parentFlowID
 		resp.MessageID = info.messageID

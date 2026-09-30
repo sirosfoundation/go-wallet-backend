@@ -1057,3 +1057,33 @@ func TestWMP_FlowStart_CurrentRequestTACLimits(t *testing.T) {
 	require.NoError(t, json.Unmarshal(resp, &ok2))
 	assert.Nil(t, ok2.Error, "full token may issue")
 }
+
+// A result that does not decode must fail the parent request, never be
+// delivered as a zero-value success.
+func TestWMP_FlowComplete_MalformedResultReportsError(t *testing.T) {
+	sess := &Session{signCh: make(chan *SignResponseMessage, 1), matchCh: make(chan *MatchResponseMessage, 1), logger: zap.NewNop()}
+	h := &wmpEngineHandler{adapter: &WMPAdapter{logger: zap.NewNop()}, session: sess}
+
+	h.registerChildFlow("s1", "p", "m1", "sign")
+	h.FlowComplete(context.Background(), &wmp.FlowCompleteParams{FlowID: "s1", Result: json.RawMessage(`"not-an-object"`)})
+	select {
+	case got := <-sess.signCh:
+		assert.NotEmpty(t, got.Error)
+		assert.Equal(t, "p", got.FlowID)
+		assert.Equal(t, "m1", got.MessageID)
+		_, err := signResult(got)
+		assert.Error(t, err)
+	default:
+		t.Fatal("no sign response delivered")
+	}
+
+	h.registerChildFlow("m2c", "p", "m2", "match")
+	h.FlowComplete(context.Background(), &wmp.FlowCompleteParams{FlowID: "m2c", Result: json.RawMessage(`[1,2]`)})
+	select {
+	case got := <-sess.matchCh:
+		assert.NotEmpty(t, got.Error)
+		assert.Equal(t, "m2", got.MessageID)
+	default:
+		t.Fatal("no match response delivered")
+	}
+}
