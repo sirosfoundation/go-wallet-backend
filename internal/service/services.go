@@ -53,6 +53,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
+	wpSvc.SetUsers(store.Users())
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -109,6 +110,10 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	if wiaSvc != nil {
 		wiaSvc.SetLifecycle(lifecycle)
 	}
+	proxySvc := NewProxyService(cfg, logger)
+	proxySvc.SetUsers(store.Users())
+	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
+	fido2Svc.SetUsers(store.Users())
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -118,11 +123,11 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
 		Keystore:         NewKeystoreService(store, cfg, logger),
-		Proxy:            NewProxyService(cfg, logger),
+		Proxy:            proxySvc,
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
+		FIDO2Attestation: fido2Svc,
 		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),

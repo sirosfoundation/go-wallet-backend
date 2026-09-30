@@ -70,6 +70,9 @@ func (h *Handlers) FIDO2AttestationRegister(c *gin.Context) {
 		ClientDataHash:    clientDataHash,
 	})
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, service.ErrFIDO2AttestationDisabled):
 			c.JSON(http.StatusServiceUnavailable, gin.H{

@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -21,7 +22,14 @@ type ProxyService struct {
 	client *http.Client
 	cfg    *config.Config
 	logger *zap.Logger
+	// users is read for the SID-AUTH-06 cut-off before the outbound request.
+	// Nil disables the recheck.
+	users tokengate.UserLookup
 }
+
+// SetUsers wires the user store Execute rechecks the request's token cut-off
+// against.
+func (s *ProxyService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // ProxyRequest represents an incoming proxy request
 type ProxyRequest struct {
@@ -69,6 +77,11 @@ func IsBinaryRequest(url string) bool {
 func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyResponse, []byte, error) {
 	if req.URL == "" {
 		return nil, nil, fmt.Errorf("URL is required")
+	}
+	// Mutation-boundary gate: the proxy acts on third parties as the wallet,
+	// so a cut-off landing after admission must stop the outbound request.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return nil, nil, err
 	}
 
 	method := strings.ToUpper(strings.TrimSpace(req.Method))

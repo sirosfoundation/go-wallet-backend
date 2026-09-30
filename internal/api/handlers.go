@@ -637,6 +637,9 @@ func (h *Handlers) ProxyRequest(c *gin.Context) {
 
 	resp, binaryData, err := h.services.Proxy.Execute(c.Request.Context(), &req)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Proxy request failed", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Proxy request failed"})
 		return
@@ -767,6 +770,9 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		req.OpenID4VCI.CredentialIssuer,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to generate key attestation", zap.Error(err))
 		c.JSON(400, gin.H{
 			"error":   "UNSUPPORTED",
