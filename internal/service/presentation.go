@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // PresentationService handles presentation operations
@@ -33,6 +34,10 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 	}
 	if presentation.PresentationIdentifier == "" {
 		return fmt.Errorf("presentation identifier is required")
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
 	}
 
 	// Set tenant ID

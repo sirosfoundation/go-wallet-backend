@@ -25,9 +25,13 @@ type TenantLookup interface {
 }
 
 // TokenAuthMiddleware is TokenAuthMiddlewareWithUsers without the user lookup,
-// so it does not enforce the SID-AUTH-06 token cut-off. It keeps the signature
-// that downstream users of this exported package compile against; use
-// TokenAuthMiddlewareWithUsers to get the cut-off.
+// so it does NOT enforce the SID-AUTH-06 token cut-off: tokens issued before a
+// wallet instance was revoked keep working. It exists only so that downstream
+// code compiled against the previous exported signature keeps building, and
+// nothing in this repository calls it (TestNoProductionCallerUsesTheWeakTokenAuthMiddleware
+// keeps it that way).
+//
+// Deprecated: use TokenAuthMiddlewareWithUsers, which enforces the cut-off.
 func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return TokenAuthMiddlewareWithUsers(v, tenants, nil, blacklist, logger)
 }
@@ -100,7 +104,7 @@ func TokenAuthMiddlewareWithUsers(v *validator.Validator, tenants TenantLookup, 
 		}
 		// Carried to the writes further down, which judge the token against
 		// the user record they load (tokengate.RefuseLoaded).
-		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), tokengate.IssuedAt(rawToken)))
+		c.Request = c.Request.WithContext(tokengate.WithSubject(c.Request.Context(), result.UserID, tokengate.IssuedAt(rawToken)))
 
 		tenant, tenantID, ok := resolveTokenTenant(c, tenants, result, logger)
 		if !ok {

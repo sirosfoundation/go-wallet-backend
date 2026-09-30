@@ -8,6 +8,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -40,6 +41,10 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 	}
 	if req.Format == "" {
 		return nil, errors.New("format is required")
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return nil, err
 	}
 
 	credential := &domain.VerifiableCredential{
@@ -122,6 +127,10 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 			return nil, err
 		}
 		s.logger.Error("Failed to get credential for update", zap.Error(err))
+		return nil, err
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return nil, err
 	}
 

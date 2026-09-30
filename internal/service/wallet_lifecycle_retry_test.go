@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -175,4 +176,66 @@ func TestEraseWalletData_FailsClosedWhenOtherTenantsCannotBeSeen(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, u.PrivateData, "a listing failure counts as live: the vault stays")
 	})
+}
+
+// A revoke-all whose cut-off after the sweep failed leaves every instance
+// revoked and a cut-off that predates the last revocation. Repeating it
+// changes nothing, so it must still repair the cut-off before it reports
+// success; cascade only fills a missing one.
+func TestRevokeAllForUser_RetryRepairsAStaleCutoff(t *testing.T) {
+	ctx := context.Background()
+	fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+	uid := seedWalletUser(t, fs.Store)
+	// A live instance in another tenant keeps the vault, so no erasure
+	// advances the cut-off behind the test's back.
+	require.NoError(t, fs.Store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: uid, TenantID: "acme", Role: "user"}))
+	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "elsewhere", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
+
+	n, err := svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
+	require.ErrorIs(t, err, ErrErasureIncomplete)
+	require.Equal(t, 1, n)
+	inst, gerr := fs.Store.WalletInstances().GetByID(ctx, "inst-"+uid.String())
+	require.NoError(t, gerr)
+	stale, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	require.True(t, stale.Before(*inst.DeactivatedAt), "the first attempt left a cut-off older than the revocation")
+
+	n, err = svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
+	require.NoError(t, err)
+	assert.Zero(t, n, "nothing left to revoke")
+	fresh, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.False(t, fresh.Before(*inst.DeactivatedAt), "the retry advanced the cut-off past the revocation")
+
+	again, err := svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
+	require.NoError(t, err)
+	assert.Zero(t, again)
+	same, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.True(t, same.Equal(fresh), "a further no-op retry leaves the cut-off alone")
+
+	t.Run("a failing repair is reported", func(t *testing.T) {
+		fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+		uid := seedWalletUser(t, fs.Store)
+		require.NoError(t, fs.Store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: uid, TenantID: "acme", Role: "user"}))
+		require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "e2", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive}))
+		_, err := svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
+		require.ErrorIs(t, err, ErrErasureIncomplete)
+		fs.failNth = nil
+		fs.fail["users.InvalidateAuthBefore"] = true
+		_, err = svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
+	})
+}
+
+func TestLatestRevoked(t *testing.T) {
+	now := time.Now()
+	older, newer := now.Add(-time.Hour), now
+	a := &domain.WalletInstance{ID: "a", DeactivatedAt: &newer}
+	b := &domain.WalletInstance{ID: "b", DeactivatedAt: &older}
+	c := &domain.WalletInstance{ID: "c"}
+	assert.Equal(t, "a", latestRevoked([]*domain.WalletInstance{b, a, c}).ID)
+	assert.Equal(t, "b", latestRevoked([]*domain.WalletInstance{b, c}).ID, "an instance with a recorded revocation beats one without")
+	assert.Equal(t, "c", latestRevoked([]*domain.WalletInstance{c}).ID, "none recorded: the last listed")
 }

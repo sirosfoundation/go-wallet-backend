@@ -882,3 +882,19 @@ func TestHandlers_PrivateDataWrite_TokenCutOffAfterAdmission(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 }
+
+func TestHandlers_UpdateSettings_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/settings", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.UpdateSettings(c)
+	})
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/settings", bytes.NewBufferString(`{"openidRefreshTokenMaxAgeInSeconds": 60}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+}

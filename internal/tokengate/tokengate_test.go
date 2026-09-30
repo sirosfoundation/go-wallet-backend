@@ -71,3 +71,21 @@ func TestRefuseLoaded(t *testing.T) {
 	assert.ErrorIs(t, RefuseLoaded(WithIssuedAt(ctx, time.Time{}), cutoff), ErrRevoked, "an unreadable iat cannot prove it postdates the cut-off")
 	assert.NoError(t, RefuseLoaded(WithIssuedAt(ctx, cutoff.Add(time.Second)), cutoff))
 }
+
+func TestRefuseNow(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	cutoff := time.Now().Truncate(time.Second)
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid}))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, cutoff))
+
+	assert.NoError(t, RefuseNow(ctx, store.Users()), "no token on the context: not judged")
+	assert.NoError(t, RefuseNow(WithSubject(ctx, uid.String(), cutoff.Add(-time.Hour)), nil), "no lookup: not judged")
+	assert.ErrorIs(t, RefuseNow(WithSubject(ctx, uid.String(), cutoff.Add(-time.Hour)), store.Users()), ErrRevoked)
+	assert.NoError(t, RefuseNow(WithSubject(ctx, uid.String(), cutoff.Add(time.Hour)), store.Users()))
+	assert.NoError(t, RefuseNow(WithSubject(ctx, "unknown", cutoff.Add(-time.Hour)), store.Users()), "the gate is not an existence check")
+	err := RefuseNow(WithSubject(ctx, uid.String(), cutoff), erroringUsers{})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrRevoked, "a store failure is not a revocation")
+}

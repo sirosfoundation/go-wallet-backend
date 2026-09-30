@@ -454,6 +454,9 @@ func (h *Handlers) StoreCredential(c *gin.Context) {
 	for _, credReq := range batchReq.Credentials {
 		credReq.HolderDID = holderDID
 		if _, err := h.services.Credential.Store(c.Request.Context(), tenantID, &credReq); err != nil {
+			if abortIfTokenRevoked(c, err) {
+				return
+			}
 			h.logger.Error("Failed to store credential", zap.Error(err))
 			// Continue storing other credentials
 		}
@@ -487,6 +490,9 @@ func (h *Handlers) UpdateCredential(c *gin.Context) {
 	tenantID, _ := h.getTenantID(c)
 	credential, err := h.services.Credential.Update(c.Request.Context(), tenantID, holderDID, &req)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to update credential", zap.Error(err))
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
@@ -1099,6 +1105,9 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 	}
 
 	if err := h.services.User.UpdateUser(c.Request.Context(), user); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to update user settings", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to update settings"})
 		return

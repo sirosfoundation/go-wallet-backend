@@ -293,13 +293,26 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 		}
 		if revokedThisPass == 0 {
 			if last == nil && len(instances) > 0 {
-				last = instances[len(instances)-1] // everything already revoked: retry the erasure
+				// Everything already revoked: a retry. Take the most recently
+				// revoked instance, since the cut-off has to cover the latest
+				// revocation, not an arbitrary one.
+				last = latestRevoked(instances)
 			}
 			break
 		}
 	}
 	if last == nil {
 		return changed, nil
+	}
+	if changed == 0 {
+		// A retry over instances an earlier attempt already revoked. That
+		// attempt may have failed at the cut-off it takes after the sweep,
+		// leaving one that predates the last revocation; cascade only
+		// establishes a missing cut-off, so repair a stale one here, as
+		// ChangeStatus does on its own retry.
+		if err := s.advanceCutoffIfStale(ctx, last, actor); err != nil {
+			return changed, errors.Join(err, s.cascade(ctx, tenantID, last, actor))
+		}
 	}
 	if changed > 0 {
 		// Advance the cut-off again now that every instance of the tenant is
@@ -315,6 +328,21 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 	// deactivate. Repeating it resumes the sweep, like the other
 	// ErrErasureIncomplete cases.
 	return changed, errors.Join(s.cascade(ctx, tenantID, last, actor), s.unsweptErr(ctx, tenantID, userID))
+}
+
+// latestRevoked returns the instance revoked most recently, falling back to
+// the last one listed when none records a revocation time.
+func latestRevoked(instances []*domain.WalletInstance) *domain.WalletInstance {
+	best := instances[len(instances)-1]
+	for _, inst := range instances {
+		if inst.DeactivatedAt == nil {
+			continue
+		}
+		if best.DeactivatedAt == nil || inst.DeactivatedAt.After(*best.DeactivatedAt) {
+			best = inst
+		}
+	}
+	return best
 }
 
 // unsweptErr reports ErrErasureIncomplete when an instance of the tenant is

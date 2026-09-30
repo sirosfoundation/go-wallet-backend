@@ -201,7 +201,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		}
 		// Carried to the writes further down, which judge the token against
 		// the user record they load (tokengate.RefuseLoaded).
-		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), tokengate.IssuedAtFromClaims(claims)))
+		c.Request = c.Request.WithContext(tokengate.WithSubject(c.Request.Context(), userID, tokengate.IssuedAtFromClaims(claims)))
 
 		// Get did from claims
 		did, _ := claims["did"].(string)

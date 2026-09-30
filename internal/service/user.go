@@ -712,6 +712,9 @@ func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domai
 
 // UpdateUser updates a user
 func (s *UserService) UpdateUser(ctx context.Context, user *domain.User) error {
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return err
+	}
 	user.UpdatedAt = time.Now()
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		return fmt.Errorf("failed to update user: %w", err)

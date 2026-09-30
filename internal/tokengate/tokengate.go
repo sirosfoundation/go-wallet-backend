@@ -95,6 +95,35 @@ func IssuedBeforeCutoff(issuedAt, cutoff time.Time) bool {
 }
 
 type issuedAtKey struct{}
+type subjectKey struct{}
+
+// WithSubject is WithIssuedAt plus the token's user id, for writes that have no
+// user record in hand (stored credentials and presentations are keyed by holder
+// DID) and so cannot use RefuseLoaded. They call RefuseNow instead.
+func WithSubject(ctx context.Context, userID string, issuedAt time.Time) context.Context {
+	return context.WithValue(WithIssuedAt(ctx, issuedAt), subjectKey{}, userID)
+}
+
+// RefuseNow reads the token's user cut-off at the mutation boundary and judges
+// the request's token against it. It is the recheck for a write that loads no
+// user: it cannot make the write atomic with a revocation, but it takes the
+// decision immediately before persisting instead of at request admission. A
+// context without a token, or a user the store does not know (the gate is not
+// an existence check), is not judged.
+func RefuseNow(ctx context.Context, users UserLookup) error {
+	userID, _ := ctx.Value(subjectKey{}).(string)
+	if userID == "" || users == nil {
+		return nil
+	}
+	cutoff, err := users.GetAuthCutoff(ctx, domain.UserIDFromString(userID))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("recheck token authorization: %w", err)
+	}
+	return RefuseLoaded(ctx, cutoff)
+}
 
 // WithIssuedAt records, on the request context, the iat of the bearer token
 // that authenticated the request. The middlewares call it once the token has
