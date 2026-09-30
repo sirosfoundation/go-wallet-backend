@@ -985,7 +985,6 @@ type AccountInfoResponse struct {
 	UUID                string                   `json:"uuid"`
 	Username            *string                  `json:"username,omitempty"`
 	DisplayName         *string                  `json:"displayName,omitempty"`
-	HasPassword         bool                     `json:"hasPassword"`
 	Settings            AccountSettings          `json:"settings"`
 	WebauthnCredentials []WebauthnCredentialInfo `json:"webauthnCredentials"`
 }
@@ -1039,7 +1038,6 @@ func (h *Handlers) GetAccountInfo(c *gin.Context) {
 		UUID:        user.UUID.String(),
 		Username:    user.Username,
 		DisplayName: user.DisplayName,
-		HasPassword: user.PasswordHash != nil,
 		Settings: AccountSettings{
 			OpenIDRefreshTokenMaxAgeInSeconds: user.OpenIDRefreshTokenMaxAge,
 		},
