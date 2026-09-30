@@ -104,6 +104,10 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		webauthnSvc.SetTokenBlacklist(tokenBlacklist)
 	}
 
+	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
+	if wiaSvc != nil {
+		wiaSvc.SetLifecycle(lifecycle)
+	}
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -118,7 +122,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
 		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
-		WalletLifecycle:  NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger)),
+		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,

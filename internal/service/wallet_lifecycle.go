@@ -384,6 +384,13 @@ func (s *WalletLifecycleService) cascade(ctx context.Context, tenantID domain.Te
 	return s.incomplete(userID, errs)
 }
 
+// CascadeForRevoked runs the revocation cascade for an instance whose
+// revocation was persisted by another component (WIAService revokes a raced
+// first attestation itself). See cascade.
+func (s *WalletLifecycleService) CascadeForRevoked(ctx context.Context, tenantID domain.TenantID, inst *domain.WalletInstance, actor LifecycleActor) error {
+	return s.cascade(ctx, tenantID, inst, actor)
+}
+
 // ensureCutoff records a token cut-off for a user that has none. Used by
 // cascade for statuses persisted outside ChangeStatus/RevokeAllForUser.
 func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID) error {
@@ -460,8 +467,9 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	}
 	// WebAuthn challenges are per user and deleted here. WIA challenges are
 	// not: they are single-use, short-lived nonces that carry only a tenant,
-	// belong to no user, and are useless to a deactivated wallet because
-	// GenerateWIA refuses it before consuming one.
+	// belong to no user (anyone can request one, so there is nothing of the
+	// wallet's in them to erase), and are useless to a deactivated wallet
+	// because GenerateWIA refuses it before signing anything.
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
 		errs = append(errs, fmt.Errorf("delete webauthn challenges: %w", err))
 	}

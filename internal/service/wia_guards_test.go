@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -168,5 +169,46 @@ func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_OwnershipAndAbsence(t *te
 		err := svc.revokeIfWalletDeactivatedMeanwhile(ctx, domain.DefaultTenantID, &mine, "new")
 		require.Error(t, err)
 		assert.NotErrorIs(t, err, ErrWIAInstanceDeactivated, "an unrevoked instance must not be reported as handled")
+	})
+}
+
+// The lifecycle cascade that revoked the user's last other instance may have
+// listed a raced first attestation while it was still active and so kept the
+// vault. When the attestation path then revokes that instance itself, nothing
+// live is left and the erasure has to happen now.
+func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_RunsTheCascade(t *testing.T) {
+	ctx := context.Background()
+	fs := newFailStore()
+	svc := newTestWIAServiceUsingStores(t, fs.WalletInstances(), fs.Users())
+	svc.SetLifecycle(NewWalletLifecycleService(fs, zap.NewNop(), nil))
+	uid := seedWalletUser(t, fs.Store)
+	require.NoError(t, fs.Store.WalletInstances().UpdateStatus(ctx, "inst-"+uid.String(), domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
+	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "raced", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
+	}))
+
+	err := svc.revokeIfWalletDeactivatedMeanwhile(ctx, domain.DefaultTenantID, &uid, "raced")
+	require.ErrorIs(t, err, ErrWIAInstanceDeactivated)
+
+	u, gerr := fs.Store.Users().GetByID(ctx, uid)
+	require.NoError(t, gerr)
+	assert.Empty(t, u.PrivateData, "the deactivated wallet's vault must be erased")
+	c, p := countHolderData(t, fs.Store, domain.DefaultTenantID, uid)
+	assert.Zero(t, c+p)
+	cutoff, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+	assert.False(t, cutoff.IsZero(), "tokens are cut off")
+
+	t.Run("a cascade that fails is reported with the refusal", func(t *testing.T) {
+		fs := newFailStore("users.EraseWalletData")
+		svc := newTestWIAServiceUsingStores(t, fs.WalletInstances(), fs.Users())
+		svc.SetLifecycle(NewWalletLifecycleService(fs, zap.NewNop(), nil))
+		uid := seedWalletUser(t, fs.Store)
+		require.NoError(t, fs.Store.WalletInstances().UpdateStatus(ctx, "inst-"+uid.String(), domain.DefaultTenantID, domain.InstanceStatusRevoked, "x"))
+		require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "raced", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
+		}))
+		err := svc.revokeIfWalletDeactivatedMeanwhile(ctx, domain.DefaultTenantID, &uid, "raced")
+		assert.ErrorIs(t, err, ErrWIAInstanceDeactivated)
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
 	})
 }

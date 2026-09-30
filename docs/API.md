@@ -285,9 +285,9 @@ An engine deployed without the backend role in the same process enforces the
 cut-off only when persistent storage is configured; with memory storage it
 logs a warning at startup and relies on the token lifetime. There is no
 second source of truth for the cut-off, so such an engine opens the
-configured storage backend exactly as a backend instance does - for MongoDB
-that includes the default-tenant and index initialisation - and its database
-principal needs the same rights as a backend instance. This is deliberately
+configured storage backend read-only - no default-tenant creation and no index
+creation for MongoDB - and its database principal needs read rights on the
+users collection only. Being unable to open it is deliberately
 fatal at startup rather than a warning: an engine that came up with the gate
 silently off would accept tokens the lifecycle had already revoked, and
 nothing would say so. A deployment that does not want the dependency leaves

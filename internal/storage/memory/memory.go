@@ -321,7 +321,7 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 	user.CreatedAt = time.Now()
 	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
+	s.data[user.UUID.String()] = deepCopyUser(user)
 	return nil
 }
 
@@ -373,7 +373,7 @@ func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	}
 
 	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
+	s.data[user.UUID.String()] = deepCopyUser(user)
 	return nil
 }
 

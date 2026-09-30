@@ -36,8 +36,21 @@ type Store struct {
 	keyAttestations *KeyAttestationStore
 }
 
-// NewStore creates a new MongoDB store
+// NewStore creates a new MongoDB store and runs its startup initialization:
+// the default tenant is created and the indexes are ensured.
 func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, true)
+}
+
+// NewReadOnlyStore connects like NewStore but performs no startup writes: no
+// default tenant, no index creation. It is for a process that only reads, such
+// as a standalone engine looking up a user's token cut-off, so its database
+// principal needs read rights on the users collection and nothing more.
+func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, false)
+}
+
+func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (*Store, error) {
 	clientOptions := options.Client().
 		ApplyURI(cfg.URI).
 		SetConnectTimeout(time.Duration(cfg.Timeout) * time.Second)
@@ -96,6 +109,10 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.invites = &InviteStore{collection: database.Collection("invites")}
 	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
 	s.keyAttestations = &KeyAttestationStore{collection: database.Collection("key_attestations")}
+
+	if !initialize {
+		return s, nil
+	}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {

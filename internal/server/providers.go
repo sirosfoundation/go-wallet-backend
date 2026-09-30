@@ -495,11 +495,9 @@ func (p *BackendProvider) TokenGate() *tokengate.Gate {
 
 // NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
 // engine that runs without the backend role in the same process. It opens
-// the configured storage backend exactly as the backend role does -
-// backend.New runs the store's startup initialization (Mongo default tenant
-// and index creation), so the database principal needs the same rights as
-// a backend instance; there is no read-only constructor - and then uses it
-// for user lookups only. With no persistent storage configured (memory)
+// the configured storage backend read-only (backend.NewReadOnly: no default
+// tenant creation, no index creation, so the database principal needs read
+// rights on the users collection only) and uses it for user lookups only. With no persistent storage configured (memory)
 // there is nothing to consult: the caller gets a nil gate and must warn that
 // pre-suspension tokens are not cut off at the engine handshake in that
 // deployment.
@@ -507,7 +505,7 @@ func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate
 	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
 		return nil, nil, nil
 	}
-	store, err := backend.New(ctx, cfg)
+	store, err := backend.NewReadOnly(ctx, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open storage for token gate: %w", err)
 	}

@@ -181,6 +181,9 @@ type WIAService struct {
 	// credential_id (see checkCredentialOwnership). Nil refuses every claim.
 	users storage.UserStore
 	audit *audit.Emitter
+	// lifecycle, when set, runs the revocation cascade (session drop, token
+	// cut-off, erasure) for an instance this service had to revoke itself.
+	lifecycle *WalletLifecycleService
 
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
@@ -190,6 +193,11 @@ type WIAService struct {
 	stopOnce  sync.Once
 	startOnce sync.Once
 }
+
+// SetLifecycle wires the wallet lifecycle service, so an instance the
+// attestation path revokes on its own (a wallet deactivated while the first
+// attestation was in flight) gets the same cascade as any other revocation.
+func (s *WIAService) SetLifecycle(l *WalletLifecycleService) { s.lifecycle = l }
 
 // NewWIAService creates a new WIA service.
 // It shares the same signing key as the WalletProviderService (same x5c chain).
@@ -930,6 +938,19 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 		})
 	}
 	s.emitAuditFailure("wallet_deactivated", errors.New("wallet deactivated while the first attestation was in flight"))
+	// The lifecycle cascade that revoked the last other instance may have
+	// listed the new record while it was still active and so kept the wallet
+	// data; now that this revocation has left nothing live, that decision has
+	// to be taken again or the deactivated wallet keeps its data. A failure is
+	// reported, and repeating the revocation of any instance of the user
+	// re-runs the cascade.
+	if s.lifecycle != nil && !alreadyRevoked {
+		inserted.Status = domain.InstanceStatusRevoked
+		if err := s.lifecycle.CascadeForRevoked(ctx, tenantID, inserted, LifecycleActor{Kind: "provider"}); err != nil {
+			s.logger.Error("cascade after revoking a raced first attestation did not complete", zap.Error(err), zap.String("jkt", newID))
+			return fmt.Errorf("%w: wallet deactivated during attestation: %w", ErrWIAInstanceDeactivated, err)
+		}
+	}
 	return fmt.Errorf("%w: wallet deactivated during attestation", ErrWIAInstanceDeactivated)
 }
 
