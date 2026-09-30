@@ -647,6 +647,21 @@ type ServerConfig struct {
 	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
 	EngineHost string `yaml:"engine_host" envconfig:"ENGINE_HOST"` // WebSocket engine bind address (defaults to Host)
 	EnginePort int    `yaml:"engine_port" envconfig:"ENGINE_PORT"` // WebSocket engine port (defaults to Port if 0)
+	// TrustedProxies lists the proxy addresses or CIDRs whose X-Forwarded-For
+	// (and X-Real-IP) headers are believed when determining the client IP,
+	// which the per-IP rate limits depend on. Use ["none"] to trust no proxy
+	// (the client IP is then the TCP peer, which is right when clients connect
+	// directly).
+	// BACKWARDS COMPATIBILITY: when unset, gin's original behaviour is kept and
+	// every peer is trusted. That lets any direct caller choose its own client
+	// IP by sending X-Forwarded-For, so the per-IP limits can be bypassed (the
+	// per-tenant limit still holds), and a warning is logged at startup while
+	// per-IP limiting is enabled. It stays the default so an upgrade does not
+	// put every client behind a load balancer into one rate-limit bucket.
+	// Production deployments should set this: to the load balancer's addresses
+	// behind one, or ["none"] without one.
+	// Env: WALLET_SERVER_TRUSTED_PROXIES (comma-separated)
+	TrustedProxies []string `yaml:"trusted_proxies" envconfig:"TRUSTED_PROXIES"`
 	// EngineWSPingInterval is how often the server sends a WebSocket ping to
 	// the client, and (via HandshakeCompleteMessage.Config) the interval the
 	// client is told to use for its own pings - see that message's doc
@@ -1413,6 +1428,11 @@ type SecurityConfig struct {
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
+	// OIDCGateRateLimit limits requests that present a token to the OIDC
+	// registration/login gates (#65). Two independent buckets: per client IP
+	// and per tenant; a request must fit in both.
+	OIDCGateRateLimit OIDCGateRateLimitConfig `yaml:"oidc_gate_rate_limit" envconfig:"OIDC_GATE_RATE_LIMIT"`
+
 	// AAGUIDBlacklist contains AAGUID blacklist configuration for WebAuthn
 	AAGUIDBlacklist AAGUIDBlacklistConfig `yaml:"aaguid_blacklist" envconfig:"AAGUID_BLACKLIST"`
 
@@ -1462,6 +1482,57 @@ type AuthRateLimitConfig struct {
 
 	// LockoutSeconds is how long to lock out after exceeding the limit
 	// Default: 300 (5 minutes)
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// OIDCGateRateLimitConfig configures rate limiting in front of the OIDC gates.
+//
+// Token validation is the expensive part of a gated request (discovery and
+// JWKS fetches, signature checks), so the limiter runs before it. It only
+// counts requests that carry a bearer token, so tenants without a gate are
+// unaffected. A failed validation costs the client extra tokens (three in
+// total instead of one), so guessing is dearer than valid use.
+//
+// Two buckets, because either alone fails badly: per-IP alone lets one
+// tenant's attackers lock out everyone behind a shared NAT; per-tenant alone
+// lets a single client exhaust a whole tenant. Client-IP keying relies on
+// gin's trusted-proxy handling being correct behind a load balancer.
+type OIDCGateRateLimitConfig struct {
+	// PerIP limits by client IP.
+	PerIP OIDCGateIPLimitConfig `yaml:"per_ip" envconfig:"PER_IP"`
+	// PerTenant limits by tenant.
+	PerTenant OIDCGateTenantLimitConfig `yaml:"per_tenant" envconfig:"PER_TENANT"`
+}
+
+// OIDCGateIPLimitConfig is the per-client-IP bucket of the OIDC gate limiter.
+// It has the same shape as AuthRateLimitConfig but its own documentation and
+// defaults; convert with AuthRateLimitConfig(c).
+type OIDCGateIPLimitConfig struct {
+	// Enabled controls whether the per-IP limit is active. Default: true
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// MaxAttempts is the number of token-bearing gate requests one client IP
+	// may make per window. Default: 30
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+	// WindowSeconds is the rate-limit window in seconds. Default: 60
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+	// LockoutSeconds is how long a client IP is refused after exceeding the
+	// limit, and the Retry-After it is sent. Default: 60
+	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
+}
+
+// OIDCGateTenantLimitConfig is the per-tenant bucket of the OIDC gate limiter.
+// It has the same shape as AuthRateLimitConfig but its own documentation and
+// defaults; convert with AuthRateLimitConfig(c).
+type OIDCGateTenantLimitConfig struct {
+	// Enabled controls whether the per-tenant limit is active. Default: true
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// MaxAttempts is the number of token-bearing gate requests one tenant
+	// may receive per window, across all clients. Default: 300
+	MaxAttempts int `yaml:"max_attempts" envconfig:"MAX_ATTEMPTS"`
+	// WindowSeconds is the rate-limit window in seconds. Default: 60
+	WindowSeconds int `yaml:"window_seconds" envconfig:"WINDOW_SECONDS"`
+	// LockoutSeconds is how long a tenant is refused after exceeding the
+	// limit, and the Retry-After it is sent. Default: 60
 	LockoutSeconds int `yaml:"lockout_seconds" envconfig:"LOCKOUT_SECONDS"`
 }
 
@@ -1749,6 +1820,10 @@ func defaultConfig() *Config {
 				WindowSeconds:  60,
 				LockoutSeconds: 300,
 			},
+			OIDCGateRateLimit: OIDCGateRateLimitConfig{
+				PerIP:     OIDCGateIPLimitConfig{Enabled: true, MaxAttempts: 30, WindowSeconds: 60, LockoutSeconds: 60},
+				PerTenant: OIDCGateTenantLimitConfig{Enabled: true, MaxAttempts: 300, WindowSeconds: 60, LockoutSeconds: 60},
+			},
 			AAGUIDBlacklist: AAGUIDBlacklistConfig{
 				Enabled:       false, // Disabled by default
 				AAGUIDs:       []string{},
@@ -1812,10 +1887,34 @@ func defaultConfig() *Config {
 	}
 }
 
+// validateTrustedProxies rejects entries that are neither an IP, a CIDR nor
+// the literal "none", so a typo fails at startup instead of at first request.
+func (c ServerConfig) validateTrustedProxies() error {
+	for _, p := range c.TrustedProxies {
+		p = strings.TrimSpace(p)
+		if strings.EqualFold(p, "none") {
+			if len(c.TrustedProxies) != 1 {
+				return fmt.Errorf("server.trusted_proxies: \"none\" cannot be combined with other entries")
+			}
+			continue
+		}
+		if net.ParseIP(p) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return fmt.Errorf("server.trusted_proxies: %q is not an IP address, CIDR or \"none\"", p)
+		}
+	}
+	return nil
+}
+
 // Validate validates the configuration
 func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
+	}
+	if err := c.Server.validateTrustedProxies(); err != nil {
+		return err
 	}
 
 	// Validate wallet-provider port when explicitly configured

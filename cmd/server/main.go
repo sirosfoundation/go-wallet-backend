@@ -188,6 +188,8 @@ func main() {
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+		serverCfg.TrustedProxies = backendCfg.Server.TrustedProxies
+		serverCfg.WarnUntrustedClientIP = backendCfg.Security.OIDCGateRateLimit.PerIP.Enabled
 	} else if registryCfg != nil {
 		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}

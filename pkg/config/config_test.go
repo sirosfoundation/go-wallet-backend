@@ -2621,6 +2621,34 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
+func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	ip, tenant := cfg.Security.OIDCGateRateLimit.PerIP, cfg.Security.OIDCGateRateLimit.PerTenant
+	if !ip.Enabled || ip.MaxAttempts != 30 || ip.WindowSeconds != 60 || ip.LockoutSeconds != 60 {
+		t.Errorf("per-IP defaults wrong: %+v", ip)
+	}
+	if !tenant.Enabled || tenant.MaxAttempts != 300 || tenant.WindowSeconds != 60 || tenant.LockoutSeconds != 60 {
+		t.Errorf("per-tenant defaults wrong: %+v", tenant)
+	}
+}
+
+func TestConfig_Validate_TrustedProxies(t *testing.T) {
+	for _, ok := range [][]string{nil, {"none"}, {"10.0.0.0/8", "192.168.1.1", "fd00::/8"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]string{{"10.0.0.0/33"}, {"lb.example.com"}, {"none", "10.0.0.1"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies") {
+			t.Errorf("%v must be rejected, got %v", bad, err)
+		}
+	}
+}
+
 func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.Audit.IdentityEvents = []string{"bound"}

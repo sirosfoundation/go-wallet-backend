@@ -42,6 +42,9 @@ type ASModule struct {
 	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
 	store          storage.Store
 	validatorCache *middleware.ValidatorCache
+	// gateLimit, when set, rate limits token-bearing requests to the passkey
+	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
+	gateLimit gin.HandlerFunc
 }
 
 // NewASModule creates and initializes the AS module.
@@ -147,6 +150,24 @@ func NewASModule(
 	}, nil
 }
 
+// SetOIDCGateRateLimiter installs the rate limiter that runs in front of the
+// passkey OIDC gates. Call it before RegisterRoutes; the same limiter is
+// meant to be shared with the /user/* gates so both draw from one set of
+// buckets.
+func (m *ASModule) SetOIDCGateRateLimiter(l *middleware.OIDCGateRateLimiter) {
+	if l != nil {
+		m.gateLimit = l.Middleware()
+	}
+}
+
+// gateLimitMiddleware returns the installed limiter, or a pass-through.
+func (m *ASModule) gateLimitMiddleware() gin.HandlerFunc {
+	if m.gateLimit != nil {
+		return m.gateLimit
+	}
+	return func(c *gin.Context) { c.Next() }
+}
+
 // RegisterRoutes registers all AS endpoints on the given router group.
 // The group should be mounted at /auth.
 func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
@@ -163,7 +184,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	{
 		// Registration routes (with OIDC registration gate).
 		registration := passkey.Group("")
-		registration.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
 		{
 			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
@@ -171,7 +192,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 		// Login routes (with OIDC login gate).
 		login := passkey.Group("")
-		login.Use(middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
 		{
 			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
 			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
