@@ -1155,7 +1155,20 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	// access tokens — only legacy HMAC JWTs would work.
 	var tv *tokenvalidator.Validator
 	var relayHandle *jwksRelay
-	if cfg.AS.Enabled {
+	//
+	// The AS JWKS is fetched from as.external_url. Without it there is no
+	// JWKS to fetch: if legacy HMAC is still enabled, fall back to the
+	// HMAC-only middleware (authMiddleware with a nil validator); otherwise
+	// no session-token mechanism is left, so fail startup (same rule as
+	// NewStandaloneEngineTokenValidator).
+	if cfg.AS.Enabled && cfg.AS.ExternalURL == "" {
+		if !cfg.LegacyEnabled() {
+			services.Stop()
+			_ = store.Close()
+			return nil, fmt.Errorf("wallet-provider with as.enabled=true and as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate session tokens")
+		}
+		logger.Warn("wallet-provider: as.external_url is not set; ES256 session tokens cannot be validated, using legacy HMAC validation only")
+	} else if cfg.AS.Enabled {
 		issuer := cfg.AS.Issuer
 		if issuer == "" {
 			issuer = cfg.JWT.Issuer

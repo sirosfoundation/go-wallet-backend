@@ -1176,6 +1176,62 @@ func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T
 	}
 }
 
+func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *config.Config {
+	t.Helper()
+	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:     true,
+			ExternalURL: externalURL,
+			Legacy:      config.ASLegacyConfig{Enabled: legacy},
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+	return cfg
+}
+
+// AS enabled, no as.external_url, legacy HMAC on: starts with the HMAC-only
+// middleware (no validator, no relay).
+func TestNewWalletProviderProvider_NoExternalURL_LegacyOn_HMACOnly(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	if p.tokenValidator != nil || p.jwksRelay != nil {
+		t.Fatal("expected HMAC-only fallback: no token validator and no JWKS relay")
+	}
+}
+
+// AS enabled, no as.external_url, legacy off: nothing can authenticate tokens.
+func TestNewWalletProviderProvider_NoExternalURL_LegacyOff_Fails(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", false), zap.NewNop())
+	if err == nil {
+		_ = p.Close()
+		t.Fatal("expected startup error with no external_url and legacy disabled")
+	}
+	if !strings.Contains(err.Error(), "as.external_url") {
+		t.Fatalf("error should name as.external_url, got: %v", err)
+	}
+}
+
+// AS enabled with as.external_url: validator and relay are wired.
+func TestNewWalletProviderProvider_ExternalURL_WiresValidatorAndRelay(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com", true), zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	if p.tokenValidator == nil || p.jwksRelay == nil {
+		t.Fatal("expected token validator and JWKS relay when as.external_url is set")
+	}
+}
+
 // TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
 // counterpart: without AS enabled, isolated wallet-provider mode falls back
 // to legacy HMAC auth, matching AuthProvider's default behavior.
