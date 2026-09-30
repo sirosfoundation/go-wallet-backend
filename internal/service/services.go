@@ -30,6 +30,7 @@ type Services struct {
 	WalletLifecycle  *WalletLifecycleService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
+	TombstoneSweeper *DeletionTombstoneSweeper
 	AAGUIDValidator  *AAGUIDValidator
 }
 
@@ -125,6 +126,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
+		TombstoneSweeper: NewDeletionTombstoneSweeper(cfg.Security.DeletionTombstone, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
 }
@@ -137,6 +139,9 @@ func (s *Services) Start() {
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Start()
 	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Start()
+	}
 	if s.WIA != nil {
 		s.WIA.Start()
 	}
@@ -146,6 +151,9 @@ func (s *Services) Start() {
 func (s *Services) Stop() {
 	if s.WIA != nil {
 		s.WIA.Stop()
+	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Stop()
 	}
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Stop()

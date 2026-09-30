@@ -1157,3 +1157,37 @@ func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
 	u.DID = "did:z"
 	require.NoError(t, store.Users().Update(ctx, u), "a record loaded after the writes updates fine")
 }
+
+func TestUserStore_DeletionTombstones(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	users := store.Users()
+	id := "tomb-" + domain.NewUserID().String()
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+
+	_, err := users.GetDeletionTombstone(ctx, id)
+	require.ErrorIs(t, err, storage.ErrNotFound)
+
+	require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID: id, TenantIDs: []domain.TenantID{"a"}, DeletedAt: t0, ExpiresAt: t0.Add(time.Hour),
+	}))
+	// A retry is idempotent: earliest DeletedAt, latest ExpiresAt, merged tenants.
+	require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID: id, TenantIDs: []domain.TenantID{"a", "b"}, DeletedAt: t0.Add(time.Minute), ExpiresAt: t0.Add(2 * time.Hour),
+	}))
+	got, err := users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.WithinDuration(t, t0, got.DeletedAt, time.Second)
+	require.WithinDuration(t, t0.Add(2*time.Hour), got.ExpiresAt, time.Second)
+	require.ElementsMatch(t, []domain.TenantID{"a", "b"}, got.TenantIDs)
+
+	n, err := users.DeleteExpiredDeletionTombstones(ctx, t0.Add(time.Hour))
+	require.NoError(t, err)
+	_ = n
+	_, err = users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err, "not expired yet")
+	_, err = users.DeleteExpiredDeletionTombstones(ctx, t0.Add(3*time.Hour))
+	require.NoError(t, err)
+	_, err = users.GetDeletionTombstone(ctx, id)
+	require.ErrorIs(t, err, storage.ErrNotFound)
+}

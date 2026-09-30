@@ -254,6 +254,8 @@ Environment prefix: `WALLET_SECURITY`
 | `security.challenge_cleanup.interval_seconds` | `WALLET_SECURITY_CHALLENGE_CLEANUP_INTERVAL_SECONDS` | integer | IntervalSeconds is how often to run cleanup (in seconds) Default: 300 (5 minutes) |
 | `security.token_blacklist.enabled` | `WALLET_SECURITY_TOKEN_BLACKLIST_ENABLED` | boolean | Enabled controls whether token blacklist checking is active |
 | `security.token_blacklist.cleanup_interval_seconds` | `WALLET_SECURITY_TOKEN_BLACKLIST_CLEANUP_INTERVAL_SECONDS` | integer | CleanupIntervalSeconds is how often to clean up expired blacklist entries Default: 3600 (1 hour) |
+| `security.deletion_tombstone.cleanup_interval_seconds` | `WALLET_SECURITY_DELETION_TOMBSTONE_CLEANUP_INTERVAL_SECONDS` | integer | CleanupIntervalSeconds is how often expired tombstones are swept. The sweeper is what expires tombstones on backends without a TTL index (memory) and a backstop on MongoDB. Default: 3600 (1 hour) |
+| `security.deletion_tombstone.retention_margin_days` | `WALLET_SECURITY_DELETION_TOMBSTONE_RETENTION_MARGIN_DAYS` | integer | RetentionMarginDays is the safety margin added to the longest token lifetime (access token, refresh token, AS session) when a tombstone's expiry is computed. Default: 30 |
 | `security.webauthn.attestation_conveyance` | `WALLET_SECURITY_WEBAUTHN_ATTESTATION_CONVEYANCE` | string | AttestationConveyance controls how the RP requests attestation from authenticators. Valid values: "none", "indirect", "direct", "enterprise" Default: "none" (recommended for most deployments - avoids certificate validation issues) Use "direct" only if you need to verify authenticator makes/models. |
 
 ## http_client

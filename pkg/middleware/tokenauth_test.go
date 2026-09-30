@@ -542,3 +542,47 @@ func TestTokenAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 		t.Fatalf("anonymous token must pass the gate, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// A deleted account leaves a tombstone in place of the user record (and its
+// cut-off): a token issued before the deletion is refused, an unknown external
+// identity with no tombstone still passes.
+func TestTokenAuthMiddleware_DeletedAccountTokenIsRevoked(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	r := gin.New()
+	r.Use(TokenAuthMiddlewareWithUsers(v, tenants, store.Users(), nil, zap.NewNop()))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+	call := func(sub string) int {
+		token := signToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims: jwt.Claims{Subject: sub}, TenantID: "test-tenant", TAC: "rwl",
+		})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := call(uid.String()); got != 200 {
+		t.Fatalf("live user: %d", got)
+	}
+	if err := store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: uid.String(), DeletedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().Delete(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	if got := call(uid.String()); got != 401 {
+		t.Fatalf("deleted account's token must be refused, got %d", got)
+	}
+	if got := call("external-idp-sub"); got != 200 {
+		t.Fatalf("an identity with no record and no tombstone keeps its behaviour, got %d", got)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -98,7 +99,7 @@ func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (
 	}
 
 	// Initialize sub-stores
-	s.users = &UserStore{collection: database.Collection("users")}
+	s.users = &UserStore{collection: database.Collection("users"), tombstones: database.Collection("user_deletion_tombstones")}
 	s.tenants = &TenantStore{collection: database.Collection("tenants")}
 	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
@@ -237,6 +238,17 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
 	}
 
+	// Deletion tombstones: MongoDB removes a tombstone at its own expires_at
+	// (expireAfterSeconds 0). The service sweeper does the same through
+	// DeleteExpiredDeletionTombstones, so a lagging TTL monitor is harmless.
+	_, err = s.users.tombstones.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(0),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create deletion tombstone indexes: %w", err)
+	}
+
 	// Key attestations collection indexes
 	_, err = s.keyAttestations.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "wallet_instance_id", Value: 1}}},
@@ -304,6 +316,47 @@ func (s *Store) Ping(ctx context.Context) error {
 // UserStore implements MongoDB user storage
 type UserStore struct {
 	collection *mongo.Collection
+	// tombstones holds domain.DeletionTombstone documents, _id = user id.
+	tombstones *mongo.Collection
+}
+
+func (s *UserStore) PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error {
+	if t == nil || t.UserID == "" {
+		return storage.ErrInvalidInput
+	}
+	update := bson.M{
+		// $setOnInsert/$max/$min on distinct fields: a retry keeps the
+		// earliest deleted_at and only ever moves expires_at later.
+		"$min": bson.M{"deleted_at": t.DeletedAt},
+		"$max": bson.M{"expires_at": t.ExpiresAt},
+	}
+	if len(t.TenantIDs) > 0 {
+		update["$addToSet"] = bson.M{"tenant_ids": bson.M{"$each": t.TenantIDs}}
+	}
+	_, err := s.tombstones.UpdateOne(ctx, bson.M{"_id": t.UserID}, update, options.Update().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("%w: put deletion tombstone: %v", storage.ErrDatabase, err)
+	}
+	return nil
+}
+
+func (s *UserStore) GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error) {
+	var t domain.DeletionTombstone
+	if err := s.tombstones.FindOne(ctx, bson.M{"_id": userID}).Decode(&t); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("%w: get deletion tombstone: %v", storage.ErrDatabase, err)
+	}
+	return &t, nil
+}
+
+func (s *UserStore) DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.tombstones.DeleteMany(ctx, bson.M{"expires_at": bson.M{"$lte": now}})
+	if err != nil {
+		return 0, fmt.Errorf("%w: delete expired deletion tombstones: %v", storage.ErrDatabase, err)
+	}
+	return int(res.DeletedCount), nil
 }
 
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {

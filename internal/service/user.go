@@ -81,6 +81,9 @@ type UserService struct {
 	sessionCleaner SessionCleaner
 	tokenBlacklist TokenRevoker
 	userRevokers   []UserRevoker
+	// now is the clock behind a deletion tombstone's timestamps; tests
+	// replace it.
+	now func() time.Time
 }
 
 // NewUserService creates a new UserService
@@ -89,8 +92,12 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 		store:  store,
 		cfg:    cfg,
 		logger: logger.Named("user-service"),
+		now:    time.Now,
 	}
 }
+
+// SetClock replaces the clock used to stamp deletion tombstones (tests).
+func (s *UserService) SetClock(now func() time.Time) { s.now = now }
 
 // SetSessionCleaner sets the session cleanup implementation.
 // When set, DeleteUser will purge active sessions for the deleted user.
@@ -324,7 +331,10 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 // error was logged and the user record deleted regardless; the maintainer has
 // yet to confirm the change):
 //
-//   - ErrDeletionIncomplete, user record kept, safe to repeat: a wallet
+//   - ErrDeletionIncomplete, user record kept, safe to repeat: the deletion
+//     tombstone (storage.DeletionTombstoneStore) could not be written - it is
+//     written before anything irreversible, and the token gate relies on it
+//     once the record is gone; a wallet
 //     instance or holder credential/presentation that could not be removed, a
 //     failed tenant-membership, wallet-instance or user lookup, and a session
 //     cleaner that fails before the permanent revocations below. None of these
@@ -489,6 +499,28 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(outstanding...))
 	}
 
+	// Leave the deletion tombstone before anything irreversible happens, and
+	// before the user record goes: deleting the record takes the token
+	// cut-off with it, and the token gate refuses a deleted account's
+	// still-valid tokens only while a tombstone stands in for that record
+	// (tokengate.Gate.Check). A failed write stops the deletion here, with
+	// nothing removed that the caller cannot retry; a retried deletion writes
+	// it again, which is idempotent (earliest DeletedAt, latest ExpiresAt).
+	// While the user record still exists the gate reads its cut-off and never
+	// the tombstone, so a deletion that stops later does not lock the caller
+	// out of the retry.
+	deletedAt := s.now().UTC()
+	if err := s.store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID:    userID.String(),
+		TenantIDs: tenantIDs,
+		DeletedAt: deletedAt,
+		ExpiresAt: deletedAt.Add(s.cfg.DeletionTombstoneRetention()),
+	}); err != nil {
+		s.logger.Error("Account deletion incomplete: deletion tombstone could not be written",
+			zap.Error(err), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: write deletion tombstone: %w", ErrDeletionIncomplete, err)
+	}
+
 	// Everything below this point is irreversible for the caller, so it only
 	// runs once the sweep above found nothing outstanding. The token
 	// blacklist's RevokeUser and the engine's Manager.RevokeUser are
@@ -537,11 +569,10 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)
-	// A surviving session is not a cosmetic failure here. Deleting the user
-	// record takes the token cut-off with it - it is a field on that record -
-	// and internal/tokengate deliberately passes a token whose user it
-	// cannot find. So a session that outlives this call could go on minting
-	// bearer tokens for an account that is supposed to be gone.
+	// A surviving session is not a cosmetic failure here. A session that
+	// outlives this call could go on minting bearer tokens for an account
+	// that is supposed to be gone; the tombstone written above makes the
+	// token gate refuse them, but they should not exist at all.
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
 			// The permanent revocations above are already in force, so this

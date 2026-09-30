@@ -855,6 +855,12 @@ func (s *WIAService) refuseIfUserGone(ctx context.Context, userID *domain.UserID
 	}
 	if _, err := s.users.GetByID(ctx, *userID); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
+			// A deleted account is reported as what it is: its tokens are
+			// revoked, not merely unknown.
+			if derr := tokengate.RefuseIfDeleted(ctx, s.users, userID.String()); derr != nil {
+				s.emitAuditFailure("account_deleted", derr)
+				return derr
+			}
 			s.emitAuditFailure("unknown_user", errors.New("attestation names a user that does not exist"))
 			return ErrWIAUnknownUser
 		}

@@ -1493,6 +1493,10 @@ type SecurityConfig struct {
 	// TokenBlacklist contains token blacklist/revocation configuration
 	TokenBlacklist TokenBlacklistConfig `yaml:"token_blacklist" envconfig:"TOKEN_BLACKLIST"`
 
+	// DeletionTombstone contains the retention and cleanup settings of the
+	// account-deletion tombstones that keep a deleted user's old tokens refused
+	DeletionTombstone DeletionTombstoneConfig `yaml:"deletion_tombstone" envconfig:"DELETION_TOMBSTONE"`
+
 	// WebAuthn contains WebAuthn-specific security configuration
 	WebAuthn WebAuthnSecurityConfig `yaml:"webauthn" envconfig:"WEBAUTHN"`
 }
@@ -1646,6 +1650,69 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	if c.CleanupIntervalSeconds == 0 {
 		c.CleanupIntervalSeconds = 3600
 	}
+}
+
+// DeletionTombstoneConfig configures the tombstone DeleteUser leaves behind.
+//
+// Deleting a user removes the record that carries the token cut-off, so
+// without a tombstone every token issued before the deletion would be taken
+// for one of an unknown (external) identity and pass the token gate. The
+// tombstone outlives every token it could cover and is then removed by a
+// periodic sweeper (and, on MongoDB, by a TTL index).
+type DeletionTombstoneConfig struct {
+	// CleanupIntervalSeconds is how often expired tombstones are swept.
+	// The sweeper is what expires tombstones on backends without a TTL index
+	// (memory) and a backstop on MongoDB.
+	// Default: 3600 (1 hour)
+	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// RetentionMarginDays is the safety margin added to the longest token
+	// lifetime (access token, refresh token, AS session) when a tombstone's
+	// expiry is computed.
+	// Default: 30
+	RetentionMarginDays int `yaml:"retention_margin_days" envconfig:"RETENTION_MARGIN_DAYS"`
+}
+
+// SetDefaults sets default values for the deletion tombstone settings
+func (c *DeletionTombstoneConfig) SetDefaults() {
+	if c.CleanupIntervalSeconds == 0 {
+		c.CleanupIntervalSeconds = 3600
+	}
+	if c.RetentionMarginDays == 0 {
+		c.RetentionMarginDays = 30
+	}
+}
+
+// DeletionTombstoneRetention is how long a deletion tombstone must be kept:
+// the longest lifetime of any bearer token that can name the deleted user
+// (legacy access token JWT.ExpiryHours, refresh token JWT.RefreshDays, AS
+// access token TTLs, AS session TTL) plus RetentionMarginDays. A tombstone
+// that expired earlier would let a still-valid token for the deleted account
+// pass the token gate again.
+func (c *Config) DeletionTombstoneRetention() time.Duration {
+	margin := c.Security.DeletionTombstone
+	margin.SetDefaults()
+
+	longest := time.Duration(c.JWT.ExpiryHours) * time.Hour
+	if r := time.Duration(c.JWT.RefreshDays) * 24 * time.Hour; r > longest {
+		longest = r
+	}
+	if c.AS.DefaultTokenTTL > longest {
+		longest = c.AS.DefaultTokenTTL
+	}
+	for _, ttl := range c.AS.AudienceTTLs {
+		if ttl > longest {
+			longest = ttl
+		}
+	}
+	sessionTTL := c.AS.SessionTTL
+	if sessionTTL == 0 {
+		sessionTTL = 24 * time.Hour // ASConfig.SetDefaults
+	}
+	if sessionTTL > longest {
+		longest = sessionTTL
+	}
+	return longest + time.Duration(margin.RetentionMarginDays)*24*time.Hour
 }
 
 // SessionStoreConfig contains WebSocket session store configuration
@@ -1888,6 +1955,10 @@ func defaultConfig() *Config {
 				Enabled:                true, // Enabled by default for security
 				CleanupIntervalSeconds: 3600,
 			},
+			DeletionTombstone: DeletionTombstoneConfig{
+				CleanupIntervalSeconds: 3600,
+				RetentionMarginDays:    30,
+			},
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout: 30, // 30 seconds default
@@ -1967,6 +2038,12 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Server.validateTrustedProxies(); err != nil {
 		return err
+	}
+	if c.Security.DeletionTombstone.CleanupIntervalSeconds < 0 {
+		return fmt.Errorf("security.deletion_tombstone.cleanup_interval_seconds must not be negative")
+	}
+	if c.Security.DeletionTombstone.RetentionMarginDays < 0 {
+		return fmt.Errorf("security.deletion_tombstone.retention_margin_days must not be negative")
 	}
 
 	// Validate wallet-provider port when explicitly configured

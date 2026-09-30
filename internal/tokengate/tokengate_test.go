@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
@@ -18,6 +19,49 @@ type erroringUsers struct{}
 
 func (erroringUsers) GetAuthCutoff(context.Context, domain.UserID) (time.Time, error) {
 	return time.Time{}, errors.New("db down")
+}
+
+func (erroringUsers) GetDeletionTombstone(context.Context, string) (*domain.DeletionTombstone, error) {
+	return nil, errors.New("db down")
+}
+
+// notFoundUsers has no record for any user and a tombstone read that fails: the
+// tombstone read must fail closed.
+type notFoundUsers struct{ erroringUsers }
+
+func (notFoundUsers) GetAuthCutoff(context.Context, domain.UserID) (time.Time, error) {
+	return time.Time{}, storage.ErrNotFound
+}
+
+func TestGate_DeletedUser(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid}))
+	g := New(store.Users())
+	iat := time.Now().Add(-time.Minute)
+
+	require.NoError(t, g.Check(ctx, uid.String(), iat), "live user, no cut-off")
+
+	require.NoError(t, store.Users().Delete(ctx, uid))
+	assert.NoError(t, g.Check(ctx, uid.String(), iat), "no record and no tombstone: an external identity, not judged")
+	assert.NoError(t, RefuseNow(WithSubject(ctx, uid.String(), iat), store.Users()))
+
+	require.NoError(t, store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID: uid.String(), DeletedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	}))
+	err := g.Check(ctx, uid.String(), iat)
+	assert.ErrorIs(t, err, ErrAccountDeleted)
+	assert.ErrorIs(t, err, ErrRevoked, "callers that map ErrRevoked need no change")
+	assert.ErrorIs(t, g.Check(ctx, uid.String(), time.Now().Add(time.Hour)), ErrRevoked, "a token issued after the deletion is refused as well")
+	assert.ErrorIs(t, RefuseNow(WithSubject(ctx, uid.String(), iat), store.Users()), ErrRevoked)
+	assert.NoError(t, g.Check(ctx, domain.NewUserID().String(), iat), "other users are unaffected")
+
+	// A failing tombstone read is an error, never a pass.
+	err = New(notFoundUsers{}).Check(ctx, uid.String(), iat)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrRevoked)
+	require.Error(t, RefuseNow(WithSubject(ctx, uid.String(), iat), notFoundUsers{}))
 }
 
 func TestGate_Check(t *testing.T) {

@@ -194,3 +194,26 @@ type RegisterRequest struct {
 	Keys        []byte     `json:"keys,omitempty"`
 	PrivateData []byte     `json:"private_data,omitempty"`
 }
+
+// DeletionTombstone records that a user account was deleted. Deleting the
+// user removes the record that carries the token cut-off (User.AuthInvalidBefore),
+// so without a tombstone the token gate could not tell a deleted user's
+// still-valid bearer token from that of an external identity that never had
+// a wallet user record. Every token naming a user that has a tombstone is
+// refused, whenever it was issued.
+//
+// A tombstone is kept until ExpiresAt, which is set past the lifetime of every
+// token that could name the user, and is then swept.
+type DeletionTombstone struct {
+	// UserID is the deleted user's id (the token subject).
+	UserID string `json:"user_id" bson:"_id"`
+	// TenantIDs are the tenants the account had data or memberships in when
+	// it was deleted. Informational (audit and diagnosis); the user id is
+	// global, so the gate does not consult it.
+	TenantIDs []TenantID `json:"tenant_ids,omitempty" bson:"tenant_ids,omitempty"`
+	// DeletedAt is when the deletion was first recorded. A retried deletion
+	// keeps the earliest value.
+	DeletedAt time.Time `json:"deleted_at" bson:"deleted_at"`
+	// ExpiresAt is when the tombstone may be removed.
+	ExpiresAt time.Time `json:"expires_at" bson:"expires_at"`
+}

@@ -29,9 +29,33 @@ import (
 var ErrRevoked = errors.New("token issued before the user's authorization was revoked")
 
 // UserLookup is the subset of storage.UserStore the gate needs: a narrow
-// read of the one auth field, not the whole user record.
+// read of the one auth field, not the whole user record, and the deletion
+// tombstone that stands in for the record once the account is gone.
 type UserLookup interface {
 	GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error)
+	GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error)
+}
+
+// ErrAccountDeleted is what a token for a deleted account is refused with. It
+// wraps ErrRevoked, so every caller that already maps ErrRevoked to a refusal
+// treats it the same way.
+var ErrAccountDeleted = fmt.Errorf("%w: the account was deleted", ErrRevoked)
+
+// RefuseIfDeleted decides what a user the store has no record of is. A
+// deleted account leaves a tombstone (UserService.DeleteUser writes it before
+// it removes the record) and its tokens are refused, whenever issued. A user
+// with neither record nor tombstone is an external identity (see Check) and is
+// not judged. A failed tombstone read fails closed.
+func RefuseIfDeleted(ctx context.Context, users UserLookup, userID string) error {
+	_, err := users.GetDeletionTombstone(ctx, userID)
+	switch {
+	case err == nil:
+		return ErrAccountDeleted
+	case errors.Is(err, storage.ErrNotFound):
+		return nil
+	default:
+		return fmt.Errorf("check deletion tombstone: %w", err)
+	}
 }
 
 // Gate checks tokens against User.AuthInvalidBefore.
@@ -51,17 +75,24 @@ func New(users UserLookup) *Gate {
 // Check refuses a token for userID that was issued at or before the user's
 // AuthInvalidBefore. No token is exempt: a lifecycle change is a provider
 // action and logging out everywhere is meant to include the session that
-// asked for it. An empty userID (anonymous token) always passes, and so does
-// a user the store does not know: the gate only enforces lifecycle cut-offs,
-// it is not an existence check. That is deliberate and cannot be tightened
-// here: the AS also issues tokens whose subject is an external identity that
-// has no wallet user record (an OIDC-authenticated admin, whose UserID is the
-// IdP's sub), and refusing "no record" would lock all of them out. The price
-// is that deleting a wallet user takes the cut-off record with it; tokens
-// issued before an account deletion are refused by the token blacklist
-// (UserService.SetTokenBlacklist, #383) instead. A token without a readable
-// iat is refused once a cut-off exists, since it cannot prove it postdates
-// the cut-off.
+// asked for it.
+//
+// A user the store has no record of is refused when DeleteUser left a
+// deletion tombstone for it (ErrAccountDeleted), whenever the token was
+// issued: deleting a user removes the record that carries the cut-off, and
+// the tombstone is what keeps that user's still-valid tokens from passing.
+// A user with no record and no tombstone passes. That is deliberate and cannot
+// be tightened here: the AS also issues tokens whose subject is an external
+// identity that has no wallet user record (an OIDC-authenticated admin, whose
+// UserID is the IdP's sub), and refusing "no record" would lock all of them
+// out. Such a token is never a deleted wallet user's, since every deletion
+// writes the tombstone first.
+//
+// An empty userID (anonymous token) is not judged here: Check only
+// enforces lifecycle state. Keeping anonymous tokens off wallet-scoped routes
+// is the routing layer's job (pkg/middleware, RequireUser). A token without a
+// readable iat is refused once a cut-off exists, since it cannot prove it
+// postdates the cut-off.
 func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) error {
 	if g == nil || userID == "" {
 		return nil
@@ -69,7 +100,7 @@ func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) err
 	cutoff, err := g.users.GetAuthCutoff(ctx, domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil
+			return RefuseIfDeleted(ctx, g.users, userID)
 		}
 		return fmt.Errorf("check token authorization: %w", err)
 	}
@@ -108,8 +139,9 @@ func WithSubject(ctx context.Context, userID string, issuedAt time.Time) context
 // the request's token against it. It is the recheck for a write that loads no
 // user: it cannot make the write atomic with a revocation, but it takes the
 // decision immediately before persisting instead of at request admission. A
-// context without a token, or a user the store does not know (the gate is not
-// an existence check), is not judged.
+// context without a token is not judged. A user the store has no record of is
+// refused if it has a deletion tombstone, and otherwise not judged (see
+// Gate.Check).
 func RefuseNow(ctx context.Context, users UserLookup) error {
 	userID, _ := ctx.Value(subjectKey{}).(string)
 	if userID == "" || users == nil {
@@ -118,7 +150,7 @@ func RefuseNow(ctx context.Context, users UserLookup) error {
 	cutoff, err := users.GetAuthCutoff(ctx, domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil
+			return RefuseIfDeleted(ctx, users, userID)
 		}
 		return fmt.Errorf("recheck token authorization: %w", err)
 	}

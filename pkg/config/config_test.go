@@ -2734,3 +2734,42 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 		t.Fatal("empty config must yield no trusted hosts")
 	}
 }
+
+func TestDeletionTombstoneRetention(t *testing.T) {
+	day := 24 * time.Hour
+	eq := func(name string, got, want time.Duration) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s: got %s, want %s", name, got, want)
+		}
+	}
+	cfg := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 7}}
+	eq("refresh token dominates, default margin", cfg.DeletionTombstoneRetention(), 37*day)
+
+	cfg.JWT.RefreshDays = 0
+	eq("no refresh tokens: the access token and the default AS session (24h)", cfg.DeletionTombstoneRetention(), 31*day)
+
+	cfg.AS.SessionTTL = 10 * day
+	cfg.AS.AudienceTTLs = map[string]time.Duration{"x": 12 * day}
+	cfg.Security.DeletionTombstone.RetentionMarginDays = 5
+	eq("longest AS token TTL plus a configured margin", cfg.DeletionTombstoneRetention(), 17*day)
+
+	ok := defaultConfig()
+	if err := ok.Validate(); err != nil && strings.Contains(err.Error(), "deletion_tombstone") {
+		t.Errorf("defaults must validate: %v", err)
+	}
+	bad := defaultConfig()
+	bad.Security.DeletionTombstone.CleanupIntervalSeconds = -1
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "cleanup_interval_seconds") {
+		t.Errorf("negative cleanup interval must be refused, got %v", err)
+	}
+	bad = defaultConfig()
+	bad.Security.DeletionTombstone.RetentionMarginDays = -1
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "retention_margin_days") {
+		t.Errorf("negative retention margin must be refused, got %v", err)
+	}
+	d := defaultConfig()
+	if d.Security.DeletionTombstone.CleanupIntervalSeconds != 3600 || d.Security.DeletionTombstone.RetentionMarginDays != 30 {
+		t.Errorf("defaults: %+v", d.Security.DeletionTombstone)
+	}
+}

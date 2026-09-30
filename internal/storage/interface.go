@@ -63,8 +63,33 @@ type UserTenantStore interface {
 	GetMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (*domain.UserTenantMembership, error)
 }
 
+// DeletionTombstoneStore keeps the record DeleteUser leaves behind so that a
+// deleted user's tokens stay refused (see domain.DeletionTombstone). It is part
+// of UserStore, so anything that can look up a user's token cut-off can also
+// tell that the user was deleted.
+type DeletionTombstoneStore interface {
+	// PutDeletionTombstone records a deletion. It is idempotent, so a retried
+	// deletion can repeat it: an existing tombstone keeps its earliest
+	// DeletedAt, its expiry only moves later, and tenant ids are merged.
+	PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error
+
+	// GetDeletionTombstone returns the tombstone for the user id, or
+	// ErrNotFound. A tombstone past its ExpiresAt that has not been swept yet
+	// is still returned: it can only outlive the tokens it covers, and
+	// refusing too long is the safe direction.
+	GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error)
+
+	// DeleteExpiredDeletionTombstones removes tombstones whose ExpiresAt is
+	// at or before now and returns how many it removed. MongoDB also expires
+	// them with a TTL index; this is what expires them on backends without
+	// one, and the backstop where the TTL monitor lags.
+	DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error)
+}
+
 // UserStore defines the interface for user storage operations
 type UserStore interface {
+	DeletionTombstoneStore
+
 	// Create creates a new user
 	Create(ctx context.Context, user *domain.User) error
 

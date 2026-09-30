@@ -569,3 +569,37 @@ func TestAuthMiddleware_CarriesTokenIssuedAtToTheHandler(t *testing.T) {
 		t.Errorf("a cut-off before the token was issued must not refuse it, got %v", earlier)
 	}
 }
+
+// The legacy middleware refuses a deleted account's token too.
+func TestAuthMiddleware_DeletedAccountTokenIsRevoked(t *testing.T) {
+	cfg := createTestConfig("test-secret")
+	store := createTestStore()
+	router := createTestRouter(cfg, store, zap.NewNop())
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": uid.String(), "iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	call := func() int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := call(); got != http.StatusOK {
+		t.Fatalf("live user: %d", got)
+	}
+	if err := store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: uid.String(), DeletedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().Delete(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	if got := call(); got != http.StatusUnauthorized {
+		t.Fatalf("deleted account's token must be refused, got %d", got)
+	}
+}

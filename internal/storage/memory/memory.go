@@ -27,7 +27,7 @@ type Store struct {
 // NewStore creates a new in-memory store
 func NewStore() *Store {
 	s := &Store{
-		users:           &UserStore{data: make(map[string]*domain.User)},
+		users:           &UserStore{data: make(map[string]*domain.User), tombstones: make(map[string]*domain.DeletionTombstone)},
 		tenants:         &TenantStore{data: make(map[domain.TenantID]*domain.Tenant)},
 		userTenants:     &UserTenantStore{data: make(map[string]*domain.UserTenantMembership)},
 		credentials:     &CredentialStore{data: make(map[int64]*domain.VerifiableCredential)},
@@ -236,8 +236,66 @@ func (s *UserTenantStore) GetMembership(ctx context.Context, userID domain.UserI
 
 // UserStore implements in-memory user storage
 type UserStore struct {
-	mu   sync.RWMutex
-	data map[string]*domain.User
+	mu         sync.RWMutex
+	data       map[string]*domain.User
+	tombstones map[string]*domain.DeletionTombstone
+}
+
+func (s *UserStore) PutDeletionTombstone(_ context.Context, t *domain.DeletionTombstone) error {
+	if t == nil || t.UserID == "" {
+		return storage.ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tombstones == nil {
+		s.tombstones = make(map[string]*domain.DeletionTombstone)
+	}
+	cp := *t
+	cp.TenantIDs = append([]domain.TenantID(nil), t.TenantIDs...)
+	if existing, ok := s.tombstones[t.UserID]; ok {
+		if existing.DeletedAt.Before(cp.DeletedAt) || cp.DeletedAt.IsZero() {
+			cp.DeletedAt = existing.DeletedAt
+		}
+		if existing.ExpiresAt.After(cp.ExpiresAt) {
+			cp.ExpiresAt = existing.ExpiresAt
+		}
+		seen := map[domain.TenantID]bool{}
+		merged := make([]domain.TenantID, 0, len(existing.TenantIDs)+len(cp.TenantIDs))
+		for _, id := range append(append([]domain.TenantID{}, existing.TenantIDs...), cp.TenantIDs...) {
+			if !seen[id] {
+				seen[id] = true
+				merged = append(merged, id)
+			}
+		}
+		cp.TenantIDs = merged
+	}
+	s.tombstones[t.UserID] = &cp
+	return nil
+}
+
+func (s *UserStore) GetDeletionTombstone(_ context.Context, userID string) (*domain.DeletionTombstone, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.tombstones[userID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	cp := *t
+	cp.TenantIDs = append([]domain.TenantID(nil), t.TenantIDs...)
+	return &cp, nil
+}
+
+func (s *UserStore) DeleteExpiredDeletionTombstones(_ context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, t := range s.tombstones {
+		if !t.ExpiresAt.After(now) {
+			delete(s.tombstones, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // deepCopyUser returns an independent copy of user, safe to read and even

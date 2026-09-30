@@ -476,6 +476,41 @@ cp wallet.db wallet.db.backup
 cp wallet.db.backup wallet.db
 ```
 
+## Account Deletion Tombstones
+
+Deleting a user removes the record that carries the user's token cut-off
+(`AuthInvalidBefore`). Bearer tokens are stateless, so a token issued before
+the deletion would otherwise stay valid until it expires. `DeleteUser`
+therefore writes a **deletion tombstone** (user id, tenants, deleted-at,
+expires-at) before it removes anything irreversible, and stops with
+`account deletion incomplete` (nothing deleted, safe to retry) if the write
+fails. Repeating a deletion rewrites the tombstone idempotently (earliest
+deleted-at, latest expiry).
+
+The token gate (both bearer middlewares, and the WIA attestation path) refuses
+every token whose user has no record but has a tombstone, whenever the token
+was issued (`401 Token has been revoked`). A user with neither a record nor a
+tombstone is an external identity (for example an OIDC-authenticated admin
+whose subject is the IdP's `sub`); those tokens are not judged, as before.
+
+A tombstone must outlive every token that could name the user. Its expiry is
+deletion time plus the longest of `jwt.expiry_hours`, `jwt.refresh_days`, the
+AS `default_token_ttl` and `audience_ttls`, and `as.session_ttl`, plus
+`security.deletion_tombstone.retention_margin_days` (default 30). Raising a
+token lifetime only lengthens the tombstones written afterwards; tombstones
+already written keep the expiry they were given.
+
+Expired tombstones are removed by two mechanisms:
+
+- MongoDB: the `user_deletion_tombstones` collection has a TTL index on
+  `expires_at` (created with the other indexes at start-up).
+- All backends: a sweeper started and stopped with the service workers runs
+  once at start-up and then every
+  `security.deletion_tombstone.cleanup_interval_seconds` (default 3600). It is
+  the only expiry for the in-memory store and a backstop for MongoDB's TTL
+  monitor, which can lag by about a minute. Running it on every replica is
+  harmless.
+
 ## Scaling Guidelines
 
 ### Vertical Scaling
