@@ -1035,6 +1035,12 @@ type FinishLoginResponse struct {
 	WebauthnRpId      string                   `json:"webauthnRpId"`
 	TenantID          string                   `json:"tenantId,omitempty"`
 	TenantDisplayName string                   `json:"tenantDisplayName,omitempty"`
+
+	// SID is the refresh-token family/session id (#402) shared by Token and
+	// RefreshToken. Never serialized: it is for server-side callers (the AS
+	// passkey login records it on its session so AS logout can revoke the
+	// family).
+	SID string `json:"-"`
 }
 
 // FinishLogin completes WebAuthn authentication
@@ -1541,6 +1547,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		WebauthnRpId:      s.cfg.Server.RPID,
 		TenantID:          string(tenantID),
 		TenantDisplayName: tenantDisplayName,
+		SID:               sid,
 	}, nil
 }
 

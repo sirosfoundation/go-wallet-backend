@@ -18,30 +18,59 @@
 // resulting duplication on PR #414).
 package legacytoken
 
-import "github.com/golang-jwt/jwt/v5"
+import (
+	"errors"
 
-// SID re-parses rawToken - a legacy HMAC-signed token already validated
-// elsewhere (by go-tokenauth's Validator, or directly) - to read its "sid"
-// (refresh-token family/session id, #402) claim. Returns "" if the token
-// can't be parsed with secret or carries no sid claim at all (e.g. minted
-// before #402); callers must treat that as "no family to check", not an
-// error.
-func SID(secret, rawToken string) string {
-	token, err := jwt.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// ErrUnparseable is returned by ParseSID when rawToken cannot be
+// signature-verified with the secret (or is not a JWT map-claims token).
+var ErrUnparseable = errors.New("legacytoken: token signature could not be verified")
+
+// ParseSID re-parses rawToken - a legacy HMAC-signed token already
+// validated elsewhere (by go-tokenauth's Validator, or directly) - to read
+// its "sid" (refresh-token family/session id, #402) claim.
+//
+// Only the HMAC signature is verified here. Time claims (exp/nbf/iat) are
+// deliberately NOT re-validated: every caller supplies a token the primary
+// validator already accepted, including within its configured clock-skew
+// leeway, and a second zero-leeway check made this parse fail inside that
+// window - hiding the sid and so skipping the revoked-family check
+// (fail-open).
+//
+// Returns ("", nil) for a verified token carrying no sid claim (e.g. minted
+// before #402). Returns ErrUnparseable when the signature cannot be
+// verified: callers that apply a family check MUST treat that as a failure
+// (reject / refuse to report a clean logout), never as "no family".
+func ParseSID(secret, rawToken string) (string, error) {
+	parser := jwt.NewParser(
+		jwt.WithoutClaimsValidation(),
+		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
+	)
+	token, err := parser.Parse(rawToken, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, jwt.ErrSignatureInvalid
 		}
 		return []byte(secret), nil
 	})
-	if err != nil || !token.Valid {
-		return ""
+	if err != nil || token == nil || !token.Valid {
+		return "", ErrUnparseable
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return ""
+		return "", ErrUnparseable
 	}
 
 	sid, _ := claims["sid"].(string)
+	return sid, nil
+}
+
+// SID is ParseSID without the error: it returns "" both when the token has
+// no sid and when it cannot be verified. Only use it where that distinction
+// does not matter; family checks must use ParseSID and fail closed.
+func SID(secret, rawToken string) string {
+	sid, _ := ParseSID(secret, rawToken)
 	return sid
 }

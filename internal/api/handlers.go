@@ -904,12 +904,7 @@ func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) t
 // access token from an earlier rotation - its own jti never individually
 // blacklisted - was still unexpired and usable again.
 func familyRetention(cfg *config.Config) time.Duration {
-	refresh := time.Duration(cfg.JWT.RefreshDays) * 24 * time.Hour
-	access := time.Duration(cfg.JWT.ExpiryHours) * time.Hour
-	if refresh > access {
-		return refresh
-	}
-	return access
+	return cfg.JWT.MaxTokenLifetime()
 }
 
 // Logout invalidates the current session by blacklisting the JWT and, when
@@ -949,16 +944,24 @@ func (h *Handlers) Logout(c *gin.Context) {
 			// (ModeSession) have no sid/refresh-token-family concept in
 			// this codebase, so only ModeLegacy is handled here.
 			if result.Mode == tokenauthclaims.ModeLegacy && h.services.TokenBlacklist != nil {
-				if rawToken, exists := c.Get("token"); exists {
-					if sid := legacytoken.SID(h.cfg.JWT.Secret, rawToken.(string)); sid != "" {
-						expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
-						if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
-							h.logger.Warn("Failed to revoke refresh-token family", zap.Error(err))
-						} else {
-							h.logger.Info("User logged out, refresh-token family revoked",
-								zap.String("sid", sid),
-							)
-						}
+				rawToken, _ := c.Get("token")
+				rawTokenStr, _ := rawToken.(string)
+				sid, sidErr := legacytoken.ParseSID(h.cfg.JWT.Secret, rawTokenStr)
+				if sidErr != nil {
+					// Fail closed: without the sid the refresh-token family
+					// cannot be revoked, so do not report a clean logout.
+					h.logger.Error("Logout: cannot determine refresh-token family", zap.Error(sidErr))
+					c.JSON(500, gin.H{"error": "Failed to revoke session"})
+					return
+				}
+				if sid != "" {
+					expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
+					if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
+						h.logger.Warn("Failed to revoke refresh-token family", zap.Error(err))
+					} else {
+						h.logger.Info("User logged out, refresh-token family revoked",
+							zap.String("sid", sid),
+						)
 					}
 				}
 			}

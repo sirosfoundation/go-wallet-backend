@@ -1393,3 +1393,52 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	require.NoError(t, ws2.ReadJSON(&msg))
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
+
+func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {
+	validatorSecret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "a-different-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet-registry"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(validatorSecret), Issuers: []string{"test-legacy-issuer"}},
+	}))
+	m.SetTokenBlacklist(&fakeEngineBlacklist{})
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "s",
+		"iss": "test-legacy-issuer", "aud": "wallet-registry", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := tok.SignedString([]byte(validatorSecret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	assert.Error(t, err)
+}
+
+// A token accepted within go-tokenauth's clock-skew leeway (expired 2s ago)
+// must still have its revoked-family check applied.
+func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied_InsideSkewWindow(t *testing.T) {
+	secret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet-registry"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret), Issuers: []string{"test-legacy-issuer"}},
+	}))
+	bl := &fakeEngineBlacklist{revokedFamilies: map[string]bool{}}
+	m.SetTokenBlacklist(bl)
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "sid-skew",
+		"iss": "test-legacy-issuer", "aud": "wallet-registry", "exp": time.Now().Add(-2 * time.Second).Unix(),
+	})
+	tokenString, err := tok.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(tokenString)
+	require.NoError(t, err, "precondition: skew-window token accepted before revocation")
+	bl.revokedFamilies["sid-skew"] = true
+	_, _, _, err = m.validateToken(tokenString)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "revoked")
+}

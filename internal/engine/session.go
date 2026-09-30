@@ -827,7 +827,12 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// for the identical reason. New-style AS-issued tokens (ModeSession)
 		// are skipped entirely.
 		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
-			if sid := legacytoken.SID(m.cfg.JWT.Secret, tokenString); sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
+			// Fail closed if the family cannot be determined.
+			sid, sidErr := legacytoken.ParseSID(m.cfg.JWT.Secret, tokenString)
+			if sidErr != nil {
+				return "", "", "", errors.New("cannot determine token family")
+			}
+			if sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
 				return "", "", "", errors.New("token has been revoked")
 			}
 		}

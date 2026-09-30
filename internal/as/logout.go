@@ -30,7 +30,7 @@ import (
 // legacyIssuer/blacklist may be nil (steps they'd perform are then
 // skipped); a missing, mismatched, expired, or unparseable bearer token is
 // never an error - the session is still revoked either way.
-func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, familyRetention time.Duration, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
 		sessionID := GetSessionCookie(c, opts)
@@ -59,9 +59,43 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *Legacy
 			}
 		}
 
+		// Revoke the refresh-token family minted alongside this session at
+		// login (#402): without it the paired refresh token stays usable
+		// after AS logout. A failure here must not be reported as a clean
+		// logout, so it surfaces as 500 (the session itself is already
+		// revoked and the cookie cleared).
+		familyErr := revokeSessionFamily(c.Request.Context(), session, sessErr, blacklist, familyRetention, logger)
+
 		ClearSessionCookie(c, opts)
+		if familyErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke refresh token"})
+			return
+		}
 		c.Status(http.StatusNoContent)
 	}
+}
+
+// revokeSessionFamily revokes session.FamilyID via blacklist. It is a no-op
+// when the session has no family (not paired with a legacy refresh token)
+// or no blacklist is wired. A session lookup error or a failing RevokeFamily
+// is returned so the caller can fail closed.
+func revokeSessionFamily(ctx context.Context, session *Session, sessErr error, blacklist TokenBlacklistChecker, retention time.Duration, logger *zap.Logger) error {
+	if blacklist == nil {
+		return nil
+	}
+	if sessErr != nil {
+		logger.Error("logout: session lookup failed, cannot revoke refresh-token family", zap.Error(sessErr))
+		return sessErr
+	}
+	if session == nil || session.FamilyID == "" {
+		return nil
+	}
+	if err := blacklist.RevokeFamily(ctx, session.FamilyID, time.Now().Add(retention)); err != nil {
+		logger.Error("logout: failed to revoke refresh-token family",
+			zap.String("sid", session.FamilyID), zap.Error(err))
+		return err
+	}
+	return nil
 }
 
 // blacklistOwnBearerToken parses bearerToken - trying the asymmetric issuer

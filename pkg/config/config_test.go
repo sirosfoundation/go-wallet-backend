@@ -2788,3 +2788,15 @@ func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
 		t.Errorf("legacy disabled must not require rp_id in as.audiences: %v", err)
 	}
 }
+
+func TestJWTConfig_MaxTokenLifetime(t *testing.T) {
+	if got := (JWTConfig{RefreshDays: 7, ExpiryHours: 24}).MaxTokenLifetime(); got != 7*24*time.Hour {
+		t.Errorf("got %v", got)
+	}
+	if got := (JWTConfig{RefreshDays: 1, ExpiryHours: 720}).MaxTokenLifetime(); got != 720*time.Hour {
+		t.Errorf("got %v", got)
+	}
+	if got := (JWTConfig{ExpiryHours: 24}).MaxTokenLifetime(); got != 24*time.Hour {
+		t.Errorf("got %v", got)
+	}
+}

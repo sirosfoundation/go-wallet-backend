@@ -28,7 +28,7 @@ func TestLogoutHandler_Success(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -67,7 +67,7 @@ func TestLogoutHandler_NoSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -112,7 +112,7 @@ func TestLogoutHandler_BlacklistsPresentedBearerToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -163,7 +163,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -213,7 +213,7 @@ func TestLogoutHandler_BlacklistsLegacyBearerToken(t *testing.T) {
 	// issuer (the asymmetric one) is nil here to simulate its
 	// ParseAndVerify failing on a legacy-shaped token and falling through
 	// to the legacy issuer, without needing a real mismatched key.
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -258,7 +258,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -310,7 +310,7 @@ func TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, &erroringBlacklist{}, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, &erroringBlacklist{}, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -346,7 +346,7 @@ func TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, &erroringBlacklist{}, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, &erroringBlacklist{}, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -365,7 +365,7 @@ func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -375,5 +375,88 @@ func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	// Should still clear the cookie and return 204 (graceful).
 	if w.Code != http.StatusNoContent {
 		t.Errorf("expected 204 even for nonexistent session, got %d", w.Code)
+	}
+}
+
+// failingGetStore makes Get fail, to exercise the fail-closed path when the
+// session (and so its refresh-token family) cannot be looked up.
+type failingGetStore struct{ *MemorySessionStore }
+
+func (failingGetStore) Get(context.Context, string) (*Session, error) {
+	return nil, errors.New("simulated session lookup failure")
+}
+
+func logoutWithFamily(t *testing.T, store SessionStore, blacklist TokenBlacklistChecker, cookie string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, blacklist, 48*time.Hour, true, zap.NewNop()))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: cookie})
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// TestLogoutHandler_RevokesRefreshTokenFamily proves AS logout revokes the
+// family recorded on the session at login (#402), with the configured
+// retention.
+func TestLogoutHandler_RevokesRefreshTokenFamily(t *testing.T) {
+	store := NewMemorySessionStore()
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-fam", UserID: "user-1", TenantID: "t", FamilyID: "sid-1",
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	bl := &fakeBlacklist{}
+	w := logoutWithFamily(t, store, bl, "sess-fam")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", w.Code)
+	}
+	exp, ok := bl.families["sid-1"]
+	if !ok {
+		t.Fatal("expected family sid-1 to be revoked")
+	}
+	if d := time.Until(exp); d < 47*time.Hour || d > 49*time.Hour {
+		t.Errorf("family expiry %v not ~48h", d)
+	}
+}
+
+func TestLogoutHandler_NoFamilyNoRevoke(t *testing.T) {
+	store := NewMemorySessionStore()
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-nofam", UserID: "user-1", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	bl := &fakeBlacklist{}
+	if w := logoutWithFamily(t, store, bl, "sess-nofam"); w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", w.Code)
+	}
+	if len(bl.families) != 0 {
+		t.Errorf("no family should be revoked, got %v", bl.families)
+	}
+}
+
+// TestLogoutHandler_FamilyRevokeErrorFailsClosed proves a failing
+// RevokeFamily is not reported as a clean logout.
+func TestLogoutHandler_FamilyRevokeErrorFailsClosed(t *testing.T) {
+	store := NewMemorySessionStore()
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-fam-err", UserID: "user-1", FamilyID: "sid-1",
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	bl := &fakeBlacklist{familyErr: errors.New("boom")}
+	w := logoutWithFamily(t, store, bl, "sess-fam-err")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+	// Session is still revoked and the cookie cleared.
+	if s, _ := store.Get(context.Background(), "sess-fam-err"); s == nil || !s.Revoked {
+		t.Error("session should be revoked even when family revocation fails")
+	}
+}
+
+func TestLogoutHandler_SessionLookupErrorFailsClosed(t *testing.T) {
+	w := logoutWithFamily(t, failingGetStore{NewMemorySessionStore()}, &fakeBlacklist{}, "whatever")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when the session (family) cannot be looked up, got %d", w.Code)
 	}
 }

@@ -1504,6 +1504,7 @@ func TestFullLoginFlow_MintsSharedRefreshTokenFamily(t *testing.T) {
 	refreshSid := sidClaim(t, finishLoginResp.RefreshToken)
 	assert.NotEmpty(t, accessSid, "expected FinishLogin's access token to carry a sid claim")
 	assert.Equal(t, accessSid, refreshSid, "access and refresh tokens from the same login must share the same sid")
+	assert.Equal(t, accessSid, finishLoginResp.SID, "FinishLoginResponse.SID must expose the family id for the AS session")
 }
 
 // TestFullLoginFlow_CloneWarningSurfaced covers issue #380: a sign-counter

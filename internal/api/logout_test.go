@@ -392,3 +392,32 @@ func TestFamilyRetention(t *testing.T) {
 		}
 	})
 }
+
+// TestHandlers_Logout_ASToken_ModeLegacy_UndeterminableSIDFailsClosed proves
+// Logout does not report success when the family id cannot be derived from
+// the (already validated) legacy token, since the refresh token would then
+// stay usable.
+func TestHandlers_Logout_ASToken_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {
+	handlers, router := setupLogoutTestHandlers(t)
+
+	wrongSecretToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1", "jti": "jti-unverifiable", "sid": "sid-x",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("not-the-configured-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := &tokenauthclaims.Result{UserID: "user-1", JTI: "jti-unverifiable", Mode: tokenauthclaims.ModeLegacy}
+
+	router.POST("/logout", func(c *gin.Context) {
+		c.Set("token", wrongSecretToken)
+		c.Set("tokenauth_result", result)
+		c.Next()
+	}, handlers.Logout)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}

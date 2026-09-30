@@ -963,6 +963,19 @@ type JWTConfig struct {
 	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
+// MaxTokenLifetime returns the longer of the configured access-token
+// (ExpiryHours) and refresh-token (RefreshDays) lifetimes. A refresh-token
+// family revocation marker must be retained at least this long, since
+// nothing enforces that the refresh token outlives the access token.
+func (c JWTConfig) MaxTokenLifetime() time.Duration {
+	refresh := time.Duration(c.RefreshDays) * 24 * time.Hour
+	access := time.Duration(c.ExpiryHours) * time.Hour
+	if refresh > access {
+		return refresh
+	}
+	return access
+}
+
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
 // (nbf, exp, iat). This accounts for minor clock differences between token
 // issuers and validators in distributed deployments.

@@ -128,6 +128,7 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		UserID:    resp.UUID,
 		DID:       "", // DID is not in FinishLoginResponse; populated if needed.
 		TenantID:  resp.TenantID,
+		FamilyID:  resp.SID,
 		ACR:       "urn:siros:acr:passkey",
 		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
 		CreatedAt: now,

@@ -596,3 +596,71 @@ func TestExtractBearer(t *testing.T) {
 		})
 	}
 }
+
+// TestTokenAuthMiddleware_ModeLegacy_FamilyCheckAppliesInsideClockSkewWindow
+// proves a token go-tokenauth accepted via its leeway (expired 2s ago, 5s
+// default leeway) still gets its revoked-family check: the SID re-parse must
+// not fail open inside that window.
+func TestTokenAuthMiddleware_ModeLegacy_FamilyCheckAppliesInsideClockSkewWindow(t *testing.T) {
+	secret := "legacy-mode-test-secret"
+	v := validator.New(validator.Config{
+		Audiences: []string{testTokenAudience},
+		Legacy:    validator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret), Issuers: []string{"legacy-mode-test-issuer"}},
+	})
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{"test-tenant": {ID: "test-tenant", Enabled: true}}}
+	logger := zap.NewNop()
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+
+	tok := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"user_id": "user-123", "tenant_id": "test-tenant", "jti": "jti-skew", "sid": "sid-skew",
+		"iss": "legacy-mode-test-issuer", "aud": testTokenAudience,
+		"exp": time.Now().Add(-2 * time.Second).Unix(),
+	})
+	tokenStr, _ := tok.SignedString([]byte(secret))
+
+	router := gin.New()
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(200) })
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("precondition: skew-window token should be accepted before revocation, got %d", w.Code)
+	}
+	_ = blacklist.RevokeFamily(context.Background(), "sid-skew", time.Now().Add(time.Hour))
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 (revoked family) for a token inside the skew window, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenAuthMiddleware_ModeLegacy_UndeterminableSIDFailsClosed proves that
+// when the validator accepted a legacy token but the family id cannot be
+// re-derived (here: cfg.JWT.Secret differs from the validator's secret), the
+// request is rejected rather than skipping the family check.
+func TestTokenAuthMiddleware_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {
+	validatorSecret := "legacy-mode-test-secret"
+	v := validator.New(validator.Config{
+		Audiences: []string{testTokenAudience},
+		Legacy:    validator.LegacyConfig{Enabled: true, HMACSecret: []byte(validatorSecret), Issuers: []string{"legacy-mode-test-issuer"}},
+	})
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{"test-tenant": {ID: "test-tenant", Enabled: true}}}
+	logger := zap.NewNop()
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "a-different-secret"}}
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+
+	tokenStr := createLegacyModeTokenWithSID(validatorSecret, "user-123", "jti-x", "sid-x")
+	router := gin.New()
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.GET("/test", func(c *gin.Context) { c.Status(200) })
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 (fail closed), got %d: %s", w.Code, w.Body.String())
+	}
+}

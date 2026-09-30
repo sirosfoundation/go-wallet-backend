@@ -33,6 +33,10 @@ type ASModule struct {
 	Blacklist TokenBlacklistChecker
 	Logger    *zap.Logger
 	Config    *config.ASConfig
+	// FamilyRetention is how long LogoutHandler keeps a refresh-token
+	// family revocation marker (the longest configured access/refresh
+	// token lifetime plus a safety margin, #402).
+	FamilyRetention time.Duration
 
 	// store and validatorCache back the tenant-header and OIDC-gate
 	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
@@ -135,18 +139,19 @@ func NewASModule(
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
-		KeyManager:     km,
-		TokenIssuer:    tokenIssuer,
-		LegacyIssuer:   legacyIssuer,
-		Sessions:       sessions,
-		Policy:         policy,
-		PasskeyHandler: passkeyHandler,
-		OIDCHandler:    oidcHandler,
-		Blacklist:      blacklist,
-		Logger:         logger,
-		Config:         cfg,
-		store:          store,
-		validatorCache: validatorCache,
+		KeyManager:      km,
+		TokenIssuer:     tokenIssuer,
+		LegacyIssuer:    legacyIssuer,
+		Sessions:        sessions,
+		Policy:          policy,
+		PasskeyHandler:  passkeyHandler,
+		OIDCHandler:     oidcHandler,
+		Blacklist:       blacklist,
+		Logger:          logger,
+		Config:          cfg,
+		FamilyRetention: jwtCfg.MaxTokenLifetime() + time.Hour,
+		store:           store,
+		validatorCache:  validatorCache,
 	}, nil
 }
 
@@ -219,7 +224,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.Blacklist, m.FamilyRetention, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

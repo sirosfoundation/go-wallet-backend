@@ -1,6 +1,7 @@
 package legacytoken
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -79,5 +80,53 @@ func TestSID_NonHMACSigningMethod_Rejected(t *testing.T) {
 	got := SID("test-secret", signed)
 	if got != "" {
 		t.Errorf("SID() = %q, want empty string for a non-HMAC-signed token", got)
+	}
+}
+
+// TestParseSID_AcceptsTokenInsideClockSkewWindow is the regression test for
+// the fail-open review finding: go-tokenauth accepts a token up to its
+// leeway past exp, so the re-parse must not re-validate time claims.
+func TestParseSID_AcceptsTokenInsideClockSkewWindow(t *testing.T) {
+	secret := "test-secret"
+	token := signTestToken(t, secret, jwt.MapClaims{
+		"sid": "sid-skew",
+		"exp": time.Now().Add(-2 * time.Second).Unix(), // expired, within 5s leeway
+		"nbf": time.Now().Add(2 * time.Second).Unix(),  // not yet valid, within leeway
+		"iat": time.Now().Add(2 * time.Second).Unix(),
+	})
+
+	sid, err := ParseSID(secret, token)
+	if err != nil || sid != "sid-skew" {
+		t.Errorf("ParseSID() = (%q, %v), want (sid-skew, nil)", sid, err)
+	}
+	if got := SID(secret, token); got != "sid-skew" {
+		t.Errorf("SID() = %q, want sid-skew", got)
+	}
+}
+
+func TestParseSID_NoSID_NilError(t *testing.T) {
+	token := signTestToken(t, "s", jwt.MapClaims{"exp": time.Now().Add(time.Hour).Unix()})
+	sid, err := ParseSID("s", token)
+	if err != nil || sid != "" {
+		t.Errorf("ParseSID() = (%q, %v), want (\"\", nil)", sid, err)
+	}
+}
+
+func TestParseSID_UnverifiableTokens_ReturnErrUnparseable(t *testing.T) {
+	good := signTestToken(t, "right", jwt.MapClaims{"sid": "x"})
+	none, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{"sid": "x"}).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	for name, tok := range map[string]string{
+		"wrong secret": good,
+		"malformed":    "not-a-jwt",
+		"alg none":     none,
+		"empty":        "",
+	} {
+		secret := "wrong"
+		if name != "wrong secret" {
+			secret = "right"
+		}
+		if sid, err := ParseSID(secret, tok); !errors.Is(err, ErrUnparseable) || sid != "" {
+			t.Errorf("%s: ParseSID() = (%q, %v), want (\"\", ErrUnparseable)", name, sid, err)
+		}
 	}
 }

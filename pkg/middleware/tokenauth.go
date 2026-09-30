@@ -102,7 +102,17 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 		// AS-issued tokens (ModeSession) have no sid/family concept at all;
 		// only ModeLegacy is checked.
 		if blacklist != nil && result.Mode == claims.ModeLegacy {
-			if sid := legacytoken.SID(cfg.JWT.Secret, rawToken); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+			// Fail closed: the token was already accepted above, so an
+			// unverifiable re-parse means we cannot tell which family it
+			// belongs to - reject rather than skip the check.
+			sid, sidErr := legacytoken.ParseSID(cfg.JWT.Secret, rawToken)
+			if sidErr != nil {
+				logger.Warn("Cannot determine refresh-token family for legacy token", zap.Error(sidErr))
+				c.JSON(401, gin.H{"error": "Invalid token"})
+				c.Abort()
+				return
+			}
+			if sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
 				logger.Warn("Token for revoked refresh-token family used",
 					zap.String("sid", sid),
 				)
