@@ -1214,13 +1214,21 @@ func TestWMP_CredentialNotification_MissingID(t *testing.T) {
 
 	select {
 	case data := <-events:
+		var env struct {
+			JSONRPC string                   `json:"jsonrpc"`
+			Method  string                   `json:"method"`
+			Params  wmp.MessageDeliverParams `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(data, &env))
+		assert.Equal(t, "2.0", env.JSONRPC)
+		assert.Equal(t, wmp.MethodMessageDeliver, env.Method)
 		var ack struct {
 			Type   string `json:"type"`
 			FlowID string `json:"flow_id"`
 			Status string `json:"status"`
 			Error  string `json:"error"`
 		}
-		require.NoError(t, json.Unmarshal(data, &ack))
+		require.NoError(t, json.Unmarshal(env.Params.Body, &ack))
 		assert.Equal(t, "notification_ack", ack.Type)
 		assert.Equal(t, "flow-1", ack.FlowID)
 		assert.Equal(t, "rejected", ack.Status)
@@ -2685,4 +2693,74 @@ func TestWMP_HTTPEndpoint_Configuration_DiscoverConfigRoundTrip(t *testing.T) {
 	assert.Equal(t, WMPRPCPath, cfg.Endpoints["rpc"])
 	assert.Equal(t, WMPEventsPath, cfg.Endpoints["events"])
 	assert.Contains(t, cfg.Capabilities, "flows")
+}
+
+// FlowError.Details (e.g. OID4VP's redirect_uri) must reach the WMP client.
+func TestWmpSessionTransport_SendJSON_FlowError_Details(t *testing.T) {
+	ct := wmp.NewChannelTransport(5, 5)
+	handler := &wmpEngineHandler{sessionID: "sess-det"}
+	peer := wmp.NewPeer(ct, handler)
+	transport := newWMPSessionTransport(peer, ct)
+	transport.handler = handler
+
+	require.NoError(t, transport.SendJSON(&FlowErrorMessage{
+		Message: Message{FlowID: "flow-1"},
+		Error: FlowError{Code: ErrCodeSignError, Message: "boom",
+			Details: map[string]interface{}{"redirect_uri": "https://rp.example/cb?error=x"}},
+	}))
+	select {
+	case data := <-ct.Out():
+		var notif struct {
+			Params wmp.FlowErrorParams `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(data, &notif))
+		var d map[string]string
+		require.NoError(t, json.Unmarshal(notif.Params.Data, &d))
+		assert.Equal(t, "https://rp.example/cb?error=x", d["redirect_uri"])
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// Every event written by the transport, including the fallback path
+// (credential-notification acks, push), must be a JSON-RPC 2.0 notification.
+func TestWmpSessionTransport_SendJSON_AllEventsAreJSONRPC(t *testing.T) {
+	ct := wmp.NewChannelTransport(10, 10)
+	handler := &wmpEngineHandler{sessionID: "sess-rpc"}
+	peer := wmp.NewPeer(ct, handler)
+	transport := newWMPSessionTransport(peer, ct)
+	transport.handler = handler
+
+	msgs := []interface{}{
+		&FlowProgressMessage{Message: Message{FlowID: "f"}, Step: "s"},
+		&FlowErrorMessage{Message: Message{FlowID: "f"}, Error: FlowError{Code: ErrCodeSignError, Message: "m"}},
+		&NotificationAckMessage{Message: Message{FlowID: "f", Type: TypeNotificationAck}},
+		&PushMessage{Message: Message{Type: TypePush}, PushType: "credential"},
+	}
+	for _, m := range msgs {
+		require.NoError(t, transport.SendJSON(m))
+	}
+	for i := range msgs {
+		select {
+		case data := <-ct.Out():
+			var env struct {
+				JSONRPC string          `json:"jsonrpc"`
+				Method  string          `json:"method"`
+				ID      json.RawMessage `json:"id"`
+				Params  json.RawMessage `json:"params"`
+			}
+			require.NoError(t, json.Unmarshal(data, &env), "event %d: %s", i, data)
+			assert.Equal(t, "2.0", env.JSONRPC, "event %d: %s", i, data)
+			assert.NotEmpty(t, env.Method, "event %d: %s", i, data)
+			assert.Empty(t, env.ID, "notification must have no id")
+			if i >= 2 {
+				assert.Equal(t, wmp.MethodMessageDeliver, env.Method)
+				var p wmp.MessageDeliverParams
+				require.NoError(t, json.Unmarshal(env.Params, &p))
+				assert.NotEmpty(t, p.Body, "legacy payload must be preserved in body")
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timeout on event %d", i)
+		}
+	}
 }

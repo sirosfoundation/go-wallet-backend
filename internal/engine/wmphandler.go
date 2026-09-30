@@ -1728,11 +1728,22 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		})
 
 	case *FlowErrorMessage:
+		// Carry Error.Details (e.g. OID4VP's redirect_uri) in Data so the
+		// WMP client sees what a WebSocket client would.
+		var data json.RawMessage
+		if len(m.Error.Details) > 0 {
+			b, err := json.Marshal(m.Error.Details)
+			if err != nil {
+				return err
+			}
+			data = b
+		}
 		return t.peer.Notify(ctx, wmp.MethodFlowError, &wmp.FlowErrorParams{
 			WMP:     t.wmpMeta(),
 			FlowID:  m.FlowID,
 			Code:    mapErrorCode(m.Error.Code),
 			Message: m.Error.Message,
+			Data:    data,
 		})
 
 	case *SignRequestMessage:
@@ -1804,14 +1815,24 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		return err
 
 	default:
-		// Fallback: marshal as raw JSON and write directly.
-		// This handles PushMessage and other types that don't have
-		// a WMP equivalent yet.
+		// Fallback for engine messages with no dedicated WMP method
+		// (PushMessage, credential-notification acks, ...): wrap the legacy
+		// object in a wmp.message.deliver notification so every event on
+		// the stream is valid JSON-RPC.
 		data, err := json.Marshal(msg)
 		if err != nil {
 			return err
 		}
-		return t.ct.WriteMessage(ctx, data)
+		var probe struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(data, &probe)
+		return t.peer.Notify(ctx, wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
+			WMP:         t.wmpMeta(),
+			ContentType: "application/json",
+			MessageType: probe.Type,
+			Body:        data,
+		})
 	}
 }
 
