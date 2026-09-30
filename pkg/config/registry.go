@@ -416,3 +416,20 @@ func (c *Config) ValidateRegistryStandalone() error {
 	}
 	return nil
 }
+
+// loadRegistrySecrets loads only the secret files the registry role can use:
+// jwt.secret_path, and only while legacy HMAC validation is enabled. Secret
+// paths of backend-only features (admin token, wallet-provider PKCS#11 and
+// attestation keys, MongoDB password) are not read, so a registry-only
+// process does not need them mounted.
+func (c *Config) loadRegistrySecrets() error {
+	if c.JWT.SecretPath == "" || !c.AS.Legacy.Enabled {
+		return nil
+	}
+	secret, err := readSecretFile(c.JWT.SecretPath)
+	if err != nil {
+		return fmt.Errorf("jwt.secret_path: %w", err)
+	}
+	c.JWT.Secret = secret
+	return nil
+}

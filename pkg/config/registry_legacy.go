@@ -127,8 +127,10 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 				"(new-style tokens are validated against <as.external_url>/auth/.well-known/jwks.json)")
 		}
 	}
+	// The old secret (file) is only read when it is going to be used, i.e.
+	// standalone; a combined process authenticates with the backend's jwt.*.
 	secret := f.JWT.Secret
-	if f.JWT.SecretPath != "" {
+	if standalone && f.JWT.SecretPath != "" {
 		s, err := readSecretFile(f.JWT.SecretPath)
 		if err != nil {
 			return warnings, fmt.Errorf("registry jwt.secret_path: %w", err)

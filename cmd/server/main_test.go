@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
+	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -118,4 +124,37 @@ func TestLoggingConfig(t *testing.T) {
 
 	got = loggingConfig(nil, reg)
 	assert.Equal(t, "warn", got.Level)
+}
+
+// Default combined wiring end to end: the engine's VCTM client reaches the
+// registry handler in-process (no network, so the outbound loopback/HTTP
+// guards do not apply).
+func TestColocatedEngineClientReachesRegistry(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "vctm.json"),
+		[]byte(`{"vct":"https://example.org/cred/v1","name":"Example"}`), 0o600))
+
+	cfg, err := config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	cfg.Registry.Cache.Path = filepath.Join(dir, "cache.json")
+	cfg.Registry.Source.LocalOverrides = []string{filepath.Join(dir, "vctm.json")}
+	cfg.Registry.Source.URL = "http://127.0.0.1:1/x.json"
+	cfg.Registry.RequireAuth = true // internal calls bypass auth and rate limiting
+
+	p, err := server.NewRegistryProvider(cfg, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+
+	// Default HTTP client policy: a network call to loopback would be refused.
+	client := engine.NewRegistryClient(cfg, zap.NewNop())
+	client.SetHandler(p.InProcessHandler())
+
+	md, err := client.FetchTypeMetadata(context.Background(), "https://example.org/cred/v1")
+	require.NoError(t, err)
+	require.NotNil(t, md, "engine client must find the VCTM through the co-located registry")
+	assert.Equal(t, "https://example.org/cred/v1", md.VCT)
+
+	md, err = client.FetchTypeMetadata(context.Background(), "https://example.org/unknown")
+	require.NoError(t, err)
+	assert.Nil(t, md)
 }

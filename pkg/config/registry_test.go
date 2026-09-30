@@ -709,3 +709,38 @@ func TestValidateRegistry_ShortSecretAndTolerance(t *testing.T) {
 	c.AS.Legacy.Enabled = false
 	assert.ErrorContains(t, c.ValidateRegistry(), "as.external_url")
 }
+
+func TestLoadRegistryOnly_IgnoresBackendOnlySecretFiles(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing")
+	p := writeFile(t, dir, "c.yaml", "server:\n  admin_token_path: "+missing+"\n"+
+		"storage:\n  mongodb:\n    password_path: "+missing+"\n"+
+		"wallet_provider:\n  pkcs11:\n    pin_path: "+missing+"\n"+
+		"jwt:\n  secret_path: "+missing+"\n"+
+		"as:\n  legacy:\n    enabled: false\n")
+	_, err := Load(p)
+	require.Error(t, err, "the full backend load needs those files")
+	cfg, err := LoadRegistryOnly(p)
+	require.NoError(t, err, "registry-only does not read backend secrets nor jwt.secret_path with legacy off")
+	assert.Empty(t, cfg.JWT.Secret)
+
+	// legacy on: jwt.secret_path is read (and required)
+	p = writeFile(t, dir, "c2.yaml", "jwt:\n  secret_path: "+missing+"\n")
+	_, err = LoadRegistryOnly(p)
+	assert.ErrorContains(t, err, "jwt.secret_path")
+	sp := writeFile(t, dir, "secret", "0123456789abcdef0123456789abcdef\n")
+	p = writeFile(t, dir, "c3.yaml", "jwt:\n  secret_path: "+sp+"\nserver:\n  admin_token_path: "+missing+"\n")
+	cfg, err = LoadRegistryOnly(p)
+	require.NoError(t, err)
+	assert.Equal(t, "0123456789abcdef0123456789abcdef", cfg.JWT.Secret)
+}
+
+func TestApplyLegacyRegistryConfig_CombinedDoesNotReadOldSecretFile(t *testing.T) {
+	dir := t.TempDir()
+	old := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+filepath.Join(dir, "gone")+"\n")
+	c := defaultConfig()
+	_, err := c.ApplyLegacyRegistryConfig(old, false)
+	require.NoError(t, err, "combined mode uses the backend jwt settings")
+	_, err = defaultConfig().ApplyLegacyRegistryConfig(old, true)
+	assert.ErrorContains(t, err, "jwt.secret_path", "standalone still needs it")
+}

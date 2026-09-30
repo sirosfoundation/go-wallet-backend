@@ -229,17 +229,21 @@ func main() {
 		resources = append(resources, backendProvider)
 	}
 
+	var registryProvider *server.RegistryProvider
 	if roles.Has(modes.RoleRegistry) {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
 		if err != nil {
 			logger.Fatal("Failed to create registry provider", zap.Error(err))
 		}
+		// Registry-only: keep the retired standalone binary's root paths.
+		provider.SetRootAliases(registryOnly)
 		// Co-located with the backend: share its tenant store and token
 		// blacklist so revocation and tenant checks apply to the registry too.
 		if backendProvider != nil {
 			provider.SetTenantLookup(backendProvider.Store().Tenants())
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
 		}
+		registryProvider = provider
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
 	}
@@ -265,6 +269,14 @@ func main() {
 		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, sharedResolver, issuerLookup)
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
+		}
+		// Engine and registry in one process: the registry is served by the
+		// shared HTTP server under /registry (not on server.registry_port),
+		// and the outbound HTTP guards reject loopback, so give the engine's
+		// VCTM client the registry in-process - unless trust.registry_url
+		// names an explicit registry.
+		if registryProvider != nil && backendCfg.Trust.RegistryURL == "" {
+			provider.SetRegistryHandler(registryProvider.InProcessHandler())
 		}
 		// Wire token validator for WebSocket handshake auth
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {

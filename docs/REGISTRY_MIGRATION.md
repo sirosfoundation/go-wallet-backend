@@ -100,3 +100,26 @@ drop `--registry-config`.
 - Combined deployments: drop `-registry-config` and move the file's content into
   the backend config's `registry:` section; drop `REGISTRY_*` variables.
 - Registry-only deployments: mount a backend-layout config, expose 8097.
+
+## HTTP paths
+
+The registry role serves `/registry/type-metadata`, `/registry/credentials` and
+`/registry/status`. A registry-only process (`--mode=registry`, including the
+`go-wallet-registry` helper image) additionally serves `/type-metadata` and
+`/credentials` at the root, exactly as the retired binary did, under the same
+authentication and rate limiting, so existing clients keep working. `/status`
+at the root is the server's own health endpoint (it cannot also be the registry
+status); use `/registry/status` for the registry status.
+
+When the engine and registry roles run in the same process, the engine's VCTM
+lookups call the registry in-process (no network, unaffected by the outbound
+loopback/plain-HTTP guards) unless `trust.registry_url` names an explicit
+registry.
+
+## Secrets in registry-only mode
+
+A registry-only process only reads `jwt.secret_path`, and only while
+`as.legacy.enabled` is true. Backend-only secret paths (admin token, MongoDB
+password, wallet-provider PIN/keys) are not read and need not be mounted. The
+deprecated `jwt.secret_path` of an old registry file is only read when the
+registry runs alone; in a combined process the backend's `jwt.*` is used.

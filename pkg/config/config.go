@@ -1728,7 +1728,7 @@ type RedisConfig struct {
 
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
-	return load(configFile, (*Config).Validate)
+	return load(configFile, (*Config).loadSecretsFromFiles, (*Config).Validate)
 }
 
 // LoadRegistryOnly loads configuration for a process that runs only the
@@ -1737,10 +1737,10 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	return load(configFile, (*Config).ValidateRegistryStandalone)
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).ValidateRegistryStandalone)
 }
 
-func load(configFile string, validate func(*Config) error) (*Config, error) {
+func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
 
@@ -1778,7 +1778,7 @@ func load(configFile string, validate func(*Config) error) (*Config, error) {
 	}
 
 	// Load secrets from files if configured
-	if err := cfg.loadSecretsFromFiles(); err != nil {
+	if err := loadSecrets(cfg); err != nil {
 		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
 	}
 

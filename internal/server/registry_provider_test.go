@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -202,4 +203,60 @@ func TestBuildTokenValidatorHelpers(t *testing.T) {
 	c.AS.Issuer = ""
 	_, err = v.Validate(context.Background(), regHMAC(t))
 	assert.NoError(t, err)
+}
+
+func TestRegistryProvider_RootAliases(t *testing.T) {
+	get := func(p *RegistryProvider, path string) int {
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		p.RegisterRoutes(r)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		return w.Code
+	}
+	cfg := registryTestConfig(t)
+	cfg.Registry.RequireAuth = true
+	cfg.AS.ExternalURL = "http://127.0.0.1:1"
+	cfg.AS.Legacy.Enabled = false
+	p, err := NewRegistryProvider(cfg, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+
+	// without aliases only /registry/* exists
+	assert.Equal(t, http.StatusNotFound, get(p, "/type-metadata?vct=x"))
+	assert.Equal(t, http.StatusUnauthorized, get(p, "/registry/type-metadata?vct=x"))
+
+	// with aliases the retired binary's root paths work, under the same auth
+	p.SetRootAliases(true)
+	assert.Equal(t, http.StatusUnauthorized, get(p, "/type-metadata?vct=x"))
+	assert.Equal(t, http.StatusUnauthorized, get(p, "/credentials"))
+	assert.Equal(t, http.StatusUnauthorized, get(p, "/registry/credentials"))
+
+	// unauthenticated mode serves them
+	cfg2 := registryTestConfig(t)
+	p2, err := NewRegistryProvider(cfg2, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p2.Close() })
+	p2.SetRootAliases(true)
+	assert.Equal(t, http.StatusOK, get(p2, "/credentials"))
+	assert.Equal(t, http.StatusBadRequest, get(p2, "/type-metadata"), "handler reached (vct required)")
+}
+
+func TestRegistryProvider_InProcessHandler(t *testing.T) {
+	cfg := registryTestConfig(t)
+	cfg.Registry.RequireAuth = true // in-process callers are trusted: no auth, no rate limit
+	cfg.AS.ExternalURL = "http://127.0.0.1:1"
+	cfg.AS.Legacy.Enabled = false
+	p, err := NewRegistryProvider(cfg, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	h := p.InProcessHandler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/registry/type-metadata", nil))
+	assert.Equal(t, http.StatusBadRequest, w.Code, "handler reached without a token")
+
+	// EngineProvider wiring
+	ep := &EngineProvider{manager: wsengine.NewManager(cfg, zap.NewNop())}
+	ep.SetRegistryHandler(h)
 }

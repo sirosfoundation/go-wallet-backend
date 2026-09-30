@@ -448,6 +448,10 @@ func (p *EngineProvider) Manager() *wsengine.Manager {
 	return p.manager
 }
 
+// SetRegistryHandler wires a co-located registry (see
+// RegistryProvider.InProcessHandler) into the engine's VCTM client.
+func (p *EngineProvider) SetRegistryHandler(h http.Handler) { p.manager.SetRegistryHandler(h) }
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
@@ -879,6 +883,8 @@ type RegistryProvider struct {
 	validator *tokenvalidator.Validator
 	tenants   middleware.TenantLookup
 	blacklist middleware.TokenBlacklistChecker
+
+	rootAliases bool
 }
 
 // registryNeedsValidator reports whether a token validator must be built:
@@ -955,6 +961,23 @@ func (p *RegistryProvider) SetTenantLookup(t middleware.TenantLookup) { p.tenant
 // tokens of revoked users are rejected on the registry routes too.
 func (p *RegistryProvider) SetTokenBlacklist(b middleware.TokenBlacklistChecker) { p.blacklist = b }
 
+// InProcessHandler returns a handler serving the registry routes under
+// /registry without authentication or rate limiting, for trusted in-process
+// callers (the co-located engine's VCTM client).
+func (p *RegistryProvider) InProcessHandler() http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	p.handler.RegisterRoutes(r.Group("/registry"))
+	return r
+}
+
+// SetRootAliases additionally serves /type-metadata and /credentials at the
+// server root, as the retired standalone registry binary did, so existing
+// go-wallet-registry clients keep working. Meant for registry-only processes.
+// /status is not aliased: the server's own /status health endpoint owns that
+// path; the registry status stays at /registry/status.
+func (p *RegistryProvider) SetRootAliases(on bool) { p.rootAliases = on }
+
 func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
 
@@ -978,6 +1001,19 @@ func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 
 	// Register handler routes under /registry prefix
 	p.handler.RegisterRoutes(group)
+
+	if p.rootAliases {
+		root := router.Group("/")
+		root.Use(registry.AuthMiddlewares(registry.AuthConfig{
+			Validator:   p.validator,
+			Tenants:     p.tenants,
+			Blacklist:   p.blacklist,
+			RequireAuth: p.rcfg.RequireAuth,
+			Logger:      p.logger,
+		})...)
+		root.Use(registry.RateLimitMiddleware(rateLimiter))
+		p.handler.RegisterRootAliases(root)
+	}
 }
 
 // Start starts the registry background fetcher
