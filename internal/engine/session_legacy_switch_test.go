@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -39,11 +40,11 @@ func TestManager_validateToken_StandaloneFallbackHonoursLegacySwitch(t *testing.
 	tok := legacySwitchToken(t, "rp.example.com")
 
 	m := NewManager(legacySwitchCfg(true, false), zap.NewNop())
-	_, _, _, err := m.validateToken(tok)
+	_, _, _, err := m.validateToken(context.Background(), tok)
 	assert.ErrorContains(t, err, "disabled")
 
 	m = NewManager(legacySwitchCfg(true, true), zap.NewNop())
-	uid, _, _, err := m.validateToken(tok)
+	uid, _, _, err := m.validateToken(context.Background(), tok)
 	require.NoError(t, err)
 	assert.Equal(t, "u", uid)
 }
@@ -57,13 +58,13 @@ func TestManager_validateToken_LegacyExemptFromAudience(t *testing.T) {
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
 		Legacy: tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(legacySwitchSecret)},
 	}))
-	uid, _, _, err := m.validateToken(legacySwitchToken(t, "rp.example.com"))
+	uid, _, _, err := m.validateToken(context.Background(), legacySwitchToken(t, "rp.example.com"))
 	require.NoError(t, err)
 	assert.Equal(t, "u", uid)
 
 	// Legacy disabled in the validator: refused.
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{}))
-	_, _, _, err = m.validateToken(legacySwitchToken(t, "rp.example.com"))
+	_, _, _, err = m.validateToken(context.Background(), legacySwitchToken(t, "rp.example.com"))
 	assert.Error(t, err)
 }
 
@@ -75,17 +76,17 @@ func TestManager_validateToken_LegacyIssuerPinned(t *testing.T) {
 		return tok
 	}
 	m := NewManager(legacySwitchCfg(false, true), zap.NewNop())
-	uid, _, _, err := m.validateToken(mint(jwt.MapClaims{"iss": "test-issuer"}))
+	uid, _, _, err := m.validateToken(context.Background(), mint(jwt.MapClaims{"iss": "test-issuer"}))
 	require.NoError(t, err)
 	assert.Equal(t, "u", uid)
-	_, _, _, err = m.validateToken(mint(jwt.MapClaims{}))
+	_, _, _, err = m.validateToken(context.Background(), mint(jwt.MapClaims{}))
 	assert.Error(t, err, "missing iss")
-	_, _, _, err = m.validateToken(mint(jwt.MapClaims{"iss": "someone-else"}))
+	_, _, _, err = m.validateToken(context.Background(), mint(jwt.MapClaims{"iss": "someone-else"}))
 	assert.Error(t, err, "mismatched iss")
 
 	cfg := legacySwitchCfg(false, true)
 	cfg.JWT.Issuer = ""
 	m = NewManager(cfg, zap.NewNop())
-	_, _, _, err = m.validateToken(mint(jwt.MapClaims{"iss": ""}))
+	_, _, _, err = m.validateToken(context.Background(), mint(jwt.MapClaims{"iss": ""}))
 	assert.Error(t, err, "empty jwt.issuer must fail closed")
 }
