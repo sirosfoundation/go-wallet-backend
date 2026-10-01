@@ -314,10 +314,12 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
 
   async connect(token: string): Promise<void> {
     this.token = token;
-    // Create the session via POST. Authentication is inline: params.auth is
-    // required, and the server validates the token (and derives user and
-    // tenant from it) as part of session.create. There is no separate
-    // wmp.session.authenticate step.
+    // Create the session via POST. The request is authenticated by the
+    // Authorization header (set by the transport from the same token); the
+    // session is owned by that identity. params.auth is optional: when sent
+    // it must resolve to the SAME identity (same user, tenant and, for an
+    // anonymous token, same jti) or session.create is refused as an invalid
+    // token. There is no separate wmp.session.authenticate step.
     const result = await this.rpc('wmp.session.create', {
       wmp: { version: '0.1' },
       security: { mode: 'tls' },
@@ -514,7 +516,7 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 
 | Engine (custom) | WMP (JSON-RPC 2.0) | Notes |
 |----------------|---------------------|-------|
-| `{"type":"handshake","app_token":"..."}` | `wmp.session.create` with inline `params.auth` | Authentication happens inside `session.create`; `wmp.session.authenticate` is not implemented by this server (it answers method-not-found) |
+| `{"type":"handshake","app_token":"..."}` | `wmp.session.create` (optional `params.auth`, which must equal the `Authorization` header identity) | The `Authorization` header authenticates `session.create` and fixes the session owner; `wmp.session.authenticate` is not implemented by this server (it answers method-not-found) |
 | `{"type":"handshake_complete","session_id":"...","capabilities":[...]}` | `SessionCreateResult{WMP, Capabilities, Security}` | WMP capabilities are typed `map[string]json.RawMessage` |
 | `{"type":"flow_start","protocol":"oid4vci",...}` | `wmp.flow.start` with `flow_type:"oid4vci"` | Direct map; WMP adds `timeout` parameter |
 | `{"type":"flow_progress","step":"...","payload":{}}` | `wmp.flow.progress` notification | Direct map |
@@ -783,7 +785,7 @@ The engine's `UserFacingMessage()` function maps to the WMP `ErrorMessage()` pat
 | Add `GET /api/v2/wallet/events` SSE endpoint (session-scoped notification stream) | Medium | P0 |
 | Implement `FlowBridge` (goroutine bridge for engine coroutine handlers) | Medium | P0 |
 | Wire engine `FlowHandlerFactory` to WMP `Profile` registration | Small | P0 |
-| Map engine `HandshakeMessage` to `wmp.session.create` with inline `params.auth` | Small | P0 |
+| Map engine `HandshakeMessage` to `wmp.session.create` (owner = `Authorization` header identity; optional `params.auth` must match it) | Small | P0 |
 | JWT auth middleware for `/api/v2/wallet/rpc` and `/api/v2/wallet/events` | Small | P0 |
 | Tenant derivation from the validated bearer token | Small | P1 |
 | Map engine error codes to WMP error codes | Small | P1 |

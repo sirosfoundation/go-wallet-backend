@@ -631,6 +631,19 @@ func (a *WMPAdapter) verifySessionOwnership(sessionID string, caller wmpCaller) 
 	return ownsSession(ws, caller)
 }
 
+// sameIdentity reports whether a validated token identity is the caller's:
+// same user, same (normalised) tenant and, for an anonymous token (no user),
+// the same jti. Compared on validated claims, never on token strings.
+func sameIdentity(id tokenIdentity, caller wmpCaller) bool {
+	if id.UserID != caller.UserID || normalizeTenant(id.TenantID) != normalizeTenant(caller.TenantID) {
+		return false
+	}
+	if id.UserID == "" && (id.JTI == "" || id.JTI != caller.TokenID) {
+		return false
+	}
+	return true
+}
+
 func ownsSession(ws *wmpSession, caller wmpCaller) bool {
 	if ws.session.UserID != caller.UserID {
 		return false
@@ -658,9 +671,22 @@ func (a *WMPAdapter) touchSession(sessionID string) {
 	a.mu.Unlock()
 }
 
-// HandleRPC handles a single JSON-RPC request (from HTTP POST /wmp/rpc).
+// HandleRPC handles a single JSON-RPC request in-process.
 // It is HandleRPCAs for a caller with no token ID.
+//
+// HandleRPC is an in-process entry with no HTTP layer: for session.create the
+// identity is taken from the request's own params.auth credential (there is no
+// separate Authorization header to disagree with). It is not reachable from
+// the network; HandleWMPRPC always uses HandleRPCAs with the validated header.
 func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID string, body []byte) ([]byte, error) {
+	if msg, err := wmp.DecodeMessage(body); err == nil && msg.Method == wmp.MethodSessionCreate {
+		var params wmp.SessionCreateParams
+		if json.Unmarshal(msg.AsRequest().Params, &params) == nil && params.Auth != nil && params.Auth.Token != "" {
+			if id, verr := a.manager.validateTokenAuth(ctx, params.Auth.Token); verr == nil {
+				return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}, body)
+			}
+		}
+	}
 	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID}, body)
 }
 
@@ -680,7 +706,7 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 	}
 
 	if msg.Method == wmp.MethodSessionCreate {
-		return a.handleSessionCreate(ctx, msg)
+		return a.handleSessionCreate(ctx, caller, msg)
 	}
 	if msg.Method == wmp.MethodSessionResume {
 		return a.handleSessionResume(ctx, caller, msg)
@@ -875,7 +901,7 @@ func (a *WMPAdapter) supersedeSession(sessionID string, session *Session) {
 }
 
 // handleSessionCreate creates a new engine session and wmp.Peer.
-func (a *WMPAdapter) handleSessionCreate(ctx context.Context, msg *wmp.Message) ([]byte, error) {
+func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, msg *wmp.Message) ([]byte, error) {
 	req := msg.AsRequest()
 
 	var params wmp.SessionCreateParams
@@ -904,32 +930,33 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, msg *wmp.Message) 
 		})
 	}
 
-	// Extract bearer token from auth object.
-	var userID, tenantID, tokenID string
-	var tac claims.TAC
-	var enforceTAC bool
+	// The HTTP-validated caller is the sole authority for who owns the
+	// session. A credential in params.auth is optional; when present it must
+	// resolve to the SAME identity as the caller (same user, tenant and, for
+	// an anonymous token, same jti). A mismatch is refused with the same
+	// error as an invalid token so the response does not reveal whether a
+	// different token is valid.
 	if params.Auth != nil && params.Auth.Token != "" {
 		if params.Auth.Type != "" && params.Auth.Type != "bearer" {
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 				"reason": "unsupported auth type; only 'bearer' is supported",
 			})
 		}
-		var err error
-		var id tokenIdentity
-		id, err = a.manager.validateTokenAuth(ctx, params.Auth.Token)
-		userID, tenantID, tac, tokenID, enforceTAC = id.UserID, id.TenantID, id.TAC, id.JTI, id.EnforceTAC
-		if err != nil {
-			a.logger.Warn("WMP auth failed", zap.Error(err))
+		id, err := a.manager.validateTokenAuth(ctx, params.Auth.Token)
+		if err != nil || !sameIdentity(id, caller) {
+			if err != nil {
+				a.logger.Warn("WMP auth failed", zap.Error(err))
+			} else {
+				a.logger.Warn("WMP session.create rejected: params.auth does not match the authenticated caller")
+			}
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 				"reason": "invalid or expired token",
 			})
 		}
-		tenantID = normalizeTenant(tenantID)
-	} else {
-		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
-			"reason": "auth required",
-		})
 	}
+	userID, tokenID := caller.UserID, caller.TokenID
+	tenantID := normalizeTenant(caller.TenantID)
+	tac, enforceTAC := caller.TAC, caller.EnforceTAC
 
 	// A session without a user identity (anonymous token) can only be told
 	// apart from other anonymous sessions by its token's jti; without one
