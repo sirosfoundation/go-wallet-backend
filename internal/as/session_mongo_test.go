@@ -96,11 +96,14 @@ func TestMongoSessionStore_RoundTrip(t *testing.T) {
 	jti, err := GenerateSessionID()
 	require.NoError(t, err)
 
-	require.NoError(t, store.Create(ctx, testSession(jti, "user-1")))
+	sess := testSession(jti, "user-1")
+	sess.FamilyID = "family-abc123"
+	require.NoError(t, store.Create(ctx, sess))
 
 	got, err := store.Get(ctx, jti)
 	require.NoError(t, err)
 	require.NotNil(t, got)
+	assert.Equal(t, "family-abc123", got.FamilyID, "FamilyID must survive the database round trip (logout revokes by family)")
 	assert.Equal(t, jti, got.JTI, "the presented JTI is handed back; only its hash is stored")
 	assert.Equal(t, "user-1", got.UserID)
 	assert.Equal(t, TAC("rwl"), got.MaxTAC)

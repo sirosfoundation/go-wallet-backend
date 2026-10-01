@@ -564,6 +564,22 @@ type fakeBlacklist struct {
 	revoked      map[string]bool
 	revokedUsers map[string]bool
 	added        map[string]time.Time
+	families     map[string]time.Time
+	familyErr    error
+}
+
+func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
+	if f.familyErr != nil {
+		return f.familyErr
+	}
+	if f.families == nil {
+		f.families = make(map[string]time.Time)
+	}
+	if existing, ok := f.families[sid]; ok && existing.After(expiry) {
+		expiry = existing
+	}
+	f.families[sid] = expiry
+	return nil
 }
 
 func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
