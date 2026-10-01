@@ -250,6 +250,9 @@ type RedisSessionStore struct {
 	keyPrefix  string
 	defaultTTL time.Duration
 	logger     *zap.Logger
+
+	// betweenDeleteBatches is a test hook run after each DeleteByUser batch.
+	betweenDeleteBatches func()
 }
 
 // RedisSessionConfig configures a Redis session store.
@@ -497,34 +500,129 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 		[]string{r.userKey(session.TenantID, session.UserID)}, sessionID).Err()
 }
 
+// deleteBatchSize bounds how many sessions one DeleteByUser script call
+// removes, keeping each (blocking) script short.
+const deleteBatchSize = 100
+
+// deleteUserBatchScript atomically removes a batch of one user's sessions and
+// then drops exactly those members from the user's session set.
+// KEYS[1] = userall set, ARGV[1] = legacy user pointer key, then groups of 5:
+// session ID, session key, (tenant,user) pointer key, tenant set key, raw
+// (pre-normalisation) tenant set key. Empty keys are skipped (session already
+// expired, or ID known only through the legacy pointer). Both pointers are
+// removed only if they still name the session (compare-and-delete), so a
+// newer session's pointer is never lost. Only the listed members are ZREM'd;
+// a member added by a concurrent Put is untouched and found next round.
+var deleteUserBatchScript = redis.NewScript(`
+for i = 2, #ARGV, 5 do
+	local id = ARGV[i]
+	if ARGV[i+1] ~= "" then redis.call("DEL", ARGV[i+1]) end
+	if ARGV[i+2] ~= "" and redis.call("GET", ARGV[i+2]) == id then redis.call("DEL", ARGV[i+2]) end
+	if redis.call("GET", ARGV[1]) == id then redis.call("DEL", ARGV[1]) end
+	if ARGV[i+3] ~= "" then redis.call("SREM", ARGV[i+3], id) end
+	if ARGV[i+4] ~= "" then redis.call("SREM", ARGV[i+4], id) end
+	redis.call("ZREM", KEYS[1], id)
+end
+return 1
+`)
+
+// deleteUserSetIfEmptyScript deletes the set KEYS[1] only if it is empty at
+// this instant. It returns 1 if the set is (now) gone, 0 if a member exists.
+// Because the check and the delete are one atomic step, a Put that adds a
+// member either lands before it (set non-empty, caller loops) or after it
+// (a fresh set is created, which indexes that session).
+var deleteUserSetIfEmptyScript = redis.NewScript(`
+if redis.call("ZCARD", KEYS[1]) == 0 then
+	redis.call("DEL", KEYS[1])
+	return 1
+end
+return 0
+`)
+
+// DeleteByUser removes the user's sessions in every tenant.
+//
+// It loops: each round atomically deletes a bounded batch of the set's
+// members (session keys, pointers, tenant-set entries) and ZREMs only those
+// members, until an atomic check finds the set empty and deletes it.
+//
+// Guarantee: every session indexed in the user's set at the time of the final
+// empty check (and every legacy-pointer session) has been removed, and no
+// session is ever left indexed-but-undiscoverable: a Put concurrent with the
+// call either is seen by a later round or creates a fresh set that remains a
+// valid index for its own session, so a later DeleteByUser finds it. A
+// session created after the final check is NOT removed by this call; at the
+// engine level such a session is subject to the user-revocation
+// cutoff/tombstone gate, which refuses and closes sessions of revoked users.
 func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
-	// Every member, expired or not: Delete is idempotent for IDs whose
-	// session key already expired, and the set is dropped at the end.
-	ids, err := r.client.ZRange(ctx, r.userSetKey(userID), 0, -1).Result()
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if err := r.Delete(ctx, id); err != nil {
+	for {
+		// Oldest-expiring first; expired members are included, their keys
+		// are simply absent.
+		ids, err := r.client.ZRange(ctx, r.userSetKey(userID), 0, deleteBatchSize-1).Result()
+		if err != nil {
 			return err
 		}
-	}
-	// Sessions created by pre-upgrade replicas are known only through the
-	// legacy pointer; remove the session it names (if it is this user's) and
-	// the pointer itself.
-	if legacyID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result(); err == nil {
-		if sess, gerr := r.Get(ctx, legacyID); gerr == nil && sess.UserID == userID {
-			if err := r.Delete(ctx, legacyID); err != nil {
+		// Sessions created by pre-upgrade replicas are known only through the
+		// legacy pointer; include the session it names (if it is this
+		// user's) and always remove the pointer itself.
+		legacyID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+		hasLegacy := err == nil
+		if hasLegacy {
+			ids = append(ids, legacyID)
+		}
+
+		if len(ids) == 0 {
+			done, err := deleteUserSetIfEmptyScript.Run(ctx, r.client, []string{r.userSetKey(userID)}).Int()
+			if err != nil {
 				return err
 			}
+			if done == 1 {
+				return nil
+			}
+			continue
 		}
-		if err := r.client.Del(ctx, r.legacyUserKey(userID)).Err(); err != nil {
+
+		args := []any{r.legacyUserKey(userID)}
+		for i, id := range ids {
+			isLegacy := hasLegacy && i == len(ids)-1
+			var sk, pk, tk, rtk string
+			if sess, gerr := r.rawSession(ctx, id); gerr == nil && (!isLegacy || sess.UserID == userID) {
+				sk = r.sessionKey(id)
+				pk = r.userKey(sess.TenantID, sess.UserID)
+				tk = r.tenantKey(sess.TenantID)
+				if raw := r.legacyTenantKey(sess.TenantID); raw != tk {
+					rtk = raw
+				}
+			} else if gerr != nil && gerr != ErrSessionNotFound {
+				return gerr
+			}
+			args = append(args, id, sk, pk, tk, rtk)
+		}
+		if err := deleteUserBatchScript.Run(ctx, r.client, []string{r.userSetKey(userID)}, args...).Err(); err != nil {
 			return err
 		}
-	} else if err != redis.Nil {
-		return err
+		if r.betweenDeleteBatches != nil {
+			r.betweenDeleteBatches()
+		}
 	}
-	return r.client.Del(ctx, r.userSetKey(userID)).Err()
+}
+
+// rawSession reads a session without the expiry check, for cleanup.
+func (r *RedisSessionStore) rawSession(ctx context.Context, sessionID string) (*SessionData, error) {
+	data, err := r.client.Get(ctx, r.sessionKey(sessionID)).Bytes()
+	if err == redis.Nil {
+		return nil, ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var session SessionData
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, err
+	}
+	return &session, nil
 }
 
 func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*SessionData, error) {
