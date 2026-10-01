@@ -101,6 +101,10 @@ func main() {
 		zap.Strings("roles", roleStrings),
 	)
 
+	// Every process that loaded the backend config honours as.legacy.enabled,
+	// whatever its roles, so log the legacy status here exactly once.
+	logLegacyStatus(backendCfg, logger)
+
 	// Security configuration validation for production environments
 	// Checks for potentially dangerous configurations and logs warnings
 	isProduction := os.Getenv("ENVIRONMENT") == "production" ||
@@ -249,6 +253,19 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// Standalone engine (no backend provider): build a JWKS-backed
+		// validator so session tokens work and as.legacy.enabled=false does not
+		// leave the handshake with no way to authenticate.
+		if backendProvider == nil {
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
+			if err != nil {
+				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
+			}
+			if sv != nil {
+				provider.SetTokenValidator(sv.Validator)
+				resources = append(resources, sv)
+			}
+		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
 		// during the WebSocket handshake too, on both the go-tokenauth and
@@ -358,4 +375,14 @@ func loadRegistryConfig(path string) (*registry.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// logLegacyStatus logs the legacy (HMAC) session-token status once for a
+// process that loaded the backend config; a nil config (registry-only) logs
+// nothing.
+func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
+	if cfg == nil {
+		return
+	}
+	server.LogLegacyTokenStatus(cfg, logger)
 }

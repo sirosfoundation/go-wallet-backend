@@ -151,7 +151,7 @@ func (ti *TokenIssuer) Issue(sub, audience, tenantID string, tac TAC, acr string
 	sig, err := jose.NewSigner(
 		jose.SigningKey{
 			Algorithm: sk.Algorithm,
-			Key:       sk.Signer,
+			Key:       sk.joseKey(),
 		},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", sk.Kid),
 	)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -1190,6 +1191,62 @@ func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T
 	}
 }
 
+func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *config.Config {
+	t.Helper()
+	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:     true,
+			ExternalURL: externalURL,
+			Legacy:      config.ASLegacyConfig{Enabled: legacy},
+		},
+	}
+	cfg.WalletProvider.PrivateKeyPath = keyPath
+	cfg.WalletProvider.CertificatePath = certPath
+	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+	return cfg
+}
+
+// AS enabled, no as.external_url, legacy HMAC on: starts with the HMAC-only
+// middleware (no validator, no relay).
+func TestNewWalletProviderProvider_NoExternalURL_LegacyOn_HMACOnly(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	if p.tokenValidator != nil || p.jwksRelay != nil {
+		t.Fatal("expected HMAC-only fallback: no token validator and no JWKS relay")
+	}
+}
+
+// AS enabled, no as.external_url, legacy off: nothing can authenticate tokens.
+func TestNewWalletProviderProvider_NoExternalURL_LegacyOff_Fails(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", false), zap.NewNop())
+	if err == nil {
+		_ = p.Close()
+		t.Fatal("expected startup error with no external_url and legacy disabled")
+	}
+	if !strings.Contains(err.Error(), "as.external_url") {
+		t.Fatalf("error should name as.external_url, got: %v", err)
+	}
+}
+
+// AS enabled with as.external_url: validator and relay are wired.
+func TestNewWalletProviderProvider_ExternalURL_WiresValidatorAndRelay(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com", true), zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	if p.tokenValidator == nil || p.jwksRelay == nil {
+		t.Fatal("expected token validator and JWKS relay when as.external_url is set")
+	}
+}
+
 // TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
 // counterpart: without AS enabled, isolated wallet-provider mode falls back
 // to legacy HMAC auth, matching AuthProvider's default behavior.
@@ -1406,6 +1463,7 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 // AuthMiddlewareWithBlacklist parses.
 func createLegacyTestToken(secret, userID, tenantID, jti string) string {
 	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss":       "test",
 		"user_id":   userID,
 		"tenant_id": tenantID,
 		"jti":       jti,
@@ -1666,12 +1724,193 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 	p.RegisterRoutes(router)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("X-Token-Mode", "session")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 from the default tenant's passkey register/begin, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A role that serves protected routes must refuse to start when a loaded
+// config disables both the AS and legacy HMAC tokens: it would otherwise
+// answer 401 to every request, valid session tokens included.
+func TestRequireSessionAuthMechanism(t *testing.T) {
+	load := func(t *testing.T, asYAML string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n" + asYAML
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return cfg
+	}
+
+	bad := load(t, "as:\n  enabled: false\n  external_url: https://as.example.com\n  legacy:\n    enabled: false\n")
+	for _, role := range []string{"backend", "wallet-provider"} {
+		err := requireSessionAuthMechanism(bad, role)
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled") {
+			t.Errorf("%s: expected rejection, got %v", role, err)
+		}
+	}
+	if _, err := NewWalletProviderProvider(bad, zap.NewNop()); err == nil {
+		t.Error("NewWalletProviderProvider must reject as.enabled=false + as.legacy.enabled=false")
+	}
+	if _, err := NewBackendProvider(bad, zap.NewNop(), []string{"backend"}); err == nil {
+		t.Error("NewBackendProvider must reject as.enabled=false + as.legacy.enabled=false")
+	}
+
+	// Legacy on (the default) leaves HMAC usable.
+	if err := requireSessionAuthMechanism(load(t, "as:\n  enabled: false\n"), "backend"); err != nil {
+		t.Errorf("legacy enabled must be accepted: %v", err)
+	}
+	// AS enabled leaves a JWKS validator, whatever legacy says.
+	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
+		t.Errorf("AS enabled must be accepted: %v", err)
+	}
+}
+
+// Every service.Services may open its own wallet-provider PKCS#11 signer
+// (HSM session pool). The combined backend role with the AS enabled must
+// therefore construct exactly two (auth + storage), never a third, unmanaged
+// one for the AS module that nothing would Stop().
+func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	count := 0
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		count++
+		return orig(s, c, l)
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.ASModule() == nil {
+		t.Fatal("expected ASModule to be wired")
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 Services (auth + storage), got %d: an extra one leaks its HSM sessions", count)
+	}
+}
+
+type closeCountingSigner struct {
+	crypto.Signer
+	closed *int
+}
+
+func (s closeCountingSigner) Close() error { *s.closed++; return nil }
+
+// Both Services aggregates (auth + storage) own a wallet-provider signer, and
+// BackendProvider.Close must close each exactly once.
+func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	var closes []*int
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		svc := orig(s, c, l)
+		n := new(int)
+		closes = append(closes, n)
+		svc.WalletProvider = service.NewWalletProviderServiceWithSigner(c, l, closeCountingSigner{Signer: key, closed: n})
+		return svc
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	if len(closes) != 2 {
+		t.Fatalf("expected 2 signer pools (auth + storage), got %d", len(closes))
+	}
+	_ = p.Close()
+	for i, n := range closes {
+		if *n != 1 {
+			t.Errorf("signer pool %d closed %d times, want exactly 1", i, *n)
+		}
+	}
+}
+
+// With legacy HMAC tokens enabled, an empty jwt.issuer would leave the
+// accepted legacy issuer list empty and accept any token signed with the
+// shared secret. Every validator constructor refuses it; with legacy off the
+// issuer may be empty.
+func TestConstructors_RefuseLegacyWithEmptyJWTIssuer(t *testing.T) {
+	legacyOn := func() *config.Config {
+		return &config.Config{JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}}
+	}
+	for name, ext := range map[string]string{"no external_url": "", "external_url": "https://as.example.org"} {
+		cfg := legacyOn()
+		cfg.AS.ExternalURL = ext
+		if _, err := NewStandaloneEngineTokenValidator(cfg, zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Errorf("standalone engine (%s): expected jwt.issuer rejection, got %v", name, err)
+		}
+	}
+	if _, err := NewBackendProvider(legacyOn(), zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewBackendProvider: expected jwt.issuer rejection, got %v", err)
+	}
+	asOn := legacyOn()
+	asOn.AS.Enabled = true
+	asOn.AS.Legacy.Enabled = true
+	if _, err := NewBackendProvider(asOn, zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewBackendProvider (AS on): expected jwt.issuer rejection, got %v", err)
+	}
+	if _, err := NewWalletProviderProvider(legacyOn(), zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("NewWalletProviderProvider: expected jwt.issuer rejection, got %v", err)
+	}
+
+	// Legacy off: no HMAC path, so an empty jwt.issuer is fine.
+	off := legacyOn()
+	off.AS.Enabled = true
+	off.AS.Issuer = "https://as.example.org"
+	if err := requireLegacyIssuer(off, "backend"); err != nil {
+		t.Errorf("legacy off with empty jwt.issuer must be accepted: %v", err)
+	}
+	if _, err := NewStandaloneEngineTokenValidator(off, zap.NewNop()); err != nil && strings.Contains(err.Error(), "jwt.issuer") {
+		t.Errorf("standalone engine, legacy off: must not demand jwt.issuer: %v", err)
+	}
+	// A normal configuration passes.
+	ok := legacyOn()
+	ok.JWT.Issuer = "wallet-backend"
+	if err := requireLegacyIssuer(ok, "backend"); err != nil {
+		t.Errorf("normal config rejected: %v", err)
 	}
 }
 
@@ -1684,7 +1923,7 @@ func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
 		AS:  config.ASConfig{Issuer: "https://as.example.com", Audiences: []string{"wallet-backend"}, Legacy: config.ASLegacyConfig{Enabled: true}},
 	}
 
-	lc := legacyValidatorConfig(cfg)
+	lc := legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled)
 	if !lc.Enabled || len(lc.Issuers) != 1 || lc.Issuers[0] != "https://jwt.example.com" {
 		t.Fatalf("legacy issuers = %v, want [JWT.Issuer]", lc.Issuers)
 	}

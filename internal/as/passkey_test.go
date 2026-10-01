@@ -46,7 +46,7 @@ func (m *mockWebAuthn) FinishRegistration(_ context.Context, _ *service.FinishRe
 func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
-	cfg := &config.ASConfig{
+	cfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
@@ -317,6 +317,43 @@ func TestPasskeyRegisterFinish_BadRequest(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestPasskeyFinish_LegacyClientRefusedWhenLegacyDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mock := &mockWebAuthn{
+		finishLoginResp: &service.FinishLoginResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
+		finishRegResp:   &service.FinishRegistrationResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
+	}
+	// as.legacy.enabled=false, no sunset date: config alone decides.
+	cfg := &config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}
+	h := NewPasskeyHandlers(mock, NewMemorySessionStore(), nil, cfg, zap.NewNop())
+	router := gin.New()
+	router.POST("/login/finish", h.LoginFinish)
+	router.POST("/register/finish", h.RegisterFinish)
+
+	for _, path := range []string{"/login/finish", "/register/finish"} {
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte("{}")))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusGone || !bytes.Contains(w.Body.Bytes(), []byte("legacy_tokens_disabled")) {
+			t.Errorf("%s: expected 410 legacy_tokens_disabled for legacy client, got %d: %s", path, w.Code, w.Body.String())
+		}
+		if bytes.Contains(w.Body.Bytes(), []byte("SECRETVALUE")) {
+			t.Errorf("%s: response must not contain a token", path)
+		}
+
+		// Session-mode client: unaffected.
+		req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader([]byte("{}")))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(TokenModeHeader, TokenModeSessionValue)
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code == http.StatusGone {
+			t.Errorf("%s: session-mode client must not be refused", path)
+		}
 	}
 }
 

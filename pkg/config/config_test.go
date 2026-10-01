@@ -18,7 +18,7 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 }
 
@@ -31,7 +31,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -60,7 +60,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -111,7 +111,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -130,7 +130,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -149,7 +149,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -231,7 +231,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -252,7 +252,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -288,7 +288,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -309,7 +309,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -759,7 +759,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -787,7 +787,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -806,7 +806,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 		}
 	}
 
@@ -1424,8 +1424,8 @@ func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "" {
-		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 != nil {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (never inherited from the wallet provider), got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1451,7 +1451,7 @@ func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
 
 func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	cfg := &Config{}
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "as-key", PIN: "1"}
 	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
 
 	cfg.EnableForRole()
@@ -1459,8 +1459,8 @@ func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
-		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 == nil || cfg.AS.SigningKeyPKCS11.KeyLabel != "as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1602,7 +1602,7 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}
 	cfg.AS.RulesDir = "/tmp/rules"
 	err := cfg.Validate()
 	if err == nil {
@@ -1613,17 +1613,38 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_AS_PKCS11NotImplemented(t *testing.T) {
-	cfg := validBaseConfig()
-	cfg.AS.Enabled = true
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
-	cfg.AS.RulesDir = "/tmp/rules"
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for PKCS11 not implemented")
+func TestConfig_Validate_AS_PKCS11(t *testing.T) {
+	cases := []struct {
+		name    string
+		p       *PKCS11SigningConfig
+		wantErr string
+	}{
+		{"ok pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}, ""},
+		{"ok pin_path", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PINPath: "/p"}, ""},
+		{"no module", &PKCS11SigningConfig{KeyLabel: "k", PIN: "1"}, "module_path is required"},
+		{"no label", &PKCS11SigningConfig{ModulePath: "/m.so", PIN: "1"}, "key_label is required"},
+		{"no pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k"}, "pin or pin_path is required"},
+		{"negative pool", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1", PoolSize: -1}, "pool_size"},
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("unexpected error: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.AS.Enabled = true
+			cfg.AS.SigningKeyPKCS11 = tc.p
+			cfg.AS.Issuer = "https://as.example"
+			cfg.AS.Audiences = []string{"wallet-backend"}
+			cfg.AS.RulesDir = "/tmp/rules"
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 
@@ -1922,7 +1943,7 @@ func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T
 	cfg := defaultConfig()
 	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
 	cfg.Storage = StorageConfig{Type: "memory"}
-	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"}
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error on zero-config default: %v", err)
@@ -2645,6 +2666,56 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
+func TestConfig_LegacyEnabled(t *testing.T) {
+	c := &Config{}
+	if !c.LegacyEnabled() {
+		t.Error("unloaded config with AS disabled: HMAC is the only mechanism")
+	}
+	c.AS.Enabled = true
+	if c.LegacyEnabled() {
+		t.Error("AS enabled, legacy off: must be disabled")
+	}
+	c.AS.Legacy.Enabled = true
+	if !c.LegacyEnabled() {
+		t.Error("AS enabled, legacy on")
+	}
+	// Loaded configs follow as.legacy.enabled even when this process has no AS
+	// (standalone engine/registry mirroring the backend).
+	c = &Config{loaded: true}
+	if c.LegacyEnabled() {
+		t.Error("loaded config with as.legacy.enabled=false must be disabled")
+	}
+	c.AS.Legacy.Enabled = true
+	if !c.LegacyEnabled() {
+		t.Error("loaded config with as.legacy.enabled=true must be enabled")
+	}
+}
+
+func TestLoad_LegacyEnabledDefaultsTrue(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/c.yaml"
+	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LegacyEnabled() {
+		t.Error("as.legacy.enabled must default to true")
+	}
+	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nas:\n  legacy:\n    enabled: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacyEnabled() {
+		t.Error("explicit as.legacy.enabled=false must disable legacy even with the AS disabled")
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {
@@ -2756,6 +2827,143 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 	}
 	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
 		t.Fatal("empty config must yield no trusted hosts")
+	}
+}
+
+// An https JWKS endpoint that redirects to plain http must be refused at the
+// redirect hop: the guard sits on the transport every hop passes through.
+func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
+	var hops []string
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hops = append(hops, r.URL.String())
+		if r.URL.Scheme == "https" {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"http://evil.example/jwks.json"}},
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		}
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+	})}
+	client := &http.Client{Transport: guard}
+	_, err := client.Get("https://as.example/auth/.well-known/jwks.json")
+	if err == nil {
+		t.Fatal("expected the http redirect hop to be refused")
+	}
+	if len(hops) != 1 {
+		t.Errorf("the plaintext hop must never reach the base transport, hops=%v", hops)
+	}
+}
+
+// Legacy HMAC tokens are pinned to jwt.issuer, so an empty one while legacy
+// is enabled would accept any token signed with the shared secret.
+func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
+	t.Run("legacy on and empty issuer is rejected", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Fatalf("expected jwt.issuer error, got %v", err)
+		}
+	})
+	t.Run("AS on, legacy on and empty jwt.issuer is rejected even with as.issuer", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		cfg.AS.Enabled = true
+		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.Legacy.Enabled = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+			t.Fatalf("expected jwt.issuer error, got %v", err)
+		}
+	})
+	t.Run("legacy off may omit it", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		cfg.AS.Enabled = true
+		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.Legacy.Enabled = false
+		cfg.AS.Audiences = []string{"wallet-backend"}
+		cfg.AS.SigningKeyPath = filepath.Join(t.TempDir(), "as.key")
+		cfg.AS.RulesDir = t.TempDir()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("legacy off with empty jwt.issuer must be valid: %v", err)
+		}
+	})
+	t.Run("normal config", func(t *testing.T) {
+		if err := validBaseConfig().Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestConfig_Validate_ExternalURLRequiresExpectedIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.ExternalURL = "https://as.example.com"
+	cfg.loaded = true // legacy disabled (as.legacy.enabled=false), so the legacy-issuer rule does not apply
+	cfg.JWT.Issuer = ""
+	cfg.AS.Issuer = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "as.external_url requires an expected issuer") {
+		t.Fatalf("expected issuer error, got %v", err)
+	}
+	cfg.AS.Issuer = "https://as.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("as.issuer must satisfy the check: %v", err)
+	}
+	cfg.AS.Issuer = ""
+	cfg.JWT.Issuer = "wallet-backend"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("jwt.issuer must satisfy the check: %v", err)
+	}
+}
+
+func TestASConfig_ExternalBaseURL(t *testing.T) {
+	cases := []struct {
+		name, in, wantPath string
+		wantErr            bool
+	}{
+		{"normal", "https://as.example", "", false},
+		{"trailing slash", "https://as.example/", "", false},
+		{"path prefix", "https://as.example/wallet", "/wallet", false},
+		{"path prefix trailing slash", "https://as.example/wallet/", "/wallet", false},
+		{"query", "https://as.example/?a=b", "", true},
+		{"fragment", "https://as.example/#frag", "", true},
+		{"empty query", "https://as.example/?", "", true},
+		{"empty fragment", "https://as.example/#", "", true},
+		{"not absolute", "as.example", "", true},
+		{"bad scheme", "ftp://as.example", "", true},
+		{"port only", "https://:443", "", true},
+		{"userinfo only", "https://user@", "", true},
+		{"userinfo and port only", "https://user@:443", "", true},
+		{"empty brackets", "https://[]", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &ASConfig{ExternalURL: tc.in}
+			u, err := a.ExternalBaseURL()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.in)
+				}
+				cfg := &Config{
+					Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+					Storage: StorageConfig{Type: "memory"},
+					JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
+					AS:      ASConfig{ExternalURL: tc.in},
+				}
+				if cfg.Validate() == nil {
+					t.Fatalf("Validate accepted %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Path != tc.wantPath {
+				t.Fatalf("path = %q, want %q", u.Path, tc.wantPath)
+			}
+		})
 	}
 }
 
@@ -2925,6 +3133,48 @@ func TestLoad_ChartShapedConfig_AppliesASDefaults(t *testing.T) {
 				t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
 			}
 		})
+	}
+}
+
+func TestLoad_ASPKCS11PINFileNotReadAtLoad(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent-pin")
+	configPath := filepath.Join(dir, "config.yaml")
+	yml := "jwt:\n  secret: 0123456789abcdef0123456789abcdef\nas:\n  external_url: https://as.example.com\n  signing_key_pkcs11:\n    module_path: /m.so\n    key_label: k\n    pin_path: " + missing + "\n"
+	if err := os.WriteFile(configPath, []byte(yml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load must not read the AS HSM PIN file: %v", err)
+	}
+	p := cfg.AS.SigningKeyPKCS11
+	if p == nil || p.PINPath != missing || p.PIN != "" {
+		t.Fatalf("PINPath must be kept and PIN left unresolved, got %+v", p)
+	}
+}
+
+func TestPKCS11SigningConfig_ResolvePIN(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pin")
+	if err := os.WriteFile(path, []byte("1234\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// File wins over inline PIN.
+	pin, err := (&PKCS11SigningConfig{PIN: "inline", PINPath: path}).ResolvePIN()
+	if err != nil || pin != "1234" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Inline PIN when no path.
+	pin, err = (&PKCS11SigningConfig{PIN: "inline"}).ResolvePIN()
+	if err != nil || pin != "inline" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Missing file: clear error that does not name the path.
+	missing := filepath.Join(dir, "secret-location-xyz")
+	_, err = (&PKCS11SigningConfig{PINPath: missing}).ResolvePIN()
+	if err == nil || !strings.Contains(err.Error(), "pin_path") || strings.Contains(err.Error(), "secret-location-xyz") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

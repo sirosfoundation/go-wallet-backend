@@ -287,6 +287,40 @@ Deprecation: true
 Sunset: 2027-10-01T00:00:00Z
 ```
 
+### Disabling legacy: `as.legacy.enabled=false` (implemented)
+
+The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. `as.legacy.sunset_date` stays informational (Sunset header) and disables nothing. With `as.legacy.enabled=false`:
+
+- HMAC tokens are refused everywhere: `TokenAuthMiddleware`, the engine handshake (including the standalone-engine HMAC fallback), the no-AS `AuthMiddlewareWithBlacklist` path, and the keystore websocket. No legacy issuer is created.
+- Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (whether or not this process runs the AS) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/*`. These 410s sit before any OIDC gate, so legacy-mode requests get `legacy_tokens_disabled` rather than an OIDC error. Session-mode clients are unaffected.
+- One startup log line states whether legacy is enabled.
+
+The `backend` and `wallet-provider` roles refuse to start with `as.enabled=false` and `as.legacy.enabled=false`: they build a JWKS validator only when the AS is enabled, so no session token could be authenticated. Enable the AS or keep legacy on. Only the standalone engine can validate against a remote AS.
+
+A standalone engine (`--mode=engine`, no backend provider) builds its own JWKS-backed validator from `as.external_url` so ES256 session tokens work and legacy can be switched off; with `as.legacy.enabled=false` and no `as.external_url` it refuses to start instead of rejecting every connection.
+
+### JWKS fetching is guarded
+
+go-tokenauth fetches the AS JWKS with `http.DefaultClient` (no client option in v0.4.0 or v0.5.0), which has no scheme policy and follows HTTPS-to-HTTP redirects. The backend therefore never lets it reach the network: a co-hosted AS serves its own keys to the validator in-process (loopback relay, no fetch), and processes that read a remote AS (isolated wallet-provider, standalone engine) fetch `<as.external_url>/auth/.well-known/jwks.json` with the guarded `http_client` (plaintext, private-address and redirect-hop checks) and relay it to the validator over a loopback-only listener. A plain-`http` `as.external_url` is refused at startup unless `http_client.allow_http` (or `allow_private_ips`) is set; a remote AS on a private address needs `allow_private_ips`.
+
+### Audience semantics
+
+An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only. Legacy HMAC tokens carry the RP ID as `aud` and are never rejected by an audience list while legacy is enabled (signature, expiry and issuer are still checked). `RequireAudience` and the engine's `wallet-registry`/`wallet-backend` check follow the same rule.
+
+### HSM-backed signing key
+
+`as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 keys only (RSA is rejected because the AS signs access tokens only with ES256, ES384 or EdDSA, an AS-key restriction rather than a signer limitation; Ed25519 is unavailable over PKCS#11 because the PKCS#11 pool cannot handle `CKK_EC_EDWARDS` keys, so use `as.signing_key_path` for Ed25519). `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
+
+### Go-live checklist for removing the legacy path
+
+0. **Precondition: all clients are moved to session mode BEFORE any backend turns legacy off** (siros-sdk-kotlin#235, siros-sdk-swift#179, wallet-frontend#322; go-siros-cli is intentionally out of scope).
+1. Client audit clean: no client reads the body `appToken`, calls `/user/*-webauthn-*` or omits `X-Token-Mode: session`.
+2. Any separate process validating session tokens (the registry: see #430) is migrated off the shared secret.
+3. `client_mode=legacy` at zero for a full token lifetime plus refresh TTL.
+4. Flip `as.legacy.enabled=false`; `jwt.secret` stays only for the OIDC state cookie.
+5. After burn-in, delete `internal/as/legacy_token.go`, the HS256 `generateToken`/refresh paths in `internal/service`, the HMAC fallbacks in `pkg/middleware/auth.go`, `internal/engine/session.go`, `internal/websocket/manager.go`, the `Legacy` config and the `/user/*` login routes.
+6. Rollback before step 5: set `as.legacy.enabled=true` and restart.
+
 ### Refresh token handling
 
 - **Legacy mode**: Continue issuing refresh tokens with same ramp-down on expiry

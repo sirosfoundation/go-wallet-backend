@@ -256,6 +256,14 @@ func (s *WalletProviderService) Issuer() string {
 	return s.cfg.WalletProvider.WIA.Issuer
 }
 
+// NewWalletProviderServiceWithSigner returns a service that owns the given
+// signer (closed by Close if it implements io.Closer-style Close() error). It
+// exists so other packages' lifecycle tests can observe signer ownership
+// without an HSM; it has no signing key material of its own beyond the signer.
+func NewWalletProviderServiceWithSigner(cfg *config.Config, logger *zap.Logger, signer crypto.Signer) *WalletProviderService {
+	return &WalletProviderService{cfg: cfg, logger: logger, signer: signer}
+}
+
 // Close releases resources held by the service.
 // For PKCS#11 signers, this closes the token session pool.
 func (s *WalletProviderService) Close() {

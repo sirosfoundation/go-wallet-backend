@@ -105,6 +105,14 @@ func logAuthReject(logger *zap.Logger, c *gin.Context, reason string, fields ...
 // AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
 func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// This path only understands HMAC tokens: with as.legacy.enabled=false
+		// nothing can validate here (fail closed).
+		if !cfg.LegacyEnabled() {
+			logAuthReject(logger, c, "legacy_tokens_disabled")
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			logAuthReject(logger, c, "missing_authorization_header")
@@ -130,6 +138,17 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			return
 		}
 
+		// Legacy HMAC tokens are all minted with iss = jwt.issuer; pin it so a
+		// token signed with the shared secret but carrying a missing or
+		// different issuer is refused. An empty jwt.issuer would disable the
+		// check (golang-jwt treats "" as "no expectation"), so fail closed.
+		if cfg.JWT.Issuer == "" {
+			logAuthReject(logger, c, "jwt_issuer_not_configured")
+			c.JSON(401, gin.H{"error": "Invalid token"})
+			c.Abort()
+			return
+		}
+
 		// Parse and validate the JWT token
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			// Validate the signing method
@@ -137,7 +156,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				return nil, jwt.ErrSignatureInvalid
 			}
 			return []byte(cfg.JWT.Secret), nil
-		})
+		}, jwt.WithIssuer(cfg.JWT.Issuer))
 
 		if err != nil || !token.Valid {
 			logAuthReject(logger, c, "invalid_token", zap.Error(err))
