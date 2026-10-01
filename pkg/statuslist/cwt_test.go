@@ -631,3 +631,46 @@ func TestCWT_ExtensionAndDuplicateClaims(t *testing.T) {
 		}
 	})
 }
+
+// cborMap hand-builds a definite-length CBOR map so key order and repeats
+// are exact.
+func cborMap(items ...[2]any) []byte {
+	b := []byte{0xa0 + byte(len(items))}
+	for _, it := range items {
+		k, _ := cbor.Marshal(it[0])
+		v, _ := cbor.Marshal(it[1])
+		b = append(append(b, k...), v...)
+	}
+	return b
+}
+
+func TestCWT_NullStandardStatusListIsNotAbsent(t *testing.T) {
+	ctx := context.Background()
+	lst := zlibBytes(t, 2, map[int]int{3: 1})
+	legacy := map[int64]any{statusListKeyBits: 2, statusListKeyLst: lst}
+	build := func(std any, withStd bool) func(uri string) []byte {
+		return func(u string) []byte {
+			items := [][2]any{
+				{int64(cwtClaimSub), u}, {int64(cwtClaimIat), time.Now().Unix()},
+				{int64(cwtClaimLegacyStatusList), legacy}, {int64(cwtClaimLegacyTTL), 900},
+			}
+			if withStd {
+				items = append(items, [2]any{int64(cwtClaimStatusList), std})
+			}
+			return signedCWTWithPayload(t, cborMap(items...))
+		}
+	}
+	t.Run("null standard claim with valid legacy map rejected", func(t *testing.T) {
+		c, uri, _ := serveCWT(t, build(nil, true), mediaTypeCWT, trustAll)
+		err := c.Check(ctx, &Reference{Idx: 3, URI: uri})
+		if err == nil || errors.Is(err, ErrRevoked) {
+			t.Fatalf("present null status_list must be unverifiable, got %v", err)
+		}
+	})
+	t.Run("absent standard claim still reads legacy layout", func(t *testing.T) {
+		c, uri, _ := serveCWT(t, build(nil, false), mediaTypeCWT, trustAll)
+		if err := c.Check(ctx, &Reference{Idx: 3, URI: uri}); !errors.Is(err, ErrRevoked) {
+			t.Fatalf("want ErrRevoked, got %v", err)
+		}
+	})
+}

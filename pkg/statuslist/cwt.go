@@ -98,8 +98,11 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w payload: %v", errCWT, err)
 	}
+	// Membership, not nil-ness, decides whether the standard claim is
+	// present: a CBOR null decodes to nil but is a present (malformed)
+	// claim, which must not fall back to the legacy layout.
 	slRaw, ttlLabel := claims[cwtClaimStatusList], int64(cwtClaimTTL)
-	if slRaw == nil {
+	if _, present := claims[cwtClaimStatusList]; !present {
 		if _, isMap := anyMap(claims[cwtClaimLegacyStatusList]); isMap {
 			slRaw, ttlLabel = claims[cwtClaimLegacyStatusList], cwtClaimLegacyTTL
 		}
