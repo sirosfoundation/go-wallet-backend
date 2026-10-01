@@ -2907,6 +2907,10 @@ func TestASConfig_ExternalBaseURL(t *testing.T) {
 		{"empty fragment", "https://as.example/#", "", true},
 		{"not absolute", "as.example", "", true},
 		{"bad scheme", "ftp://as.example", "", true},
+		{"port only", "https://:443", "", true},
+		{"userinfo only", "https://user@", "", true},
+		{"userinfo and port only", "https://user@:443", "", true},
+		{"empty brackets", "https://[]", "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

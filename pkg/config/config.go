@@ -134,7 +134,7 @@ type ASConfig struct {
 func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
 	raw := a.ExternalURL
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return nil, fmt.Errorf("as.external_url %q is not an absolute http(s) URL", raw)
 	}
 	if strings.ContainsAny(raw, "?#") || u.RawQuery != "" || u.Fragment != "" {
