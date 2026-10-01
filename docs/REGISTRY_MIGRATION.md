@@ -24,13 +24,13 @@ the backend config and protected by the shared go-tokenauth validator
 | `image_embed.*` | `registry.image_embed.*` |
 | `filter.*` | `registry.filter.*` |
 | `rate_limit.*` | `registry.rate_limit.*` |
-| `jwt.require_auth` | `registry.require_auth` (`WALLET_REGISTRY_REQUIRE_AUTH`) |
-| `jwt.secret`, `jwt.secret_path` | top-level `jwt.secret` / `jwt.secret_path` (legacy HMAC only, see below) |
-| `jwt.issuer` | `as.issuer` (falls back to `jwt.issuer`) |
-| `server.host`, `server.port` | `server.registry_host`, `server.registry_port` when the registry runs alone; the shared `server.host`/`server.port` when combined |
-| `server.cors`, `server.tls`, `server.served_by_header` | `server.cors`, `server.tls`, `server.served_by_header` |
-| `logging.*` | `logging.*` |
-| `http_client.*` | `http_client.*` |
+| `jwt.require_auth` | `registry.require_auth` (`WALLET_REGISTRY_REQUIRE_AUTH`); a value set explicitly in the new configuration wins |
+| `jwt.secret`, `jwt.secret_path` | top-level `jwt.secret` / `jwt.secret_path` (legacy HMAC only, see below). Registry-only processes only: the old values are used when no `jwt.secret` is already configured, and the old `secret_path` is read only while `as.legacy.enabled` is true; in a combined process they are ignored |
+| `jwt.issuer` | top-level `jwt.issuer` (the expected `iss` of legacy HMAC tokens; registry-only processes only, ignored in a combined process). `as.issuer` is separate: it is the expected `iss` of asymmetric (AS-issued) tokens and falls back to `jwt.issuer` when unset, so set it explicitly if AS-issued tokens use a different issuer |
+| `server.host`, `server.port` | `server.registry_host`, `server.registry_port` when the registry runs alone; ignored in a combined process, which uses the backend's own listen settings |
+| `server.cors`, `server.tls`, `server.served_by_header` | `server.cors`, `server.tls`, `server.served_by_header` (registry-only processes only; ignored in a combined process) |
+| `logging.*` | `logging.*` (registry-only processes only) |
+| `http_client.*` | `http_client.*` (registry-only processes only) |
 | `trust.*` (present in the example file but never read) | dropped |
 
 Environment variables: `REGISTRY_<KEY>` becomes `WALLET_REGISTRY_<KEY>` for the
