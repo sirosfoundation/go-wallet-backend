@@ -32,6 +32,9 @@ jobs:
       custom-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || '' }}
       custom-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}
 
+  # Transition helper image: the main server binary with --mode=registry as its
+  # entrypoint (see Dockerfile.registry). The registry is a role of the main
+  # binary; the image name is kept so existing deployments keep working.
   registry:
     uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
     permissions:

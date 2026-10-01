@@ -170,7 +170,8 @@ go-wallet-backend/
 │   ├── ARCHITECTURE.md      # Architecture documentation
 │   ├── API.md               # API reference
 │   ├── DEPLOYMENT.md        # Deployment guide
-│   └── MIGRATION.md         # Migration guide
+│   ├── MIGRATION.md         # Migration guide
+│   └── REGISTRY_MIGRATION.md # Registry: standalone config to roles-based binary
 ├── go.mod
 ├── go.sum
 ├── Makefile

@@ -258,6 +258,13 @@ func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 	m.verifierStore = store
 }
 
+// SetRegistryHandler makes VCTM lookups call a registry served in this process
+// (handler serves the registry routes under /registry) instead of going over
+// the network.
+func (m *Manager) SetRegistryHandler(h http.Handler) {
+	m.registryClient.SetHandler(h)
+}
+
 // SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
