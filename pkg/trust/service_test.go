@@ -1220,3 +1220,25 @@ func TestService_EvaluateStatusListSigner_LogsAreRedacted(t *testing.T) {
 		})
 	}
 }
+
+// failedResolver reports an in-band failure from Resolve (Failed=true).
+type failedResolver struct{ testMockEvaluator }
+
+func (f *failedResolver) Resolve(_ context.Context, _ string) (*EvaluationResponse, error) {
+	return &EvaluationResponse{Decision: false, Reason: "pdp down", Failed: true}, nil
+}
+
+func TestResolveDID_InBandFailureIsNotDenial(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Trust.PDPURL = "http://pdp.test"
+	svc := NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		return &failedResolver{}, nil
+	})
+	keys, err := svc.ResolveDID(context.Background(), "did:web:example.com", "")
+	if err == nil || keys != nil {
+		t.Fatalf("expected error and no keys, got %v, %v", keys, err)
+	}
+	if !strings.Contains(err.Error(), "failed") || strings.Contains(err.Error(), "denied") {
+		t.Errorf("want failure (not denial) error, got %v", err)
+	}
+}

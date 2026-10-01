@@ -320,6 +320,8 @@ func (m *EvaluatorManager) Evaluate(ctx context.Context, req *EvaluationRequest)
 	return &EvaluationResponse{
 		Decision: false,
 		Reason:   "no evaluator available for resource type: " + string(keyType),
+		// No evaluator could even be asked: no decision, not a denial.
+		Failed: true,
 	}, nil
 }
 

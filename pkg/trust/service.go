@@ -615,6 +615,11 @@ func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint stri
 		return nil, fmt.Errorf("DID resolution failed: %w", err)
 	}
 
+	if resp.Failed {
+		// In-band evaluator failure (PDP outage etc.): not a denial.
+		return nil, fmt.Errorf("DID resolution failed: %s", resp.Reason)
+	}
+
 	if !resp.Decision {
 		return nil, fmt.Errorf("DID resolution denied: %s", resp.Reason)
 	}

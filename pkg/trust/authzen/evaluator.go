@@ -191,6 +191,7 @@ func (e *Evaluator) Resolve(ctx context.Context, subjectID string) (*trust.Evalu
 		return &trust.EvaluationResponse{
 			Decision: false,
 			Reason:   fmt.Sprintf("AuthZEN resolution error: %v", err),
+			Failed:   true,
 		}, nil
 	}
 
@@ -211,6 +212,7 @@ func (e *Evaluator) EvaluateX5C(ctx context.Context, subjectID string, certChain
 		return &trust.EvaluationResponse{
 			Decision: false,
 			Reason:   fmt.Sprintf("AuthZEN X5C evaluation error: %v", err),
+			Failed:   true,
 		}, nil
 	}
 
