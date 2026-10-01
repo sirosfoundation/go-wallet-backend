@@ -2,11 +2,14 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // TokenBlacklistChecker is the token blacklist capability this package
@@ -40,6 +43,9 @@ type tokenDeps struct {
 	audiences []string
 	blacklist TokenBlacklistChecker
 	logger    *zap.Logger
+	// gate refuses delegating tokens issued before the user's SID-AUTH-06
+	// cut-off (optional; nil enforces nothing).
+	gate *tokengate.Gate
 }
 
 // TokenResponse is the response body for POST /auth/token.
@@ -66,7 +72,10 @@ type TokenEndpointConfig struct {
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
-	Logger          *zap.Logger
+	// Gate refuses delegating tokens issued before the user's SID-AUTH-06
+	// cut-off (optional; nil enforces nothing).
+	Gate   *tokengate.Gate
+	Logger *zap.Logger
 }
 
 // TokenEndpointHandler creates the handler for POST /auth/token.
@@ -88,6 +97,7 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 		audiences: cfg.Audiences,
 		blacklist: cfg.Blacklist,
 		logger:    cfg.Logger,
+		gate:      cfg.Gate,
 	}
 	return func(c *gin.Context) {
 		var req TokenRequest
@@ -143,6 +153,9 @@ func handleSessionTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
+	if !sessionPassesCutoff(c, deps, session) {
+		return
+	}
 
 	tenantID := req.TenantID
 	if tenantID == "" {
@@ -179,7 +192,7 @@ func handleSessionTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleAnonymousTokenRequest issues a token that omits the caller's
@@ -208,6 +221,9 @@ func handleAnonymousTokenRequest(
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
+	if !sessionPassesCutoff(c, deps, session) {
 		return
 	}
 
@@ -265,7 +281,32 @@ func handleAnonymousTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, "", req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), "", req.Audience, tenantID, tac, session.ACR)
+}
+
+// sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
+// token cut-off, so a session that outlived a revocation - the lifecycle
+// cascade drops sessions, but that can fail and is reported as
+// ERASURE_INCOMPLETE - cannot mint a fresh bearer token. Minting new tokens
+// after a lifecycle change always requires a new login. It writes the
+// response and returns false when the session is refused.
+func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
+	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant())
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, tokengate.ErrRevoked):
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "session predates a wallet lifecycle change"})
+	default:
+		deps.logger.Error("token cut-off check failed", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	}
+	return false
+}
+
+// sessionSubject identifies a session for the cut-off re-check.
+func sessionSubject(session *Session) cutoffSubject {
+	return cutoffSubject{userID: session.UserID, issuedAt: session.authInstant()}
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -318,6 +359,21 @@ func handleDelegationTokenRequest(
 		}
 	}
 
+	// SID-AUTH-06: a delegating token issued before the user's wallet was
+	// revoked must not mint a fresh (post-cut-off) token. The parent is what
+	// gets judged (see cutoffSubject): a child token would carry a fresh iat
+	// and so would clear the cut-off on its own.
+	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
+	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt); err != nil {
+		if errors.Is(err, tokengate.ErrRevoked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
+		} else {
+			deps.logger.Error("token cut-off check failed", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		}
+		return
+	}
+
 	// Delegating token must have the 'k' permission.
 	if !parentClaims.TAC.Has(TACDelegate) {
 		c.JSON(http.StatusForbidden, gin.H{
@@ -361,13 +417,30 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parent, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // issueToken is the common path for both session and delegation flows.
+// cutoffSubject is what the caller authenticated with, so issueToken can
+// re-check the SID-AUTH-06 cut-off after minting: the new token's own iat is
+// necessarily fresh, so only the credential behind it can still be judged.
+//
+// What it carries is the issuing instant of the token or session that asked,
+// which is the only thing a cut-off can be applied to. A token minted here
+// would carry a fresh iat, so every gate in the system would accept it and a
+// pre-cut-off credential would have laundered itself into an unrestricted one
+// for a wallet that was just revoked. Minting after a lifecycle change always
+// requires a new login, for a delegating bearer token as for a session
+// cookie.
+type cutoffSubject struct {
+	userID   string
+	issuedAt time.Time
+}
+
 func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
+	subject cutoffSubject,
 	sub, audience, tenantID string,
 	tac TAC,
 	acr string,
@@ -407,6 +480,19 @@ func issueToken(
 	if err != nil {
 		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})
+		return
+	}
+
+	// SID-AUTH-06: the cut-off was checked before the policy evaluation and
+	// the signing above; a suspension or revocation landing in between must
+	// not be handed a token whose fresh iat the resource gate would accept.
+	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt); err != nil {
+		if errors.Is(err, tokengate.ErrRevoked) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})
+		} else {
+			deps.logger.Error("token cut-off re-check failed", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		}
 		return
 	}
 

@@ -105,6 +105,17 @@ type User struct {
 	// User settings
 	OpenIDRefreshTokenMaxAge int64 `json:"openid_refresh_token_max_age,omitempty" bson:"openid_refresh_token_max_age,omitempty"`
 
+	// AuthInvalidBefore cuts off bearer tokens issued at or before this
+	// instant (SID-AUTH-06): set when a wallet instance is revoked, so
+	// stateless tokens that outlive the dropped sessions stop working too. Checked by internal/tokengate. Zero means no cut-off.
+	AuthInvalidBefore time.Time `json:"-" bson:"auth_invalid_before,omitempty"`
+	// AuthFence counts the lifecycle writes (cut-offs and erasures) applied
+	// to this user. It only ever increases, and UserStore.Update refuses a
+	// record whose copy is behind the stored value, so a record loaded
+	// before a lifecycle write can never restore what it replaced - even
+	// when both carry the same AuthInvalidBefore timestamp.
+	AuthFence int64 `json:"-" bson:"auth_fence,omitempty"`
+
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 }
@@ -182,4 +193,27 @@ type RegisterRequest struct {
 	WalletType  WalletType `json:"wallet_type"`
 	Keys        []byte     `json:"keys,omitempty"`
 	PrivateData []byte     `json:"private_data,omitempty"`
+}
+
+// DeletionTombstone records that a user account was deleted. Deleting the
+// user removes the record that carries the token cut-off (User.AuthInvalidBefore),
+// so without a tombstone the token gate could not tell a deleted user's
+// still-valid bearer token from that of an external identity that never had
+// a wallet user record. Every token naming a user that has a tombstone is
+// refused, whenever it was issued.
+//
+// A tombstone is kept until ExpiresAt, which is set past the lifetime of every
+// token that could name the user, and is then swept.
+type DeletionTombstone struct {
+	// UserID is the deleted user's id (the token subject).
+	UserID string `json:"user_id" bson:"_id"`
+	// TenantIDs are the tenants the account had data or memberships in when
+	// it was deleted. Informational (audit and diagnosis); the user id is
+	// global, so the gate does not consult it.
+	TenantIDs []TenantID `json:"tenant_ids,omitempty" bson:"tenant_ids,omitempty"`
+	// DeletedAt is when the deletion was first recorded. A retried deletion
+	// keeps the earliest value.
+	DeletedAt time.Time `json:"deleted_at" bson:"deleted_at"`
+	// ExpiresAt is when the tombstone may be removed.
+	ExpiresAt time.Time `json:"expires_at" bson:"expires_at"`
 }

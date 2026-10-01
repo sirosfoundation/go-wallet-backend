@@ -25,7 +25,7 @@ func TestAuthRejectionsAreLogged(t *testing.T) {
 	type mw func(*zap.Logger) gin.HandlerFunc
 	middlewares := map[string]mw{
 		"tokenauth": func(l *zap.Logger) gin.HandlerFunc {
-			return TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, l)
+			return TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), l)
 		},
 		"legacy": func(l *zap.Logger) gin.HandlerFunc { return AuthMiddlewareWithBlacklist(cfg, store, nil, l) },
 		"admin":  func(l *zap.Logger) gin.HandlerFunc { return AdminAuthMiddleware("admin-secret", l) },

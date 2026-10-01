@@ -19,6 +19,7 @@ import (
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -107,12 +108,15 @@ type Session struct {
 	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
 	// per-protocol check must treat it as a no-op, exactly like
 	// requireTACIfEnforced does for HTTP routes.
-	TAC     claims.TAC
-	conn    *websocket.Conn
-	sendMu  sync.Mutex
-	flows   map[string]*Flow
-	flowsMu sync.RWMutex
-	logger  *zap.Logger
+	TAC claims.TAC
+	// tokenIssuedAt is the handshake token's iat, for the SID-AUTH-06
+	// re-check on every flow start (Manager.recheckToken).
+	tokenIssuedAt time.Time
+	conn          *websocket.Conn
+	sendMu        sync.Mutex
+	flows         map[string]*Flow
+	flowsMu       sync.RWMutex
+	logger        *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -147,9 +151,41 @@ type Flow struct {
 	StartTime time.Time
 	Handler   FlowHandler
 
+	// cancel stops the flow's own context, and is set before the flow is
+	// published on the session. Cancelling through the handler alone is not
+	// enough: a handler is built after the flow becomes visible, and each
+	// handler installs its own cancel at the top of Execute, so a revocation
+	// arriving in that window would find nothing to cancel and the flow
+	// would run on regardless. The context exists from the moment anyone
+	// can see the flow, so cancelling it always lands.
+	cancel context.CancelFunc
+
 	// Flow-specific data
 	Data map[string]interface{}
 	mu   sync.RWMutex
+}
+
+// Cancel stops the flow: its own context first, which always exists, then
+// the handler if one has been built yet. Safe to call more than once, and
+// safe to call on a flow whose handler is still being constructed.
+func (f *Flow) Cancel() {
+	f.mu.Lock()
+	cancel, handler := f.cancel, f.Handler
+	f.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if handler != nil {
+		handler.Cancel()
+	}
+}
+
+// setHandler publishes the handler under the flow's own lock, so a concurrent
+// Cancel either sees it or does not, rather than racing the assignment.
+func (f *Flow) setHandler(h FlowHandler) {
+	f.mu.Lock()
+	f.Handler = h
+	f.mu.Unlock()
 }
 
 // Manager manages WebSocket sessions and flows
@@ -177,6 +213,15 @@ type Manager struct {
 
 	// Persistent session store (optional, for horizontal scaling)
 	sessionStore SessionStore
+
+	// tokenGate refuses tokens issued before the user's SID-AUTH-06
+	// authorization cut-off (optional; see internal/tokengate).
+	tokenGate *tokengate.Gate
+
+	// beforeRegister, when non-nil, runs after the handshake token has been
+	// validated and the session built, but before registerSession. Tests use
+	// it to land a cut-off in exactly that window.
+	beforeRegister func()
 
 	// tokenValidator validates access tokens via go-tokenauth (optional).
 	// When set, validateToken uses it instead of direct HMAC parsing.
@@ -261,6 +306,23 @@ func (m *Manager) SetVerifierStore(store storage.VerifierStore) {
 // SetTokenValidator sets the go-tokenauth validator for WebSocket handshake auth.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
+}
+
+// SetTokenGate wires the SID-AUTH-06 token cut-off check into handshake
+// authentication: a token issued before the user's wallet was revoked cannot
+// open a new engine session. The same check runs again at every flow start,
+// because a socket held by another engine process survives the cascade's
+// DeleteByUser and an issuance or a presentation is exactly what a revoked
+// wallet must not perform.
+func (m *Manager) SetTokenGate(g *tokengate.Gate) {
+	m.tokenGate = g
+}
+
+// recheckToken re-applies the token cut-off to an established session (see
+// handleFlowStart). No gate configured means no cut-off enforcement, as at
+// the handshake.
+func (m *Manager) recheckToken(session *Session) error {
+	return m.tokenGate.Check(context.Background(), session.UserID, session.tokenIssuedAt)
 }
 
 // SetTokenBlacklist sets the token blacklist consulted during the
@@ -382,6 +444,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
+		tokenIssuedAt: tokengate.IssuedAt(handshake.AppToken),
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -395,6 +458,10 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		pongTimeout:   pongTimeout,
 	}
 
+	if m.beforeRegister != nil {
+		m.beforeRegister()
+	}
+
 	// Register session. A rejection here means the user was revoked in the
 	// narrow window between validateToken's own check above and this call -
 	// registerSession has already closed the connection itself in that
@@ -404,6 +471,18 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		return
 	}
 	defer m.unregisterSession(session)
+
+	// SID-AUTH-06: a cut-off that landed between validateToken and the
+	// registration above would have been missed by DeleteByUser (nothing to
+	// close yet). Re-check now that the session is visible.
+	if err := m.recheckToken(session); err != nil {
+		m.logger.Warn("Session refused after registration", zap.Error(err))
+		m.sendError(conn, "", ErrCodeAuthFailed, "Authorization revoked")
+		// Fail closed: drop the socket right away with a policy-violation
+		// close frame rather than waiting for the deferred teardown.
+		session.closeWithReason("authorization revoked")
+		return
+	}
 
 	// Send handshake complete
 	capabilities := m.getCapabilities()
@@ -463,9 +542,7 @@ func (m *Manager) handleSession(session *Session) {
 		// Cancel all active flows
 		session.flowsMu.Lock()
 		for _, flow := range session.flows {
-			if flow.Handler != nil {
-				flow.Handler.Cancel()
-			}
+			flow.Cancel()
 		}
 		session.flowsMu.Unlock()
 	}()
@@ -579,6 +656,14 @@ var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VCI: "i",
 }
 
+// anonymousProtocols are the flow protocols a session with no user (a token the
+// AS issued without "sub") may run: lookups of public metadata. Everything else
+// acts for a wallet (receives or presents credentials) and needs an identity,
+// so an anonymous session is refused for it at flow start.
+var anonymousProtocols = map[Protocol]bool{
+	ProtocolVCTM: true,
+}
+
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
@@ -601,6 +686,31 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		loggedFlowID = loggedFlowID[:8]
 	}
 	logger = session.logger.With(zap.String("flow_id", loggedFlowID), zap.String("protocol", string(msg.Protocol)))
+
+	// SID-AUTH-06: an established session keeps running until a flow starts;
+	// re-check the handshake token against the user's cut-off here so a
+	// revocation that DeleteByUser could not reach - another engine process
+	// or instance in a split or scaled deployment - still stops the wallet
+	// at its next flow. The gate reads the shared store.
+	//
+	// After the logger above, not before it: this is the one refusal on this
+	// path that a reader will go looking for, and it is worth a lot more
+	// with the flow id and protocol attached.
+	if err := m.recheckToken(session); err != nil {
+		logger.Warn("Flow refused: authorization revoked", zap.Error(err))
+		_ = session.SendFlowError(flowID, "", ErrCodeAuthFailed, "Authorization revoked")
+		_ = session.conn.Close()
+		return
+	}
+
+	// An anonymous token is for registry/metadata lookups only: it may not
+	// start a flow that acts for a wallet. The handshake itself stays open to
+	// it, since a lookup flow needs the connection.
+	if session.UserID == "" && !anonymousProtocols[msg.Protocol] {
+		logger.Warn("Flow refused: anonymous session")
+		_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "anonymous tokens are not accepted for protocol: "+string(msg.Protocol))
+		return
+	}
 
 	// Get handler factory first (before acquiring flow lock)
 	m.handlersMu.RLock()
@@ -641,6 +751,11 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
+	// The flow's context is created before the flow is published, so a
+	// revocation that arrives while the handler is still being built has
+	// something to cancel.
+	flowCtx, cancelFlow := context.WithTimeout(context.Background(), 5*time.Minute)
+
 	// Create flow while still holding lock
 	flow := &Flow{
 		ID:        flowID,
@@ -648,12 +763,14 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		Session:   session,
 		State:     FlowStep("started"),
 		StartTime: time.Now(),
+		cancel:    cancelFlow,
 		Data:      make(map[string]interface{}),
 	}
 
 	// Register flow immediately to reserve slot
 	session.flows[flowID] = flow
 	session.flowsMu.Unlock()
+	defer cancelFlow()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
@@ -666,7 +783,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
-	flow.Handler = handler
+	flow.setHandler(handler)
 
 	defer func() {
 		session.flowsMu.Lock()
@@ -674,12 +791,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		session.flowsMu.Unlock()
 	}()
 
-	// Execute flow
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// A revocation between publishing the flow and here has already
+	// cancelled flowCtx, so do not start the work.
+	if err := flowCtx.Err(); err != nil {
+		logger.Info("Flow cancelled before it started", zap.Error(err))
+		return
+	}
 
 	logger.Info("Starting flow")
-	if err := handler.Execute(ctx, msg); err != nil {
+	if err := handler.Execute(flowCtx, msg); err != nil {
 		logger.Error("Flow failed", zap.Error(err))
 		// Error should have been sent by handler
 		return
@@ -873,6 +993,10 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 			}
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
+		// See SetTokenGate for why the engine checks at all.
+		if err := m.tokenGate.Check(ctx, result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
+			return "", "", "", err
+		}
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
@@ -920,6 +1044,10 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		// optional feature is configured at all (#403).
 		if m.isUserRevoked(userID) {
 			return "", "", "", errors.New("token has been revoked")
+		}
+		// See SetTokenGate for why the engine checks at all.
+		if err := m.tokenGate.Check(ctx, userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
+			return "", "", "", err
 		}
 		return userID, tenantID, "", nil
 	}
@@ -973,6 +1101,50 @@ func (m *Manager) GetSessionByUser(userID string) (*Session, error) {
 	return session, nil
 }
 
+// DeleteByUser drops the user's live WebSocket session as well as its
+// persisted record. It is the engine's service.SessionCleaner: SessionStore
+// alone only forgets the SessionData, while the Manager keeps the
+// authenticated Session and its socket in sessions/userIndex and would let an
+// already-connected client continue flows after its wallet instance was
+// revoked (SID-AUTH-06). Closing the connection ends the read
+// loop, which unregisters the session; the maps are cleared here as well so
+// the user is gone from the Manager the moment this returns.
+func (m *Manager) DeleteByUser(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	// The persisted delete runs under the same lock as the in-memory one.
+	// Releasing it first left a window in which a session registering for
+	// this user wrote its record and then had it deleted by this call,
+	// leaving a live socket with nothing in the store and nothing to restore
+	// after a restart. registerSession already holds this lock across its
+	// own store writes, so serializing here costs no more than it does
+	// there and makes the two operations agree on an order.
+	m.sessionsMu.Lock()
+	defer m.sessionsMu.Unlock()
+	if live, ok := m.userIndex[userID]; ok {
+		m.logger.Info("Closing live session for user", zap.String("user_id", userID))
+		// Cancel the flows here rather than leaving it to handleSession's
+		// deferred cleanup. That cleanup does run, but only once the read
+		// loop notices the closed connection, so this call would otherwise
+		// return while an issuance or presentation started before the
+		// revocation was still working. Each flow runs on its own context,
+		// not the connection's, so closing the socket does not reach it.
+		live.flowsMu.Lock()
+		for _, flow := range live.flows {
+			flow.Cancel()
+		}
+		live.flowsMu.Unlock()
+		_ = live.conn.Close()
+		delete(m.sessions, live.ID)
+		delete(m.userIndex, userID)
+	}
+	if m.sessionStore == nil {
+		return nil
+	}
+	return m.sessionStore.DeleteByUser(ctx, userID)
+}
+
 // ListSessions returns all sessions for a tenant from the persistent store
 func (m *Manager) ListSessions(ctx context.Context, tenantID string) ([]*SessionData, error) {
 	if m.sessionStore == nil {
@@ -989,29 +1161,20 @@ func (m *Manager) CleanupSessions(ctx context.Context) (int64, error) {
 	return m.sessionStore.Cleanup(ctx)
 }
 
-// DeleteByUser implements service.SessionCleaner (duck-typed - engine must
-// not import package service): it permanently marks userID revoked for
-// this engine process (see RevokeUser) and closes every live WebSocket
-// session it currently holds for that user, e.g. because the account was
-// just deleted.
-//
-// This is a separate cleaner from the persistent SessionStore's own
-// DeleteByUser (see cmd/server/main.go, which wires both): that one only
-// ever purged the persisted SessionData bookkeeping record, never the
-// *websocket.Conn* itself, so an already-established connection for a
-// deleted user stayed open and usable until it disconnected on its own
-// (#393 - found as a follow-up to #391, which closed the equivalent gap
-// for new handshakes via IsUserRevoked, but not for connections that were
-// already past the handshake).
+// (Manager.DeleteByUser, above, is the engine's service.SessionCleaner: it
+// drops the user's sessions but does NOT bar the user from reconnecting,
+// because wallet-instance revocation and "log out everywhere" (SID-AUTH-06)
+// use the same cleaner and the user's other devices must stay able to log
+// in. Permanent, account-deletion-grade revocation is the separate
+// RevokeUser below, wired only into UserService.DeleteUser via
+// service.UserRevoker - see cmd/server/main.go. On main these two were one
+// method; they diverged when the lifecycle cascade needed the non-permanent
+// behaviour.)
 //
 // Sessions live on other backend replicas (Redis-backed horizontal
-// scaling) are out of scope here: only this process's own live connections
-// can be closed directly.
-func (m *Manager) DeleteByUser(_ context.Context, userID string) error {
-	m.RevokeUser(userID)
-	return nil
-}
-
+// scaling) are out of scope for RevokeUser: only this process's own live
+// connections can be closed directly (#393).
+//
 // RevokeUser permanently marks userID revoked for this engine process:
 // every current and future WebSocket session for that user is rejected
 // from now on (see isUserRevoked, consulted by validateToken and

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // IssuerService handles credential issuer operations
@@ -30,6 +31,12 @@ func (s *IssuerService) Create(ctx context.Context, tenantID domain.TenantID, is
 	// Validate required fields
 	if issuer.CredentialIssuerIdentifier == "" {
 		return fmt.Errorf("credential issuer identifier is required")
+	}
+
+	// SID-AUTH-06: judge the request's token against the cut-off as it stands
+	// now, at the mutation boundary, not as it stood at admission.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
 	}
 
 	// Set tenant ID
@@ -90,6 +97,12 @@ func (s *IssuerService) GetAll(ctx context.Context, tenantID domain.TenantID) ([
 
 // Update updates an existing issuer
 func (s *IssuerService) Update(ctx context.Context, issuer *domain.CredentialIssuer) error {
+	// SID-AUTH-06: judge the request's token against the cut-off as it stands
+	// now, at the mutation boundary, not as it stood at admission.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Issuers().Update(ctx, issuer); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
@@ -106,6 +119,12 @@ func (s *IssuerService) Update(ctx context.Context, issuer *domain.CredentialIss
 
 // Delete removes an issuer
 func (s *IssuerService) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	// SID-AUTH-06: judge the request's token against the cut-off as it stands
+	// now, at the mutation boundary, not as it stood at admission.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Issuers().Delete(ctx, tenantID, id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound

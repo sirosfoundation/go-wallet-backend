@@ -8,6 +8,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -40,6 +41,10 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 	}
 	if req.Format == "" {
 		return nil, errors.New("format is required")
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return nil, err
 	}
 
 	credential := &domain.VerifiableCredential{
@@ -125,6 +130,10 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 		return nil, err
 	}
 
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return nil, err
+	}
+
 	// Update fields
 	credential.InstanceID = req.InstanceID
 	credential.SigCount = req.SigCount
@@ -149,6 +158,10 @@ func (s *CredentialService) Delete(ctx context.Context, tenantID domain.TenantID
 	}
 	if credentialIdentifier == "" {
 		return errors.New("credential_identifier is required")
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
 	}
 
 	if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, credentialIdentifier); err != nil {

@@ -249,6 +249,24 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// SID-AUTH-06: tokens issued before a wallet suspension/revocation
+		// cannot open a new engine session (applies to both token paths).
+		if backendProvider != nil {
+			provider.SetTokenGate(backendProvider.TokenGate())
+		} else {
+			gateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			gate, closer, err := server.NewStandaloneTokenGate(gateCtx, backendCfg)
+			cancel()
+			switch {
+			case err != nil:
+				logger.Fatal("Failed to open storage for the engine token gate", zap.Error(err))
+			case gate == nil:
+				logger.Warn("Standalone engine without persistent storage: bearer tokens issued before a wallet suspension/revocation are not cut off at the WebSocket handshake; co-host the backend role or configure storage")
+			default:
+				provider.SetTokenGate(gate)
+				resources = append(resources, closer)
+			}
+		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
 		// during the WebSocket handshake too, on both the go-tokenauth and
@@ -260,21 +278,25 @@ func main() {
 		engineProvider = provider
 	}
 
-	// Wire session stores into UserService so DeleteUser purges AS cookie
-	// sessions and, when the engine runs in this process, active engine
-	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
-	// engine role: a --mode=backend deployment has AS sessions to drop too.
-	// Both engine cleaners are wired: SessionStore() only purges the
-	// persisted SessionData bookkeeping record, while Manager() closes the
-	// live *websocket.Conn* itself - without the latter, a connection that
-	// was already established before the user was deleted stayed open and
-	// usable until it disconnected on its own (#393).
+	// Wire session cleaners into UserService so DeleteUser purges AS cookie
+	// sessions and, when the engine runs in this process, live engine
+	// (WebSocket) sessions alike, and into the wallet lifecycle service so
+	// revoking a wallet instance drops the same sessions
+	// (SID-AUTH-06). The AS cleaner is wired regardless of the engine role:
+	// a --mode=backend deployment has AS sessions to drop too. The engine
+	// cleaner is the Manager, which closes the open WebSocket as well as
+	// deleting the persisted record.
 	if backendProvider != nil {
 		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
 		if engineProvider != nil {
-			cleaners = append(cleaners, engineProvider.SessionStore(), engineProvider.Manager())
+			cleaners = append(cleaners, engineProvider.SessionCleaner())
+			// Account deletion (unlike wallet-instance revocation or "log
+			// out everywhere", which share the cleaner above) also bars the
+			// user from reconnecting to this engine at all (#393/#403).
+			backendProvider.Services().User.AddUserRevoker(engineProvider.Manager())
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
+		backendProvider.Services().WalletLifecycle.SetSessionCleaner(cleaners)
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.
@@ -283,6 +305,13 @@ func main() {
 		provider, err := server.NewAdminProvider(backendCfg, logger)
 		if err != nil {
 			logger.Fatal("Failed to create admin provider", zap.Error(err))
+		}
+		// --mode=admin,engine is a valid combination, and then the live
+		// WebSocket sessions an admin revocation has to drop are in this
+		// process after all. Without this the cascade would cut the user's
+		// tokens off but leave the socket open until its next gate check.
+		if engineProvider != nil {
+			provider.SetSessionCleaner(engineProvider.SessionCleaner())
 		}
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)

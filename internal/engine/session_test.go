@@ -27,7 +27,10 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -670,6 +673,13 @@ func runHandleFlowStart(t *testing.T, m *Manager, tac claims.TAC, protocol Proto
 // behavior (e.g. the short-flow_id-vs-log-truncation regression below).
 func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID string) *FlowErrorMessage {
 	t.Helper()
+	return runHandleFlowStartAs(t, m, tac, protocol, flowID, "test-user")
+}
+
+// runHandleFlowStartAs is runHandleFlowStartWithID for a session of the given
+// user; "" is an anonymous session.
+func runHandleFlowStartAs(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID, userID string) *FlowErrorMessage {
+	t.Helper()
 
 	result := make(chan *FlowErrorMessage, 1)
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
@@ -693,6 +703,7 @@ func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol
 
 	session := testSession(conn)
 	session.TAC = tac
+	session.UserID = userID
 
 	m.handleFlowStart(session, &FlowStartMessage{Message: Message{FlowID: flowID}, Protocol: protocol})
 
@@ -1011,6 +1022,153 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
 }
 
+// SID-AUTH-06: a token issued before the user's wallet was
+// revoked cannot open a new engine session.
+func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	mint := func(iat time.Time) string {
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": uid.String(), "tenant_id": "t", "iat": iat.Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte("test-secret"))
+		require.NoError(t, err)
+		return s
+	}
+	old := mint(time.Now().Add(-2 * time.Minute))
+	_, _, _, err := m.validateToken(context.Background(), old)
+	require.NoError(t, err, "no cut-off yet")
+
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)))
+	_, _, _, err = m.validateToken(context.Background(), old)
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, _, _, err = m.validateToken(context.Background(), mint(time.Now()))
+	assert.NoError(t, err, "a token issued after the cut-off opens a session")
+}
+
+// Revoking a wallet instance must end the user's *live*
+// WebSocket session, not just forget its persisted record: the Manager is the
+// service.SessionCleaner precisely so an already-connected client cannot keep
+// running flows after the token gate would refuse a new handshake.
+func TestManager_DeleteByUser_ClosesLiveSessionAndStoreRecord(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+
+	upgrader := websocket.Upgrader{}
+	registered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		m.registerSession(&Session{ID: "sess-1", UserID: "user-1", TenantID: "t", conn: conn, flows: map[string]*Flow{}, logger: zap.NewNop(), closeCh: make(chan struct{}, 1)})
+		close(registered)
+		// Keep the server side of the socket alive until the test ends.
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	defer func() { _ = ws.Close() }()
+	<-registered
+
+	_, err = m.GetSessionByUser("user-1")
+	require.NoError(t, err)
+	stored, err := store.GetByUser(context.Background(), "user-1")
+	require.NoError(t, err)
+	require.NotNil(t, stored, "registerSession persists the record")
+
+	require.NoError(t, m.DeleteByUser(context.Background(), "user-1"))
+
+	_, err = m.GetSessionByUser("user-1")
+	assert.ErrorIs(t, err, ErrSessionNotFound, "live session gone from the Manager")
+	_, err = store.GetByUser(context.Background(), "user-1")
+	assert.ErrorIs(t, err, ErrSessionNotFound, "persisted record gone from the store")
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = ws.ReadMessage()
+	assert.Error(t, err, "the client's socket was closed by DeleteByUser")
+
+	assert.NoError(t, m.DeleteByUser(context.Background(), "nobody"), "idempotent for unknown users")
+}
+
+// SID-AUTH-06: an established session is re-checked against the user's token
+// cut-off when a flow starts, so a suspension or revocation that another
+// process or instance performed still stops this wallet at its next flow.
+func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	session := &Session{ID: "s1", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute)}
+	require.NoError(t, m.recheckToken(session), "no cut-off yet")
+
+	// The wallet is revoked by a request carrying "acting-jti", which the
+	// backend keeps exempt so that request can be repeated.
+	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now()))
+	assert.ErrorIs(t, m.recheckToken(session), tokengate.ErrRevoked, "the handshake token predates the cut-off")
+
+	// No token is exempt anywhere: the backend's gate refuses the same token
+	// the engine just refused, so a socket held by another engine process
+	// cannot outlive the cut-off either.
+	gate := tokengate.New(store.Users())
+	assert.ErrorIs(t, gate.Check(context.Background(), uid.String(), session.tokenIssuedAt), tokengate.ErrRevoked,
+		"the backend gate refuses it too")
+	assert.ErrorIs(t, m.recheckToken(&Session{ID: "s2", UserID: uid.String(), tokenIssuedAt: session.tokenIssuedAt}),
+		tokengate.ErrRevoked, "whoever holds the socket")
+
+	anon := &Session{ID: "s3", UserID: ""}
+	assert.NoError(t, m.recheckToken(anon), "anonymous sessions are not gated")
+	assert.NoError(t, NewManager(cfg, zap.NewNop()).recheckToken(session), "no gate configured: nothing enforced")
+}
+
+// A revocation can arrive while a flow's handler is still being built. The
+// flow is published on the session before the handler exists, and each
+// handler installs its own cancellation at the top of Execute, so cancelling
+// through the handler alone would find nothing and the flow would run on.
+// The flow's own context is created before it is visible, so cancelling it
+// always lands.
+func TestFlow_CancelBeforeHandlerIsBuilt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	flow := &Flow{ID: "f1", cancel: cancel, Data: map[string]interface{}{}}
+
+	// No handler yet, exactly the window handleFlowStart leaves open.
+	require.Nil(t, flow.Handler)
+	flow.Cancel()
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("cancelling a flow with no handler must still cancel its context")
+	}
+
+	// And it stays safe once a handler appears, and on a second call.
+	flow.setHandler(nil)
+	flow.Cancel()
+}
+
+// Cancel must not race the handler assignment: both go through the flow's
+// own lock. Run with -race.
+func TestFlow_CancelRacesHandlerAssignment(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	flow := &Flow{ID: "f2", cancel: cancel, Data: map[string]interface{}{}}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); flow.setHandler(nil) }()
+	go func() { defer wg.Done(); flow.Cancel() }()
+	wg.Wait()
+}
+
 // dialAndHandshakeAsUser dials m's HandleConnection over a real WebSocket
 // connection, completes the handshake for userID with a legacy HMAC token
 // (mirroring TestManager_validateToken_UserID), and waits for the session to
@@ -1202,12 +1360,12 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 	assert.True(t, stillPresent, "the innocent bystander must still be registered")
 }
 
-// TestManager_DeleteByUser_ClosesLiveConnection exercises the exact seam
+// TestManager_RevokeUser_ClosesLiveConnection exercises the exact seam
 // service.UserService.DeleteUser calls through: Manager.DeleteByUser is
 // wired into service.MultiSessionCleaner alongside the persistent
 // SessionStore's own DeleteByUser (see cmd/server/main.go). Manager itself
 // duck-types service.SessionCleaner without engine importing that package.
-func TestManager_DeleteByUser_ClosesLiveConnection(t *testing.T) {
+func TestManager_RevokeUser_ClosesLiveConnection(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
 
@@ -1219,7 +1377,7 @@ func TestManager_DeleteByUser_ClosesLiveConnection(t *testing.T) {
 	ws := dialAndHandshakeAsUser(t, m, wsURL, deletedUser)
 	defer func() { _ = ws.Close() }()
 
-	require.NoError(t, m.DeleteByUser(context.Background(), deletedUser))
+	m.RevokeUser(deletedUser)
 
 	require.Eventually(t, func() bool {
 		_, _, err := ws.ReadMessage()
@@ -1342,7 +1500,7 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 	}, time.Second, 10*time.Millisecond, "client did not observe the server closing the connection")
 }
 
-// TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature is the
+// TestManager_RevokeUser_WorksWithoutTokenBlacklistFeature is the
 // end-to-end regression test for #403: account deletion (via
 // Manager.DeleteByUser, the exact seam service.UserService.DeleteUser
 // calls through - see cmd/server/main.go) must both close an
@@ -1351,7 +1509,7 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 // security.token_blacklist feature - which this test never configures at
 // all (no SetTokenBlacklist call, legacy HMAC auth path, m.blacklist is
 // nil throughout).
-func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
+func TestManager_RevokeUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
 
@@ -1365,7 +1523,7 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 
 	// Simulate account deletion through the actual seam
 	// service.UserService.DeleteUser calls (see cmd/server/main.go).
-	require.NoError(t, m.DeleteByUser(context.Background(), userID))
+	m.RevokeUser(userID)
 
 	// The already-open session must actually close.
 	require.Eventually(t, func() bool {
@@ -1393,6 +1551,101 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	var msg Message
 	require.NoError(t, ws2.ReadJSON(&msg))
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
+}
+
+// SID-AUTH-06 race: the cut-off lands after validateToken's gate check but
+// before registerSession. The sweep cannot see the not-yet-indexed session,
+// so the post-registration recheck must refuse it and close the socket
+// immediately rather than leave it connected until a flow starts.
+func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(context.Background(), &domain.User{UUID: uid}))
+	m.SetTokenGate(tokengate.New(store.Users()))
+
+	var hookRan atomic.Bool
+	m.beforeRegister = func() {
+		hookRan.Store(true)
+		require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now()))
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ws.Close() })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   uid.String(),
+		"tenant_id": "t",
+		"iat":       time.Now().Add(-time.Minute).Unix(),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{Message: Message{Type: TypeHandshake}, AppToken: tok}))
+
+	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			break // connection closed: required outcome
+		}
+		assert.NotContains(t, string(data), TypeHandshakeComplete, "a revoked token must never get handshake_complete")
+	}
+	assert.True(t, hookRan.Load())
+	// The close frame is written before the handler returns, and the
+	// deferred unregisterSession runs only then, so the client can observe
+	// the closed socket a moment before the bookkeeping is cleaned up.
+	// Wait for that rather than asserting at the instant of close.
+	assert.Eventually(t, func() bool {
+		m.sessionsMu.RLock()
+		defer m.sessionsMu.RUnlock()
+		return len(m.sessions) == 0 && len(m.userIndex) == 0
+	}, 2*time.Second, 5*time.Millisecond, "the refused session must not stay registered")
+}
+
+// An anonymous token (no user) is for registry/metadata lookups: it may run the
+// VCTM lookup flow, but not a flow that acts for a wallet.
+func TestManager_handleFlowStart_AnonymousSessionMayOnlyLookUpMetadata(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+	m.RegisterFlowHandler(ProtocolOID4VP, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return stubFlowHandler{}, nil
+	})
+	m.RegisterFlowHandler(ProtocolVCTM, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return stubFlowHandler{}, nil
+	})
+
+	for _, p := range []Protocol{ProtocolOID4VCI, ProtocolOID4VP} {
+		msg := runHandleFlowStartAs(t, m, "rli", p, "", "")
+		require.NotNil(t, msg, "anonymous %s flow must be refused", p)
+		assert.Equal(t, ErrCodeForbidden, msg.Error.Code)
+	}
+	assert.Nil(t, runHandleFlowStartAs(t, m, "r", ProtocolVCTM, "", ""), "a metadata lookup is what anonymous tokens are for")
+	// The same flows are fine for a session that names a user.
+	assert.Nil(t, runHandleFlowStartAs(t, m, "rli", ProtocolOID4VCI, "", "some-user"))
+}
+
+// TestManager_NilTokenGate pins the documented no-gate behavior of a
+// standalone engine with memory/no storage (NewStandaloneTokenGate returns a
+// nil gate): the legacy handshake branch and recheckToken must not
+// dereference it.
+func TestManager_NilTokenGate(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+	m.SetTokenGate(nil)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u-1", "tenant_id": "t-1", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	s, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	userID, _, _, err := m.validateToken(context.Background(), s)
+	require.NoError(t, err)
+	assert.Equal(t, "u-1", userID)
+
+	assert.NoError(t, m.recheckToken(&Session{UserID: "u-1", tokenIssuedAt: time.Now()}))
 }
 
 func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
@@ -293,6 +294,8 @@ func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(401, gin.H{"error": "Authentication failed"})
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
+			c.JSON(403, lifecycleRefusalBody(err))
 		case errors.Is(err, service.ErrTenantAccessDenied):
 			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
 		case errors.Is(err, service.ErrIdentityNotBound):
@@ -452,6 +455,9 @@ func (h *Handlers) StoreCredential(c *gin.Context) {
 	for _, credReq := range batchReq.Credentials {
 		credReq.HolderDID = holderDID
 		if _, err := h.services.Credential.Store(c.Request.Context(), tenantID, &credReq); err != nil {
+			if abortIfTokenRevoked(c, err) {
+				return
+			}
 			h.logger.Error("Failed to store credential", zap.Error(err))
 			// Continue storing other credentials
 		}
@@ -485,6 +491,9 @@ func (h *Handlers) UpdateCredential(c *gin.Context) {
 	tenantID, _ := h.getTenantID(c)
 	credential, err := h.services.Credential.Update(c.Request.Context(), tenantID, holderDID, &req)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to update credential", zap.Error(err))
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
@@ -544,6 +553,9 @@ func (h *Handlers) DeleteCredential(c *gin.Context) {
 	tenantID, _ := h.getTenantID(c)
 
 	if err := h.services.Credential.Delete(c.Request.Context(), tenantID, holderDID, credentialID); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -626,6 +638,9 @@ func (h *Handlers) ProxyRequest(c *gin.Context) {
 
 	resp, binaryData, err := h.services.Proxy.Execute(c.Request.Context(), &req)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Proxy request failed", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Proxy request failed"})
 		return
@@ -756,6 +771,9 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		req.OpenID4VCI.CredentialIssuer,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to generate key attestation", zap.Error(err))
 		c.JSON(400, gin.H{
 			"error":   "UNSUPPORTED",
@@ -837,6 +855,9 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
@@ -1064,6 +1085,24 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		domain.UserIDFromString(userID.(string)),
 		holderDID,
 	); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
+		if errors.Is(err, service.ErrUserNotFound) {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+		if errors.Is(err, service.ErrDeletionIncomplete) {
+			// The account still exists on purpose, so the caller can repeat
+			// the request rather than be left with a stranded wallet
+			// instance and no way to authenticate.
+			h.logger.Error("Account deletion incomplete", zap.Error(err))
+			c.JSON(409, gin.H{
+				"error":   errCodeDeletionIncomplete,
+				"message": "part of the account data could not be removed; the account still exists, repeat the request to finish it",
+			})
+			return
+		}
 		h.logger.Error("Failed to delete user", zap.Error(err))
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -1174,6 +1213,9 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 	}
 
 	if err := h.services.User.UpdateUser(c.Request.Context(), user); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to update user settings", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to update settings"})
 		return
@@ -1242,6 +1284,9 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
 		case errors.Is(err, service.ErrChallengeNotFound):
@@ -1304,6 +1349,9 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		ifMatch,
 	)
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -1354,6 +1402,9 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 		credentialID,
 		req.Nickname,
 	); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
 			return
@@ -1490,4 +1541,29 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 		}
 	}
 	return resp
+}
+
+// lifecycleRefusalBody is the 403 body of a SID-AUTH-06 login refusal: the
+// error code and message clients already read, plus the `scope` that says
+// whether the wallet still exists. The AS passkey handler builds the same
+// body from the same mapping, so the two login endpoints cannot disagree.
+func lifecycleRefusalBody(err error) gin.H {
+	d := service.LifecycleRefusalDetails(err)
+	return gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message}
+}
+
+// abortIfTokenRevoked answers 401 when a write refused the request's bearer
+// token because the user's authorization was cut off after the middleware
+// admitted it (tokengate.RefuseLoaded). It reports whether it answered.
+//
+// storage.ErrStaleWrite is the same refusal arriving from the other side: the
+// lifecycle fence advanced the user's cut-off after the record was loaded but
+// before UserStore.Update, so the write was rejected to keep it from restoring
+// data after an erasure. It is a revoked-token answer, not a server error.
+func abortIfTokenRevoked(c *gin.Context, err error) bool {
+	if !errors.Is(err, tokengate.ErrRevoked) && !errors.Is(err, storage.ErrStaleWrite) {
+		return false
+	}
+	c.JSON(401, gin.H{"error": "Token has been revoked"})
+	return true
 }

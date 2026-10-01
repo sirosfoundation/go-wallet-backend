@@ -28,8 +28,8 @@ func (m *memoryWIAChallengeStore) Put(_ context.Context, tenantID domain.TenantI
 	return m.store.put(c), nil
 }
 
-func (m *memoryWIAChallengeStore) Consume(_ context.Context, challenge string) (bool, error) {
-	_, ok := m.store.consume(challenge)
+func (m *memoryWIAChallengeStore) Consume(_ context.Context, tenantID domain.TenantID, challenge string) (bool, error) {
+	_, ok := m.store.consume(tenantID, challenge)
 	return ok, nil
 }
 

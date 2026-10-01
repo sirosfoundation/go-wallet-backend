@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
@@ -44,7 +45,14 @@ type WalletProviderService struct {
 	certChain       []string
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
+	// users is read for the SID-AUTH-06 cut-off at the minting boundary (see
+	// GenerateKeyAttestation). Nil disables the recheck (tests, standalone).
+	users tokengate.UserLookup
 }
+
+// SetUsers wires the user store the key-attestation path rechecks the
+// request's token cut-off against, immediately before and after minting.
+func (s *WalletProviderService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // NewWalletProviderService creates a new WalletProviderService.
 // instances is used to corroborate a KA request's self-reported security
@@ -284,6 +292,11 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	if !s.IsSupported() {
 		return "", ErrKeyAttestationNotSupported
 	}
+	// Mutation-boundary gate: the middleware admitted this request at entry,
+	// but a cut-off (user-wide revocation, deletion) may have landed since.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
+	}
 	start := time.Now()
 	defer func() { kaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
@@ -392,6 +405,12 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	if err != nil {
 		s.logger.Error("Failed to sign key attestation JWT", zap.Error(err))
 		kaGenerationErrors.Inc()
+		return "", err
+	}
+
+	// Last look before the KA leaves: a cut-off landing while it was being
+	// signed must withhold it (same as the WIA path).
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
 

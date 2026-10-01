@@ -27,8 +27,10 @@ type Services struct {
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
 	FIDO2Attestation *FIDO2AttestationService
+	WalletLifecycle  *WalletLifecycleService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
+	TombstoneSweeper *DeletionTombstoneSweeper
 	AAGUIDValidator  *AAGUIDValidator
 }
 
@@ -51,6 +53,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
+	wpSvc.SetUsers(store.Users())
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -75,7 +78,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Use the shared SET audit emitter constructor so WIA issuance events are
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), store.Users(), wiaAuditor, challengeStore)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but
@@ -103,6 +106,15 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		webauthnSvc.SetTokenBlacklist(tokenBlacklist)
 	}
 
+	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
+	userSvc.SetUserLocker(lifecycle)
+	if wiaSvc != nil {
+		wiaSvc.SetLifecycle(lifecycle)
+	}
+	proxySvc := NewProxyService(cfg, logger)
+	proxySvc.SetUsers(store.Users())
+	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
+	fido2Svc.SetUsers(store.Users())
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -112,13 +124,15 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
 		Keystore:         NewKeystoreService(store, cfg, logger),
-		Proxy:            NewProxyService(cfg, logger),
+		Proxy:            proxySvc,
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
+		FIDO2Attestation: fido2Svc,
+		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
+		TombstoneSweeper: NewDeletionTombstoneSweeper(cfg.Security.DeletionTombstone, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
 }
@@ -131,6 +145,9 @@ func (s *Services) Start() {
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Start()
 	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Start()
+	}
 	if s.WIA != nil {
 		s.WIA.Start()
 	}
@@ -140,6 +157,9 @@ func (s *Services) Start() {
 func (s *Services) Stop() {
 	if s.WIA != nil {
 		s.WIA.Stop()
+	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Stop()
 	}
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Stop()

@@ -2759,6 +2759,60 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 	}
 }
 
+func TestDeletionTombstoneRetention(t *testing.T) {
+	day := 24 * time.Hour
+	eq := func(name string, got, want time.Duration) {
+		t.Helper()
+		if got != want {
+			t.Errorf("%s: got %s, want %s", name, got, want)
+		}
+	}
+	margin := 30 * day
+	floor := MinFamilyRetention
+	cfg := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 7}}
+	eq("tiny lifetimes: the one-year floor plus the default margin", cfg.DeletionTombstoneRetention(), floor+margin)
+
+	cfg.JWT.RefreshDays = 0
+	eq("no refresh tokens: still the floor", cfg.DeletionTombstoneRetention(), floor+margin)
+
+	cfg.AS.SessionTTL = 10 * day
+	cfg.AS.AudienceTTLs = map[string]time.Duration{"x": 12 * day}
+	cfg.Security.DeletionTombstone.RetentionMarginDays = 5
+	eq("short AS TTLs and a configured margin: floor plus margin", cfg.DeletionTombstoneRetention(), floor+5*day)
+
+	// Lowering a lifetime must not shorten retention below the floor.
+	high := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 300}}
+	low := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 7}}
+	if low.DeletionTombstoneRetention() < high.DeletionTombstoneRetention() {
+		t.Errorf("lowering refresh_days shortened retention: %s < %s", low.DeletionTombstoneRetention(), high.DeletionTombstoneRetention())
+	}
+
+	// Raising a lifetime above the floor extends retention.
+	cfg2 := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 500}}
+	eq("lifetime above the floor extends retention", cfg2.DeletionTombstoneRetention(), 500*day+margin)
+	cfg2.AS.AudienceTTLs = map[string]time.Duration{"x": 600 * day}
+	eq("AS TTL above the floor extends retention", cfg2.DeletionTombstoneRetention(), 600*day+margin)
+
+	ok := defaultConfig()
+	if err := ok.Validate(); err != nil && strings.Contains(err.Error(), "deletion_tombstone") {
+		t.Errorf("defaults must validate: %v", err)
+	}
+	bad := defaultConfig()
+	bad.Security.DeletionTombstone.CleanupIntervalSeconds = -1
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "cleanup_interval_seconds") {
+		t.Errorf("negative cleanup interval must be refused, got %v", err)
+	}
+	bad = defaultConfig()
+	bad.Security.DeletionTombstone.RetentionMarginDays = -1
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "retention_margin_days") {
+		t.Errorf("negative retention margin must be refused, got %v", err)
+	}
+	d := defaultConfig()
+	if d.Security.DeletionTombstone.CleanupIntervalSeconds != 3600 || d.Security.DeletionTombstone.RetentionMarginDays != 30 {
+		t.Errorf("defaults: %+v", d.Security.DeletionTombstone)
+	}
+}
+
 func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
 	mk := func(legacy bool, audiences ...string) *Config {
 		cfg := validBaseConfig()

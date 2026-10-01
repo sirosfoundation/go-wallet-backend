@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -161,6 +163,10 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
+		// Every route below acts on an account, a wallet or tenant
+		// configuration on a user's behalf; an anonymous token (no user) is
+		// for registry lookups only and is refused here.
+		middleware.RequireUser(),
 	)
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
@@ -195,6 +201,24 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
+			// Wallet instance lifecycle, self-service (SID-AUTH-06)
+			// `l` (list), like every other collection endpoint here
+			// (/issuer/all, /verifier/all, GET /storage/vc); `r` is the
+			// per-object read permission used for /instances/{id}-shaped
+			// reads, and gating a listing on it would let a read-only token
+			// enumerate instances a list-only token cannot see.
+			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.ListMyWalletInstances)
+			// `w`: logging out everywhere changes server-side state (it
+			// advances the token cut-off and drops live sessions) but
+			// destroys nothing, so it is a write and not a delete.
+			//
+			// There is no self-service route that revokes an instance.
+			// Revocation cannot be undone, so a user who revoked the
+			// instance behind their last passkey would lock themselves out
+			// with no way back (SID-AUTH-06, admin_instance_handlers.go).
+			// What a user owns is logging out everywhere, and removing the
+			// account outright.
+			session.POST("/logout-all", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.LogoutEverywhere)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
@@ -259,7 +283,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.store.Users(), p.logger)
 	}
 	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
 	// latter hardcodes a nil blacklist, which is exactly what left Logout's
@@ -319,6 +343,9 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
+		// Stored credentials belong to a user; an anonymous token is for
+		// registry lookups only.
+		middleware.RequireUser(),
 	)
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
@@ -341,7 +368,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.store.Users(), p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
 	// provider is combined with an AuthProvider under BackendProvider,
@@ -437,6 +464,14 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
+// SessionCleaner returns the cleaner that drops a user's engine sessions:
+// the Manager itself, which closes the live WebSocket and deletes the
+// persisted record, rather than the bare SessionStore, which only does the
+// latter (see Manager.DeleteByUser).
+func (p *EngineProvider) SessionCleaner() service.SessionCleaner {
+	return p.manager
+}
+
 // Manager returns the engine's WebSocket session manager for cross-provider
 // wiring. It duck-types service.SessionCleaner (via its DeleteByUser
 // method), so it can be wired into service.MultiSessionCleaner exactly like
@@ -452,6 +487,40 @@ func (p *EngineProvider) Manager() *wsengine.Manager {
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
+}
+
+// SetTokenGate passes the SID-AUTH-06 token cut-off check to the engine so a
+// token issued before a suspension/revocation cannot open a new session.
+func (p *EngineProvider) SetTokenGate(g *tokengate.Gate) {
+	p.manager.SetTokenGate(g)
+}
+
+// TokenGate returns the token cut-off check over this backend's user store.
+func (p *BackendProvider) TokenGate() *tokengate.Gate {
+	return tokengate.New(p.store.Users())
+}
+
+// NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
+// engine that runs without the backend role in the same process. It opens
+// the configured storage backend read-only (backend.NewReadOnly: no default
+// tenant creation, no index creation, so the database principal needs read
+// rights on the users and user_deletion_tombstones collections only: a
+// token whose user has no record is refused if a deletion tombstone exists,
+// so the gate reads the tombstone too and fails closed, refusing the token, if
+// that read is denied) and uses it for user lookups only. With no persistent
+// storage configured (memory)
+// there is nothing to consult: the caller gets a nil gate and must warn that
+// pre-suspension tokens are not cut off at the engine handshake in that
+// deployment.
+func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate.Gate, io.Closer, error) {
+	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
+		return nil, nil, nil
+	}
+	store, err := backend.NewReadOnly(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open storage for token gate: %w", err)
+	}
+	return tokengate.New(store.Users()), store, nil
 }
 
 // SetTokenBlacklist passes a token blacklist to the WebSocket engine so its
@@ -696,6 +765,9 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
 		protected.Use(p.authMiddleware())
+		// Anonymous tokens ARE accepted here (no RequireUser): these are
+		// registry lookups, the one thing an anonymous token is for.
+		//
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
 		// wallet-backend audience - never require a broader one. Only
@@ -716,7 +788,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.store.Users(), p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382).
 	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
@@ -783,6 +855,10 @@ func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
 // RegisterAdminRoutes implements AdminRouteProvider for BackendProvider.
 func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	if svcs := p.Services(); svcs != nil {
+		// Admin status changes share the self-service cascade (SID-AUTH-06).
+		adminHandlers.SetLifecycle(svcs.WalletLifecycle)
+	}
 	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 
@@ -805,11 +881,20 @@ func (p *BackendProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 // AdminProvider provides only admin routes, without public auth/storage routes.
 // Use this when running admin as a standalone mode separate from the backend.
 type AdminProvider struct {
-	store   backend.Backend
-	auditor *audit.Emitter
-	cfg     *config.Config
-	logger  *zap.Logger
+	store          backend.Backend
+	auditor        *audit.Emitter
+	cfg            *config.Config
+	logger         *zap.Logger
+	sessionCleaner service.SessionCleaner
 }
+
+// SetSessionCleaner gives the standalone admin API a way to drop live
+// sessions when it revokes an instance. It is wired only when something in
+// this process owns sessions, which for --mode=admin means the engine is
+// co-hosted (--mode=admin,engine). Without it a revocation still cuts the
+// user's tokens off, and their sessions end at the next gate check rather
+// than immediately.
+func (p *AdminProvider) SetSessionCleaner(sc service.SessionCleaner) { p.sessionCleaner = sc }
 
 // NewAdminProvider creates a standalone admin route provider
 func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, error) {
@@ -863,6 +948,24 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
+	// A standalone admin deployment gets the same lifecycle service the
+	// backend uses, so a revocation here is a real revocation: transition
+	// rules, audit, the SID-AUTH-06 token cut-off, and the erasure of a
+	// wallet whose last live instance is gone. Without it the handler would
+	// write the status straight to the store and answer 200 while the
+	// device's tokens still worked - which, for the one operation a wallet
+	// instance has and cannot undo, is the worst possible half-measure.
+	//
+	lifecycle := service.NewWalletLifecycleService(p.store, p.logger, p.auditor)
+	// A session cleaner is wired only when this process owns sessions, which
+	// for --mode=admin means the engine is co-hosted. Otherwise the AS and
+	// the engine are other processes and there is nothing here to close:
+	// their sessions end at the cut-off, which every gate consults, rather
+	// than at an immediate drop.
+	if p.sessionCleaner != nil {
+		lifecycle.SetSessionCleaner(p.sessionCleaner)
+	}
+	adminHandlers.SetLifecycle(lifecycle)
 	adminHandlers.SetAllowHTTP(p.cfg.HTTPClient.AllowsPlaintext())
 	adminHandlers.RegisterRoutes(adminGroup)
 }
@@ -1075,7 +1178,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.store.Users(), p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). This
 	// provider never runs co-hosted with BackendProvider (see cmd/server -
@@ -1087,7 +1190,7 @@ func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Wallet-provider routes with auth middleware
 	wp := router.Group("/wallet-provider")
-	wp.Use(p.authMiddleware())
+	wp.Use(p.authMiddleware(), middleware.RequireUser())
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.

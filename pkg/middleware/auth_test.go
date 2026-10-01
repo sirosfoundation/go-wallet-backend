@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -563,5 +565,111 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status %d with lowercase bearer, got %d", http.StatusOK, w.Code)
+	}
+}
+
+// SID-AUTH-06: a legacy token issued before the user's wallet was
+// or revoked is refused even though it has not expired.
+func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := createTestConfig("test-secret")
+	store := createTestStore()
+	router := createTestRouter(cfg, store, logger)
+	uid := domain.NewUserID()
+	if err := store.Users().Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	mint := func(iat time.Time) string {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": uid.String(), "iat": iat.Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		s, _ := tok.SignedString([]byte("test-secret"))
+		return s
+	}
+	call := func(token string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	old := mint(time.Now().Add(-2 * time.Minute))
+	if got := call(old); got != http.StatusOK {
+		t.Fatalf("before any cut-off the token is fine, got %d", got)
+	}
+	if err := store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := call(old); got != http.StatusUnauthorized {
+		t.Fatalf("token issued before the cut-off must be refused, got %d", got)
+	}
+	if got := call(mint(time.Now())); got != http.StatusOK {
+		t.Fatalf("token issued after the cut-off must pass, got %d", got)
+	}
+}
+
+// The middleware hands the admitted token's iat down to the writes behind it,
+// which judge it against the record they load (tokengate.RefuseLoaded): a
+// cut-off after that iat refuses, one before it does not.
+func TestAuthMiddleware_CarriesTokenIssuedAtToTheHandler(t *testing.T) {
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	store := createTestStore()
+	router := gin.New()
+	router.Use(AuthMiddleware(cfg, store, zap.NewNop()))
+	var later, earlier error
+	router.GET("/test", func(c *gin.Context) {
+		later = tokengate.RefuseLoaded(c.Request.Context(), time.Now().Add(time.Hour))
+		earlier = tokengate.RefuseLoaded(c.Request.Context(), time.Now().Add(-time.Hour))
+		c.Status(http.StatusOK)
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+createTokenWithJTI(secret, "user-123", "jti-iat", time.Now()))
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if !errors.Is(later, tokengate.ErrRevoked) {
+		t.Errorf("a cut-off after the token was issued must refuse it, got %v", later)
+	}
+	if earlier != nil {
+		t.Errorf("a cut-off before the token was issued must not refuse it, got %v", earlier)
+	}
+}
+
+// The legacy middleware refuses a deleted account's token too.
+func TestAuthMiddleware_DeletedAccountTokenIsRevoked(t *testing.T) {
+	cfg := createTestConfig("test-secret")
+	store := createTestStore()
+	router := createTestRouter(cfg, store, zap.NewNop())
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": uid.String(), "iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	call := func() int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := call(); got != http.StatusOK {
+		t.Fatalf("live user: %d", got)
+	}
+	if err := store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: uid.String(), DeletedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().Delete(ctx, uid); err != nil {
+		t.Fatal(err)
+	}
+	if got := call(); got != http.StatusUnauthorized {
+		t.Fatalf("deleted account's token must be refused, got %d", got)
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -57,7 +58,14 @@ type FIDO2AttestationService struct {
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
 	trust           *trust.Service
+	// users is read for the SID-AUTH-06 cut-off at the write boundary. Nil
+	// disables the recheck.
+	users tokengate.UserLookup
 }
+
+// SetUsers wires the user store Verify rechecks the request's token cut-off
+// against before and after it records the evidence.
+func (s *FIDO2AttestationService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // NewFIDO2AttestationService creates a new FIDO2 attestation verifier. trust
 // evaluates the attestation's x5c chain against go-trust's fidomds3
@@ -202,8 +210,18 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		AAGUID:           aaguid.String(),
 		VerifiedAt:       verifiedAt,
 	}
+	// Mutation-boundary gate: the request was admitted before the (slow)
+	// verification above; a cut-off since then must stop the write.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return err
+	}
 	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
+	}
+	// A cut-off landing during the write fails the request closed; the
+	// revocation cascade owns cleaning up the record just written.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return err
 	}
 
 	s.logger.Info("FIDO2 hardware attestation verified",

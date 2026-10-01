@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -856,5 +859,99 @@ func TestHandlers_RefreshToken_Disabled(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
+	}
+}
+
+// A request admitted before a revocation, whose write then meets a record the
+// revocation already cut off, is answered 401 rather than restoring erased data
+// or surfacing as a server error.
+func TestHandlers_PrivateDataWrite_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/private-data", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.UpdatePrivateData(c)
+	})
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	body, _ := json.Marshal(map[string]interface{}{"privateData": taggedbinary.TaggedBytes([]byte(`{"x":1}`))})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/private-data", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+}
+
+// A logout-all admitted before a revocation must not advance the cut-off again.
+func TestHandlers_LogoutEverywhere_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/logout-all", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.LogoutEverywhere(c)
+	})
+	ctx := context.Background()
+	require.NoError(t, handlers.services.User.LogoutEverywhere(ctx, user.UUID))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout-all", nil))
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+}
+
+func TestHandlers_UpdateSettings_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/settings", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.UpdateSettings(c)
+	})
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/settings", bytes.NewBufferString(`{"openidRefreshTokenMaxAgeInSeconds": 60}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+}
+
+// DeleteUser erases the account; a request admitted before a revocation
+// advanced the cut-off is answered 401 and deletes nothing, while a token
+// issued after the cut-off is accepted.
+func TestHandlers_DeleteUser_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	var issuedAt time.Time
+	router.DELETE("/", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), issuedAt))
+		handlers.DeleteUser(c)
+	})
+	issuedAt = time.Now().Add(-time.Minute)
+	require.NoError(t, handlers.services.User.LogoutEverywhere(context.Background(), user.UUID))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+	_, err := handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	assert.NoError(t, err, "the refused request must not delete the account")
+
+	issuedAt = time.Now().Add(time.Minute)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	_, err = handlers.services.User.GetUserByID(context.Background(), user.UUID)
+	assert.Error(t, err, "a fresh token deletes the account")
+}
+
+// An unknown subject (a token the gate let through as an external identity)
+// gets 404 from DELETE, not a 400 or a tombstone.
+func TestHandlers_DeleteUser_UnknownSubjectIs404(t *testing.T) {
+	handlers, router, _ := setupTestHandlersWithUser(t)
+	ghost := &domain.User{UUID: domain.NewUserID(), DID: "did:example:ghost"}
+	router.DELETE("/", authMiddlewareForUser(ghost), handlers.DeleteUser)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
 }
