@@ -109,7 +109,14 @@ type Session struct {
 	transportMu  sync.RWMutex // guards transport reassignment during session resume
 	flows        map[string]*Flow
 	flowsMu      sync.RWMutex
-	logger       *zap.Logger
+	// closed is set by endSession under flowsMu, before it scans flows. Every
+	// path that publishes a flow into flows checks it under the same lock, so
+	// a flow is either visible to endSession's cancellation scan or refused.
+	closed bool
+	// testHookBeforePublish, when set (tests only), runs in the WMP FlowStart
+	// after the handler is built and before it is published.
+	testHookBeforePublish func()
+	logger                *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -472,6 +479,7 @@ func (s *Session) endSession() {
 			close(s.closeCh)
 		}
 		s.flowsMu.Lock()
+		s.closed = true
 		for _, flow := range s.flows {
 			if flow.Handler != nil {
 				flow.Handler.Cancel()
@@ -658,6 +666,11 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	// Check concurrent flow limit and register atomically to prevent race condition.
 	// We hold the lock from check through registration to ensure atomic check-and-add.
 	session.flowsMu.Lock()
+	if session.closed {
+		session.flowsMu.Unlock()
+		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Session closed")
+		return
+	}
 	pendingFlows := len(session.flows)
 	if pendingFlows >= MaxPendingFlowsPerSession {
 		session.flowsMu.Unlock()
@@ -691,7 +704,18 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
+	// Publish the handler under flowsMu and re-check closed: endSession may
+	// have scanned flows while Handler was still nil and so skipped Cancel.
+	session.flowsMu.Lock()
+	if session.closed {
+		session.flowsMu.Unlock()
+		handler.Cancel()
+		session.removeFlow(flowID, flow)
+		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Session closed")
+		return
+	}
 	flow.Handler = handler
+	session.flowsMu.Unlock()
 
 	defer session.removeFlow(flowID, flow)
 

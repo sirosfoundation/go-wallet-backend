@@ -1171,3 +1171,81 @@ func TestWMP_FlowEnd_PurgesUnfinishedChild(t *testing.T) {
 	_, ok := h.peekChildFlow("c2")
 	assert.True(t, ok)
 }
+
+type countingHandler struct {
+	executed atomic.Int32
+	cancels  atomic.Int32
+}
+
+func (h *countingHandler) Execute(context.Context, *FlowStartMessage) error {
+	h.executed.Add(1)
+	return nil
+}
+func (h *countingHandler) Cancel() { h.cancels.Add(1) }
+
+// endSession landing between handler construction and publication must make
+// FlowStart refuse the flow: nothing is registered, the handler is cancelled
+// and never executed, and the client gets an error.
+func TestWMP_FlowStart_EndSessionBetweenBuildAndPublish(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	h := &countingHandler{}
+	m.RegisterFlowHandler("counter", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+		return h, nil
+	})
+	sid := createWMPSession(t, a)
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+	sess.testHookBeforePublish = sess.endSession
+
+	resp, err := a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "counter", "late"))
+	require.NoError(t, err)
+	var r wmp.Response
+	require.NoError(t, json.Unmarshal(resp, &r))
+	require.NotNil(t, r.Error, "flow start on a closed session must fail")
+
+	sess.flowsMu.RLock()
+	_, present := sess.flows["late"]
+	sess.flowsMu.RUnlock()
+	assert.False(t, present)
+	assert.Equal(t, int32(1), h.cancels.Load())
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(0), h.executed.Load(), "rejected flow must not run")
+}
+
+// Stress: concurrent FlowStart and endSession never leave a registered,
+// uncancelled flow behind. Run with -race.
+func TestWMP_FlowStart_EndSessionStress(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		a, m := testWMPAdapter()
+		h := &blockingHandler{release: make(chan struct{})}
+		m.RegisterFlowHandler("blocker", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+			return h, nil
+		})
+		sid := createWMPSession(t, a)
+		a.mu.RLock()
+		sess := a.peers[sid].session
+		a.mu.RUnlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "blocker", "f"))
+		}()
+		go func() { defer wg.Done(); sess.endSession() }()
+		wg.Wait()
+
+		sess.flowsMu.RLock()
+		f, present := sess.flows["f"]
+		sess.flowsMu.RUnlock()
+		if present {
+			// Published before teardown, so teardown must have cancelled it.
+			assert.Equal(t, int32(1), h.cancels.Load(), "surviving flow was not cancelled")
+			_ = f
+		}
+		close(h.release)
+		cleanupWMP(a, m)
+	}
+}

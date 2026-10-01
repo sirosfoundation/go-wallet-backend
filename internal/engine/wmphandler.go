@@ -1566,6 +1566,9 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	// flow's completion delete the other's registration) and enforces the
 	// concurrent-flow limit. Callers hold flowsMu.
 	checkSlot := func() *wmp.RPCError {
+		if h.session.closed {
+			return wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "session closed"})
+		}
 		if _, dup := h.session.flows[flowID]; dup {
 			return wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "flow_id already in use"})
 		}
@@ -1604,7 +1607,11 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}
 	flow.Handler = handler
 
-	// Publish atomically with the authoritative duplicate/limit check.
+	if hook := h.session.testHookBeforePublish; hook != nil {
+		hook()
+	}
+
+	// Publish atomically with the authoritative duplicate/limit/closed check.
 	h.session.flowsMu.Lock()
 	if rpcErr := checkSlot(); rpcErr != nil {
 		h.session.flowsMu.Unlock()
