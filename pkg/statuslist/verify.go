@@ -13,12 +13,14 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"golang.org/x/net/idna"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
@@ -273,7 +275,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	// The signer trust decision is tenant-scoped (the tenant travels in ctx),
 	// so a cached, already trust-evaluated list is only reused within the
 	// tenant it was evaluated for.
-	key := trust.TenantFromContext(ctx) + "\x00" + uri
+	key := trust.TenantFromContext(ctx) + "\x00" + cacheURI(uri)
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && c.now().Before(e.expires) {
 		c.mu.Unlock()
@@ -647,6 +649,68 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	return parsedList{bits: lc.bits, list: list, expires: expires, iat: *lc.iat}, nil
 }
 
+// canonicalOrigin returns the serialized origin of uri in canonical form, so
+// equivalent spellings of one origin get one trust subject: lowercase scheme
+// and host, IDN hosts in their A-label (punycode) form, no trailing dot on
+// the host and no port when it is the scheme's default.
+func canonicalOrigin(uri string) (string, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", err
+	}
+	return originOf(u)
+}
+
+func originOf(u *url.URL) (string, error) {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimRight(strings.ToLower(u.Hostname()), ".")
+	if scheme == "" || host == "" {
+		return "", errors.New("no origin")
+	}
+	isIP := false
+	if _, err := netip.ParseAddr(host); err == nil {
+		isIP = true
+	}
+	if !isIP {
+		ascii, err := idna.Lookup.ToASCII(host)
+		if err != nil {
+			return "", err
+		}
+		host = ascii
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host, nil
+}
+
+// cacheURI is uri with its origin canonicalized (fragment dropped), so
+// spellings of one origin share a cache entry and flight. A uri whose origin
+// cannot be canonicalized is used as given.
+func cacheURI(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return uri
+	}
+	origin, err := originOf(u)
+	if err != nil {
+		return uri
+	}
+	c, err := url.Parse(origin)
+	if err != nil {
+		return uri
+	}
+	u.Scheme, u.Host, u.Fragment, u.RawFragment = c.Scheme, c.Host, "", ""
+	return u.String()
+}
+
 // evaluateSigner asks the trust service whether the list signer may publish
 // status lists. The subject is the list's iss claim, or the origin of its URI.
 func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust.KeyMaterial) error {
@@ -655,11 +719,11 @@ func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust
 	}
 	subject := iss
 	if subject == "" {
-		u, err := url.Parse(uri)
-		if err != nil || u.Host == "" {
+		origin, err := canonicalOrigin(uri)
+		if err != nil {
 			return fmt.Errorf("%w: no signer identity", ErrTrustUnavailable)
 		}
-		subject = u.Scheme + "://" + u.Host
+		subject = origin
 	}
 	trusted, err := c.trust(ctx, subject, km)
 	if err != nil {
