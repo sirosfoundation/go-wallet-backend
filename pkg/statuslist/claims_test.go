@@ -20,7 +20,7 @@ import (
 // unverifiable, never be read as absent.
 func TestParseJWT_PresentClaimsAreStrict(t *testing.T) {
 	key := newKey(t)
-	now := time.Now()
+	now := testEpoch
 	good := func(uri string) jwt.MapClaims {
 		return jwt.MapClaims{
 			"sub": uri, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
@@ -95,7 +95,7 @@ func TestParseJWT_PresentClaimsAreStrict(t *testing.T) {
 			defer srv.Close()
 			uri = srv.URL + "/statuslists/1"
 			var subject string
-			c := NewChecker(srv.Client(), false, func(_ context.Context, sub string, _ *trust.KeyMaterial) (bool, error) {
+			c := newTestChecker(srv.Client(), false, func(_ context.Context, sub string, _ *trust.KeyMaterial) (bool, error) {
 				subject = sub
 				return true, nil
 			})
@@ -139,7 +139,7 @@ func TestAccept_TTLLifetime(t *testing.T) {
 		{"min int64", ptr64(math.MinInt64), 0, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewChecker(nil, false, trustAll)
+			c := newTestChecker(nil, false, trustAll)
 			c.now = func() time.Time { return now }
 			iat := now.Add(-tc.iatAgo).Unix()
 			pl, err := c.accept(context.Background(), "https://x.example/l", &trust.KeyMaterial{}, listClaims{

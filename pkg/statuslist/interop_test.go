@@ -31,7 +31,7 @@ func serviceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values ma
 	t.Helper()
 	claims := jwt.MapClaims{
 		"sub": listURL,
-		"iat": time.Now().Unix(),
+		"iat": testEpoch.Unix(),
 		"ttl": 900,
 		"status_list": map[string]any{
 			"bits": 2,
@@ -55,14 +55,14 @@ func serviceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values ma
 func x5cServiceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values map[int]int, jwkMode string) (string, *trust.KeyMaterial) {
 	t.Helper()
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "status service"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+		NotBefore: testEpoch.Add(-time.Hour), NotAfter: testEpoch.Add(time.Hour)}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	x5c := []string{base64.StdEncoding.EncodeToString(der)}
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
-		"sub": listURL, "iat": time.Now().Unix(), "ttl": 900,
+		"sub": listURL, "iat": testEpoch.Unix(), "ttl": 900,
 		"status_list": map[string]any{"bits": 2, "lst": packList(t, 2, values, 64)},
 	})
 	tok.Header["typ"] = "statuslist+jwt"
@@ -113,7 +113,7 @@ func TestInterop_SirosStatusServiceShape(t *testing.T) {
 
 	// Kid only (no embedded key; the service is being updated to send x5c/jwk):
 	// unverifiable, never a verdict, even for a revoked index.
-	c := NewChecker(srv.Client(), false, trustAll)
+	c := newTestChecker(srv.Client(), false, trustAll)
 	err := c.Check(ctx, &Reference{Idx: 3, URI: uri})
 	if !errors.Is(err, ErrNoSignerKey) || errors.Is(err, ErrRevoked) {
 		t.Fatalf("kid-only service token must be unverifiable, got %v", err)
@@ -127,7 +127,7 @@ func TestInterop_SirosStatusServiceShape(t *testing.T) {
 	withX5C = true
 	var gotSubject string
 	var gotKM *trust.KeyMaterial
-	c = NewChecker(srv.Client(), false, func(_ context.Context, subject string, km *trust.KeyMaterial) (bool, error) {
+	c = newTestChecker(srv.Client(), false, func(_ context.Context, subject string, km *trust.KeyMaterial) (bool, error) {
 		gotSubject, gotKM = subject, km
 		return true, nil
 	})
@@ -165,7 +165,7 @@ func TestCheck_HeaderKeyPrecedence(t *testing.T) {
 		}))
 		uri = srv.URL + "/lists/1"
 		var gotType string
-		c := NewChecker(srv.Client(), false, func(_ context.Context, _ string, km *trust.KeyMaterial) (bool, error) {
+		c := newTestChecker(srv.Client(), false, func(_ context.Context, _ string, km *trust.KeyMaterial) (bool, error) {
 			gotType = km.Type
 			return true, nil
 		})
@@ -197,7 +197,7 @@ func TestCheck_PresentButMalformedJWKIsUnverifiable(t *testing.T) {
 		}))
 		uri = srv.URL + "/lists/1"
 		called := false
-		c := NewChecker(srv.Client(), false, func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+		c := newTestChecker(srv.Client(), false, func(context.Context, string, *trust.KeyMaterial) (bool, error) {
 			called = true
 			return true, nil
 		})
@@ -286,7 +286,7 @@ func TestCheck_SignerTrustDecisions(t *testing.T) {
 	// The context reaches the trust call (tenant propagation) and an iss
 	// claim, when present, is the subject.
 	c, uri, _ := serve(t, func(u string) string {
-		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iss": "https://status.example", "iat": time.Now().Unix(),
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iss": "https://status.example", "iat": testEpoch.Unix(),
 			"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
 		tok.Header["typ"] = "statuslist+jwt"
 		tok.Header["jwk"] = jwkOf(&key.PublicKey)
@@ -308,7 +308,7 @@ func TestCheck_SignerTrustDecisions(t *testing.T) {
 }
 
 func TestEvaluateSigner_NoIdentity(t *testing.T) {
-	c := NewChecker(nil, false, trustAll)
+	c := newTestChecker(nil, false, trustAll)
 	if err := c.evaluateSigner(context.Background(), "", "not a url", &trust.KeyMaterial{}); !errors.Is(err, ErrTrustUnavailable) {
 		t.Fatalf("got %v", err)
 	}
@@ -364,7 +364,7 @@ func TestCache_TTLMeasuredFromIat(t *testing.T) {
 	key := newKey(t)
 	mk := func(iatAgo time.Duration, ttl int64) func(string) string {
 		return func(u string) string {
-			tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": time.Now().Add(-iatAgo).Unix(), "ttl": ttl,
+			tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": testEpoch.Add(-iatAgo).Unix(), "ttl": ttl,
 				"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
 			tok.Header["typ"] = "statuslist+jwt"
 			tok.Header["jwk"] = jwkOf(&key.PublicKey)
@@ -385,12 +385,12 @@ func TestCache_TTLMeasuredFromIat(t *testing.T) {
 	// iat 100 s ago with ttl 200 s: cached, but only for the remaining ~100 s.
 	c, uri, hits = serve(t, mk(100*time.Second, 200), "")
 	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
-	c.now = func() time.Time { return time.Now().Add(150 * time.Second) }
+	c.now = func() time.Time { return testEpoch.Add(150 * time.Second) }
 	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if *hits != 2 {
 		t.Fatalf("cache outlived iat+ttl: %d fetches", *hits)
 	}
-	c.now = func() time.Time { return time.Now().Add(30 * time.Second) }
+	c.now = func() time.Time { return testEpoch.Add(30 * time.Second) }
 	c.cache = map[string]cachedList{}
 	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
@@ -405,14 +405,14 @@ func TestCache_TTLMeasuredFromIat(t *testing.T) {
 func TestCache_DeadlineNotExtendedBySlowTrust(t *testing.T) {
 	key := newKey(t)
 	c, uri, hits := serve(t, func(u string) string {
-		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": time.Now().Unix(), "ttl": 60,
+		tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": u, "iat": testEpoch.Unix(), "ttl": 60,
 			"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, nil, 64)}})
 		tok.Header["typ"] = "statuslist+jwt"
 		tok.Header["jwk"] = jwkOf(&key.PublicKey)
 		s, _ := tok.SignedString(key)
 		return s
 	}, "")
-	clock := time.Now()
+	clock := testEpoch
 	c.now = func() time.Time { return clock }
 	// The trust call takes 2 minutes of (fake) time, longer than the ttl.
 	c.trust = func(context.Context, string, *trust.KeyMaterial) (bool, error) {
@@ -460,7 +460,7 @@ func TestParseJWT_PresentX5CValidated(t *testing.T) {
 	hb, _ := base64.RawURLEncoding.DecodeString(leaf)
 	_ = json.Unmarshal(hb, &gh)
 
-	c := NewChecker(nil, false, trustAll)
+	c := newTestChecker(nil, false, trustAll)
 	for name, tc := range map[string]struct {
 		x5c    any
 		absent bool
@@ -514,7 +514,7 @@ func TestParseJWT_CritHeaderRejected(t *testing.T) {
 		s.FillBytes(sig[32:])
 		return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
 	}
-	c := NewChecker(nil, false, trustAll)
+	c := newTestChecker(nil, false, trustAll)
 	for name, tc := range map[string]struct {
 		crit   any
 		absent bool
@@ -564,7 +564,7 @@ func TestX5CLeafEncodingWithJWK(t *testing.T) {
 			}))
 			defer srv.Close()
 			uri = srv.URL + "/l"
-			c := NewChecker(srv.Client(), false, trustAll)
+			c := newTestChecker(srv.Client(), false, trustAll)
 			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
@@ -579,7 +579,7 @@ func TestX5CLeafEncodingWithJWK(t *testing.T) {
 func x5cTokenEncoded(t *testing.T, key *ecdsa.PrivateKey, listURL, jwkMode string, urlEnc bool) string {
 	t.Helper()
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "s"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+		NotBefore: testEpoch.Add(-time.Hour), NotAfter: testEpoch.Add(time.Hour)}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -589,7 +589,7 @@ func x5cTokenEncoded(t *testing.T, key *ecdsa.PrivateKey, listURL, jwkMode strin
 		enc = base64.RawURLEncoding.EncodeToString(der)
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
-		"sub": listURL, "iat": time.Now().Unix(), "ttl": 900,
+		"sub": listURL, "iat": testEpoch.Unix(), "ttl": 900,
 		"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, map[int]int{3: 1}, 64)},
 	})
 	tok.Header["typ"] = "statuslist+jwt"

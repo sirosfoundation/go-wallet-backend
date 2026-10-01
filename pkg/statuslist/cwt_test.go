@@ -52,7 +52,7 @@ type cwtOpts struct {
 func selfSigned(t *testing.T, key *ecdsa.PrivateKey) []byte {
 	t.Helper()
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "cwt signer"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+		NotBefore: testEpoch.Add(-time.Hour), NotAfter: testEpoch.Add(time.Hour)}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 		claims[cwtClaimIss] = o.iss
 	}
 	if !o.noIat {
-		claims[cwtClaimIat] = time.Now().Unix()
+		claims[cwtClaimIat] = testEpoch.Unix()
 	}
 	if !o.exp.IsZero() {
 		claims[cwtClaimExp] = o.exp.Unix()
@@ -197,12 +197,12 @@ func serveCWT(t *testing.T, mk func(uri string) []byte, ctype string, tr SignerT
 	}))
 	t.Cleanup(srv.Close)
 	uri = srv.URL + "/lists/1"
-	return NewChecker(srv.Client(), false, tr), uri, accept
+	return newTestChecker(srv.Client(), false, tr), uri, accept
 }
 
 func TestCWT_VerifyAndVerdicts(t *testing.T) {
 	ctx := context.Background()
-	future := time.Now().Add(time.Hour)
+	future := testEpoch.Add(time.Hour)
 	p384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	p521, _ := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
 
@@ -247,8 +247,8 @@ func TestCWT_Rejections(t *testing.T) {
 		{"forged signature", cwtOpts{badSig: true}, nil, "signature", nil},
 		{"wrong sub", cwtOpts{sub: "https://other/x"}, nil, "does not match", nil},
 		{"missing iat", cwtOpts{noIat: true}, nil, "no iat", nil},
-		{"expired", cwtOpts{exp: time.Now().Add(-time.Minute)}, nil, "expired", nil},
-		{"future iat", cwtOpts{claims: map[int64]any{cwtClaimIat: time.Now().Add(time.Hour).Unix()}}, nil, "issued in the future", nil},
+		{"expired", cwtOpts{exp: testEpoch.Add(-time.Minute)}, nil, "expired", nil},
+		{"future iat", cwtOpts{claims: map[int64]any{cwtClaimIat: testEpoch.Add(time.Hour).Unix()}}, nil, "issued in the future", nil},
 		{"bad bits", cwtOpts{bits: 3}, nil, "bits", nil},
 		{"unknown alg", cwtOpts{alg: -8}, nil, "unsupported COSE alg", nil},
 		{"alg/key mismatch", cwtOpts{alg: coseAlgES384}, nil, "does not match alg", nil},
@@ -304,7 +304,7 @@ func TestCWT_Rejections(t *testing.T) {
 // A present claim of the wrong CBOR type is rejected, never read as absent.
 func TestCWT_ClaimTypeViolations(t *testing.T) {
 	ctx := context.Background()
-	future := time.Now().Add(time.Hour).Unix()
+	future := testEpoch.Add(time.Hour).Unix()
 	tests := []struct {
 		name  string
 		o     cwtOpts
@@ -370,8 +370,8 @@ func TestCWT_NotBefore(t *testing.T) {
 		nbf     time.Time
 		wantErr bool
 	}{
-		{"future nbf rejected", time.Now().Add(time.Hour), true},
-		{"past nbf accepted", time.Now().Add(-time.Hour), false},
+		{"future nbf rejected", testEpoch.Add(time.Hour), true},
+		{"past nbf accepted", testEpoch.Add(-time.Hour), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, uri, _ := serveCWT(t, func(u string) []byte { return makeCWT(t, cwtOpts{sub: u, nbf: tc.nbf}) }, mediaTypeCWT, trustAll)
@@ -482,7 +482,7 @@ func TestContentTypeMalformedVsMissing(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 		uri = srv.URL + "/statuslists/1"
-		return NewChecker(srv.Client(), false, trustAll).Check(ctx, &Reference{Idx: 1, URI: uri})
+		return newTestChecker(srv.Client(), false, trustAll).Check(ctx, &Reference{Idx: 1, URI: uri})
 	}
 	// Absent header: the intentional JWT path.
 	if err := run(t, nil); err != nil {
@@ -585,7 +585,7 @@ func TestCWT_ExtensionAndDuplicateClaims(t *testing.T) {
 		// Hand-built so the key order and repeats are exact.
 		var b []byte
 		items := [][2]any{
-			{int64(cwtClaimSub), uri}, {int64(cwtClaimIat), time.Now().Unix()},
+			{int64(cwtClaimSub), uri}, {int64(cwtClaimIat), testEpoch.Unix()},
 			{int64(cwtClaimTTL), 900},
 			{int64(cwtClaimStatusList), map[int64]any{statusListKeyBits: 2, statusListKeyLst: lst}},
 		}
@@ -612,7 +612,7 @@ func TestCWT_ExtensionAndDuplicateClaims(t *testing.T) {
 	})
 	t.Run("duplicate keys rejected", func(t *testing.T) {
 		for name, extra := range map[string][2]any{
-			"integer": {int64(cwtClaimIat), time.Now().Unix()},
+			"integer": {int64(cwtClaimIat), testEpoch.Unix()},
 			"text":    {"dup", 1},
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -657,7 +657,7 @@ func signedCWTWithHeaders(t *testing.T, uri string, protExtra [][2]any, unprot [
 	t.Helper()
 	key := newKey(t)
 	payload := cborMap(
-		[2]any{int64(cwtClaimSub), uri}, [2]any{int64(cwtClaimIat), time.Now().Unix()},
+		[2]any{int64(cwtClaimSub), uri}, [2]any{int64(cwtClaimIat), testEpoch.Unix()},
 		[2]any{int64(cwtClaimTTL), 900},
 		[2]any{int64(cwtClaimStatusList), map[int64]any{statusListKeyBits: 2, statusListKeyLst: zlibBytes(t, 2, map[int]int{3: 1})}})
 	items := [][2]any{
@@ -732,7 +732,7 @@ func TestCWT_NullStandardStatusListIsNotAbsent(t *testing.T) {
 	build := func(std any, withStd bool) func(uri string) []byte {
 		return func(u string) []byte {
 			items := [][2]any{
-				{int64(cwtClaimSub), u}, {int64(cwtClaimIat), time.Now().Unix()},
+				{int64(cwtClaimSub), u}, {int64(cwtClaimIat), testEpoch.Unix()},
 				{int64(cwtClaimLegacyStatusList), legacy}, {int64(cwtClaimLegacyTTL), 900},
 			}
 			if withStd {
@@ -799,7 +799,7 @@ func TestCWT_TTLValues(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, e := range c.cache {
-					if rem := e.expires.Sub(time.Now()); rem <= 0 || rem > maxCacheTTL {
+					if rem := e.expires.Sub(testEpoch); rem <= 0 || rem > maxCacheTTL {
 						t.Fatalf("cached lifetime %v out of (0, %v]", rem, maxCacheTTL)
 					}
 				}

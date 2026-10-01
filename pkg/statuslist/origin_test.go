@@ -37,7 +37,7 @@ func TestCanonicalOrigin(t *testing.T) {
 
 func TestEvaluateSigner_CanonicalSubject(t *testing.T) {
 	var subjects []string
-	c := NewChecker(nil, false, func(_ context.Context, subject string, _ *trust.KeyMaterial) (bool, error) {
+	c := newTestChecker(nil, false, func(_ context.Context, subject string, _ *trust.KeyMaterial) (bool, error) {
 		subjects = append(subjects, subject)
 		return true, nil
 	})

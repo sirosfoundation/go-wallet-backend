@@ -60,7 +60,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func TestLoad_ConcurrentSameURIFetchesOnce(t *testing.T) {
 	key := newKey(t)
 	s := newSlowServer(t, func(sub string) string { return makeToken(t, tokenOpts{sub: sub, key: key}) })
-	c := NewChecker(s.srv.Client(), false, trustAll)
+	c := newTestChecker(s.srv.Client(), false, trustAll)
 	ref := &Reference{Idx: 1, URI: s.srv.URL + "/statuslists/1"}
 
 	const n = 20
@@ -93,7 +93,7 @@ func TestLoad_GlobalConcurrencyBound(t *testing.T) {
 	key := newKey(t)
 	s := newSlowServer(t, func(sub string) string { return makeToken(t, tokenOpts{sub: sub, key: key}) })
 	const limit, n = 3, 12
-	c := NewChecker(s.srv.Client(), false, trustAll).WithMaxConcurrentLoads(limit)
+	c := newTestChecker(s.srv.Client(), false, trustAll).WithMaxConcurrentLoads(limit)
 
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
@@ -123,7 +123,7 @@ func TestLoad_GlobalConcurrencyBound(t *testing.T) {
 func TestLoad_QueuedLoadHonoursContext(t *testing.T) {
 	key := newKey(t)
 	s := newSlowServer(t, func(sub string) string { return makeToken(t, tokenOpts{sub: sub, key: key}) })
-	c := NewChecker(s.srv.Client(), false, trustAll).WithMaxConcurrentLoads(1)
+	c := newTestChecker(s.srv.Client(), false, trustAll).WithMaxConcurrentLoads(1)
 
 	// Occupy the only slot.
 	hold := make(chan error, 1)
@@ -151,7 +151,7 @@ func TestLoad_QueuedLoadHonoursContext(t *testing.T) {
 func TestLoad_WaiterCancellationDoesNotPoisonOthers(t *testing.T) {
 	key := newKey(t)
 	s := newSlowServer(t, func(sub string) string { return makeToken(t, tokenOpts{sub: sub, key: key}) })
-	c := NewChecker(s.srv.Client(), false, trustAll)
+	c := newTestChecker(s.srv.Client(), false, trustAll)
 	ref := &Reference{Idx: 1, URI: s.srv.URL + "/statuslists/1"}
 
 	other := make(chan error, 1)
@@ -186,7 +186,7 @@ func TestLoad_WaiterCancellationDoesNotPoisonOthers(t *testing.T) {
 func TestLoad_LastWaiterLeavingCancelsFlight(t *testing.T) {
 	key := newKey(t)
 	s := newSlowServer(t, func(sub string) string { return makeToken(t, tokenOpts{sub: sub, key: key}) })
-	c := NewChecker(s.srv.Client(), false, trustAll)
+	c := newTestChecker(s.srv.Client(), false, trustAll)
 	ref := &Reference{Idx: 1, URI: s.srv.URL + "/statuslists/1"}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,9 +221,9 @@ func TestLoad_OutOfOrderCompletionKeepsNewerStatus(t *testing.T) {
 		sub := "https://" + r.Host + r.URL.Path
 		var tok string
 		if fetch.Add(1) == 1 { // older token: everything VALID
-			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: time.Now().Add(-10 * time.Second)})
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: testEpoch.Add(-10 * time.Second)})
 		} else { // newer token: index 1 revoked
-			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: time.Now().Add(-time.Second), values: map[int]int{1: 1}})
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: testEpoch.Add(-time.Second), values: map[int]int{1: 1}})
 		}
 		w.Header().Set("Content-Type", mediaTypeJWT)
 		_, _ = w.Write([]byte(tok))
@@ -240,7 +240,7 @@ func TestLoad_OutOfOrderCompletionKeepsNewerStatus(t *testing.T) {
 		}
 		return true, nil
 	}
-	c := NewChecker(srv.Client(), false, slowThenFast)
+	c := newTestChecker(srv.Client(), false, slowThenFast)
 	ref := &Reference{Idx: 1, URI: srv.URL + "/statuslists/1"}
 
 	ctxA, cancelA := context.WithCancel(context.Background())
@@ -271,7 +271,7 @@ func TestLoad_OutOfOrderCompletionKeepsNewerStatus(t *testing.T) {
 // the newer revision superseded.
 func TestLoad_OutOfOrderCompletionSameSecondKeepsNewerStatus(t *testing.T) {
 	key := newKey(t)
-	iat := time.Now().Add(-5 * time.Second).Truncate(time.Second) // shared by both revisions
+	iat := testEpoch.Add(-5 * time.Second).Truncate(time.Second) // shared by both revisions
 	var fetch atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sub := "https://" + r.Host + r.URL.Path
@@ -296,7 +296,7 @@ func TestLoad_OutOfOrderCompletionSameSecondKeepsNewerStatus(t *testing.T) {
 		}
 		return true, nil
 	}
-	c := NewChecker(srv.Client(), false, slowThenFast)
+	c := newTestChecker(srv.Client(), false, slowThenFast)
 	ref := &Reference{Idx: 1, URI: srv.URL + "/statuslists/1"}
 
 	ctxA, cancelA := context.WithCancel(context.Background())
@@ -323,8 +323,8 @@ func TestLoad_OutOfOrderCompletionSameSecondKeepsNewerStatus(t *testing.T) {
 }
 
 func TestStore_SameIatOlderGenerationNeverReplaces(t *testing.T) {
-	now := time.Now()
-	c := NewChecker(http.DefaultClient, false, trustAll)
+	now := testEpoch
+	c := newTestChecker(http.DefaultClient, false, trustAll)
 	c.now = func() time.Time { return now }
 	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 100, gen: 2}
 	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100, gen: 1}
@@ -336,8 +336,8 @@ func TestStore_SameIatOlderGenerationNeverReplaces(t *testing.T) {
 }
 
 func TestStore_NeverReplacesNewerVersion(t *testing.T) {
-	now := time.Now()
-	c := NewChecker(http.DefaultClient, false, trustAll)
+	now := testEpoch
+	c := newTestChecker(http.DefaultClient, false, trustAll)
 	c.now = func() time.Time { return now }
 	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 200}
 	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100}

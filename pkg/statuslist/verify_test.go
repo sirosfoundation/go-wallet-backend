@@ -62,7 +62,7 @@ func makeToken(t *testing.T, o tokenOpts) string {
 		o.typ = "statuslist+jwt"
 	}
 	if o.iat.IsZero() {
-		o.iat = time.Now()
+		o.iat = testEpoch
 	}
 	claims := jwt.MapClaims{
 		"sub": o.sub, "iat": o.iat.Unix(),
@@ -107,13 +107,13 @@ func serve(t *testing.T, mk func(uri string) string, ctype string) (*Checker, st
 	}))
 	t.Cleanup(srv.Close)
 	uri = srv.URL + "/statuslists/1"
-	return NewChecker(srv.Client(), false, trustAll), uri, hits
+	return newTestChecker(srv.Client(), false, trustAll), uri, hits
 }
 
 func TestCheck(t *testing.T) {
 	key := newKey(t)
 	ctx := context.Background()
-	future := time.Now().Add(time.Hour)
+	future := testEpoch.Add(time.Hour)
 
 	tests := []struct {
 		name    string
@@ -139,7 +139,7 @@ func TestCheck(t *testing.T) {
 			return tokenOpts{sub: u, key: key}
 		}, idx: 9999, wantErr: "out of range"},
 		{name: "expired", opts: func(u string) tokenOpts {
-			return tokenOpts{sub: u, exp: time.Now().Add(-time.Minute), key: key}
+			return tokenOpts{sub: u, exp: testEpoch.Add(-time.Minute), key: key}
 		}, idx: 1, wantErr: "expired"},
 		{name: "wrong sub", opts: func(u string) tokenOpts {
 			return tokenOpts{sub: "https://other/x", key: key}
@@ -199,7 +199,7 @@ func TestCheck_FetchFailuresFailClosed(t *testing.T) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c := NewChecker(srv.Client(), false, trustAll)
+	c := newTestChecker(srv.Client(), false, trustAll)
 	if err := c.Check(context.Background(), &Reference{Idx: 1, URI: srv.URL}); err == nil {
 		t.Fatal("http 500 must be an error")
 	}
@@ -211,7 +211,7 @@ func TestCheck_FetchFailuresFailClosed(t *testing.T) {
 func TestCheck_Cache(t *testing.T) {
 	key := newKey(t)
 	c, uri, hits := serve(t, func(u string) string {
-		return makeToken(t, tokenOpts{sub: u, key: key, exp: time.Now().Add(time.Hour)})
+		return makeToken(t, tokenOpts{sub: u, key: key, exp: testEpoch.Add(time.Hour)})
 	}, "")
 	for i := 0; i < 3; i++ {
 		if err := c.Check(context.Background(), &Reference{Idx: 1, URI: uri}); err != nil {
@@ -221,7 +221,7 @@ func TestCheck_Cache(t *testing.T) {
 	if *hits != 1 {
 		t.Fatalf("want 1 fetch, got %d", *hits)
 	}
-	c.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	c.now = func() time.Time { return testEpoch.Add(2 * time.Hour) }
 	_ = c.Check(context.Background(), &Reference{Idx: 1, URI: uri})
 	if *hits != 2 {
 		t.Fatalf("want refetch after ttl, got %d fetches", *hits)
@@ -327,7 +327,7 @@ func TestCheck_RequiresIat(t *testing.T) {
 func TestCheck_FutureIat(t *testing.T) {
 	ctx := context.Background()
 	key := newKey(t)
-	base := time.Now()
+	base := testEpoch
 	for _, tc := range []struct {
 		name    string
 		iat     time.Time
@@ -363,8 +363,8 @@ func TestCheck_NotBefore(t *testing.T) {
 		nbf     time.Time
 		wantErr bool
 	}{
-		{"future nbf rejected", time.Now().Add(time.Hour), true},
-		{"past nbf accepted", time.Now().Add(-time.Hour), false},
+		{"future nbf rejected", testEpoch.Add(time.Hour), true},
+		{"past nbf accepted", testEpoch.Add(-time.Hour), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, uri, _ := serve(t, func(u string) string { return makeToken(t, tokenOpts{sub: u, key: key, nbf: tc.nbf}) }, "")
@@ -431,10 +431,10 @@ func TestCheck_CacheKeyedByExactURI(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.Header().Set("Content-Type", mediaTypeJWT)
-		_, _ = w.Write([]byte(makeToken(t, tokenOpts{sub: srvURL(r) + "/l/1#a", key: key, exp: time.Now().Add(time.Hour)})))
+		_, _ = w.Write([]byte(makeToken(t, tokenOpts{sub: srvURL(r) + "/l/1#a", key: key, exp: testEpoch.Add(time.Hour)})))
 	}))
 	t.Cleanup(srv.Close)
-	c := NewChecker(srv.Client(), false, trustAll)
+	c := newTestChecker(srv.Client(), false, trustAll)
 	base := srv.URL + "/l/1"
 	ctx := context.Background()
 
@@ -464,3 +464,17 @@ func TestCheck_CacheKeyedByExactURI(t *testing.T) {
 }
 
 func srvURL(r *http.Request) string { return "https://" + r.Host }
+
+// testEpoch is the single fake "now" shared by token minting and the Checker
+// in every test: tokens are minted relative to it and newTestChecker pins the
+// Checker's clock to it, so no test depends on the wall clock or on where in
+// a second it happens to run. Tests advance time by replacing c.now with
+// testEpoch.Add(d), never by reading real time.
+var testEpoch = time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)
+
+// newTestChecker is NewChecker with the clock pinned to testEpoch.
+func newTestChecker(client *http.Client, allowHTTP bool, trustFn SignerTrust) *Checker {
+	c := NewChecker(client, allowHTTP, trustFn)
+	c.now = func() time.Time { return testEpoch }
+	return c
+}
