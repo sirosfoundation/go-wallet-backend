@@ -309,7 +309,7 @@ An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only.
 
 ### HSM-backed signing key
 
-`as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 and Ed25519 keys. `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
+`as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 keys only (the PKCS#11 signer cannot sign with Ed25519 or RSA; use `as.signing_key_path` for Ed25519). `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
 
 ### Go-live checklist for removing the legacy path
 

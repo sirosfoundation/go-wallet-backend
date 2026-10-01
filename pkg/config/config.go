@@ -60,7 +60,7 @@ type ASConfig struct {
 	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
 
 	// SigningKeyPKCS11 configures an HSM-backed (PKCS#11) AS signing key
-	// (ECDSA P-256/P-384 or Ed25519). Requires a binary built with
+	// (ECDSA P-256/P-384 only; Ed25519 and RSA are not supported by the PKCS#11 signer). Requires a binary built with
 	// -tags pkcs11. module_path, key_label and pin or pin_path are required.
 	// Mutually exclusive with SigningKeyPath.
 	SigningKeyPKCS11 *PKCS11SigningConfig `yaml:"signing_key_pkcs11,omitempty" envconfig:"SIGNING_KEY_PKCS11"`

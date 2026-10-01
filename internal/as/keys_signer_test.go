@@ -245,6 +245,22 @@ func TestNewConfiguredKeyManager(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, h.closed)
 
+	// Ed25519 via PKCS#11 -> refuse clearly and close (real backend cannot sign it)
+	_, edk, _ := ed25519.GenerateKey(rand.Reader)
+	he := &fakeHSM{inner: edk}
+	newPKCS11Signer = func(*signing.PKCS11Config) (crypto.Signer, error) { return he, nil }
+	_, err = newConfiguredKeyManager(&config.ASConfig{SigningKeyPKCS11: &config.PKCS11SigningConfig{ModulePath: "m"}})
+	assert.ErrorContains(t, err, "supports only ECDSA")
+	assert.ErrorContains(t, err, "Ed25519")
+	assert.True(t, he.closed)
+
+	// P-384 via PKCS#11 works
+	k384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	newPKCS11Signer = func(*signing.PKCS11Config) (crypto.Signer, error) { return &fakeHSM{inner: k384}, nil }
+	km384, err := newConfiguredKeyManager(&config.ASConfig{SigningKeyPKCS11: &config.PKCS11SigningConfig{ModulePath: "m"}})
+	require.NoError(t, err)
+	issueAndVerify(t, km384)
+
 	// success, config passed through
 	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	var got *signing.PKCS11Config
