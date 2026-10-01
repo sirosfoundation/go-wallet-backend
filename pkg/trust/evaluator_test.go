@@ -325,3 +325,15 @@ func TestEvaluatorManager_SupportedResourceTypes(t *testing.T) {
 		t.Errorf("SupportedResourceTypes() has %d types, want 2", len(types))
 	}
 }
+
+func TestEvaluatorManager_NoEvaluatorIsFailedNotDenial(t *testing.T) {
+	resp, err := NewEvaluatorManager().Evaluate(context.Background(), &EvaluationRequest{
+		SubjectID: "s", KeyType: ResourceTypeX5C,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Decision || !resp.Failed {
+		t.Errorf("want Decision=false Failed=true, got %+v", resp)
+	}
+}

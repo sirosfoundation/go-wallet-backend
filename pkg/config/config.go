@@ -255,6 +255,26 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	return c.DefaultTokenTTL
 }
 
+// StatusCheckMode selects how the engine treats credential status
+// (draft-ietf-oauth-status-list) when the wallet is about to present.
+type StatusCheckMode string
+
+const (
+	// StatusCheckOff performs no status lookup.
+	StatusCheckOff StatusCheckMode = "off"
+	// StatusCheckWarn (the default) looks status up and logs every problem,
+	// including a positively determined revocation, but never refuses a
+	// presentation.
+	StatusCheckWarn StatusCheckMode = "warn"
+	// StatusCheckEnforceRevoked refuses a presentation only when the
+	// credential is positively determined not to be valid; anything that
+	// prevents a determination is logged and the presentation proceeds.
+	StatusCheckEnforceRevoked StatusCheckMode = "enforce-revoked"
+	// StatusCheckStrict refuses a presentation unless the credential is
+	// positively determined to be valid.
+	StatusCheckStrict StatusCheckMode = "strict"
+)
+
 // DCQLConsentCheckMode selects how the engine treats a consent that does not
 // fit the DCQL query the backend sent to the client.
 type DCQLConsentCheckMode string
@@ -270,25 +290,94 @@ const (
 	DCQLConsentCheckEnforce DCQLConsentCheckMode = "enforce"
 )
 
-// Effective returns the mode to apply, treating the zero value as the default.
-func (m DCQLConsentCheckMode) Effective() DCQLConsentCheckMode {
-	if m == "" {
-		return DCQLConsentCheckWarn
-	}
-	return m
-}
-
-func (m DCQLConsentCheckMode) validate() error {
-	switch m.Effective() {
-	case DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce:
-		return nil
-	}
-	return fmt.Errorf("invalid presentation.dcql_consent_check %q: must be one of off, warn, enforce", string(m))
-}
-
 // PresentationConfig controls checks the engine applies to what the wallet is
 // about to present in an OpenID4VP flow.
 type PresentationConfig struct {
+	// StatusCheck controls the Token Status List (draft-ietf-oauth-status-list)
+	// check on presented JWT-shaped credentials (SD-JWT VC / JWT VC) that carry a
+	// `status.status_list` claim. Only those credentials are covered: a
+	// credential whose `status` object has no `status_list` member (another
+	// status mechanism) is not checked in any mode, strict included, while a
+	// null, empty or malformed `status`/`status_list` is treated as undetermined.
+	// The verifier, not the wallet, is responsible for the authoritative
+	// check, and a list may be reachable by the issuer and verifier but not
+	// by the wallet, so the default never blocks a presentation. Values:
+	// `off` (no lookup);
+	// `warn` (default: look up and log a warning for every problem, including
+	// a revoked credential, but never refuse; a revocation logs
+	// "credential status revoked");
+	// `enforce-revoked` (refuse with CREDENTIAL_REVOKED only when the list
+	// was fetched, verified (a JWT list: its JWS against the x5c/jwk in its
+	// header; a CWT list: its COSE_Sign1 against the x5chain in its headers),
+	// that signer key accepted by the go-trust issuer PDP, and the entry is
+	// non-zero, i.e. INVALID, SUSPENDED or application-specific; if
+	// the list cannot be fetched or verified, log a warning and proceed);
+	// `strict` (refuse unless the entry is positively VALID: an unreachable,
+	// unsigned, expired or malformed list also refuses, with
+	// CREDENTIAL_STATUS_UNDETERMINED - a neutral "could not be confirmed as
+	// valid" message - rather than CREDENTIAL_REVOKED, which is reserved for a
+	// confirmed revocation).
+	// Choose enforce-revoked or strict to have the wallet refuse. The signer
+	// is evaluated by go-trust with action.name `status-list-signer` (a
+	// negative is final; an error falls back to credential-issuer unless
+	// status_list_signer_fallback is false); the
+	// go-trust deployment must define a policy of that name or go-trust applies
+	// its default policy (docs/adr/012-trust-evaluation-architecture.md).
+	// A list without a verifiable, trusted signer key (no x5c/jwk/x5chain, no PDP
+	// configured, negative or failed trust decision) is unverifiable and never
+	// produces a verdict in any mode.
+	// mdoc credentials are not checked. Unknown values fail at startup.
+	// Env: WALLET_PRESENTATION_STATUS_CHECK
+	StatusCheck StatusCheckMode `yaml:"status_check" envconfig:"STATUS_CHECK"`
+
+	// StatusListSignerFallback controls what happens when go-trust cannot
+	// answer (transport or evaluation error) the `status-list-signer`
+	// evaluation of a status list's signer: when true (default) the backend
+	// asks once more as `credential-issuer` and trusts the signer if that is
+	// positive; when false the error stands and the list is unverifiable. A
+	// genuine negative decision to `status-list-signer` is always final and
+	// never falls back. Env: WALLET_PRESENTATION_STATUS_LIST_SIGNER_FALLBACK
+	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
+
+	// StatusCheckBudgetSeconds bounds the TOTAL time the status checks of one
+	// presentation may take, across all presented credentials (they run one
+	// after another; each can otherwise spend the outbound HTTP timeout plus
+	// trust-evaluation timeouts on an unreachable list, which with enough
+	// credentials would exhaust the flow deadline and stop even warn mode from
+	// submitting). A check in flight is cut off when the budget expires and the
+	// remaining checks are skipped, each treated as "status could not be
+	// determined": warn and enforce-revoked log a warning and proceed, strict
+	// refuses (fails closed) with CREDENTIAL_STATUS_UNDETERMINED. Seconds;
+	// 0 (default) means 30. Keep it well below the flow timeout. Must be
+	// between 0 and MaxTrustCacheTTLSeconds (the largest seconds value a
+	// time.Duration holds); a larger value would wrap negative.
+	// Env: WALLET_PRESENTATION_STATUS_CHECK_BUDGET_SECONDS
+	StatusCheckBudgetSeconds int `yaml:"status_check_budget_seconds" envconfig:"STATUS_CHECK_BUDGET_SECONDS"`
+
+	// StatusListMinEntries rejects a Token Status List that holds fewer than
+	// this many entries once inflated (bytes*8/bits), before its signer is
+	// evaluated; such a list is unverifiable (strict refuses, the other modes
+	// log and proceed). Default 0: no minimum. The Token Status List draft
+	// (-21) sets no receiver-side minimum, it only notes that a larger list
+	// gives better herd privacy (a privacy recommendation for the Status
+	// Issuer), and real publishers emit smaller lists (the SIROS status
+	// service defaults to 100000 entries). Set e.g. 131072 (16 KiB at 1
+	// bit) only if every status issuer you rely on publishes at least that.
+	// Must not be negative.
+	// Env: WALLET_PRESENTATION_STATUS_LIST_MIN_ENTRIES
+	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
+
+	// StatusListMaxConcurrentLoads bounds how many Token Status Lists the
+	// backend fetches and inflates at the same time, across all presentations.
+	// Each load can hold up to 36 MiB (4 MiB token plus 32 MiB inflated list),
+	// which the list cache limit does not cover, so without this bound a burst
+	// of presentations could exhaust memory. Loads of the same list are shared
+	// regardless. A check waiting for a slot gives up when its status check
+	// budget expires (status undetermined). 0 (default) means 8. Must not be
+	// negative.
+	// Env: WALLET_PRESENTATION_STATUS_LIST_MAX_CONCURRENT_LOADS
+	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
+
 	// DCQLConsentCheck compares the user's consent (selected credential query
 	// ids and disclosed claims) with the DCQL query the backend sent to the
 	// client, before any signing. The frontend is not trusted to have
@@ -303,6 +392,39 @@ type PresentationConfig struct {
 	// contents of the resulting vp_token. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
 	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
+}
+
+// Effective returns the mode to apply, treating the zero value as the default.
+func (m StatusCheckMode) Effective() StatusCheckMode {
+	if m == "" {
+		return StatusCheckWarn
+	}
+	return m
+}
+
+// validate rejects unknown modes so a typo cannot silently weaken the check.
+func (m StatusCheckMode) validate() error {
+	switch m.Effective() {
+	case StatusCheckOff, StatusCheckWarn, StatusCheckEnforceRevoked, StatusCheckStrict:
+		return nil
+	}
+	return fmt.Errorf("invalid presentation.status_check %q: must be one of off, warn, enforce-revoked, strict", string(m))
+}
+
+// Effective returns the mode to apply, treating the zero value as the default.
+func (m DCQLConsentCheckMode) Effective() DCQLConsentCheckMode {
+	if m == "" {
+		return DCQLConsentCheckWarn
+	}
+	return m
+}
+
+func (m DCQLConsentCheckMode) validate() error {
+	switch m.Effective() {
+	case DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce:
+		return nil
+	}
+	return fmt.Errorf("invalid presentation.dcql_consent_check %q: must be one of off, warn, enforce", string(m))
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -1988,7 +2110,7 @@ func defaultConfig() *Config {
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
-		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		Presentation: PresentationConfig{StatusCheck: StatusCheckWarn, StatusListSignerFallback: true, DCQLConsentCheck: DCQLConsentCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -2316,6 +2438,23 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.Presentation.StatusCheck.validate(); err != nil {
+		return err
+	}
+	if c.Presentation.StatusCheckBudgetSeconds < 0 {
+		return fmt.Errorf("invalid presentation.status_check_budget_seconds %d: must not be negative", c.Presentation.StatusCheckBudgetSeconds)
+	}
+	// It is multiplied by time.Second; past the int64 nanosecond range that
+	// wraps negative and the budget would silently fall back to the default.
+	if c.Presentation.StatusCheckBudgetSeconds > MaxTrustCacheTTLSeconds {
+		return fmt.Errorf("invalid presentation.status_check_budget_seconds %d: must not exceed %d (a larger value overflows time.Duration)", c.Presentation.StatusCheckBudgetSeconds, MaxTrustCacheTTLSeconds)
+	}
+	if c.Presentation.StatusListMinEntries < 0 {
+		return fmt.Errorf("invalid presentation.status_list_min_entries %d: must not be negative", c.Presentation.StatusListMinEntries)
+	}
+	if c.Presentation.StatusListMaxConcurrentLoads < 0 {
+		return fmt.Errorf("invalid presentation.status_list_max_concurrent_loads %d: must not be negative", c.Presentation.StatusListMaxConcurrentLoads)
+	}
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
 		return err
 	}

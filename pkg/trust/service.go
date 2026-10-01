@@ -113,6 +113,13 @@ type TrustInfo struct {
 	Framework    string   `json:"framework,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
 	Certificates []string `json:"certificates,omitempty"`
+	// Action names the AuthZEN action whose positive decision produced this
+	// result; set only by EvaluateStatusListSigner.
+	Action string `json:"action,omitempty"`
+	// EvaluationFailed is true when no decision could be had (transport or
+	// evaluation error), as opposed to the PDP answering "no". Trusted is
+	// false in both cases; callers must use this field, not Reason text.
+	EvaluationFailed bool `json:"evaluation_failed,omitempty"`
 }
 
 // EvaluatorFactory creates a TrustEvaluator for a given PDP endpoint.
@@ -295,6 +302,115 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 	})
 }
 
+// StatusListSignerAction is the AuthZEN action.name sent when evaluating the
+// signer of a Token Status List (draft-ietf-oauth-status-list). It is distinct
+// from credential-issuer on purpose: being trusted to issue credentials is not
+// the same as being trusted to publish their revocation status, and an
+// external status service signs with its own key.
+//
+// The go-trust deployment MUST define a policy with exactly this name.
+// go-trust's PolicyManager.GetPolicy falls back to the DEFAULT policy for an
+// unknown action.name, so without it the signer is silently judged by the
+// default policy. See docs/adr/012-trust-evaluation-architecture.md
+// ("AuthZEN actions used by go-wallet-backend").
+const StatusListSignerAction = "status-list-signer"
+
+// FrameworkNone is TrustInfo.Framework when no PDP endpoint is configured.
+const FrameworkNone = "none"
+
+// StatusListSignerFallbackAction is the second action tried when the
+// status-list-signer evaluation errors (and the fallback is enabled).
+const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
+
+// evalFailedReasonPrefix starts TrustInfo.Reason (human-readable only) when
+// the evaluation itself failed; TrustInfo.EvaluationFailed is the signal.
+const evalFailedReasonPrefix = "Trust evaluation failed"
+
+// statusEvalFailedClass is the only description of a failed status-list
+// signer evaluation that is logged: the raw error and PDP reason may carry
+// token-controlled text.
+const statusEvalFailedClass = "evaluation_failed"
+
+// EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
+// x5c chain or jwk from a status list's header) may sign status lists for
+// subject (the list's iss claim, else the origin of the list URI).
+//
+// The first call sends action.name "status-list-signer" (Role is left empty so
+// the explicit action is used, as for EvaluateFIDO2Attestation). Its outcome:
+//
+//   - positive: trusted, no further call;
+//   - genuine negative: FINAL, the signer is untrusted and no second call is
+//     made ("deny is deny");
+//   - no PDP configured (Framework "none"): untrusted, no second call (it
+//     could not differ);
+//   - error (transport or evaluation failure): if fallbackOnError, a second
+//     call is made as the credential-issuer role via EvaluateIssuer, with the
+//     same subject, key material, endpoint and tenant, and the signer is
+//     trusted if that is positive. A negative there is a negative; an error
+//     there leaves the first error. With fallbackOnError false, the error
+//     stands and no second call is made.
+//
+// TrustInfo.Action names the action that produced a positive result, so
+// callers can tell a status-list-signer decision from a fallback one. A
+// negative and an error remain distinguishable through
+// TrustInfo.EvaluationFailed (true for an error); the no-PDP case is
+// identified by Framework == FrameworkNone. Callers must never classify an
+// outcome from the human-readable Reason text.
+//
+// The endpoint is resolved like EvaluateIssuer's (session override, then the
+// per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
+// issuer-side entity, and no separate status-list PDP setting exists.
+func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial, fallbackOnError bool) (*TrustInfo, error) {
+	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
+	first, err := s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
+		action:      StatusListSignerAction,
+		keyMaterial: keyMaterial,
+		logLabel:    "status_list_signer",
+		redact:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if first.Trusted {
+		first.Action = StatusListSignerAction
+		s.logger.Debug("status list signer trusted",
+			zap.String("signer_trust_action", StatusListSignerAction))
+		return first, nil
+	}
+	if first.Framework == FrameworkNone {
+		return first, nil
+	}
+	if !first.EvaluationFailed {
+		s.logger.Warn("status list signer denied",
+			zap.String("reason", "signer_untrusted_denied"),
+			zap.String("signer_trust_action", StatusListSignerAction))
+		return first, nil
+	}
+	if !fallbackOnError {
+		return first, nil
+	}
+
+	second, err := s.evaluate(ctx, subject, endpoint, RoleCredentialIssuer, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "issuer",
+		redact:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if second.Trusted {
+		second.Action = StatusListSignerFallbackAction
+		s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
+			zap.String("signer_trust_action", StatusListSignerFallbackAction),
+			zap.String("status_list_signer_error", statusEvalFailedClass))
+		return second, nil
+	}
+	if !second.EvaluationFailed {
+		return second, nil
+	}
+	return first, nil
+}
+
 // evaluateOptions bundles evaluate's request-shaping parameters beyond the
 // required subject/endpoint/role, keeping evaluate's own parameter count
 // down (each field here used to be its own positional parameter).
@@ -317,6 +433,10 @@ type evaluateOptions struct {
 	// EvaluationRequest.Context (see EvaluateVerifierWithContext's doc
 	// comment for why this exists).
 	evalContext map[string]interface{}
+	// redact keeps the subject, evaluator errors and PDP reasons out of this
+	// call's log lines (they are token-controlled); only an error class is
+	// logged.
+	redact bool
 }
 
 // evaluate is the shared implementation for issuer, verifier, and FIDO2
@@ -326,6 +446,12 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	keyMaterial := opts.keyMaterial
 	logLabel := opts.logLabel
 	evalContext := opts.evalContext
+	subjectField := func() []zap.Field {
+		if opts.redact {
+			return nil
+		}
+		return []zap.Field{zap.String(logLabel, subjectID)}
+	}
 
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
@@ -336,7 +462,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		// This prevents automatic trust bypass when trust evaluation is not properly set up
 		return &TrustInfo{
 			Trusted:   false,
-			Framework: "none",
+			Framework: FrameworkNone,
 			Reason:    "Trust evaluation not configured - no PDP endpoint available",
 		}, nil
 	}
@@ -374,8 +500,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 			req.Key = keyMaterial.X5C
 			s.logger.Debug("Trust evaluation with x5c",
-				zap.String(logLabel, subjectID),
-				zap.Int("cert_count", len(keyMaterial.X5C)))
+				append(subjectField(), zap.Int("cert_count", len(keyMaterial.X5C)))...)
 		case "jwk":
 			// Normalize JWKS/JWK into a flat slice of individual JWK objects
 			normalized := NormalizeJWKS(keyMaterial.JWK)
@@ -387,8 +512,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 			req.Key = normalized
 			s.logger.Debug("Trust evaluation with JWK",
-				zap.String(logLabel, subjectID),
-				zap.Int("key_count", len(normalized)))
+				append(subjectField(), zap.Int("key_count", len(normalized)))...)
 		case "":
 			// Type not set but key material provided; try to infer
 			if len(keyMaterial.X5C) > 0 {
@@ -403,20 +527,42 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 		}
 	} else {
-		s.logger.Debug("Trust evaluation resolution-only",
-			zap.String(logLabel, subjectID))
+		s.logger.Debug("Trust evaluation resolution-only", subjectField()...)
 	}
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
 	if err != nil {
-		s.logger.Warn("Trust evaluation error",
-			zap.String(logLabel, subjectID),
-			zap.Error(err))
+		if opts.redact {
+			s.logger.Warn("Trust evaluation error", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation error",
+				zap.String(logLabel, subjectID),
+				zap.Error(err))
+		}
 		return &TrustInfo{
-			Trusted:   false,
-			Framework: "authzen",
-			Reason:    "Trust evaluation failed: " + err.Error(),
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + err.Error(),
+			EvaluationFailed: true,
+		}, nil
+	}
+
+	if resp.Failed {
+		// The evaluator reports a PDP/build failure in-band (no Go error):
+		// that is a failed evaluation, not a denial.
+		if opts.redact {
+			s.logger.Warn("Trust evaluation failed", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation failed",
+				zap.String(logLabel, subjectID),
+				zap.String("reason", resp.Reason))
+		}
+		return &TrustInfo{
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + resp.Reason,
+			EvaluationFailed: true,
 		}, nil
 	}
 
@@ -467,6 +613,11 @@ func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint stri
 	resp, err := resolver.Resolve(ctx, did)
 	if err != nil {
 		return nil, fmt.Errorf("DID resolution failed: %w", err)
+	}
+
+	if resp.Failed {
+		// In-band evaluator failure (PDP outage etc.): not a denial.
+		return nil, fmt.Errorf("DID resolution failed: %s", resp.Reason)
 	}
 
 	if !resp.Decision {

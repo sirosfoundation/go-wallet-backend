@@ -534,6 +534,128 @@ For `x509_san_dns` client_id_scheme, the PDP is responsible for validating that
 the certificate's SAN DNS names match the `client_id`. The backend extracts
 key material but delegates all policy decisions to the PDP.
 
+## AuthZEN actions used by go-wallet-backend (contract with go-trust)
+
+go-trust selects a policy by `action.name` (`policies.policies.<name>` in its
+config). This section lists every action the backend sends, verified against
+`pkg/trust` (`Service.evaluate`, `pkg/trust/authzen`), `internal/engine` and
+`internal/api/authzen_proxy.go`. In every case the AuthZEN request is
+`subject {type: "key", id: <subject>}`, `resource {type, id: <subject>, key}`,
+optional `action {name}` and `context`, and the tenant is carried in the
+`X-Tenant-ID` header (`trust.TenantTransport`, from `trust.ContextWithTenant`).
+Inside the backend `Role` maps to `action.name`; an explicit action is used only
+when `Role` is empty.
+
+| Call site (backend) | action.name | subject.id | resource.type / key | context | decision=true means |
+|---|---|---|---|---|---|
+| `Service.EvaluateIssuer` (engine OID4VCI, `internal/engine/oid4vci.go`) | `credential-issuer` | issuer identifier | `x5c` (chain, base64 DER strings) or `jwk` (flat list of JWKs); none = resolution-only | `credential_type` (comma-separated vct/doctype list) when set | the key/chain is trusted for this issuer to issue credentials |
+| `Service.EvaluateVerifier` / `EvaluateVerifierWithContext` (engine OID4VP) | `credential-verifier` | verifier `client_id` | `x5c` or `jwk` as above | `client_id_scheme`, `response_uri`, `redirect_uri`, `trust_chain` (OIDF), attestation fields when present | the key is trusted for this verifier to request credentials |
+| `Service.EvaluateFIDO2Attestation` (`internal/service/fido2_attestation.go`) | `wscd-previewsign-provision` (`trust.FIDO2AttestationAction`) | authenticator AAGUID | `x5c` (attestation chain) | none | the AAGUID/chain is an acceptable hardware key (global PDP, no per-flow override) |
+| `Service.EvaluateStatusListSigner` (engine OID4VP status check) | `status-list-signer` (`trust.StatusListSignerAction`), then, only if that call errors, `credential-issuer` (see below) | list `iss` claim, else origin of the list URI (`scheme://host[:port]`) | `x5c` (JWS `x5c` / COSE `x5chain`, base64 DER, leaf first) or `jwk` | none | see below |
+| `Service.ResolveDID` (engine OID4VP JAR signed by a DID) | none | the DID | no type/key (resolution-only) | none | the DID resolved; the DID document comes back in `trust_metadata` |
+| `POST /v1/evaluate` (authzen proxy) | forwarded unchanged from the caller (`getActionName` only logs it) | as supplied | as supplied | as supplied | as the PDP defines it |
+| `POST /v1/resolve` for `url` subjects (`resolveURLSubject`) | `credential-issuer`, with `action.parameters.credential_types` when supplied | issuer URL | `x5c`/`jwk`, or `resolution` when no key could be extracted | none | as `credential-issuer` above |
+| `POST /v1/resolve` authorization pre-check (`Resolve`) | resource type (e.g. `resolution`, `credential_issuer`) as action name, only when `credential_types` are supplied | subject id | resource type as above | none | evaluated by the local SPOCP authorizer, not sent to go-trust |
+
+The roles `wallet_provider` and `pid-provider` exist as constants in
+`pkg/trust` (aliases of go-trust's `trustapi`) but no backend code path sends
+them today.
+
+### `status-list-signer`
+
+Sent when the wallet has verified the signature of a Token Status List (JWT or
+CWT form) and must decide whether the signing key may publish status lists:
+
+```
+POST /evaluation            X-Tenant-ID: <tenant>
+{ "subject":  {"type": "key", "id": "https://status.example"},
+  "resource": {"type": "x5c", "id": "https://status.example", "key": ["<base64 DER leaf>", "<base64 DER CA>"]},
+  "action":   {"name": "status-list-signer"} }
+```
+
+- `subject.id` is the list's `iss` claim if it has one, otherwise the origin of
+  the list URI. `resource.type` is `x5c` (preferred; the list carries `x5c` in
+  the JWS header or `x5chain` in the COSE headers) or `jwk`. A list with no key
+  material is never sent; it is unverifiable.
+- **A positive decision MUST mean**: the key or chain chains to a trust anchor
+  that is authorised to sign revocation status lists for that origin/issuer.
+  It must not merely mean "is a credential issuer": a credential issuer key
+  is not thereby a status list signer, and the service that signs lists is
+  normally a different party with a different key.
+- **Typed result.** `TrustInfo.EvaluationFailed` (not the `Reason` text) says
+  the evaluation errored rather than the PDP answering no; `TrustInfo.Framework ==
+  trust.FrameworkNone` says no PDP is configured. The backend never inspects
+  PDP-supplied reason text for control flow.
+- **Caching.** Verified lists are cached per (tenant, list URI), because the trust
+  decision is tenant-scoped; a list is cached until `iat + ttl` (capped by `exp`
+  and one hour), or not at all if already past it. The cache is bounded by entry
+  count and by total inflated bytes (64 MiB).
+- **Call sequence ("deny is deny").** `EvaluateStatusListSigner` first sends
+  `status-list-signer`:
+  - positive: the signer is trusted, no second call;
+  - **genuine negative: final**, the signer is untrusted and no second call is made
+    (logged as a warning with `reason=signer_untrusted_denied` and
+    `signer_trust_action=status-list-signer`);
+  - no PDP configured (Framework `none`): untrusted, no second call;
+  - **error** (transport or evaluation failure): if
+    `presentation.status_list_signer_fallback` is true (the default), a second
+    request is sent as `credential-issuer` (`EvaluateIssuer`) with the same subject,
+    key material, endpoint and tenant, and the signer is trusted if that is
+    positive; a negative there is a negative, an error there leaves the first error.
+    With the switch false the error stands, no second call is made and the list is
+    unverifiable.
+  Trust via the fallback logs the warning `status list signer trusted via
+  credential-issuer fallback; ...` with `signer_trust_action=credential-issuer` and
+  the first call's error; a positive first call logs `signer_trust_action=status-list-signer`
+  (debug). A negative and an error stay distinguishable in the result. The fallback
+  therefore only covers PDP unavailability or evaluation errors on the new action
+  (for example an older go-trust that rejects it); it never overrides a decision.
+- **Endpoint**: the issuer PDP resolution of `EvaluateIssuer` (session override,
+  `trust.issuer.pdp_url`, then the global `trust.pdp_url`); there is no separate
+  status-list PDP setting.
+- **Backend fail-closed semantics**: no PDP configured, a transport or evaluation
+  error, or a negative decision all leave the list *unverifiable*; an unverifiable
+  list never produces a revoked verdict. What that means for the presentation
+  follows the `presentation.status_check` mode table (warn and enforce-revoked
+  proceed with a warning, strict refuses).
+
+#### Default-policy fallback hazard
+
+go-trust's `PolicyManager.GetPolicy(actionName)` returns the **default policy**
+when `action.name` matches no configured policy
+(`go-trust/pkg/registry/policy.go`). If the deployment has no policy named
+`status-list-signer`, every list signer is judged by the default policy (for
+example the `credential-verifier` policy). That can produce a positive decision
+for a key that must never sign revocation data, **or a negative one**, and since
+a negative is now final, a missing policy can also DENY every list signer.
+**A go-trust deployment MUST define an explicit policy named
+`status-list-signer`**; the backend cannot detect its absence. Because a
+status-list-signer policy's decision is final, it can both widen and narrow trust
+relative to the `credential-issuer` policy. An
+example (keys from `go-trust/pkg/config`; the registry name is operator-defined
+and must refer to a registry that holds only the anchors allowed to sign status
+lists):
+
+```yaml
+policies:
+  default_policy: credential-verifier
+  policies:
+    status-list-signer:
+      description: "Keys allowed to sign Token Status Lists"
+      registries:
+        - status-list-signers      # a registry whose anchors are status-list signers only
+      constraints:
+        require_key_binding: true  # the key must be validated, not just the name resolved
+        allowed_key_types: ["x5c", "jwk"]
+```
+
+Compatibility: a go-trust version or deployment without this policy applies its
+default policy to the action (there is no error), with the consequences above.
+The `credential-issuer` fallback does not help there, since it happens only on
+errors. Roll the policy out to go-trust before enabling
+`presentation.status_check: enforce-revoked` or `strict`; with the default `warn`
+mode a wrong trust decision can only affect log output.
+
 ## Related
 
 - ADR-003: AuthZEN Integration

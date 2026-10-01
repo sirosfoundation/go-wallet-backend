@@ -2645,6 +2645,78 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
+	for _, mode := range []StatusCheckMode{"", StatusCheckOff, StatusCheckWarn, StatusCheckEnforceRevoked, StatusCheckStrict} {
+		if err := mode.validate(); err != nil {
+			t.Errorf("%q: %v", mode, err)
+		}
+	}
+	if StatusCheckMode("").Effective() != StatusCheckWarn || StatusCheckStrict.Effective() != StatusCheckStrict {
+		t.Error("Effective() must default the zero value to warn and keep explicit values")
+	}
+	for _, bad := range []StatusCheckMode{"true", "enforce", "STRICT", "fail-closed"} {
+		err := bad.validate()
+		if err == nil || !strings.Contains(err.Error(), "presentation.status_check") {
+			t.Errorf("%q: want a presentation.status_check error, got %v", bad, err)
+		}
+	}
+	if !defaultConfig().Presentation.StatusListSignerFallback {
+		t.Error("status_list_signer_fallback must default to true")
+	}
+	if defaultConfig().Presentation.StatusCheck != StatusCheckWarn {
+		t.Error("default must be warn")
+	}
+
+	cfg := &Config{
+		Server:       ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		Storage:      StorageConfig{Type: "memory"},
+		JWT:          JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		Presentation: PresentationConfig{StatusCheck: "bogus"},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check") {
+		t.Errorf("Validate must reject an unknown status_check, got %v", err)
+	}
+	cfg.Presentation.StatusCheck = StatusCheckWarn
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("warn rejected: %v", err)
+	}
+	if defaultConfig().Presentation.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check_budget_seconds") {
+		t.Errorf("Validate must reject a negative status_check_budget_seconds, got %v", err)
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check_budget_seconds") {
+		t.Errorf("Validate must reject an overflowing status_check_budget_seconds, got %v", err)
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("the maximum status_check_budget_seconds rejected: %v", err)
+	}
+	if d := time.Duration(cfg.Presentation.StatusCheckBudgetSeconds) * time.Second; d <= 0 {
+		t.Errorf("maximum budget wraps negative: %v", d)
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = 0
+	cfg.Presentation.StatusListMinEntries = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_min_entries") {
+		t.Errorf("Validate must reject a negative status_list_min_entries, got %v", err)
+	}
+	cfg.Presentation.StatusListMinEntries = 131072
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("131072 rejected: %v", err)
+	}
+	cfg.Presentation.StatusListMaxConcurrentLoads = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_max_concurrent_loads") {
+		t.Errorf("Validate must reject a negative status_list_max_concurrent_loads, got %v", err)
+	}
+	cfg.Presentation.StatusListMaxConcurrentLoads = 4
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("4 rejected: %v", err)
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {
