@@ -153,7 +153,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 
 // understoodHeaders are the header labels this verifier processes; a label
 // listed in crit must be one of them (RFC 9052 section 3.1).
-var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrCrit: true, coseHdrTyp: true, coseHdrX5Chain: true}
+var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrTyp: true, coseHdrX5Chain: true}
 
 // checkHeaders enforces the COSE header rules that the signature does not:
 // a label appears in at most one bucket (RFC 9052 section 3), crit is
@@ -176,11 +176,21 @@ func checkHeaders(prot, unprot map[int64]any) error {
 	if !ok || len(crit) == 0 {
 		return errors.New("crit must be a non-empty array")
 	}
+	seen := make(map[int64]bool, len(crit))
 	for _, e := range crit {
 		label, ok := toInt64(e)
 		if !ok {
 			return fmt.Errorf("critical header %v is not understood", e)
 		}
+		// RFC 9052 section 3.1: crit must not list itself, and each
+		// critical label occurs once.
+		if label == coseHdrCrit {
+			return errors.New("crit must not list itself")
+		}
+		if seen[label] {
+			return fmt.Errorf("critical header %d is listed more than once", label)
+		}
+		seen[label] = true
 		if !understoodHeaders[label] {
 			return fmt.Errorf("critical header %d is not understood", label)
 		}
