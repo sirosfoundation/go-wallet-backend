@@ -37,33 +37,13 @@ func tokenIssuer(cfg *config.Config) string {
 //
 // The returned validator is not started; callers Start() it.
 //
-// NOTE for the go-tokenauth v0.5.0 bump (#414) and the audience-list change
-// (#429): this is the only function that needs to change (Audiences must be
-// non-empty and also apply to legacy tokens there, so Legacy.Issuers must be
-// set to the jwt issuer and the caller-specific audience list must include
-// rp_id for legacy tokens).
+// Legacy token settings come from legacyValidatorConfig (providers.go).
 func buildTokenValidator(cfg *config.Config, audiences []string, rev revocation.Checker) *tokenvalidator.Validator {
-	legacySecret := []byte(cfg.JWT.Secret)
 	return tokenvalidator.New(tokenvalidator.Config{
-		JWKSURL:   tokenJWKSURL(cfg),
-		Issuer:    tokenIssuer(cfg),
-		Audiences: audiences,
-		Legacy: tokenvalidator.LegacyConfig{
-			// Never validate HMAC tokens against an empty key.
-			Enabled:    cfg.AS.Legacy.Enabled && len(legacySecret) > 0,
-			HMACSecret: legacySecret,
-			// Legacy tokens are issued with jwt.issuer; without this
-			// go-tokenauth v0.4.0 accepts any issuer for a valid HMAC.
-			Issuers: legacyIssuers(cfg),
-		},
+		JWKSURL:    tokenJWKSURL(cfg),
+		Issuer:     tokenIssuer(cfg),
+		Audiences:  audiences,
+		Legacy:     legacyValidatorConfig(cfg),
 		Revocation: rev,
 	})
-}
-
-// legacyIssuers returns the accepted issuers of legacy HMAC tokens: jwt.issuer.
-func legacyIssuers(cfg *config.Config) []string {
-	if cfg.JWT.Issuer == "" {
-		return nil
-	}
-	return []string{cfg.JWT.Issuer}
 }

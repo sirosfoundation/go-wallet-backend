@@ -535,13 +535,27 @@ func setupServerTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	v := tokenvalidator.New(tokenvalidator.Config{
 		JWKSURL: srv.URL,
 		Issuer:  "test-issuer",
+		// go-tokenauth v0.5.0 made Config.Audiences mandatory - both
+		// validation paths now refuse to validate at all when it's empty
+		// (closing a fail-open audience-confusion gap). This mirrors the
+		// real deployment's Audiences: cfg.AS.Audiences (the whole
+		// deployment's configured, accepted set - see
+		// NewBackendProvider/NewAuthProvider's own wiring), with
+		// route-level restriction still layered on top via
+		// result.HasAudience/RequireAudience - so it must list every
+		// audience any test in this file signs a token for, not just the
+		// one(s) a given test expects to ultimately be accepted after that
+		// finer route-level check.
+		Audiences: []string{"wallet-registry", "wallet-backend", "some-other-audience"},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: jwt.Claims{Audience: jwt.Audience{"wallet-backend"}},
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Validate(context.Background(), probe); err == nil {
@@ -1608,6 +1622,10 @@ func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, use
 	return false
 }
 
+func (fakeEngineBlacklistForProviderTest) IsFamilyRevoked(ctx context.Context, sid string) bool {
+	return false
+}
+
 // TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
 // Copilot review finding on the passkey tenant-perimeter fix (#374/#386):
 // NewBackendProvider must pass its own configured, SSRF-guarded HTTP client
@@ -1654,5 +1672,37 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 from the default tenant's passkey register/begin, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A deployment may configure AS.Issuer differently from JWT.Issuer. Legacy
+// tokens are minted with iss=JWT.Issuer, so the validator must be told that
+// explicitly rather than falling back to the AS issuer.
+func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "https://jwt.example.com"},
+		AS:  config.ASConfig{Issuer: "https://as.example.com", Audiences: []string{"wallet-backend"}, Legacy: config.ASLegacyConfig{Enabled: true}},
+	}
+
+	lc := legacyValidatorConfig(cfg)
+	if !lc.Enabled || len(lc.Issuers) != 1 || lc.Issuers[0] != "https://jwt.example.com" {
+		t.Fatalf("legacy issuers = %v, want [JWT.Issuer]", lc.Issuers)
+	}
+
+	v := tokenvalidator.New(tokenvalidator.Config{
+		Issuer:    cfg.AS.Issuer,
+		Audiences: cfg.AS.Audiences,
+		Legacy:    lc,
+	})
+	tok := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "sub": "user-1",
+		"tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	raw, err := tok.SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Validate(context.Background(), raw); err != nil {
+		t.Fatalf("legacy token minted with JWT.Issuer must validate when AS.Issuer differs: %v", err)
 	}
 }

@@ -190,9 +190,9 @@ func TestBuildTokenValidatorHelpers(t *testing.T) {
 	// Legacy HMAC is never validated against an empty key.
 	c.AS.Legacy.Enabled = true
 	c.JWT.Secret = ""
-	assert.Equal(t, []string{"jwt-iss"}, legacyIssuers(c))
+	assert.Equal(t, []string{"jwt-iss"}, legacyValidatorConfig(c).Issuers)
 	c.JWT.Issuer = ""
-	assert.Nil(t, legacyIssuers(c))
+	assert.Nil(t, legacyValidatorConfig(c).Issuers)
 	c.JWT.Issuer = "wallet-backend"
 	v := buildTokenValidator(c, nil, nil)
 	_, err := v.Validate(context.Background(), regHMAC(t))

@@ -130,8 +130,21 @@ type ASConfig struct {
 
 	// Audiences lists the accepted audience values for token validation.
 	// Tokens must contain at least one of these in their "aud" claim.
-	// When empty, audience validation is skipped.
+	// Required when AS is enabled, but an empty list is filled with the
+	// documented defaults ("wallet-backend", "wallet-engine",
+	// "wallet-registry", plus server.rp_id while as.legacy.enabled is true)
+	// before validation, so configs that never set it keep working.
+	// Validate() rejects an empty list only if that defaulting was skipped.
+	// go-tokenauth v0.5.0 made this mandatory at the validator level too
+	// (both its validation paths now refuse to validate at all when their
+	// own configured Audiences is empty, closing a fail-open
+	// audience-confusion gap - a deployment upgraded past that version
+	// with no audiences configured would otherwise reject every request
+	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
+	// When as.legacy.enabled is true an explicitly configured list must ALSO
+	// include server.rp_id: legacy (HMAC) tokens carry the RP ID as their
+	// audience, and Validate() rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -257,6 +270,40 @@ func (c *Config) EnableForRole() {
 	c.AS.SetDefaults()
 	if c.AS.Issuer == "" {
 		c.AS.Issuer = c.JWT.Issuer
+	}
+	c.applyASSecurityDefaults()
+}
+
+// defaultASAudiences is the documented default for as.audiences.
+var defaultASAudiences = []string{"wallet-backend", "wallet-engine", "wallet-registry"}
+
+// defaultJWTIssuer is the documented default for jwt.issuer (see defaultConfig).
+const defaultJWTIssuer = "wallet-backend"
+
+// applyASSecurityDefaults fills in the documented defaults for the settings
+// Validate() makes mandatory whenever the AS is enabled, so that existing
+// deployments that never set them (e.g. the siros-id-stack chart renders
+// `as.enabled: true` with no `audiences`) keep starting. It is a no-op when
+// the AS is disabled, and never overrides an explicitly configured value.
+//
+// Shared by Load() (which must run it BEFORE Validate()) and EnableForRole()
+// so both paths produce an identical result.
+//
+//   - as.audiences empty: the documented default set, plus server.rp_id while
+//     legacy (HMAC) tokens are enabled (they carry the RP ID as "aud").
+//   - jwt.issuer empty while legacy tokens are enabled: "wallet-backend".
+func (c *Config) applyASSecurityDefaults() {
+	if !c.AS.Enabled {
+		return
+	}
+	if len(c.AS.Audiences) == 0 {
+		c.AS.Audiences = append([]string(nil), defaultASAudiences...)
+		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
+			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
+		}
+	}
+	if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+		c.JWT.Issuer = defaultJWTIssuer
 	}
 }
 
@@ -1011,7 +1058,45 @@ type JWTConfig struct {
 	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
+	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it. Defaults to "wallet-backend"; if it is blanked while as.legacy.enabled is true, that default is re-applied before validation.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+}
+
+// MaxTokenLifetime returns the longer of the configured access-token
+// (ExpiryHours) and refresh-token (RefreshDays) lifetimes. A refresh-token
+// family revocation marker must be retained at least this long, since
+// nothing enforces that the refresh token outlives the access token.
+func (c JWTConfig) MaxTokenLifetime() time.Duration {
+	refresh := time.Duration(c.RefreshDays) * 24 * time.Hour
+	access := time.Duration(c.ExpiryHours) * time.Hour
+	if refresh > access {
+		return refresh
+	}
+	return access
+}
+
+// MinFamilyRetention is the floor for how long a refresh-token family
+// revocation marker is kept (365 days).
+//
+// The marker must outlive every token of the family, but the only bound
+// available at logout is the CURRENT configuration, while tokens may have
+// been minted under an earlier, longer one (e.g. jwt.refresh_days lowered
+// after deployment). A retention derived from the current lifetimes alone
+// could therefore expire early and un-revoke older tokens. The floor makes
+// retention non-shrinking across configuration changes for any earlier
+// configuration with token lifetimes up to a year; markers are tiny and
+// swept afterwards, so the cost is negligible. Configurations that ever
+// issued tokens beyond a year are covered by MaxTokenLifetime taking the
+// larger value.
+const MinFamilyRetention = 365 * 24 * time.Hour
+
+// FamilyRetention returns how long to keep a refresh-token family
+// revocation marker: the longer of MaxTokenLifetime and MinFamilyRetention.
+func (c JWTConfig) FamilyRetention() time.Duration {
+	if m := c.MaxTokenLifetime(); m > MinFamilyRetention {
+		return m
+	}
+	return MinFamilyRetention
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -1782,6 +1867,10 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
 	}
 
+	// Apply the documented AS defaults before validating: Validate() makes
+	// them mandatory, and configs written before that must keep loading.
+	cfg.applyASSecurityDefaults()
+
 	// Validate configuration
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -1987,7 +2076,7 @@ func defaultConfig() *Config {
 		JWT: JWTConfig{
 			ExpiryHours: 24,
 			RefreshDays: 7,
-			Issuer:      "wallet-backend",
+			Issuer:      defaultJWTIssuer,
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
@@ -2255,6 +2344,36 @@ func (c *Config) Validate() error {
 		if c.AS.Issuer == "" {
 			return fmt.Errorf("as: issuer is required (set as.issuer or jwt.issuer)")
 		}
+		// Required as of the go-tokenauth v0.5.0 dependency bump: an empty
+		// Audiences list used to mean "skip audience validation" both here
+		// and in go-tokenauth's own Validator, but go-tokenauth v0.5.0
+		// made it a hard configuration error there instead (closing a
+		// fail-open audience-confusion gap) - every request would
+		// otherwise start being silently rejected at runtime the moment
+		// this dependency is upgraded, for any deployment that previously
+		// relied on the old "empty means accept any audience" behavior.
+		// Failing fast here, at startup, is far preferable to that.
+		if len(c.AS.Audiences) == 0 {
+			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
+		}
+		// Legacy (HMAC) tokens carry "aud": Server.RPID (see
+		// UserService/WebAuthnService.generateToken), and go-tokenauth v0.5
+		// validates that against AS.Audiences. If the RP ID is not among
+		// them, every legacy login token is rejected on its next protected
+		// request - a failure that only shows up at runtime, so refuse it here.
+		// Legacy tokens are minted with "iss": jwt.issuer and validated
+		// against Legacy.Issuers=[jwt.issuer]; an empty value would mint
+		// tokens with an empty iss and turn go-tokenauth's mandatory issuer
+		// check into a no-op, so require it (as.issuer does not help: it is
+		// not the legacy issuer).
+		if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+			return fmt.Errorf("as: legacy tokens are enabled but jwt.issuer is empty; legacy tokens are issued and validated with jwt.issuer, so set it or disable as.legacy.enabled")
+		}
+		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
+			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
+				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",
+				c.Server.RPID)
+		}
 	}
 
 	// Validate WIA configuration
@@ -2498,4 +2617,13 @@ func (c AuditConfig) validateIdentityEvents() error {
 		}
 	}
 	return nil
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

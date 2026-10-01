@@ -190,3 +190,58 @@ func TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer(t *testing.T) {
 		t.Errorf("expected a real legacy appToken (iss=jwtCfg.Issuer) to validate against m.LegacyIssuer, got: %v", err)
 	}
 }
+
+// TestNewASModule_LogoutSIDParserIndependentOfLegacyEnabled proves legacy
+// authentication stays disabled (LegacyIssuer nil, so the auth middleware
+// rejects legacy bearers) while the signature-only logout parser still
+// exists; and that without jwt.secret the fallback is unavailable.
+func TestNewASModule_LogoutSIDParserIndependentOfLegacyEnabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := writeTestSigningKey(t, dir)
+	cfg := &config.ASConfig{
+		SigningKeyPath: keyPath,
+		Issuer:         "https://as.example.com",
+		ExternalURL:    "https://as.example.com",
+		Legacy:         config.ASLegacyConfig{Enabled: false},
+	}
+	cfg.SetDefaults()
+	jwtCfg := &config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer", ExpiryHours: 1}
+
+	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, memory.NewStore(), nil, nil, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewASModule() error = %v", err)
+	}
+	if m.LegacyIssuer != nil {
+		t.Fatal("legacy authentication must stay disabled")
+	}
+	if m.LogoutSIDParser == nil {
+		t.Fatal("expected a logout sid parser even with legacy disabled")
+	}
+
+	// Legacy bearer is still rejected for authentication.
+	gin.SetMode(gin.TestMode)
+	legacy := NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, time.Hour)
+	tok, err := legacy.Issue("user-1", "did:key:u", "t", "rp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.Use(UnifiedAuthMiddleware(m.Sessions, m.TokenIssuer, m.LegacyIssuer, []string{"rp"}, true, zap.NewNop()))
+	router.GET("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("legacy bearer must be rejected for authentication, got %d", w.Code)
+	}
+
+	// No secret: fallback unavailable.
+	m2, err := NewASModule(context.Background(), cfg, &config.JWTConfig{Issuer: "test-issuer"}, nil, memory.NewStore(), nil, nil, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewASModule() error = %v", err)
+	}
+	if m2.LogoutSIDParser != nil {
+		t.Error("no jwt.secret must mean no logout sid parser")
+	}
+}

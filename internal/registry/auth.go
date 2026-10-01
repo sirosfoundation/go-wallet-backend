@@ -20,6 +20,12 @@ import (
 // registry only adds the audience rule and the context keys its rate limiter
 // reads (AuthenticatedKey, TenantIDKey).
 type AuthConfig struct {
+	// Config supplies jwt.secret, used to read the refresh-token family (sid)
+	// of legacy tokens for family revocation. When nil, legacy tokens cannot
+	// be tied to a family and are rejected whenever a Blacklist is set (fail
+	// closed).
+	Config *config.Config
+
 	// Validator validates Bearer tokens. May be nil only when RequireAuth is
 	// false, in which case every request is treated as unauthenticated.
 	Validator *validator.Validator
@@ -71,7 +77,11 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	if tenants == nil {
 		tenants = anyTenant{}
 	}
-	strict := middleware.TokenAuthMiddleware(cfg.Validator, tenants, cfg.Blacklist, logger)
+	mwCfg := cfg.Config
+	if mwCfg == nil {
+		mwCfg = &config.Config{}
+	}
+	strict := middleware.TokenAuthMiddleware(mwCfg, cfg.Validator, tenants, cfg.Blacklist, logger)
 	return []gin.HandlerFunc{
 		strict,
 		func(c *gin.Context) {

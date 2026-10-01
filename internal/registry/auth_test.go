@@ -203,6 +203,8 @@ func (f fakeTenants) GetByID(_ context.Context, id domain.TenantID) (*domain.Ten
 
 type fakeBlacklist struct{ revokedUser, revokedJTI string }
 
+func (fakeBlacklist) IsFamilyRevoked(context.Context, string) bool { return false }
+
 func (f fakeBlacklist) IsBlacklisted(_ context.Context, j string) bool {
 	return f.revokedJTI != "" && j == f.revokedJTI
 }
