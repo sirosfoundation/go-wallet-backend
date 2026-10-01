@@ -20,16 +20,19 @@ import (
 )
 
 // TokenBlacklistChecker is an interface for checking if a token is
-// blacklisted, either individually by jti (e.g. an explicit logout) or in
+// blacklisted, either individually by jti (e.g. an explicit logout), in
 // bulk for every token belonging to a user (e.g. an account deletion, which
 // has no way to enumerate every jti it ever issued - see
-// TokenBlacklist.RevokeUser). Shared by both the legacy HMAC path
-// (AuthMiddlewareWithBlacklist) and the go-tokenauth path
-// (TokenAuthMiddleware), so a revocation is honored regardless of which
-// authenticated the request.
+// TokenBlacklist.RevokeUser), or in bulk for every token in a refresh-token
+// family/session (e.g. logging out a session that had a still-valid
+// refresh token issued alongside it - see TokenBlacklist.RevokeFamily,
+// #402). Shared by both the legacy HMAC path (AuthMiddlewareWithBlacklist)
+// and the go-tokenauth path (TokenAuthMiddleware), so a revocation is
+// honored regardless of which authenticated the request.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
+	IsFamilyRevoked(ctx context.Context, sid string) bool
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -186,6 +189,24 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			if blacklist.IsUserRevoked(c.Request.Context(), userID) {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", userID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
+
+			// Refresh-token family revocation (#402): rejects an access
+			// token whose "sid" claim (see
+			// WebAuthnService.generateToken/generateRefreshToken) ties it to
+			// a session Logout has since revoked in bulk
+			// (TokenBlacklist.RevokeFamily) - even though this specific
+			// access token's own jti was never individually blacklisted. A
+			// no-op for a token with no sid claim at all (minted before
+			// #402, or never paired with a refresh token in the first
+			// place - e.g. FinishRegistration).
+			if sid, _ := claims["sid"].(string); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+				logger.Warn("Token for revoked refresh-token family used",
+					zap.String("sid", sid),
 				)
 				c.JSON(401, gin.H{"error": "Token has been revoked"})
 				c.Abort()

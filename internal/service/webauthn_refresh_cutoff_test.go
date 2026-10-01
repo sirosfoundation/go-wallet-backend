@@ -25,7 +25,7 @@ func TestRefreshAccessToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	user := &domain.User{UUID: domain.NewUserID(), DID: "did:x"}
 	require.NoError(t, store.Users().Create(ctx, user))
 
-	refresh, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+	refresh, err := svc.generateRefreshToken(user, domain.DefaultTenantID, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, refresh)
 
@@ -76,7 +76,7 @@ func TestRefreshAccessToken_CutoffDuringRefreshIsRefused(t *testing.T) {
 	racing := &racingUserStore{Store: base, users: &cutoffAfterFirstRead{UserStore: base.Users(), uid: user.UUID}}
 	svc := &WebAuthnService{store: racing, cfg: cfg, logger: zap.NewNop()}
 
-	refresh, err := svc.generateRefreshToken(user, domain.DefaultTenantID)
+	refresh, err := svc.generateRefreshToken(user, domain.DefaultTenantID, "")
 	require.NoError(t, err)
 	_, err = svc.RefreshAccessToken(ctx, &RefreshTokenRequest{RefreshToken: refresh})
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "the source refresh token predates the cut-off that landed mid-request")

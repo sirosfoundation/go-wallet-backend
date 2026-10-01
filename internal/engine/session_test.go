@@ -52,13 +52,26 @@ func setupEngineTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	}))
 	t.Cleanup(srv.Close)
 
-	v := tokenvalidator.New(tokenvalidator.Config{JWKSURL: srv.URL, Issuer: "test-issuer"})
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: srv.URL,
+		Issuer:  "test-issuer",
+		// go-tokenauth v0.5.0 made Config.Audiences mandatory - both
+		// validation paths now refuse to validate at all when it's empty
+		// (closing a fail-open audience-confusion gap). This mirrors the
+		// real deployment's Audiences: cfg.AS.Audiences, with route-level
+		// restriction (result.HasAudience) still layered on top, so it
+		// must list every audience any test in this file signs a token
+		// for.
+		Audiences: []string{"wallet-registry", "wallet-backend", "some-other-audience"},
+	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signEngineToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}},
+	})
 	require.Eventually(t, func() bool {
 		_, err := v.Validate(context.Background(), probe)
 		return err == nil
@@ -223,7 +236,7 @@ func TestManager_validateToken_UserID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, tenantID, tac, err := m.validateToken(tokenString)
+	userID, tenantID, tac, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user-123", userID)
 	assert.Equal(t, "test-tenant", tenantID)
@@ -251,7 +264,7 @@ func TestManager_validateToken_UUID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, tenantID, _, err := m.validateToken(tokenString)
+	userID, tenantID, _, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "uuid-user-456", userID)
 	assert.Empty(t, tenantID) // wallet-backend-server tokens don't have tenant_id
@@ -275,7 +288,7 @@ func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, _, err := m.validateToken(tokenString)
+	userID, _, _, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "native-user", userID)
 }
@@ -297,7 +310,7 @@ func TestManager_validateToken_MissingBothUserIDAndUUID(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing user_id or uuid")
 }
@@ -318,7 +331,7 @@ func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
 	})
 	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
 
-	_, _, _, err := m.validateToken(tokenString)
+	_, _, _, err := m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -339,7 +352,7 @@ func TestManager_validateToken_ExpiredToken(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -359,7 +372,7 @@ func TestManager_validateToken_WrongSecret(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("wrong-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -381,7 +394,7 @@ func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, _, err := m.validateToken(tokenString)
+	userID, _, _, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user", userID)
 }
@@ -404,7 +417,7 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -425,7 +438,7 @@ func TestManager_validateToken_GoTokenauth_AllowsRegistryAudience(t *testing.T) 
 		ACR:      "urn:siros:acr:passkey",
 	})
 
-	_, tenantID, tac, err := m.validateToken(token)
+	_, tenantID, tac, err := m.validateToken(context.Background(), token)
 	require.NoError(t, err)
 	assert.Equal(t, "test-tenant", tenantID)
 	assert.Equal(t, claims.TAC("r"), tac)
@@ -447,14 +460,15 @@ func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
 		ACR:      "urn:siros:acr:passkey",
 	})
 
-	_, _, _, err := m.validateToken(token)
+	_, _, _, err := m.validateToken(context.Background(), token)
 	assert.Error(t, err)
 }
 
 // fakeEngineBlacklist is a minimal TokenBlacklistChecker test double.
 type fakeEngineBlacklist struct {
-	revoked      map[string]bool
-	revokedUsers map[string]bool
+	revoked         map[string]bool
+	revokedUsers    map[string]bool
+	revokedFamilies map[string]bool
 }
 
 func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
@@ -463,6 +477,10 @@ func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) boo
 
 func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
 	return f.revokedUsers[userID]
+}
+
+func (f *fakeEngineBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
+	return f.revokedFamilies[sid]
 }
 
 // TestManager_validateToken_GoTokenauth_RevokedUserDenied proves the #391
@@ -484,7 +502,7 @@ func TestManager_validateToken_GoTokenauth_RevokedUserDenied(t *testing.T) {
 		ACR:      "urn:siros:acr:passkey",
 	})
 
-	_, _, _, err := m.validateToken(token)
+	_, _, _, err := m.validateToken(context.Background(), token)
 	assert.Error(t, err)
 }
 
@@ -506,7 +524,7 @@ func TestManager_validateToken_Legacy_RevokedJTIDenied(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -523,7 +541,7 @@ func TestManager_validateToken_Legacy_RevokedUserDenied(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	_, _, _, err = m.validateToken(tokenString)
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
 	assert.Error(t, err)
 }
 
@@ -546,9 +564,75 @@ func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
 	tokenString, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, _, err := m.validateToken(tokenString)
+	userID, _, _, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "test-user-123", userID)
+}
+
+// TestManager_validateToken_Legacy_RevokedFamilyDenied is a regression test
+// for a Copilot review finding on #414: an access token carrying a "sid"
+// claim (the refresh-token family/session id - see
+// service.WebAuthnService.generateToken's doc comment) must be rejected
+// once that family has been revoked (TokenBlacklist.RevokeFamily, what
+// api.Handlers.Logout calls), even though this token's own jti was never
+// individually blacklisted - otherwise an access token from an earlier
+// rotation of an already-logged-out session could still establish a NEW
+// engine WebSocket session.
+func TestManager_validateToken_Legacy_RevokedFamilyDenied(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-1": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"jti":     "jti-not-individually-blacklisted",
+		"sid":     "sid-revoked-1",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	assert.Error(t, err)
+}
+
+// TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied is a
+// regression test for the same #414 finding, on the go-tokenauth path: it
+// "auto-detects new-style vs legacy" tokens, so a WebAuthnService-issued
+// legacy HMAC token can reach this branch too whenever the AS is enabled
+// (m.tokenValidator set) - go-tokenauth's shared *claims.Result has no
+// "sid" field at all, so validateToken must re-parse the raw token itself
+// (legacyTokenSID) to still catch a revoked family here.
+func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *testing.T) {
+	secret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	m := NewManager(cfg, zap.NewNop())
+	v := tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet.example.com"},
+		Legacy: tokenvalidator.LegacyConfig{
+			Enabled:    true,
+			HMACSecret: []byte(secret),
+			Issuers:    []string{"test-legacy-issuer"},
+		},
+	})
+	m.SetTokenValidator(v)
+	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-2": true}})
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":   "test-user-123",
+		"tenant_id": "test-tenant",
+		"jti":       "jti-not-individually-blacklisted-2",
+		"sid":       "sid-revoked-2",
+		"iss":       "test-legacy-issuer",
+		"aud":       "wallet.example.com",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "revoked", "must be rejected by the family check, not the audience check")
 }
 
 // ===== handleFlowStart TAC enforcement tests =====
@@ -956,13 +1040,13 @@ func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 		return s
 	}
 	old := mint(time.Now().Add(-2 * time.Minute))
-	_, _, _, err := m.validateToken(old)
+	_, _, _, err := m.validateToken(context.Background(), old)
 	require.NoError(t, err, "no cut-off yet")
 
 	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-time.Minute)))
-	_, _, _, err = m.validateToken(old)
+	_, _, _, err = m.validateToken(context.Background(), old)
 	assert.ErrorIs(t, err, tokengate.ErrRevoked)
-	_, _, _, err = m.validateToken(mint(time.Now()))
+	_, _, _, err = m.validateToken(context.Background(), mint(time.Now()))
 	assert.NoError(t, err, "a token issued after the cut-off opens a session")
 }
 
@@ -1557,9 +1641,100 @@ func TestManager_NilTokenGate(t *testing.T) {
 	s, err := token.SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
-	userID, _, _, err := m.validateToken(s)
+	userID, _, _, err := m.validateToken(context.Background(), s)
 	require.NoError(t, err)
 	assert.Equal(t, "u-1", userID)
 
 	assert.NoError(t, m.recheckToken(&Session{UserID: "u-1", tokenIssuedAt: time.Now()}))
+}
+
+func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {
+	validatorSecret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "a-different-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet.example.com"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(validatorSecret), Issuers: []string{"test-legacy-issuer"}},
+	}))
+	m.SetTokenBlacklist(&fakeEngineBlacklist{})
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "s",
+		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := tok.SignedString([]byte(validatorSecret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot determine token family")
+}
+
+// A token accepted within go-tokenauth's clock-skew leeway (expired 2s ago)
+// must still have its revoked-family check applied.
+func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied_InsideSkewWindow(t *testing.T) {
+	secret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	m := NewManager(cfg, zap.NewNop())
+	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet.example.com"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret), Issuers: []string{"test-legacy-issuer"}},
+	}))
+	bl := &fakeEngineBlacklist{revokedFamilies: map[string]bool{}}
+	m.SetTokenBlacklist(bl)
+
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "sid-skew",
+		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(-2 * time.Second).Unix(),
+	})
+	tokenString, err := tok.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	require.NoError(t, err, "precondition: skew-window token accepted before revocation")
+	bl.revokedFamilies["sid-skew"] = true
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "revoked")
+}
+
+// A done context must fail closed in validateToken (never read as "family
+// not revoked"), on both the legacy-HMAC and go-tokenauth ModeLegacy paths.
+func TestManager_validateToken_CancelledContextFailsClosed(t *testing.T) {
+	secret := "test-secret-legacy-mode"
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "test-user-123",
+		"iss":     "test-legacy-issuer",
+		"aud":     "wallet.example.com",
+		"sid":     "sid-live",
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(secret))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	plain := NewManager(cfg, zap.NewNop())
+	plain.SetTokenBlacklist(&fakeEngineBlacklist{})
+	_, _, _, err = plain.validateToken(ctx, tokenString)
+	require.ErrorIs(t, err, context.Canceled)
+
+	withValidator := NewManager(cfg, zap.NewNop())
+	withValidator.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
+		Audiences: []string{"wallet.example.com"},
+		Legacy: tokenvalidator.LegacyConfig{
+			Enabled:    true,
+			HMACSecret: []byte(secret),
+			Issuers:    []string{"test-legacy-issuer"},
+		},
+	}))
+	withValidator.SetTokenBlacklist(&fakeEngineBlacklist{})
+	_, _, _, err = withValidator.validateToken(ctx, tokenString)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// Sanity: the same token is accepted with a live context.
+	_, _, _, err = withValidator.validateToken(context.Background(), tokenString)
+	require.NoError(t, err)
 }

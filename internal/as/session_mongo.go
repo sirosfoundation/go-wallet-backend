@@ -26,6 +26,7 @@ type sessionDoc struct {
 	CreatedAt       time.Time `bson:"created_at"`
 	AuthenticatedAt time.Time `bson:"authenticated_at,omitempty"`
 	ExpiresAt       time.Time `bson:"expires_at"`
+	FamilyID        string    `bson:"family_id,omitempty"`
 	Revoked         bool      `bson:"revoked"`
 }
 
@@ -75,6 +76,7 @@ func (s *MongoSessionStore) Create(ctx context.Context, session *Session) error 
 		CreatedAt:       session.CreatedAt,
 		AuthenticatedAt: session.AuthenticatedAt,
 		ExpiresAt:       session.ExpiresAt,
+		FamilyID:        session.FamilyID,
 		Revoked:         session.Revoked,
 	}
 	if _, err := s.coll.InsertOne(ctx, doc); err != nil {
@@ -106,6 +108,7 @@ func (s *MongoSessionStore) Get(ctx context.Context, jti string) (*Session, erro
 		CreatedAt:       doc.CreatedAt,
 		AuthenticatedAt: doc.AuthenticatedAt,
 		ExpiresAt:       doc.ExpiresAt,
+		FamilyID:        doc.FamilyID,
 		Revoked:         doc.Revoked,
 	}, nil
 }

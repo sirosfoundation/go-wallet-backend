@@ -64,6 +64,21 @@ func createTokenWithJTI(secret, userID, jti string, issuedAt time.Time) string {
 	return tokenString
 }
 
+// createTokenWithSID builds a legacy HMAC access token carrying a "sid"
+// claim (the refresh-token family/session id - see
+// service.WebAuthnService.generateToken's doc comment), for testing #402's
+// family-revocation check.
+func createTokenWithSID(secret, userID, jti, sid string) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"jti":     jti,
+		"sid":     sid,
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, _ := token.SignedString([]byte(secret))
+	return tokenString
+}
+
 // Helper function to create a test router with auth middleware and a success handler
 func createTestRouter(cfg *config.Config, store storage.Store, logger *zap.Logger) *gin.Engine {
 	router := gin.New()
@@ -336,6 +351,61 @@ func TestAuthMiddlewareWithBlacklist_DeletedUserTokenRejected(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for unrelated user's token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestAuthMiddlewareWithBlacklist_RevokedFamilyTokenRejected is a regression
+// test for #402: an access token carrying a "sid" claim must be rejected
+// once Logout has revoked that refresh-token family (TokenBlacklist.
+// RevokeFamily), even though this specific access token's own jti was
+// never individually blacklisted - proving the actual security gap #402
+// was filed for: a still-valid access token from the same session as a
+// stolen/still-held refresh token must also stop working once that session
+// is logged out, not linger until it naturally expires.
+func TestAuthMiddlewareWithBlacklist_RevokedFamilyTokenRejected(t *testing.T) {
+	logger := zap.NewNop()
+	secret := "test-secret"
+	cfg := createTestConfig(secret)
+	cfg.Security.TokenBlacklist.Enabled = true
+	store := createTestStore()
+
+	blacklist := service.NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	router := createBlacklistTestRouter(cfg, store, blacklist, logger)
+
+	tokenStr := createTokenWithSID(secret, "user-123", "jti-family-1", "sid-family-1")
+
+	// Token works before the family is revoked.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 before family revocation, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Simulate Logout revoking the whole family (see api.Handlers.Logout).
+	if err := blacklist.RevokeFamily(context.Background(), "sid-family-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+
+	// The same access token - its own jti never individually blacklisted -
+	// must now be rejected too.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a token whose refresh-token family was revoked, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// A token from a DIFFERENT family must be unaffected.
+	otherToken := createTokenWithSID(secret, "user-789", "jti-family-2", "sid-family-2")
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+otherToken)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for a token from an unrelated, non-revoked family, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

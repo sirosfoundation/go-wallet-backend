@@ -124,7 +124,7 @@ func TestMintTokens(t *testing.T) {
 	seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
 	gate := func() error { return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1") }
 
-	access, refresh, err := s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
+	access, refresh, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
 	require.NoError(t, err, "no cut-off: tokens issued")
 	require.NotEmpty(t, access)
 	require.NotEmpty(t, refresh)
@@ -132,7 +132,7 @@ func TestMintTokens(t *testing.T) {
 	// Cut-off in the same second as minting: the tokens are minted again in
 	// the next second and pass.
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
-	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
+	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
 	require.NoError(t, err)
 	cutoff, _ := store.Users().GetAuthCutoff(ctx, userID)
 	// Both handed-out tokens have to postdate the cut-off, not just the last
@@ -148,16 +148,16 @@ func TestMintTokens(t *testing.T) {
 	// the precise lifecycle refusal.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second)))
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate, ErrVerificationFailed)
+	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 
 	// Same future cut-off but the gate passes (the other passkey's instance
 	// is still active): refused with the caller's refusal so the client
 	// logs in again.
 	gate2 := func() error { return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2") }
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, gate2, ErrVerificationFailed)
+	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate2, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrVerificationFailed)
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, nil, ErrInvalidRefreshToken)
+	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", nil, ErrInvalidRefreshToken)
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "refresh flow uses its own refusal")
 }
 
@@ -179,7 +179,7 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	// No cut-off at all: the minted token is unimpeachable by iat alone, so
 	// only the recheck can see the revocation that landed meanwhile.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "racing"))
-	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
+	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", func() error {
 		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
 	}, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)

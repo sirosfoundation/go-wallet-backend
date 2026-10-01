@@ -61,7 +61,7 @@ func TestLoginRacingRevocation_NoTokenSurvivesTheRevocation(t *testing.T) {
 			if err != nil {
 				return
 			}
-			access, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
+			access, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", func() error {
 				return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, uid, credID)
 			}, ErrVerificationFailed)
 			if err == nil {
@@ -152,7 +152,7 @@ func TestLoginInsideTheRevocationWindow_TokenIsCutOffByTheSecondCutoff(t *testin
 		// token's iat is strictly after it and only the second cut-off can
 		// refuse it.
 		time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
-		token, _, loginErr = s.mintTokens(ctx, user, domain.DefaultTenantID, func() error {
+		token, _, loginErr = s.mintTokens(ctx, user, domain.DefaultTenantID, "", func() error {
 			return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, uid, "pk-w")
 		}, ErrVerificationFailed)
 	}
