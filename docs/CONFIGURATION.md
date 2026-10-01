@@ -133,7 +133,7 @@ Environment prefix: `WALLET_AS`
 | `as.signing_key_pkcs11.module_path` | `WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH` | string |  |
 | `as.signing_key_pkcs11.slot_id` | `WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID` | uint |  |
 | `as.signing_key_pkcs11.pin` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN` | string |  |
-| `as.signing_key_pkcs11.pin_path` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). For the AS signer it is read only when the signer is constructed, not by Load. |
+| `as.signing_key_pkcs11.pin_path` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
 | `as.signing_key_pkcs11.key_label` | `WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL` | string |  |
 | `as.signing_key_pkcs11.pool_size` | `WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `as.issuer` | `WALLET_AS_ISSUER` | string | Issuer is the value of the "iss" claim in issued access tokens. Defaults to JWT.Issuer if not set. |
@@ -162,7 +162,7 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.pkcs11.module_path` | `WALLET_WALLET_PROVIDER_PKCS11_MODULE_PATH` | string |  |
 | `wallet_provider.pkcs11.slot_id` | `WALLET_WALLET_PROVIDER_PKCS11_SLOT_ID` | uint |  |
 | `wallet_provider.pkcs11.pin` | `WALLET_WALLET_PROVIDER_PKCS11_PIN` | string |  |
-| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). For the AS signer it is read only when the signer is constructed, not by Load. |
+| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
 | `wallet_provider.pkcs11.key_label` | `WALLET_WALLET_PROVIDER_PKCS11_KEY_LABEL` | string |  |
 | `wallet_provider.pkcs11.pool_size` | `WALLET_WALLET_PROVIDER_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `wallet_provider.wia.enabled` | `WALLET_WALLET_PROVIDER_WIA_ENABLED` | boolean | Enabled controls whether WIA endpoints are registered |

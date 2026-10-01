@@ -1039,7 +1039,7 @@ type PKCS11SigningConfig struct {
 	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
-	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN). For the AS signer it is read only when the signer is constructed, not by Load.
+	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load.
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
 	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
 }
