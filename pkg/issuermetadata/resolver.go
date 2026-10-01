@@ -92,6 +92,15 @@ type Config struct {
 	// PreferSigned controls whether the resolver sends Accept headers
 	// preferring signed (application/jwt) responses. Default: true.
 	PreferSigned *bool
+
+	// FallbackOn4xx enables a workaround for non-compliant issuers that answer
+	// the preferred Accept with a 4xx (406 Not Acceptable, but also 400, 404,
+	// 415, ... some servers only serve what their Accept list names) instead of
+	// serving an acceptable representation: the resolver retries once with the
+	// alternate media type. HTTP 429 is never retried this way. Default: true
+	// when nil (set false for strict content negotiation, where any non-200
+	// is terminal).
+	FallbackOn4xx *bool
 }
 
 type cachedEntry struct {
@@ -273,18 +282,61 @@ func (r *Resolver) preferSigned() bool {
 	return true
 }
 
+// fallbackOn4xx reports whether a 4xx on the preferred Accept should trigger a
+// retry with the alternate media type.
+func (r *Resolver) fallbackOn4xx() bool {
+	if r.cfg.FallbackOn4xx != nil {
+		return *r.cfg.FallbackOn4xx
+	}
+	return true
+}
+
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
+	// metadata, some issuers reject the application/jwt Accept with a 4xx
+	// instead of falling back to JSON (and the reverse when unsigned is
+	// preferred); retry once requesting the other representation in that case.
+	accepts := []string{"application/json", "application/jwt"}
+	if r.preferSigned() {
+		accepts = []string{"application/jwt", "application/json"}
+	}
+	// With the 4xx fallback turned off, only the preferred representation is
+	// requested and any non-200 status is terminal.
+	if !r.fallbackOn4xx() {
+		accepts = accepts[:1]
 	}
 
-	// Content negotiation per OpenID4VCI §12.2.2
-	if r.preferSigned() {
-		req.Header.Set("Accept", "application/jwt, application/json;q=0.9")
-	} else {
-		req.Header.Set("Accept", "application/json, application/jwt;q=0.9")
+	var lastStatus int
+	for _, accept := range accepts {
+		result, status, err := r.fetchOnce(ctx, issuerURL, metadataURL, accept)
+		if err != nil {
+			return nil, err
+		}
+		if status == http.StatusOK {
+			return result, nil
+		}
+		lastStatus = status
+		// A client error on the preferred representation may just mean the
+		// issuer does not serve that media type, so try the other one. Other
+		// statuses are terminal, as is 429: it says nothing about the media
+		// type, and an immediate second request only adds load.
+		if status < 400 || status >= 500 || status == http.StatusTooManyRequests {
+			break
+		}
 	}
+	return nil, fmt.Errorf("issuer returned HTTP %d", lastStatus)
+}
+
+// fetchOnce performs a single metadata GET with the given Accept header. It
+// returns the parsed result only on HTTP 200; on any other status it returns
+// the status code (and a nil result) so the caller can decide whether to retry
+// with a different Accept.
+func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept string) (*fetchResult, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Accept", accept)
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
@@ -292,39 +344,41 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	// HTTPS endpoints is inherent to OpenID4VCI issuer metadata discovery —
 	// the issuer URL comes from a user-presented credential and can be any
 	// public HTTPS endpoint; there is no known-good allowlist.
-	resp, err := r.httpClient.Do(req) // lgtm[go/request-forgery]
+	resp, err := r.httpClient.Do(req) // codeql[go/request-forgery]
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, 0, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("issuer returned HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 
 	body, err := readLimitedBody(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("reading response: %w", err)
 	}
 
 	// Determine format from Content-Type header.
 	contentType := resp.Header.Get("Content-Type")
 	mediaType, _, parseErr := mime.ParseMediaType(contentType)
 	if contentType != "" && parseErr != nil {
-		return nil, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
+		return nil, resp.StatusCode, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
 	}
 
 	switch mediaType {
 	case "application/jwt":
 		// Entire response body is a JWS per OpenID4VCI §12.2.3
-		return r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		res, err := r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		return res, resp.StatusCode, err
 
 	case "application/json", "":
 		// Standard JSON response, possibly with legacy signed_metadata field
-		return r.handleJSONResponse(ctx, issuerURL, body)
+		res, err := r.handleJSONResponse(ctx, issuerURL, body)
+		return res, resp.StatusCode, err
 
 	default:
-		return nil, fmt.Errorf("unsupported Content-Type: %s", contentType)
+		return nil, resp.StatusCode, fmt.Errorf("unsupported Content-Type: %s", contentType)
 	}
 }
 

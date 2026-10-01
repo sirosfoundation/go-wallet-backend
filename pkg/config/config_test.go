@@ -2621,6 +2621,12 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
+func TestDefaultConfig_MetadataFallbackOn4xxIsOn(t *testing.T) {
+	if !defaultConfig().HTTPClient.MetadataFallbackOn4xx {
+		t.Error("metadata 4xx fallback must default to on (#371)")
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {

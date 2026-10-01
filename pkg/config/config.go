@@ -283,6 +283,21 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+
+	// MetadataFallbackOn4xx enables a workaround for non-compliant OpenID4VCI
+	// issuers that answer the issuer-metadata resolver's preferred Accept with
+	// a 4xx (406, but also 400, 404, 415, ...) instead of serving an acceptable
+	// representation: the resolver retries once with the alternate media type
+	// (JSON<->JWT). HTTP 429 is never retried this way. It only triggers after
+	// a failed first attempt, at the cost of one extra request to an issuer
+	// that really is down or missing. Default: true. Set false for strict
+	// content negotiation, where any non-200 is terminal.
+	// Env: WALLET_HTTP_CLIENT_METADATA_FALLBACK_ON_4XX
+	// Only the wallet server builds an issuer-metadata resolver; the registry
+	// server shares this struct but never reads the field (docs:"wallet-only"
+	// keeps it out of the registry reference).
+	MetadataFallbackOn4xx bool `yaml:"metadata_fallback_on_4xx" envconfig:"METADATA_FALLBACK_ON_4XX" docs:"wallet-only"`
+
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
 	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC
@@ -1890,7 +1905,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout: 30, // 30 seconds default
+			Timeout:               30,   // 30 seconds default
+			MetadataFallbackOn4xx: true, // retry the other media type on a 4xx (#371)
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},

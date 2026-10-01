@@ -49,20 +49,23 @@ type StructInfo struct {
 
 // FieldInfo holds parsed field metadata.
 type FieldInfo struct {
-	GoName    string
-	GoType    string
-	YAMLTag   string
-	EnvTag    string
-	Doc       string
-	InlineDoc string // trailing comment (e.g., `// Admin API bind address`)
-	TypeName  string // resolved struct type name, if embedded struct
-	Omitempty bool
+	GoName     string
+	GoType     string
+	YAMLTag    string
+	EnvTag     string
+	Doc        string
+	InlineDoc  string // trailing comment (e.g., `// Admin API bind address`)
+	TypeName   string // resolved struct type name, if embedded struct
+	Omitempty  bool
+	WalletOnly bool // docs:"wallet-only": omitted from the registry server's reference
 }
 
 // Registry of all parsed struct types, keyed by pkg.TypeName.
 type Registry struct {
 	types map[string]*StructInfo
 	fset  *token.FileSet
+	// OmitWalletOnly drops fields tagged docs:"wallet-only" from the output.
+	OmitWalletOnly bool
 }
 
 func NewRegistry() *Registry {
@@ -128,6 +131,7 @@ func (r *Registry) extractStructs(file *ast.File, pkgName string) {
 					tag := strings.Trim(field.Tag.Value, "`")
 					fi.YAMLTag = extractTag(tag, "yaml")
 					fi.EnvTag = extractTag(tag, "envconfig")
+					fi.WalletOnly = extractTag(tag, "docs") == "wallet-only"
 					fi.Omitempty = strings.Contains(fi.YAMLTag, ",omitempty")
 					fi.YAMLTag = strings.Split(fi.YAMLTag, ",")[0]
 				}
@@ -352,6 +356,9 @@ func flattenStruct(reg *Registry, info *StructInfo, pathPrefix, envPrefix string
 	}
 	var docs []FieldDoc
 	for _, f := range info.Fields {
+		if f.WalletOnly && reg.OmitWalletOnly {
+			continue
+		}
 		yamlKey := f.YAMLTag
 		if yamlKey == "" {
 			yamlKey = strings.ToLower(f.GoName)
@@ -503,6 +510,10 @@ func main() {
 	// Parse registry config (internal/registry + internal/embed + pkg/config for cross-refs)
 	// Parse pkg/config first so its types are available but internal/registry's Config wins
 	regReg := NewRegistry()
+	// Fields tagged docs:"wallet-only" in shared config structs (e.g.
+	// HTTPClientConfig) are not read by the registry server, so its reference
+	// must not advertise them.
+	regReg.OmitWalletOnly = true
 	if _, err := os.Stat(pkgDir); err == nil {
 		if err := regReg.ParseDir(pkgDir); err != nil {
 			log.Fatalf("error parsing %s: %v", pkgDir, err)
