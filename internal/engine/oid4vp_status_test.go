@@ -132,6 +132,66 @@ func TestCheckPresentationStatus(t *testing.T) {
 	}
 }
 
+// jwtVP wraps credential JWTs in a JWT VP (jwt_vc_json presentation shape).
+func jwtVP(t *testing.T, vcs ...string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vc any = vcs
+	if len(vcs) == 1 {
+		vc = vcs[0]
+	}
+	return signJWT(t, key, map[string]any{"typ": "JWT"}, jwt.MapClaims{
+		"iss": "did:example:holder", "vp": map[string]any{"verifiableCredential": vc},
+	})
+}
+
+func TestCheckPresentationStatus_JWTVP(t *testing.T) {
+	ctx := context.Background()
+	h, mint := statusFixture(t, false)
+	vc := func(idx int) string { return strings.TrimSuffix(strings.SplitN(mint(idx, true), "~", 2)[0], "~") }
+
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, vc(0))); err != nil {
+		t.Fatalf("valid embedded VC refused: %v", err)
+	}
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, vc(1))); err == nil {
+		t.Fatal("revoked VC inside a JWT VP accepted")
+	}
+	// Every credential is covered, not just the first.
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, vc(0), vc(0), vc(1))); err == nil {
+		t.Fatal("revoked VC among several in a JWT VP accepted")
+	}
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, vc(0), vc(0))); err != nil {
+		t.Fatalf("all-valid JWT VP refused: %v", err)
+	}
+	// Inside a DCQL vp_token object too.
+	obj, _ := json.Marshal(map[string][]string{"a": {jwtVP(t, vc(1))}})
+	if err := h.checkPresentationStatus(ctx, string(obj)); err == nil {
+		t.Fatal("revoked VC in a JWT VP inside a DCQL vp_token accepted")
+	}
+	// warn mode logs but never refuses.
+	h.statusMode = config.StatusCheckWarn
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, vc(1))); err != nil {
+		t.Fatalf("warn must not refuse: %v", err)
+	}
+}
+
+func TestCheckPresentationStatus_JWTVPUnreachable(t *testing.T) {
+	ctx := context.Background()
+	h, mint := statusFixture(t, true)
+	vp := jwtVP(t, strings.SplitN(mint(0, true), "~", 2)[0])
+	h.statusMode = config.StatusCheckEnforceRevoked
+	if err := h.checkPresentationStatus(ctx, vp); err != nil {
+		t.Fatalf("enforce-revoked must proceed when the list is unreachable: %v", err)
+	}
+	h.statusMode = config.StatusCheckStrict
+	if err := h.checkPresentationStatus(ctx, vp); err == nil {
+		t.Fatal("strict must refuse an undeterminable embedded VC")
+	}
+}
+
 func malformedStatusCredential(t *testing.T) string {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	return signJWT(t, key, map[string]any{}, jwt.MapClaims{"status": map[string]any{"status_list": "x"}}) + "~"

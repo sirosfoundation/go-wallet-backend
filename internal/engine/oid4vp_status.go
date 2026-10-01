@@ -92,7 +92,8 @@ func sharedStatusChecker(cfg *config.Config, svc *TrustService) *statuslist.Chec
 //     and the verifier owns the authoritative check.
 //   - strict: also refuses when the status cannot be determined.
 //
-// Only JWT-shaped credentials (SD-JWT VC, JWT VC) are examined: the status
+// Only JWT-shaped credentials (SD-JWT VC, JWT VC) are examined; a JWT VP is
+// unwrapped and each credential JWT in vp.verifiableCredential is checked: the status
 // claim is in the issuer-signed JWT and is never selectively disclosable, so
 // it is readable without the disclosures. mdoc credentials carry their status
 // in the MSO and are not checked here (follow-up).
@@ -212,6 +213,38 @@ func listHost(uri string) string {
 }
 
 func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string, b *statusBudget) error {
+	return h.checkTokenStatusDepth(ctx, token, b, 0)
+}
+
+// maxVPNesting is how deep embedded credentials are followed: the presented
+// token may be a JWT VP (depth 0) whose vp.verifiableCredential entries are
+// the credentials (depth 1). A credential is not itself unwrapped again.
+const maxVPNesting = 1
+
+// embeddedCredentials returns the credential JWTs a JWT VP carries in
+// vp.verifiableCredential (a string or an array; non-string entries, such as
+// Data Integrity credential objects, are not JWTs and are skipped).
+func embeddedCredentials(claims map[string]any) []string {
+	vp, ok := claims["vp"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	switch vc := vp["verifiableCredential"].(type) {
+	case string:
+		return []string{vc}
+	case []any:
+		var out []string
+		for _, e := range vc {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func (h *OID4VPHandler) checkTokenStatusDepth(ctx context.Context, token string, b *statusBudget, depth int) error {
 	issuerJWT, _, _ := strings.Cut(strings.TrimSpace(token), "~")
 	parts := strings.Split(issuerJWT, ".")
 	if len(parts) != 3 {
@@ -224,6 +257,16 @@ func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string, b *s
 		// Not a credential JWT after all (e.g. an opaque token).
 		h.Logger.Debug("presented credential payload unreadable; status not checked", zap.Error(err))
 		return nil
+	}
+	// A jwt_vc / jwt_vc_json presentation is a JWT VP: the status claims live
+	// in the credential JWTs it embeds, not in its own payload. Every embedded
+	// credential is checked, under the same shared budget.
+	if depth < maxVPNesting {
+		for _, vc := range embeddedCredentials(claims) {
+			if err := h.checkTokenStatusDepth(ctx, vc, b, depth+1); err != nil {
+				return err
+			}
+		}
 	}
 	ref, present, err := statuslist.ReferenceFromCredentialClaims(claims)
 	if !present {
