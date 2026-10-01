@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
@@ -754,4 +756,26 @@ func TestWalletInstanceStore_UpdateStatus_UnknownStatusCannotBeRevoked(t *testin
 	if after.Status != domain.InstanceStatus("bogus") || after.DeactivatedAt != nil {
 		t.Fatalf("record must be untouched: %+v", after)
 	}
+}
+
+// Upsert reports the generation of the record it applied to, for a new and
+// for an existing record, and a record deleted and re-created gets another.
+func TestWalletInstanceStore_Upsert_ReportsGeneration(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore().WalletInstances()
+	first := &domain.WalletInstance{ID: "g1", TenantID: "t", Status: domain.InstanceStatusActive}
+	require.NoError(t, s.Upsert(ctx, first))
+	require.NotEmpty(t, first.Generation)
+	got, err := s.GetByID(ctx, "g1")
+	require.NoError(t, err)
+	require.Equal(t, got.Generation, first.Generation)
+
+	again := &domain.WalletInstance{ID: "g1", TenantID: "t"}
+	require.NoError(t, s.Upsert(ctx, again))
+	require.Equal(t, first.Generation, again.Generation)
+
+	require.NoError(t, s.DeleteIfUnchanged(ctx, "g1", "t", got.Binding()))
+	re := &domain.WalletInstance{ID: "g1", TenantID: "t", Status: domain.InstanceStatusActive}
+	require.NoError(t, s.Upsert(ctx, re))
+	require.NotEqual(t, first.Generation, re.Generation)
 }

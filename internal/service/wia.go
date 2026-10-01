@@ -738,6 +738,14 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 				s.emitAuditFailure("instance_not_owned", err)
 				return "", fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
 			}
+			// The record was deleted and attested again between the upsert
+			// and the bind/link that follows it; nothing was written to the
+			// replacement. Refuse rather than hand out a WIA for a record
+			// that is not the one this attestation checked.
+			if errors.Is(err, storage.ErrBindingChanged) {
+				s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+				return "", fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+			}
 			s.emitAuditFailure("instance_record_failed", err)
 			return "", fmt.Errorf("record wallet instance: %w", err)
 		}

@@ -387,6 +387,11 @@ type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
 	// An existing instance keeps its Status (only UpdateStatus changes it) and its first
 	// non-empty CredentialID (the passkey link is client-supplied and must not be moved).
+	// On success instance.Generation is set to the generation of the record the
+	// write applied to. The owner bind and credential link are conditional on that
+	// generation, so a record deleted and re-created mid-call is never bound to
+	// this caller: Upsert then returns ErrBindingChanged and the callers must
+	// refuse the attestation.
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.

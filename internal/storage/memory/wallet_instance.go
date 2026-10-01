@@ -66,6 +66,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 			(instance.UserID == nil || (existing.UserID != nil && *existing.UserID == *instance.UserID)) {
 			existing.CredentialID = instance.CredentialID
 		}
+		// Reported to the caller, as the Mongo store does: the bind and link
+		// above ran against exactly this generation, atomically under the lock.
+		instance.Generation = existing.Generation
 	} else {
 		instance.AttestationCount = 1
 		// A fresh generation per insert: a record deleted and attested again

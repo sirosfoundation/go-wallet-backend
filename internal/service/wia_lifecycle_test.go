@@ -830,3 +830,57 @@ func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *test
 		t.Fatalf("re-attestation for a removed account = %v, want ErrWIAUnknownUser", err)
 	}
 }
+
+// replacedMidUpsertInstances simulates the record being deleted and the same
+// thumbprint attested again by another user right after the caller's upsert
+// matched it and before its owner bind/link ran. A store that scopes those
+// follow-ups to the generation it upserted refuses with ErrBindingChanged and
+// leaves the replacement unowned by the caller; this wrapper plays that store.
+type replacedMidUpsertInstances struct {
+	storage.WalletInstanceStore
+	replacement domain.UserID
+}
+
+func (r *replacedMidUpsertInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if err := r.WalletInstanceStore.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	cur, err := r.WalletInstanceStore.GetByID(ctx, inst.ID)
+	if err != nil {
+		return err
+	}
+	if err := r.WalletInstanceStore.DeleteIfUnchanged(ctx, inst.ID, inst.TenantID, cur.Binding()); err != nil {
+		return err
+	}
+	w := r.replacement
+	if err := r.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{
+		ID: inst.ID, TenantID: inst.TenantID, UserID: &w, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		return err
+	}
+	return storage.ErrBindingChanged
+}
+
+func TestWIAService_GenerateWIA_RecordReplacedBeforeBindGetsNoWIA(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore().WalletInstances()
+	replacement := domain.UserIDFromString("user-replacement")
+	svc := newTestWIAServiceUsing(t, &replacedMidUpsertInstances{WalletInstanceStore: base, replacement: replacement})
+	caller := domain.UserIDFromString("user-old-caller")
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, _ := createTestPop(t, challenge)
+	wia, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &caller, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAInstanceNotOwned) || wia != "" {
+		t.Fatalf("expected ErrWIAInstanceNotOwned and no WIA, got wia=%q err=%v", wia, err)
+	}
+	mine, err := base.GetByUser(ctx, domain.DefaultTenantID, caller)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if len(mine) != 0 {
+		t.Fatalf("the replacement must not belong to the old caller: %v", mine)
+	}
+}

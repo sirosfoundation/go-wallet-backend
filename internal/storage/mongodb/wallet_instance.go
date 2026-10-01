@@ -57,14 +57,24 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
 	}
 
-	opts := options.Update().SetUpsert(true)
-	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
+	// FindOneAndUpdate returns the document as written, so the generation the
+	// follow-up bind and link are scoped to is the one this upsert inserted or
+	// matched, not whatever a later read would find.
+	var written struct {
+		Generation string `bson:"generation"`
+	}
+	err := s.collection.FindOneAndUpdate(ctx, filter, update,
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After).
+			SetProjection(bson.M{"generation": 1}),
+	).Decode(&written)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
 			return storage.ErrAlreadyExists
 		}
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
 	}
+	// Reported to the caller, as the memory store does.
+	instance.Generation = written.Generation
 
 	// The user binding is written only while the document has none, so two
 	// authenticated attestations of the same anonymous instance cannot both
@@ -78,12 +88,14 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// on the record tenant A created. The read-back refuses B's WIA either
 	// way; this keeps A's record bindable by A's real owner.
 	if instance.UserID != nil {
-		bindFilter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID, "$or": []bson.M{
-			{"user_id": bson.M{"$exists": false}},
-			{"user_id": nil},
-		}}
-		if _, err := s.collection.UpdateOne(ctx, bindFilter, bson.M{"$set": bson.M{"user_id": instance.UserID}}); err != nil {
+		res, err := s.collection.UpdateOne(ctx, upsertBindFilter(instance), bson.M{"$set": bson.M{"user_id": instance.UserID}})
+		if err != nil {
 			return fmt.Errorf("%w: bind wallet instance user: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 0 {
+			if err := s.requireGeneration(ctx, instance); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -103,20 +115,83 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// first-link-wins rule; it cannot claim a credential id in practice,
 	// GenerateWIA refuses one without an authenticated caller.
 	if instance.CredentialID != "" {
-		linkFilter := bson.M{
-			"_id":       instance.ID,
-			"tenant_id": instance.TenantID,
-			"$or": []bson.M{
-				{"credential_id": bson.M{"$exists": false}},
-				{"credential_id": ""},
-			},
-		}
-		if instance.UserID != nil {
-			linkFilter["user_id"] = *instance.UserID
-		}
-		if _, err := s.collection.UpdateOne(ctx, linkFilter, bson.M{"$set": bson.M{"credential_id": instance.CredentialID}}); err != nil {
+		res, err := s.collection.UpdateOne(ctx, upsertLinkFilter(instance), bson.M{"$set": bson.M{"credential_id": instance.CredentialID}})
+		if err != nil {
 			return fmt.Errorf("%w: link wallet instance credential: %v", storage.ErrDatabase, err)
 		}
+		if res.MatchedCount == 0 {
+			if err := s.requireGeneration(ctx, instance); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// generationCond matches the generation the upsert wrote: none (absent, null
+// or empty) for a record that predates generations.
+func generationCond(gen string) bson.M {
+	if gen == "" {
+		return bson.M{"$or": []bson.M{
+			{"generation": bson.M{"$exists": false}},
+			{"generation": nil},
+			{"generation": ""},
+		}}
+	}
+	return bson.M{"generation": gen}
+}
+
+// upsertBindFilter is the filter of Upsert's owner bind. Besides id, tenant
+// and "still unowned" it carries the generation the upsert wrote: the bind
+// is a separate statement, and if the record was deleted and the thumbprint
+// attested again in between, an unscoped bind would match the replacement's
+// empty owner and park it on this caller.
+func upsertBindFilter(instance *domain.WalletInstance) bson.M {
+	return bson.M{"$and": []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+		{"$or": []bson.M{
+			{"user_id": bson.M{"$exists": false}},
+			{"user_id": nil},
+		}},
+	}}
+}
+
+// upsertLinkFilter is the filter of Upsert's passkey link; see
+// upsertBindFilter for why it is scoped to the generation.
+func upsertLinkFilter(instance *domain.WalletInstance) bson.M {
+	conds := []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+		{"$or": []bson.M{
+			{"credential_id": bson.M{"$exists": false}},
+			{"credential_id": ""},
+		}},
+	}
+	if instance.UserID != nil {
+		conds = append(conds, bson.M{"user_id": *instance.UserID})
+	}
+	return bson.M{"$and": conds}
+}
+
+// requireGeneration tells a follow-up write that matched nothing because the
+// record is already bound or linked (fine; the caller reads it back) from one
+// that matched nothing because the record is no longer the one the upsert
+// wrote. The latter is ErrBindingChanged: nothing was written to the
+// replacement, and the caller must refuse the attestation.
+func (s *WalletInstanceStore) requireGeneration(ctx context.Context, instance *domain.WalletInstance) error {
+	n, err := s.collection.CountDocuments(ctx, bson.M{"$and": []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+	}})
+	if err != nil {
+		return fmt.Errorf("%w: re-check wallet instance generation: %v", storage.ErrDatabase, err)
+	}
+	if n == 0 {
+		return storage.ErrBindingChanged
 	}
 	return nil
 }
