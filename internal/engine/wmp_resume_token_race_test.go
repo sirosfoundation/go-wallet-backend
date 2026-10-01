@@ -59,3 +59,45 @@ func TestWMP_SessionCreateFailsWhenPeerRemovedBeforeToken(t *testing.T) {
 	assert.Empty(t, a.peers)
 	assert.Empty(t, a.resumptionTokens, "no token may survive for the closed session")
 }
+
+// A create that is superseded by a second create for the same user between
+// manager registration and peer publication must fail rather than return a
+// session (and resumption token) that is already torn down. The hook
+// interleaves the two creates deterministically.
+func TestWMP_SessionCreateFailsWhenSupersededBeforePublication(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	create := func(id string) *wmp.Response {
+		body := wmpRequest(id, "wmp.session.create", wmp.SessionCreateParams{
+			WMP:      wmp.Metadata{Version: wmp.Version},
+			Security: wmp.SecurityMode{Mode: "tls"},
+			Auth:     &wmp.AuthObject{Type: "bearer", Token: testToken("user-1", "tenant-a")},
+		})
+		resp, err := a.HandleRPC(context.Background(), "", "", "", body)
+		require.NoError(t, err)
+		var rpcResp wmp.Response
+		require.NoError(t, json.Unmarshal(resp, &rpcResp))
+		return &rpcResp
+	}
+
+	var second *wmp.Response
+	fired := false
+	a.afterRegister = func(string) {
+		if fired {
+			return
+		}
+		fired = true
+		second = create("2") // registers, superseding the first create
+	}
+
+	first := create("1")
+	require.NotNil(t, first.Error, "superseded create must fail")
+	require.NotNil(t, second)
+	require.Nil(t, second.Error, "the newer create must succeed")
+
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	assert.Len(t, a.peers, 1, "only the newer session may be published")
+	assert.Len(t, a.resumptionTokens, 1, "no token may exist for the superseded session")
+}

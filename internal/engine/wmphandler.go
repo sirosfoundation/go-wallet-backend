@@ -47,6 +47,7 @@ type WMPAdapter struct {
 	outbound          map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
 	externalURL       string                      // public base URL for discovery (SetExternalURL)
 	draining          bool                        // set by Drain/Close; new sessions and requests are refused
+	afterRegister     func(sessionID string)      // test hook: runs between manager registration and peer publication
 	beforeCreateToken func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
 
 	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
@@ -949,6 +950,10 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	}
 	buf := &wmpEventBuffer{}
 
+	if a.afterRegister != nil {
+		a.afterRegister(sessionID)
+	}
+
 	a.mu.Lock()
 	if a.draining {
 		// Shutdown began after the request was admitted: nothing will ever
@@ -957,6 +962,18 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		a.teardown(ws)
 		return wmpErrorBytes(req.ID, wmp.ErrRateLimited, map[string]string{
 			"reason": "server shutting down",
+		})
+	}
+	// A concurrent create for the same user may have superseded this session
+	// (closing its transport) after registerSession but before this point.
+	// Checking under a.mu, which also guards publication, means a superseded
+	// create fails instead of publishing a peer that is about to be torn down.
+	if !a.manager.isCurrentSession(session) {
+		a.mu.Unlock()
+		a.teardown(ws)
+		a.logger.Warn("WMP session.create rejected: superseded by a newer session during creation", zap.String("session_id", sessionID))
+		return wmpErrorBytes(req.ID, wmp.ErrInternalError, map[string]string{
+			"reason": "session superseded during creation",
 		})
 	}
 	a.peers[sessionID] = ws
@@ -1022,7 +1039,7 @@ func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession) (str
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if ws != nil && a.peers[sessionID] != ws {
+	if ws != nil && (a.peers[sessionID] != ws || !a.manager.isCurrentSession(ws.session)) {
 		return "", false
 	}
 	a.resumptionTokens[token] = &resumptionEntry{

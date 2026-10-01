@@ -781,6 +781,24 @@ func (m *Manager) registerSession(session *Session) bool {
 	return true
 }
 
+// isCurrentSession reports whether session is still the registered session
+// (and, for an identified user, still the user's current one): a later
+// registerSession for the same user supersedes it and closes its transport.
+// Callers publishing a freshly registered session use it to fail a create
+// that lost that race instead of reporting success for a session that is
+// already being torn down.
+func (m *Manager) isCurrentSession(session *Session) bool {
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	if m.sessions[session.ID] != session {
+		return false
+	}
+	if session.UserID != "" && m.userIndex[session.UserID] != session {
+		return false
+	}
+	return true
+}
+
 func (m *Manager) unregisterSession(session *Session) {
 	m.sessionsMu.Lock()
 	defer m.sessionsMu.Unlock()
