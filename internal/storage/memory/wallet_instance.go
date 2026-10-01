@@ -42,7 +42,11 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		// First user binding wins; a bound instance is never re-parented here
 		// (see the Mongo implementation and WIAService.signWIA's read-back).
 		if existing.UserID == nil && instance.UserID != nil {
-			existing.UserID = instance.UserID
+			// Copied: the caller's pointer must not stay an alias of the
+			// stored owner, or mutating it later would re-parent the instance
+			// and change which user's login is gated.
+			u := *instance.UserID
+			existing.UserID = &u
 		}
 		if instance.DeviceInfo != nil {
 			// Copied, so a caller that keeps mutating its own struct cannot
@@ -104,6 +108,17 @@ func cloneInstance(in *domain.WalletInstance) *domain.WalletInstance {
 		cp.SecurityProperties = &sp
 	}
 	return &cp
+}
+
+// cloneBinding copies a binding, whose Owner is a pointer into the caller's
+// memory. The conditional operations only read it, but a caller mutating it
+// concurrently would race with the comparison, and Mongo takes a value copy.
+func cloneBinding(in domain.InstanceBinding) domain.InstanceBinding {
+	if in.Owner != nil {
+		o := *in.Owner
+		in.Owner = &o
+	}
+	return in
 }
 
 func (s *WalletInstanceStore) GetByID(_ context.Context, id string) (*domain.WalletInstance, error) {
@@ -174,7 +189,8 @@ func (s *WalletInstanceStore) UpdateStatusForUser(_ context.Context, id string, 
 func (s *WalletInstanceStore) UpdateStatusIfUnchanged(_ context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateStatusLocked(id, tenantID, nil, &expected, status, reason)
+	binding := cloneBinding(expected)
+	return s.updateStatusLocked(id, tenantID, nil, &binding, status, reason)
 }
 
 // DeleteIfUnchanged deletes only while the record still matches the expected
@@ -183,6 +199,7 @@ func (s *WalletInstanceStore) DeleteIfUnchanged(_ context.Context, id string, te
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	expected = cloneBinding(expected)
 	inst, ok := s.data[id]
 	if !ok || inst.TenantID != tenantID {
 		return storage.ErrNotFound
@@ -260,6 +277,7 @@ func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, te
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	expected = cloneBinding(expected)
 	inst, ok := s.data[id]
 	if !ok || inst.TenantID != tenantID {
 		return storage.ErrNotFound
