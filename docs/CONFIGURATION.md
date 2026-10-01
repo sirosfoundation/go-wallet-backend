@@ -21,6 +21,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [security](#security)
 - [http_client](#http_client)
 - [authzen_proxy](#authzen_proxy)
+- [r2ps_admin](#r2ps_admin)
 - [audit](#audit)
 - [presentation](#presentation)
 - [Registry Server](#registry-server)
@@ -282,6 +283,16 @@ Environment prefix: `WALLET_AUTHZEN_PROXY`
 | `authzen_proxy.issuer_entitlement_mode` | `WALLET_AUTHZEN_PROXY_ISSUER_ENTITLEMENT_MODE` | string | IssuerEntitlementMode decides what happens when a PID or attestation provider is not registered for what it is offering: "warn" (default, report and continue), "fail" (refuse), or "off" (do not check).  The default is warn, not fail, because the ARF obligation to verify registration certificates applies 24 months after the amending Regulation enters into force. Until then, refusing a provider that has simply not been registered yet would break issuance that is currently legitimate. An unrecognised value is treated as warn rather than off, so a typo cannot silently disable the check. |
 | `authzen_proxy.allow_resolution` | `WALLET_AUTHZEN_PROXY_ALLOW_RESOLUTION` | boolean | AllowResolution controls whether resolution-only requests are allowed. Resolution requests fetch metadata (DID documents, entity configs) without key validation. Default: true |
 | `authzen_proxy.fail_open_on_tenant_lookup_error` | `WALLET_AUTHZEN_PROXY_FAIL_OPEN_ON_TENANT_LOOKUP_ERROR` | boolean | FailOpenOnTenantLookupError controls behavior when per-tenant PDP lookup fails. If false (default), tenant lookup errors return an error to the client. If true, falls back to the global PDP URL on lookup errors. Security note: fail-closed (false) prevents bypassing per-tenant security policies. |
+
+## r2ps_admin
+
+Environment prefix: `WALLET_R2PS_ADMIN`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `r2ps_admin.base_url` | `WALLET_R2PS_ADMIN_BASE_URL` | string | BaseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444"). It must be an absolute https URL without userinfo, query or fragment; plain http is accepted only where http_client permits plaintext (http_client.allow_http / allow_private_ips). Requests go through the SSRF-guarded http_client. An invalid value disables the /admin/r2ps routes and is logged at startup. |
+| `r2ps_admin.token` | `WALLET_R2PS_ADMIN_TOKEN` | string | Token is the bearer token sent as "Authorization: Bearer" on every request to the R2PS admin API. go-r2ps-service's admin listener requires one (a JWT accepted via R2PS_ADMIN_JWKS_URL with list/read/ write TAC, or its static R2PS_ADMIN_DEV_TOKEN). Prefer token_file so the secret is not in the config file or environment. The token is never logged. Whether the server requires auth cannot be known from here, so an empty token is allowed (e.g. network-isolated deployments without token auth); the server then answers 401 if it does require one. |
+| `r2ps_admin.token_file` | `WALLET_R2PS_ADMIN_TOKEN_FILE` | string | TokenFile is a path to a file containing the bearer token (surrounding whitespace is trimmed). Takes precedence over token. |
 
 ## audit
 

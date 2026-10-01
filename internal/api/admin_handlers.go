@@ -14,14 +14,16 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/r2ps"
 )
 
 // AdminHandlers contains handlers for internal admin API endpoints
 type AdminHandlers struct {
-	store     storage.Store
-	logger    *zap.Logger
-	audit     *audit.Emitter
-	allowHTTP bool // when true, plain HTTP OIDC issuer URLs are permitted (test/dev environments)
+	store      storage.Store
+	logger     *zap.Logger
+	audit      *audit.Emitter
+	r2psClient *r2ps.Client
+	allowHTTP  bool // when true, plain HTTP OIDC issuer URLs are permitted (test/dev environments)
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
@@ -31,6 +33,13 @@ func NewAdminHandlers(store storage.Store, logger *zap.Logger, auditor *audit.Em
 		logger: logger,
 		audit:  auditor,
 	}
+}
+
+// SetR2PSClient wires the optional R2PS admin client. When nil (the default),
+// the /r2ps proxy routes are not registered. Must be called before
+// RegisterRoutes.
+func (h *AdminHandlers) SetR2PSClient(c *r2ps.Client) {
+	h.r2psClient = c
 }
 
 // SetAllowHTTP configures whether OIDC gate provider issuer URLs may use
@@ -1153,6 +1162,19 @@ func (h *AdminHandlers) RegisterRoutes(adminGroup *gin.RouterGroup) {
 		// Tenant statistics
 		tenants.GET("/:id/stats", h.GetTenantStats)
 	}
+
+	// R2PS WSCD proxy (only registered when R2PS client is configured)
+	if h.r2psClient != nil {
+		r2psGroup := adminGroup.Group("/r2ps")
+		{
+			r2psGroup.GET("/keys", h.R2PSListKeys)
+			r2psGroup.GET("/keys/:kid", h.R2PSGetKey)
+			r2psGroup.GET("/statuses/:category", h.R2PSListStatuses)
+			r2psGroup.GET("/status/:category/:idx", h.R2PSGetStatus)
+			r2psGroup.PUT("/status/:category/:idx", h.R2PSSetStatus)
+		}
+	}
+
 }
 
 // emitAudit is a nil-safe helper for emitting SET audit events.

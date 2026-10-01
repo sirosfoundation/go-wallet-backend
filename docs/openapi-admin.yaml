@@ -77,6 +77,8 @@ tags:
     description: Verifier management per tenant
   - name: Invites
     description: Invite code management for controlled registration
+  - name: R2PS
+    description: Proxy to the R2PS admin API (WSCD/WSCA keys and status lists). Routes exist only when r2ps_admin.base_url is configured.
 
 paths:
   /admin/status:
@@ -1002,6 +1004,185 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /admin/r2ps/keys:
+    get:
+      tags: [R2PS]
+      summary: List WSCD public keys
+      description: Lists public keys held by the R2PS service, optionally filtered by client_id.
+      operationId: listR2PSKeys
+      parameters:
+        - name: client_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Keys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/R2PSKeyList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/keys/{kid}:
+    get:
+      tags: [R2PS]
+      summary: Get a WSCD public key
+      operationId: getR2PSKey
+      parameters:
+        - name: kid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/R2PSPublicKey'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/statuses/{category}:
+    get:
+      tags: [R2PS]
+      summary: List status entries in a category
+      operationId: listR2PSStatuses
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Status entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/R2PSStatusList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /admin/r2ps/status/{category}/{idx}:
+    get:
+      tags: [R2PS]
+      summary: Get the status of one index
+      operationId: getR2PSStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Status entry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/R2PSStatusEntry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [R2PS]
+      summary: Set the status of one index (valid, revoked, suspended)
+      operationId: setR2PSStatus
+      parameters:
+        - name: category
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: idx
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: integer
+                  enum: [0, 1, 2]
+                  description: 0=valid, 1=revoked, 2=suspended
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/R2PSStatusUpdate'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: R2PS service unreachable or returned an error (an upstream 404 is passed through as 404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   parameters:
     tenantId:
@@ -1073,6 +1254,98 @@ components:
         service:
           type: string
           example: wallet-backend-admin
+
+    R2PSPublicKey:
+      type: object
+      description: A WSCD public key held by the R2PS service
+      required: [kid]
+      properties:
+        kid:
+          type: string
+        curve:
+          type: string
+          example: P-256
+        pub_key:
+          type: string
+          description: Base64-encoded public key
+        creation_time:
+          type: integer
+          format: int64
+          description: Unix time of key creation
+        client_id:
+          type: string
+
+    R2PSKeyList:
+      type: object
+      required: [count, keys]
+      properties:
+        count:
+          type: integer
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/R2PSPublicKey'
+
+    R2PSStatusEntry:
+      type: object
+      description: The status of one index in an R2PS status list
+      required: [category, idx, status]
+      properties:
+        category:
+          type: string
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
+          description: 0=valid, 1=revoked, 2=suspended
+        label:
+          type: string
+          description: Human-readable status label from R2PS
+        used:
+          type: boolean
+          description: Whether the index has been allocated to a credential
+
+    R2PSStatusListItem:
+      type: object
+      required: [idx, status]
+      properties:
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
+        label:
+          type: string
+
+    R2PSStatusList:
+      type: object
+      required: [category, count, entries]
+      properties:
+        category:
+          type: string
+        count:
+          type: integer
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/R2PSStatusListItem'
+
+    R2PSStatusUpdate:
+      type: object
+      description: Result of a status change
+      required: [category, idx, status]
+      properties:
+        category:
+          type: string
+        idx:
+          type: integer
+          minimum: 0
+        status:
+          type: integer
+          enum: [0, 1, 2]
 
     ErrorResponse:
       type: object

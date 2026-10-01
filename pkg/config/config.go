@@ -31,6 +31,7 @@ type Config struct {
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
+	R2PSAdmin      R2PSAdminConfig      `yaml:"r2ps_admin" envconfig:"R2PS_ADMIN"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
@@ -2415,6 +2416,29 @@ func (c *ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// R2PSAdminConfig configures the R2PS admin API client for WSCD/WSCA status queries.
+type R2PSAdminConfig struct {
+	// BaseURL is the R2PS admin endpoint (e.g. "https://r2ps-admin:8444").
+	// It must be an absolute https URL without userinfo, query or fragment;
+	// plain http is accepted only where http_client permits plaintext
+	// (http_client.allow_http / allow_private_ips). Requests go through the
+	// SSRF-guarded http_client. An invalid value disables the /admin/r2ps
+	// routes and is logged at startup.
+	BaseURL string `yaml:"base_url" envconfig:"BASE_URL"`
+	// Token is the bearer token sent as "Authorization: Bearer" on every
+	// request to the R2PS admin API. go-r2ps-service's admin listener
+	// requires one (a JWT accepted via R2PS_ADMIN_JWKS_URL with list/read/
+	// write TAC, or its static R2PS_ADMIN_DEV_TOKEN). Prefer token_file so
+	// the secret is not in the config file or environment. The token is never
+	// logged. Whether the server requires auth cannot be known from here, so
+	// an empty token is allowed (e.g. network-isolated deployments without
+	// token auth); the server then answers 401 if it does require one.
+	Token string `yaml:"token" envconfig:"TOKEN"`
+	// TokenFile is a path to a file containing the bearer token (surrounding
+	// whitespace is trimmed). Takes precedence over token.
+	TokenFile string `yaml:"token_file" envconfig:"TOKEN_FILE"`
 }
 
 // AuditConfig configures the SET (Security Event Token) audit trail emitter.
