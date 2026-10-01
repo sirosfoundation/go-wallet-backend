@@ -19,8 +19,11 @@
 package legacytoken
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -83,11 +86,24 @@ func SID(secret, rawToken string) string {
 // algorithm, i.e. whether it is a legacy token rather than a new-style
 // asymmetric one. Nothing about the token is trusted by this; it only routes.
 func IsHMAC(rawToken string) bool {
-	tok, _, err := jwt.NewParser().ParseUnverified(rawToken, jwt.MapClaims{})
-	if err != nil || tok == nil {
+	// Read only the JOSE header's "alg" for routing. This deliberately does
+	// not go through a JWT parser: no claims are read and nothing is trusted,
+	// and every token routed here is signature-verified (HS* only) later.
+	header, _, ok := strings.Cut(rawToken, ".")
+	if !ok {
 		return false
 	}
-	switch alg, _ := tok.Header["alg"].(string); alg {
+	raw, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		return false
+	}
+	var h struct {
+		Alg string `json:"alg"`
+	}
+	if json.Unmarshal(raw, &h) != nil {
+		return false
+	}
+	switch h.Alg {
 	case "HS256", "HS384", "HS512":
 		return true
 	}

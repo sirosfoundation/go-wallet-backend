@@ -1,7 +1,11 @@
 package legacytoken
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -216,5 +220,28 @@ func TestIsHMAC(t *testing.T) {
 		if IsHMAC(tok) {
 			t.Errorf("%q treated as HMAC", tok)
 		}
+	}
+}
+
+// Algorithm-confusion: a token whose header claims RS256 (or none) but which
+// is MAC'd with the shared HMAC secret must be refused by both the router and
+// the validator.
+func TestAlgConfusionRefused(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	enc := base64.RawURLEncoding.EncodeToString
+	signing := enc([]byte(`{"alg":"RS256","typ":"JWT"}`)) + "." +
+		enc([]byte(`{"iss":"wallet-backend","exp":`+strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)+`}`))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signing))
+	rs := signing + "." + enc(mac.Sum(nil))
+
+	if IsHMAC(rs) {
+		t.Error("RS256-header token routed as HMAC")
+	}
+	if _, err := ValidateAnyAudience(secret, []string{"wallet-backend"}, rs); err == nil {
+		t.Error("RS256-with-HMAC-secret token accepted by ValidateAnyAudience")
+	}
+	if _, err := ParseSID(secret, rs); err == nil {
+		t.Error("RS256-with-HMAC-secret token accepted by ParseSID")
 	}
 }
