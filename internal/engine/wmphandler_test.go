@@ -1053,8 +1053,7 @@ func TestWMP_SessionClose_NilParams(t *testing.T) {
 	ws := a.peers[sessionID]
 	a.mu.RUnlock()
 
-	handler := &wmpEngineHandler{adapter: a, sessionID: sessionID, session: ws.session}
-	handler.SessionClose(context.Background(), nil)
+	ws.handler.SessionClose(context.Background(), nil)
 
 	_, err := a.Events(sessionID)
 	assert.Error(t, err, "session should be closed even when params is nil")

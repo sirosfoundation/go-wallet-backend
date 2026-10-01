@@ -47,6 +47,7 @@ type WMPAdapter struct {
 	outbound            map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
 	externalURL         string                      // public base URL for discovery (SetExternalURL)
 	draining            bool                        // set by Drain/Close; new sessions and requests are refused
+	afterExpiryScan     func()                      // test hook: runs between cleanupExpired's scan and its closes
 	beforeResumePublish func(sessionID string)      // test hook: runs between a resume's validation and its publication
 	afterRegister       func(sessionID string)      // test hook: runs between manager registration and peer publication
 	beforeCreateToken   func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
@@ -569,21 +570,50 @@ func (a *WMPAdapter) cleanupExpired() {
 		}
 	}
 
-	// Collect idle or TTL-expired sessions to close.
-	var expiredSessions []string
+	// Collect idle or TTL-expired sessions to close. The scanned *wmpSession
+	// is kept (not just its ID): a resume may replace the peer after this
+	// scan, and the stale decision must not close the replacement.
+	type expiredEntry struct {
+		sid string
+		ws  *wmpSession
+	}
+	var expiredSessions []expiredEntry
 	for sid, ws := range a.peers {
-		if now.Sub(ws.lastActivity) > wmpSessionIdleTimeout {
-			expiredSessions = append(expiredSessions, sid)
-		} else if !ws.expiresAt.IsZero() && now.After(ws.expiresAt) {
-			expiredSessions = append(expiredSessions, sid)
+		if wmpSessionExpiredLocked(ws, now) {
+			expiredSessions = append(expiredSessions, expiredEntry{sid, ws})
 		}
 	}
 	a.mu.Unlock()
 
-	for _, sid := range expiredSessions {
-		a.logger.Info("Closing expired/idle WMP session", zap.String("session_id", sid[:8]))
-		a.CloseSession(sid)
+	if a.afterExpiryScan != nil {
+		a.afterExpiryScan()
 	}
+
+	for _, e := range expiredSessions {
+		// Re-check idleness/TTL at close time under the lock: the session
+		// may have been touched since the scan.
+		if a.closeSessionIf(e.sid, e.ws, func(ws *wmpSession) bool {
+			return wmpSessionExpiredLocked(ws, time.Now())
+		}) {
+			a.logger.Info("Closed expired/idle WMP session", zap.String("session_id", shortID(e.sid)))
+		}
+	}
+}
+
+func shortID(sid string) string {
+	if len(sid) > 8 {
+		return sid[:8]
+	}
+	return sid
+}
+
+// wmpSessionExpiredLocked reports whether ws is idle or past its TTL at now.
+// Callers must hold a.mu (lastActivity is written under it).
+func wmpSessionExpiredLocked(ws *wmpSession, now time.Time) bool {
+	if now.Sub(ws.lastActivity) > wmpSessionIdleTimeout {
+		return true
+	}
+	return !ws.expiresAt.IsZero() && now.After(ws.expiresAt)
 }
 
 // verifySessionOwnership checks that the session belongs to the authenticated user.
@@ -790,18 +820,39 @@ func (a *WMPAdapter) teardown(ws *wmpSession) {
 // wmpSession for the same ID, and that replacement must not be destroyed by
 // the outgoing goroutine's own cleanup.
 func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
+	a.closeSessionIf(sessionID, ws, nil)
+}
+
+// closeSessionIf is closeSessionIfCurrent with an extra predicate evaluated
+// under a.mu once ws is confirmed current; a false result leaves the session
+// alone. It reports whether the session was closed.
+func (a *WMPAdapter) closeSessionIf(sessionID string, ws *wmpSession, pred func(*wmpSession) bool) bool {
 	a.mu.Lock()
 	current, ok := a.peers[sessionID]
-	if !ok || current != ws {
-		// Superseded by a resume (or already removed) — nothing to do.
+	if !ok || current != ws || (pred != nil && !pred(ws)) {
+		// Superseded by a resume, already removed, or no longer eligible.
 		a.mu.Unlock()
-		return
+		return false
 	}
 	delete(a.peers, sessionID)
 	a.dropSessionStateLocked(sessionID)
 	a.mu.Unlock()
 
 	a.teardown(ws)
+	return true
+}
+
+// closeSessionIfHandler closes sessionID only if h is the handler of the
+// currently installed peer, so a close request delivered on a connection a
+// resume has since replaced cannot terminate the resumed session.
+func (a *WMPAdapter) closeSessionIfHandler(sessionID string, h *wmpEngineHandler) {
+	a.mu.RLock()
+	ws, ok := a.peers[sessionID]
+	a.mu.RUnlock()
+	if !ok {
+		return
+	}
+	a.closeSessionIf(sessionID, ws, func(cur *wmpSession) bool { return cur.handler == h })
 }
 
 // supersedeSession invalidates the adapter state of a session that the
@@ -1516,7 +1567,7 @@ func (h *wmpEngineHandler) SessionClose(_ context.Context, params *wmp.SessionCl
 	h.adapter.logger.Info("WMP session closed by client",
 		zap.String("session_id", h.sessionID),
 		zap.String("reason", reason))
-	h.adapter.CloseSession(h.sessionID)
+	h.adapter.closeSessionIfHandler(h.sessionID, h)
 }
 
 // logger returns the adapter's logger, or a no-op one for a bare handler.
