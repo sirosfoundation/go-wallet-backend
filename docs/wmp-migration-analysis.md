@@ -186,8 +186,12 @@ data: {"jsonrpc":"2.0","method":"wmp.flow.progress","params":{...}}
 Event IDs are decimal integers (a per-session counter that survives reconnects
 and `wmp.session.resume`). On reconnect, `fetch-event-source` sends
 `Last-Event-ID: 42` and the server replays the events after that ID. A
-`Last-Event-ID` that is not a decimal integer is ignored and replay falls back
-to the first event not yet written to any connection.
+`Last-Event-ID` that is absent or not a decimal integer is treated as "no
+cursor": the server replays every retained event (the bounded 200-event ring).
+The server keeps no per-session delivery state, because a successful flush only
+hands bytes to the connection or a proxy and does not prove the client parsed
+the frame. **Duplicates are therefore possible** after a reconnect, and clients
+must dedupe by event ID (IDs are monotonic per session).
 
 This means **OAuth redirects are a non-issue** — when the user returns from the
 authorization server, the SSE stream reconnects and the server replays any missed

@@ -194,9 +194,36 @@ func (f *flushFailWriter) FlushError() error {
 	return nil
 }
 
-// An event whose flush failed must not count as delivered, or a reconnect
-// without Last-Event-ID would skip it for good.
-func TestWMP_SSE_FlushFailureDoesNotAdvanceDelivered(t *testing.T) {
+// A reconnect without Last-Event-ID must replay every retained event, even
+// ones written to an earlier connection: a flush only hands bytes to the
+// connection or proxy, so the server cannot know the client parsed them.
+func TestWMP_SSE_NoCursorReplaysRetainedEvents(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	buf := a.getOrCreateEventBuffer(sid)
+	buf.append([]byte(`{"x":1}`))
+
+	connect := func() string {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+		w := &syncRecorder{ResponseRecorder: httptest.NewRecorder()}
+		done := make(chan struct{})
+		go func() { a.HandleWMPEvents(w, req); close(done) }()
+		require.Eventually(t, func() bool { return strings.Contains(w.String(), `"x":1`) }, 2*time.Second, 10*time.Millisecond)
+		cancel()
+		<-done
+		return w.String()
+	}
+	first := connect()
+	second := connect()
+	assert.Contains(t, first, "id: 1\n")
+	assert.Contains(t, second, "id: 1\n", "no cursor: the already-flushed event is replayed")
+}
+
+// A failed flush must stop the handler; the event stays replayable.
+func TestWMP_SSE_FlushFailureStopsHandler(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 	sid := createWMPSession(t, a)
@@ -214,7 +241,8 @@ func TestWMP_SSE_FlushFailureDoesNotAdvanceDelivered(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("SSE handler did not stop after a failed flush")
 	}
-	assert.Zero(t, buf.delivered(), "a failed flush must not advance deliveredID")
+	evs, _ := buf.after(0)
+	assert.Len(t, evs, 1, "the event must remain replayable")
 }
 
 // recordingWriter accepts every write and flush and records the deadlines set.

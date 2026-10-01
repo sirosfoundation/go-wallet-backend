@@ -143,10 +143,9 @@ type wmpBufferedEvent struct {
 // notifications emitted while no client is connected - or in the window of
 // a resume - are retained.
 type wmpEventBuffer struct {
-	mu          sync.Mutex
-	events      []wmpBufferedEvent
-	nextID      int64
-	deliveredID int64 // highest event ID written to an SSE connection
+	mu     sync.Mutex
+	events []wmpBufferedEvent
+	nextID int64
 
 	// wake is closed (and replaced) on every append so SSE handlers can
 	// block until there is something new; done is closed when the session
@@ -229,22 +228,6 @@ func (b *wmpEventBuffer) after(cursor int64) ([]wmpBufferedEvent, <-chan struct{
 	return out, b.wake
 }
 
-// markDelivered records that events up to id were written to a client.
-func (b *wmpEventBuffer) markDelivered(id int64) {
-	b.mu.Lock()
-	if id > b.deliveredID {
-		b.deliveredID = id
-	}
-	b.mu.Unlock()
-}
-
-// delivered returns the highest event ID written to a client so far.
-func (b *wmpEventBuffer) delivered() int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.deliveredID
-}
-
 // doneCh is closed when the owning session has ended.
 func (b *wmpEventBuffer) doneCh() <-chan struct{} {
 	b.mu.Lock()
@@ -282,16 +265,16 @@ func (b *wmpEventBuffer) pendingCount() int {
 }
 
 // missedSince counts the events a client that last received lastReceivedID
-// has not seen. When the client supplies no (parseable) cursor the count is
-// of events not yet written to any SSE connection; a cursor older than the
-// retained window counts everything retained (older events are evicted and
-// cannot be replayed).
+// has not seen. When the client supplies no (parseable) cursor every retained
+// event counts, since the server keeps no delivery state and will replay them
+// all; a cursor older than the retained window likewise counts everything
+// retained (older events are evicted and cannot be replayed).
 func (b *wmpEventBuffer) missedSince(lastReceivedID string) int {
 	cursor, err := strconv.ParseInt(lastReceivedID, 10, 64)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err != nil || lastReceivedID == "" {
-		cursor = b.deliveredID
+		cursor = 0
 	}
 	n := 0
 	for _, ev := range b.events {
@@ -649,8 +632,8 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 }
 
 // Events returns a channel of the session's outbound notifications, as the
-// SSE stream would deliver them, starting after the last event already
-// written to a client. It is a convenience subscription; the HTTP SSE
+// SSE stream would deliver them, starting with the events still retained in
+// the session's buffer (bounded ring) and then live ones. It is a convenience subscription; the HTTP SSE
 // handler reads the event buffer directly. The channel is closed when the
 // session ends.
 func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
@@ -664,13 +647,12 @@ func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	out := make(chan []byte, maxWMPBufferedEvents)
 	go func() {
 		defer close(out)
-		cursor := buf.delivered()
+		var cursor int64
 		done := buf.doneCh()
 		for {
 			evs, wake := buf.after(cursor)
 			for _, ev := range evs {
 				cursor = ev.ID
-				buf.markDelivered(ev.ID)
 				select {
 				case out <- ev.Data:
 				case <-done:

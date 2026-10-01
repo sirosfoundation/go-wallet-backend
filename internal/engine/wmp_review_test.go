@@ -306,7 +306,7 @@ func TestWMP_Resume_MissedMessagesFromCursor(t *testing.T) {
 	require.Nil(t, rpcErr)
 	assert.Equal(t, 2, res.MissedMessages)
 
-	// No cursor: nothing was ever written to an SSE connection, so all 3.
+	// No cursor: the server keeps no delivery state, so all 3 retained count.
 	res, rpcErr = doResume(t, a, "u", "t", resumeBody(sid, res.ResumptionToken, ""))
 	require.Nil(t, rpcErr)
 	assert.Equal(t, 3, res.MissedMessages)
@@ -601,8 +601,9 @@ func TestWMP_SSE_DeliversEventsBufferedBeforeConnect(t *testing.T) {
 	cancel()
 	<-done
 
-	// Reconnect without Last-Event-ID resumes after what was delivered.
-	assert.Equal(t, int64(2), buf.delivered())
+	// Reconnect without Last-Event-ID replays everything retained.
+	evs, _ := buf.after(0)
+	assert.Len(t, evs, 2)
 }
 
 type syncRecorder struct {
@@ -635,8 +636,8 @@ func TestWMPEventBuffer_ZeroValueAndClose(t *testing.T) {
 	}
 	assert.Equal(t, int64(1), id)
 	assert.Equal(t, 1, b.missedSince("garbage"))
-	b.markDelivered(1)
-	assert.Equal(t, 0, b.missedSince(""))
+	assert.Equal(t, 1, b.missedSince(""))
+	assert.Equal(t, 0, b.missedSince("1"))
 	b.close()
 	b.close() // idempotent
 	select {

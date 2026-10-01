@@ -243,10 +243,13 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Events are appended to the session's buffer as they are emitted (see
 	// pumpEvents), whether or not a client is connected, and IDs are durable
-	// across reconnects and wmp.session.resume. A reconnecting client's
-	// Last-Event-ID selects where to replay from; without one the stream
-	// starts at the first event not yet written to any connection.
-	cursor := buf.delivered()
+	// across reconnects and wmp.session.resume. Replay is driven solely by
+	// the client's Last-Event-ID cursor: the server keeps no delivery state,
+	// because a successful Flush only hands bytes to the connection or a
+	// proxy and does not prove the client parsed the frame. Without a cursor
+	// every retained event is replayed; duplicates are possible and clients
+	// dedupe by the monotonic event ID.
+	var cursor int64
 	if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
 		if id, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
 			cursor = id
@@ -265,15 +268,10 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(events) > 0 {
 			armWrite()
-			// Only a successful flush means the events left the server:
-			// advance the delivered mark after it, never before, so a
-			// connection dropped between Write and Flush cannot make the
-			// next one skip them (a duplicate is safer than a loss).
 			if err := rc.Flush(); err != nil {
 				return
 			}
 			clearWrite()
-			buf.markDelivered(cursor)
 		}
 		select {
 		case <-ctx.Done():
