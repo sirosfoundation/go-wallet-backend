@@ -55,11 +55,12 @@ func newLegacyRegistryFile() *legacyRegistryFile {
 //
 //   - Nothing is done, and no warning is returned, when neither the file exists
 //     nor any REGISTRY_* variable changes a setting.
-//   - When the new `registry:` section (or WALLET_REGISTRY_*) is also
-//     configured, the new section wins and the deprecated configuration is
-//     ignored entirely, with a warning saying so.
-//   - Otherwise the deprecated settings are mapped onto Config.Registry (see
-//     docs/REGISTRY_MIGRATION.md for the table). The old `jwt` block is not used for
+//   - The deprecated settings are mapped onto Config.Registry (see
+//     docs/REGISTRY_MIGRATION.md for the table), merged per key: a key set
+//     explicitly in the new `registry:` section (or WALLET_REGISTRY_*) wins,
+//     while keys it leaves unset are still filled from the deprecated
+//     configuration. A warning names every key where both set a value, and
+//     the new value was kept. The old `jwt` block is not used for
 //     validation any more: jwt.require_auth becomes registry.require_auth, and
 //     jwt.secret / jwt.secret_path / jwt.issuer keep validating legacy HMAC
 //     tokens by mapping to the backend's jwt.* when those are unset.
