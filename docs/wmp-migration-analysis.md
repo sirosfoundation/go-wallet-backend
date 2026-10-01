@@ -135,7 +135,7 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 |---------|-----------|----------|
 | OAuth redirects | Connection dies, must reconnect + resume | SSE auto-reconnects with `Last-Event-ID`; POST requests are stateless |
 | Tenant routing | Must establish at handshake, maintain for lifetime | Every POST carries the `Authorization` bearer token; the tenant is derived from its validated claims |
-| Load balancing | Sticky sessions required | Plain HTTP (no upgrade), but session state is process-local, so RPC POSTs and SSE reconnects still need session affinity to the same instance (see the caveat below); no per-connection upgrade handling |
+| Load balancing | Sticky sessions required | Plain HTTP (no upgrade), but session state is process-local, so RPC POSTs and SSE reconnects still need session affinity to the same instance (see [Multi-replica deployment](#multi-replica-deployment-session-affinity)); no per-connection upgrade handling |
 | Mobile WebView | Connection lost on background/navigate | SSE reconnects on foreground; pending POSTs just retry |
 | Proxy/firewall | Upgrade negotiation blocked by some | Standard HTTP/2, universally supported |
 | Code complexity | 1200+ lines of connection management | ~200 lines (fetch-based SSE + fetch) |
@@ -439,6 +439,30 @@ the client must start a new session (`wmp.session.create`, with a fresh bearer
 token if needed) and restart any flow; a resume attempt returns
 `session not found`.
 
+### Multi-replica deployment: session affinity
+
+WMP session state is **process-local**: the session registry (peer, user and
+tenant, TTL, resumption tokens), the active flows with their handler
+goroutines, and the per-session SSE event buffer all live in the memory of the
+engine process that handled `wmp.session.create`. The Redis session store does
+not share any of it. A request for that session that reaches a different
+replica fails with `session not found` (HTTP 404), so a deployment with more
+than one engine replica must configure load-balancer affinity keyed on the WMP
+session ID:
+
+- RPC POSTs and the SSE GET must carry the session ID in the `Wmp-Session-Id`
+  header (RPC bodies also carry `params.wmp.session_id`); hash or pin on that
+  header (NGINX `hash $http_wmp_session_id consistent;`, an Envoy header hash
+  policy, or Traefik header-based sticky routing).
+- `wmp.session.create` has no session ID yet and may go to any replica; the
+  replica that handles it owns the session, and affinity applies from the
+  response onward.
+
+The engine logs a warning when the WMP routes are mounted. Making the state
+shareable, which would remove the requirement, is tracked in
+[#432](https://github.com/sirosfoundation/go-wallet-backend/issues/432). See
+also the Scaling Guidelines in `docs/DEPLOYMENT.md`.
+
 ### Mobile WebView Token Persistence
 
 On Android WebViews, `sessionStorage` may be cleared when the app goes to
@@ -451,7 +475,7 @@ cannot be re-established. The entire flow is lost.
 With HTTP+SSE, losing the token is **recoverable**:
 
 1. The WMP session and in-progress flow survive server-side (in the same
-   backend process today; a shared store such as Redis is future work)
+   backend process today, so multi-replica deployments need session affinity; a shared store is tracked in #432)
 2. The SSE stream disconnects but the flow handler goroutine keeps waiting
 3. When the app returns to foreground and re-authenticates (e.g., via
    refresh token from native bridge storage), the client:

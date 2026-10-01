@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -367,6 +368,10 @@ type EngineProvider struct {
 	metadataResolver *issuermetadata.Resolver
 	manager          *wsengine.Manager
 	wmpAdapter       *wsengine.WMPAdapter
+
+	// wmpAffinityWarnOnce makes the multi-replica affinity warning fire once
+	// per provider even if RegisterRoutes is called more than once.
+	wmpAffinityWarnOnce sync.Once
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -471,7 +476,32 @@ func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
 
+// wmpAffinityWarning is the message logged when the WMP routes are mounted.
+const wmpAffinityWarning = "WMP session state is process-local: with more than one engine replica, " +
+	"the load balancer must pin each WMP session to one replica by the WMP session ID " +
+	"(Wmp-Session-Id header or params.wmp.session_id) for both RPC POSTs and the SSE stream; " +
+	"without affinity a request reaching another replica fails with session not found (404). " +
+	"The Redis session store does not share this state. Shared WMP session state is tracked in " +
+	"https://github.com/sirosfoundation/go-wallet-backend/issues/432"
+
+// warnWMPSessionAffinity logs, once, the multi-replica deployment requirement
+// that follows from WMP session state being held in process memory (#432).
+func (p *EngineProvider) warnWMPSessionAffinity() {
+	p.wmpAffinityWarnOnce.Do(func() {
+		if p.logger == nil {
+			return
+		}
+		p.logger.Warn(wmpAffinityWarning,
+			zap.String("rpc_path", wsengine.WMPRPCPath),
+			zap.String("events_path", wsengine.WMPEventsPath),
+			zap.String("affinity_key", "Wmp-Session-Id"),
+			zap.String("issue", "#432"))
+	})
+}
+
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
+	p.warnWMPSessionAffinity()
+
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
 		p.manager.HandleConnection(c.Writer, c.Request)

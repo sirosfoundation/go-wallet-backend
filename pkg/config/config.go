@@ -920,7 +920,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts
+	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica, the load balancer in front of this URL must pin each WMP session to one replica by the Wmp-Session-Id header (RPC POSTs and the SSE GET), otherwise a request reaching another replica gets session not found (404); the Redis session store does not share this state (see issue 432)
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)

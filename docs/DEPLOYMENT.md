@@ -545,6 +545,47 @@ The AS session store itself is shared when it is MongoDB-backed, so sessions
 and the recorded refresh-token family survive across replicas; only the
 revocation markers are process-local.
 
+#### WMP sessions need load-balancer affinity
+
+The WMP (HTTP+SSE) transport keeps its session state in the memory of the
+engine process that created the session. This is process-local and is **not**
+shared between replicas:
+
+- the WMP session registry (the peer, the authenticated user and tenant, the
+  session TTL and the resumption tokens),
+- the active flows and their handler goroutines, and
+- the per-session SSE event buffer used for `Last-Event-ID` replay.
+
+The Redis session store does **not** change this: it backs the WebSocket
+engine's persisted session bookkeeping, not the WMP session registry, event
+buffer or flows. Without affinity, a `POST /api/v2/wallet/rpc` or an SSE `GET`
+(`/api/v2/wallet/events`, `/api/v2/wallet/rpc/events`) that lands on a replica
+which did not create the session fails with `session not found` (HTTP 404), and
+a flow in progress cannot continue.
+
+With more than one engine replica you must therefore configure the load
+balancer to route every request of a WMP session to the same replica, keyed on
+the WMP session ID:
+
+- Every RPC POST and the SSE GET carry it in the `Wmp-Session-Id` header (the
+  RPC body also carries it as `params.wmp.session_id`). Hash or pin on that
+  header, for example `hash $http_wmp_session_id consistent;` in an NGINX
+  `upstream`, a header-hash `lb_policy` (`ring_hash`/`maglev` with a header hash
+  policy on `wmp-session-id`) in Envoy, or header-based sticky routing in
+  Traefik.
+- `wmp.session.create` has no session ID yet, so it may go to any replica. The
+  replica that handles it owns the session, and the client sends the returned
+  session ID on every later request, so affinity applies from the response
+  onward. Requests without the header (the create call, other endpoints) can be
+  balanced freely.
+- Make sure the proxy forwards `Wmp-Session-Id` and does not buffer the SSE
+  stream.
+
+The engine logs a warning at startup, when the WMP routes are mounted, as a
+reminder of this requirement. Sharing WMP session state between replicas, which
+would remove the requirement, is tracked in
+[#432](https://github.com/sirosfoundation/go-wallet-backend/issues/432).
+
 ### Database Scaling
 
 - MongoDB sharding
