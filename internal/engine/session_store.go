@@ -369,7 +369,8 @@ func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID stri
 // user and to the requested tenant (compared normalised, as everywhere else);
 // otherwise it is reported as not found and never leaks another tenant's
 // session. A match is lazily backfilled into the new pointer and user index so
-// later lookups, Delete and DeleteByUser take the normal path.
+// later lookups, Delete and DeleteByUser take the normal path. The pointer
+// backfill is SET NX so it never overwrites a newer session's pointer.
 func (r *RedisSessionStore) getByLegacyUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
 	sessionID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result()
 	if err == redis.Nil {
@@ -388,7 +389,12 @@ func (r *RedisSessionStore) getByLegacyUser(ctx context.Context, tenantID, userI
 
 	if ttl := time.Until(session.ExpiresAt); ttl > 0 {
 		pipe := r.client.TxPipeline()
-		pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
+		// SET NX: between the miss in GetByUser and this pipeline another
+		// replica may have Put a newer session and pointed the user at it;
+		// an unconditional SET would repoint the user to this older legacy
+		// session. The legacy session is still returned (it was current when
+		// read); the set memberships below are idempotent and harmless.
+		pipe.SetNX(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
 		pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
 		r.indexUserSession(ctx, pipe, session, ttl)
 		if _, err := pipe.Exec(ctx); err != nil {
