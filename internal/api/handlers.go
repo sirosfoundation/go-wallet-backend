@@ -1551,8 +1551,13 @@ func lifecycleRefusalBody(err error) gin.H {
 // abortIfTokenRevoked answers 401 when a write refused the request's bearer
 // token because the user's authorization was cut off after the middleware
 // admitted it (tokengate.RefuseLoaded). It reports whether it answered.
+//
+// storage.ErrStaleWrite is the same refusal arriving from the other side: the
+// lifecycle fence advanced the user's cut-off after the record was loaded but
+// before UserStore.Update, so the write was rejected to keep it from restoring
+// data after an erasure. It is a revoked-token answer, not a server error.
 func abortIfTokenRevoked(c *gin.Context, err error) bool {
-	if !errors.Is(err, tokengate.ErrRevoked) {
+	if !errors.Is(err, tokengate.ErrRevoked) && !errors.Is(err, storage.ErrStaleWrite) {
 		return false
 	}
 	c.JSON(401, gin.H{"error": "Token has been revoked"})
