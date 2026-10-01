@@ -138,14 +138,15 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 | Load balancing | Sticky sessions required | Plain HTTP (no upgrade), but session state is process-local, so RPC POSTs and SSE reconnects still need session affinity to the same instance (see the caveat below); no per-connection upgrade handling |
 | Mobile WebView | Connection lost on background/navigate | SSE reconnects on foreground; pending POSTs just retry |
 | Proxy/firewall | Upgrade negotiation blocked by some | Standard HTTP/2, universally supported |
-| Code complexity | 1200+ lines of connection management | ~200 lines (EventSource + fetch) |
+| Code complexity | 1200+ lines of connection management | ~200 lines (fetch-based SSE + fetch) |
 | Debugging | Opaque binary frames | Standard HTTP requests visible in DevTools |
 | Latency impact | ~20ms per frame | ~50ms per HTTP round-trip (irrelevant for user flows) |
 
 ### SSE Reconnection
 
 The native browser `EventSource` API cannot send custom headers (no
-`Authorization`). We use **`@microsoft/fetch-event-source`**
+`Authorization`), and the events endpoint requires the bearer token, so
+native `EventSource` cannot be used at all. Clients use fetch-based SSE; we use **`@microsoft/fetch-event-source`**
 (2.8k stars, MIT, ~3KB) which wraps `fetch()` to provide:
 
 - Custom headers on the SSE connection
@@ -250,7 +251,7 @@ The frontend transport becomes dramatically simpler:
 
 ```typescript
 class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
-  private events: EventSource | null = null;
+  private abort: AbortController | null = null; // fetch-based SSE, not native EventSource
   private sessionId: string | null = null;
   
   async connect(token: string): Promise<void> {
@@ -361,8 +362,9 @@ This means:
   replays the `authorization_required` progress step. Client POSTs the auth code.
 - **Mobile background**: App goes to background, SSE disconnects. On foreground,
   reconnect + replay. No lost events.
-- **Network hiccup**: Browser auto-reconnects EventSource. Server replays from
-  last confirmed event.
+- **Network hiccup**: the fetch-based SSE client (`@microsoft/fetch-event-source`)
+  reconnects and sends `Last-Event-ID`; the server replays from the last confirmed
+  event. Clients must dedupe by event ID, since replay can redeliver events.
 
 For longer disconnects (the transport is gone but the session is still live),
 the client uses `wmp.session.resume` via POST. Resume only replaces the
@@ -692,7 +694,7 @@ The engine's `UserFacingMessage()` function maps to the WMP `ErrorMessage()` pat
 
 | Task | Effort | Priority |
 |------|--------|----------|
-| `OIDFlowHTTPTransport` class (~200 LoC: fetch + EventSource) | Medium | P0 |
+| `OIDFlowHTTPTransport` class (~200 LoC: fetch + fetch-based SSE) | Medium | P0 |
 | JSON-RPC 2.0 request/response helpers | Small | P0 |
 | Handle nested `sign` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
 | Handle nested `match` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
@@ -720,8 +722,11 @@ Features we gain from this migration:
 
 1. **Survives OAuth redirects** — SSE auto-reconnects with `Last-Event-ID` replay.
    The root cause of PR #126 bugs ceases to exist.
-2. **No connection management** — browser handles EventSource reconnection natively.
-   Eliminates 400+ lines of reconnection logic.
+2. **No hand-written connection management** — native `EventSource` cannot send the
+   required `Authorization` header, so clients use fetch-based SSE
+   (e.g. `@microsoft/fetch-event-source`), which handles reconnection and
+   `Last-Event-ID`; clients must dedupe by event ID. This still eliminates 400+ lines
+   of reconnection logic.
 3. **Standard HTTP semantics** — every request carries the bearer token, from which user and tenant are derived.
    No handshake-time context establishment.
 4. **Standard HTTP load balancing, with one caveat** — the transport is plain
@@ -810,7 +815,7 @@ migration transparent to the rest of the frontend:
 
 ```typescript
 class OIDFlowHTTPTransport implements IOIDFlowTransport {
-  // fetch() for requests, EventSource for notifications
+  // fetch() for requests, fetch-based SSE for notifications (native EventSource cannot send Authorization)
   // Same IOIDFlowTransport callbacks as WebSocket version
 }
 ```
@@ -852,7 +857,7 @@ Week 3-4: Backend HTTP+SSE endpoints (Phase 2)
   └─ Run alongside existing WebSocket engine (feature flag)
 
 Week 5-6: Frontend HTTP+SSE transport (Phase 3)
-  ├─ OIDFlowHTTPTransport (fetch + EventSource, ~200 LoC)
+  ├─ OIDFlowHTTPTransport (fetch + fetch-based SSE, ~200 LoC)
   ├─ Sign/match/trust via flow.action
   ├─ SSE reconnection with Last-Event-ID
   └─ Feature-flagged rollout (HTTP+SSE vs WebSocket)
