@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"sync"
@@ -364,20 +365,30 @@ func (t *tokenSet) addValue(raw json.RawMessage) {
 func (t *tokenSet) addStringsOrOne(raw json.RawMessage) {
 	raw = json.RawMessage(strings.TrimSpace(string(raw)))
 	if len(raw) > 0 && raw[0] == '[' {
+		// Members read before a defect (or before trailing input) are still
+		// returned so a revoked one is never hidden by what follows it.
 		elems, ok := jsonArrayElements(raw)
-		if !ok {
-			t.malformed++
-			return
-		}
 		for _, e := range elems {
 			t.addValue(e)
+		}
+		if !ok {
+			t.malformed++
 		}
 		return
 	}
 	t.addValue(raw)
 }
 
-// jsonArrayElements splits a JSON array into its raw elements.
+// onlyWhitespaceLeft reports whether the decoder has nothing but whitespace
+// left, i.e. the top-level JSON value just read was the whole input.
+func onlyWhitespaceLeft(dec *json.Decoder) bool {
+	_, err := dec.Token()
+	return err == io.EOF
+}
+
+// jsonArrayElements splits a JSON array into its raw elements. On failure
+// (including trailing non-whitespace input after the array) ok is false but
+// the elements read so far are still returned.
 func jsonArrayElements(raw json.RawMessage) ([]json.RawMessage, bool) {
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
@@ -387,14 +398,14 @@ func jsonArrayElements(raw json.RawMessage) ([]json.RawMessage, bool) {
 	for dec.More() {
 		var e json.RawMessage
 		if dec.Decode(&e) != nil {
-			return nil, false
+			return out, false
 		}
 		out = append(out, e)
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
-		return nil, false
+		return out, false
 	}
-	return out, true
+	return out, onlyWhitespaceLeft(dec)
 }
 
 // jsonObjectValues returns every member value of a JSON object in document
@@ -408,18 +419,18 @@ func jsonObjectValues(raw string) ([]json.RawMessage, bool) {
 	var out []json.RawMessage
 	for dec.More() {
 		if _, err := dec.Token(); err != nil { // key
-			return nil, false
+			return out, false
 		}
 		var v json.RawMessage
 		if dec.Decode(&v) != nil {
-			return nil, false
+			return out, false
 		}
 		out = append(out, v)
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
-		return nil, false
+		return out, false
 	}
-	return out, true
+	return out, onlyWhitespaceLeft(dec)
 }
 
 // presentedTokens flattens a vp_token into the individual presentations: a
@@ -434,12 +445,24 @@ func presentedTokens(vpToken string) tokenSet {
 	switch vpToken[0] {
 	case '{':
 		vals, ok := jsonObjectValues(vpToken)
+		for _, raw := range vals {
+			ts.addStringsOrOne(raw)
+		}
 		if !ok {
+			ts.malformed++
+		}
+		return ts
+	case '"':
+		// A bare JSON string: exactly one token, nothing may follow it.
+		dec := json.NewDecoder(strings.NewReader(vpToken))
+		var s string
+		if dec.Decode(&s) != nil {
 			ts.malformed++
 			return ts
 		}
-		for _, raw := range vals {
-			ts.addStringsOrOne(raw)
+		ts.tokens = append(ts.tokens, s)
+		if !onlyWhitespaceLeft(dec) {
+			ts.malformed++
 		}
 		return ts
 	case '[':

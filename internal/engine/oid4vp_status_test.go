@@ -305,7 +305,7 @@ func TestPresentedTokens_Shapes(t *testing.T) {
 	assert.Equal(t, []string{"a", "b"}, presentedTokens("a\nb").tokens)
 	// Malformed JSON is counted, never silently treated as raw tokens.
 	assert.Equal(t, 1, presentedTokens(`{"q":`).malformed)
-	assert.Equal(t, 1, presentedTokens(`[1,`).malformed)
+	assert.Equal(t, 2, presentedTokens(`[1,`).malformed)
 	// Mixed arrays keep every string member and count the rest.
 	for in, want := range map[string]int{`[1,2]`: 2, `["x",1]`: 1, `[1,"x"]`: 1, `[null,"x"]`: 1, `["x",{"a":1}]`: 0, `["x",[ "y" ]]`: 1, `["x",true]`: 1} {
 		ts := presentedTokens(in)
@@ -822,6 +822,84 @@ func TestCheckPresentationStatus_OtherMechanismNotCovered(t *testing.T) {
 	for name, st := range map[string]any{"empty": map[string]any{}, "null": nil, "string": "x"} {
 		if err := h.checkPresentationStatus(ctx, cred(st)); err == nil {
 			t.Fatalf("strict must refuse a %s status claim", name)
+		}
+	}
+}
+
+// Trailing non-whitespace input after the top-level JSON value is malformed
+// (fail closed in strict mode), but tokens read before it are still checked.
+func TestPresentedTokens_TrailingInput(t *testing.T) {
+	for _, in := range []string{
+		`["a"] ["b"]`, `["a"] garbage`, `{"q":["a"]} {"q":["b"]}`, `{"q":"a"} x`, `"a" extra`, `["a"]]`, `"a""b"`,
+	} {
+		ts := presentedTokens(in)
+		assert.Equal(t, 1, ts.malformed, in)
+		assert.Equal(t, []string{"a"}, ts.tokens, in)
+	}
+	for _, in := range []string{`["a"]  `, "[\"a\"]\n\t ", `{"q":["a"]} `, ` "a" `, "{\"q\":\"a\"}\n"} {
+		ts := presentedTokens(in)
+		assert.Zero(t, ts.malformed, in)
+		assert.Equal(t, []string{"a"}, ts.tokens, in)
+	}
+}
+
+func TestCheckPresentationStatus_TrailingInput(t *testing.T) {
+	ctx := context.Background()
+	h, mint := statusFixture(t, false)
+	rev, ok := mint(1, true), mint(0, true)
+	q := func(v string) string { b, _ := json.Marshal([]string{v}); return string(b) }
+	o := func(v string) string { b, _ := json.Marshal(map[string]any{"q": []string{v}}); return string(b) }
+	s := func(v string) string { b, _ := json.Marshal(v); return string(b) }
+	const warnMsg = "presented token collection has malformed members; they were skipped"
+	run := func(mode config.StatusCheckMode, tok string) (error, int, int) {
+		hh := *h
+		hh.statusMode = mode
+		core, logs := observer.New(zap.WarnLevel)
+		hh.Logger = zap.New(core)
+		err := hh.checkPresentationStatus(ctx, tok)
+		return err, logs.FilterMessage("credential status revoked").Len(), logs.FilterMessage(warnMsg).Len()
+	}
+	modes := []config.StatusCheckMode{config.StatusCheckWarn, config.StatusCheckEnforceRevoked, config.StatusCheckStrict}
+	// A revoked token before the trailing input is still reported revoked.
+	for name, tok := range map[string]string{
+		"array":  q(rev) + ` garbage`,
+		"array2": q(rev) + ` ` + q(ok),
+		"dcql":   o(rev) + ` ` + o(ok),
+		"string": s(rev) + ` extra`,
+	} {
+		for _, mode := range modes {
+			err, revoked, _ := run(mode, tok)
+			if mode == config.StatusCheckWarn {
+				require.NoError(t, err, "%s/%s", name, mode)
+				assert.Equal(t, 1, revoked, "%s/%s", name, mode)
+			} else {
+				require.Error(t, err, "%s/%s", name, mode)
+			}
+		}
+	}
+	// Valid token followed by trailing input: only strict refuses.
+	for name, tok := range map[string]string{
+		"array":  q(ok) + ` ` + q(rev),
+		"array2": q(ok) + ` garbage`,
+		"dcql":   o(ok) + ` ` + o(rev),
+		"string": s(ok) + ` extra`,
+	} {
+		for _, mode := range modes {
+			err, _, warns := run(mode, tok)
+			if mode == config.StatusCheckStrict {
+				require.Error(t, err, "%s/%s", name, mode)
+			} else {
+				require.NoError(t, err, "%s/%s", name, mode)
+			}
+			assert.Equal(t, 1, warns, "%s/%s", name, mode)
+		}
+	}
+	// Trailing whitespace only is valid.
+	for _, tok := range []string{q(ok) + " \n\t", o(ok) + "  ", s(ok) + "\n"} {
+		for _, mode := range modes {
+			err, _, warns := run(mode, tok)
+			require.NoError(t, err, "%q/%s", tok, mode)
+			assert.Zero(t, warns)
 		}
 	}
 }
