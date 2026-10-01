@@ -42,9 +42,13 @@ func TestParseJWT_PresentClaimsAreStrict(t *testing.T) {
 			delete(c, "ttl")
 		}},
 		{name: "iss null", mutate: func(c jwt.MapClaims) { c["iss"] = nil }, wantErr: "iss"},
+		{name: "iss empty", mutate: func(c jwt.MapClaims) { c["iss"] = "" }, wantErr: "iss"},
+		{name: "iss whitespace", mutate: func(c jwt.MapClaims) { c["iss"] = " \t" }, wantErr: "iss"},
 		{name: "iss number", mutate: func(c jwt.MapClaims) { c["iss"] = 5 }, wantErr: "iss"},
 		{name: "iss object", mutate: func(c jwt.MapClaims) { c["iss"] = map[string]any{} }, wantErr: "iss"},
 		{name: "sub null", mutate: func(c jwt.MapClaims) { c["sub"] = nil }, wantErr: "sub"},
+		{name: "sub empty", mutate: func(c jwt.MapClaims) { c["sub"] = "" }, wantErr: "sub"},
+		{name: "sub whitespace", mutate: func(c jwt.MapClaims) { c["sub"] = " " }, wantErr: "sub"},
 		{name: "sub number", mutate: func(c jwt.MapClaims) { c["sub"] = 1 }, wantErr: "sub"},
 		{name: "iat null", mutate: func(c jwt.MapClaims) { c["iat"] = nil }, wantErr: "iat"},
 		{name: "iat string", mutate: func(c jwt.MapClaims) { c["iat"] = "1" }, wantErr: "iat"},
@@ -67,6 +71,7 @@ func TestParseJWT_PresentClaimsAreStrict(t *testing.T) {
 		{name: "bits null", mutate: func(c jwt.MapClaims) { c["status_list"].(map[string]any)["bits"] = nil }, wantErr: "bits"},
 		{name: "bits string", mutate: func(c jwt.MapClaims) { c["status_list"].(map[string]any)["bits"] = "1" }, wantErr: "bits"},
 		{name: "lst null", mutate: func(c jwt.MapClaims) { c["status_list"].(map[string]any)["lst"] = nil }, wantErr: "lst"},
+		{name: "lst empty", mutate: func(c jwt.MapClaims) { c["status_list"].(map[string]any)["lst"] = "" }, wantErr: "lst"},
 		{name: "lst number", mutate: func(c jwt.MapClaims) { c["status_list"].(map[string]any)["lst"] = 3 }, wantErr: "lst"},
 	}
 	for _, tc := range tests {

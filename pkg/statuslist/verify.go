@@ -570,7 +570,9 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, 
 }
 
 // jwtString reads an optional string claim; a present member that is not a
-// JSON string (including null) is an error.
+// JSON string (including null), or is empty or only whitespace, is an error:
+// an empty iss must not be read as absent (it would change the trust subject
+// to the URI origin).
 func jwtString(m map[string]json.RawMessage, name string) (string, error) {
 	raw, ok := m[name]
 	if !ok {
@@ -579,6 +581,9 @@ func jwtString(m map[string]json.RawMessage, name string) (string, error) {
 	var s string
 	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &s) != nil {
 		return "", fmt.Errorf("status list claim %s is not a string", name)
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("status list claim %s is empty", name)
 	}
 	return s, nil
 }
