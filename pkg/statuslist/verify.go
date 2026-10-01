@@ -757,10 +757,8 @@ func checkX5CHeader(raw json.RawMessage) error {
 		if len(e) == 0 || e[0] != '"' || json.Unmarshal(e, &cert) != nil || cert == "" {
 			return fmt.Errorf("status list x5c[%d] is not a certificate string", i)
 		}
-		if _, err := base64.StdEncoding.DecodeString(cert); err != nil {
-			if _, err := base64.RawURLEncoding.DecodeString(cert); err != nil {
-				return fmt.Errorf("status list x5c[%d]: %w", i, err)
-			}
+		if _, err := trust.DecodeX5CCert(cert); err != nil {
+			return fmt.Errorf("status list x5c[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -770,7 +768,7 @@ func checkJWKMatchesLeaf(jwkParam json.RawMessage, leaf string) error {
 	if jwkParam == nil {
 		return nil
 	}
-	der, err := base64.StdEncoding.DecodeString(leaf)
+	der, err := trust.DecodeX5CCert(leaf)
 	if err != nil {
 		return fmt.Errorf("status list x5c leaf: %w", err)
 	}

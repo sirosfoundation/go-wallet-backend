@@ -489,3 +489,70 @@ func TestParseJWT_PresentX5CValidated(t *testing.T) {
 		})
 	}
 }
+
+// The x5c leaf is accepted in standard base64 or unpadded base64url, also
+// when a jwk header must be matched against it.
+func TestX5CLeafEncodingWithJWK(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		urlEnc  bool
+		jwkMode string
+		wantErr bool
+	}{
+		{"std x5c + matching jwk", false, "match", false},
+		{"base64url x5c + matching jwk", true, "match", false},
+		{"base64url x5c + mismatching jwk", true, "mismatch", true},
+		{"std x5c + mismatching jwk", false, "mismatch", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := newKey(t)
+			var uri string
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/statuslist+jwt")
+				tok := x5cTokenEncoded(t, key, uri, tc.jwkMode, tc.urlEnc)
+				_, _ = w.Write([]byte(tok))
+			}))
+			defer srv.Close()
+			uri = srv.URL + "/l"
+			c := NewChecker(srv.Client(), false, trustAll)
+			err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !errors.Is(err, errKeyMismatch) {
+				t.Fatalf("want key mismatch, got %v", err)
+			}
+		})
+	}
+}
+
+func x5cTokenEncoded(t *testing.T, key *ecdsa.PrivateKey, listURL, jwkMode string, urlEnc bool) string {
+	t.Helper()
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "s"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := base64.StdEncoding.EncodeToString(der)
+	if urlEnc {
+		enc = base64.RawURLEncoding.EncodeToString(der)
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"sub": listURL, "iat": time.Now().Unix(), "ttl": 900,
+		"status_list": map[string]any{"bits": 1, "lst": packList(t, 1, map[int]int{3: 1}, 64)},
+	})
+	tok.Header["typ"] = "statuslist+jwt"
+	tok.Header["x5c"] = []string{enc}
+	if jwkMode == "match" {
+		tok.Header["jwk"] = jwkOf(&key.PublicKey)
+	} else {
+		tok.Header["jwk"] = jwkOf(&newKey(t).PublicKey)
+	}
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
