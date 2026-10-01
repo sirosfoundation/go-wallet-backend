@@ -96,15 +96,11 @@ func (s *failInstances) GetByUser(ctx context.Context, t domain.TenantID, u doma
 	return s.WalletInstanceStore.GetByUser(ctx, t, u)
 }
 
-func (s *failInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+func (s *failInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
 	if err := s.f.err("instances.UpdateStatus"); err != nil {
 		return err
 	}
-	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
-}
-
-func (s *failInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return s.UpdateStatus(ctx, id, tenantID, st, reason)
+	return s.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason)
 }
 
 type failUsers struct {
@@ -503,8 +499,8 @@ type attestingInstances struct {
 	fired  bool
 }
 
-func (a *attestingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
-	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason); err != nil {
+func (a *attestingInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason); err != nil {
 		return err
 	}
 	if !a.fired && st == domain.InstanceStatusRevoked {
@@ -515,10 +511,6 @@ func (a *attestingInstances) UpdateStatus(ctx context.Context, id string, tenant
 		})
 	}
 	return nil
-}
-
-func (a *attestingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return a.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
 type racingInstanceStore struct {
@@ -597,8 +589,8 @@ type alwaysAttestingInstances struct {
 	n      int
 }
 
-func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
-	if err := a.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason); err != nil {
+func (a *alwaysAttestingInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason); err != nil {
 		return err
 	}
 	if st != domain.InstanceStatusRevoked {
@@ -612,10 +604,6 @@ func (a *alwaysAttestingInstances) UpdateStatus(ctx context.Context, id string, 
 		UserID:   &uid,
 		Status:   domain.InstanceStatusActive,
 	})
-}
-
-func (a *alwaysAttestingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return a.UpdateStatus(ctx, id, tenantID, st, reason)
 }
 
 // A client attesting fast enough to outrun the bounded sweep must not get a

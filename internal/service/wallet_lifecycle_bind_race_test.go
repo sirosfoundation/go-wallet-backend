@@ -22,12 +22,12 @@ type bindingInstances struct {
 	userID domain.UserID
 }
 
-func (b *bindingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+func (b *bindingInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, exp domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
 	uid := b.userID
 	if err := b.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: tenantID, UserID: &uid}); err != nil {
 		return err
 	}
-	return b.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
+	return b.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, exp, st, reason)
 }
 
 // An anonymous instance bound to a user concurrently with its revocation must

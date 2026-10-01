@@ -112,15 +112,11 @@ func (s *hookStore) WalletInstances() storage.WalletInstanceStore {
 	return &hookInstances{s.Store.WalletInstances(), s}
 }
 
-func (s *hookInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+func (s *hookInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
 	if s.h.beforeRevoke != nil {
 		s.h.beforeRevoke()
 	}
-	return s.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
-}
-
-func (s *hookInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return s.UpdateStatus(ctx, id, tenantID, st, reason)
+	return s.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason)
 }
 
 // The narrow window, made deterministic: a login completes entirely between the

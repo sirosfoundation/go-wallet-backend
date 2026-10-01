@@ -216,7 +216,7 @@ func (r *revokeAllRacingInstances) Upsert(ctx context.Context, inst *domain.Wall
 	return nil
 }
 
-func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
+func (r *revokeAllRacingInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
 	cur, err := r.WalletInstanceStore.GetByID(ctx, id)
 	if err != nil {
 		return err
@@ -224,11 +224,7 @@ func (r *revokeAllRacingInstances) UpdateStatus(ctx context.Context, id string, 
 	if cur.Status == domain.InstanceStatusRevoked {
 		return domain.ErrInvalidStatusTransition
 	}
-	return r.WalletInstanceStore.UpdateStatus(ctx, id, domain.DefaultTenantID, status, reason)
-}
-
-func (r *revokeAllRacingInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return r.UpdateStatus(ctx, id, tenantID, st, reason)
+	return r.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, domain.DefaultTenantID, b, status, reason)
 }
 
 // A revoke-all that wins the race and revokes the just-inserted instance

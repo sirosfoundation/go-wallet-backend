@@ -141,6 +141,10 @@ func (s *WalletLifecycleService) ListForUser(ctx context.Context, tenantID domai
 	return instances, nil
 }
 
+// changeStatusMaxAttempts bounds how often ChangeStatus retries a write that
+// lost to an owner bind on the same record.
+const changeStatusMaxAttempts = 3
+
 // ChangeStatus moves one instance to target after checking tenant, ownership
 // (for a user actor) and the domain transition rules, then runs the cascade.
 // Returns storage.ErrNotFound, ErrWalletInstanceNotOwned or
@@ -182,27 +186,66 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		}
 		return inst, nil
 	}
-	if target != domain.InstanceStatusActive {
-		// Fail closed: cut off issued tokens before the status is persisted.
-		// If the cut-off cannot be recorded nothing changes and the caller
-		// gets an error; if the status write then fails, the user's tokens
-		// are cut off while the instance stays active, which only costs a
-		// re-login. The reverse order would leave a blocked instance whose
-		// pre-cut-off tokens keep working until a retry.
-		if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+	// The write carries the binding that was read (owner, including "none",
+	// and generation), so it can only land on that exact record. The id is a
+	// global key: between the read above and the write the record can be
+	// deleted and the same thumbprint attested again, possibly by another
+	// user of the tenant, and a write keyed by id and tenant alone would
+	// revoke that replacement - and the re-read below would then run the
+	// cascade against its owner.
+	//
+	// A mismatch is sorted out by re-reading. The same generation with a
+	// different owner is the record itself, bound by an attestation in the
+	// meantime (an anonymous instance gaining its user): the checks run again
+	// against the fresh state and the write is retried, which keeps that
+	// legitimate bind from failing the request. A different generation is a
+	// replacement the caller never asked about: it is left alone and the
+	// instance reported as not found.
+	for attempt := 1; ; attempt++ {
+		if target != domain.InstanceStatusActive {
+			// Fail closed: cut off issued tokens before the status is persisted.
+			// If the cut-off cannot be recorded nothing changes and the caller
+			// gets an error; if the status write then fails, the user's tokens
+			// are cut off while the instance stays active, which only costs a
+			// re-login. The reverse order would leave a blocked instance whose
+			// pre-cut-off tokens keep working until a retry.
+			if err := s.cutOffTokens(ctx, inst, actor); err != nil {
+				return nil, err
+			}
+		}
+		err := s.store.WalletInstances().UpdateStatusIfUnchanged(ctx, instanceID, tenantID, inst.Binding(), target, reason)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, storage.ErrBindingChanged) {
 			return nil, err
 		}
-	}
-	if err := s.store.WalletInstances().UpdateStatus(ctx, instanceID, tenantID, target, reason); err != nil {
-		return nil, err
+		cur, gerr := s.store.WalletInstances().GetByID(ctx, instanceID)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if cur.TenantID != tenantID || cur.Generation != inst.Generation {
+			return nil, storage.ErrNotFound
+		}
+		if actor.UserID != nil && (cur.UserID == nil || *cur.UserID != *actor.UserID) {
+			return nil, ErrWalletInstanceNotOwned
+		}
+		if err := domain.ValidateStatusTransition(cur.Status, target); err != nil {
+			return nil, err
+		}
+		if attempt >= changeStatusMaxAttempts {
+			return nil, err
+		}
+		inst = cur
 	}
 	// Work from the record as persisted, not from the copy read before the
-	// write. The write is filtered by instance id and tenant, so an anonymous
-	// instance that an attestation bound to a user between that read and the
-	// write is revoked all the same, and the pre-write copy still says "no
-	// owner": cutting off tokens and running the cascade from it would skip
-	// the very user the revocation now belongs to, leaving their tokens and
-	// sessions alive. The pre-write cut-off above is necessarily blind to a
+	// write. An attestation can bind an anonymous instance to a user after
+	// the write (the bind is not conditional on status), and the pre-write
+	// copy still says "no owner": cutting off tokens and running the cascade
+	// from it would skip the very user the revocation now belongs to, leaving
+	// their tokens and sessions alive. If the record was meanwhile replaced
+	// (a different generation) the persisted copy is somebody else's, and
+	// the record that was revoked is the one this request observed. The pre-write cut-off above is necessarily blind to a
 	// bind that lands after it; the one below, from the persisted owner, is
 	// what covers it. When the re-read fails the status is already persisted,
 	// so the caller gets ErrErasureIncomplete and the same request, which
@@ -214,7 +257,12 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		s.emitAudit(inst.ID, target, reason, actor)
 		return inst, fmt.Errorf("%w: re-read instance after the status write: %w", ErrErasureIncomplete, err)
 	}
-	inst = persisted
+	if persisted.Generation == inst.Generation {
+		inst = persisted
+	} else {
+		inst.Status = target
+		inst.UpdatedAt = time.Now().UTC()
+	}
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
 		// Cut the tokens off again, now that the status is persisted. The
@@ -338,7 +386,7 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 					return 0, err
 				}
 			}
-			if err := s.store.WalletInstances().UpdateStatusForUser(ctx, inst.ID, tenantID, userID, domain.InstanceStatusRevoked, reason); err != nil {
+			if err := s.store.WalletInstances().UpdateStatusIfUnchanged(ctx, inst.ID, tenantID, inst.Binding(), domain.InstanceStatusRevoked, reason); err != nil {
 				err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)
 				if last != nil {
 					// Revocations already persisted must not keep their

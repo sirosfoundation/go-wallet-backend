@@ -954,7 +954,17 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	}
 	const reason = "wallet deactivated during attestation"
 	alreadyRevoked := false
-	if err := s.instances.UpdateStatus(ctx, newID, tenantID, domain.InstanceStatusRevoked, reason); err != nil {
+	// Conditional on the record verified above (owner and generation): the
+	// read and this write are not atomic, and if the record was deleted and
+	// the thumbprint attested again by another user of the tenant in between,
+	// a write keyed by id and tenant would revoke that user's new instance
+	// for this attestation's cleanup. A changed binding is the same
+	// "not ours" race the checks above report, not a revocation to perform.
+	if err := s.instances.UpdateStatusIfUnchanged(ctx, newID, tenantID, inserted.Binding(), domain.InstanceStatusRevoked, reason); err != nil {
+		if errors.Is(err, storage.ErrBindingChanged) || errors.Is(err, storage.ErrNotFound) {
+			s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+			return fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+		}
 		// The only transition to revoked a store refuses is from revoked
 		// itself, and both stores report it as an invalid transition: a
 		// concurrent revoke-all already took the new record with it, which

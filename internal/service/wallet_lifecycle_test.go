@@ -36,18 +36,14 @@ type failAfterInstances struct {
 	allowed string
 }
 
-func (f *failAfterInstances) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, st domain.InstanceStatus, reason string) error {
+func (f *failAfterInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
 	if f.allowed == "" {
 		f.allowed = id
 	}
 	if id != f.allowed {
 		return errors.New("db down")
 	}
-	return f.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, reason)
-}
-
-func (f *failAfterInstances) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, _ domain.UserID, st domain.InstanceStatus, reason string) error {
-	return f.UpdateStatus(ctx, id, tenantID, st, reason)
+	return f.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason)
 }
 
 // storeWithInstances swaps the wallet-instance store of a storage.Store.
