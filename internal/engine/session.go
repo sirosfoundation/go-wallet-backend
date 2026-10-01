@@ -343,7 +343,8 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	userID, tenantID, tac, err := m.validateToken(handshake.AppToken)
+	id, err := m.validateTokenAuth(handshake.AppToken)
+	userID, tenantID, tac := id.UserID, id.TenantID, id.TAC
 	if err != nil {
 		m.logger.Warn("Authentication failed",
 			zap.Error(err),
@@ -375,6 +376,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
+		TACEnforced:   id.EnforceTAC,
 		transport:     transport,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -634,7 +636,9 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	// Manager.validateToken - not "no permissions"), mirroring
 	// requireTACIfEnforced's identical conditional enforcement for HTTP
 	// routes (internal/server/providers.go).
-	if session.TAC != "" {
+	// A modern token (session.TACEnforced) is always checked, even with an
+	// empty TAC, which means "no permissions".
+	if session.TACEnforced || session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
 			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
 			logger.Warn("Rejected flow start - insufficient TAC",

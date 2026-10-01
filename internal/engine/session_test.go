@@ -1310,3 +1310,75 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	require.NoError(t, ws2.ReadJSON(&msg))
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
+
+// TestHandleNewConnection_TACEnforcementByProvenance drives the real WebSocket
+// handshake and flow_start: a modern token with an empty TAC means "no
+// permissions" and must be refused for a protocol that needs one, a legacy
+// token (no TAC concept) is unaffected, and a modern token with a sufficient
+// TAC works as before.
+func TestHandleNewConnection_TACEnforcementByProvenance(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := newManagerWithStubOID4VCIHandler(t)
+	m.cfg = cfg
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	// Legacy HMAC tokens are served by a manager without a go-tokenauth validator.
+	lm := newManagerWithStubOID4VCIHandler(t)
+	lserver := httptest.NewServer(http.HandlerFunc(lm.HandleConnection))
+	t.Cleanup(lserver.Close)
+	legacyURL := "ws" + strings.TrimPrefix(lserver.URL, "http")
+
+	modern := func(tac claims.TAC) string {
+		return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-backend"}, Subject: "u1"},
+			TenantID: "test-tenant",
+			TAC:      tac,
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+	legacy, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u2", "tenant_id": "test-tenant", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	required := requiredTACForProtocol[ProtocolOID4VCI]
+	cases := []struct {
+		name      string
+		url       string
+		token     string
+		forbidden bool
+	}{
+		{"modern empty TAC refused", wsURL, modern(""), true},
+		{"modern sufficient TAC allowed", wsURL, modern(claims.TAC(required)), false},
+		{"legacy token unaffected", legacyURL, legacy, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws, _, err := websocket.DefaultDialer.Dial(tc.url, nil)
+			require.NoError(t, err)
+			defer func() { _ = ws.Close() }()
+			require.NoError(t, ws.WriteJSON(HandshakeMessage{Message: Message{Type: TypeHandshake}, AppToken: tc.token}))
+			var complete HandshakeCompleteMessage
+			require.NoError(t, ws.ReadJSON(&complete))
+			require.Equal(t, TypeHandshakeComplete, complete.Type)
+
+			require.NoError(t, ws.WriteJSON(FlowStartMessage{
+				Message:  Message{Type: TypeFlowStart, FlowID: "flow-1234"},
+				Protocol: ProtocolOID4VCI,
+			}))
+			_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			var fe FlowErrorMessage
+			err = ws.ReadJSON(&fe)
+			if tc.forbidden {
+				require.NoError(t, err)
+				assert.Equal(t, ErrCodeForbidden, fe.Error.Code)
+			} else {
+				assert.Error(t, err, "no flow_error expected")
+			}
+		})
+	}
+}
