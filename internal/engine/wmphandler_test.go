@@ -2825,3 +2825,27 @@ func TestWmpSessionTransport_SendJSON_AllEventsAreJSONRPC(t *testing.T) {
 		}
 	}
 }
+
+// The engine URL setting is a WebSocket URL in shipped configs; discovery must
+// derive the matching HTTP(S) base from it.
+func TestWMPAdapter_SetExternalURL_WebSocketSchemes(t *testing.T) {
+	for in, want := range map[string]string{
+		"wss://ws.wallet.example.com":      "https://ws.wallet.example.com",
+		"wss://ws.wallet.example.com/":     "https://ws.wallet.example.com",
+		"wss://ws.example.com:8443/prefix": "https://ws.example.com:8443/prefix",
+		"ws://localhost:8082":              "http://localhost:8082",
+		"https://wallet.example.com":       "https://wallet.example.com",
+		"http://localhost:8080":            "http://localhost:8080",
+	} {
+		a, m := testWMPAdapter()
+		require.NoError(t, a.SetExternalURL(in), in)
+		assert.Equal(t, want, a.externalURL, in)
+		cleanupWMP(a, m)
+	}
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	for _, bad := range []string{"wss://", "wss://x.example/?q=1", "ws://x.example/#f", "wss://%zz"} {
+		assert.Error(t, a.SetExternalURL(bad), bad)
+	}
+	assert.False(t, a.HasExternalURL())
+}

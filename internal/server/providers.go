@@ -423,20 +423,7 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
 	wmpAdapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
-	// Public base URL for the WMP discovery document: the engine's external
-	// URL when it is an http(s) one, else the AS's. Unset/invalid leaves
-	// /.well-known/wmp-configuration failing closed (503).
-	for _, candidate := range []string{cfg.Server.ExternalURLs.EngineURL, cfg.AS.ExternalURL} {
-		if candidate == "" {
-			continue
-		}
-		if err := wmpAdapter.SetExternalURL(candidate); err == nil {
-			break
-		}
-	}
-	if !wmpAdapter.HasExternalURL() {
-		logger.Warn("No usable external URL configured (server.external_urls.engine_url or as.external_url); /.well-known/wmp-configuration will return 503")
-	}
+	configureWMPExternalURL(wmpAdapter, cfg, logger)
 
 	return &EngineProvider{
 		cfg:              cfg,
@@ -1185,4 +1172,21 @@ func (p *WalletProviderProvider) Close() error {
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
+}
+
+// configureWMPExternalURL sets the public base URL for the WMP discovery
+// document: the engine's external URL (server.external_urls.engine_url, which
+// is normally a ws:// or wss:// URL and is mapped to http(s) by
+// SetExternalURL), else the AS's. Unset/invalid leaves
+// /.well-known/wmp-configuration failing closed (503).
+func configureWMPExternalURL(adapter *wsengine.WMPAdapter, cfg *config.Config, logger *zap.Logger) {
+	for _, candidate := range []string{cfg.Server.ExternalURLs.EngineURL, cfg.AS.ExternalURL} {
+		if candidate == "" {
+			continue
+		}
+		if err := adapter.SetExternalURL(candidate); err == nil {
+			return
+		}
+	}
+	logger.Warn("No usable external URL configured (server.external_urls.engine_url or as.external_url); /.well-known/wmp-configuration will return 503")
 }

@@ -51,7 +51,7 @@ single absolute `https` base URL, POSTs JSON-RPC to it and opens the stream at
 `endpoints.rpc = <external-url>/api/v2/wallet/rpc` and
 `endpoints.events = <external-url>/api/v2/wallet/rpc/events`, and the server
 serves the stream at both `/api/v2/wallet/events` and `/api/v2/wallet/rpc/events`.
-The external URL comes from `server.external_urls.engine_url` (if http/https),
+The external URL comes from `server.external_urls.engine_url` (a `wss://`/`ws://` URL is mapped to `https://`/`http://`),
 else `as.external_url`; with neither, the discovery endpoint returns 503
 rather than advertising unusable relative URLs. JSON-RPC notifications are
 answered `202 Accepted` with an empty body (the client accepts only 200/202).

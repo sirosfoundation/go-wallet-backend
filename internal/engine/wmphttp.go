@@ -288,9 +288,19 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 // SetExternalURL sets the public base URL (scheme://host[:port][/prefix])
 // under which the WMP endpoints are reachable; the discovery document
 // advertises absolute URLs built from it. Only http(s) URLs with a host and
-// no query or fragment are accepted.
+// no query or fragment are accepted. A WebSocket URL - which is what
+// server.external_urls.engine_url holds - is mapped to the HTTP URL of the
+// same host: wss:// to https://, ws:// to http://.
 func (a *WMPAdapter) SetExternalURL(raw string) error {
 	u, err := url.Parse(strings.TrimRight(raw, "/"))
+	if err == nil {
+		switch u.Scheme {
+		case "wss":
+			u.Scheme = "https"
+		case "ws":
+			u.Scheme = "http"
+		}
+	}
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("invalid WMP external URL %q", raw)
 	}
