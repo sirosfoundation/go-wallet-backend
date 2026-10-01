@@ -275,7 +275,14 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	// The signer trust decision is tenant-scoped (the tenant travels in ctx),
 	// so a cached, already trust-evaluated list is only reused within the
 	// tenant it was evaluated for.
-	key := trust.TenantFromContext(ctx) + "\x00" + cacheURI(uri)
+	//
+	// The key uses the EXACT reference URI, not a canonical form: accept
+	// binds the token's sub to the exact uri only when a list is loaded
+	// (draft-ietf-oauth-status-list-21 sections 5.1/5.2: sub MUST be equal to the
+	// uri claim of the Referenced Token, compared as exact strings), so an entry may only be
+	// reused for the uri it was validated against. Only the trust subject
+	// (evaluateSigner) uses the canonical origin.
+	key := trust.TenantFromContext(ctx) + "\x00" + uri
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && c.now().Before(e.expires) {
 		c.mu.Unlock()
@@ -689,26 +696,6 @@ func originOf(u *url.URL) (string, error) {
 		host += ":" + port
 	}
 	return scheme + "://" + host, nil
-}
-
-// cacheURI is uri with its origin canonicalized (fragment dropped), so
-// spellings of one origin share a cache entry and flight. A uri whose origin
-// cannot be canonicalized is used as given.
-func cacheURI(uri string) string {
-	u, err := url.Parse(uri)
-	if err != nil {
-		return uri
-	}
-	origin, err := originOf(u)
-	if err != nil {
-		return uri
-	}
-	c, err := url.Parse(origin)
-	if err != nil {
-		return uri
-	}
-	u.Scheme, u.Host, u.Fragment, u.RawFragment = c.Scheme, c.Host, "", ""
-	return u.String()
 }
 
 // evaluateSigner asks the trust service whether the list signer may publish

@@ -421,3 +421,46 @@ func TestCheck_MinEntries(t *testing.T) {
 		})
 	}
 }
+
+// The cache and flights are keyed by the exact reference URI: a list whose sub
+// was validated against one URI is never returned for another spelling of it
+// (different fragment, equivalent origin) without sub being checked again.
+func TestCheck_CacheKeyedByExactURI(t *testing.T) {
+	key := newKey(t)
+	hits := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", mediaTypeJWT)
+		_, _ = w.Write([]byte(makeToken(t, tokenOpts{sub: srvURL(r) + "/l/1#a", key: key, exp: time.Now().Add(time.Hour)})))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewChecker(srv.Client(), false, trustAll)
+	base := srv.URL + "/l/1"
+	ctx := context.Background()
+
+	if err := c.Check(ctx, &Reference{Idx: 1, URI: base + "#a"}); err != nil {
+		t.Fatal(err)
+	}
+	// Legitimate repeat of the same URI hits the cache.
+	if err := c.Check(ctx, &Reference{Idx: 1, URI: base + "#a"}); err != nil || hits != 1 {
+		t.Fatalf("repeat: err=%v hits=%d, want cache hit", err, hits)
+	}
+	// Another fragment is a different reference: not served from the #a
+	// entry, and its sub does not match.
+	if err := c.Check(ctx, &Reference{Idx: 1, URI: base + "#b"}); err == nil || errors.Is(err, ErrRevoked) {
+		t.Fatalf("#b: err=%v, want sub mismatch", err)
+	}
+	if hits != 2 {
+		t.Fatalf("#b hits=%d, want a fresh fetch", hits)
+	}
+	// An equivalent spelling of the origin is also a distinct reference.
+	alt := "HTTPS" + strings.TrimPrefix(base, "https") + "#a"
+	if err := c.Check(ctx, &Reference{Idx: 1, URI: alt}); err == nil {
+		t.Fatal("differently spelled uri must not reuse the cached list")
+	}
+	if hits != 3 {
+		t.Fatalf("alt hits=%d, want a fresh fetch", hits)
+	}
+}
+
+func srvURL(r *http.Request) string { return "https://" + r.Host }

@@ -58,17 +58,3 @@ func TestEvaluateSigner_CanonicalSubject(t *testing.T) {
 		t.Errorf("iss subject: %v", subjects)
 	}
 }
-
-func TestCacheURI(t *testing.T) {
-	a := cacheURI("https://STATUS.Example:443/l/1?x=1#frag")
-	b := cacheURI("https://status.example/l/1?x=1")
-	if a != b || a != "https://status.example/l/1?x=1" {
-		t.Errorf("cacheURI = %q, %q", a, b)
-	}
-	if cacheURI("https://status.example:8443/l") == cacheURI("https://status.example/l") {
-		t.Error("non-default port must stay distinct")
-	}
-	if got := cacheURI("%zz"); got != "%zz" {
-		t.Errorf("unparseable uri changed: %q", got)
-	}
-}
