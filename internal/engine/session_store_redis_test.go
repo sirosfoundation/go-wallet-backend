@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -207,4 +208,107 @@ func TestRedisSessionStore_UpdateExtendsUserSetExpiry(t *testing.T) {
 	s.ExpiresAt = time.Now().Add(2 * time.Hour)
 	require.NoError(t, store.Update(ctx, s))
 	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.userSetKey("u1")).Seconds(), 5)
+}
+
+// seedLegacySession writes a session exactly as the previous release did: the
+// session key, an unescaped `user:<userID>` pointer and a raw-tenant set; no
+// tenant-scoped pointer and no userall index.
+func seedLegacySession(t *testing.T, store *RedisSessionStore, s *SessionData, ttl time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	data, err := json.Marshal(s)
+	require.NoError(t, err)
+	require.NoError(t, store.client.Set(ctx, store.sessionKey(s.ID), data, ttl).Err())
+	require.NoError(t, store.client.Set(ctx, store.legacyUserKey(s.UserID), s.ID, ttl).Err())
+	require.NoError(t, store.client.SAdd(ctx, store.legacyTenantKey(s.TenantID), s.ID).Err())
+}
+
+func TestRedisSessionStore_LegacyGetByUserFallsBackAndBackfills(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	got, err := store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "old", got.ID)
+
+	// Backfilled: new pointer and index exist and now carry the TTL.
+	assert.True(t, mr.Exists(store.userKey("t1", "u1")))
+	members, err := mr.ZMembers(store.userSetKey("u1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"old"}, members)
+
+	// Works without the legacy pointer afterwards.
+	mr.Del(store.legacyUserKey("u1"))
+	got, err = store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "old", got.ID)
+}
+
+func TestRedisSessionStore_LegacyPointerOtherTenantNotReturned(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	_, err := store.GetByUser(ctx, "t2", "u1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	assert.False(t, mr.Exists(store.userKey("t2", "u1")), "must not backfill for another tenant")
+	assert.False(t, mr.Exists(store.userSetKey("u1")))
+}
+
+func TestRedisSessionStore_LegacyEmptyTenantNormalised(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "", "u1", time.Hour), time.Hour)
+
+	got, err := store.GetByUser(ctx, normalizeTenant(""), "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "old", got.ID)
+}
+
+func TestRedisSessionStore_LegacyDeleteByUser(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+	require.NoError(t, store.Put(ctx, redisSess("new", "t2", "u1", time.Hour)))
+	seedLegacySession(t, store, redisSess("other", "t1", "u2", time.Hour), time.Hour)
+
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+
+	assert.False(t, mr.Exists(store.sessionKey("old")))
+	assert.False(t, mr.Exists(store.sessionKey("new")))
+	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
+	assert.False(t, mr.Exists(store.userKey("t2", "u1")))
+	members, _ := mr.SMembers(store.legacyTenantKey("t1"))
+	assert.Equal(t, []string{"other"}, members)
+	assert.True(t, mr.Exists(store.sessionKey("other")), "other users untouched")
+}
+
+func TestRedisSessionStore_LegacyDeleteRemovesLegacyPointer(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	require.NoError(t, store.Delete(context.Background(), "old"))
+	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
+	assert.False(t, mr.Exists(store.sessionKey("old")))
+}
+
+func TestRedisSessionStore_LegacyDeleteKeepsLegacyPointerToOtherSession(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+	require.NoError(t, store.Put(ctx, redisSess("new", "t2", "u1", time.Hour)))
+
+	require.NoError(t, store.Delete(ctx, "new"))
+	assert.True(t, mr.Exists(store.legacyUserKey("u1")))
+}
+
+func TestRedisSessionStore_LegacyPointerExpires(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	advanceRedis(mr, 2*time.Hour)
+	_, err := store.GetByUser(context.Background(), "t1", "u1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	require.NoError(t, store.DeleteByUser(context.Background(), "u1"))
 }

@@ -238,6 +238,26 @@ Apply:
 kubectl apply -f k8s/deployment.yaml
 ```
 
+### Rolling Upgrades and the Redis Session Store
+
+Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
+This release scopes it by tenant (`<prefix>user:<tenant>:<userID>`) and adds a
+`<prefix>userall:<userID>` index used for account deletion. New writes use only
+the new keys. To keep sessions created by not-yet-upgraded replicas reachable
+during a rolling upgrade, the store falls back to the legacy pointer:
+
+- `GetByUser` uses the legacy pointer when the new one is absent, returns the
+  session only if its user and (normalised) tenant match the request, and
+  lazily backfills the new pointer and index.
+- `DeleteByUser` and `Delete` also remove the legacy pointer and the session it
+  names.
+
+The fallback is bounded by the maximum session lifetime (`DefaultTTL`, 24h
+unless configured): legacy keys carry the session TTL and disappear on their
+own, after which the fallback finds nothing. Sessions still written by old
+replicas during the rollout stay covered for the same window; complete the
+rollout within it and no migration step is needed.
+
 ### Horizontal Pod Autoscaler
 
 Create `k8s/hpa.yaml`:
