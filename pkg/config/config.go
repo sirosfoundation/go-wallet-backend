@@ -248,7 +248,10 @@ const (
 type PresentationConfig struct {
 	// StatusCheck controls the Token Status List (draft-ietf-oauth-status-list)
 	// check on presented JWT-shaped credentials (SD-JWT VC / JWT VC) that carry a
-	// `status.status_list` claim.
+	// `status.status_list` claim. Only those credentials are covered: a
+	// credential whose `status` object has no `status_list` member (another
+	// status mechanism) is not checked in any mode, strict included, while a
+	// null, empty or malformed `status`/`status_list` is treated as undetermined.
 	// The verifier, not the wallet, is responsible for the authoritative
 	// check, and a list may be reachable by the issuer and verifier but not
 	// by the wallet, so the default never blocks a presentation. Values:

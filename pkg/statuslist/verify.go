@@ -101,10 +101,14 @@ type Reference struct {
 var ErrRevoked = errors.New("credential status is not valid")
 
 // ReferenceFromCredentialClaims extracts the status_list reference from a
-// decoded credential payload. present reports whether the credential carries
-// a `status` claim at all; a credential that does but whose reference cannot
-// be read returns present=true with an error, so the caller fails closed
-// instead of treating a malformed claim as "no status".
+// decoded credential payload. present reports whether the credential is
+// covered by Token Status List, i.e. carries a `status.status_list` member.
+// A non-empty `status` object without that member uses some other status
+// mechanism; the draft requires unknown members to be ignored, so it is
+// reported as present=false (not covered by this check, in every mode,
+// strict included). A null, non-object or empty `status`, or a `status_list`
+// member that cannot be read, returns present=true with an error so the
+// caller fails closed instead of treating a malformed claim as "no status".
 func ReferenceFromCredentialClaims(claims map[string]any) (ref *Reference, present bool, err error) {
 	raw, ok := claims["status"]
 	if !ok {
@@ -119,9 +123,11 @@ func ReferenceFromCredentialClaims(claims map[string]any) (ref *Reference, prese
 	}
 	rawList, ok := status["status_list"]
 	if !ok {
-		// A status mechanism other than Token Status List, which this
-		// package cannot check.
-		return nil, true, errors.New("status claim has no status_list reference")
+		if len(status) == 0 {
+			return nil, true, errors.New("status claim is an empty object")
+		}
+		// Another status mechanism only; unknown members are ignored.
+		return nil, false, nil
 	}
 	m, ok := rawList.(map[string]any)
 	if !ok {

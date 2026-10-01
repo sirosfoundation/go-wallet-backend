@@ -228,6 +228,20 @@ func TestCheck_Cache(t *testing.T) {
 	}
 }
 
+// A non-empty status object without status_list is another mechanism: not
+// covered (present=false, no error); with status_list, other members are ignored.
+func TestReferenceFromCredentialClaims_OtherMechanism(t *testing.T) {
+	_, present, err := ReferenceFromCredentialClaims(map[string]any{"status": map[string]any{"revocation_list": map[string]any{"x": 1}}})
+	if present || err != nil {
+		t.Fatalf("other mechanism only: present=%v err=%v, want false, nil", present, err)
+	}
+	ref, present, err := ReferenceFromCredentialClaims(map[string]any{"status": map[string]any{
+		"other": 1, "status_list": map[string]any{"idx": float64(3), "uri": "https://x/y"}}})
+	if !present || err != nil || ref.Idx != 3 || ref.URI != "https://x/y" {
+		t.Fatalf("status_list plus other members: %+v present=%v err=%v", ref, present, err)
+	}
+}
+
 func TestReferenceFromCredentialClaims(t *testing.T) {
 	ok := map[string]any{"status": map[string]any{"status_list": map[string]any{"idx": float64(7), "uri": "https://x/y"}}}
 	ref, present, err := ReferenceFromCredentialClaims(ok)
@@ -238,9 +252,14 @@ func TestReferenceFromCredentialClaims(t *testing.T) {
 		t.Fatal("no status claim must be reported absent")
 	}
 	for name, claims := range map[string]map[string]any{
-		"not object":  {"status": "x"},
 		"null":        {"status": nil},
-		"no list":     {"status": map[string]any{"other": 1}},
+		"empty":       {"status": map[string]any{}},
+		"not object":  {"status": "x"},
+		"list null":   {"status": map[string]any{"status_list": nil}},
+		"list string": {"status": map[string]any{"status_list": "x"}},
+		"list empty":  {"status": map[string]any{"status_list": map[string]any{}}},
+		"idx string":  {"status": map[string]any{"status_list": map[string]any{"idx": "1", "uri": "u"}}},
+		"uri number":  {"status": map[string]any{"status_list": map[string]any{"idx": float64(1), "uri": 5}}},
 		"no idx":      {"status": map[string]any{"status_list": map[string]any{"uri": "u"}}},
 		"neg idx":     {"status": map[string]any{"status_list": map[string]any{"idx": float64(-1), "uri": "u"}}},
 		"frac idx":    {"status": map[string]any{"status_list": map[string]any{"idx": 1.5, "uri": "u"}}},

@@ -731,3 +731,27 @@ func TestCheckPresentationStatus_BudgetBoundsSlowLists(t *testing.T) {
 		})
 	}
 }
+
+// A credential whose status object carries only another mechanism is not
+// covered by the Token Status List check, even in strict mode; an empty or
+// null status object is malformed and strict refuses it.
+func TestCheckPresentationStatus_OtherMechanismNotCovered(t *testing.T) {
+	ctx := context.Background()
+	h, _ := statusFixture(t, true)
+	h.statusMode = config.StatusCheckStrict
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	cred := func(status any) string {
+		return signJWT(t, key, map[string]any{}, jwt.MapClaims{"status": status}) + "~"
+	}
+	if err := h.checkPresentationStatus(ctx, cred(map[string]any{"revocation": map[string]any{"id": "x"}})); err != nil {
+		t.Fatalf("strict must not refuse a credential with another status mechanism only: %v", err)
+	}
+	if err := h.checkPresentationStatus(ctx, jwtVP(t, strings.TrimSuffix(cred(map[string]any{"other": 1}), "~"))); err != nil {
+		t.Fatalf("strict must not refuse an embedded VC with another status mechanism only: %v", err)
+	}
+	for name, st := range map[string]any{"empty": map[string]any{}, "null": nil, "string": "x"} {
+		if err := h.checkPresentationStatus(ctx, cred(st)); err == nil {
+			t.Fatalf("strict must refuse a %s status claim", name)
+		}
+	}
+}
