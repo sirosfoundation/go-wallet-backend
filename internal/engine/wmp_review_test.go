@@ -26,7 +26,8 @@ import (
 // between the two.
 type revokeOnSecondCheck struct{ calls atomic.Int32 }
 
-func (r *revokeOnSecondCheck) IsBlacklisted(context.Context, string) bool { return false }
+func (r *revokeOnSecondCheck) IsBlacklisted(context.Context, string) bool   { return false }
+func (r *revokeOnSecondCheck) IsFamilyRevoked(context.Context, string) bool { return false }
 func (r *revokeOnSecondCheck) IsUserRevoked(context.Context, string) bool {
 	return r.calls.Add(1) > 1
 }
@@ -96,7 +97,7 @@ func TestOwnsSession_AnonymousBoundToTokenID(t *testing.T) {
 func TestValidateTokenID_ReturnsJTI(t *testing.T) {
 	m := testManager()
 	defer m.Close()
-	_, _, _, jti, err := m.validateTokenID(testToken("u", "t"))
+	_, _, _, jti, err := m.validateTokenID(context.Background(), testToken("u", "t"))
 	require.NoError(t, err)
 	assert.Empty(t, jti, "test token carries no jti")
 }

@@ -17,6 +17,9 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
@@ -47,7 +50,16 @@ type TenantLookup interface {
 // RevokeUser (#383) would otherwise never be consulted for tokens
 // validated through this path - only for tokens validated through the
 // legacy AuthMiddlewareWithBlacklist.
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+//
+// cfg is used only to re-parse a legacy-mode token (result.Mode ==
+// ModeLegacy) far enough to read its "sid" (refresh-token family) claim for
+// the same family-revocation check (#402) - go-tokenauth's *claims.Result
+// is shared with AS-issued tokens and deliberately doesn't expose a
+// wallet-backend-specific claim like "sid", so this re-parses the same
+// legacy HMAC token go-tokenauth already validated (see
+// legacytoken.SID) rather than growing that shared type/module for one
+// caller's claim.
+func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -80,6 +92,36 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 			c.JSON(401, gin.H{"error": "Token has been revoked"})
 			c.Abort()
 			return
+		}
+
+		// Refresh-token family revocation (#402), legacy-mode tokens only:
+		// go-tokenauth "auto-detects new-style vs legacy" (this function's
+		// own doc comment above), so a WebAuthnService-issued legacy HMAC
+		// token can reach this middleware instead of
+		// AuthMiddlewareWithBlacklist whenever the AS is enabled - and
+		// without this check, revoking its family on logout would be
+		// silently ineffective for exactly that deployment mode. New-style
+		// AS-issued tokens (ModeSession) have no sid/family concept at all;
+		// only ModeLegacy is checked.
+		if blacklist != nil && result.Mode == claims.ModeLegacy {
+			// Fail closed: the token was already accepted above, so an
+			// unverifiable re-parse means we cannot tell which family it
+			// belongs to - reject rather than skip the check.
+			sid, sidErr := legacytoken.ParseSID(cfg.JWT.Secret, rawToken)
+			if sidErr != nil {
+				logger.Warn("Cannot determine refresh-token family for legacy token", zap.Error(sidErr))
+				c.JSON(401, gin.H{"error": "Invalid token"})
+				c.Abort()
+				return
+			}
+			if sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+				logger.Warn("Token for revoked refresh-token family used",
+					zap.String("sid", sid),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Tenant validation: look up and check enabled
@@ -196,7 +238,26 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 // user-facing routes should reject a "wallet-registry"-only token even
 // though the deployment as a whole accepts that audience for other
 // purposes.
+//
+// LEGACY TOKEN EXEMPTION: RequireAudience admits ModeLegacy (HMAC login)
+// tokens regardless of their audience (see audience.Allowed). That is correct
+// for every group guarded today, but a group that must be restricted to a
+// NARROWER audience (one ordinary login tokens must not reach) cannot use
+// this function: it would silently admit them. Such a group must opt in to
+// strictness by using RequireAudienceStrict instead.
 func RequireAudience(allowed ...string) gin.HandlerFunc {
+	return requireAudience(true, allowed)
+}
+
+// RequireAudienceStrict is RequireAudience without the ModeLegacy exemption:
+// the token's audience must match one of allowed, whatever its mode. Use it
+// for any future route group restricted to a narrower audience than the
+// deployment-wide AS.Audiences.
+func RequireAudienceStrict(allowed ...string) gin.HandlerFunc {
+	return requireAudience(false, allowed)
+}
+
+func requireAudience(admitLegacy bool, allowed []string) gin.HandlerFunc {
 	if len(allowed) == 0 {
 		// allowed is fixed at route-registration time, not per-request, so
 		// this is always a programming error, never a runtime condition -
@@ -218,7 +279,8 @@ func RequireAudience(allowed ...string) gin.HandlerFunc {
 			return
 		}
 
-		if !result.HasAudience(allowed...) {
+		// Legacy-token exemption is decided by admitLegacy (see audience.Allowed).
+		if !audience.Allowed(result, admitLegacy, allowed...) {
 			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return

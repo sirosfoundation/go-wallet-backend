@@ -824,7 +824,7 @@ func (a *WMPAdapter) supersedeSession(sessionID string, session *Session) {
 }
 
 // handleSessionCreate creates a new engine session and wmp.Peer.
-func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([]byte, error) {
+func (a *WMPAdapter) handleSessionCreate(ctx context.Context, msg *wmp.Message) ([]byte, error) {
 	req := msg.AsRequest()
 
 	var params wmp.SessionCreateParams
@@ -865,7 +865,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 		}
 		var err error
 		var id tokenIdentity
-		id, err = a.manager.validateTokenAuth(params.Auth.Token)
+		id, err = a.manager.validateTokenAuth(ctx, params.Auth.Token)
 		userID, tenantID, tac, tokenID, enforceTAC = id.UserID, id.TenantID, id.TAC, id.JTI, id.EnforceTAC
 		if err != nil {
 			a.logger.Warn("WMP auth failed", zap.Error(err))

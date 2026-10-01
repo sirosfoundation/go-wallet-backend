@@ -68,7 +68,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := a.manager.validateTokenAuth(token)
+	id, err := a.manager.validateTokenAuth(r.Context(), token)
 	if err != nil {
 		a.logger.Warn("WMP HTTP auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)
@@ -173,7 +173,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing or invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
-	id, err := a.manager.validateTokenAuth(token)
+	id, err := a.manager.validateTokenAuth(r.Context(), token)
 	if err != nil {
 		a.logger.Warn("WMP SSE auth failed", zap.Error(err))
 		http.Error(w, "invalid or expired token", http.StatusUnauthorized)

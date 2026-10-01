@@ -387,6 +387,18 @@ az container create \
     WALLET_JWT_SECRET='your-secret'
 ```
 
+### Authorization Server defaults (upgrade note)
+
+When `as.enabled` is true and `as.audiences` is empty or omitted, the backend
+applies the documented default audiences (`wallet-backend`, `wallet-engine`,
+`wallet-registry`, plus `server.rp_id` while `as.legacy.enabled` is true)
+before validating the configuration. Likewise, an empty `jwt.issuer` with
+`as.legacy.enabled: true` falls back to `wallet-backend`. Configurations that
+never set these (for example the siros-id-stack chart, which renders
+`as.enabled: true` with legacy off and no `audiences`) therefore keep starting
+unchanged. An explicitly configured `as.audiences` is never altered; with
+legacy enabled it must include `server.rp_id`.
+
 ## Production Checklist
 
 - [ ] Use MongoDB or other scalable database
@@ -508,6 +520,30 @@ cp wallet.db.backup wallet.db
 - Add more instances
 - Use load balancer
 - Required for > 1000 users
+
+#### Token revocation with several replicas
+
+Token revocation state is held **in memory, per process**: revoked access-token
+JTIs, revoked users (account deletion), single-use refresh-token consumption
+and, since refresh-token family revocation on logout, the revoked
+refresh-token family markers. With one replica a logout or account deletion is
+enforced immediately. With **several replicas, or after a restart**, a
+revocation recorded on one replica is not seen by the others, so for example a
+stolen refresh token can still be exchanged on a replica that never handled
+the logout until the token expires (refresh tokens live `jwt.refresh_days`).
+
+`POST /user/session/logout` fails closed: if the refresh-token family cannot
+be revoked it answers `500 {"error":"Failed to revoke session"}` instead of
+`200`, and the client should retry (logout is idempotent). The access token's
+jti is blacklisted only after the family revocation succeeds, so the same
+token still authenticates on the retry.
+
+Until a shared revocation store exists (tracked in #407 / #415), either run a
+single replica for the token-issuing role, or route a user's requests to the
+same replica (session affinity) and accept that a restart forgets revocations.
+The AS session store itself is shared when it is MongoDB-backed, so sessions
+and the recorded refresh-token family survive across replicas; only the
+revocation markers are process-local.
 
 ### Database Scaling
 

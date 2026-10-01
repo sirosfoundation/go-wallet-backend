@@ -19,13 +19,18 @@ import (
 // ASModule is the top-level authorization server module that wires together
 // all AS components and registers routes.
 type ASModule struct {
-	KeyManager     *KeyManager
-	TokenIssuer    *TokenIssuer
-	LegacyIssuer   *LegacyTokenIssuer
-	Sessions       SessionStore
-	Policy         PolicyEngine
-	PasskeyHandler *PasskeyHandlers
-	OIDCHandler    *OIDCHandlers
+	KeyManager   *KeyManager
+	TokenIssuer  *TokenIssuer
+	LegacyIssuer *LegacyTokenIssuer
+	// LogoutSIDParser is a signature-only legacy HMAC parser used by
+	// LogoutHandler to find the refresh-token family of a pre-#402 session.
+	// Built whenever jwt.secret is set, regardless of as.legacy.enabled; it
+	// is never used to authenticate requests. Nil when no secret is set.
+	LogoutSIDParser *LegacyTokenIssuer
+	Sessions        SessionStore
+	Policy          PolicyEngine
+	PasskeyHandler  *PasskeyHandlers
+	OIDCHandler     *OIDCHandlers
 	// Blacklist checks whether a token has been revoked (via Logout/user
 	// deletion - see #382/#383). Used by the delegation-exchange path in
 	// TokenEndpointHandler so a revoked parent token can't be re-delegated
@@ -33,6 +38,10 @@ type ASModule struct {
 	Blacklist TokenBlacklistChecker
 	Logger    *zap.Logger
 	Config    *config.ASConfig
+	// FamilyRetention is how long LogoutHandler keeps a refresh-token
+	// family revocation marker (the longest configured access/refresh
+	// token lifetime plus a safety margin, #402).
+	FamilyRetention time.Duration
 
 	// store and validatorCache back the tenant-header and OIDC-gate
 	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
@@ -101,6 +110,16 @@ func NewASModule(
 		)
 	}
 
+	// Signature-only parser for LogoutHandler's pre-#402 family fallback,
+	// available even when legacy authentication is disabled (the refresh
+	// route is mounted on jwt.refresh_days, not as.legacy.enabled). With no
+	// jwt.secret there is nothing to verify against, so the fallback is
+	// unavailable (an empty HMAC key must never be used).
+	var logoutSIDParser *LegacyTokenIssuer
+	if jwtCfg.Secret != "" {
+		logoutSIDParser = NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, 0)
+	}
+
 	// Session store: MongoDB when the storage backend is MongoDB (sessions
 	// survive restarts and are shared across instances, #324), memory
 	// otherwise, unless as.session_store says which.
@@ -135,18 +154,20 @@ func NewASModule(
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
-		KeyManager:     km,
-		TokenIssuer:    tokenIssuer,
-		LegacyIssuer:   legacyIssuer,
-		Sessions:       sessions,
-		Policy:         policy,
-		PasskeyHandler: passkeyHandler,
-		OIDCHandler:    oidcHandler,
-		Blacklist:      blacklist,
-		Logger:         logger,
-		Config:         cfg,
-		store:          store,
-		validatorCache: validatorCache,
+		KeyManager:      km,
+		TokenIssuer:     tokenIssuer,
+		LegacyIssuer:    legacyIssuer,
+		LogoutSIDParser: logoutSIDParser,
+		Sessions:        sessions,
+		Policy:          policy,
+		PasskeyHandler:  passkeyHandler,
+		OIDCHandler:     oidcHandler,
+		Blacklist:       blacklist,
+		Logger:          logger,
+		Config:          cfg,
+		FamilyRetention: jwtCfg.FamilyRetention() + time.Hour,
+		store:           store,
+		validatorCache:  validatorCache,
 	}, nil
 }
 
@@ -219,7 +240,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.LogoutSIDParser, m.Blacklist, m.FamilyRetention, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

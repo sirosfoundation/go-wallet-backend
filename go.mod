@@ -21,7 +21,7 @@ require (
 	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.1
 	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirosfoundation/go-spocp v0.1.0
-	github.com/sirosfoundation/go-tokenauth v0.4.0
+	github.com/sirosfoundation/go-tokenauth v0.5.0
 	github.com/sirosfoundation/go-trust v0.21.1
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
 	github.com/sirosfoundation/go-wmp v0.5.0

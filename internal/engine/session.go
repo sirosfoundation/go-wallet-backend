@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,9 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 var (
@@ -50,6 +53,16 @@ var (
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
+
+	// IsFamilyRevoked reports whether sid - a refresh-token family/session
+	// id (see service.WebAuthnService.generateToken's doc comment) - has
+	// been revoked via RevokeFamily (what api.Handlers.Logout calls). Added
+	// for #402/#414 (Copilot review): without this, an access token from an
+	// earlier rotation of a since-logged-out session - its own jti never
+	// individually blacklisted - could still authenticate a NEW WebSocket
+	// handshake to this engine even after the HTTP paths (pkg/middleware.
+	// AuthMiddlewareWithBlacklist/TokenAuthMiddleware) already reject it.
+	IsFamilyRevoked(ctx context.Context, sid string) bool
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
@@ -372,6 +385,13 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	transport := newWSTransport(conn)
 	defer func() { _ = transport.Close() }()
 
+	// Handshake-scoped context: the upgrade request's own context is
+	// cancelled as soon as ServeHTTP returns (this runs in a goroutine after
+	// the connection was hijacked), so bound the handshake explicitly with
+	// the same 30s budget as the read deadline below.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Wait for handshake message
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	_, message, err := conn.ReadMessage()
@@ -399,7 +419,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	id, err := m.validateTokenAuth(handshake.AppToken)
+	id, err := m.validateTokenAuth(ctx, handshake.AppToken)
 	userID, tenantID, tac := id.UserID, id.TenantID, id.TAC
 	if err != nil {
 		m.logger.Warn("Authentication failed",
@@ -923,21 +943,26 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
+// engineAdmitsLegacyTokens is whether the engine transport accepts ModeLegacy
+// (HMAC login) tokens without an audience match. True today, as for every
+// other guarded route group; see audience.Allowed.
+const engineAdmitsLegacyTokens = true
+
 // validateToken authenticates tokenString and returns its identity.
 // tac is only ever populated on the go-tokenauth path - the legacy HMAC
 // path (below) has no TAC concept at all, so callers must treat an empty
 // tac as "not applicable here", not "no permissions", exactly like
 // requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
-func (m *Manager) validateToken(tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
-	userID, tenantID, tac, _, err = m.validateTokenID(tokenString)
+func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
+	userID, tenantID, tac, _, err = m.validateTokenID(ctx, tokenString)
 	return
 }
 
 // validateTokenID is validateToken that also returns the token's jti (empty
 // if the token carries none). The WMP adapter binds sessions to it so
 // anonymous callers (UserID == "") cannot address each other's sessions.
-func (m *Manager) validateTokenID(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
-	id, err := m.validateTokenAuth(tokenString)
+func (m *Manager) validateTokenID(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
+	id, err := m.validateTokenAuth(ctx, tokenString)
 	return id.UserID, id.TenantID, id.TAC, id.JTI, err
 }
 
@@ -955,21 +980,33 @@ type tokenIdentity struct {
 
 // validateTokenAuth is validateTokenID that also reports token provenance
 // (see tokenIdentity.EnforceTAC).
-func (m *Manager) validateTokenAuth(tokenString string) (tokenIdentity, error) {
-	userID, tenantID, tac, jti, enforce, err := m.validateTokenFull(tokenString)
+func (m *Manager) validateTokenAuth(ctx context.Context, tokenString string) (tokenIdentity, error) {
+	userID, tenantID, tac, jti, enforce, err := m.validateTokenFull(ctx, tokenString)
 	return tokenIdentity{UserID: userID, TenantID: normalizeTenant(tenantID), TAC: tac, JTI: jti, EnforceTAC: enforce}, err
 }
 
-func (m *Manager) validateTokenFull(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, enforceTAC bool, err error) {
+func (m *Manager) validateTokenFull(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, jti string, enforceTAC bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", "", "", false, fmt.Errorf("token validation aborted: %w", err)
+	}
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
-		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
+		result, err := m.tokenValidator.Validate(ctx, tokenString)
 		if err != nil {
 			return "", "", "", "", false, err
 		}
 		// The engine transport, like the AuthZEN proxy, only needs a
 		// wallet-registry or wallet-backend audience - never a broader one.
-		if !result.HasAudience("wallet-registry", "wallet-backend") {
+		//
+		// Legacy (HMAC) tokens are exempt, exactly like
+		// middleware.RequireAudience (see audience.Allowed for why:
+		// they carry aud=Server.RPID, already validated against
+		// AS.Audiences). The exemption is an explicit opt-in constant, not an
+		// implicit special case: if the engine transport is ever restricted
+		// to a narrower audience that ordinary login tokens must not reach,
+		// flip engineAdmitsLegacyTokens to false. Session-mode tokens always
+		// keep the strict check.
+		if !audience.Allowed(result, engineAdmitsLegacyTokens, "wallet-registry", "wallet-backend") {
 			return "", "", "", "", false, errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
@@ -980,8 +1017,34 @@ func (m *Manager) validateTokenFull(tokenString string) (userID, tenantID string
 		// TokenBlacklist feature and the engine's own always-on
 		// revokedUsers (#403) - either one saying revoked is enough to
 		// reject.
-		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
+		if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
 			return "", "", "", "", false, errors.New("token has been revoked")
+		}
+		// Refresh-token family revocation (#402/#414), legacy-mode tokens
+		// only: go-tokenauth "auto-detects new-style vs legacy" tokens, so a
+		// WebAuthnService-issued legacy HMAC token can reach this branch
+		// too whenever the AS is enabled. go-tokenauth's shared
+		// *claims.Result has no "sid" field at all (it's shared with
+		// AS-issued tokens, which have no family concept in this codebase),
+		// so this reuses legacytoken.SID to re-parse the same
+		// already-validated raw token independently and reach that one
+		// extra claim - the same helper TokenAuthMiddleware itself uses,
+		// for the identical reason. New-style AS-issued tokens (ModeSession)
+		// are skipped entirely.
+		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
+			// Fail closed if the family cannot be determined.
+			sid, sidErr := legacytoken.ParseSID(m.cfg.JWT.Secret, tokenString)
+			if sidErr != nil {
+				return "", "", "", "", false, errors.New("cannot determine token family")
+			}
+			// Re-check ctx right before the lookup: fail closed rather than
+			// treat an abandoned handshake's lookup as "not revoked".
+			if err := ctx.Err(); err != nil {
+				return "", "", "", "", false, fmt.Errorf("family revocation check aborted: %w", err)
+			}
+			if sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
+				return "", "", "", "", false, errors.New("token has been revoked")
+			}
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
 		return result.UserID, result.TenantID, result.TAC, result.JTI, result.Mode != claims.ModeLegacy, nil
@@ -1013,11 +1076,15 @@ func (m *Manager) validateTokenFull(tokenString string) (userID, tenantID string
 			return "", "", "", "", false, errors.New("invalid token claims: missing user_id or uuid")
 		}
 		if m.blacklist != nil {
-			ctx := context.Background()
 			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
 				return "", "", "", "", false, errors.New("token has been revoked")
 			}
 			if m.blacklist.IsUserRevoked(ctx, userID) {
+				return "", "", "", "", false, errors.New("token has been revoked")
+			}
+			// Refresh-token family revocation (#402/#414) - see the
+			// go-tokenauth branch above's identical check for why.
+			if sid, _ := mapClaims["sid"].(string); sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
 				return "", "", "", "", false, errors.New("token has been revoked")
 			}
 		}
