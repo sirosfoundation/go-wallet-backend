@@ -260,6 +260,12 @@ func (s *WalletInstanceStore) missOrChanged(ctx context.Context, id string, tena
 	return storage.ErrBindingChanged
 }
 
+// revocableSourceFilter is the status condition of a revocation: the stored
+// status must be one domain.RevocableStatuses names.
+func revocableSourceFilter() bson.M {
+	return bson.M{"$in": domain.RevocableStatuses()}
+}
+
 // updateStatus applies the revocation to the record matching match, which
 // always carries _id and tenant_id (and user_id for the owner-checked form).
 func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, status domain.InstanceStatus, reason string) error {
@@ -274,11 +280,11 @@ func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, st
 	}
 	switch status {
 	case domain.InstanceStatusRevoked:
-		// Anything not already revoked may be revoked, which is what makes a
-		// legacy suspended record reachable at all: it can no longer be
-		// created, but one written by an earlier release must still be
-		// closable by an operator.
-		filter["status"] = bson.M{"$ne": domain.InstanceStatusRevoked}
+		// Only active and legacy suspended may be revoked (the latter is
+		// what makes a record written by an earlier release closable by an
+		// operator). An unknown or corrupted status matches nothing, so it
+		// fails closed rather than being revoked.
+		filter["status"] = revocableSourceFilter()
 	default:
 		// Anything else is refused here rather than left to run with an
 		// unconstrained filter ({_id: id} alone), which would write the

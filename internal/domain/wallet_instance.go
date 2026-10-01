@@ -58,10 +58,31 @@ func ValidateStatusTransition(current, target InstanceStatus) error {
 	if current == target {
 		return nil // no-op
 	}
-	if target == InstanceStatusRevoked && current != InstanceStatusRevoked {
+	if target == InstanceStatusRevoked && current.IsRevocable() {
 		return nil
 	}
 	return ErrInvalidStatusTransition
+}
+
+// RevocableStatuses lists the stored statuses an instance may be revoked from:
+// active, and the legacy suspended state. Anything else - an unknown or
+// corrupted value included - is not a legal source state, so revoking it fails
+// closed instead of turning a record nobody understands into a non-live one
+// (which would let the lifecycle cascade treat the wallet as deactivated and
+// erase its data). Storage backends build their conditional-update filters
+// from this list so they enforce the same rule as ValidateStatusTransition.
+func RevocableStatuses() []InstanceStatus {
+	return []InstanceStatus{InstanceStatusActive, InstanceStatusLegacySuspended}
+}
+
+// IsRevocable reports whether s is a legal source state for revocation.
+func (s InstanceStatus) IsRevocable() bool {
+	for _, r := range RevocableStatuses() {
+		if s == r {
+			return true
+		}
+	}
+	return false
 }
 
 // WSCDType identifies the type of WSCD backing this wallet instance.

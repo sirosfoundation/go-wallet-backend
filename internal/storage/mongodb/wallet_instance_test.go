@@ -95,6 +95,21 @@ func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.
 	require.Error(t, err, "revoking an already-revoked instance matches nothing")
 }
 
+func TestWalletInstanceStore_UpdateStatus_UnknownStoredStatusCannotBeRevoked(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-corrupt", TenantID: "acme", Status: domain.InstanceStatus("bogus"),
+	}))
+	err := wis.UpdateStatus(ctx, "inst-corrupt", "acme", domain.InstanceStatusRevoked, "x")
+	require.ErrorIs(t, err, domain.ErrInvalidStatusTransition)
+	got, err := wis.GetByID(ctx, "inst-corrupt")
+	require.NoError(t, err)
+	require.Equal(t, domain.InstanceStatus("bogus"), got.Status)
+}
+
 // The Mongo store must agree with the memory one about what is removable, so
 // a racing revocation keeps its tombstone in both.
 func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {

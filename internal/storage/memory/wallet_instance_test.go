@@ -727,3 +727,31 @@ func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testin
 		t.Fatal(err)
 	}
 }
+
+// A corrupted or unknown stored status is not a legal source state: revoking
+// it fails closed and leaves the record untouched.
+func TestWalletInstanceStore_UpdateStatus_UnknownStatusCannotBeRevoked(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-corrupt", TenantID: "acme", Status: domain.InstanceStatus("bogus"),
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	got, err := wis.GetByID(ctx, "inst-corrupt")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if err := wis.UpdateStatus(ctx, "inst-corrupt", "acme", domain.InstanceStatusRevoked, "x"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatus = %v, want ErrInvalidStatusTransition", err)
+	}
+	if err := wis.UpdateStatusIfUnchanged(ctx, "inst-corrupt", "acme", got.Binding(), domain.InstanceStatusRevoked, "x"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("UpdateStatusIfUnchanged = %v, want ErrInvalidStatusTransition", err)
+	}
+	after, _ := wis.GetByID(ctx, "inst-corrupt")
+	if after.Status != domain.InstanceStatus("bogus") || after.DeactivatedAt != nil {
+		t.Fatalf("record must be untouched: %+v", after)
+	}
+}
