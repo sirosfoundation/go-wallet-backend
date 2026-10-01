@@ -528,7 +528,7 @@ func TestCWTHelpers(t *testing.T) {
 	if b, err := x5chain([]byte{1}); err != nil || len(b) != 1 {
 		t.Error("single-cert x5chain")
 	}
-	if m, err := decodeHeaderMap(nil); err != nil || len(m) != 0 {
+	if m, _, err := decodeHeaderMap(nil); err != nil || len(m) != 0 {
 		t.Error("empty protected header")
 	}
 }
@@ -701,6 +701,9 @@ func TestCWT_HeaderLabels(t *testing.T) {
 		{"crit two distinct understood labels", [][2]any{{int64(coseHdrCrit), []any{int64(coseHdrTyp), int64(coseHdrAlg)}}}, cborMap(), true},
 		{"empty crit", [][2]any{{int64(coseHdrCrit), []any{}}}, cborMap(), false},
 		{"crit not an array", [][2]any{{int64(coseHdrCrit), "typ"}}, cborMap(), false},
+		{"same text label in both buckets", [][2]any{{"x-ext", "a"}}, cborMap([2]any{"x-ext", "b"}), false},
+		{"text label only in unprotected, other text only in protected", [][2]any{{"x-a", 1}}, cborMap([2]any{"x-b", 1}), true},
+		{"same integer label in both buckets", [][2]any{{int64(99), 1}}, cborMap([2]any{int64(99), 2}), false},
 		{"crit in unprotected header", nil, cborMap([2]any{int64(coseHdrCrit), []any{int64(coseHdrTyp)}}), false},
 	}
 	for _, tc := range cases {

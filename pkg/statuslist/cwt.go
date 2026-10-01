@@ -60,11 +60,11 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w: %v", errCWT, err)
 	}
-	prot, err := decodeHeaderMap(sign1.protected)
+	prot, protText, err := decodeHeaderMap(sign1.protected)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w protected header: %v", errCWT, err)
 	}
-	if err := checkHeaders(prot, sign1.unprotected); err != nil {
+	if err := checkHeaders(prot, sign1.unprotected, protText, sign1.unprotectedText); err != nil {
 		return parsedList{}, fmt.Errorf("%w header: %v", errCWT, err)
 	}
 
@@ -158,8 +158,15 @@ var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrTyp: true, coseH
 // checkHeaders enforces the COSE header rules that the signature does not:
 // a label appears in at most one bucket (RFC 9052 section 3), crit is
 // integrity-protected and non-empty, and every critical label is present in
-// the protected header and understood.
-func checkHeaders(prot, unprot map[int64]any) error {
+// the protected header and understood. Integer and text labels are both
+// checked for cross-bucket duplicates; unknown non-critical text labels are
+// otherwise ignored.
+func checkHeaders(prot, unprot map[int64]any, protText, unprotText map[string]bool) error {
+	for k := range unprotText {
+		if protText[k] {
+			return fmt.Errorf("label %q is in both the protected and unprotected header", k)
+		}
+	}
 	for k := range unprot {
 		if _, dup := prot[k]; dup {
 			return fmt.Errorf("label %d is in both the protected and unprotected header", k)
@@ -250,6 +257,7 @@ func cwtInt(claims map[int64]any, label int64, name string) (*int64, error) {
 type sign1 struct {
 	protected, payload, signature []byte
 	unprotected                   map[int64]any
+	unprotectedText               map[string]bool
 }
 
 // decodeSign1 reads a COSE_Sign1. draft-ietf-oauth-status-list-21 section 5.2
@@ -281,7 +289,7 @@ func decodeSign1(data []byte) (*sign1, error) {
 		return nil, fmt.Errorf("protected header: %w", err)
 	}
 	var err error
-	if out.unprotected, err = decodeHeaderBucket(arr[1]); err != nil {
+	if out.unprotected, out.unprotectedText, err = decodeHeaderLabels(arr[1]); err != nil {
 		return nil, fmt.Errorf("unprotected header: %w", err)
 	}
 	if err := cbor.Unmarshal(arr[2], &out.payload); err != nil || out.payload == nil {
@@ -295,29 +303,40 @@ func decodeSign1(data []byte) (*sign1, error) {
 
 // decodeHeaderMap decodes the serialized protected header (empty means an
 // empty map).
-func decodeHeaderMap(b []byte) (map[int64]any, error) {
+func decodeHeaderMap(b []byte) (map[int64]any, map[string]bool, error) {
 	if len(b) == 0 {
-		return map[int64]any{}, nil
+		return map[int64]any{}, map[string]bool{}, nil
 	}
-	return decodeHeaderBucket(b)
+	return decodeHeaderLabels(b)
 }
 
-// decodeHeaderBucket decodes a COSE header map. Labels may be integers or text
-// strings, so it is decoded with mixed keys: integer labels are returned and
-// text-labelled extension parameters are ignored. A repeated label is an
-// error.
+// decodeHeaderBucket decodes a COSE map for claim decoding: integer labels
+// are returned and text-labelled extension parameters are ignored. A
+// repeated label is an error.
 func decodeHeaderBucket(b []byte) (map[int64]any, error) {
+	ints, _, err := decodeHeaderLabels(b)
+	return ints, err
+}
+
+// decodeHeaderLabels decodes a COSE header map with mixed keys. Integer
+// labels are returned with their values; text labels are returned only as a
+// set so that cross-bucket duplicates can be rejected (RFC 9052 section 3).
+// A repeated label within the map is an error.
+func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 	var raw map[any]any
 	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := make(map[int64]any, len(raw))
+	ints := make(map[int64]any, len(raw))
+	texts := make(map[string]bool)
 	for k, v := range raw {
 		if label, ok := toInt64(k); ok {
-			out[label] = v
+			ints[label] = v
+		} else if t, ok := k.(string); ok {
+			texts[t] = true
 		}
 	}
-	return out, nil
+	return ints, texts, nil
 }
 
 // headerValue looks a label up in the protected then the unprotected header.
