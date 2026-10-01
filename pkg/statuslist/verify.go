@@ -468,12 +468,20 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, 
 		return parsedList{}, errors.New("status list token is not a JWT")
 	}
 	var header struct {
-		Typ string          `json:"typ"`
-		JWK json.RawMessage `json:"jwk"`
-		X5C json.RawMessage `json:"x5c"`
+		Typ  string          `json:"typ"`
+		JWK  json.RawMessage `json:"jwk"`
+		X5C  json.RawMessage `json:"x5c"`
+		Crit json.RawMessage `json:"crit"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
 		return parsedList{}, fmt.Errorf("status list header: %w", err)
+	}
+	// RFC 7515 section 4.1.11: a JWS that lists critical extensions this
+	// verifier does not implement must be rejected. None are supported, so any
+	// PRESENT crit (null, empty or populated) makes the list unverifiable, as
+	// on the CWT path.
+	if header.Crit != nil {
+		return parsedList{}, errors.New("status list token has a crit header, which is not supported")
 	}
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
 		return parsedList{}, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)

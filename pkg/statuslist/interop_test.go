@@ -490,6 +490,55 @@ func TestParseJWT_PresentX5CValidated(t *testing.T) {
 	}
 }
 
+// A present crit header is never ignored (RFC 7515 section 4.1.11): no critical
+// extensions are supported, so null, empty and populated crit are all refused
+// even though the signature is valid.
+func TestParseJWT_CritHeaderRejected(t *testing.T) {
+	key := newKey(t)
+	good, _ := x5cServiceToken(t, key, "https://x.example/l/1", map[int]int{}, "match")
+	build := func(crit any, absent bool) string {
+		h := map[string]any{"alg": "ES256", "typ": "statuslist+jwt", "jwk": jwkOf(&key.PublicKey)}
+		if !absent {
+			h["crit"] = crit
+		}
+		b, _ := json.Marshal(h)
+		parts := strings.Split(good, ".")
+		signing := base64.RawURLEncoding.EncodeToString(b) + "." + parts[1]
+		digest := sha256.Sum256([]byte(signing))
+		r, s, err := ecdsa.Sign(rand.Reader, key, digest[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig := make([]byte, 64)
+		r.FillBytes(sig[:32])
+		s.FillBytes(sig[32:])
+		return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+	}
+	c := NewChecker(nil, false, trustAll)
+	for name, tc := range map[string]struct {
+		crit   any
+		absent bool
+		reject bool
+	}{
+		"null":        {crit: nil, reject: true},
+		"empty":       {crit: []string{}, reject: true},
+		"unknown ext": {crit: []string{"exp-ext"}, reject: true},
+		"string":      {crit: "exp-ext", reject: true},
+		"absent":      {absent: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := c.parseJWT(context.Background(), build(tc.crit, tc.absent), "https://x.example/l/1")
+			isCrit := err != nil && strings.Contains(err.Error(), "crit")
+			if tc.reject && !isCrit {
+				t.Fatalf("err = %v, want crit rejection", err)
+			}
+			if !tc.reject && isCrit {
+				t.Fatalf("err = %v, unexpected crit rejection", err)
+			}
+		})
+	}
+}
+
 // The x5c leaf is accepted in standard base64 or unpadded base64url, also
 // when a jwk header must be matched against it.
 func TestX5CLeafEncodingWithJWK(t *testing.T) {
