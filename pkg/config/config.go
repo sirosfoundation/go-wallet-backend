@@ -303,6 +303,23 @@ func (c *Config) applyASSecurityDefaults() {
 	}
 }
 
+// SessionAudiences returns the audiences a token validator must be built
+// with: as.audiences when set, otherwise the documented defaults (plus
+// server.rp_id while legacy tokens are enabled). Load() fills as.audiences
+// only when the AS is enabled; a process that validates remote-AS tokens
+// without running the AS itself (standalone engine) still needs a non-empty
+// list, because go-tokenauth refuses to validate without one.
+func (c *Config) SessionAudiences() []string {
+	if len(c.AS.Audiences) > 0 {
+		return c.AS.Audiences
+	}
+	auds := append([]string(nil), defaultASAudiences...)
+	if c.LegacyEnabled() && c.Server.RPID != "" && !containsString(auds, c.Server.RPID) {
+		auds = append(auds, c.Server.RPID)
+	}
+	return auds
+}
+
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
 func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 	if ttl, ok := c.AudienceTTLs[audience]; ok {
@@ -1864,6 +1881,13 @@ func Load(configFile string) (*Config, error) {
 	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
+	}
+
+	// envconfig allocates nil pointer-to-struct fields while walking them, so
+	// an AS that only sets signing_key_path would otherwise look as if it also
+	// configured an (empty) PKCS#11 key and trip the mutual-exclusion check.
+	if p := cfg.AS.SigningKeyPKCS11; p != nil && *p == (PKCS11SigningConfig{}) {
+		cfg.AS.SigningKeyPKCS11 = nil
 	}
 
 	// Load secrets from files if configured

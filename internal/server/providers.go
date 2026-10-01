@@ -563,7 +563,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 		// Legacy tokens carry aud = RP ID, which config validation requires
 		// in as.audiences while legacy is enabled, so the validator can apply
 		// the list uniformly.
-		Audiences: cfg.AS.Audiences,
+		Audiences: cfg.SessionAudiences(),
 		Legacy:    legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
 	})
 	v.Start(context.Background())

@@ -1632,6 +1632,7 @@ func TestConfig_Validate_AS_PKCS11(t *testing.T) {
 			cfg.AS.Enabled = true
 			cfg.AS.SigningKeyPKCS11 = tc.p
 			cfg.AS.Issuer = "https://as.example"
+			cfg.AS.Audiences = []string{"wallet-backend"}
 			cfg.AS.RulesDir = "/tmp/rules"
 			err := cfg.Validate()
 			if tc.wantErr == "" {
@@ -2883,6 +2884,7 @@ func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
 		cfg.AS.Enabled = true
 		cfg.AS.Issuer = "https://as.example.org"
 		cfg.AS.Legacy.Enabled = false
+		cfg.AS.Audiences = []string{"wallet-backend"}
 		cfg.AS.SigningKeyPath = filepath.Join(t.TempDir(), "as.key")
 		cfg.AS.RulesDir = t.TempDir()
 		if err := cfg.Validate(); err != nil {
