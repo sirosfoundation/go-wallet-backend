@@ -59,6 +59,17 @@ type TenantLookup interface {
 // legacytoken.SID) rather than growing that shared type/module for one
 // caller's claim.
 func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+	return TokenAuthMiddlewareWithValidate(cfg, v.Validate, tenants, blacklist, logger)
+}
+
+// TokenAuthMiddlewareWithValidate is TokenAuthMiddleware with the token
+// validation step supplied by the caller (validate must return the same
+// *claims.Result a go-tokenauth Validator would, and an error to reject).
+// Every check after validation - user, refresh-token family and tenant
+// handling - is identical. It lets a caller route some tokens through a
+// different validation (the registry's audience-independent legacy path)
+// without duplicating the post-validation chain.
+func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx context.Context, rawToken string) (*claims.Result, error), tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -72,7 +83,7 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
 		// Per-jti revocation is already checked inside Validate itself (see
 		// this function's doc comment).
-		result, err := v.Validate(c.Request.Context(), rawToken)
+		result, err := validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})

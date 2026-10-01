@@ -12,7 +12,9 @@ server:
   # Required while as.legacy.enabled is true and jwt.secret is set: the RP ID
   # of the backend that issues the legacy HMAC tokens (their "aud" claim).
   # Startup fails if it is left at the default "localhost". Not needed with
-  # as.legacy.enabled=false.
+  # as.legacy.enabled=false. (Exception: a process started from the deprecated
+  # registry.yaml / REGISTRY_* alias keeps starting without it and validates
+  # legacy tokens without an audience check - see docs/REGISTRY_MIGRATION.md.)
   # rp_id: "wallet.example.org"
   host: "0.0.0.0"
   # Registry-only processes listen on registry_port (default 8097).

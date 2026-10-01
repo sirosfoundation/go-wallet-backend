@@ -192,6 +192,19 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 			c.HTTPClient = f.HTTPClient
 		}
 	}
+	// The old schema has no rp_id, so a registry-only process cannot give
+	// go-tokenauth the audience (the issuing backend's RP ID) its mandatory
+	// audience list needs for legacy HMAC tokens. Keep such deployments
+	// working for this release by validating legacy tokens without an
+	// audience check; the new configuration shape requires server.rp_id.
+	if standalone && c.AS.Legacy.Enabled && c.JWT.Secret != "" && (c.Server.RPID == "" || c.Server.RPID == "localhost") {
+		c.registryLegacyAudienceIndependent = true
+		warnings = append(warnings, "DEPRECATED: the deprecated registry configuration has no server.rp_id, so legacy HMAC tokens "+
+			"are validated WITHOUT an audience (\"aud\") check on this path (signature, jwt.issuer, expiry and revocation are still enforced); "+
+			"new-style tokens are unaffected. The new configuration requires server.rp_id (WALLET_SERVER_RP_ID) set to the RP ID of "+
+			"the backend that issues the legacy tokens, and then checks their audience; this compatibility path will be removed with "+
+			"the deprecated configuration")
+	}
 	return warnings, nil
 }
 

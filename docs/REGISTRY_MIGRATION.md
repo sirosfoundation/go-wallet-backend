@@ -58,10 +58,28 @@ roles, also when the process does not run the authorization server:
 - legacy validation also needs `server.rp_id` set to the RP ID of the backend
   that issued the tokens (their `aud` claim; go-tokenauth applies the audience
   list to legacy tokens too, so the registry cannot exempt them). A registry-only
-  process refuses to start with the default `localhost` while legacy HMAC
-  validation is enabled;
+  process using the new configuration refuses to start with the default
+  `localhost` while legacy HMAC validation is enabled (the deprecated alias is
+  exempt, see below);
 - `as.external_url`, `as.issuer` (or `jwt.issuer`) and, while legacy is enabled,
   `jwt.secret`/`jwt.secret_path` must be set; startup names the missing ones.
+
+Deprecated alias and `server.rp_id`: the old registry schema has no `rp_id`. A
+registry-only process started from the deprecated `registry.yaml` / `REGISTRY_*`
+alias that has a shared HMAC secret (`jwt.secret` mapped from the old `jwt`
+block or set in the backend config), `as.legacy.enabled` and no explicit
+`server.rp_id` therefore keeps starting for this release. On that path legacy
+HMAC tokens are validated **without an audience (`aud`) check**; everything else
+is still enforced: HMAC signature with `jwt.secret`, `iss` equal to
+`jwt.issuer`, a present and unexpired `exp` (5s leeway), and the jti, user and
+refresh-token-family revocation checks and tenant checks (invalid tokens are
+401; with `require_auth: false` they are treated as unauthenticated). New-style
+(asymmetric) tokens keep their `wallet-registry` audience rule. A `DEPRECATED`
+warning is logged at startup. Setting `server.rp_id` (`WALLET_SERVER_RP_ID`) to
+the issuing backend's RP ID switches the process to the strict new behaviour
+(audience checked); the new configuration shape requires it and fails startup
+otherwise. This compatibility path is removed together with the deprecated
+configuration.
 
 Deployments that migrate through the deprecated alias with the old HMAC-only
 `jwt.require_auth: true` and no `as.external_url` keep starting (with a warning)

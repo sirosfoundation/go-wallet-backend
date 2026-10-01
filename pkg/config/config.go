@@ -69,6 +69,13 @@ type Config struct {
 	// keep starting (HMAC tokens only) until they migrate.
 	registryLegacyTolerateNoJWKS bool
 
+	// registryLegacyAudienceIndependent is set by the deprecated registry.yaml
+	// alias on a registry-only process that validates legacy HMAC tokens while
+	// server.rp_id is unset/default: the old schema has no rp_id, so legacy
+	// tokens are validated without an audience check (see
+	// RegistryLegacyAudienceIndependent).
+	registryLegacyAudienceIndependent bool
+
 	// loadWarnings are non-fatal findings from loading (see Warnings).
 	loadWarnings []string
 }
@@ -1865,7 +1872,11 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	return load(configFile, (*Config).loadRegistrySecrets, (*Config).ValidateRegistryStandalone)
+	// The legacy-audience check is deliberately not part of the load-time
+	// validation: the deprecated registry.yaml overlay (applied afterwards)
+	// can decide that it does not apply; ValidateRegistryStandalone runs it
+	// once the overlay is in place.
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
 }
 
 func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {

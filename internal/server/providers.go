@@ -892,7 +892,9 @@ type RegistryProvider struct {
 // tokens are enabled, the RP ID (their audience, see UserService/
 // WebAuthnService). go-tokenauth cannot exempt legacy tokens from its audience
 // list, so a registry-only process must have server.rp_id set to the issuing
-// backend's RP ID (config.ValidateRegistryStandalone enforces it).
+// backend's RP ID (config.ValidateRegistryStandalone enforces it) - except on
+// the deprecated registry.yaml path, where legacy tokens bypass the audience
+// list altogether (config.Config.RegistryLegacyAudienceIndependent).
 func registryTokenAudiences(cfg *config.Config) []string {
 	auds := []string{config.RegistryAudience}
 	if cfg.AS.Legacy.Enabled && cfg.Server.RPID != "" {
@@ -996,20 +998,28 @@ func (p *RegistryProvider) SetRootAliases(on bool) { p.rootAliases = on }
 func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
 
+// authConfig is the request-authentication configuration of the registry
+// routes. LegacyAudienceIndependent is set only by the deprecated registry
+// config path (see config.Config.RegistryLegacyAudienceIndependent).
+func (p *RegistryProvider) authConfig() registry.AuthConfig {
+	return registry.AuthConfig{
+		Config:                    p.cfg,
+		Validator:                 p.validator,
+		Tenants:                   p.tenants,
+		Blacklist:                 p.blacklist,
+		RequireAuth:               p.rcfg.RequireAuth,
+		LegacyAudienceIndependent: p.cfg.RegistryLegacyAudienceIndependent(),
+		Logger:                    p.logger,
+	}
+}
+
 func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 	// Registry routes with its own middleware group
 	group := router.Group("/registry")
 
 	// Shared go-tokenauth authentication (sets the authenticated flag and
 	// tenant id read by the rate limiter)
-	group.Use(registry.AuthMiddlewares(registry.AuthConfig{
-		Config:      p.cfg,
-		Validator:   p.validator,
-		Tenants:     p.tenants,
-		Blacklist:   p.blacklist,
-		RequireAuth: p.rcfg.RequireAuth,
-		Logger:      p.logger,
-	})...)
+	group.Use(registry.AuthMiddlewares(p.authConfig())...)
 
 	// Add rate limiting
 	rateLimiter := registry.NewRateLimiter(p.rcfg.RateLimit)
@@ -1020,14 +1030,7 @@ func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 
 	if p.rootAliases {
 		root := router.Group("/")
-		root.Use(registry.AuthMiddlewares(registry.AuthConfig{
-			Config:      p.cfg,
-			Validator:   p.validator,
-			Tenants:     p.tenants,
-			Blacklist:   p.blacklist,
-			RequireAuth: p.rcfg.RequireAuth,
-			Logger:      p.logger,
-		})...)
+		root.Use(registry.AuthMiddlewares(p.authConfig())...)
 		root.Use(registry.RateLimitMiddleware(rateLimiter))
 		p.handler.RegisterRootAliases(root)
 	}

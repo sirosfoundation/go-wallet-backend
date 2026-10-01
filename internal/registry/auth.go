@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -45,7 +46,33 @@ type AuthConfig struct {
 	// unauthenticated.
 	RequireAuth bool
 
+	// LegacyAudienceIndependent validates legacy HMAC tokens without checking
+	// their "aud" claim (see legacytoken.ValidateAnyAudience): issuer
+	// (Config.JWT.Issuer), expiry and signature (Config.JWT.Secret) are still
+	// enforced, and the revocation/tenant checks below apply unchanged.
+	// Asymmetric tokens still go through Validator with its audience list.
+	// Set only for the deprecated registry.yaml compatibility path, which has
+	// no server.rp_id to give the validator; never for the new config shape.
+	LegacyAudienceIndependent bool
+
 	Logger *zap.Logger
+}
+
+// validateFunc returns the token validation step: the go-tokenauth validator,
+// except that, with LegacyAudienceIndependent, HMAC tokens are validated by
+// legacytoken.ValidateAnyAudience and never reach the validator (so there is
+// no fallback that could re-introduce an audience check or skip the issuer
+// check).
+func (cfg AuthConfig) validateFunc() func(context.Context, string) (*claims.Result, error) {
+	return func(ctx context.Context, raw string) (*claims.Result, error) {
+		if cfg.LegacyAudienceIndependent && legacytoken.IsHMAC(raw) {
+			if cfg.Config == nil {
+				return nil, errors.New("registry: no configuration for legacy token validation")
+			}
+			return legacytoken.ValidateAnyAudience(cfg.Config.JWT.Secret, []string{cfg.Config.JWT.Issuer}, raw)
+		}
+		return cfg.Validator.Validate(ctx, raw)
+	}
 }
 
 // anyTenant accepts every tenant id; used when there is no tenant store.
@@ -83,7 +110,7 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	if mwCfg == nil {
 		mwCfg = &config.Config{}
 	}
-	strict := middleware.TokenAuthMiddleware(mwCfg, cfg.Validator, tenants, cfg.Blacklist, logger)
+	strict := middleware.TokenAuthMiddlewareWithValidate(mwCfg, cfg.validateFunc(), tenants, cfg.Blacklist, logger)
 	return []gin.HandlerFunc{
 		strict,
 		func(c *gin.Context) {
@@ -177,6 +204,7 @@ func markAuthenticated(c *gin.Context, res *claims.Result) {
 // optionalAuth recognises valid tokens but never rejects a request.
 func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 	v := cfg.Validator
+	validate := cfg.validateFunc()
 	return func(c *gin.Context) {
 		c.Set(string(AuthenticatedKey), false)
 
@@ -191,7 +219,7 @@ func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 			return
 		}
 		rawToken := strings.TrimSpace(parts[1])
-		res, err := v.Validate(c.Request.Context(), rawToken)
+		res, err := validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logger.Debug("registry token validation failed, continuing unauthenticated", zap.Error(err))
 			c.Next()

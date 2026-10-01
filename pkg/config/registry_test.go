@@ -899,3 +899,50 @@ func TestApplyLegacyRegistryConfig_EnvPresenceWarnsRegardlessOfValue(t *testing.
 		})
 	}
 }
+
+func TestApplyLegacyRegistryConfig_AudienceIndependentLegacyPath(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "registry.yaml", legacyRegistryYAML)
+
+	// Deprecated config, registry-only, HMAC secret, no rp_id: starts, with a
+	// warning that the audience is not checked.
+	c := defaultConfig()
+	w, err := c.ApplyLegacyRegistryConfig(p, true)
+	require.NoError(t, err)
+	assert.True(t, c.RegistryLegacyAudienceIndependent())
+	assert.Contains(t, strings.Join(w, "\n"), "WITHOUT an audience")
+	assert.Contains(t, strings.Join(w, "\n"), "server.rp_id")
+	require.NoError(t, c.ValidateRegistryStandalone(), "deprecated config keeps starting")
+	require.NoError(t, c.ValidateRegistry())
+
+	// Control: the same resulting config WITHOUT the deprecated marker (the
+	// new shape) fails startup with the clear rp_id error.
+	n := defaultConfig()
+	n.AS.Legacy.Enabled = true
+	n.JWT.Secret = "0123456789abcdef0123456789abcdef"
+	err = n.ValidateRegistryStandalone()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server.rp_id")
+	assert.False(t, n.RegistryLegacyAudienceIndependent())
+
+	// An explicit rp_id keeps audience checking (new behaviour wins).
+	c2 := defaultConfig()
+	c2.Server.RPID = "wallet.example.org"
+	_, err = c2.ApplyLegacyRegistryConfig(p, true)
+	require.NoError(t, err)
+	assert.False(t, c2.RegistryLegacyAudienceIndependent())
+
+	// Not registry-only, legacy disabled, or no secret: not applicable.
+	c3 := defaultConfig()
+	_, err = c3.ApplyLegacyRegistryConfig(p, false)
+	require.NoError(t, err)
+	assert.False(t, c3.RegistryLegacyAudienceIndependent())
+	c4 := defaultConfig()
+	c4.AS.Legacy.Enabled = false
+	_, err = c4.ApplyLegacyRegistryConfig(p, true)
+	require.NoError(t, err)
+	assert.False(t, c4.RegistryLegacyAudienceIndependent())
+	c5 := defaultConfig()
+	_, err = c5.ApplyLegacyRegistryConfig(writeFile(t, t.TempDir(), "r.yaml", "cache:\n  path: /x\n"), true)
+	require.NoError(t, err)
+	assert.False(t, c5.RegistryLegacyAudienceIndependent(), "no secret in the old config")
+}

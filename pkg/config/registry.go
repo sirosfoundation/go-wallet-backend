@@ -387,7 +387,31 @@ func (c *Config) ValidateRegistry() error {
 // CORS. In this mode the process listens on server.registry_host /
 // server.registry_port (default host:8097), the same default as the retired
 // standalone registry binary.
+//
+// It also fails startup when the process would validate legacy HMAC tokens
+// with server.rp_id unset or default (see validateStandaloneLegacyAudience),
+// unless the deprecated registry.yaml overlay marked the audience-independent
+// compatibility path (RegistryLegacyAudienceIndependent).
 func (c *Config) ValidateRegistryStandalone() error {
+	if err := c.validateRegistryStandaloneServer(); err != nil {
+		return err
+	}
+	return c.validateStandaloneLegacyAudience()
+}
+
+// RegistryLegacyAudienceIndependent reports whether legacy HMAC tokens must be
+// validated without an audience check. It is true only for a registry-only
+// process started from the deprecated registry.yaml / REGISTRY_* alias that
+// has a shared jwt.secret with as.legacy.enabled and no server.rp_id: the old
+// schema never had an rp_id, and go-tokenauth's mandatory audience list would
+// otherwise reject every legacy token (the audience of which is the issuing
+// backend's RP ID). Issuer, expiry, signature and revocation are still
+// enforced. The new configuration shape never takes this path.
+func (c *Config) RegistryLegacyAudienceIndependent() bool {
+	return c.registryLegacyAudienceIndependent
+}
+
+func (c *Config) validateRegistryStandaloneServer() error {
 	port := c.Server.RegistryPort
 	if port == 0 {
 		port = 8097
@@ -411,10 +435,7 @@ func (c *Config) ValidateRegistryStandalone() error {
 			return fmt.Errorf("server.tls.key_file is required when TLS is enabled")
 		}
 	}
-	if err := c.Server.validateTrustedProxies(); err != nil {
-		return err
-	}
-	return c.validateStandaloneLegacyAudience()
+	return c.Server.validateTrustedProxies()
 }
 
 // validateStandaloneLegacyAudience fails startup when a registry-only process
@@ -424,7 +445,7 @@ func (c *Config) ValidateRegistryStandalone() error {
 // to exempt them), so with the default RP ID every token minted by a real
 // backend would be silently rejected.
 func (c *Config) validateStandaloneLegacyAudience() error {
-	if !c.AS.Legacy.Enabled || c.JWT.Secret == "" {
+	if !c.AS.Legacy.Enabled || c.JWT.Secret == "" || c.registryLegacyAudienceIndependent {
 		return nil
 	}
 	if c.Server.RPID == "" || c.Server.RPID == "localhost" {

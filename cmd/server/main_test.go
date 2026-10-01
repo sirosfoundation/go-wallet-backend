@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
@@ -158,3 +164,78 @@ func TestColocatedEngineClientReachesRegistry(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, md)
 }
+
+// Deprecated registry.yaml (HMAC secret, no server.rp_id, no as.external_url)
+// on a registry-only process: it must start, and the registry accepts a valid
+// legacy token whatever its audience while rejecting bad issuer / expired /
+// revoked tokens. The new config shape with the same secret fails startup.
+func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	dir := t.TempDir()
+	old := filepath.Join(dir, "registry.yaml")
+	require.NoError(t, os.WriteFile(old, []byte("cache:\n  path: "+filepath.Join(dir, "c.json")+"\n"+
+		"source:\n  url: http://127.0.0.1:1/x.json\n"+
+		"jwt:\n  secret: \""+secret+"\"\n  issuer: wallet-backend\n  require_auth: true\n"), 0o600))
+
+	cfg, err := config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	w, err := setupRegistryConfig(cfg, old, true)
+	require.NoError(t, err, "deprecated HMAC-only config keeps starting")
+	assert.Contains(t, strings.Join(w, "\n"), "WITHOUT an audience")
+	cfg.Registry.DynamicCache.Enabled = false
+
+	p, err := server.NewRegistryProvider(cfg, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, p.Start(context.Background()))
+	t.Cleanup(func() { _ = p.Close() })
+
+	mk := func(mod func(jwt.MapClaims)) string {
+		c := jwt.MapClaims{"iss": "wallet-backend", "user_id": "u", "tenant_id": "acme", "jti": "j1",
+			"aud": "rp.of-some-backend.example", "exp": time.Now().Add(time.Hour).Unix()}
+		if mod != nil {
+			mod(c)
+		}
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, c).SignedString([]byte(secret))
+		require.NoError(t, err)
+		return "Bearer " + s
+	}
+	get := func(authz string) int {
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		p.RegisterRoutes(r)
+		req := httptest.NewRequest(http.MethodGet, "/registry/status", nil)
+		if authz != "" {
+			req.Header.Set("Authorization", authz)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	assert.Equal(t, http.StatusOK, get(mk(nil)), "any audience")
+	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { c["aud"] = "totally-different" })))
+	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { delete(c, "aud") })))
+	assert.Equal(t, http.StatusUnauthorized, get(""))
+	assert.Equal(t, http.StatusUnauthorized, get(mk(func(c jwt.MapClaims) { c["iss"] = "evil" })))
+	assert.Equal(t, http.StatusUnauthorized, get(mk(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })))
+
+	// Revoked (jti): same token, now blacklisted.
+	p.SetTokenBlacklist(revokedJTI("j1"))
+	assert.Equal(t, http.StatusUnauthorized, get(mk(nil)))
+	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { c["jti"] = "j2" })), "other jti unaffected")
+
+	// New config shape: same secret, no rp_id -> clear startup error.
+	n, err := config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	n.AS.Legacy.Enabled = true
+	n.JWT.Secret = secret
+	_, err = setupRegistryConfig(n, "", true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server.rp_id")
+}
+
+type revokedJTI string
+
+func (r revokedJTI) IsBlacklisted(_ context.Context, jti string) bool { return jti == string(r) }
+func (revokedJTI) IsUserRevoked(context.Context, string) bool         { return false }
+func (revokedJTI) IsFamilyRevoked(context.Context, string) bool       { return false }

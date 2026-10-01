@@ -339,7 +339,12 @@ exception is `server.rp_id`: while `as.legacy.enabled` is true and a `jwt.secret
 is configured, it must be set to the RP ID of the backend that issues the legacy
 HMAC tokens (their `aud` claim; go-tokenauth applies its audience list to them
 too). Startup fails with a clear error if it is left at the default `localhost`;
-alternatively set `as.legacy.enabled: false`.
+alternatively set `as.legacy.enabled: false`. The one exemption is a
+registry-only process started from the deprecated `registry.yaml` / `REGISTRY_*`
+alias (which has no `rp_id`) with no `server.rp_id` set: it keeps starting and
+validates legacy HMAC tokens without an audience check (signature, `jwt.issuer`,
+expiry and revocation are still enforced) until the deprecated configuration is
+removed; see [REGISTRY_MIGRATION.md](REGISTRY_MIGRATION.md).
 
 When `registry.require_auth` is `true` the process needs the settings to build
 the shared token validator (the AS itself is *not* run, keep `as.enabled` false):
