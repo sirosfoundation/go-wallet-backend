@@ -47,6 +47,15 @@ func TestUserWrites_RefuseATokenTheLoadedRecordCutsOff(t *testing.T) {
 		_, err = svc.UpdatePrivateData(base, uid, []byte("internal"), "")
 		assert.NoError(t, err, "a context without a token iat is not judged")
 	})
+	t.Run("LogoutEverywhere", func(t *testing.T) {
+		stale, err := store.Users().GetAuthCutoff(base, uid)
+		require.NoError(t, err)
+		err = svc.LogoutEverywhere(before, uid)
+		assert.ErrorIs(t, err, tokengate.ErrRevoked)
+		got, err := store.Users().GetAuthCutoff(base, uid)
+		require.NoError(t, err)
+		assert.True(t, got.Equal(stale), "a refused logout-all must not advance the cut-off")
+	})
 	t.Run("DeleteWebAuthnCredential", func(t *testing.T) {
 		_, err := svc.DeleteWebAuthnCredential(before, uid, "a", nil, "")
 		assert.ErrorIs(t, err, tokengate.ErrRevoked)

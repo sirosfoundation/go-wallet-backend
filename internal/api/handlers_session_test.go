@@ -883,6 +883,22 @@ func TestHandlers_PrivateDataWrite_TokenCutOffAfterAdmission(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 }
 
+// A logout-all admitted before a revocation must not advance the cut-off again.
+func TestHandlers_LogoutEverywhere_TokenCutOffAfterAdmission(t *testing.T) {
+	handlers, router, user := setupTestHandlersWithUser(t)
+	admittedAt := time.Now().Add(-time.Minute)
+	router.POST("/logout-all", authMiddlewareForUser(user), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(tokengate.WithIssuedAt(c.Request.Context(), admittedAt))
+		handlers.LogoutEverywhere(c)
+	})
+	ctx := context.Background()
+	require.NoError(t, handlers.services.User.LogoutEverywhere(ctx, user.UUID))
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout-all", nil))
+	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
+}
+
 func TestHandlers_UpdateSettings_TokenCutOffAfterAdmission(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	admittedAt := time.Now().Add(-time.Minute)

@@ -301,11 +301,18 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 // thing a user can safely do to themselves, because logging in again undoes
 // all of it.
 func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID) error {
-	if _, err := s.store.Users().GetByID(ctx, userID); err != nil {
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return ErrUserNotFound
 		}
 		return fmt.Errorf("failed to load user: %w", err)
+	}
+	// A token a revocation has already cut off must not advance the cut-off
+	// again: a bearer request admitted before the revocation could otherwise
+	// keep invalidating the tokens of a fresh login.
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return err
 	}
 	// The cut-off first: if it fails nothing has changed, whereas dropping
 	// the sessions first would leave the already-issued tokens working while

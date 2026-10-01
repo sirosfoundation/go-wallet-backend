@@ -62,6 +62,9 @@ func (h *Handlers) LogoutEverywhere(c *gin.Context) {
 	userID := domain.UserIDFromString(uid.(string))
 
 	if err := h.services.User.LogoutEverywhere(c.Request.Context(), userID); err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		if errors.Is(err, service.ErrUserNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
