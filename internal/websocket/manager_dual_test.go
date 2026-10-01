@@ -35,9 +35,10 @@ func wsValidator(t *testing.T, legacy bool) (*tokenvalidator.Validator, *ecdsa.P
 	}))
 	t.Cleanup(srv.Close)
 	v := tokenvalidator.New(tokenvalidator.Config{
-		JWKSURL: srv.URL,
-		Issuer:  "as",
-		Legacy:  tokenvalidator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(wsDualSecret)},
+		JWKSURL:   srv.URL,
+		Issuer:    "as",
+		Audiences: []string{"wallet-backend", "wallet-registry", "rp.example.com"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(wsDualSecret), Issuers: []string{"test-issuer"}},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
@@ -71,7 +72,7 @@ func wsHMAC(t *testing.T, secret string) string {
 	t.Helper()
 	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"iss":     "test-issuer",
-		"user_id": "legacy-user", "tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
+		"user_id": "legacy-user", "tenant_id": "default", "aud": "rp.example.com", "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(secret))
 	require.NoError(t, err)
 	return s

@@ -73,6 +73,7 @@ func createTokenWithJTI(secret, userID, jti string, issuedAt time.Time) string {
 // family-revocation check.
 func createTokenWithSID(secret, userID, jti, sid string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"jti":     jti,
 		"sid":     sid,

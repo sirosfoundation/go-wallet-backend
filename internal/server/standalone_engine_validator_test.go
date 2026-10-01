@@ -64,6 +64,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		c.AS.Enabled = true // unloaded config: the switch is honoured with the AS on
 		c.AS.Legacy.Enabled = legacy
 		c.AS.Issuer = "as-issuer"
+		c.AS.Audiences = []string{"wallet-backend", "rp.example", "any-rp-id"}
 		c.AS.ExternalURL = srv.URL + "/"
 		// The test AS is plain http on loopback.
 		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
@@ -91,7 +92,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("legacy on: issuer pinned to jwt.issuer, no audience filtering", func(t *testing.T) {
+	t.Run("legacy on: issuer pinned to jwt.issuer, RP-ID audience accepted", func(t *testing.T) {
 		v, err := NewStandaloneEngineTokenValidator(base(true), zap.NewNop())
 		require.NoError(t, err)
 		defer func() { _ = v.Close() }()
@@ -103,7 +104,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{}))
 		assert.Error(t, err, "missing iss")
 		res, err := v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "legacy", "aud": "any-rp-id"}))
-		require.NoError(t, err, "aud (the RP ID) must not be filtered on HMAC tokens")
+		require.NoError(t, err, "aud (the RP ID) is in as.audiences")
 		assert.Equal(t, []string{"any-rp-id"}, res.Audience)
 	})
 

@@ -17,7 +17,7 @@ import (
 // legacyValidatorConfig is the one place all three go-tokenauth validator
 // constructors get their legacy settings from, so this is what pins the
 // accepted legacy issuer for each of them.
-func TestLegacyValidatorConfig_PinsJWTIssuerWithoutAudienceFiltering(t *testing.T) {
+func TestLegacyValidatorConfig_PinsJWTIssuer(t *testing.T) {
 	const secret = "0123456789abcdef0123456789abcdef"
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "jwt-issuer"}}
 	cfg.AS.Issuer = "as-issuer" // differs from jwt.issuer on purpose
@@ -27,9 +27,9 @@ func TestLegacyValidatorConfig_PinsJWTIssuerWithoutAudienceFiltering(t *testing.
 	assert.Equal(t, []string{"jwt-issuer"}, lc.Issuers)
 	assert.False(t, legacyValidatorConfig(cfg, false).Enabled)
 
-	// Mirror the constructors: top-level Issuer is the AS issuer, and no
-	// Audiences are passed.
-	v := tokenvalidator.New(tokenvalidator.Config{Issuer: cfg.AS.Issuer, Legacy: lc})
+	// Mirror the constructors: top-level Issuer is the AS issuer, and the
+	// audience list (which includes the RP ID while legacy is on) is passed.
+	v := tokenvalidator.New(tokenvalidator.Config{Issuer: cfg.AS.Issuer, Audiences: []string{"rp.example.org"}, Legacy: lc})
 	mint := func(claims jwt.MapClaims) string {
 		claims["user_id"], claims["tenant_id"] = "u", "t"
 		claims["exp"] = time.Now().Add(time.Hour).Unix()
@@ -45,7 +45,5 @@ func TestLegacyValidatorConfig_PinsJWTIssuerWithoutAudienceFiltering(t *testing.
 	_, err = v.Validate(context.Background(), mint(jwt.MapClaims{}))
 	assert.Error(t, err, "missing issuer")
 	_, err = v.Validate(context.Background(), mint(jwt.MapClaims{"iss": "jwt-issuer", "aud": "rp.example.org"}))
-	assert.NoError(t, err, "correct issuer accepted, and its RP-ID audience is not filtered")
-	_, err = v.Validate(context.Background(), mint(jwt.MapClaims{"iss": "jwt-issuer"}))
-	assert.NoError(t, err)
+	assert.NoError(t, err, "correct issuer accepted, and its RP-ID audience is in the list")
 }

@@ -56,14 +56,15 @@ func TestManager_validateToken_LegacyExemptFromAudience(t *testing.T) {
 	cfg.AS.Audiences = []string{"wallet-backend"}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Legacy: tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(legacySwitchSecret)},
+		Audiences: []string{"wallet-backend", "rp.example.com"},
+		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(legacySwitchSecret), Issuers: []string{"test-issuer"}},
 	}))
 	uid, _, _, err := m.validateToken(context.Background(), legacySwitchToken(t, "rp.example.com"))
 	require.NoError(t, err)
 	assert.Equal(t, "u", uid)
 
 	// Legacy disabled in the validator: refused.
-	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{}))
+	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{Audiences: []string{"wallet-backend", "rp.example.com"}}))
 	_, _, _, err = m.validateToken(context.Background(), legacySwitchToken(t, "rp.example.com"))
 	assert.Error(t, err)
 }
