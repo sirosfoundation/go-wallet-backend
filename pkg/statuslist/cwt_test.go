@@ -42,6 +42,7 @@ type cwtOpts struct {
 	typUnprot bool // typ only in the unprotected header
 	noX5Chain bool
 	x5cInUnp  bool                // put x5chain in the unprotected header
+	x5t       any                 // protected x5t (COSE_CertHash); "match" computes a valid one
 	wrap      func(arr []any) any // overrides the default tag 18 envelope
 	textKeys  bool                // draft CDDL: "bits"/"lst" text keys in status_list
 	legacy    bool                // vc#703 layout: status_list=65534, ttl=65535
@@ -185,6 +186,12 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 		chain := []any{selfSigned(t, o.key)}
 		if o.x5cInUnp {
 			unprot[coseHdrX5Chain] = chain
+			if o.x5t == "match" {
+				h := sha256.Sum256(chain[0].([]byte))
+				prot[coseHdrX5T] = []any{int64(coseHashSHA256), h[:]}
+			} else if o.x5t != nil {
+				prot[coseHdrX5T] = o.x5t
+			}
 		} else {
 			prot[coseHdrX5Chain] = chain
 		}
@@ -251,16 +258,16 @@ func TestCWT_VerifyAndVerdicts(t *testing.T) {
 	p521, _ := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
 
 	for name, o := range map[string]cwtOpts{
-		"tagged":                      {},
-		"x5chain unprot":              {x5cInUnp: true},
-		"ES384":                       {key: p384},
-		"ES512":                       {key: p521},
-		"typ short form":              {typ: "statuslist+cwt"},
-		"exp":                         {exp: future},
-		"legacy vc#703":               {legacy: true},
-		"1 bit":                       {bits: 1},
-		"text keys (draft CDDL)":      {textKeys: true},
-		"text keys, vc legacy labels": {textKeys: true, legacy: true},
+		"tagged":                        {},
+		"x5chain unprot + matching x5t": {x5cInUnp: true, x5t: "match"},
+		"ES384":                         {key: p384},
+		"ES512":                         {key: p521},
+		"typ short form":                {typ: "statuslist+cwt"},
+		"exp":                           {exp: future},
+		"legacy vc#703":                 {legacy: true},
+		"1 bit":                         {bits: 1},
+		"text keys (draft CDDL)":        {textKeys: true},
+		"text keys, vc legacy labels":   {textKeys: true, legacy: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			o.values = map[int]int{3: 1, 4: 1}
@@ -299,6 +306,10 @@ func TestCWT_Rejections(t *testing.T) {
 		{"wrong typ", cwtOpts{typ: "application/cwt"}, nil, "typ", nil},
 		{"missing typ", cwtOpts{noTyp: true}, nil, "typ", nil},
 		{"typ only in unprotected header", cwtOpts{typUnprot: true}, nil, "typ", nil},
+		{"unprotected x5chain alone", cwtOpts{x5cInUnp: true}, nil, "not integrity protected", nil},
+		{"x5t mismatch", cwtOpts{x5cInUnp: true, x5t: []any{int64(coseHashSHA256), make([]byte, 32)}}, nil, "does not match", nil},
+		{"x5t unsupported hash", cwtOpts{x5cInUnp: true, x5t: []any{int64(-99), make([]byte, 32)}}, nil, "unsupported x5t", nil},
+		{"x5t malformed", cwtOpts{x5cInUnp: true, x5t: "junk"}, nil, "x5t", nil},
 		{"no key material", cwtOpts{noX5Chain: true}, nil, "", ErrNoSignerKey},
 		{"empty lst", cwtOpts{rawLst: []byte{}}, nil, "lst", nil},
 		{"garbage lst", cwtOpts{rawLst: []byte("not zlib")}, nil, "lst", nil},

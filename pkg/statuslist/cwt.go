@@ -5,6 +5,9 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
@@ -26,6 +29,11 @@ const (
 	coseHdrCrit    = 2  // RFC 9052 section 3.1
 	coseHdrTyp     = 16 // "type" header parameter
 	coseHdrX5Chain = 33 // RFC 9360
+	coseHdrX5T     = 34 // RFC 9360, COSE_CertHash
+
+	coseHashSHA256 = -16
+	coseHashSHA384 = -43
+	coseHashSHA512 = -44
 
 	coseAlgES256 = -7
 	coseAlgES384 = -35
@@ -79,7 +87,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		return parsedList{}, fmt.Errorf("%w has no alg in its protected header", errCWT)
 	}
 
-	chain, err := x5chain(headerValue(prot, sign1.unprotected, coseHdrX5Chain))
+	chain, err := signerChain(prot, sign1.unprotected)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w x5chain: %v", errCWT, err)
 	}
@@ -153,7 +161,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 
 // understoodHeaders are the header labels this verifier processes; a label
 // listed in crit must be one of them (RFC 9052 section 3.1).
-var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrTyp: true, coseHdrX5Chain: true}
+var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrTyp: true, coseHdrX5Chain: true, coseHdrX5T: true}
 
 // checkHeaders enforces the COSE header rules that the signature does not:
 // a label appears in at most one bucket (RFC 9052 section 3), crit is
@@ -355,12 +363,69 @@ func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 	return ints, texts, nil
 }
 
-// headerValue looks a label up in the protected then the unprotected header.
-func headerValue(prot, unprot map[int64]any, label int64) any {
-	if v, ok := prot[label]; ok {
-		return v
+// signerChain returns the x5chain that carries the signer certificate.
+// RFC 9360 section 2: "The end-entity certificate MUST be integrity
+// protected by COSE. This can, for example, be done by sending the header
+// parameter in the protected header, sending an 'x5chain' in the unprotected
+// header combined with an 'x5t' in the protected header, or including the
+// end-entity certificate in the external_aad." An x5chain in the protected
+// header is accepted; one only in the unprotected header is accepted solely
+// when the protected header holds an x5t that matches its end-entity
+// certificate. Otherwise the chain could be swapped without invalidating the
+// signature, changing the trust decision.
+func signerChain(prot, unprot map[int64]any) ([][]byte, error) {
+	if v, ok := prot[coseHdrX5Chain]; ok {
+		return x5chain(v)
 	}
-	return unprot[label]
+	v, ok := unprot[coseHdrX5Chain]
+	if !ok {
+		return nil, nil
+	}
+	chain, err := x5chain(v)
+	if err != nil || len(chain) == 0 {
+		return chain, err
+	}
+	if err := checkX5T(prot[coseHdrX5T], chain[0]); err != nil {
+		return nil, fmt.Errorf("unprotected x5chain is not integrity protected (RFC 9360 section 2): %v", err)
+	}
+	return chain, nil
+}
+
+// checkX5T verifies a protected x5t (COSE_CertHash, RFC 9360) against a
+// certificate.
+func checkX5T(v any, der []byte) error {
+	arr, ok := v.([]any)
+	if v == nil || !ok || len(arr) != 2 {
+		return errors.New("no protected x5t binding the end-entity certificate")
+	}
+	alg, ok := toInt64(arr[0])
+	if !ok {
+		if n, isNeg := arr[0].(int64); isNeg {
+			alg, ok = n, true
+		}
+	}
+	want, isBytes := arr[1].([]byte)
+	if !ok || !isBytes {
+		return errors.New("malformed x5t")
+	}
+	var sum []byte
+	switch alg {
+	case coseHashSHA256:
+		h := sha256.Sum256(der)
+		sum = h[:]
+	case coseHashSHA384:
+		h := sha512.Sum384(der)
+		sum = h[:]
+	case coseHashSHA512:
+		h := sha512.Sum512(der)
+		sum = h[:]
+	default:
+		return fmt.Errorf("unsupported x5t hash algorithm %d", alg)
+	}
+	if subtle.ConstantTimeCompare(sum, want) != 1 {
+		return errors.New("x5t does not match the end-entity certificate")
+	}
+	return nil
 }
 
 // x5chain reads an x5chain header value: one DER certificate or an array.
