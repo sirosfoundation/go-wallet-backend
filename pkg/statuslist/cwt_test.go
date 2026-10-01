@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
@@ -545,4 +546,88 @@ func TestCWT_MinEntries(t *testing.T) {
 			t.Fatalf("min %d: wantErr=%v got %v", tc.min, tc.wantErr, err)
 		}
 	}
+}
+
+// signedCWTWithPayload builds a CWT around an exact claims payload.
+func signedCWTWithPayload(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	key := newKey(t)
+	prot, _ := cbor.Marshal(map[int64]any{
+		coseHdrAlg: coseAlgES256, coseHdrTyp: "application/statuslist+cwt",
+		coseHdrX5Chain: []any{selfSigned(t, key)},
+	})
+	tbs, _ := cbor.Marshal([]any{"Signature1", prot, []byte{}, payload})
+	sum := sha256.Sum256(tbs)
+	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	out, err := cbor.Marshal(cbor.Tag{Number: coseTagSign1, Content: []any{prot, map[int64]any{}, payload, sig}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestCWT_ExtensionAndDuplicateClaims(t *testing.T) {
+	ctx := context.Background()
+	lst := zlibBytes(t, 2, map[int]int{3: 1})
+	payloadFor := func(uri string, extra ...[2]any) []byte {
+		// Hand-built so the key order and repeats are exact.
+		var b []byte
+		items := [][2]any{
+			{int64(cwtClaimSub), uri}, {int64(cwtClaimIat), time.Now().Unix()},
+			{int64(cwtClaimTTL), 900},
+			{int64(cwtClaimStatusList), map[int64]any{statusListKeyBits: 2, statusListKeyLst: lst}},
+		}
+		items = append(items, extra...)
+		b = append(b, 0xa0+byte(len(items)))
+		for _, it := range items {
+			k, _ := cbor.Marshal(it[0])
+			v, _ := cbor.Marshal(it[1])
+			b = append(append(b, k...), v...)
+		}
+		return b
+	}
+	t.Run("text-labelled and unknown integer extension claims accepted", func(t *testing.T) {
+		c, uri, _ := serveCWT(t, func(u string) []byte {
+			return signedCWTWithPayload(t, payloadFor(u,
+				[2]any{"x-extension", "v"}, [2]any{"nested", map[string]any{"a": 1}}, [2]any{int64(-70000), true}, [2]any{int64(1000), []byte{1}}))
+		}, mediaTypeCWT, trustAll)
+		if err := c.Check(ctx, &Reference{Idx: 2, URI: uri}); err != nil {
+			t.Fatalf("valid entry: %v", err)
+		}
+		if err := c.Check(ctx, &Reference{Idx: 3, URI: uri}); !errors.Is(err, ErrRevoked) {
+			t.Fatalf("want ErrRevoked, got %v", err)
+		}
+	})
+	t.Run("duplicate keys rejected", func(t *testing.T) {
+		for name, extra := range map[string][2]any{
+			"integer": {int64(cwtClaimIat), time.Now().Unix()},
+			"text":    {"dup", 1},
+		} {
+			t.Run(name, func(t *testing.T) {
+				c, uri, _ := serveCWT(t, func(u string) []byte {
+					p := payloadFor(u, [2]any{"dup", 0}, extra)
+					return signedCWTWithPayload(t, p)
+				}, mediaTypeCWT, trustAll)
+				err := c.Check(ctx, &Reference{Idx: 2, URI: uri})
+				if err == nil || errors.Is(err, ErrRevoked) {
+					t.Fatalf("duplicate claim key must be unverifiable, got %v", err)
+				}
+			})
+		}
+	})
+	t.Run("known claims stay strict beside extensions", func(t *testing.T) {
+		c, uri, _ := serveCWT(t, func(u string) []byte {
+			return signedCWTWithPayload(t, payloadFor(u, [2]any{"x", 1}, [2]any{int64(cwtClaimExp), "soon"}))
+		}, mediaTypeCWT, trustAll)
+		err := c.Check(ctx, &Reference{Idx: 2, URI: uri})
+		if err == nil || !strings.Contains(err.Error(), "exp") {
+			t.Fatalf("mistyped exp must be rejected, got %v", err)
+		}
+	})
 }

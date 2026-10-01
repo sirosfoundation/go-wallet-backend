@@ -94,8 +94,8 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		km.X5C = append(km.X5C, base64.StdEncoding.EncodeToString(der))
 	}
 
-	var claims map[int64]any
-	if err := cbor.Unmarshal(sign1.payload, &claims); err != nil {
+	claims, err := decodeClaims(sign1.payload)
+	if err != nil {
 		return parsedList{}, fmt.Errorf("%w payload: %v", errCWT, err)
 	}
 	slRaw, ttlLabel := claims[cwtClaimStatusList], int64(cwtClaimTTL)
@@ -142,6 +142,34 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	}
 	lc.bits, lc.lst = int(bits), lst
 	return c.accept(ctx, uri, km, lc)
+}
+
+// claimsDecMode rejects a claims map that repeats a key.
+var claimsDecMode = func() cbor.DecMode {
+	dm, err := cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF}.DecMode()
+	if err != nil {
+		panic(err)
+	}
+	return dm
+}()
+
+// decodeClaims reads a CWT claims set. Claim keys may be integers or text
+// strings and the status-list profile permits additional claims, so the
+// map is decoded with mixed keys: the integer-labelled claims are returned
+// and text-labelled ones (extensions) are ignored. A repeated key is an
+// error.
+func decodeClaims(payload []byte) (map[int64]any, error) {
+	var raw map[any]any
+	if err := claimsDecMode.Unmarshal(payload, &raw); err != nil {
+		return nil, err
+	}
+	out := make(map[int64]any, len(raw))
+	for k, v := range raw {
+		if label, ok := toInt64(k); ok {
+			out[label] = v
+		}
+	}
+	return out, nil
 }
 
 // cwtString reads an optional text claim; a present claim of another type is
