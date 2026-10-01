@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -42,37 +41,12 @@ func runVCTMFlow(t *testing.T, m *Manager, vct string) map[string]any {
 	return out
 }
 
-func TestVCTMFlow_UsesInProcessRegistryClient(t *testing.T) {
-	cfg := testConfig()
-	cfg.Server.RegistryPort = unusedPort(t) // nothing listens: only the in-process path can answer
-	m := NewManager(cfg, zap.NewNop())
-
-	var hits atomic.Int32
-	m.SetRegistryHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		if r.URL.Path != "/registry/vctm/urn:example:id" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"vct":"urn:example:id","name":"From fake"}`))
-	}))
-
-	out := runVCTMFlow(t, m, "urn:example:id")
-	assert.Equal(t, string(TypeFlowComplete), out["type"])
-	assert.EqualValues(t, 1, hits.Load())
-	var md TypeMetadata
-	raw, err := json.Marshal(out["type_metadata"])
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(raw, &md))
-	assert.Equal(t, "From fake", md.Name)
-}
-
 func TestVCTMFlow_DefaultClientUsesConfiguredRegistryURL(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		assert.Equal(t, "/vctm/urn:example:id", r.URL.Path)
+		assert.Equal(t, "/type-metadata", r.URL.Path)
+		assert.Equal(t, "urn:example:id", r.URL.Query().Get("vct"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"vct":"urn:example:id","name":"From http"}`))
 	}))

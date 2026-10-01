@@ -144,11 +144,13 @@ func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*V
 	return &metadata, nil
 }
 
-// GetVCTM issues GET <registry>/vctm/<vct> and returns the raw response; the
-// caller closes the body. It uses this client's transport (in-process handler
-// or HTTP), so every registry lookup goes the same way.
+// GetVCTM issues GET <registry>/type-metadata?vct=<vct> - the route every
+// registry serves (the integrated handler and external go-wallet-registry;
+// there is no /vctm/<vct> route) - and returns the raw response; the caller
+// closes the body. It uses this client's transport (in-process handler or
+// HTTP), so every registry lookup goes the same way.
 func (rc *RegistryClient) GetVCTM(ctx context.Context, vct string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", rc.registryURL()+"/vctm/"+url.PathEscape(vct), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", rc.registryURL()+"/type-metadata?vct="+url.QueryEscape(vct), nil)
 	if err != nil {
 		return nil, err
 	}
