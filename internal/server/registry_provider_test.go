@@ -24,7 +24,10 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-const regTestSecret = "0123456789abcdef0123456789abcdef"
+const (
+	regTestSecret = "0123456789abcdef0123456789abcdef"
+	regTestRPID   = "wallet.example.org"
+)
 
 type regAS struct {
 	key *ecdsa.PrivateKey
@@ -68,7 +71,7 @@ func (a *regAS) token(t *testing.T, aud []string) string {
 func regHMAC(t *testing.T) string {
 	t.Helper()
 	s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
-		"iss": "wallet-backend", "user_id": "u", "tenant_id": "acme",
+		"iss": "wallet-backend", "aud": regTestRPID, "user_id": "u", "tenant_id": "acme",
 		"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
 	require.NoError(t, err)
 	return s
@@ -111,6 +114,7 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	cfg.AS.Enabled = false // registry-only: validates, does not run the AS
 	cfg.AS.ExternalURL = as.srv.URL
 	cfg.AS.Legacy.Enabled = true
+	cfg.Server.RPID = regTestRPID
 	cfg.JWT.Secret = regTestSecret
 	require.NoError(t, cfg.ValidateRegistry())
 
@@ -123,12 +127,13 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, ""))
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer junk"))
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-registry"})))
-	assert.Equal(t, http.StatusForbidden, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-backend"})))
+	// An AS token for another audience is refused by the validator (v0.5).
+	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-backend"})))
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+regHMAC(t)), "legacy HMAC accepted while enabled")
 
 	// Legacy HMAC from a different issuer is rejected (jwt.issuer is enforced).
 	badIss, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
-		"iss": "someone-else", "user_id": "u", "tenant_id": "acme",
+		"iss": "someone-else", "aud": regTestRPID, "user_id": "u", "tenant_id": "acme",
 		"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+badIss))
@@ -194,12 +199,12 @@ func TestBuildTokenValidatorHelpers(t *testing.T) {
 	c.JWT.Issuer = ""
 	assert.Nil(t, legacyValidatorConfig(c).Issuers)
 	c.JWT.Issuer = "wallet-backend"
-	v := buildTokenValidator(c, nil, nil)
+	v := buildTokenValidator(c, []string{regTestRPID}, nil)
 	_, err := v.Validate(context.Background(), regHMAC(t))
 	assert.Error(t, err)
 
 	c.JWT.Secret = regTestSecret
-	v = buildTokenValidator(c, nil, nil)
+	v = buildTokenValidator(c, []string{regTestRPID}, nil)
 	c.AS.Issuer = ""
 	_, err = v.Validate(context.Background(), regHMAC(t))
 	assert.NoError(t, err)

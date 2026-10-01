@@ -887,6 +887,18 @@ type RegistryProvider struct {
 	rootAliases bool
 }
 
+// registryTokenAudiences is the "aud" list the registry's token validator
+// accepts: the registry audience for AS-issued tokens and, when legacy HMAC
+// tokens are enabled, the RP ID (their audience, see UserService/
+// WebAuthnService).
+func registryTokenAudiences(cfg *config.Config) []string {
+	auds := []string{config.RegistryAudience}
+	if cfg.AS.Legacy.Enabled && cfg.Server.RPID != "" {
+		auds = append(auds, cfg.Server.RPID)
+	}
+	return auds
+}
+
 // registryNeedsValidator reports whether a token validator must be built:
 // always when registry.require_auth is set, otherwise only when there is a
 // token source to recognise (an AS to fetch JWKS from, or a legacy HMAC
@@ -943,7 +955,7 @@ func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvi
 		// go-tokenauth v0.5 refuses to validate without an audience list.
 		// The registry's narrower rule (registry.AuthMiddlewares) is still
 		// enforced on top of it.
-		p.validator = buildTokenValidator(cfg, nil, nil)
+		p.validator = buildTokenValidator(cfg, registryTokenAudiences(cfg), nil)
 		logger.Info("Registry token validation configured",
 			zap.String("jwks_url", tokenJWKSURL(cfg)),
 			zap.Bool("legacy_hmac", cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""),

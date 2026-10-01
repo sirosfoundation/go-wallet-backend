@@ -11,6 +11,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -139,10 +140,7 @@ func resultFrom(c *gin.Context) *claims.Result {
 
 // audienceAllowed implements the registry audience rule.
 func audienceAllowed(res *claims.Result) bool {
-	if res.Mode == claims.ModeLegacy {
-		return true
-	}
-	return res.HasAudience(config.RegistryAudience)
+	return audience.Allowed(res, true, config.RegistryAudience)
 }
 
 func markAuthenticated(c *gin.Context, res *claims.Result) {

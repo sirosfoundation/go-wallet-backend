@@ -28,6 +28,7 @@ import (
 const (
 	testIssuer = "https://as.example.org"
 	testSecret = "0123456789abcdef0123456789abcdef"
+	testRPID   = "wallet.example.org"
 )
 
 type authEnv struct {
@@ -54,9 +55,11 @@ func (e *authEnv) validator(t *testing.T, legacy bool) *validator.Validator {
 	v := validator.New(validator.Config{
 		JWKSURL: e.jwks.URL,
 		Issuer:  testIssuer,
-		// The registry passes no audience list to the validator and enforces
-		// its own audience rule.
-		Legacy: validator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(testSecret)},
+		// go-tokenauth v0.5 requires an audience list (also applied to legacy
+		// tokens, whose aud is the RP ID); the registry enforces its narrower
+		// rule on top.
+		Audiences: []string{"wallet-registry", "wallet-backend", testRPID},
+		Legacy:    validator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(testSecret), Issuers: []string{"wallet-backend"}},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
@@ -89,6 +92,7 @@ func hmacToken(t *testing.T, secret string, aud []string, tenant string) string 
 	t.Helper()
 	c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "tenant_id": tenant,
 		"exp": time.Now().Add(time.Hour).Unix()}
+	c["aud"] = testRPID
 	if aud != nil {
 		c["aud"] = aud
 	}
@@ -161,23 +165,23 @@ func TestAuthMiddlewares_Strict(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, []string{"wallet-backend"}, "acme", future))
 		assert.Equal(t, http.StatusForbidden, r.status)
 	})
-	t.Run("ES256 no audience is 403", func(t *testing.T) {
+	t.Run("ES256 no audience is 401 (rejected by go-tokenauth v0.5)", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, nil, "acme", future))
-		assert.Equal(t, http.StatusForbidden, r.status)
+		assert.Equal(t, http.StatusUnauthorized, r.status)
 	})
 	t.Run("expired ES256 is 401", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(-time.Hour)))
 		assert.Equal(t, http.StatusUnauthorized, r.status)
 	})
-	t.Run("legacy HMAC without audience accepted while legacy enabled", func(t *testing.T) {
+	t.Run("legacy HMAC with the RP ID audience accepted while legacy enabled", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, nil, "acme"))
 		assert.Equal(t, http.StatusOK, r.status)
 		assert.True(t, r.auth)
 		assert.Equal(t, "acme", r.tenant)
 	})
-	t.Run("legacy HMAC with unrelated audience never rejected by audience", func(t *testing.T) {
+	t.Run("legacy HMAC with an audience outside the validator list is 401", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, []string{"something-else"}, "acme"))
-		assert.Equal(t, http.StatusOK, r.status)
+		assert.Equal(t, http.StatusUnauthorized, r.status)
 	})
 	t.Run("legacy HMAC with wrong secret is 401", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+hmacToken(t, "ffffffffffffffffffffffffffffffff", nil, "acme"))
@@ -329,7 +333,7 @@ func TestAuthMiddlewares_Optional(t *testing.T) {
 		}
 	})
 	t.Run("legacy HMAC recognised while enabled", func(t *testing.T) {
-		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, []string{"x"}, "acme"))
+		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, []string{testRPID}, "acme"))
 		assert.True(t, r.auth)
 	})
 	t.Run("legacy HMAC ignored when disabled", func(t *testing.T) {
