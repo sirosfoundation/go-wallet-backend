@@ -91,8 +91,9 @@ type Reference struct {
 }
 
 // ErrRevoked is wrapped by the error Check returns ONLY when the list was
-// fetched, its signature, typ, sub and exp were verified, and the entry at the
-// credential's index is anything other than VALID (0): INVALID (1), SUSPENDED
+// fetched, its signature, typ, sub and required iat were verified (exp, nbf
+// and ttl are optional, and are validated whenever present), and the entry at
+// the credential's index is anything other than VALID (0): INVALID (1), SUSPENDED
 // (2) or an application-specific value. Every other error Check returns means
 // "could not determine" and must not be read as revocation. The distinction is
 // what lets a wallet refuse only on a positive determination while leaving the
