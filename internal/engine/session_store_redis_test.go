@@ -456,3 +456,109 @@ func TestRedisSessionStore_ConcurrentPutDeleteByUserNoOrphans(t *testing.T) {
 	}
 	assert.False(t, mr.Exists(store.userSetKey("u1")))
 }
+
+// The tenant-scoped pointer lives in a namespace disjoint from the legacy
+// `user:<userID>` pointer and is injectively encoded: legacy user "default:u"
+// and new (tenant "default", user "u") must never share a key or see each
+// other's sessions, in either direction and across all operations.
+func TestRedisSessionStore_LegacyAndScopedKeysDoNotCollide(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	ctx := context.Background()
+
+	assert.NotEqual(t, store.legacyUserKey("default:u"), store.userKey("default", "u"))
+
+	// Legacy session of user "default:u" (tenant t1), written by an old replica.
+	seedLegacySession(t, store, redisSess("legacy", "t1", "default:u", time.Hour), time.Hour)
+	// New session for (default, u).
+	require.NoError(t, store.Put(ctx, redisSess("fresh", "default", "u", time.Hour)))
+
+	got, err := store.GetByUser(ctx, "default", "u")
+	require.NoError(t, err)
+	assert.Equal(t, "fresh", got.ID)
+	got, err = store.GetByUser(ctx, "t1", "default:u")
+	require.NoError(t, err)
+	assert.Equal(t, "legacy", got.ID)
+
+	// Deleting one never touches the other.
+	require.NoError(t, store.Delete(ctx, "fresh"))
+	got, err = store.GetByUser(ctx, "t1", "default:u")
+	require.NoError(t, err)
+	assert.Equal(t, "legacy", got.ID)
+
+	require.NoError(t, store.Put(ctx, redisSess("fresh2", "default", "u", time.Hour)))
+	require.NoError(t, store.DeleteByUser(ctx, "default:u"))
+	_, err = store.Get(ctx, "legacy")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	got, err = store.GetByUser(ctx, "default", "u")
+	require.NoError(t, err)
+	assert.Equal(t, "fresh2", got.ID, "DeleteByUser(default:u) must not remove user u's session")
+
+	require.NoError(t, store.DeleteByUser(ctx, "u"))
+	_, err = store.GetByUser(ctx, "default", "u")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+}
+
+// A legacy pointer that names another user's session (the old, ambiguous key
+// scheme) is never returned, backfilled, or used to delete that session.
+func TestRedisSessionStore_CollidingLegacyPointerNeverCrossesUsers(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+
+	// Session of user "u" in tenant "default", but pointed at by the legacy
+	// key of user "default:u"-style collisions: forge the pointer.
+	require.NoError(t, store.Put(ctx, redisSess("victim", "default", "u", time.Hour)))
+	require.NoError(t, store.client.Set(ctx, store.legacyUserKey("x"), "victim", time.Hour).Err())
+
+	_, err := store.GetByUser(ctx, "default", "x")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	assert.False(t, mr.Exists(store.userKey("default", "x")), "no backfill for a foreign session")
+
+	require.NoError(t, store.DeleteByUser(ctx, "x"))
+	got, err := store.Get(ctx, "victim")
+	require.NoError(t, err, "DeleteByUser(x) must not delete a legacy-pointed session of another user")
+	assert.Equal(t, "u", got.UserID)
+	got, err = store.GetByUser(ctx, "default", "u")
+	require.NoError(t, err)
+	assert.Equal(t, "victim", got.ID)
+	assert.False(t, mr.Exists(store.legacyUserKey("x")), "the colliding legacy pointer itself is removed")
+}
+
+// IDs and tenants with ':' and other special characters stay isolated.
+func TestRedisSessionStore_SpecialCharacterIDsAreIsolated(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	ctx := context.Background()
+
+	pairs := [][2]string{
+		{"a", "b:c"}, {"a:b", "c"}, {"a:b:c", ""}, {"a", "b%3Ac"},
+		{"a b", "c/d"}, {"a/b", "c d"}, {"", "x"}, {"default", "y"},
+		{"t", "u:"}, {"t:", "u"}, {"%", "%25"}, {"é", "ü"},
+	}
+	keys := map[string]bool{}
+	for i, p := range pairs {
+		k := store.userKey(p[0], p[1])
+		require.False(t, keys[k], "key collision for %q", p)
+		keys[k] = true
+		id := "s" + string(rune('A'+i))
+		require.NoError(t, store.Put(ctx, redisSess(id, p[0], p[1], time.Hour)))
+	}
+	for i, p := range pairs {
+		id := "s" + string(rune('A'+i))
+		got, err := store.GetByUser(ctx, p[0], p[1])
+		require.NoError(t, err, "%q", p)
+		assert.Equal(t, id, got.ID, "%q", p)
+	}
+
+	// Delete one: all others remain.
+	require.NoError(t, store.Delete(ctx, "sA"))
+	for i, p := range pairs[1:] {
+		got, err := store.GetByUser(ctx, p[0], p[1])
+		require.NoError(t, err)
+		assert.Equal(t, "s"+string(rune('A'+i+1)), got.ID)
+	}
+	// DeleteByUser removes only that user's sessions.
+	require.NoError(t, store.DeleteByUser(ctx, "b:c"))
+	_, err := store.GetByUser(ctx, "a", "b:c")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.GetByUser(ctx, "a:b", "c")
+	assert.NoError(t, err)
+}

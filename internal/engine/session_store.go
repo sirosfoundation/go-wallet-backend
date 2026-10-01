@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -303,8 +304,18 @@ func (r *RedisSessionStore) sessionKey(sessionID string) string {
 }
 
 // userKey is the per-(tenant, user) pointer to that user's current session.
+//
+// It lives in its own `usert:` namespace, disjoint from the legacy
+// `user:<userID>` pointer, and encodes both fields as unpadded base64url
+// (alphabet A-Z a-z 0-9 - _, never ':'), so the ':' separator is unambiguous
+// and distinct (tenant, user) pairs can never map to the same key. Sharing
+// the legacy namespace (or using an escaping that leaves ':' intact) would
+// let legacy user "default:u" and (tenant "default", user "u") collide.
 func (r *RedisSessionStore) userKey(tenantID, userID string) string {
-	return r.keyPrefix + "user:" + url.PathEscape(normalizeTenant(tenantID)) + ":" + url.PathEscape(userID)
+	enc := base64.RawURLEncoding
+	return r.keyPrefix + "usert:" +
+		enc.EncodeToString([]byte(normalizeTenant(tenantID))) + ":" +
+		enc.EncodeToString([]byte(userID))
 }
 
 // userSetKey is the sorted set of the IDs of all of a user's sessions across
@@ -315,8 +326,9 @@ func (r *RedisSessionStore) userSetKey(userID string) string {
 }
 
 // legacyUserKey is the pre-tenant-scoping per-user pointer (`<prefix>user:<userID>`,
-// unescaped, written by earlier releases with the session's TTL). New code never
-// writes it; it is only read and removed so that sessions created by replicas
+// written raw by earlier releases with the session's TTL, so ambiguous when IDs
+// contain ':'; readers must verify the named session's user and tenant). New
+// code never writes it; it is only read and removed so that sessions created by replicas
 // still running the previous release remain reachable during a rolling upgrade.
 // The fallback is bounded by the maximum session TTL (DefaultTTL, 24h by
 // default): once every pre-upgrade session has expired, the key no longer exists.
