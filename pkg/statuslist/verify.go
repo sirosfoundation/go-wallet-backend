@@ -459,32 +459,95 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, 
 		}
 	}
 
-	var claims struct {
-		Sub        string `json:"sub"`
-		Iss        string `json:"iss"`
-		Iat        *int64 `json:"iat"`
-		Exp        *int64 `json:"exp"`
-		Nbf        *int64 `json:"nbf"`
-		TTL        *int64 `json:"ttl"`
-		StatusList *struct {
-			Bits int    `json:"bits"`
-			Lst  string `json:"lst"`
-		} `json:"status_list"`
-	}
-	if err := decodeSegment(parts[1], &claims); err != nil {
+	// Decode presence-aware: a member that is present but null or of the
+	// wrong type is rejected, never read as absent (a null iss would change
+	// the trust subject to the URI origin; a null exp/nbf/ttl would skip the
+	// temporal checks). The CWT path is equally strict.
+	var members map[string]json.RawMessage
+	if err := decodeSegment(parts[1], &members); err != nil {
 		return parsedList{}, fmt.Errorf("status list payload: %w", err)
 	}
-	if claims.StatusList == nil {
+	var lc listClaims
+	var cerr error
+	if lc.sub, cerr = jwtString(members, "sub"); cerr != nil {
+		return parsedList{}, cerr
+	}
+	if lc.iss, cerr = jwtString(members, "iss"); cerr != nil {
+		return parsedList{}, cerr
+	}
+	for _, f := range []struct {
+		dst  **int64
+		name string
+	}{{&lc.iat, "iat"}, {&lc.exp, "exp"}, {&lc.nbf, "nbf"}, {&lc.ttl, "ttl"}} {
+		if *f.dst, cerr = jwtInt(members, f.name); cerr != nil {
+			return parsedList{}, cerr
+		}
+	}
+	rawSL, ok := members["status_list"]
+	if !ok {
 		return parsedList{}, errors.New("status list token has no status_list claim")
 	}
-	lst, err := base64.RawURLEncoding.DecodeString(claims.StatusList.Lst)
+	sl, cerr := jwtObject(rawSL, "status_list")
+	if cerr != nil {
+		return parsedList{}, cerr
+	}
+	bits, cerr := jwtInt(sl, "bits")
+	if cerr != nil {
+		return parsedList{}, fmt.Errorf("status_list: %w", cerr)
+	}
+	if bits == nil {
+		return parsedList{}, errors.New("status list token status_list has no bits")
+	}
+	lstStr, cerr := jwtString(sl, "lst")
+	if cerr != nil {
+		return parsedList{}, fmt.Errorf("status_list: %w", cerr)
+	}
+	if _, ok := sl["lst"]; !ok {
+		return parsedList{}, errors.New("status list token status_list has no lst")
+	}
+	lst, err := base64.RawURLEncoding.DecodeString(lstStr)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("status list lst: %w", err)
 	}
-	return c.accept(ctx, uri, km, listClaims{
-		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, nbf: claims.Nbf, ttl: claims.TTL,
-		bits: claims.StatusList.Bits, lst: lst,
-	})
+	lc.bits, lc.lst = int(*bits), lst
+	return c.accept(ctx, uri, km, lc)
+}
+
+// jwtString reads an optional string claim; a present member that is not a
+// JSON string (including null) is an error.
+func jwtString(m map[string]json.RawMessage, name string) (string, error) {
+	raw, ok := m[name]
+	if !ok {
+		return "", nil
+	}
+	var s string
+	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &s) != nil {
+		return "", fmt.Errorf("status list claim %s is not a string", name)
+	}
+	return s, nil
+}
+
+// jwtInt reads an optional integer claim; a present member that is not a JSON
+// integer (including null) is an error.
+func jwtInt(m map[string]json.RawMessage, name string) (*int64, error) {
+	raw, ok := m[name]
+	if !ok {
+		return nil, nil
+	}
+	var n int64
+	if len(raw) == 0 || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) || json.Unmarshal(raw, &n) != nil {
+		return nil, fmt.Errorf("status list claim %s is not an integer", name)
+	}
+	return &n, nil
+}
+
+// jwtObject decodes a present member that must be a JSON object.
+func jwtObject(raw json.RawMessage, name string) (map[string]json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if len(raw) == 0 || raw[0] != '{' || json.Unmarshal(raw, &m) != nil {
+		return nil, fmt.Errorf("status list claim %s is not an object", name)
+	}
+	return m, nil
 }
 
 // listClaims is the form-independent content of a Status List Token.
