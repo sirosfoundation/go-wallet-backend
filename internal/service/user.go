@@ -666,6 +666,33 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		}
 	}
 
+	// Final cleanup barrier for holder data. The first sweep ran before the
+	// token cut-off was advanced (it has to: advancing earlier would refuse the
+	// caller's own token and cost them the retry a failed sweep promises). A
+	// request the middleware admitted before the cut-off can therefore have
+	// written a credential or presentation after that sweep and before the
+	// cut-off landed: its mutation check still saw the old cut-off. From here
+	// on every such write is refused (RefuseNow reads the advanced cut-off, and
+	// the tombstone covers the record's removal), so one more sweep, after the
+	// fence, removes whatever an already-admitted request left behind. A write
+	// that passed its check just before the fence and is persisted after this
+	// sweep is the residual window a per-process check cannot close without a
+	// lock around the credential write paths; the final user deletion below
+	// then makes every later write refuse.
+	//
+	// A failure here is retryable and fails closed: the user record is kept,
+	// the cut-off and revocations only move forward, and the repeat (with a
+	// fresh login) sweeps again.
+	var finalErrs []error
+	for _, tenantID := range tenantIDs {
+		finalErrs = append(finalErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+	}
+	if len(finalErrs) > 0 {
+		s.logger.Error("Account deletion incomplete: holder data could not be removed after the token cut-off",
+			zap.Error(errors.Join(finalErrs...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: final holder-data sweep: %w", ErrDeletionIncomplete, errors.Join(finalErrs...))
+	}
+
 	// Memberships come last, once nothing is outstanding anywhere. They are
 	// what makes a non-default tenant findable at all: the retry after a
 	// DELETION_INCOMPLETE rebuilds its tenant list from them, so a
