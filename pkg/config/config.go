@@ -907,6 +907,20 @@ func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
 	return srv.ListenAndServe()
 }
 
+// Serve serves srv on an already-bound listener, using TLS if t is enabled and
+// plain HTTP otherwise. Binding the listener separately (net.Listen) lets the
+// caller report bind failures synchronously instead of from a goroutine.
+func (t *TLSConfig) Serve(srv *http.Server, ln net.Listener) error {
+	if t.Enabled {
+		if srv.TLSConfig == nil {
+			srv.TLSConfig = &tls.Config{}
+		}
+		srv.TLSConfig.MinVersion = t.TLSMinVersion()
+		return srv.ServeTLS(ln, t.CertFile, t.KeyFile)
+	}
+	return srv.Serve(ln)
+}
+
 // CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
 type CORSConfig struct {
 	// AllowedOrigins is a list of origins that may access the resource.

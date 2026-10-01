@@ -12,6 +12,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -200,8 +201,36 @@ func (c *providerChecker) CheckReady(ctx context.Context) error {
 	return c.checker.CheckReady(ctx)
 }
 
-// Start builds routers and starts http servers
+// Start builds routers and starts http servers. Listeners are bound
+// synchronously, so an occupied port or invalid address is returned as an
+// error instead of being logged from a serving goroutine. If startup fails
+// after some listeners were bound, they are shut down again.
 func (m *Manager) Start(ctx context.Context) error {
+	if err := m.start(ctx); err != nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Shutdown(sctx)
+		return err
+	}
+	return nil
+}
+
+// listenAndServe binds srv.Addr synchronously and serves it in a goroutine.
+func (m *Manager) listenAndServe(srv *http.Server, tlsCfg *config.TLSConfig, listeningMsg, errMsg string, fields []zap.Field) error {
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return fmt.Errorf("%s: cannot listen on %s: %w", errMsg, srv.Addr, err)
+	}
+	m.logger.Info(listeningMsg, fields...)
+	go func() {
+		if err := tlsCfg.Serve(srv, ln); err != nil && err != http.ErrServerClosed {
+			m.logger.Error(errMsg, zap.Error(err))
+		}
+	}()
+	return nil
+}
+
+func (m *Manager) start(ctx context.Context) error {
 	// Set Gin mode
 	if m.cfg.LoggingLevel == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -261,12 +290,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	go func() {
-		m.logger.Info("HTTP server listening", zap.String("address", httpAddr))
-		if err := m.cfg.TLS.ListenAndServe(m.httpServer); err != nil && err != http.ErrServerClosed {
-			m.logger.Error("HTTP server error", zap.Error(err))
-		}
-	}()
+	if err := m.listenAndServe(m.httpServer, &m.cfg.TLS, "HTTP server listening", "HTTP server error", []zap.Field{zap.String("address", httpAddr)}); err != nil {
+		return err
+	}
 
 	// Start WebSocket server if providers registered
 	if m.wsRouter != nil {
@@ -282,12 +308,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		// Add status to WebSocket server too
 		m.addStatusEndpoints(m.wsRouter)
 
-		go func() {
-			m.logger.Info("WebSocket server listening", zap.String("address", wsAddr))
-			if err := m.cfg.TLS.ListenAndServe(m.wsServer); err != nil && err != http.ErrServerClosed {
-				m.logger.Error("WebSocket server error", zap.Error(err))
-			}
-		}()
+		if err := m.listenAndServe(m.wsServer, &m.cfg.TLS, "WebSocket server listening", "WebSocket server error", []zap.Field{zap.String("address", wsAddr)}); err != nil {
+			return err
+		}
 	}
 
 	// Start wallet-provider server if providers registered on separate port
@@ -308,12 +331,9 @@ func (m *Manager) Start(ctx context.Context) error {
 			IdleTimeout:  60 * time.Second,
 		}
 
-		go func() {
-			m.logger.Info("Wallet-provider server listening (PKCS#11 isolated)", zap.String("address", wpAddr))
-			if err := m.cfg.TLS.ListenAndServe(m.wpServer); err != nil && err != http.ErrServerClosed {
-				m.logger.Error("Wallet-provider server error", zap.Error(err))
-			}
-		}()
+		if err := m.listenAndServe(m.wpServer, &m.cfg.TLS, "Wallet-provider server listening (PKCS#11 isolated)", "Wallet-provider server error", []zap.Field{zap.String("address", wpAddr)}); err != nil {
+			return err
+		}
 	}
 
 	// Start admin server if configured
@@ -528,12 +548,9 @@ func (m *Manager) startAdminServer() error {
 	// otherwise fall back to the shared TLS configuration.
 	adminTLS := effectiveAdminTLS(&m.cfg.TLS, m.cfg.AdminTLS)
 
-	go func() {
-		m.logger.Info("Admin server listening", zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled))
-		if err := adminTLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
-			m.logger.Error("Admin server error", zap.Error(err))
-		}
-	}()
+	if err := m.listenAndServe(m.adminServer, adminTLS, "Admin server listening", "Admin server error", []zap.Field{zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled)}); err != nil {
+		return err
+	}
 
 	return nil
 }
