@@ -871,3 +871,31 @@ func unsetJWTIssuerEnv(t *testing.T) {
 	t.Setenv("WALLET_JWT_ISSUER", "")
 	require.NoError(t, os.Unsetenv("WALLET_JWT_ISSUER"))
 }
+
+func TestApplyLegacyRegistryConfig_EnvPresenceWarnsRegardlessOfValue(t *testing.T) {
+	cases := map[string]struct {
+		key, val string
+		warn     bool
+	}{
+		"default value": {"REGISTRY_SERVER_PORT", "8097", true},
+		"empty value":   {"REGISTRY_SERVER_HOST", "", true},
+		"changed value": {"REGISTRY_SERVER_PORT", "9000", true},
+		"unrelated":     {"REGISTRYX_SERVER_PORT", "8097", false},
+		"unknown key":   {"REGISTRY_NO_SUCH_SETTING", "x", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			c := defaultConfig()
+			w, err := c.ApplyLegacyRegistryConfig(filepath.Join(t.TempDir(), "absent.yaml"), true)
+			require.NoError(t, err)
+			if !tc.warn {
+				assert.Empty(t, w)
+				return
+			}
+			require.NotEmpty(t, w)
+			assert.Contains(t, w[0], "DEPRECATED")
+			assert.Contains(t, w[0], tc.key)
+		})
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/kelseyhightower/envconfig"
@@ -85,19 +86,26 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 		}
 	}
 
-	snapshot := *f
+	// Presence is detected with LookupEnv, not by comparing values: a
+	// variable that sets the built-in default (REGISTRY_SERVER_PORT=8097) or
+	// an empty value is still a use of the deprecated configuration.
+	presentEnv, err := presentLegacyRegistryEnv(f)
+	if err != nil {
+		return nil, err
+	}
 	if err := envconfig.Process("REGISTRY", f); err != nil {
 		return nil, fmt.Errorf("failed to process deprecated REGISTRY_* environment variables: %w", err)
 	}
-	envSet := !reflect.DeepEqual(snapshot, *f)
+	envSet := len(presentEnv) > 0
 
 	if !fileFound && !envSet {
 		return nil, nil
 	}
 
-	src := "REGISTRY_* environment variables"
+	envDesc := "REGISTRY_* environment variables (" + strings.Join(presentEnv, ", ") + ")"
+	src := envDesc
 	if fileFound && envSet {
-		src = fmt.Sprintf("registry config file %s and REGISTRY_* environment variables", path)
+		src = fmt.Sprintf("registry config file %s and %s", path, envDesc)
 	} else if fileFound {
 		src = fmt.Sprintf("registry config file %s", path)
 	}
@@ -185,6 +193,25 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 		}
 	}
 	return warnings, nil
+}
+
+// presentLegacyRegistryEnv returns, sorted, the REGISTRY_* variables that are
+// set in the environment (even to an empty value or to the default) and that
+// map to a field of the legacy registry configuration. Unrelated variables,
+// and REGISTRY_* names no field uses, are not reported.
+func presentLegacyRegistryEnv(spec *legacyRegistryFile) ([]string, error) {
+	var keys strings.Builder
+	if err := envconfig.Usagef("REGISTRY", spec, &keys, "{{range .}}{{.Key}}\n{{end}}"); err != nil {
+		return nil, fmt.Errorf("failed to inspect deprecated REGISTRY_* environment variables: %w", err)
+	}
+	var present []string
+	for _, key := range strings.Fields(keys.String()) {
+		if _, ok := os.LookupEnv(key); ok {
+			present = append(present, key)
+		}
+	}
+	sort.Strings(present)
+	return present, nil
 }
 
 // mergeLegacyRegistry fills every leaf of dst the new configuration did not
