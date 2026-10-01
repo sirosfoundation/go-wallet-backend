@@ -22,7 +22,6 @@ import (
 // (draft-ietf-oauth-status-list, CWT section; RFC 9052, RFC 8392).
 const (
 	coseTagSign1 = 18
-	cwtTag       = 61
 
 	coseHdrAlg     = 1
 	coseHdrTyp     = 16 // "type" header parameter
@@ -179,18 +178,25 @@ type sign1 struct {
 	unprotected                   map[int64]any
 }
 
-// decodeSign1 reads a COSE_Sign1, tagged (18, optionally inside the CWT tag
-// 61) or untagged.
+// decodeSign1 reads a COSE_Sign1. draft-ietf-oauth-status-list-21 section 5.2
+// requires the tagged COSE_Sign1 (18) and forbids the CWT tag (61), so exactly
+// one tag 18 is accepted: untagged arrays, tag 61 (alone or nested with 18),
+// repeated tags and COSE_Mac0 (17, which needs a shared key and cannot be
+// verified against a public signer key) are all rejected.
 func decodeSign1(data []byte) (*sign1, error) {
-	for i := 0; i < 2 && len(data) > 0 && data[0]>>5 == 6; i++ {
-		var tag cbor.RawTag
-		if err := cbor.Unmarshal(data, &tag); err != nil {
-			return nil, err
-		}
-		if tag.Number != coseTagSign1 && tag.Number != cwtTag {
-			return nil, fmt.Errorf("unexpected CBOR tag %d", tag.Number)
-		}
-		data = tag.Content
+	var tag cbor.RawTag
+	if len(data) == 0 || data[0]>>5 != 6 {
+		return nil, errors.New("COSE_Sign1 must be tagged with CBOR tag 18")
+	}
+	if err := cbor.Unmarshal(data, &tag); err != nil {
+		return nil, err
+	}
+	if tag.Number != coseTagSign1 {
+		return nil, fmt.Errorf("unexpected CBOR tag %d, want COSE_Sign1 (18)", tag.Number)
+	}
+	data = tag.Content
+	if len(data) > 0 && data[0]>>5 == 6 {
+		return nil, errors.New("nested CBOR tag inside COSE_Sign1 tag")
 	}
 	var arr []cbor.RawMessage
 	if err := cbor.Unmarshal(data, &arr); err != nil || len(arr) != 4 {

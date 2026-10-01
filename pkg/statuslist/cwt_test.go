@@ -38,11 +38,10 @@ type cwtOpts struct {
 	noTyp     bool
 	typUnprot bool // typ only in the unprotected header
 	noX5Chain bool
-	x5cInUnp  bool // put x5chain in the unprotected header
-	untagged  bool
-	cwtTag    bool
-	textKeys  bool // draft CDDL: "bits"/"lst" text keys in status_list
-	legacy    bool // vc#703 layout: status_list=65534, ttl=65535
+	x5cInUnp  bool                // put x5chain in the unprotected header
+	wrap      func(arr []any) any // overrides the default tag 18 envelope
+	textKeys  bool                // draft CDDL: "bits"/"lst" text keys in status_list
+	legacy    bool                // vc#703 layout: status_list=65534, ttl=65535
 	badSig    bool
 	rawLst    []byte
 }
@@ -173,12 +172,9 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 	}
 	arr := []any{protBytes, unprot, payload, sig}
 	var out []byte
-	switch {
-	case o.untagged:
-		out, err = cbor.Marshal(arr)
-	case o.cwtTag:
-		out, err = cbor.Marshal(cbor.Tag{Number: cwtTag, Content: cbor.Tag{Number: coseTagSign1, Content: arr}})
-	default:
+	if o.wrap != nil {
+		out, err = cbor.Marshal(o.wrap(arr))
+	} else {
 		out, err = cbor.Marshal(cbor.Tag{Number: coseTagSign1, Content: arr})
 	}
 	if err != nil {
@@ -209,8 +205,6 @@ func TestCWT_VerifyAndVerdicts(t *testing.T) {
 
 	for name, o := range map[string]cwtOpts{
 		"tagged":                      {},
-		"untagged":                    {untagged: true},
-		"cwt tag":                     {cwtTag: true},
 		"x5chain unprot":              {x5cInUnp: true},
 		"ES384":                       {key: p384},
 		"ES512":                       {key: p521},
@@ -262,6 +256,18 @@ func TestCWT_Rejections(t *testing.T) {
 		{"empty lst", cwtOpts{rawLst: []byte{}}, nil, "lst", nil},
 		{"garbage lst", cwtOpts{rawLst: []byte("not zlib")}, nil, "lst", nil},
 		{"not cose", cwtOpts{}, func([]byte) []byte { return []byte{0x01} }, "COSE_Sign1", nil},
+		{"untagged", cwtOpts{wrap: func(a []any) any { return a }}, nil, "tag 18", nil},
+		{"tag 61 alone", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 61, Content: a} }}, nil, "tag 61", nil},
+		{"61 wrapping 18", cwtOpts{wrap: func(a []any) any {
+			return cbor.Tag{Number: 61, Content: cbor.Tag{Number: 18, Content: a}}
+		}}, nil, "tag 61", nil},
+		{"18 wrapping 61", cwtOpts{wrap: func(a []any) any {
+			return cbor.Tag{Number: 18, Content: cbor.Tag{Number: 61, Content: a}}
+		}}, nil, "nested", nil},
+		{"double tag 18", cwtOpts{wrap: func(a []any) any {
+			return cbor.Tag{Number: 18, Content: cbor.Tag{Number: 18, Content: a}}
+		}}, nil, "nested", nil},
+		{"COSE_Mac0 tag 17", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 17, Content: a} }}, nil, "tag 17", nil},
 		{"wrong tag", cwtOpts{}, func([]byte) []byte { return []byte{0xc1, 0x80} }, "tag", nil},
 		{"truncated", cwtOpts{}, func(b []byte) []byte { return b[:len(b)/2] }, "CWT", nil},
 	}
