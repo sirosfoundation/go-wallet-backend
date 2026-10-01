@@ -466,12 +466,22 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, 
 	var header struct {
 		Typ string          `json:"typ"`
 		JWK json.RawMessage `json:"jwk"`
+		X5C json.RawMessage `json:"x5c"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
 		return parsedList{}, fmt.Errorf("status list header: %w", err)
 	}
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
 		return parsedList{}, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
+	}
+	// Presence-aware like jwk: a PRESENT x5c always takes precedence, so it
+	// must be a usable chain. A null, empty, non-array or malformed x5c is
+	// rejected here rather than being read as absent (which would let a jwk
+	// stand in for it).
+	if header.X5C != nil {
+		if err := checkX5CHeader(header.X5C); err != nil {
+			return parsedList{}, err
+		}
 	}
 	// The list's own header key verifies the JWS; whether that key may
 	// publish status lists is the trust service's decision, taken below once
@@ -728,6 +738,34 @@ func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust
 // jwkParam is the raw header member: nil means absent. A present member that is
 // null, empty, not an object or not a usable key is malformed key material and
 // makes the list unverifiable.
+// checkX5CHeader requires a present x5c header parameter to be a non-empty
+// JSON array of base64 (standard or URL alphabet, as the verifier accepts)
+// certificate strings.
+func checkX5CHeader(raw json.RawMessage) error {
+	if len(raw) == 0 || raw[0] != '[' {
+		return errors.New("status list x5c is not an array")
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return fmt.Errorf("status list x5c: %w", err)
+	}
+	if len(elems) == 0 {
+		return errors.New("status list x5c is empty")
+	}
+	for i, e := range elems {
+		var cert string
+		if len(e) == 0 || e[0] != '"' || json.Unmarshal(e, &cert) != nil || cert == "" {
+			return fmt.Errorf("status list x5c[%d] is not a certificate string", i)
+		}
+		if _, err := base64.StdEncoding.DecodeString(cert); err != nil {
+			if _, err := base64.RawURLEncoding.DecodeString(cert); err != nil {
+				return fmt.Errorf("status list x5c[%d]: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
 func checkJWKMatchesLeaf(jwkParam json.RawMessage, leaf string) error {
 	if jwkParam == nil {
 		return nil

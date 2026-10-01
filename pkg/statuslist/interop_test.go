@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,5 +427,65 @@ func TestCache_DeadlineNotExtendedBySlowTrust(t *testing.T) {
 	}
 	if *hits != 2 || len(c.cache) != 0 {
 		t.Fatalf("list cached past iat+ttl after a slow trust call: hits=%d cached=%d", *hits, len(c.cache))
+	}
+}
+
+// A present x5c is never read as absent: null, empty, non-array and malformed
+// chains are refused even when a valid jwk would verify the token.
+func TestParseJWT_PresentX5CValidated(t *testing.T) {
+	key := newKey(t)
+	good, _ := x5cServiceToken(t, key, "https://x.example/l/1", map[int]int{}, "match")
+	hdrPart := func(x5c any, absent bool) string {
+		h := map[string]any{"alg": "ES256", "typ": "statuslist+jwt", "jwk": jwkOf(&key.PublicKey)}
+		if !absent {
+			h["x5c"] = x5c
+		}
+		b, _ := json.Marshal(h)
+		parts := strings.Split(good, ".")
+		signing := base64.RawURLEncoding.EncodeToString(b) + "." + parts[1]
+		digest := sha256.Sum256([]byte(signing))
+		r, s, err := ecdsa.Sign(rand.Reader, key, digest[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig := make([]byte, 64)
+		r.FillBytes(sig[:32])
+		s.FillBytes(sig[32:])
+		return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+	}
+	leaf := strings.Split(good, ".")[0]
+	var gh struct {
+		X5C []string `json:"x5c"`
+	}
+	hb, _ := base64.RawURLEncoding.DecodeString(leaf)
+	_ = json.Unmarshal(hb, &gh)
+
+	c := NewChecker(nil, false, trustAll)
+	for name, tc := range map[string]struct {
+		x5c    any
+		absent bool
+		reject bool
+	}{
+		"null":       {x5c: nil, reject: true},
+		"empty":      {x5c: []string{}, reject: true},
+		"string":     {x5c: gh.X5C[0], reject: true},
+		"object":     {x5c: map[string]any{}, reject: true},
+		"non-string": {x5c: []any{1}, reject: true},
+		"null elem":  {x5c: []any{nil}, reject: true},
+		"empty elem": {x5c: []string{""}, reject: true},
+		"bad base64": {x5c: []string{"!!!notbase64"}, reject: true},
+		"valid":      {x5c: gh.X5C},
+		"absent":     {absent: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := c.parseJWT(context.Background(), hdrPart(tc.x5c, tc.absent), "https://x.example/l/1")
+			isX5C := err != nil && strings.Contains(err.Error(), "x5c")
+			if tc.reject && !isX5C {
+				t.Fatalf("err = %v, want x5c rejection", err)
+			}
+			if !tc.reject && isX5C {
+				t.Fatalf("err = %v, unexpected x5c rejection", err)
+			}
+		})
 	}
 }
