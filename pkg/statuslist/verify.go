@@ -39,6 +39,15 @@ const (
 	maxCacheEntries = 256
 	maxCacheBytes   = 64 << 20
 
+	// DefaultMaxConcurrentLoads is how many status lists may be fetched and
+	// inflated at once when WithMaxConcurrentLoads is not used. Each load can
+	// hold up to maxTokenBytes + maxInflateBytes (36 MiB), so the default
+	// bounds in-flight memory at about 290 MiB.
+	DefaultMaxConcurrentLoads = 8
+	// flightTimeout is the backstop for one shared load; callers' own
+	// contexts (the status check budget) normally end it far sooner.
+	flightTimeout = 2 * time.Minute
+
 	statusListTokenTyp = "statuslist+jwt"
 	mediaTypeJWT       = "application/statuslist+jwt"
 	mediaTypeCWT       = "application/statuslist+cwt"
@@ -141,6 +150,22 @@ type Checker struct {
 	cacheBytes int
 	// cacheLimit is maxCacheBytes; a field so tests can shrink it.
 	cacheLimit int
+
+	// flights are the loads in progress, by cache key (guarded by mu);
+	// loadSem bounds how many run at once.
+	flights map[string]*flight
+	loadSem chan struct{}
+}
+
+// flight is one shared fetch-and-verify. The result fields are written before
+// done is closed and read only after.
+type flight struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	waiters int // guarded by Checker.mu
+	bits    int
+	list    []byte
+	err     error
 }
 
 type cachedList struct {
@@ -156,7 +181,8 @@ type cachedList struct {
 // a nil signerTrust no list can be authoritative and every Check reports the
 // list as unverifiable.
 func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *Checker {
-	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}, cacheLimit: maxCacheBytes}
+	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}, cacheLimit: maxCacheBytes,
+		flights: map[string]*flight{}, loadSem: make(chan struct{}, DefaultMaxConcurrentLoads)}
 }
 
 // WithMinEntries makes the Checker reject a status list that holds fewer than
@@ -175,6 +201,19 @@ func (c *Checker) WithMinEntries(n int) *Checker {
 		n = 0
 	}
 	c.minEntries = n
+	return c
+}
+
+// WithMaxConcurrentLoads bounds how many status lists the Checker fetches and
+// inflates at the same time; further loads wait for a slot (honouring their
+// context, so a check that runs out of budget is undetermined rather than
+// blocked). n <= 0 selects DefaultMaxConcurrentLoads. Call it before the
+// Checker is shared; it is not safe to change afterwards.
+func (c *Checker) WithMaxConcurrentLoads(n int) *Checker {
+	if n <= 0 {
+		n = DefaultMaxConcurrentLoads
+	}
+	c.loadSem = make(chan struct{}, n)
 	return c
 }
 
@@ -202,6 +241,17 @@ func (c *Checker) Check(ctx context.Context, ref *Reference) error {
 	return nil
 }
 
+// load returns the status list for uri. Concurrent callers for the same
+// (tenant, uri) share ONE fetch-and-verify (a flight), and the number of
+// flights running at once is bounded (WithMaxConcurrentLoads), so a burst of
+// presentations cannot each allocate a token plus an inflated list; the
+// cache limit alone does not bound that in-flight memory.
+//
+// Every waiter honours its own ctx (which carries the per-presentation status
+// check budget): it returns ctx's error, which does not wrap ErrRevoked, as
+// soon as it expires, and a caller giving up never cancels the flight for
+// the others. The flight itself is cancelled only when its last waiter has
+// left.
 func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	// The signer trust decision is tenant-scoped (the tenant travels in ctx),
 	// so a cached, already trust-evaluated list is only reused within the
@@ -212,8 +262,58 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 		c.mu.Unlock()
 		return e.bits, e.list, nil
 	}
+	f, ok := c.flights[key]
+	if !ok {
+		// The flight outlives any single caller, so it takes ctx's values
+		// (the tenant) but neither its cancellation nor its deadline.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flightTimeout)
+		f = &flight{done: make(chan struct{}), cancel: cancel}
+		c.flights[key] = f
+		go c.runFlight(fctx, key, uri, f)
+	}
+	f.waiters++
 	c.mu.Unlock()
 
+	select {
+	case <-f.done:
+		return f.bits, f.list, f.err
+	case <-ctx.Done():
+		c.mu.Lock()
+		f.waiters--
+		if f.waiters == 0 {
+			// Nobody is left to use the result: stop the work and let a
+			// later caller start a fresh flight.
+			if c.flights[key] == f {
+				delete(c.flights, key)
+			}
+			f.cancel()
+		}
+		c.mu.Unlock()
+		return 0, nil, fmt.Errorf("status list load: %w", ctx.Err())
+	}
+}
+
+// runFlight performs one load and publishes the outcome to its waiters.
+func (c *Checker) runFlight(ctx context.Context, key, uri string, f *flight) {
+	defer f.cancel()
+	f.bits, f.list, f.err = c.loadOnce(ctx, key, uri)
+	c.mu.Lock()
+	if c.flights[key] == f {
+		delete(c.flights, key)
+	}
+	c.mu.Unlock()
+	close(f.done)
+}
+
+// loadOnce fetches, verifies and caches one list, holding a load slot for
+// the duration.
+func (c *Checker) loadOnce(ctx context.Context, key, uri string) (int, []byte, error) {
+	select {
+	case c.loadSem <- struct{}{}:
+		defer func() { <-c.loadSem }()
+	case <-ctx.Done():
+		return 0, nil, fmt.Errorf("waiting for a status list load slot: %w", ctx.Err())
+	}
 	body, mediaType, err := c.fetch(ctx, uri)
 	if err != nil {
 		return 0, nil, err

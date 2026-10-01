@@ -317,6 +317,17 @@ type PresentationConfig struct {
 	// Env: WALLET_PRESENTATION_STATUS_LIST_MIN_ENTRIES
 	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
 
+	// StatusListMaxConcurrentLoads bounds how many Token Status Lists the
+	// backend fetches and inflates at the same time, across all presentations.
+	// Each load can hold up to 36 MiB (4 MiB token plus 32 MiB inflated list),
+	// which the list cache limit does not cover, so without this bound a burst
+	// of presentations could exhaust memory. Loads of the same list are shared
+	// regardless. A check waiting for a slot gives up when its status check
+	// budget expires (status undetermined). 0 (default) means 8. Must not be
+	// negative.
+	// Env: WALLET_PRESENTATION_STATUS_LIST_MAX_CONCURRENT_LOADS
+	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
+
 	// DCQLConsentCheck compares the user's consent (selected credential query
 	// ids and disclosed claims) with the DCQL query the backend sent to the
 	// client, before any signing. The frontend is not trusted to have
@@ -2318,6 +2329,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Presentation.StatusListMinEntries < 0 {
 		return fmt.Errorf("invalid presentation.status_list_min_entries %d: must not be negative", c.Presentation.StatusListMinEntries)
+	}
+	if c.Presentation.StatusListMaxConcurrentLoads < 0 {
+		return fmt.Errorf("invalid presentation.status_list_max_concurrent_loads %d: must not be negative", c.Presentation.StatusListMaxConcurrentLoads)
 	}
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
 		return err

@@ -2683,6 +2683,14 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("131072 rejected: %v", err)
 	}
+	cfg.Presentation.StatusListMaxConcurrentLoads = -1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_max_concurrent_loads") {
+		t.Errorf("Validate must reject a negative status_list_max_concurrent_loads, got %v", err)
+	}
+	cfg.Presentation.StatusListMaxConcurrentLoads = 4
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("4 rejected: %v", err)
+	}
 }
 
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
