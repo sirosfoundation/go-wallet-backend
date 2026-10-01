@@ -482,7 +482,7 @@ const wmpAffinityWarning = "WMP session state is process-local: with more than o
 	"(session.create, RPC POSTs, SSE GET and responses to server-initiated requests) is the Authorization bearer token, " +
 	"so key affinity on a hash of the Authorization header; Wmp-Session-Id, params.wmp.session_id and the SSE " +
 	"session_id query parameter are secondary hints that not every request carries. " +
-	"Limits: a refreshed token may be routed to another replica, where the session must then be resumed or recreated. " +
+	"Limits: a refreshed token may be routed to another replica, where the session is not found and resume cannot recover it (the resumption token is process-local too), so the client must create a new session. " +
 	"Without affinity a request reaching another replica fails with session not found (404). " +
 	"The Redis session store does not share this state. Shared WMP session state is tracked in " +
 	"https://github.com/sirosfoundation/go-wallet-backend/issues/432"

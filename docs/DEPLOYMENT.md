@@ -586,8 +586,12 @@ only key present on every request is the Authorization bearer token:
   in an NGINX `upstream`, or a header hash policy on `authorization` in Envoy.
   Several sessions of one token share a replica, which is fine.
 - Limits: access tokens rotate on refresh. A request carrying a refreshed token
-  may hash to a different replica, where the session is not found (404); the
-  client must then resume (`wmp.session.resume`) or recreate the session. Do not
+  may hash to a different replica, where the session is not found (404).
+  `wmp.session.resume` does not recover from this: the resumption token and the
+  session registry are process-local too, so that replica answers
+  `session not found` for the resume as well. The client must create a new
+  session (`wmp.session.create`) and restart its flows. Resume works only while
+  routing still reaches the original replica. Do not
   rely on `Wmp-Session-Id` or the `session_id` query parameter alone: they are
   secondary hints usable only for requests that carry them, and the stock client
   does not send the header at all.

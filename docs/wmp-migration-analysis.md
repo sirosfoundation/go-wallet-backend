@@ -466,7 +466,10 @@ is **not** a sufficient key, because not every request carries it:
   `session.create`, RPCs, the SSE stream and responses all reach the owning
   replica. Several sessions of one token share a replica.
 - Limits: tokens rotate on refresh, so a refreshed token may be routed to
-  another replica; the client must then resume or recreate the session.
+  another replica, where the session is not found. Resume does not help there
+  (the resumption token is process-local too); the client must create a new
+  session and flow. Resume works only while routing still reaches the original
+  replica.
   `Wmp-Session-Id` and `session_id` are secondary hints usable only for the
   requests that carry them.
 - No affinity cookie is issued: the stock go-wmp HTTPS+SSE client uses
@@ -836,8 +839,9 @@ Features we gain from this migration:
    HTTP (no protocol upgrade), but the current implementation keeps WMP sessions,
    resumption tokens, event buffers, active flows and peers in process-local
    memory (`WMPAdapter`), so RPC POSTs and SSE reconnects for a session must
-   reach the same backend instance (session affinity, e.g. by the
-   `Wmp-Session-Id` header / `session_id` query parameter). Stateless routing
+   reach the same backend instance (session affinity, keyed on a hash of the
+   `Authorization` header, the only identifier every request carries; see
+   [Multi-replica deployment](#multi-replica-deployment-session-affinity)). Stateless routing
    would require moving that state to a shared store first; the existing
    session store persists metadata only, and another replica answers
    session-not-found.
