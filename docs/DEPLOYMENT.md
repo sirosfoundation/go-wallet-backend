@@ -511,9 +511,16 @@ whose subject is the IdP's `sub`); those tokens are not judged, as before.
 A tombstone must outlive every token that could name the user. Its expiry is
 deletion time plus the longest of `jwt.expiry_hours`, `jwt.refresh_days`, the
 AS `default_token_ttl` and `audience_ttls`, and `as.session_ttl`, plus
-`security.deletion_tombstone.retention_margin_days` (default 30). Raising a
-token lifetime only lengthens the tombstones written afterwards; tombstones
-already written keep the expiry they were given.
+`security.deletion_tombstone.retention_margin_days` (default 30). The longest
+lifetime is floored at 365 days (the same floor as refresh-token family
+markers): tokens keep the expiry they were minted with, so lowering a
+lifetime later (for example `jwt.refresh_days`) must not shorten retention
+below what tokens issued under the earlier configuration may still carry. A
+deployment that ever issued tokens valid for more than a year must keep the
+larger lifetime configured. Raising a token lifetime only lengthens the
+tombstones written afterwards; tombstones already written keep the expiry
+they were given, a repeated deletion only moves it later, and neither the
+sweeper nor the TTL index removes a tombstone before its stored expiry.
 
 Expired tombstones are removed by two mechanisms:
 

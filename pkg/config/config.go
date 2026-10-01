@@ -1752,8 +1752,8 @@ type DeletionTombstoneConfig struct {
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
 
 	// RetentionMarginDays is the safety margin added to the longest token
-	// lifetime (access token, refresh token, AS session) when a tombstone's
-	// expiry is computed.
+	// lifetime (access token, refresh token, AS session; itself floored at one
+	// year, see MinFamilyRetention) when a tombstone's expiry is computed.
 	// Default: 30
 	RetentionMarginDays int `yaml:"retention_margin_days" envconfig:"RETENTION_MARGIN_DAYS"`
 }
@@ -1774,6 +1774,17 @@ func (c *DeletionTombstoneConfig) SetDefaults() {
 // access token TTLs, AS session TTL) plus RetentionMarginDays. A tombstone
 // that expired earlier would let a still-valid token for the deleted account
 // pass the token gate again.
+//
+// The lifetimes are floored at MinFamilyRetention, the same deployment-wide
+// floor used for refresh-token family markers. Tokens carry the expiry they
+// were minted with, but the only bound available at deletion time is the
+// CURRENT configuration; if a lifetime was lowered after tokens were issued
+// (e.g. jwt.refresh_days 365 -> 7), a tombstone sized from the new value
+// would expire while older tokens are still valid, and the token gate would
+// then treat the deleted user as an external identity and accept them.
+// The floor keeps retention from shrinking below what earlier configurations
+// with lifetimes up to a year may have issued; larger current lifetimes still
+// extend it. The margin is added on top of the floored value.
 func (c *Config) DeletionTombstoneRetention() time.Duration {
 	margin := c.Security.DeletionTombstone
 	margin.SetDefaults()
@@ -1796,6 +1807,9 @@ func (c *Config) DeletionTombstoneRetention() time.Duration {
 	}
 	if sessionTTL > longest {
 		longest = sessionTTL
+	}
+	if longest < MinFamilyRetention {
+		longest = MinFamilyRetention
 	}
 	return longest + time.Duration(margin.RetentionMarginDays)*24*time.Hour
 }

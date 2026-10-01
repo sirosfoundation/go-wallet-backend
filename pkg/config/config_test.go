@@ -2767,16 +2767,31 @@ func TestDeletionTombstoneRetention(t *testing.T) {
 			t.Errorf("%s: got %s, want %s", name, got, want)
 		}
 	}
+	margin := 30 * day
+	floor := MinFamilyRetention
 	cfg := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 7}}
-	eq("refresh token dominates, default margin", cfg.DeletionTombstoneRetention(), 37*day)
+	eq("tiny lifetimes: the one-year floor plus the default margin", cfg.DeletionTombstoneRetention(), floor+margin)
 
 	cfg.JWT.RefreshDays = 0
-	eq("no refresh tokens: the access token and the default AS session (24h)", cfg.DeletionTombstoneRetention(), 31*day)
+	eq("no refresh tokens: still the floor", cfg.DeletionTombstoneRetention(), floor+margin)
 
 	cfg.AS.SessionTTL = 10 * day
 	cfg.AS.AudienceTTLs = map[string]time.Duration{"x": 12 * day}
 	cfg.Security.DeletionTombstone.RetentionMarginDays = 5
-	eq("longest AS token TTL plus a configured margin", cfg.DeletionTombstoneRetention(), 17*day)
+	eq("short AS TTLs and a configured margin: floor plus margin", cfg.DeletionTombstoneRetention(), floor+5*day)
+
+	// Lowering a lifetime must not shorten retention below the floor.
+	high := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 300}}
+	low := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 7}}
+	if low.DeletionTombstoneRetention() < high.DeletionTombstoneRetention() {
+		t.Errorf("lowering refresh_days shortened retention: %s < %s", low.DeletionTombstoneRetention(), high.DeletionTombstoneRetention())
+	}
+
+	// Raising a lifetime above the floor extends retention.
+	cfg2 := &Config{JWT: JWTConfig{ExpiryHours: 24, RefreshDays: 500}}
+	eq("lifetime above the floor extends retention", cfg2.DeletionTombstoneRetention(), 500*day+margin)
+	cfg2.AS.AudienceTTLs = map[string]time.Duration{"x": 600 * day}
+	eq("AS TTL above the floor extends retention", cfg2.DeletionTombstoneRetention(), 600*day+margin)
 
 	ok := defaultConfig()
 	if err := ok.Validate(); err != nil && strings.Contains(err.Error(), "deletion_tombstone") {
