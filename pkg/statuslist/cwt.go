@@ -226,8 +226,9 @@ func decodeClaims(payload []byte) (map[int64]any, error) {
 	return decodeHeaderBucket(payload)
 }
 
-// cwtString reads an optional text claim; a present claim of another type is
-// an error.
+// cwtString reads an optional text claim; a present claim of another type, or
+// one that is empty or only whitespace, is an error (never read as absent, which
+// would change the trust subject).
 func cwtString(claims map[int64]any, label int64, name string) (string, error) {
 	v, ok := claims[label]
 	if !ok {
@@ -236,6 +237,9 @@ func cwtString(claims map[int64]any, label int64, name string) (string, error) {
 	s, ok := v.(string)
 	if !ok {
 		return "", fmt.Errorf("%w claim %s (%d) is %T, want text", errCWT, name, label, v)
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("%w claim %s (%d) is empty", errCWT, name, label)
 	}
 	return s, nil
 }
