@@ -395,7 +395,19 @@ func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 // signature, changing the trust decision.
 func signerChain(prot, unprot map[int64]any) ([][]byte, error) {
 	if v, ok := prot[coseHdrX5Chain]; ok {
-		return x5chain(v)
+		chain, err := x5chain(v)
+		if err != nil || len(chain) == 0 {
+			return chain, err
+		}
+		// A protected x5t is validated whenever it is present, so a token
+		// cannot carry a (possibly critical) mismatching certificate hash
+		// and still yield a verdict.
+		if _, has := prot[coseHdrX5T]; has {
+			if err := checkX5T(prot[coseHdrX5T], chain[0]); err != nil {
+				return nil, fmt.Errorf("protected x5t: %v", err)
+			}
+		}
+		return chain, nil
 	}
 	v, ok := unprot[coseHdrX5Chain]
 	if !ok {
