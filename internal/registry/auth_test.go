@@ -106,6 +106,7 @@ func hmacToken(t *testing.T, secret string, aud []string, tenant string) string 
 // handler (the rate limiter) would see.
 type probeResult struct {
 	status int
+	body   string
 	auth   bool
 	tenant string
 	hasTen bool
@@ -131,6 +132,7 @@ func probe(t *testing.T, cfg AuthConfig, authz string) probeResult {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	res.status = w.Code
+	res.body = w.Body.String()
 	return res
 }
 
@@ -165,6 +167,7 @@ func TestAuthMiddlewares_Strict(t *testing.T) {
 	t.Run("ES256 wrong audience is 403", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, []string{"wallet-backend"}, "acme", future))
 		assert.Equal(t, http.StatusForbidden, r.status)
+		assert.Contains(t, r.body, "audience not permitted", "rejected by the registry audience rule")
 	})
 	t.Run("ES256 no audience is 401 (rejected by go-tokenauth v0.5)", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, nil, "acme", future))
@@ -228,39 +231,70 @@ func TestAuthMiddlewares_StrictWithTenantStoreAndBlacklist(t *testing.T) {
 	assert.Equal(t, http.StatusOK, probe(t, cfg, tok).status)
 
 	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": false}}
-	assert.Equal(t, http.StatusForbidden, probe(t, cfg, tok).status)
+	assert.Equal(t, http.StatusForbidden, probe(t, cfg, tok).status, "disabled tenant")
 
 	cfg.Tenants = fakeTenants{enabled: map[string]bool{}}
 	assert.Equal(t, http.StatusUnauthorized, probe(t, cfg, tok).status)
 
 	cfg.Tenants = fakeTenants{enabled: map[string]bool{"acme": true}}
 	cfg.Blacklist = fakeBlacklist{revokedUser: "user-1"}
-	assert.Equal(t, http.StatusUnauthorized, probe(t, cfg, tok).status)
+	r := probe(t, cfg, tok)
+	assert.Equal(t, http.StatusUnauthorized, r.status)
+	assert.Contains(t, r.body, "Token has been revoked")
+	// Positive control: a blacklist that does not name the user lets it through.
+	cfg.Blacklist = fakeBlacklist{revokedUser: "someone-else"}
+	assert.Equal(t, http.StatusOK, probe(t, cfg, tok).status)
 }
 
 func TestAuthMiddlewares_JTIRevocation(t *testing.T) {
 	env := newAuthEnv(t)
 	future := time.Now().Add(time.Hour)
 	es := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", future) // jti-1
+	// A fully valid legacy token (RP ID audience, signed with the configured
+	// secret, carrying a live refresh-token family), so that the only thing
+	// that can reject it below is its jti.
 	c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "tenant_id": "acme", "jti": "legacy-jti",
-		"exp": time.Now().Add(time.Hour).Unix()}
+		"sid": "live-family", "aud": testRPID, "exp": time.Now().Add(time.Hour).Unix()}
 	hs, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(testSecret))
 	require.NoError(t, err)
 	hs = "Bearer " + hs
 
-	for _, require := range []bool{true, false} {
-		cfg := AuthConfig{Validator: env.validator(t, true), RequireAuth: require, Logger: zap.NewNop(),
-			Blacklist: fakeBlacklist{revokedJTI: "jti-1"}}
-		r := probe(t, cfg, es)
-		assert.False(t, r.auth, "asymmetric jti revoked, strict=%v", require)
-		if require {
-			assert.Equal(t, http.StatusUnauthorized, r.status)
+	for _, strict := range []bool{true, false} {
+		cfg := AuthConfig{
+			Validator: env.validator(t, true), RequireAuth: strict, Logger: zap.NewNop(),
+			Config:    &config.Config{JWT: config.JWTConfig{Secret: testSecret}},
+			Blacklist: fakeBlacklist{revokedJTI: "unrelated-jti"},
 		}
+
+		// Positive controls: with no matching jti revoked both tokens pass
+		// the whole chain.
+		r := probe(t, cfg, es)
+		assert.Equal(t, http.StatusOK, r.status, "asymmetric control, strict=%v", strict)
+		assert.True(t, r.auth, "asymmetric control, strict=%v", strict)
+		r = probe(t, cfg, hs)
+		assert.Equal(t, http.StatusOK, r.status, "legacy control, strict=%v", strict)
+		assert.True(t, r.auth, "legacy control, strict=%v", strict)
+		assert.Equal(t, "acme", r.tenant, "legacy control, strict=%v", strict)
+
+		cfg.Blacklist = fakeBlacklist{revokedJTI: "jti-1"}
+		r = probe(t, cfg, es)
+		assert.False(t, r.auth, "asymmetric jti revoked, strict=%v", strict)
+		if strict {
+			assert.Equal(t, http.StatusUnauthorized, r.status)
+			assert.Contains(t, r.body, "Token has been revoked")
+		}
+		r = probe(t, cfg, hs)
+		assert.True(t, r.auth, "legacy token unaffected by another jti, strict=%v", strict)
+
 		cfg.Blacklist = fakeBlacklist{revokedJTI: "legacy-jti"}
 		r = probe(t, cfg, hs)
-		assert.False(t, r.auth, "legacy jti revoked, strict=%v", require)
+		assert.False(t, r.auth, "legacy jti revoked, strict=%v", strict)
+		if strict {
+			assert.Equal(t, http.StatusUnauthorized, r.status)
+			assert.Contains(t, r.body, "Token has been revoked", "rejected by jti, not by an earlier check")
+		}
 		r = probe(t, cfg, es)
-		assert.True(t, r.auth, "other tokens unaffected, strict=%v", require)
+		assert.True(t, r.auth, "other tokens unaffected, strict=%v", strict)
 	}
 }
 
