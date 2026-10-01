@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1163,9 +1164,15 @@ func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
 // yields a guarded client rather than http.DefaultClient: a loopback issuer
 // must be refused unless the test-only option is set.
 func TestNew_DefaultClientIsSSRFGuarded(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var hits atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
+		// Valid metadata: if the server is reached, Resolve succeeds, so a
+		// refusal can only come from the guard, not from a later parse or
+		// validation failure.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"credential_issuer": srv.URL})
 	}))
 	defer srv.Close()
 
@@ -1176,7 +1183,27 @@ func TestNew_DefaultClientIsSSRFGuarded(t *testing.T) {
 	if r.httpClient == http.DefaultClient {
 		t.Fatal("resolver must not use http.DefaultClient")
 	}
-	if _, err := r.Resolve(context.Background(), srv.URL); err == nil {
+	_, err = r.Resolve(context.Background(), srv.URL)
+	if err == nil {
 		t.Fatal("expected loopback issuer to be refused by the default guarded client")
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("loopback server was reached %d time(s); guard did not block the request (err: %v)", got, err)
+	}
+	if !strings.Contains(err.Error(), "private/loopback address") {
+		t.Fatalf("error is not the SSRF refusal: %v", err)
+	}
+
+	// Positive control: the same server is reachable, and Resolve succeeds,
+	// when the test-only opt-out is set.
+	open, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if _, err := open.Resolve(context.Background(), srv.URL); err != nil {
+		t.Fatalf("control: Resolve with opt-out failed: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("control: server was not reached with the opt-out set")
 	}
 }
