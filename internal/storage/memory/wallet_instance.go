@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
@@ -62,6 +64,9 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 	} else {
 		instance.AttestationCount = 1
+		// A fresh generation per insert: a record deleted and attested again
+		// under the same id is a different record to a conditional write.
+		instance.Generation = uuid.NewString()
 		if instance.CreatedAt.IsZero() {
 			instance.CreatedAt = time.Now().UTC()
 		}
@@ -155,25 +160,54 @@ func (s *WalletInstanceStore) GetAllByUser(_ context.Context, userID domain.User
 func (s *WalletInstanceStore) UpdateStatus(_ context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateStatusLocked(id, tenantID, nil, status, reason)
+	return s.updateStatusLocked(id, tenantID, nil, nil, status, reason)
 }
 
 func (s *WalletInstanceStore) UpdateStatusForUser(_ context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateStatusLocked(id, tenantID, &userID, status, reason)
+	return s.updateStatusLocked(id, tenantID, &userID, nil, status, reason)
+}
+
+// UpdateStatusIfUnchanged revokes only while the record still matches the
+// expected owner and generation. See the interface.
+func (s *WalletInstanceStore) UpdateStatusIfUnchanged(_ context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.updateStatusLocked(id, tenantID, nil, &expected, status, reason)
+}
+
+// DeleteIfUnchanged deletes only while the record still matches the expected
+// owner and generation. See the interface.
+func (s *WalletInstanceStore) DeleteIfUnchanged(_ context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inst, ok := s.data[id]
+	if !ok || inst.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	if !expected.Matches(inst) {
+		return storage.ErrBindingChanged
+	}
+	delete(s.data, id)
+	return nil
 }
 
 // updateStatusLocked is the shared body of UpdateStatus and
-// UpdateStatusForUser; owner, when non-nil, is part of the match. The caller
-// holds s.mu.
-func (s *WalletInstanceStore) updateStatusLocked(id string, tenantID domain.TenantID, owner *domain.UserID, status domain.InstanceStatus, reason string) error {
+// UpdateStatusForUser; owner, when non-nil, is part of the match, and so is
+// binding (owner and generation) when non-nil, answering ErrBindingChanged on
+// a mismatch. The caller holds s.mu.
+func (s *WalletInstanceStore) updateStatusLocked(id string, tenantID domain.TenantID, owner *domain.UserID, binding *domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
 	instance, ok := s.data[id]
 	if !ok || instance.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
 	if owner != nil && (instance.UserID == nil || *instance.UserID != *owner) {
 		return storage.ErrNotFound
+	}
+	if binding != nil && !binding.Matches(instance) {
+		return storage.ErrBindingChanged
 	}
 
 	// Revocation is the only status this writes, exactly as the Mongo
@@ -222,13 +256,16 @@ func (s *WalletInstanceStore) IncrementAttestation(_ context.Context, id string)
 
 // DeleteIfRemovable deletes only while the instance is still removable. See
 // the interface for why a tombstone must survive a racing revocation.
-func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, tenantID domain.TenantID) error {
+func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	inst, ok := s.data[id]
 	if !ok || inst.TenantID != tenantID {
 		return storage.ErrNotFound
+	}
+	if !expected.Matches(inst) {
+		return storage.ErrBindingChanged
 	}
 	if !inst.Status.IsLive() && inst.UserID != nil {
 		return domain.ErrInvalidStatusTransition

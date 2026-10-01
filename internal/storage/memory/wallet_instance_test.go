@@ -423,7 +423,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.DeleteIfRemovable(ctx, "inst-live", "acme"); err != nil {
+	if err := wis.DeleteIfRemovable(ctx, "inst-live", "acme", bindingOf(t, wis, "inst-live")); err != nil {
 		t.Fatalf("a live instance must be removable: %v", err)
 	}
 
@@ -436,7 +436,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	if err := wis.UpdateStatus(ctx, "inst-tomb", "acme", domain.InstanceStatusRevoked, "stolen"); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.DeleteIfRemovable(ctx, "inst-tomb", "acme"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+	if err := wis.DeleteIfRemovable(ctx, "inst-tomb", "acme", bindingOf(t, wis, "inst-tomb")); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("a tombstone must survive, got %v", err)
 	}
 	if _, err := wis.GetByID(ctx, "inst-tomb"); err != nil {
@@ -449,7 +449,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.DeleteIfRemovable(ctx, "inst-stray", "acme"); err != nil {
+	if err := wis.DeleteIfRemovable(ctx, "inst-stray", "acme", bindingOf(t, wis, "inst-stray")); err != nil {
 		t.Fatalf("a record with no user must be removable: %v", err)
 	}
 
@@ -459,7 +459,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.DeleteIfRemovable(ctx, "inst-other", "acme"); !errors.Is(err, storage.ErrNotFound) {
+	if err := wis.DeleteIfRemovable(ctx, "inst-other", "acme", bindingOf(t, wis, "inst-other")); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("another tenant's record must not be reachable, got %v", err)
 	}
 }
@@ -586,5 +586,144 @@ func TestWalletInstanceStore_ReturnedNestedDataIsACopy(t *testing.T) {
 	got, _ = wis.GetByID(ctx, "inst-nested")
 	if got.DeviceInfo.Platform != "android" {
 		t.Errorf("stored DeviceInfo aliases the caller's struct: %+v", got.DeviceInfo)
+	}
+}
+
+// bindingOf reads the binding of a stored record, as a caller that is about
+// to make a conditional write would.
+func bindingOf(t *testing.T, wis storage.WalletInstanceStore, id string) domain.InstanceBinding {
+	t.Helper()
+	inst, err := wis.GetByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read %s: %v", id, err)
+	}
+	return inst.Binding()
+}
+
+// Every insert gets a generation of its own, and a record deleted and created
+// again under the same id and tenant is a different record to a conditional
+// write, whoever owns the replacement.
+func TestWalletInstanceStore_Conditional_ReplacementIsNotTheRecordRead(t *testing.T) {
+	ctx := context.Background()
+	alice := domain.UserIDFromString("alice")
+	bob := domain.UserIDFromString("bob")
+
+	type write struct {
+		name string
+		do   func(wis storage.WalletInstanceStore, b domain.InstanceBinding) error
+	}
+	writes := []write{
+		{"UpdateStatusIfUnchanged", func(wis storage.WalletInstanceStore, b domain.InstanceBinding) error {
+			return wis.UpdateStatusIfUnchanged(ctx, "jkt", "acme", b, domain.InstanceStatusRevoked, "x")
+		}},
+		{"DeleteIfUnchanged", func(wis storage.WalletInstanceStore, b domain.InstanceBinding) error {
+			return wis.DeleteIfUnchanged(ctx, "jkt", "acme", b)
+		}},
+		{"DeleteIfRemovable", func(wis storage.WalletInstanceStore, b domain.InstanceBinding) error {
+			return wis.DeleteIfRemovable(ctx, "jkt", "acme", b)
+		}},
+	}
+	// owners of the original and of the replacement; nil is unowned.
+	cases := []struct {
+		name         string
+		first, again *domain.UserID
+	}{
+		{"replaced by another user", &alice, &bob},
+		{"replaced by the same user", &alice, &alice},
+		{"unowned replaced by an owned one", nil, &bob},
+		{"owned replaced by an unowned one", &alice, nil},
+		{"unowned replaced by an unowned one", nil, nil},
+	}
+	for _, w := range writes {
+		for _, c := range cases {
+			t.Run(w.name+"/"+c.name, func(t *testing.T) {
+				wis := NewStore().WalletInstances()
+				if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "jkt", TenantID: "acme", UserID: c.first, Status: domain.InstanceStatusActive}); err != nil {
+					t.Fatal(err)
+				}
+				read := bindingOf(t, wis, "jkt")
+				if err := wis.DeleteIfUnchanged(ctx, "jkt", "acme", read); err != nil {
+					t.Fatal(err)
+				}
+				if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "jkt", TenantID: "acme", UserID: c.again, Status: domain.InstanceStatusActive}); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.do(wis, read); !errors.Is(err, storage.ErrBindingChanged) {
+					t.Fatalf("a write from the stale binding must be refused with ErrBindingChanged, got %v", err)
+				}
+				got, err := wis.GetByID(ctx, "jkt")
+				if err != nil {
+					t.Fatalf("the replacement must survive: %v", err)
+				}
+				if got.Status != domain.InstanceStatusActive || got.DeactivatedAt != nil {
+					t.Errorf("the replacement must be untouched, got %+v", got)
+				}
+				if got.Generation == "" || got.Generation == read.Generation {
+					t.Errorf("the replacement needs a generation of its own, read %q replacement %q", read.Generation, got.Generation)
+				}
+			})
+		}
+	}
+}
+
+// The binding the caller read still works, and an owner bound after the read
+// (the anonymous instance gaining its user) makes it stale.
+func TestWalletInstanceStore_Conditional_MatchAndOwnerBind(t *testing.T) {
+	ctx := context.Background()
+	alice := domain.UserIDFromString("alice")
+	wis := NewStore().WalletInstances()
+
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	unowned := bindingOf(t, wis, "anon")
+	// Another tenant's request does not see the record at all.
+	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "other", unowned, domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("wrong tenant: want ErrNotFound, got %v", err)
+	}
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "anon", TenantID: "acme", UserID: &alice, Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "acme", unowned, domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrBindingChanged) {
+		t.Fatalf("the unowned binding must be stale once the record is bound, got %v", err)
+	}
+	if err := wis.DeleteIfUnchanged(ctx, "anon", "acme", unowned); !errors.Is(err, storage.ErrBindingChanged) {
+		t.Fatalf("want ErrBindingChanged, got %v", err)
+	}
+	fresh := bindingOf(t, wis, "anon")
+	if fresh.Generation != unowned.Generation {
+		t.Fatalf("binding an owner must not change the generation")
+	}
+	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "acme", fresh, domain.InstanceStatusRevoked, "x"); err != nil {
+		t.Fatalf("the fresh binding must write: %v", err)
+	}
+	// Right record, already revoked: the transition error, not a binding one.
+	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "acme", fresh, domain.InstanceStatusRevoked, "x"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("want ErrInvalidStatusTransition, got %v", err)
+	}
+	if err := wis.DeleteIfUnchanged(ctx, "anon", "acme", fresh); err != nil {
+		t.Fatalf("the fresh binding must delete: %v", err)
+	}
+	if err := wis.DeleteIfUnchanged(ctx, "anon", "acme", fresh); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a gone record is ErrNotFound, got %v", err)
+	}
+}
+
+// A record written before generations existed has none and is matched by an
+// expected binding with none.
+func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore()
+	wis := store.WalletInstances()
+	store.walletInstances.data["legacy"] = &domain.WalletInstance{ID: "legacy", TenantID: "acme", Status: domain.InstanceStatusActive}
+	b := bindingOf(t, wis, "legacy")
+	if b.Generation != "" {
+		t.Fatalf("setup: want no generation, got %q", b.Generation)
+	}
+	if err := wis.UpdateStatusIfUnchanged(ctx, "legacy", "acme", domain.InstanceBinding{Generation: "g"}, domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrBindingChanged) {
+		t.Fatalf("a binding with a generation must not match a record without one, got %v", err)
+	}
+	if err := wis.UpdateStatusIfUnchanged(ctx, "legacy", "acme", b, domain.InstanceStatusRevoked, "x"); err != nil {
+		t.Fatal(err)
 	}
 }

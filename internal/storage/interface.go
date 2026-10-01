@@ -14,6 +14,12 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrBindingChanged is returned by the conditional wallet-instance writes
+	// when a record with that id exists in the tenant but is no longer the one
+	// the caller read: it was bound to another owner, or deleted and created
+	// again (a different generation). Nothing was written. A record that does
+	// not exist, or belongs to another tenant, still answers ErrNotFound.
+	ErrBindingChanged = errors.New("wallet instance binding changed")
 	// ErrStaleWrite is returned by UserStore.Update when the stored record's
 	// lifecycle cut-off (User.AuthInvalidBefore) advanced after the caller
 	// loaded the record: writing the stale copy back would undo a wallet
@@ -425,6 +431,24 @@ type WalletInstanceStore interface {
 	// record that is not that user's answers storage.ErrNotFound.
 	UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error
 
+	// UpdateStatusIfUnchanged is UpdateStatus with the expected binding in
+	// the write's filter: the record is revoked only while it is still in
+	// tenantID, owned by expected.Owner (nil meaning unowned) AND of
+	// generation expected.Generation, all in one atomic predicate. A read
+	// followed by a write keyed only by id and tenant can land on a
+	// replacement record - the id is a global key, so the same thumbprint can
+	// be deleted and attested again by another user of the same tenant in
+	// between. Returns storage.ErrBindingChanged when the record exists in the
+	// tenant but is not the one described, storage.ErrNotFound when it is gone
+	// or another tenant's, and domain.ErrInvalidStatusTransition when it is
+	// the right record but already revoked.
+	UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error
+
+	// DeleteIfUnchanged hard-deletes a wallet instance only while it is still
+	// in tenantID and matches expected (owner and generation), atomically.
+	// Same errors as UpdateStatusIfUnchanged, minus the transition one.
+	DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
+
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
 
@@ -442,7 +466,9 @@ type WalletInstanceStore interface {
 	DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error
 
 	// DeleteIfRemovable hard-deletes a wallet instance only while it is
-	// still removable: live, or bound to no user. It returns
+	// still removable (live, or bound to no user) AND still the record the
+	// caller read (expected owner and generation). It returns
+	// storage.ErrBindingChanged when the record was replaced, and
 	// domain.ErrInvalidStatusTransition when the record exists but has
 	// become a lifecycle tombstone, and storage.ErrNotFound when it is gone
 	// or belongs to another tenant.
@@ -452,7 +478,7 @@ type WalletInstanceStore interface {
 	// tombstone deleted - which is the record that keeps login and new
 	// attestations refused, so that device would look never-enrolled on its
 	// next attestation. The condition travels with the delete instead.
-	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID) error
+	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2

@@ -204,9 +204,23 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	// snapshot, and a revocation landing between the two would have its
 	// fresh tombstone deleted here - the very record that keeps login and
 	// new attestations refused for that device.
-	if err := h.store.WalletInstances().DeleteIfRemovable(c.Request.Context(), instanceID, tenantID); err != nil {
+	//
+	// The record read above travels with it too (owner and generation). The
+	// id is a global key, so if this instance was deleted and the same
+	// thumbprint attested again - by another user of the tenant - between
+	// the read and here, the replacement is also live or unowned and would
+	// pass the removability test; only the binding says it is not the one
+	// the operator asked about.
+	if err := h.store.WalletInstances().DeleteIfRemovable(c.Request.Context(), instanceID, tenantID, instance.Binding()); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
+			return
+		}
+		if errors.Is(err, storage.ErrBindingChanged) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":   "wallet_instance_changed",
+				"message": "the wallet instance was replaced while the request was in flight; nothing was deleted",
+			})
 			return
 		}
 		if errors.Is(err, domain.ErrInvalidStatusTransition) {

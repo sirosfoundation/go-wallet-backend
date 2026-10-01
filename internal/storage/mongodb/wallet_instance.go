@@ -2,9 +2,11 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -40,6 +42,10 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		// record back and refuse a mismatch, see WIAService.signWIA).
 		"$setOnInsert": bson.M{
 			"created_at": instance.CreatedAt,
+			// A fresh generation per insert, so a record deleted and
+			// attested again under the same id is a different record to a
+			// conditional write (see domain.InstanceBinding).
+			"generation": uuid.NewString(),
 			"status":     instance.Status,
 			"tenant_id":  instance.TenantID,
 		},
@@ -185,6 +191,75 @@ func (s *WalletInstanceStore) UpdateStatusForUser(ctx context.Context, id string
 	return s.updateStatus(ctx, bson.M{"_id": id, "tenant_id": tenantID, "user_id": userID}, status, reason)
 }
 
+// bindingFilter matches the record with this id in this tenant that still has
+// the expected owner (none, for an unowned one) and generation (none, for a
+// record written before generations existed). Absent, null and empty-string
+// all count as "none" for both, as elsewhere in this store.
+func bindingFilter(id string, tenantID domain.TenantID, b domain.InstanceBinding) bson.M {
+	none := func(field string) bson.M {
+		return bson.M{"$or": []bson.M{
+			{field: bson.M{"$exists": false}},
+			{field: nil},
+			{field: ""},
+		}}
+	}
+	conds := []bson.M{{"_id": id}, {"tenant_id": tenantID}}
+	if b.Owner == nil {
+		conds = append(conds, none("user_id"))
+	} else {
+		conds = append(conds, bson.M{"user_id": *b.Owner})
+	}
+	if b.Generation == "" {
+		conds = append(conds, none("generation"))
+	} else {
+		conds = append(conds, bson.M{"generation": b.Generation})
+	}
+	return bson.M{"$and": conds}
+}
+
+// UpdateStatusIfUnchanged is UpdateStatus with the expected owner and
+// generation in the filter. See the interface.
+func (s *WalletInstanceStore) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
+	err := s.updateStatus(ctx, bindingFilter(id, tenantID, expected), status, reason)
+	if errors.Is(err, storage.ErrNotFound) {
+		// Nothing matched the binding; tell "no such record in this tenant"
+		// from "a different record now".
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+		if cerr != nil {
+			return fmt.Errorf("%w: update wallet instance status: %v", storage.ErrDatabase, cerr)
+		}
+		if count > 0 {
+			return storage.ErrBindingChanged
+		}
+	}
+	return err
+}
+
+// DeleteIfUnchanged deletes only while the record matches the expected owner
+// and generation. See the interface.
+func (s *WalletInstanceStore) DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
+	res, err := s.collection.DeleteOne(ctx, bindingFilter(id, tenantID, expected))
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		return s.missOrChanged(ctx, id, tenantID)
+	}
+	return nil
+}
+
+// missOrChanged classifies a conditional write that matched nothing.
+func (s *WalletInstanceStore) missOrChanged(ctx context.Context, id string, tenantID domain.TenantID) error {
+	count, err := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if count == 0 {
+		return storage.ErrNotFound
+	}
+	return storage.ErrBindingChanged
+}
+
 // updateStatus applies the revocation to the record matching match, which
 // always carries _id and tenant_id (and user_id for the owner-checked form).
 func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, status domain.InstanceStatus, reason string) error {
@@ -260,25 +335,32 @@ func (s *WalletInstanceStore) IncrementAttestation(ctx context.Context, id strin
 // DeleteIfRemovable deletes only while the instance is still removable, so a
 // revocation landing between the caller's check and this delete keeps its
 // tombstone. See the interface for why that record must survive.
-func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID) error {
-	filter := bson.M{
-		"_id":       id,
-		"tenant_id": tenantID,
-		"$or": []bson.M{
+func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
+	bound := bindingFilter(id, tenantID, expected)
+	filter := bson.M{"$and": []bson.M{
+		bound,
+		{"$or": []bson.M{
 			{"status": domain.InstanceStatusActive},
 			{"user_id": bson.M{"$in": []interface{}{nil, ""}}},
 			{"user_id": bson.M{"$exists": false}},
-		},
-	}
+		}},
+	}}
 	res, err := s.collection.DeleteOne(ctx, filter)
 	if err != nil {
 		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
 	}
 	if res.DeletedCount == 0 {
-		// Tell "gone or another tenant's" apart from "became a tombstone".
-		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
-		if cerr != nil || count == 0 {
-			return storage.ErrNotFound
+		// Tell "gone or another tenant's" and "a different record now" apart
+		// from "became a tombstone".
+		if err := s.missOrChanged(ctx, id, tenantID); !errors.Is(err, storage.ErrBindingChanged) {
+			return err
+		}
+		count, cerr := s.collection.CountDocuments(ctx, bound)
+		if cerr != nil {
+			return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, cerr)
+		}
+		if count == 0 {
+			return storage.ErrBindingChanged
 		}
 		return domain.ErrInvalidStatusTransition
 	}

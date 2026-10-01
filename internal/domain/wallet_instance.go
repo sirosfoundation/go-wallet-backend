@@ -159,6 +159,18 @@ type WalletInstance struct {
 	// AttestationCount is the total number of WIAs issued to this instance.
 	AttestationCount int64 `json:"attestation_count" bson:"attestation_count"`
 
+	// Generation identifies this exact record. The store assigns a fresh
+	// random value when it inserts the record, and it never changes for the
+	// life of the record. The id is a global key (the instance-key
+	// thumbprint), so a record that is deleted and attested again - possibly
+	// by another user of the same tenant - has the same id and tenant as its
+	// predecessor; only the generation tells the two apart. Together with the
+	// owner it forms the InstanceBinding that conditional writes carry.
+	//
+	// A record written before the field existed has none (""), and matches an
+	// expected binding whose generation is empty.
+	Generation string `json:"-" bson:"generation,omitempty"`
+
 	// CreatedAt is when this instance was first seen (first WIA issuance).
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 
@@ -188,4 +200,36 @@ type SecurityProperties struct {
 	KeyStorage         []string `json:"key_storage" bson:"key_storage"`                         // ISO 18045 AVA_VAN levels
 	UserAuthentication []string `json:"user_authentication" bson:"user_authentication"`         // Authentication methods
 	Certification      string   `json:"certification,omitempty" bson:"certification,omitempty"` // Certification scheme URI
+}
+
+// InstanceBinding identifies the exact record a caller observed: who owned it
+// (nil for an unowned one) and which generation of the record it was.
+// Conditional store writes (UpdateStatusIfUnchanged, DeleteIfUnchanged,
+// DeleteIfRemovable) apply only while the stored record still matches, so a
+// write decided from an earlier read cannot land on a replacement record that
+// has the same id and tenant.
+type InstanceBinding struct {
+	Owner      *UserID
+	Generation string
+}
+
+// Binding returns the binding of the record as it was read.
+func (w *WalletInstance) Binding() InstanceBinding {
+	b := InstanceBinding{Generation: w.Generation}
+	if w.UserID != nil {
+		u := *w.UserID
+		b.Owner = &u
+	}
+	return b
+}
+
+// Matches reports whether the record is the one the binding describes.
+func (b InstanceBinding) Matches(w *WalletInstance) bool {
+	if b.Generation != w.Generation {
+		return false
+	}
+	if b.Owner == nil {
+		return w.UserID == nil
+	}
+	return w.UserID != nil && *w.UserID == *b.Owner
 }

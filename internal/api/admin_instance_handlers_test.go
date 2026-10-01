@@ -18,6 +18,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
@@ -546,5 +547,64 @@ func TestRevokeAllWalletInstancesForUser_AcceptsNoBody(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for an absent body, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// replacingInstanceStore deletes the instance it is asked to delete
+// conditionally and attests the same thumbprint again for another user of the
+// same tenant first - the interleaving between the handler's read and its
+// delete. The replacement is live and owned, so it would pass the
+// removability condition on its own.
+type replacingInstanceStore struct {
+	storage.Store
+	other domain.UserID
+}
+
+func (s *replacingInstanceStore) WalletInstances() storage.WalletInstanceStore {
+	return &replacingInstances{s.Store.WalletInstances(), s}
+}
+
+type replacingInstances struct {
+	storage.WalletInstanceStore
+	s *replacingInstanceStore
+}
+
+func (r *replacingInstances) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, exp domain.InstanceBinding) error {
+	cur, err := r.WalletInstanceStore.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := r.WalletInstanceStore.DeleteIfUnchanged(ctx, id, tenantID, cur.Binding()); err != nil {
+		return err
+	}
+	other := r.s.other
+	if err := r.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: tenantID, UserID: &other, Status: domain.InstanceStatusActive}); err != nil {
+		return err
+	}
+	return r.WalletInstanceStore.DeleteIfRemovable(ctx, id, tenantID, exp)
+}
+
+func TestDeleteWalletInstance_ReplacementBetweenReadAndDeleteSurvives(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	owner := domain.NewUserID()
+	other := domain.NewUserID()
+	store := &replacingInstanceStore{Store: base, other: other}
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	seedInstance(t, h, "inst-1", "acme", &owner)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/inst-1", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "wallet_instance_changed") {
+		t.Fatalf("expected 409 wallet_instance_changed, got %d %s", w.Code, w.Body.String())
+	}
+	got, err := base.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil {
+		t.Fatalf("the replacement must survive: %v", err)
+	}
+	if got.UserID == nil || *got.UserID != other || got.Status != domain.InstanceStatusActive {
+		t.Fatalf("the replacement must be untouched, got %+v", got)
 	}
 }
