@@ -65,6 +65,16 @@ func TestUserWrites_RefuseATokenTheLoadedRecordCutsOff(t *testing.T) {
 		assert.ErrorIs(t, err, tokengate.ErrRevoked)
 		assert.NoError(t, svc.RenameWebAuthnCredential(after, uid, "a", "renamed"))
 	})
+	t.Run("BeginAddCredential", func(t *testing.T) {
+		w, _ := setupWebAuthnService(t)
+		w.store = store
+		resp, err := w.BeginAddCredential(before, uid)
+		assert.True(t, errors.Is(err, tokengate.ErrRevoked), "got %v", err)
+		assert.Nil(t, resp, "no creation options may be handed to a revoked token")
+		resp, err = w.BeginAddCredential(after, uid)
+		assert.NoError(t, err, "a token issued after the cut-off proceeds")
+		assert.NotNil(t, resp)
+	})
 	t.Run("FinishAddCredential", func(t *testing.T) {
 		w, _ := setupWebAuthnService(t)
 		w.store = store

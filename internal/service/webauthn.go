@@ -2014,6 +2014,11 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	if err != nil {
 		return nil, err
 	}
+	// Token-authenticated, and it stores a challenge and hands out creation
+	// options: a token the user's cut-off already predates gets neither.
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
 
 	waUser := &WebAuthnUser{user: user}
 
