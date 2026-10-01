@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"sync"
 	"time"
 
@@ -32,8 +33,9 @@ type SessionStore interface {
 	// Get retrieves a session by ID.
 	Get(ctx context.Context, sessionID string) (*SessionData, error)
 
-	// GetByUser retrieves a session by user ID.
-	GetByUser(ctx context.Context, userID string) (*SessionData, error)
+	// GetByUser retrieves the session of a user within a tenant. A user
+	// holds at most one session per tenant.
+	GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error)
 
 	// Put stores a session. Returns ErrSessionExists if session already exists.
 	Put(ctx context.Context, session *SessionData) error
@@ -44,7 +46,8 @@ type SessionStore interface {
 	// Delete removes a session by ID.
 	Delete(ctx context.Context, sessionID string) error
 
-	// DeleteByUser removes sessions for a user.
+	// DeleteByUser removes the user's sessions in every tenant (user-wide
+	// revocation, e.g. account deletion).
 	DeleteByUser(ctx context.Context, userID string) error
 
 	// List returns all sessions for a tenant.
@@ -61,7 +64,7 @@ type SessionStore interface {
 type MemorySessionStore struct {
 	mu        sync.RWMutex
 	sessions  map[string]*SessionData
-	userIndex map[string]string // userID -> sessionID
+	userIndex map[userKey]string // (tenant, user) -> sessionID
 	logger    *zap.Logger
 }
 
@@ -69,7 +72,7 @@ type MemorySessionStore struct {
 func NewMemorySessionStore(logger *zap.Logger) *MemorySessionStore {
 	return &MemorySessionStore{
 		sessions:  make(map[string]*SessionData),
-		userIndex: make(map[string]string),
+		userIndex: make(map[userKey]string),
 		logger:    logger.Named("memory_store"),
 	}
 }
@@ -90,11 +93,11 @@ func (m *MemorySessionStore) Get(ctx context.Context, sessionID string) (*Sessio
 	return session, nil
 }
 
-func (m *MemorySessionStore) GetByUser(ctx context.Context, userID string) (*SessionData, error) {
+func (m *MemorySessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sessionID, ok := m.userIndex[userID]
+	sessionID, ok := m.userIndex[userKey{TenantID: tenantID, UserID: userID}]
 	if !ok {
 		return nil, ErrSessionNotFound
 	}
@@ -120,7 +123,7 @@ func (m *MemorySessionStore) Put(ctx context.Context, session *SessionData) erro
 	}
 
 	m.sessions[session.ID] = session
-	m.userIndex[session.UserID] = session.ID
+	m.userIndex[userKey{TenantID: session.TenantID, UserID: session.UserID}] = session.ID
 	return nil
 }
 
@@ -133,7 +136,7 @@ func (m *MemorySessionStore) Update(ctx context.Context, session *SessionData) e
 	}
 
 	m.sessions[session.ID] = session
-	m.userIndex[session.UserID] = session.ID
+	m.userIndex[userKey{TenantID: session.TenantID, UserID: session.UserID}] = session.ID
 	return nil
 }
 
@@ -146,7 +149,11 @@ func (m *MemorySessionStore) Delete(ctx context.Context, sessionID string) error
 		return nil // Idempotent
 	}
 
-	delete(m.userIndex, session.UserID)
+	// Only drop the index entry if it still points at this session.
+	k := userKey{TenantID: session.TenantID, UserID: session.UserID}
+	if m.userIndex[k] == sessionID {
+		delete(m.userIndex, k)
+	}
 	delete(m.sessions, sessionID)
 	return nil
 }
@@ -155,13 +162,16 @@ func (m *MemorySessionStore) DeleteByUser(ctx context.Context, userID string) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	sessionID, exists := m.userIndex[userID]
-	if !exists {
-		return nil // Idempotent
+	for id, session := range m.sessions {
+		if session.UserID == userID {
+			delete(m.sessions, id)
+		}
 	}
-
-	delete(m.sessions, sessionID)
-	delete(m.userIndex, userID)
+	for k := range m.userIndex {
+		if k.UserID == userID {
+			delete(m.userIndex, k)
+		}
+	}
 	return nil
 }
 
@@ -187,7 +197,10 @@ func (m *MemorySessionStore) Cleanup(ctx context.Context) (int64, error) {
 	now := time.Now()
 	for id, session := range m.sessions {
 		if now.After(session.ExpiresAt) {
-			delete(m.userIndex, session.UserID)
+			k := userKey{TenantID: session.TenantID, UserID: session.UserID}
+			if m.userIndex[k] == id {
+				delete(m.userIndex, k)
+			}
 			delete(m.sessions, id)
 			count++
 		}
@@ -258,8 +271,15 @@ func (r *RedisSessionStore) sessionKey(sessionID string) string {
 	return r.keyPrefix + sessionID
 }
 
-func (r *RedisSessionStore) userKey(userID string) string {
-	return r.keyPrefix + "user:" + userID
+// userKey is the per-(tenant, user) pointer to that user's current session.
+func (r *RedisSessionStore) userKey(tenantID, userID string) string {
+	return r.keyPrefix + "user:" + url.PathEscape(tenantID) + ":" + url.PathEscape(userID)
+}
+
+// userSetKey holds the IDs of all of a user's sessions across tenants, so a
+// user-wide DeleteByUser can find them.
+func (r *RedisSessionStore) userSetKey(userID string) string {
+	return r.keyPrefix + "userall:" + url.PathEscape(userID)
 }
 
 func (r *RedisSessionStore) tenantKey(tenantID string) string {
@@ -287,8 +307,8 @@ func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*Session
 	return &session, nil
 }
 
-func (r *RedisSessionStore) GetByUser(ctx context.Context, userID string) (*SessionData, error) {
-	sessionID, err := r.client.Get(ctx, r.userKey(userID)).Result()
+func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
+	sessionID, err := r.client.Get(ctx, r.userKey(tenantID, userID)).Result()
 	if err == redis.Nil {
 		return nil, ErrSessionNotFound
 	}
@@ -313,8 +333,9 @@ func (r *RedisSessionStore) Put(ctx context.Context, session *SessionData) error
 	// Use transaction for atomicity
 	pipe := r.client.TxPipeline()
 	pipe.SetNX(ctx, r.sessionKey(session.ID), data, ttl)
-	pipe.Set(ctx, r.userKey(session.UserID), session.ID, ttl)
+	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
 	pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
+	pipe.SAdd(ctx, r.userSetKey(session.UserID), session.ID)
 
 	_, err = pipe.Exec(ctx)
 	return err
@@ -342,7 +363,7 @@ func (r *RedisSessionStore) Update(ctx context.Context, session *SessionData) er
 
 	pipe := r.client.TxPipeline()
 	pipe.Set(ctx, r.sessionKey(session.ID), data, ttl)
-	pipe.Set(ctx, r.userKey(session.UserID), session.ID, ttl)
+	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
 
 	_, err = pipe.Exec(ctx)
 	return err
@@ -360,23 +381,33 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 
 	pipe := r.client.TxPipeline()
 	pipe.Del(ctx, r.sessionKey(sessionID))
-	pipe.Del(ctx, r.userKey(session.UserID))
 	pipe.SRem(ctx, r.tenantKey(session.TenantID), sessionID)
+	pipe.SRem(ctx, r.userSetKey(session.UserID), sessionID)
 
 	_, err = pipe.Exec(ctx)
-	return err
-}
-
-func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
-	session, err := r.GetByUser(ctx, userID)
-	if err == ErrSessionNotFound {
-		return nil // Idempotent
-	}
 	if err != nil {
 		return err
 	}
+	// Drop the (tenant, user) pointer only if it still names this session; a
+	// newer session may have replaced it.
+	uk := r.userKey(session.TenantID, session.UserID)
+	if cur, gerr := r.client.Get(ctx, uk).Result(); gerr == nil && cur == sessionID {
+		return r.client.Del(ctx, uk).Err()
+	}
+	return nil
+}
 
-	return r.Delete(ctx, session.ID)
+func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
+	ids, err := r.client.SMembers(ctx, r.userSetKey(userID)).Result()
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := r.Delete(ctx, id); err != nil {
+			return err
+		}
+	}
+	return r.client.Del(ctx, r.userSetKey(userID)).Err()
 }
 
 func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*SessionData, error) {

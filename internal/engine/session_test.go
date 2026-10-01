@@ -1005,7 +1005,7 @@ func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		m.sessionsMu.RLock()
 		defer m.sessionsMu.RUnlock()
-		_, stillIndexed := m.userIndex[deletedUser]
+		stillIndexed := hasUserIndexed(m, deletedUser)
 		return len(m.sessions) == 0 && !stillIndexed
 	}, time.Second, 10*time.Millisecond, "session bookkeeping was not cleaned up after close")
 }
@@ -1113,7 +1113,7 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 	require.NoError(t, survivorWS.SetReadDeadline(time.Time{}))
 
 	m.sessionsMu.RLock()
-	_, stillPresent := m.userIndex["innocent-bystander"]
+	stillPresent := hasUserIndexed(m, "innocent-bystander")
 	m.sessionsMu.RUnlock()
 	assert.True(t, stillPresent, "the innocent bystander must still be registered")
 }
@@ -1198,7 +1198,7 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 
 	m.sessionsMu.RLock()
 	_, present := m.sessions[session.ID]
-	_, indexed := m.userIndex[session.UserID]
+	_, indexed := m.userIndex[session.userKey()]
 	m.sessionsMu.RUnlock()
 	assert.False(t, present, "a rejected session must not be added to m.sessions")
 	assert.False(t, indexed, "a rejected session must not be added to m.userIndex")
@@ -1381,4 +1381,143 @@ func TestHandleNewConnection_TACEnforcementByProvenance(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hasUserIndexed reports whether userID has an entry in m.userIndex under any
+// tenant. The caller must hold m.sessionsMu.
+func hasUserIndexed(m *Manager, userID string) bool {
+	for k := range m.userIndex {
+		if k.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func newMultiTenantTestSession(id, tenantID, userID string) *Session {
+	return &Session{ID: id, TenantID: tenantID, UserID: userID, logger: zap.NewNop(), transport: &closeHookTransport{}}
+}
+
+// closeHookTransport is a no-op SessionTransport that reports Close calls.
+type closeHookTransport struct{ onClose func() }
+
+func (c *closeHookTransport) SendJSON(interface{}) error { return nil }
+func (c *closeHookTransport) ReadMessage(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (c *closeHookTransport) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
+
+// A user in tenants A and B keeps one session in each; a second session in
+// the same tenant supersedes only that tenant's first.
+func TestManager_RegisterSession_OneSessionPerTenantUser(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	var supersededA int
+	a1 := newMultiTenantTestSession("a1", "tenant-a", "user-1")
+	a1.onSuperseded = func() { supersededA++ }
+	b1 := newMultiTenantTestSession("b1", "tenant-b", "user-1")
+	require.True(t, m.registerSession(a1))
+	require.True(t, m.registerSession(b1))
+
+	assert.Equal(t, 0, supersededA, "a session in tenant B must not supersede tenant A's")
+	assert.True(t, m.isCurrentSession(a1))
+	assert.True(t, m.isCurrentSession(b1))
+	gotA, err := m.GetSessionByUser("tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, a1, gotA)
+	gotB, err := m.GetSessionByUser("tenant-b", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, b1, gotB)
+
+	a2 := newMultiTenantTestSession("a2", "tenant-a", "user-1")
+	require.True(t, m.registerSession(a2))
+	assert.Equal(t, 1, supersededA)
+	assert.False(t, m.isCurrentSession(a1))
+	assert.True(t, m.isCurrentSession(a2))
+	assert.True(t, m.isCurrentSession(b1), "tenant B session must survive tenant A supersede")
+
+	// Unregistering the superseded session must not drop its successor's index.
+	m.unregisterSession(a1)
+	assert.True(t, m.isCurrentSession(a2))
+
+	// Anonymous sessions are never indexed or superseded.
+	an1 := newMultiTenantTestSession("an1", "tenant-a", "")
+	an2 := newMultiTenantTestSession("an2", "tenant-a", "")
+	require.True(t, m.registerSession(an1))
+	require.True(t, m.registerSession(an2))
+	assert.True(t, m.isCurrentSession(an1))
+	assert.True(t, m.isCurrentSession(an2))
+}
+
+// Persisted session bookkeeping is also per (tenant, user).
+func TestManager_RegisterSession_StoreKeepsBothTenants(t *testing.T) {
+	m := testManager()
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+	defer m.Close()
+	ctx := context.Background()
+
+	require.True(t, m.registerSession(newMultiTenantTestSession("a1", "tenant-a", "user-1")))
+	require.True(t, m.registerSession(newMultiTenantTestSession("b1", "tenant-b", "user-1")))
+	_, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	_, err = store.GetByUser(ctx, "tenant-b", "user-1")
+	require.NoError(t, err)
+
+	require.True(t, m.registerSession(newMultiTenantTestSession("a2", "tenant-a", "user-1")))
+	_, err = store.Get(ctx, "a1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "b1")
+	require.NoError(t, err)
+	got, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, "a2", got.ID)
+}
+
+// User-wide revocation closes the user's sessions in every tenant.
+func TestManager_RevokeUser_ClosesSessionsInAllTenants(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	var closed []string
+	mk := func(id, tenant, user string) *Session {
+		s := newMultiTenantTestSession(id, tenant, user)
+		s.transport = &closeHookTransport{onClose: func() { closed = append(closed, id) }}
+		return s
+	}
+	require.True(t, m.registerSession(mk("a", "tenant-a", "user-1")))
+	require.True(t, m.registerSession(mk("b", "tenant-b", "user-1")))
+	require.True(t, m.registerSession(mk("other", "tenant-a", "user-2")))
+
+	require.NoError(t, m.DeleteByUser(context.Background(), "user-1"))
+	assert.ElementsMatch(t, []string{"a", "b"}, closed)
+}
+
+func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	for _, s := range []*SessionData{
+		{ID: "a", UserID: "u", TenantID: "ta", ExpiresAt: exp},
+		{ID: "b", UserID: "u", TenantID: "tb", ExpiresAt: exp},
+		{ID: "c", UserID: "other", TenantID: "ta", ExpiresAt: exp},
+	} {
+		require.NoError(t, store.Put(ctx, s))
+	}
+	require.NoError(t, store.Delete(ctx, "a"))
+	_, err := store.GetByUser(ctx, "tb", "u")
+	require.NoError(t, err, "deleting tenant A's session must not drop tenant B's index")
+
+	require.NoError(t, store.DeleteByUser(ctx, "u"))
+	_, err = store.Get(ctx, "b")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "c")
+	assert.NoError(t, err)
 }
