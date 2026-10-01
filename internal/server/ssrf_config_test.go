@@ -60,7 +60,8 @@ func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP: true,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true, // loopback test server
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)

@@ -44,6 +44,7 @@ import (
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 )
 
@@ -77,8 +78,17 @@ type Config struct {
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
 	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, http.DefaultClient is used.
+	// If nil, New builds an SSRF-guarded client (see pkg/config
+	// HTTPClientConfig.NewHTTPClient) that refuses private, loopback,
+	// link-local and cloud-metadata addresses; it never falls back to
+	// http.DefaultClient.
 	HTTPClient *http.Client
+
+	// UnsafeAllowPrivateAddressesForTesting lets the guarded client that New
+	// builds when HTTPClient is nil connect to private and loopback addresses
+	// (e.g. httptest servers). It has no effect when HTTPClient is set.
+	// For testing only; do not set in production.
+	UnsafeAllowPrivateAddressesForTesting bool
 
 	// AllowHTTP permits non-TLS issuer URLs.
 	// For testing only; do not set in production.
@@ -103,6 +113,10 @@ type cachedEntry struct {
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
+// defaultHTTPTimeout is the timeout of the guarded client New builds when
+// Config.HTTPClient is nil.
+const defaultHTTPTimeout = 30 * time.Second
+
 const maxResponseBodyBytes = 10 * 1024 * 1024
 
 // readLimitedBody reads up to maxResponseBodyBytes from r.
@@ -139,7 +153,13 @@ func New(cfg Config) (*Resolver, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		// Never fall back to http.DefaultClient: issuer URLs are
+		// caller-controlled, so the default client must refuse private,
+		// loopback and metadata addresses.
+		httpClient = config.HTTPClientConfig{
+			AllowHTTP:       cfg.AllowHTTP,
+			AllowPrivateIPs: cfg.UnsafeAllowPrivateAddressesForTesting,
+		}.NewHTTPClient(defaultHTTPTimeout)
 	}
 
 	return &Resolver{
@@ -288,8 +308,11 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
-	// DialContext (blocking private/loopback IPs, always constructed via
-	// cfg.HTTPClient.NewHTTPClient(); see pkg/config). Fetching arbitrary
+	// DialContext (blocking private/loopback IPs): New either uses the
+	// caller's Config.HTTPClient (documented to be guarded, built via
+	// config.HTTPClientConfig.NewHTTPClient in production) or, when that is
+	// nil, builds a guarded client itself; it never uses http.DefaultClient.
+	// Fetching arbitrary
 	// public HTTPS endpoints is inherent to OpenID4VCI issuer metadata
 	// discovery — the issuer URL comes from a user-presented credential and
 	// can be any public HTTPS endpoint; there is no known-good allowlist.
